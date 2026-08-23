@@ -2230,6 +2230,63 @@ where
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentTeamResult<AgentTeamEntityReply> {
+        let operation = command.operation_label();
+        // Counted once, on the verdict that actually left the entity: the
+        // re-verified pass can answer a first-pass refusal differently.
+        let reply = self.apply_reverified(command, router, now).await;
+        match &reply {
+            // Only a durable decision counts: a `Duplicate` answered from the
+            // operation log and a `Snapshot` both transitioned nothing, so a
+            // replay never double-counts.
+            Ok(AgentTeamEntityReply::Applied { .. }) => {
+                self.count_operation(operation, "applied");
+            }
+            Ok(_) => {}
+            Err(error) if error.is_domain_refusal() => {
+                self.count_operation(operation, "refused");
+            }
+            Err(_) => {}
+        }
+        reply
+    }
+
+    /// [`Self::apply`], with a refused first pass re-answered from durable
+    /// state.
+    ///
+    /// A command that *commits* is fenced by its own compare-and-set — it is
+    /// written at the cached record's revision, so a second writer that moved
+    /// the durable record first makes the write lose, drops the cache, and
+    /// the retry re-reads. A command that is *refused* writes nothing, so
+    /// that fence never engages, and a board answering a claim epoch or
+    /// membership fence from a cache the A2A service's own store handle has
+    /// already moved past would hand out a definitive-looking refusal and,
+    /// writing nothing, never correct itself for the whole residency.
+    ///
+    /// Bounded to one extra pass: the second verdict is computed from a
+    /// re-materialized record and is therefore authoritative whatever it
+    /// says. The happy path pays nothing.
+    async fn apply_reverified(
+        &mut self,
+        command: AgentTeamEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentTeamResult<AgentTeamEntityReply> {
+        let reverify = command.clone();
+        match self.apply_once(command, router, now).await {
+            Err(error) if error.is_domain_refusal() => {
+                self.recover(now).await?;
+                self.apply_once(reverify, router, now).await
+            }
+            other => other,
+        }
+    }
+
+    async fn apply_once(
+        &mut self,
+        command: AgentTeamEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentTeamResult<AgentTeamEntityReply> {
         self.ensure_recovered(now).await?;
 
         if let Some(operation_id) = command.operation_id() {
@@ -2254,15 +2311,7 @@ where
         }
         self.require_history_headroom(now).await?;
 
-        let operation = command.operation_label();
         let reply = self.apply_transition(command, now).await;
-        match &reply {
-            Ok(_) => self.count_operation(operation, "applied"),
-            Err(error) if error.is_domain_refusal() => {
-                self.count_operation(operation, "refused");
-            }
-            Err(_) => {}
-        }
         // Owed exchanges are drained by the courier — the settle pass — and
         // never synchronously from a command; the router rides along only so
         // callers hold the same surface everywhere.

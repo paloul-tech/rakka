@@ -6326,7 +6326,29 @@ where
         // transition commits before the settle pass, so a resolution can be
         // durable even when the call fails.
         let resolution_before = self.fan_in_resolution();
-        let reply = self.apply_command(command, router, now).await;
+        let reverify = command.clone();
+        let reply = match self.apply_command(command, router, now).await {
+            // A command that *commits* is fenced by its own compare-and-set:
+            // it is written at the cached record's revision, so a second
+            // writer that moved the durable record first makes the write
+            // lose, drops the cache, and the retry re-reads. A command that
+            // is *refused* writes nothing, so that fence never engages — and
+            // a run has two writers by construction, this resident facade and
+            // the courier reaching the same durable record through its own
+            // store handle. A generation, fence, or effect-attempt guard
+            // answered from a cache the other writer has already moved past
+            // is a definitive-looking refusal that, writing nothing, would
+            // never correct itself for the whole residency. So a refusal is
+            // re-answered against a re-materialized record — bounded to one
+            // extra pass, whose verdict is authoritative whatever it says.
+            // The happy path pays nothing, which is the point of a resident
+            // entity at all.
+            Err(error) if run_refusal_may_be_stale(&error) => {
+                self.rematerialize(now).await?;
+                self.apply_command(reverify, router, now).await
+            }
+            other => other,
+        };
         self.record_fan_in_resolution(resolution_before);
         reply
     }
@@ -8274,6 +8296,28 @@ where
         entity = entity.without_buffering();
     }
     entity
+}
+
+/// Whether a refused command's verdict could have been computed from a stale
+/// cached record, and so must be re-answered against durable state.
+///
+/// Infrastructure faults are excluded deliberately, and not merely because
+/// re-reading would not change them: a run's settlement runs *after* its
+/// transition commits, so a post-commit dispatch or persistence failure
+/// surfaces from a command that already applied. Re-driving such a command
+/// would answer it `Duplicate` from the operation log and swallow the fault
+/// the caller must see. Only a domain refusal — a verdict derived from the
+/// record's own fences, which by construction wrote nothing — is re-answered.
+fn run_refusal_may_be_stale(error: &AgentRunError) -> bool {
+    !matches!(
+        error,
+        AgentRunError::Identity(_)
+            | AgentRunError::Schema(_)
+            | AgentRunError::Choreography(_)
+            | AgentRunError::Persistence(_)
+            | AgentRunError::Effect(_)
+            | AgentRunError::Model(_)
+    )
 }
 
 /// Returns a sharded reference to one run entity.

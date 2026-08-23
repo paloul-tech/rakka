@@ -150,30 +150,45 @@ async fn a_wire_turn_committed_past_a_resident_conversation_heals_on_its_next_sw
         AgentConversationEntityReply::Applied { .. }
     ));
 
-    // The rightful next speaker reaches the resident, whose stale cursor
-    // still expects p1's turn 0: refused, and the refusal writes nothing.
-    let refused = resident
-        .apply(submit(0, 1, "p2", "response"), &fx.router, fx.now())
-        .await;
-    assert!(
-        refused.is_err(),
-        "the stale cursor refuses the in-order turn: {refused:?}"
+    // The resident's cache still predates that turn: it is holding exactly
+    // the stale view a fence would be answered from.
+    assert_eq!(
+        resident
+            .snapshot()
+            .expect("the resident snapshots")
+            .expect("the conversation exists")
+            .turns
+            .len(),
+        0,
+        "the resident has not seen the wire turn"
     );
 
     // The resident's own settle sweep — no passivation, no lost race, no
     // mutating command in between — must re-materialize the durable record.
+    // (The command path re-materializes on a refusal under its own parity in
+    // `command_rematerialization.rs`; this asserts the sweep does it without
+    // any command at all, for the resident that idles owing nothing.)
     let _ = resident
         .settle_side_effects(&fx.router, fx.now())
         .await
         .expect("the resident sweep settles");
 
-    // The same submission now lands: the refusal was never memoized (a
-    // non-committing refusal writes nothing), so the retry re-runs the door
-    // against the re-materialized cursor.
+    assert_eq!(
+        resident
+            .snapshot()
+            .expect("the resident snapshots")
+            .expect("the conversation exists")
+            .turns
+            .len(),
+        1,
+        "the sweep re-materialized the other writer's turn"
+    );
+
+    // And the rightful next speaker now lands against that record.
     let reply = resident
         .apply(submit(0, 1, "p2", "response"), &fx.router, fx.now())
         .await
-        .expect("an inability must not outlive the sweep: the in-order turn is admitted");
+        .expect("the in-order turn is admitted");
     assert!(matches!(
         reply,
         AgentConversationEntityReply::Applied { .. }

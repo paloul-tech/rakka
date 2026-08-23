@@ -11878,6 +11878,37 @@ where
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentTaskResult<AgentTaskEntityReply> {
+        let reverify = command.clone();
+        match self.apply_once(command, router, now).await {
+            // A command that *commits* is fenced by its own compare-and-set:
+            // it is written at the cached record's revision, so a second
+            // writer that moved the durable record first makes the write
+            // lose, drops the cache, and the retry re-reads. A command that
+            // is *refused* writes nothing, so that fence never engages — and
+            // a task has two writers by construction, this resident facade
+            // and the A2A service's own store handle. An assignment
+            // generation, claim epoch, or submission fence answered from a
+            // cache the other writer has already moved past is a
+            // definitive-looking refusal that, writing nothing, would never
+            // correct itself for the whole residency. So a refusal is
+            // re-answered against a re-materialized record — bounded to one
+            // extra pass, whose verdict is authoritative whatever it says.
+            // The happy path pays nothing, which is the point of a resident
+            // entity at all.
+            Err(error) if task_refusal_may_be_stale(&error) => {
+                self.recover(now).await?;
+                self.apply_once(reverify, router, now).await
+            }
+            other => other,
+        }
+    }
+
+    async fn apply_once(
+        &mut self,
+        command: AgentTaskEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<AgentTaskEntityReply> {
         self.ensure_recovered(now).await?;
 
         if let Some(operation_id) = command.operation_id() {
@@ -14396,6 +14427,27 @@ where
         entity = entity.without_buffering();
     }
     entity
+}
+
+/// Whether a refused command's verdict could have been computed from a stale
+/// cached record, and so must be re-answered against durable state.
+///
+/// Infrastructure faults are excluded deliberately, and not merely because
+/// re-reading would not change them: a task's settlement runs *after* its
+/// transition commits, so a post-commit history or persistence failure
+/// surfaces from a command that already applied. Re-driving such a command
+/// would answer it `Duplicate` from the operation log and swallow the fault
+/// the caller must see. Only a domain refusal — a verdict derived from the
+/// record's own fences, which by construction wrote nothing — is re-answered.
+fn task_refusal_may_be_stale(error: &AgentTaskError) -> bool {
+    !matches!(
+        error,
+        AgentTaskError::Identity(_)
+            | AgentTaskError::Schema(_)
+            | AgentTaskError::Choreography(_)
+            | AgentTaskError::Persistence(_)
+            | AgentTaskError::AgentRead { .. }
+    )
 }
 
 /// Returns a sharded reference to one typed-task entity.

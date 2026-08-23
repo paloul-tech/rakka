@@ -2018,6 +2018,68 @@ where
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentConversationResult<AgentConversationEntityReply> {
+        let operation = command.operation_label();
+        let reply = self.apply_reverified(command, router, now).await;
+        // Counted once, on the verdict that actually left the entity: the
+        // re-verified pass below can answer a first-pass refusal differently,
+        // and a duplicate — the past-window ledger echo — made no durable
+        // decision and counts nothing, so a replay never double-counts.
+        match &reply {
+            Ok(AgentConversationEntityReply::Applied { .. }) => {
+                self.count_operation(operation, "applied");
+            }
+            Ok(_) => {}
+            Err(error) if error.is_domain_refusal() => {
+                self.count_operation(operation, "refused");
+            }
+            Err(_) => {}
+        }
+        reply
+    }
+
+    /// [`Self::apply`], with a refused first pass re-answered from durable
+    /// state.
+    ///
+    /// A command that *commits* is fenced by its own compare-and-set: the
+    /// transition is computed from the cached record and written at that
+    /// record's revision, so a second writer that moved the durable record
+    /// first makes the write lose, drops the cache, and the retry re-reads.
+    /// A command that is *refused* writes nothing, so that fence never
+    /// engages — and a refusal derived from a stale cache is a definitive
+    /// answer the caller is entitled to rely on. Every governed conversation
+    /// has two writers by construction (this resident facade and the A2A
+    /// service's own store handle), so a cursor, round-epoch, or ledger fence
+    /// answered from a cache that predates the other writer refuses the
+    /// rightful next turn and, writing nothing, would never correct itself
+    /// for the whole residency.
+    ///
+    /// So a refusal is treated as what it is — a verdict this facade may not
+    /// be qualified to give — and re-answered against a re-materialized
+    /// record. Bounded to one extra pass: the second verdict is authoritative
+    /// by construction, so it is returned whatever it says. The happy path
+    /// pays nothing, which is the point of a resident entity at all.
+    async fn apply_reverified(
+        &mut self,
+        command: AgentConversationEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentConversationResult<AgentConversationEntityReply> {
+        let reverify = command.clone();
+        match self.apply_once(command, router, now).await {
+            Err(error) if error.is_domain_refusal() => {
+                self.recover(now).await?;
+                self.apply_once(reverify, router, now).await
+            }
+            other => other,
+        }
+    }
+
+    async fn apply_once(
+        &mut self,
+        command: AgentConversationEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentConversationResult<AgentConversationEntityReply> {
         self.ensure_recovered(now).await?;
 
         if let Some(operation_id) = command.operation_id() {
@@ -2040,7 +2102,6 @@ where
             ));
         }
 
-        let operation = command.operation_label();
         // The past-window ledger echo is answered before every other guard,
         // including the history headroom one: it writes nothing at all, so a
         // redelivered turn must converge on the recorded turn even while the
@@ -2053,12 +2114,7 @@ where
                     Ok(()) => Ok(AgentConversationEntityReply::Duplicate {
                         outcome: self.state()?.outcome(),
                     }),
-                    Err(error) => {
-                        if error.is_domain_refusal() {
-                            self.count_operation(operation, "refused");
-                        }
-                        Err(error)
-                    }
+                    Err(error) => Err(error),
                 };
             }
         }
@@ -2084,12 +2140,7 @@ where
             } => admit_end_early(self.state()?, moderator, *expected_round, reason, now),
             _ => Ok(()),
         };
-        if let Err(error) = admission {
-            if error.is_domain_refusal() {
-                self.count_operation(operation, "refused");
-            }
-            return Err(error);
-        }
+        admission?;
 
         self.require_history_headroom(now).await?;
 
@@ -2119,18 +2170,6 @@ where
         };
 
         let reply = self.apply_transition(command, moderation, now).await;
-        match &reply {
-            // A duplicate — the past-window ledger echo — made no durable
-            // decision and counts nothing, so a replay never double-counts.
-            Ok(AgentConversationEntityReply::Applied { .. }) => {
-                self.count_operation(operation, "applied");
-            }
-            Ok(_) => {}
-            Err(error) if error.is_domain_refusal() => {
-                self.count_operation(operation, "refused");
-            }
-            Err(_) => {}
-        }
         // A rejected transition flushed nothing and, after a persistence
         // fence, holds no recovered cache — flushing here would mask the
         // rejection with a recovery error.
