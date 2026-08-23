@@ -340,23 +340,27 @@ fn every_cross_participant_kind_classifies_alike_at_both_ends() {
         AgentExchangeParticipant, AgentExchangeResult, AgentRunParticipant, AgentTaskParticipant,
     };
 
-    // (kind, payload type, initiator address, receiver address, whether the
-    // task participant is the initiator, and the codes with their verdicts).
-    let cases: Vec<(
-        AgentExchangeKind,
-        &str,
-        AgentEntityAddress,
-        AgentEntityAddress,
-        bool,
-        Vec<(&str, bool)>,
-    )> = vec![
-        (
-            AgentExchangeKind::DelegationResult,
-            AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
-            AgentEntityAddress::Task(task_scope()),
-            AgentEntityAddress::Run(run_scope()),
-            true,
-            vec![
+    /// One exchange kind's two ends, with the verdict each refusal code must
+    /// draw from both of them.
+    struct Case {
+        kind: AgentExchangeKind,
+        payload_type: &'static str,
+        initiator: AgentEntityAddress,
+        receiver: AgentEntityAddress,
+        /// Whether the task participant is this kind's initiator; the run
+        /// participant is the other end either way.
+        task_initiates: bool,
+        codes: Vec<(&'static str, bool)>,
+    }
+
+    let cases = vec![
+        Case {
+            kind: AgentExchangeKind::DelegationResult,
+            payload_type: AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
+            initiator: AgentEntityAddress::Task(task_scope()),
+            receiver: AgentEntityAddress::Run(run_scope()),
+            task_initiates: true,
+            codes: vec![
                 ("delegation-result-unknown-run", true),
                 ("delegation-result-unknown-delegation", true),
                 ("delegation-result-forged", true),
@@ -365,14 +369,14 @@ fn every_cross_participant_kind_classifies_alike_at_both_ends() {
                 ("delegation-result-undecodable", false),
                 ("unsupported-exchange", false),
             ],
-        ),
-        (
-            AgentExchangeKind::RunCancel,
-            AGENT_RUN_CANCEL_PAYLOAD_TYPE,
-            AgentEntityAddress::Task(task_scope()),
-            AgentEntityAddress::Run(run_scope()),
-            true,
-            vec![
+        },
+        Case {
+            kind: AgentExchangeKind::RunCancel,
+            payload_type: AGENT_RUN_CANCEL_PAYLOAD_TYPE,
+            initiator: AgentEntityAddress::Task(task_scope()),
+            receiver: AgentEntityAddress::Run(run_scope()),
+            task_initiates: true,
+            codes: vec![
                 ("run-cancel-forged", true),
                 ("run-cancel-unassigned", true),
                 ("run-cancel-stale-generation", true),
@@ -380,52 +384,60 @@ fn every_cross_participant_kind_classifies_alike_at_both_ends() {
                 ("run-cancel-failed", false),
                 ("unsupported-exchange", false),
             ],
-        ),
-        (
-            AgentExchangeKind::DelegationCancel,
-            AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE,
-            AgentEntityAddress::Run(run_scope()),
-            AgentEntityAddress::Task(task_scope()),
-            false,
-            vec![
+        },
+        Case {
+            kind: AgentExchangeKind::DelegationCancel,
+            payload_type: AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE,
+            initiator: AgentEntityAddress::Run(run_scope()),
+            receiver: AgentEntityAddress::Task(task_scope()),
+            task_initiates: false,
+            codes: vec![
                 ("delegation-cancel-forged", true),
                 ("delegation-cancel-not-delegated", true),
                 ("delegation-cancel-undecodable", false),
                 ("unsupported-exchange", false),
             ],
-        ),
-        (
-            AgentExchangeKind::BudgetSettlement,
-            AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE,
-            AgentEntityAddress::Run(run_scope()),
-            AgentEntityAddress::Task(task_scope()),
-            false,
-            vec![
+        },
+        Case {
+            kind: AgentExchangeKind::BudgetSettlement,
+            payload_type: AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE,
+            initiator: AgentEntityAddress::Run(run_scope()),
+            receiver: AgentEntityAddress::Task(task_scope()),
+            task_initiates: false,
+            codes: vec![
                 (AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN, true),
                 ("task-state-too-large", false),
                 ("exchange-payload-decoding", false),
                 ("unsupported-exchange", false),
             ],
-        ),
-        (
-            AgentExchangeKind::BudgetReturn,
-            AGENT_BUDGET_RETURN_PAYLOAD_TYPE,
-            AgentEntityAddress::Run(run_scope()),
-            AgentEntityAddress::Task(task_scope()),
-            false,
-            vec![
+        },
+        Case {
+            kind: AgentExchangeKind::BudgetReturn,
+            payload_type: AGENT_BUDGET_RETURN_PAYLOAD_TYPE,
+            initiator: AgentEntityAddress::Run(run_scope()),
+            receiver: AgentEntityAddress::Task(task_scope()),
+            task_initiates: false,
+            codes: vec![
                 (AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN, true),
                 ("task-state-too-large", false),
                 ("exchange-payload-decoding", false),
                 ("unsupported-exchange", false),
             ],
-        ),
+        },
     ];
 
     let fx = fixture();
     let task = AgentTaskParticipant;
     let run = AgentRunParticipant;
-    for (kind, payload_type, initiator, receiver, task_initiates, codes) in cases {
+    for case in cases {
+        let Case {
+            kind,
+            payload_type,
+            initiator,
+            receiver,
+            task_initiates,
+            codes,
+        } = case;
         let operation = AgentOperationId::new(
             rakka_agent::AgentOperationKind::Command,
             [tenant().as_str(), &format!("{kind}")],
