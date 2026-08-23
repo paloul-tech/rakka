@@ -11123,22 +11123,21 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
     ) -> Result<(), crate::choreography::AgentChoreographyError> {
         match envelope.kind() {
             AgentExchangeKind::DelegationResult if !result.is_accepted() => {
-                // A refused delegation result settles only under the parent's
-                // definitive answers: the delegation is unknown, forged, not
+                // The initiator half of the shared classifier: a refused
+                // delegation result settles only under the parent's
+                // definitive answers — the delegation is unknown, forged, not
                 // owned, or the run never existed — undeliverable however
                 // often it is re-driven. Every other refusal is the
                 // receiver's inability — a `delegation-result-early` receipt
                 // race, an `unsupported-exchange` from an owner that predates
                 // the kind, a payload it could not decode — and the exchange
-                // stays outstanding for re-drive until an owner that can
-                // answer it does.
+                // stays outstanding for re-drive, which the run's receiver
+                // half of the same classifier keeps answerable by declining
+                // to memoize that class.
                 match result.status().rejection_code() {
-                    Some(
-                        "delegation-result-unknown-run"
-                        | "delegation-result-unknown-delegation"
-                        | "delegation-result-forged"
-                        | "delegation-result-not-owned",
-                    ) => Ok(()),
+                    Some(code) if crate::coordination::delegation_result_refusal_settles(code) => {
+                        Ok(())
+                    }
                     code => Err(
                         crate::choreography::AgentChoreographyError::UnsettleableRefusal {
                             kind: AgentExchangeKind::DelegationResult,
@@ -11148,22 +11147,64 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                 }
             }
             AgentExchangeKind::RunCancel if !result.is_accepted() => {
-                // A refused run-cancel settles only under the run's definitive
-                // answers: the sender was not its task, the run never received
-                // the generation, or the generation is not the one it serves.
-                // Every other refusal — an `unsupported-exchange` from an
-                // owner that predates the kind, a payload it could not decode
-                // — leaves the exchange outstanding for re-drive until an
-                // owner that can answer it does (the rolling-upgrade rule).
+                // The initiator half of the shared classifier: a refused
+                // run-cancel settles only under the run's definitive answers
+                // — the sender was not its task, the run never received the
+                // generation, or the generation is not the one it serves.
+                // Every other refusal leaves the exchange outstanding for
+                // re-drive (the rolling-upgrade rule), and the run's receiver
+                // half keeps that class unmemoized so the re-drive actually
+                // re-runs the arm.
                 match result.status().rejection_code() {
-                    Some(
-                        "run-cancel-forged"
-                        | "run-cancel-unassigned"
-                        | "run-cancel-stale-generation",
-                    ) => Ok(()),
+                    Some(code) if crate::coordination::run_cancel_refusal_settles(code) => Ok(()),
                     code => Err(
                         crate::choreography::AgentChoreographyError::UnsettleableRefusal {
                             kind: AgentExchangeKind::RunCancel,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::DelegationCancel if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the task is
+                // this exchange's receiver, and the host memoizes only the
+                // refusals classified definitive here. This arm's own
+                // version-skew refusal, `delegation-cancel-undecodable`,
+                // therefore re-runs on the next drive instead of answering
+                // every re-drive from the journal — which would quiesce the
+                // parent's subtree cancellation against a child that never
+                // learned it was cancelled.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::delegation_cancel_refusal_settles(code) => {
+                        Ok(())
+                    }
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::DelegationCancel,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            kind @ (AgentExchangeKind::BudgetSettlement | AgentExchangeKind::BudgetReturn)
+                if !result.is_accepted() =>
+            {
+                // The receiver half of the shared classifier: the task is
+                // this exchange's receiver, and the host memoizes only the
+                // ledger's own replay answer. Every other refusal this arm
+                // mints is an inability — a payload it could not decode, a
+                // record too full to record the settlement right now — and
+                // memoizing one would answer every re-drive from the journal
+                // while the child run's escrow leaked, unsettleable at the
+                // run because its initiator half keeps exactly this class
+                // outstanding.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::escrow_settlement_refusal_settles(code) => {
+                        Ok(())
+                    }
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind,
                             code: code.unwrap_or_default().to_string(),
                         },
                     ),
@@ -11291,6 +11332,20 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                 // never-created or never-terminalizing upstream leaves the
                 // dependent durably `Blocked`, the documented
                 // stuck-dependency struggle signal.
+                // `task-dependency-limit-exceeded` — the other exit of the
+                // same bound check — stays outstanding here for the same
+                // reason, and deliberately classifies the *opposite* way
+                // from `team_claim_refusal_settles`: this arm answers a
+                // terminal upstream with its outcome receipt *before* it
+                // reaches the bound at all, so the upstream's own
+                // terminalization turns the refusal into a real answer,
+                // whereas the claim path answers a terminal task under
+                // `team-claim-task-terminal` and can never reach past the
+                // bound. Both ends of this exchange are this same
+                // participant, so the arm is the receiver's classifier too:
+                // an upstream over its ceiling declines to memoize, and the
+                // no-op guard in the choreography host keeps that costing
+                // nothing durable.
                 match result.status().rejection_code() {
                     Some("dependency-registration-forged" | "task-dependents-exhausted") => Ok(()),
                     code => Err(

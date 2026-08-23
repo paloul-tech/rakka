@@ -685,6 +685,23 @@ pub(crate) fn handoff_result_refusal_settles(code: &str) -> bool {
 /// no re-drive of the genuine board's exchange changes the answer, and
 /// leaving it unmemoized would just re-run a forged sender's arm — and
 /// its durable write — on every delivery.
+///
+/// The two exits of the task's bound check classify oppositely here, exactly
+/// as they do for [`conversation_terminal_notice_refusal_settles`].
+/// `task-state-too-large` settles: the claim arm restores every field it
+/// touched before the refusal leaves, so the board is free to re-post the
+/// entry, and the claim's own growth is what the bound refused.
+/// `task-dependency-limit-exceeded` — the *other* exit of that same
+/// [`crate::task::AgentTask::check_bounds`] call, reached after the arm has
+/// mutated and restored — settles for the sharper reason: recording a claim
+/// does not touch the task's dependency map, and a definition refresh that
+/// lowered `max_dependencies` under a record already over it refuses every
+/// claim identically for as long as the task lives. The claim path answers a
+/// *terminal* task under `team-claim-task-terminal` before it ever reaches
+/// the bound, so unlike the dependency-registration posture there is no
+/// terminal flip that turns this refusal into a real answer. Leaving it
+/// outstanding would park the board entry `Pending` and unstealable against
+/// a task no member can ever claim.
 pub(crate) fn team_claim_refusal_settles(code: &str) -> bool {
     matches!(
         code,
@@ -699,6 +716,7 @@ pub(crate) fn team_claim_refusal_settles(code: &str) -> bool {
             | "team-claim-limit-exceeded"
             | "team-claim-forged"
             | "task-state-too-large"
+            | "task-dependency-limit-exceeded"
             | "team-release-assignment-inflight"
             | "team-release-unknown"
     )
@@ -719,6 +737,79 @@ pub(crate) fn team_claim_result_refusal_settles(code: &str) -> bool {
         code,
         "team-not-found" | "team-claim-unknown" | "team-claim-forged"
     )
+}
+
+/// Whether one refusal code definitively settles a delegation result at its
+/// initiating child task.
+///
+/// The same two-ended classifier discipline: the child settles its owed
+/// report only on the parent run's definitive answers — no such run, no such
+/// delegation, a forged sender, or a cell this delegation does not own — and
+/// the run declines to memoize everything else. Two refusals it mints stay
+/// outside the set for the same reason, and neither needs a rolling upgrade
+/// to appear. `delegation-result-undecodable` is version skew. The sharper
+/// one is `delegation-result-early`: a child that terminalizes before the
+/// parent's own send receipt settles the delegation cell is refused *because
+/// the parent is not ready yet*, so memoizing it would answer every re-drive
+/// from the journal while the parent's fan-in member — and the goal behind
+/// it — waited on a result that had already been delivered once.
+pub(crate) fn delegation_result_refusal_settles(code: &str) -> bool {
+    matches!(
+        code,
+        "delegation-result-unknown-run"
+            | "delegation-result-unknown-delegation"
+            | "delegation-result-forged"
+            | "delegation-result-not-owned"
+    )
+}
+
+/// Whether one refusal code definitively settles a run-cancel at its
+/// initiating task.
+///
+/// The same two-ended classifier discipline: the task settles its owed
+/// propagation only on the run's definitive answers — the sender was not its
+/// task, the run never received the generation, or the generation is not the
+/// one it serves — and the run declines to memoize the rest.
+/// `run-cancel-undecodable` is version skew, and `run-cancel-failed` is the
+/// wind-down failing to start right now; memoizing either would leave the
+/// task's cancellation propagating forever against a run that would accept
+/// it on the next drive.
+pub(crate) fn run_cancel_refusal_settles(code: &str) -> bool {
+    matches!(
+        code,
+        "run-cancel-forged" | "run-cancel-unassigned" | "run-cancel-stale-generation"
+    )
+}
+
+/// Whether one refusal code definitively settles a delegation-cancel at its
+/// initiating parent run.
+///
+/// The same two-ended classifier discipline: the parent settles its owed
+/// cancellation only on the child task's definitive answers — the sender was
+/// not its recorded parent, or it carries no such delegation — and the child
+/// declines to memoize `delegation-cancel-undecodable`, the version skew a
+/// rolling upgrade resolves. Memoizing that one would quiesce the parent's
+/// subtree cancellation against a child that never learned it was cancelled.
+pub(crate) fn delegation_cancel_refusal_settles(code: &str) -> bool {
+    matches!(
+        code,
+        "delegation-cancel-forged" | "delegation-cancel-not-delegated"
+    )
+}
+
+/// Whether one refusal code definitively settles a budget settlement or
+/// return at its initiating child run.
+///
+/// The same two-ended classifier discipline, and only the ledger's own
+/// replay answer qualifies: [`crate::budget::AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN`]
+/// proves the escrow was already settled and returned, so this step is done.
+/// Every other refusal is the parent task's inability rather than the ledger
+/// answering — a payload it could not decode, a record too full to record the
+/// settlement right now — and the task declines to memoize them, because
+/// settling on one would mark the run `Settled`/`Returned` while the task
+/// never recorded the consumption, leaking the child's escrow for good.
+pub(crate) fn escrow_settlement_refusal_settles(code: &str) -> bool {
+    code == crate::budget::AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN
 }
 
 /// One coordination capability descriptor: the policy payload behind one
