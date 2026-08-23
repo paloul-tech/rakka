@@ -1835,7 +1835,11 @@ impl AgentExchangeSettlement {
 /// persisted field of that record — not derived, not stored elsewhere — because
 /// the substrate's guarantees rest on it being written in the same
 /// compare-and-set as the domain transition.
-pub trait AgentExchangeState: DurableState {
+/// `PartialEq` is part of the contract because the host compares a
+/// transitioned state against the record it started from: a delivery that
+/// changed nothing must not burn a durable revision (see
+/// [`AgentExchangeHost::accept`]).
+pub trait AgentExchangeState: DurableState + PartialEq {
     /// The participant's durable saga record.
     fn exchange_journal(&self) -> &AgentExchangeJournal;
 
@@ -2193,7 +2197,31 @@ where
         // The result and whatever it now owes commit together, so a receiver can
         // never be durably committed to a decision whose onward exchange it
         // forgot to record.
+        let owed_nothing = owed.is_empty();
         self.record_owed(&mut state, owed, now)?;
+        // Only an unsettleable refusal that owed nothing can have left the
+        // record untouched, and both are cheap to test — so the structural
+        // comparison below runs on that path alone, never on the accepted
+        // transitions that make up ordinary traffic.
+        if !settles && owed_nothing && state == record.state {
+            // The delivery changed nothing: the refusal was unsettleable, so
+            // no journal entry was recorded, it owed no exchange, and the
+            // transition left the domain state as it found it. Writing here
+            // would burn a byte-identical revision on every re-drive of a
+            // standing outstanding exchange — for the life of both entities —
+            // and each spurious bump would conflict the entity's other writer
+            // in the documented two-writer topology, exactly what the
+            // initiator's own unchanged-code guards refuse to do
+            // ([`Self::record_unsettleable_refusal`],
+            // [`Self::record_delivery_failure`]).
+            //
+            // The cached record stands: state and revision are both exactly
+            // what this host already held, so it remains an accurate view of
+            // the durable record it read. Re-materializing a *stale* view is
+            // the settle pass's job — the entity's own re-materialization —
+            // never a write this delivery performs for its side effect.
+            return Ok(AgentExchangeReply::applied(envelope, result, now));
+        }
         self.persist(state, record.revision).await?;
         Ok(AgentExchangeReply::applied(envelope, result, now))
     }
