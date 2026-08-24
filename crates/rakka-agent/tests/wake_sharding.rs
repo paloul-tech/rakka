@@ -68,6 +68,7 @@ async fn the_controller_passivates_between_wakes_and_a_durable_wake_reactivates_
                         input: AgentTaskContent::inline(serde_json::json!({ "goal": 1 }))
                             .expect("the input is inline-bounded"),
                         assignee: None,
+                        team: None,
                         goal: Some(goal_id()),
                         goal_mode: continuous_goal_mode(wake_policy()),
                         goal_spec: None,

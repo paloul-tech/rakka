@@ -397,6 +397,55 @@ fn a_setup_may_not_add_a_coordination_capability_or_operation_class() {
 }
 
 #[test]
+fn a_setup_may_keep_a_granted_coordination_capability() {
+    // The positive control the refusal above is only meaningful against: the
+    // dimension is a *subset* check, not a ban on naming coordination at all.
+    // Without this, a checker that rejected every non-empty capability set
+    // would pass the widening test and silently break every legitimate
+    // handoff, delegation, claim, and turn.
+    let mut envelope = narrowed_envelope();
+    envelope
+        .coordination_capabilities
+        .insert(AgentCoordinationCapabilityKind::Handoff);
+
+    let setup = AgentSetupRevision::new(
+        AgentRevisionNumber::INITIAL,
+        &definition(),
+        envelope,
+        provenance(2),
+    )
+    .expect("a setup selecting a granted capability should be accepted");
+    assert!(setup
+        .envelope()
+        .coordination_capabilities
+        .contains(&AgentCoordinationCapabilityKind::Handoff));
+    assert!(granted_envelope()
+        .narrowing_violations(setup.envelope())
+        .is_empty());
+}
+
+#[test]
+fn no_coordination_capability_kind_can_be_added_by_a_setup() {
+    // Every kind, not just the one that happened to be written first. The
+    // definition grants only `Handoff`, so the other three are each a
+    // widening on their own — which is what keeps the dimension honest as
+    // kinds are added to the enum.
+    for kind in [
+        AgentCoordinationCapabilityKind::Delegation,
+        AgentCoordinationCapabilityKind::Team,
+        AgentCoordinationCapabilityKind::Moderation,
+    ] {
+        let mut envelope = narrowed_envelope();
+        envelope.coordination_capabilities.insert(kind);
+        let codes = setup_violation_codes(envelope);
+        assert!(
+            codes.contains(&"unauthorized-coordination-capability"),
+            "{kind:?} was not reported as a widening: {codes:?}"
+        );
+    }
+}
+
+#[test]
 fn every_widening_is_reported_at_once() {
     // An operator fixing a rejected setup should see every problem, not just the
     // first one the checker happened to reach.

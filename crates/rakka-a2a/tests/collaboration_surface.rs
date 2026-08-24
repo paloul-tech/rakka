@@ -22,13 +22,17 @@ use rakka_a2a::agents::{
     RakkaAgentA2AService, AGENT_COLLABORATION_EXTENSION_PREFIX, AGENT_COLLABORATION_EXTENSION_URI,
     AGENT_COLLABORATION_SCHEMA_VERSION, META_AGENT_ID, META_COLLABORATION, META_TASK_DEFINITION,
 };
-use rakka_a2a::auth::AllowAllAuthorizer;
+use rakka_a2a::auth::{
+    A2AAuthorizationDecision, A2AAuthorizationRequest, A2AAuthorizer, A2AOperation,
+    AllowAllAuthorizer,
+};
 use rakka_a2a::mapping::{A2AHeaderTenantResolver, META_DEDUPLICATION_KEY};
 use rakka_a2a::projection::InMemoryA2ATaskProjectionStore;
 use rakka_agent::testkit::{
     run_entity, CrashingStateStore, DeferredExchangeRouter, DeterministicModelAdapter,
     InProcessRunEntityTransport, InProcessTaskEntityTransport, ScriptedDispatcher,
 };
+use rakka_agent::InMemoryAgentTeamHistoryStore;
 use rakka_agent::{
     delegation_id_for, effect_id_for, run_id_for_assignment, AgentA2aSendExecutor,
     AgentA2aSendFinding, AgentAssignmentGeneration, AgentAuthorityEnvelope, AgentCapabilityId,
@@ -50,7 +54,18 @@ use rakka_persistence::{DurableStateStore, InMemoryDurableStateStore};
 type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = CrashingStateStore<AgentRunState>;
-type Service = RakkaAgentA2AService<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore, RunStore>;
+type Service = RakkaAgentA2AService<
+    TaskStore,
+    AgentStore,
+    InMemoryAgentTaskHistoryStore,
+    RunStore,
+    TeamStore,
+    InMemoryAgentTeamHistoryStore,
+    ConversationStore,
+    rakka_agent::InMemoryAgentConversationHistoryStore,
+>;
+type TeamStore = InMemoryDurableStateStore<rakka_agent::AgentTeamState>;
+type ConversationStore = InMemoryDurableStateStore<rakka_agent::AgentConversationState>;
 
 const TENANT: &str = "acme";
 const COORDINATOR: &str = "coordinator";
@@ -138,6 +153,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(adapter: DeterministicModelAdapter) -> Self {
+        Self::with_authorizer(adapter, Arc::new(AllowAllAuthorizer))
+    }
+
+    fn with_authorizer(
+        adapter: DeterministicModelAdapter,
+        authorizer: Arc<dyn rakka_a2a::auth::A2AAuthorizer>,
+    ) -> Self {
         let tasks = TaskStore::new();
         let agents = AgentStore::new();
         let runs = RunStore::new();
@@ -181,11 +203,15 @@ impl Fixture {
                 agents.clone(),
                 history.clone(),
                 runs.clone(),
+                TeamStore::default(),
+                InMemoryAgentTeamHistoryStore::new(),
+                ConversationStore::default(),
+                rakka_agent::InMemoryAgentConversationHistoryStore::new(),
                 router.clone(),
                 Arc::new(catalog),
                 Arc::new(InMemoryA2ATaskProjectionStore::local()),
                 Arc::new(A2AHeaderTenantResolver),
-                Arc::new(AllowAllAuthorizer),
+                authorizer,
             )
             .with_clock(Arc::new(TestClock(clock.clone())))
             .with_default_tenant(TENANT),
@@ -360,6 +386,7 @@ impl Fixture {
                     input: AgentTaskContent::inline(json!({ "goal": "translate everything" }))
                         .expect("the input is inline-bounded"),
                     assignee: Some(coordinator()),
+                    team: None,
                     goal: None,
                     goal_mode: Default::default(),
                     goal_spec: None,
@@ -536,7 +563,7 @@ async fn a_delegation_creates_exactly_one_child_across_the_a2a_surface() {
     // The public projection echoes the delegation.
     let task = fixture
         .service
-        .get_task(&params(), Some(TENANT), child_task.as_str(), None)
+        .get_task(&params(), Some(TENANT), child_task.as_str(), None, None)
         .await
         .expect("the child task projects");
     let echo = task
@@ -802,6 +829,132 @@ async fn an_aged_out_replay_converges_on_its_own_child_instead_of_conflicting() 
     }
 }
 
+/// The aged-out replay's disambiguation is the deployment's own recovery
+/// step, so it reads the child's durable state directly — never the
+/// authorized `tasks/get`, whose deployment authorization gates external
+/// callers. An authorizer that denies principal-less reads (the normal
+/// production posture) must not convert the replay into a definitive
+/// refusal that strands the durably created child while the parent records
+/// the delegation as refused.
+#[tokio::test]
+async fn an_aged_out_replay_converges_under_a_read_denying_authorizer() {
+    struct DenyReads;
+
+    #[async_trait::async_trait]
+    impl A2AAuthorizer for DenyReads {
+        async fn authorize(
+            &self,
+            request: &A2AAuthorizationRequest<'_>,
+        ) -> A2AAuthorizationDecision {
+            if request.operation == A2AOperation::GetTask && request.principal.is_none() {
+                return A2AAuthorizationDecision::Deny;
+            }
+            A2AAuthorizationDecision::Allow
+        }
+    }
+
+    let fixture = Fixture::with_authorizer(DeterministicModelAdapter::new(), Arc::new(DenyReads));
+    fixture
+        .instantiate(&specialist(), "translator-v1", SPECIALIST_DEFINITION)
+        .await;
+
+    let parent_run = fixture.run_scope(&coordinator(), PARENT_TASK);
+    let delegation = delegation_id_for(&parent_run, 9, 0).expect("the delegation id derives");
+    let record = AgentDelegationRecord {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
+        a2a_message_id: delegation.as_str().to_string(),
+        deduplication_key: delegation.as_str().to_string(),
+        delegation,
+        goal: None,
+        parent_task: AgentTaskId::new(PARENT_TASK).expect("task id should be valid"),
+        parent_run: parent_run.clone(),
+        lineage: Vec::new(),
+        ancestors: Vec::new(),
+        depth: 1,
+        requested_skill: AgentCapabilityId::new(SKILL).expect("capability id should be valid"),
+        resolved: AgentDelegationTarget::new(
+            specialist(),
+            AgentTaskDefinitionId::new(SPECIALIST_DEFINITION)
+                .expect("definition id should be valid"),
+        ),
+        turn: 9,
+        slot: 0,
+        effect: effect_id_for(&parent_run, 9, 0).expect("the effect id derives"),
+        call_id: AgentToolCallId::new("call-1").expect("call id should be valid"),
+        input: AgentTaskContent::inline(json!({ "text": "hello" }))
+            .expect("the input is inline-bounded"),
+        result_schema: None,
+        budget: None,
+        granted_descendants: None,
+        deadline: None,
+        definition_revision: AgentRevisionNumber::new(1),
+        settings_revision: AgentRevisionNumber::new(1),
+        telemetry: AgentTelemetryContext::default(),
+        created_at: AgentTimestampMillis::new(1),
+    };
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let intent = AgentRunEffect::new(
+        &parent_run,
+        record.turn,
+        record.slot,
+        AgentRunEffectRequest::A2aSend {
+            delegation: Box::new(record.clone()),
+        },
+        &spec,
+        AgentRevisionNumber::new(1),
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the intent builds");
+    let executor = A2AAgentDelegationSendExecutor::new(fixture.service.clone());
+
+    let first = executor
+        .execute(&parent_run, &intent, &record, None)
+        .await
+        .expect("the first send executes");
+    let AgentA2aSendFinding::Sent { child_task, .. } = first else {
+        panic!("the first send creates the child, got {first:?}");
+    };
+
+    // Age the create operation out of the child's deduplication window,
+    // exactly as the sibling test does.
+    let child_scope =
+        AgentTaskScope::new(tenant(), child_task.clone()).expect("the child scope is valid");
+    let persistence_id = child_scope.persistence_id();
+    let held = fixture
+        .tasks
+        .load(&persistence_id)
+        .await
+        .expect("the child state loads")
+        .expect("the child exists");
+    let mut encoded = serde_json::to_value(&held.state).expect("the state encodes");
+    let log = encoded
+        .get_mut("applied_operations")
+        .expect("the operation log field exists");
+    *log = json!([]);
+    let evicted: AgentTaskState = serde_json::from_value(encoded).expect("the state decodes");
+    fixture
+        .tasks
+        .compare_and_set(&persistence_id, held.revision, evicted)
+        .await
+        .expect("the evicted state stores");
+
+    // The replay meets `task-already-created`; the probe answers from the
+    // durable snapshot despite the denied read, and the parent keeps its
+    // child instead of recording a refusal beside a running task.
+    let replay = executor
+        .execute(&parent_run, &intent, &record, None)
+        .await
+        .expect("the aged-out replay executes");
+    match replay {
+        AgentA2aSendFinding::Sent {
+            child_task: replayed,
+            ..
+        } => assert_eq!(replayed, child_task),
+        other => panic!("the replay converges under the deployment's own probe, got {other:?}"),
+    }
+}
+
 /// The fail-closed version matrix of specification 14.4: every half-formed
 /// engagement of the collaboration extension refuses the send whole.
 #[tokio::test]
@@ -852,6 +1005,60 @@ async fn half_formed_collaboration_engagements_fail_closed() {
             matches!(error, RakkaAgentA2AError::Unsupported { .. }),
             "{label} should fail closed as unsupported, not {error}"
         );
+    }
+}
+
+/// A task's own collaboration *echo*, round-tripped onto a send, is refused
+/// for what it is rather than classified into whichever cluster it happens
+/// to trip.
+///
+/// `io.rakka.collaboration` is one public key carrying two directions — the
+/// inbound command envelope and the outbound projection echo — and
+/// `team_echo` and `handoff_echo` key their identity on the very cluster
+/// names the inbound parser discriminates on. Both are shipped surface, so
+/// the parser gates on the `schema` every command declares and no echo does.
+/// Otherwise the refusal a relay got back depended on the task's
+/// collaboration history: add a terminated conversation to a handed-off task
+/// and the same bytes changed branches.
+#[tokio::test]
+async fn a_projection_echo_replayed_as_a_command_is_refused_for_what_it_is() {
+    let fixture = Fixture::new(DeterministicModelAdapter::new());
+    fixture
+        .instantiate(&specialist(), "translator-v1", SPECIALIST_DEFINITION)
+        .await;
+
+    // The echo object `sync_agent_status` assembles for a task that was
+    // handed off, took a board claim, and governed a conversation that
+    // ended — every cluster discriminator present at once, no `schema`.
+    let echo = json!({
+        "handoff": "handoff-1",
+        "handoff-status": "accepted",
+        "handoff-target": "specialist",
+        "team": "support",
+        "team-claim": "team-claim-1",
+        "team-claim-status": "accepted",
+        "conversation-id": "standup",
+        "conversation-status": "ended",
+        "conversation-reason": "rounds-complete",
+        "conversation-rounds": 1,
+        "conversation-turns": 2,
+    });
+    let mut replayed = collaboration_message("echo-replay", "echo-replay");
+    if let Some(metadata) = replayed.metadata.as_mut() {
+        metadata.insert(META_COLLABORATION.to_string(), echo);
+    }
+
+    let error = fixture
+        .service
+        .send_message(&params(), &send_request(replayed))
+        .await
+        .expect_err("an echo is not a command");
+    match error {
+        RakkaAgentA2AError::Unsupported { reason, .. } => assert!(
+            reason.contains("declares no schema version"),
+            "the refusal names the real defect, not a cluster it tripped: {reason}"
+        ),
+        other => panic!("an echo replay should fail closed as unsupported, not {other}"),
     }
 }
 

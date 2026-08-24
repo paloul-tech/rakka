@@ -3,7 +3,10 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use rakka_agent::{AgentEntityError, AgentIdentityError, AgentRunError, AgentTaskError};
+use rakka_agent::{
+    AgentConversationError, AgentCoordinationReplayError, AgentEntityError, AgentGoalViewError,
+    AgentIdentityError, AgentRunError, AgentTaskError, AgentTeamError,
+};
 
 use crate::mapping::A2AMappingError;
 use crate::task::TaskProjectionError;
@@ -27,10 +30,24 @@ pub enum RakkaAgentA2AError {
     Task(AgentTaskError),
     /// The agent entity refused or failed the command.
     Entity(AgentEntityError),
+    /// The team entity refused or failed the command.
+    Team(AgentTeamError),
+    /// The conversation entity refused or failed the command.
+    Conversation(AgentConversationError),
     /// Reading run state for the projection failed.
     Run(AgentRunError),
     /// The public projection read model failed.
     Projection(TaskProjectionError),
+    /// A scoped coordination-event replay failed.
+    ///
+    /// An expired retention window is *not* here: it is a legal answer the
+    /// caller acts on, not a failure (specification 17.13).
+    Coordination(AgentCoordinationReplayError),
+    /// Assembling the authorized goal view failed.
+    ///
+    /// A denied caller is not here either: authorization answers `None`, byte
+    /// identical to a goal that does not exist.
+    GoalView(AgentGoalViewError),
     /// The entity refused the command with a stable domain code.
     Refused {
         /// Stable refusal code from the entity reply.
@@ -71,8 +88,16 @@ impl RakkaAgentA2AError {
             Self::Identity(_) => "invalid-identity",
             Self::Task(error) => error.code(),
             Self::Entity(error) => error.code(),
+            Self::Team(error) => error.code(),
+            Self::Conversation(error) => error.code(),
             Self::Run(error) => error.code(),
-            Self::Projection(_) => "projection",
+            // Forwarded, not flattened: `TaskProjectionError::code` documents
+            // its codes as a compatibility commitment, and a caller that cannot
+            // tell `replay-window-expired` from a store outage cannot act on
+            // either.
+            Self::Projection(error) => error.code(),
+            Self::Coordination(error) => error.code(),
+            Self::GoalView(error) => error.code(),
             Self::Refused { .. } => "refused",
             Self::Unauthorized => "unauthorized",
             Self::UnknownAgent { .. } => "unknown-agent",
@@ -89,8 +114,12 @@ impl Display for RakkaAgentA2AError {
             Self::Identity(error) => Display::fmt(error, f),
             Self::Task(error) => Display::fmt(error, f),
             Self::Entity(error) => Display::fmt(error, f),
+            Self::Team(error) => Display::fmt(error, f),
+            Self::Conversation(error) => Display::fmt(error, f),
             Self::Run(error) => Display::fmt(error, f),
             Self::Projection(error) => Display::fmt(error, f),
+            Self::Coordination(error) => Display::fmt(error, f),
+            Self::GoalView(error) => Display::fmt(error, f),
             Self::Refused { code, message } => write!(f, "refused ({code}): {message}"),
             Self::Unauthorized => write!(f, "the operation was not authorized"),
             Self::UnknownAgent {
@@ -115,8 +144,12 @@ impl Error for RakkaAgentA2AError {
             Self::Identity(error) => Some(error),
             Self::Task(error) => Some(error),
             Self::Entity(error) => Some(error),
+            Self::Team(error) => Some(error),
+            Self::Conversation(error) => Some(error),
             Self::Run(error) => Some(error),
             Self::Projection(error) => Some(error),
+            Self::Coordination(error) => Some(error),
+            Self::GoalView(error) => Some(error),
             _ => None,
         }
     }
@@ -131,6 +164,18 @@ impl From<A2AMappingError> for RakkaAgentA2AError {
 impl From<AgentIdentityError> for RakkaAgentA2AError {
     fn from(error: AgentIdentityError) -> Self {
         Self::Identity(error)
+    }
+}
+
+impl From<AgentTeamError> for RakkaAgentA2AError {
+    fn from(error: AgentTeamError) -> Self {
+        Self::Team(error)
+    }
+}
+
+impl From<AgentConversationError> for RakkaAgentA2AError {
+    fn from(error: AgentConversationError) -> Self {
+        Self::Conversation(error)
     }
 }
 
@@ -155,5 +200,17 @@ impl From<AgentRunError> for RakkaAgentA2AError {
 impl From<TaskProjectionError> for RakkaAgentA2AError {
     fn from(error: TaskProjectionError) -> Self {
         Self::Projection(error)
+    }
+}
+
+impl From<AgentCoordinationReplayError> for RakkaAgentA2AError {
+    fn from(error: AgentCoordinationReplayError) -> Self {
+        Self::Coordination(error)
+    }
+}
+
+impl From<AgentGoalViewError> for RakkaAgentA2AError {
+    fn from(error: AgentGoalViewError) -> Self {
+        Self::GoalView(error)
     }
 }

@@ -297,6 +297,7 @@ async fn create_child(
                     input: AgentTaskContent::inline(json!({ "text": "delegated" }))
                         .expect("the input is inline-bounded"),
                     assignee: None,
+                    team: None,
                     goal: bind_goal.then(goal),
                     goal_mode: Default::default(),
                     goal_spec: None,
@@ -994,6 +995,7 @@ async fn a_continuous_roots_epochs_join_the_view() {
                 input: AgentTaskContent::inline(json!({ "goal": 1 }))
                     .expect("the input is inline-bounded"),
                 assignee: None,
+                team: None,
                 goal: None,
                 goal_mode: common::continuous_goal_mode(wake_policy()),
                 goal_spec: Some(Box::new(goal_spec_draft(common::goal_spec(), true))),
@@ -1352,3 +1354,96 @@ async fn claims_join_when_a_source_answers_and_degrade_when_it_fails() {
 // shares a schema window — so the gate's coverage rides the run-record
 // variant above (under its own `run-schema-unsupported` code), and the
 // cross-version half belongs to the compatibility matrix.
+
+/// The slice 5.1 lockstep: a mid-transfer handoff joins the run node's
+/// collaboration view and the task node's handoff provenance in the same
+/// assembly — and the pending transfer resolves the *source* run, whose pair
+/// the task record itself no longer names.
+#[tokio::test]
+async fn a_pending_handoff_joins_the_view_and_resolves_the_source_run() {
+    use rakka_agent::{AgentA2aHandoffFinding, AgentA2aHandoffSendExecutor, AgentHandoffRecord};
+
+    /// Claims the transfer was recorded without touching the task, holding
+    /// the cell at `Sent` — the mid-transfer window the view must survive.
+    struct ClaimingHandoffExecutor;
+    impl AgentA2aHandoffSendExecutor for ClaimingHandoffExecutor {
+        fn execute<'a>(
+            &'a self,
+            _scope: &'a AgentRunScope,
+            _intent: &'a AgentRunEffect,
+            _handoff: &'a AgentHandoffRecord,
+            _credential: Option<&'a AgentEphemeralCredential>,
+        ) -> AgentDispatchFuture<'a, AgentA2aHandoffFinding> {
+            Box::pin(async move {
+                Ok(AgentA2aHandoffFinding::Recorded {
+                    target_generation: None,
+                    peer_status: "working".to_string(),
+                })
+            })
+        }
+    }
+
+    let fixture = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new().with_turn(
+            AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                .with_text("Transferring to billing.")
+                .with_tool_call(
+                    AgentToolCallRequest::new(
+                        AgentToolCallId::new("call-1").expect("call id"),
+                        common::handoff_tool_id(),
+                        json!({ "skill": common::HANDOFF_SKILL, "reason": "needs billing" }),
+                    )
+                    .expect("the tool call is bounded"),
+                ),
+        ),
+    ))
+    .with_delegation(common::handoff_config());
+    let _ = fixture
+        .dispatcher
+        .clone()
+        .with_a2a_handoff_executor(Arc::new(ClaimingHandoffExecutor));
+    fixture.instantiate_agent().await;
+    fixture
+        .apply_task_command(goal_task_creation_command(
+            task_definition(),
+            goal_spec_draft(common::goal_spec_with_handoff(), true),
+        ))
+        .await
+        .expect("the goal task should create");
+    fixture.pump().await.expect("the loop should converge");
+
+    let view = assemble(&fixture).await.expect("the goal resolves");
+    assert_eq!(view.tasks.len(), 1);
+    assert_eq!(view.runs.len(), 1, "the source run joins the view");
+
+    // The run node carries the handoff cell — the same shape the run-scoped
+    // operational snapshot carries, so the two surfaces cannot disagree.
+    let run_node = &view.runs[0];
+    assert_eq!(
+        run_node.scope,
+        run_scope(),
+        "the pending transfer resolves the source"
+    );
+    let cell = run_node
+        .collaboration
+        .handoff
+        .as_ref()
+        .expect("the handoff joins the collaboration view");
+    assert_eq!(cell.status, "sent");
+    assert_eq!(cell.target.as_str(), common::HANDOFF_TARGET);
+    assert_eq!(cell.context_refs, 0);
+    let snapshot = agent_operational_snapshot(
+        &fixture.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(999_000),
+    )
+    .await
+    .expect("the snapshot reads")
+    .expect("the run exists");
+    assert_eq!(
+        view.runs[0].collaboration, snapshot.collaboration,
+        "the goal view and the operational snapshot derive one collaboration shape"
+    );
+    assert!(snapshot.collaboration.handoff.is_some());
+}

@@ -3269,9 +3269,28 @@ Milestone: M5. Acceptance:
 [Coordination Capability Milestone](spec.md#coordination-capability-milestone-m5).
 Scenarios owed: 38, 41-43, 45.
 
-Open decisions to resolve: 6 (agent cards/assignment), 18 (first-class
-patterns — resolved default), 19 (setup envelope — enforced since Phase 1),
-21 (replayable coordination events).
+Open decisions to resolve: 6 (agent cards/assignment — slice 4.3's
+`AgentDelegationTarget` catalog already implements the recommended shape
+for delegation; slice 5.1 records the disposition and reuses the catalog
+for handoff target resolution), 18 (first-class patterns — resolved
+default), 19 (setup envelope — enforced since Phase 1), 21 (replayable
+coordination events — resolved by slice 5.5).
+
+**Slice text revised 2026-08-07** against the delivered M1-M4 architecture;
+the scenario mapping and done-whens are unchanged. What prior phases
+already supply: `AgentCoordinationCapabilityKind` as an admission-enforced
+envelope dimension (slices 1.2/4.3), `AgentRunStatus::HandedOff`, the
+coordination-tool interception door, the cell + `A2aSendCall` +
+executor-port + `io.rakka.collaboration` extension idioms (4.3-4.6), the
+`AgentRunCollaborationView`/goal-view lockstep rule (4.7), the per-task
+replay cursor with expired-window resync (1.12), and the `WaitingForInput`
+projection row (1.12). Debts explicitly parked here by earlier slices:
+input delivery to an existing task refuses pending 5.4 (slice 1.12), the
+dependents registry (4.6 → 5.4), the goal-view wire surface (4.7 → 5.5).
+Sequencing: 5.4 depends only on Phase 1 machinery and may run first or in
+parallel; 5.5 must trail 5.1-5.3, whose events it replays. Slice 5.5b was
+added 2026-08-13 to own the two terminal-notification exchanges 5.2 and 5.3
+had recorded against 5.5, which shipped as a read contract.
 
 ### Slice 5.1 — Capability model and handoff
 
@@ -3280,51 +3299,471 @@ Spec: [8.8](spec.md#88-coordination-capability-model),
 (handoff lineage).
 Guidance: [Coordination Capabilities](technical-guidance.md#coordination-capabilities).
 
-- `AgentCoordinationCapability` descriptors as trusted definition/setup data;
-  runtime may expose them to the model as tools, but model output cannot
-  create capability, target, budget, or scope.
-- Handoff: same `AgentTaskId`, source-run fencing, target-run creation,
-  explicit context/artifact projection only, `HandedOff` terminal recorded
-  after durable target acceptance; traverses outbox/inbox + `rakka-a2a` even
-  colocated.
+- Descriptors only — the capability *kind* set, the
+  `CoordinationCapability` envelope dimension, and its admission
+  enforcement shipped in Phases 1/4. This slice adds
+  `AgentCoordinationCapability` descriptors (the four policy payloads) in
+  `coordination.rs` as trusted definition/setup data and wires the existing
+  `AgentRunDelegationConfig` in as the `Delegation` policy's realization.
+  Unchanged rule: the runtime may expose capabilities to the model as
+  tools, but model output cannot create capability, target, budget, or
+  scope.
+- Handoff reuses the delegation idioms wholesale: initiation is a
+  model-visible coordination tool through the 4.3 interception door
+  (refusals are failed tool results the run survives); the handoff id
+  derives from (run scope, turn, slot) via the `delegation_id_for` digest
+  construction and doubles as the A2A message/dedup key; a handoff cell on
+  `AgentLoopState` commits in the same compare-and-set as the `A2aSendCall`
+  effect whose payload is the handoff record; the `io.rakka.collaboration`
+  extension widens with handoff identity
+  ([spec 14.4](spec.md#144-agent-to-agent-effects) reserves it); the target
+  resolves once inside the committing CAS through the
+  `AgentDelegationTarget` catalog (open decision 6's disposition).
+- The new machinery is same-task transfer: ingress drives a new assignment
+  generation on the *same* `AgentTaskId` (`decide_assignment`, not
+  `generated_task_id`); the source run is fenced from completion and effect
+  scheduling; `HandedOff` records only after durable target acceptance;
+  context/artifact projection is explicit-only, with no session-memory
+  namespace reuse and no private-memory exposure; handoff lineage lands in
+  authorized task metadata/history; traversal is outbox/inbox +
+  `rakka-a2a` even colocated.
+- Interactions to settle in-slice: the wind-down fence treatment of a
+  pending handoff send under cancellation (`exempt_from_wind_down_fence` is
+  kind-based); the 4.6 chase condition must cover a
+  handed-off-but-unaccepted target; handoff does not debit `Descendants`
+  (same task) but `delegation_envelope_for` needs an explicit
+  handoff-target arm; the 4.7 goal-view run re-derivation
+  (`run_id_for_assignment` over assignee + generation) must handle a
+  handed-off generation chain — resolve the earlier-generations gap here or
+  keep it explicitly surfaced.
+- View lockstep: the handoff cell joins `AgentRunCollaborationView` and the
+  goal-view task node in this slice (the view structs are
+  `#[non_exhaustive]` for exactly this).
 
 Done when: scenario 38 passes.
+
+**Amended as implemented (2026-08-07).** Landed as specified, with the
+in-slice interactions resolved as follows (decision points user-approved):
+
+- **Descriptors** are construction-validated wiring, never serialized
+  definition data: `AgentCoordinationCapability` and the four policies live
+  in `coordination.rs`; `AgentRunDelegationConfig::descriptor()` derives the
+  Delegation payload, and the handoff policy rides the same config
+  (`with_handoff`, gated on the `Handoff` kind exactly as `new()` gates on
+  `Delegation`) — so the existing `with_delegation` plumbing (entity, store,
+  sharding settings, testkit) needed no second config path.
+- **The task-side resolution machine is the load-bearing piece** the risk
+  review demanded: the bounded `AgentTask::handoff` provenance (latest hop
+  only, chain in history per 9.6) stashes the source assignment whole and
+  carries a status + `result_settled` once-guard. It is the deduplication
+  echo past the journal window, the source address for every owed
+  derivation, and the goal view's source-run join. The twelfth exchange,
+  `HandoffResult` (task → source run), is owed by a pure derivation the
+  settle pass re-derives; its settle terminates the source
+  `HandedOff` (the status finally became reachable via the new
+  `AgentRunTerminalReason::HandedOff`) or restores the stashed source on a
+  refusal — the **single-attempt** posture: readiness, exhaustion
+  (`handoff-assignments-exhausted`), and the fail-closed escrow refusal
+  (`handoff-budget-unaffordable`; the source's open escrow child makes an
+  exact-fit budget unable to afford the target's generation — the recorded
+  policy hook for reserved handoff headroom stays unimplemented) all
+  resolve through one helper.
+- **Wind-down fence**: the handoff send stays non-exempt
+  (`exempt_from_wind_down_fence` unchanged); `fence_unsent_effects` gained
+  the handoff-cell arm (`Failed{run-winding-down}`). The 4.6 chase needed
+  no run-side arm: cancellation routes to exactly one owner through the
+  task — an accepted target generation takes the `RunCancel` while the
+  source terminalizes `HandedOff`; a refusal restores the source into its
+  own wind-down; an unminted pending transfer resolves refused inside the
+  cancellation-marker transition. An unresolved transfer holds
+  `settle_run_disposition` open via `awaits_children`.
+- **Interception exclusivity** goes beyond the planned refusals: the
+  transfer must be the turn's only work (`handoff-with-planned-calls`) and
+  refuses beside outstanding children, an unresolved group, or a live or
+  ambiguous effect — closing the 8.9 replay-ambiguity window structurally.
+  The delegation cycle check is deliberately not copied (A→B→A is bounded
+  by the definition's new `max_handoffs`, default 4), and the planner never
+  touches the descendants ceilings. There is deliberately no door-side
+  escrow pre-check: the task's ledger is not readable at the run's door,
+  so affordability resolves through the task's own refusal.
+- **Goal-view gap (user-approved: latest hop only)**: the re-derivation
+  resolves a mid-transfer task to the provenance's recorded source pair;
+  generations before the latest handoff stay the explicitly surfaced gap.
+- **Ambiguous send (user-approved: probe, then definitive)**: the
+  `A2AAgentHandoffSendExecutor` probes the task's durable handoff echo on
+  an ambiguous failure; an unanswerable probe leaves the attempt retryable,
+  and exhaustion parks the source indeterminate (the run-side `Exhausted`
+  arm maps a handoff send to `Indeterminate`) rather than resuming it
+  beside a possibly-live transfer.
+- **Wire**: the collaboration extension's handoff cluster is a second
+  shape under the one metadata key, discriminated by its `handoff` field —
+  the delegation envelope is untouched, old receivers fail closed on a
+  populated cluster (14.4), plain clients stay untouched — and ingress
+  derives the operation id under the reserved `AgentOperationKind::Handoff`.
+- Proof roster: `tests/handoff_record.rs` (6), `tests/handoff_cancellation.rs`
+  (3, including the crash-point sweep over the committed-but-unsent fence
+  window), the goal view's handoff join + lockstep, and rakka-a2a's
+  `tests/handoff_surface.rs` (scenario 38 end to end over the real service
+  core + the wire fail-closed matrix). Owed onward: `AgentDecisionKind`'s
+  reserved `handoff` label (interception still rides `CallTools`, the
+  delegation precedent), the `rakka.agent.handoff` span rows (otel), the
+  reserved-headroom policy hook, and 5.5's replayable handoff events.
 
 ### Slice 5.2 — Team coordination
 
 Spec: [8.10](spec.md#810-team-coordination).
 
-- `AgentTeamId`, bounded membership, durable shared task board; atomic
-  claim/release/transfer with revision/lease fencing and stable operation
-  IDs; mediated peer messages over durable commands.
-- Idle teams and members passivate; the board is data.
+- `AgentTeamId` plus a sharded team entity: leader, root goal, bounded
+  member types/instances, capability scopes, creation/expiry policy, and
+  the durable shared task board as entity state; claim/release/transfer are
+  atomic compare-and-sets under revision/lease fencing with stable
+  operation IDs; stale commands fail closed.
+- A board claim composes with the existing assignment machinery — it drives
+  `decide_assignment` on the task entity, whose assignment-generation
+  fencing is already the one-normal-owner guarantee; the board never holds
+  a second copy of ownership.
+- Team↔task exchanges follow the acyclic choreography rule (accept() makes
+  local progress only; the courier drains the journal) as new exchange
+  kinds beyond the current eleven; mediated peer messages are durable
+  commands over `rakka-a2a` carrying team identity in the collaboration
+  extension — never direct actor references.
+- Idle teams and members passivate; the board is data, not a resident
+  coordinator — no single-coordinator topology.
+- [Spec 17.13](spec.md#1713-structured-logs-runtime-events-and-audit) audit
+  and bounded metrics for
+  creation/membership/claim/transfer/message/disband.
 
 Done when: scenario 42 passes (one normal claim owner; stale commands fail
 closed).
+
+**Amended as implemented (2026-08-08).** Landed as specified, with the
+in-slice decisions resolved as follows (scope decisions user-approved):
+
+- **Claim ingress is A2A/entity commands only** (user-approved): no
+  model-visible team tool this slice — no interception-door arm, no team
+  effect kind, no executor port. `AgentTeamPolicy` filled out with the
+  bounded ceilings, `claim_lease_ms`, `expires_after_ms`, and a
+  shaped-but-dormant `tool: Option<AgentToolId>` hook so the door lands
+  later without re-plumbing; every field serde-defaulted so the 5.1
+  revision-only shell still decodes. **Mediated peer messages are a
+  durable board ring** (user-approved): bounded, recipient-read through
+  the team query surface, drop-oldest with a durable `messages_dropped`
+  counter, no push delivery. **Membership is mutable** (user-approved):
+  join/leave fence on the lifecycle revision with provenance; the leader
+  is immovable, a member holding an unresolved claim cannot leave.
+- **The claim choreography is two new exchange kinds** (`ALL` is 14):
+  `TeamClaim` (team → task) owed in the same compare-and-set as the board
+  mutation, whose pure task-side arbitration records the bounded
+  `AgentTask::team_claim` provenance (echo-before-every-guard, the
+  `record_handoff` precedent) against a new durable claim-epoch fence
+  (`team_claim_fence`) that closes courier reordering — the reply means
+  "claim recorded", never "assignment made"; and `TeamClaimResult`
+  (task → team), the `HandoffResult` mirror (pure derivation, settle-pass
+  re-drive, `result_settled` once-guard) settling the board entry Active
+  with an observational generation/run echo or reopening it under the
+  refusal code. Board tasks are ordinary creations with the new
+  `AgentTaskCreation::team` provenance and a deferred assignee (the
+  `MissingAssignee` guard relaxes only under a team); the claim sets the
+  assignee and the existing `decide_assignment` mints the one generation —
+  the assignment fence stays the one-owner guarantee, proven by a direct
+  fence test (`team-claim-already-owned` over an accepted assignment).
+- **Single-attempt posture, the handoff precedent**: readiness refusal,
+  `team-claim-assignments-exhausted` (the claim resolves rather than the
+  task terminating — the board's members decide what an unassignable
+  entry means, bounded by the definition's new `max_team_claims`,
+  default 4), `team-claim-budget-unaffordable`, a run refusal, and a
+  pre-mint cancellation all resolve through one helper
+  (`resolve_team_claim_refusal`) that clears the assignee back to the
+  board-pending posture. A superseding claim (transfer, expired-lease
+  steal) refuses over an in-flight offer
+  (`team-claim-assignment-inflight`) so exactly one generation is ever in
+  flight; the lease bounds the claim-pending window only, and an
+  activated claim is never stealable. Release is holder-or-leader,
+  pre-acceptance only, epoch-qualified in its operation id so a retried
+  release is a new durable operation; post-acceptance transfer defers to
+  the handoff machinery. Terminal/foreign tasks close entries lazily
+  through claim refusals (`Done` + code) — the task→team terminal
+  notification exchange stays owed to 5.5b (re-parked from 5.5 on
+  2026-08-13).
+- **Wire**: the team cluster is the third shape under
+  `io.rakka.collaboration`, discriminated by its `team` field checked
+  before `handoff` (`deny_unknown_fields` fails a two-discriminator
+  payload whole); verbs are claim/release/transfer/post-task/message/
+  join/leave — create and disband are entity-command-only trusted
+  wiring. A team send must not name `message.task_id`
+  (`team-send-names-task`); ids derive under `TeamClaim` plus the new
+  `TeamMessage`/`TeamOperation` operation kinds; membership changes
+  require an authenticated principal. The command authorizes under its
+  own `A2AOperation::TeamCommand` with the typed `A2ATeamClaim` bound in,
+  answers with an immediate message (never a task), returns stale fences
+  as structured refusals, and the projection echoes the governing claim
+  beside the delegation/handoff echoes via the metadata-synced path. The
+  service gained team store generics; no persistence/postgres work
+  (stores are state-generic), though the `AgentTeamHistoryStore`
+  PostgreSQL backend is owed.
+- **Audit + metrics**: a parallel `AgentTeamHistoryStore` (idempotent
+  slot-keyed appends, identities and codes only), three new task-history
+  kinds (`team-claim-recorded/accepted/refused`), and
+  `rakka.agent.team.operations` {operation, outcome} counted once per
+  durable decision at the entity boundary ("operation" joined the closed
+  metric-key set) — asserted in tests, closing the unasserted-counter gap
+  5.1 left. Otel team span rows owed, the 5.1 precedent.
+- Proof roster: `tests/team_board.rs` (7), `tests/team_claim_assignment.rs`
+  (11, scenario 42's core incl. the two-shard stale-owner race and the
+  three-layer replay convergence), `tests/team_claim_recovery.rs` (3,
+  self-covering crash sweeps over every team- and task-store write of the
+  claim round trip), `tests/team_passivation.rs` (2, real sharded
+  entities: zero-resident board with the claim activating across
+  passivation), the team-operations metric assertion, and rakka-a2a's
+  `tests/team_surface.rs` (4, scenario 42's wire half + fail-closed
+  matrix + per-operation authorization). Owed onward: 5.5's replayable
+  team events (landed 2026-08-13), the task→team terminal notification
+  (landed 2026-08-14 in 5.5b; the handoff-refresh of the board owner echo
+  was user-scoped out of 5.5b and stays owed), board rewake
+  parking, goal/collaboration-view team dimensions, the team otel rows,
+  the Postgres team-history backend, the model-visible team tool door
+  (+ its reserved `AgentDecisionKind` label), and A2A-carried
+  create/disband if ever needed.
 
 ### Slice 5.3 — Moderation
 
 Spec: [8.11](spec.md#811-moderation).
 
-- `AgentConversationId`, participant set, durable turn/round state,
-  transcript artifacts, budgets; only the current participant may submit;
-  duplicates rejected; participants passivate between turns.
+- `AgentConversationId` plus a conversation entity: moderator, authorized
+  participant set, mode, durable turn/round state, transcript artifact or
+  bounded messages, completion rule.
+- Turn ownership reuses the sender-fence and settled-cell idioms (the M3
+  epoch precedent): only the current participant may submit; duplicate or
+  out-of-order turns are rejected via journal deduplication keyed on
+  (conversation, round, turn, participant).
+- Round/iteration/time/token budgets ride the conserved-dimension escrow
+  model — no parallel budget machinery.
+- The moderator may end early under policy; its proposed result still
+  passes typed task-result validation and the 4.2 evaluation door.
+- Participants and moderator passivate between turns.
 
 Done when: scenario 43 passes (turn recovery without duplication across
 passivation/shard movement).
+
+**Amended as implemented (2026-08-10).** Landed as specified, with the
+in-slice decisions resolved as follows (scope decisions user-approved):
+
+- **Turn ingress is A2A/entity commands only** (user-approved, the 5.2
+  posture): no model-visible moderation tool this slice — no
+  interception-door arm, no conversation effect kind, no executor port.
+  `AgentModerationPolicy` filled out with the clamped serde-defaulted
+  ceilings (`max_rounds` 4/16, `max_turns_per_round` 8/16, `max_messages`
+  8/16, `max_message_bytes` 1024, `moderator_may_end_early`) and the
+  shaped-but-dormant `tool: Option<AgentToolId>` hook, so the 5.1
+  revision-only shell still decodes. **Budgets reuse the existing
+  vocabulary with no new conserved dimension** (user-approved):
+  the creation carries a token grant and a wall-clock horizon whose
+  deadline fixes at creation (the run-budget idiom), consumption is
+  `AgentBudgetConsumption` recorded even when a turn overshoots (the
+  spend already happened in the speaker's run), and exhaustion refuses
+  the next turn under the dimension's own code — never parking, never a
+  task escrow child. **The task binding is required and observational**
+  (user-approved): creation names the governing `AgentTaskId`, the
+  moderator is that task's assignee, and the early-end *result* rides
+  the existing run-side evaluation and result-proposal doors unchanged —
+  zero new door machinery, the assignee sender fences already enforce
+  it. **The transcript is the bounded in-state ring plus an
+  identity-only artifact reference** (user-approved): drop-oldest with
+  visible `messages_dropped`, never a deduplication surface, the
+  reference recovered verbatim per scenario 43.
+- **Zero new exchange kinds and no task-side machinery**: unlike the
+  team claim, a conversation drives nothing on the task, so
+  `AgentExchangeKind::ALL` stays at fourteen and `task.rs` is untouched;
+  the conversation (`conversation.rs`, `RakkaAgentConversation`, the
+  fifth sharded entity under `AgentEntityClass::Conversation`) embeds
+  the exchange host with a refuse-all participant and an empty journal
+  so the terminal-notification exchange is a code change, not a schema
+  migration. That exchange, the task-side conversation provenance, and the
+  projection echo were re-parked from 5.5 to 5.5b on 2026-08-13.
+- **Turn identity carries the body digest**: the operation id derives
+  over (tenant, conversation, round, turn, participant, body digest)
+  under the reserved `ConversationTurn` kind — a durable redelivery
+  re-derives the same operation and converges; a *regenerated*
+  same-coordinate submission derives a new one that the dense turn
+  ledger refuses loudly (`conversation-turn-content-mismatch`) instead
+  of silently absorbing. The ledger is the durable echo past the bounded
+  operation-log window, checked before every guard including the
+  terminal one (the `record_handoff` idiom); a creation-time worst-case
+  arithmetic (`conversation-policy-too-large`) keeps it affordable so a
+  mid-round state-bounds refusal cannot wedge the protocol. The new
+  `AgentOperationKind::ConversationOperation` covers create/end/expiry,
+  the end round-qualified (the release-epoch hazard); ingress derives
+  turn operations from these coordinates, never the wire discriminator.
+- **Two modes, owner derived not stored**: round-robin (owner =
+  `participants[turn]`) and moderator-directed (moderator owns even
+  turns; each carries `Designate` or `CloseRound`; `designated` is the
+  one stored owner fact) — the derived-owner and stored-owner recovery
+  shapes scenario 43 must prove. `AllRounds` completion ends the
+  conversation in the compare-and-set that finishes the final round
+  (completion beats exhaustion); `ModeratorDecides` parks the cursor at
+  the ceiling with the status active. One deliberate deviation from the
+  planned ladder: a passed deadline refuses `conversation-expired`
+  before *and* after the durable flip (the team `require_active` rule —
+  the refusal code must not depend on whether the sweep ran) rather
+  than a separate pre-flip `wall-clock` code.
+- **Wire**: the conversation cluster is the fourth shape under
+  `io.rakka.collaboration`, discriminated by its `conversation` field
+  checked before `team` and `handoff`; verbs are submit-turn/end —
+  create is entity-command-only trusted wiring. A conversation send must
+  not name `message.task_id` (`conversation-send-names-task`); the end
+  requires an authenticated principal. The command authorizes under its
+  own `A2AOperation::ConversationCommand` with the typed
+  `A2AConversationClaim` bound in, answers with an immediate message,
+  returns domain refusals as structured `Rejected` payloads, and the
+  service gained conversation store generics (eight, spelled once via
+  the new `SharedRakkaAgentA2AService` alias); the
+  `AgentConversationHistoryStore` PostgreSQL backend is owed, the team
+  precedent.
+- **Audit + metrics**: a parallel `AgentConversationHistoryStore`
+  (idempotent slot-keyed appends; identities, coordinates, and codes
+  only), five conversation history kinds
+  (`conversation-created/turn-recorded/round-advanced/ended/expired`),
+  and `rakka.agent.moderation.turns` {operation, outcome} counted once
+  per durable decision at the entity boundary — duplicates and ledger
+  echoes count nothing; both keys were already in the closed metric
+  vocabulary, so the guidance table's `mode` label is owed with the
+  model-visible tool, as are the otel moderation span rows.
+- Proof roster: `tests/conversation_protocol.rs` (9, lifecycle +
+  budgets + expiry + the golden-vector operation-id pin),
+  `tests/conversation_turns.rs` (7, ownership/ordering/dedup incl. the
+  seventy-turn past-window ledger echo converging after the end),
+  `tests/conversation_recovery.rs` (2, self-covering crash sweeps over
+  every conversation-store write of a full round), and
+  `tests/conversation_passivation.rs` (3, real sharded entities:
+  scenario 43's five nouns recovered at zero residency without
+  duplicating a turn, the stored designation surviving, idle
+  auto-passivation), the moderation-turns metric assertion, and
+  rakka-a2a's `tests/conversation_surface.rs` (4, scenario 43's wire
+  half + fail-closed matrix + per-operation authorization). Owed
+  onward: 5.5's replayable turn events (landed 2026-08-13), the
+  conversation-terminal → task notification with the task-side
+  conversation provenance and projection echo (landed 2026-08-14 in
+  5.5b), goal/collaboration-view conversation dimensions, the moderation
+  otel rows, the Postgres conversation-history backend, and the
+  model-visible moderation tool door (+ its reserved
+  `AgentDecisionKind` label and `mode` metric label).
 
 ### Slice 5.4 — Human-owned tasks
 
 Spec: [8.12](spec.md#812-human-owned-tasks),
 [14.3](spec.md#143-taskrun-state-mapping) (`WaitingForInput` row).
 
-- Tasks deliberately unassigned to agents, completed by authenticated
-  humans/services with typed results through the same validation path;
-  dependency unblocking and failure propagation.
+- Ownership policy: a task deliberately unassigned per its definition's
+  human/service ownership policy; the `WaitingForInput` status and its
+  `INPUT_REQUIRED` projection row are already proven (slice 1.12).
+- Unlock the slice 1.12 deferral: `message/send` naming an existing
+  `task_id` currently refuses with a stable reason — replace the refusal
+  with authenticated, deduplicated typed-result delivery through the same
+  validation path, on the `RecordWorkflowResult` idiom (operation id pure
+  over identity, non-committing refusals, first-writer-wins).
+- Build the dependents registry (deferred from 4.6): completion unblocks
+  dependents; failure propagates the declared dependency policy; any
+  ingress firing over a live run takes `request_task_cancellation`, never
+  `terminate`.
 - Keep the boundary with effect-bound checkpoints explicit
-  ([spec 8.12](spec.md#812-human-owned-tasks)).
+  ([spec 8.12](spec.md#812-human-owned-tasks)): exact-effect approval stays
+  `AgentCheckpoint`-bound; a human task never substitutes.
+
+**Amended as implemented (2026-08-11):**
+
+- **The human result is an entity command on the `RecordWorkflowResult`
+  idiom, sharing the run path's validation cores.**
+  `AgentTaskEntityCommand::SubmitHumanResult` carries
+  `AgentHumanResultSubmission` (principal, claimed definition/version/schema,
+  bounded content, causation); `human_result_operation_id` is pure over
+  `(tenant, task, discriminator)` under the new
+  `AgentOperationKind::ResultSubmission`, so a retry converges on the
+  original decision — a recorded rejection included — and a corrected
+  resubmission is a new discriminator. `validate_proposal` became the
+  origin-neutral `validate_result(&AgentResultClaim)`;
+  `accept_result`/`reject_result` split into cores parameterized by origin,
+  the exchange wrappers byte-identical. The ladder answers durable echoes
+  before every guard, terminal included: the accepted result's
+  `proposal_id`, the materialized `last_rejection`, and a bounded
+  fingerprint ring (`AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY` = 32,
+  FNV fingerprints — full operation ids would not fit the 32 KiB record)
+  refusing older rejections `submission-already-rejected` so a replay never
+  re-spends the budget. Refusals are non-committing
+  (`AgentTaskError::SubmissionRefused`); exhaustion terminalizes by
+  `terminate` — no live run exists. `AgentAcceptedResult.run` became
+  `Option<AgentRunId>` + additive `principal` (user-approved);
+  `AgentTaskHistoryEntry` gained additive `principal`; the submission
+  decision rides `AgentTaskOutcome.submission` (bounded summary) via the
+  new `AgentTaskOutcomeExtras` closure plumbing, so duplicates echo it.
+- **The dependents registry is two exchange kinds over the existing
+  choreography.** `DependencyRegistration` (dependent→upstream, owed in the
+  same CAS as the forward edge from Create/DeclareDependency/the creation
+  exchange, plus the `settle_dependency_registrations` courier half that
+  also self-heals pre-registry edges); the upstream records
+  `AgentTask.dependents` (`AgentTaskDependentRecord`, cap
+  `AGENT_TASK_MAX_DEPENDENTS` = 32, `task-dependents-exhausted` beyond it —
+  the refused dependent stays Blocked on the relay path). An
+  already-terminal upstream answers the receipt with its outcome and
+  records nothing; the dependent's settle arm applies it through the
+  existing `record_dependency_outcome` core. `DependencyOutcome`
+  (upstream→each unsettled dependent) is folded into `owed_child_reports`
+  and fires **immediately at terminal commit with no escrow gate**
+  (user-approved: the payload is absorbing at `terminate`, unlike a
+  delegation report's consumption fields); the goal-budget and stagnation
+  terminals are backstopped by `settle_dependent_notifications`. The
+  `ResultProposal` exchange arm converted to the owing form so a run-path
+  acceptance/exhaustion owes dependent outcomes in its own CAS. Fencing:
+  initiator matched against the claimed dependent / the forward edge
+  (`dependency-registration-forged`, `dependency-outcome-forged`);
+  same-outcome idempotent, conflict fails closed; settled markers
+  (`registration_settled`, `outcome_settled`) quiesce the derivations past
+  the journal window. **`task-not-created` at registration is a
+  non-settling refusal** (user-approved): a racing create converges on
+  re-drive; a never-created upstream leaves the dependent durably Blocked —
+  the stuck-dependency struggle signal. Enabling that posture,
+  `drive_pending_exchanges` records an `UnsettleableRefusal` as a failed
+  attempt on the outstanding exchange instead of erroring the pass (the
+  task_entity assignments-exhausted test re-pinned to the new shape).
+- **The wire half replaced the slice 1.12 refusal in place.** A plain
+  `ContinueTask` send is the submission: `io.rakka.agent.result` carries
+  the declared contract as one `deny_unknown_fields` object, the principal
+  is required, and authorization runs under the new
+  `A2AOperation::SubmitTaskResult` with `A2ATaskResultClaim` bound in
+  (`authorize_claimed` gained the second claim parameter). A committed
+  rejection answers **`Ok(Task)`** (user-approved) with the rule code on
+  the projection's new rejection echo (`io.rakka.agent.rejections`,
+  `io.rakka.agent.last-rejection`, assembled in
+  `agent_metadata_from_snapshot` per the 5.1 metadata-half rule);
+  non-committing entity refusals map to `Refused` decisions at the
+  submission branch (the handoff-path `Err(Task(...))` wart not repeated).
+  New normalize guards: `delegation-send-names-task` (closing the
+  accidental fall-through), `result-submission-requires-task`,
+  `result-binding-conflicts-with-collaboration`; the operation-kind
+  fallback split by intent so a submission id can never alias a creation
+  id. The typed client gained `submit_task_result`
+  (`AgentClientTaskResultRequest`, required trait method). Metrics:
+  `rakka.agent.human.results` {outcome} and
+  `rakka.agent.dependency.outcomes` {outcome}, durable-diff counted.
+- Proof roster: `tests/human_owned_tasks.rs` (9: scenario 41 both halves —
+  completion unblocking a real dependent, exhaustion cancelling a live
+  dependent through the request path — op-id golden vectors, the refusal
+  ladder, past-window accepted/rejected replays, the owner-loss sweep,
+  metric assertions), `tests/dependency_registry.rs` (6: terminal-upstream
+  receipt, continue-with-evidence, the fencing matrix, the ceiling,
+  relay/exchange convergence, pre-registry self-heal),
+  tests/choreography.rs's ALL-driven failure windows over the two new
+  kinds, and rakka-a2a's `tests/human_task_surface.rs` (8: the four-part
+  surface shape + rejection echo, exhaustion, crash sweep, typed client).
+  Owed onward: 5.5 replays the dependency events; evidence artifacts on
+  the wire submission stay behind the deferred artifact strategy; the
+  agents-surface metric consumer for `A2AOperation::as_label` remains
+  absent.
 
 Done when: scenario 41 passes.
+**Done (2026-08-11):** scenario 41 passes end to end over the real
+entities (`tests/human_owned_tasks.rs`) and over the wire
+(`crates/rakka-a2a/tests/human_task_surface.rs`), with the owner-loss
+sweeps covering every task-store write of both flows.
 
 ### Slice 5.5 — Replayable coordination events
 
@@ -3332,22 +3771,486 @@ Spec: [17.13](spec.md#1713-structured-logs-runtime-events-and-audit),
 [14.5](spec.md#145-typed-agent-client).
 Guidance: [Client, Events, and Testkit](technical-guidance.md#client-events-and-testkit).
 
-- Extend the Phase 1 event replay to coordination events (assignment,
-  handoff, claim, turn) with monotonic scoped cursor, bounded retention, and
-  explicit resync; derived struggle signals stay projections.
+- Extend the slice 1.12 replay (per-task event log, task-scoped cursor,
+  expired-window resync in `rakka-a2a`) to coordination events —
+  assignment, handoff, claim, turn — emitted only after the durable
+  transition and deduplication-safe.
+- Generalize to scoped cursors: team and conversation scopes do not fit the
+  `<task-id>:<sequence>` shape; bounded retention and explicit resync per
+  scope. Resolves open decision 21.
+- Derived struggle signals (stalled claims, moderation exhaustion) stay
+  observability projections.
+- Typed-client subscription surface, absorbing the 4.7 recorded follow-up:
+  the goal-view wire surface (an `A2AOperation::GoalViewRead`-shaped
+  operation plus typed-client query over the untouched principal-free
+  assembly core and `authorized_agent_goal_view` wrapper).
 
 Done when: scenario 45 passes.
+**Done (2026-08-13):** scenario 45 passes over the real logs
+(`tests/coordination_replay.rs`) and over the real service core
+(`crates/rakka-a2a/tests/coordination_surface.rs`), both halves: a cursor
+resuming across every scope class that keeps a log, and an exhausted window
+answering a floor the reader resumes from. Open decision 21 is resolved.
+
+**Amended as implemented (2026-08-13):**
+
+- **The coordination event log already existed; what was missing was the way
+  out.** Every coordination transition already writes an ordered, deduplicated
+  record — the task, team, and conversation history logs, and the run's
+  decision-event sink — each written *after* the compare-and-set that decided
+  it, on a sequence that transition consumed. So this slice adds **no second
+  write path, no new durable record, and no new outbox**: 17.13's "emitted only
+  after the durable transition" and "duplicate processing creates one logical
+  event" were already satisfied on the write side, and durable task/run state
+  stays the correctness source. `events.rs` is a *read* contract over the four
+  logs. Open decision 21 resolves accordingly: yes, replayable, with bounded
+  retention, a monotonic scoped cursor, and explicit resync.
+- **The scoped cursor is the entity address.**
+  `AgentCoordinationCursor` encodes `AgentEntityAddress::key()` + `:` +
+  sequence, so `task/acme/order-1:7` and `team/acme/support:3` are both legal
+  and the team and conversation scopes that could never fit
+  `<task-id>:<sequence>` now have one. Identity segments are validated free of
+  `/` but may contain `:`, so the sequence is taken from the *last* separator —
+  the suffix the encoder always appends. The substrate's public task cursor is
+  a documented compatibility commitment and is untouched; the two shapes
+  cross-reject (a bare `<task-id>:<seq>` has no class segment and fails closed).
+  **The fence is scope equality, not just tenant**: a bare address whose last
+  segment ends in digits is a syntactically valid cursor for a *different*
+  entity in the same tenant, so a cursor naming any scope other than the one
+  addressed is refused (`coordination-cursor-scope-mismatch`), the substrate
+  projection's own rule.
+- **Two answers, never a short page.** `AgentCoordinationReplay` is
+  `Page { events, next_cursor, complete_through, has_more, unrecoverable_losses }`
+  or `WindowExpired { oldest_retained, resume_from }`, and the expired arm names
+  a cursor the reader can actually resume from. `complete_through` closes the
+  matching ambiguity at the head: entries reach their log on the settle pass
+  *after* the transition, so an empty tail can mean "you are current" or "the
+  entity still owes its sink" — the team and conversation snapshots gained
+  `owed_history` beside their existing `history_entries` so a reader can tell.
+  The merged `AgentCoordinationEventKind` label is `<scope-class>/<source-label>`
+  because the source vocabularies are **not** disjoint: a task records
+  `team-claim-recorded` when it takes a board claim and a team records
+  `team-claim-recorded` when it makes one, and a label that merged them would
+  merge two different events at two sequences in two logs.
+- **Retention is an opt-in read window, and the contract lives on the trait.**
+  The three in-memory history stores gained `with_retention(n)` — *off* by
+  default, because these logs are also the audit record 17.13 requires and the
+  entity refuses a transition rather than lose an entry (`require_history_headroom`),
+  so enabling eviction forfeits that audit obligation for whatever the window
+  drops, and the builder says so. A read below the floor answers the new
+  `…HistoryWindowExpired { oldest_retained }` on each entity's error enum, and
+  the page is walked for contiguity so a hole the reader would *cross* is
+  refused too, not only one at the head. `testkit`'s
+  `assert_{task,team,conversation}_history_store_contract` is the conformance
+  harness, so the owed PostgreSQL backends inherit the contract instead of
+  reimplementing it — which is exactly how the substrate's two projection
+  backends came to duplicate the same check twice.
+- **Six defects had to be fixed for the contract to be real rather than
+  nominal**, all found by design review and verified in source before any
+  code changed. (1) `record_decision` dropped the lowest-sequence *unflushed*
+  event after it had already consumed a sequence, and the sink checked only the
+  head — so a reader paged silently across the hole; the sink now walks the page
+  it is about to hand over and refuses at the discontinuity, the rule the
+  substrate's public event log already kept. (2) The assemble-failure branch
+  counted a drop *without* consuming the sequence, making that loss undetectable
+  by any reader; it now consumes it, so the loss is a hole rather than a
+  silence. (3) `is_domain_refusal` on the team and conversation errors is
+  exclusionary, so a new variant becomes a "refusal" by default — the
+  window-expired read answer would have been returned to a caller as a rejected
+  *command* and counted against the entity's refusal metric; both now exclude it
+  and say why. (4) `RakkaAgentA2AError::code()` flattened every `Projection(_)`
+  to `"projection"`, so the existing `replay-window-expired` code never reached
+  the wire despite `TaskProjectionError::code` documenting those codes as a
+  compatibility commitment; it forwards now. (5) `A2AAuthorizationRequest` had
+  no constructor, so each new typed claim broke every literal site — it gained
+  `new(operation)` plus `with_*` setters and became `#[non_exhaustive]`, and the
+  five existing sites moved over. (6) The run scope is served by an
+  `Option<Arc<dyn AgentDecisionEventSink>>` builder rather than a ninth store
+  generic, and the three history stores are read from the fields the service
+  already holds — adding a store accessor would have broken
+  `tests/service_shape.rs`, which pins the wired-store construction sites.
+- **Deliberate deviations from the approved plan, both narrowing:**
+  `AgentTaskError` did *not* gain an `is_domain_refusal` — it has no
+  default-open classifier for a new variant to fall into, so the method would
+  have been unused public API rather than a fix. And
+  `RakkaAgentA2AError::code()` kept its `&'static str` signature: rather than
+  relax it, `AgentCoordinationReplayError` carries the *typed* source errors
+  (`Task`/`Team`/`Conversation`/`RunEvents`) instead of a stringly code, which
+  forwards their static codes and lets a caller match the underlying failure.
+  The sink's own backend code stays in the message under one stable
+  `coordination-run-events-failed`, which loses nothing semantically distinct
+  because the expired window is an answer rather than an error.
+- **Wire = two read operations as direct service methods** (the
+  `replay_task_events` precedent; the agents surface has no route binding at
+  all, deferred since 1.12, so the service core *is* the surface).
+  `A2AOperation::CoordinationEventRead` and `::GoalViewRead`, each with its own
+  typed claim (`A2ACoordinationClaim`, `A2AGoalViewClaim`) bound in before
+  anything is read. Neither borrows `normalize_agent_cancel`'s task-shaped
+  normalization — these reads name no task — so `resolve_agent_tenant` is the
+  new tenant-only helper. `authorized_agent_goal_view_bounded` is the clamped
+  entry point the wire needs: the unbounded wrapper fans out to
+  `AGENT_GOAL_VIEW_MAX_TASKS` whatever the caller asked. **A `GoalViewRead`
+  denial answers `Ok(None)`, not `Unauthorized`** — byte-identical to an absent
+  goal, to an unauthenticated caller, and to a goal that never existed, because
+  a distinguishable wire error would reopen exactly the existence oracle the
+  owner fence closed.
+- **Typed client**: `coordination_events(scope, cursor, limit)` and
+  `goal_view(goal, max_tasks)` as required `AgentClientTransport` methods
+  (breaking for external implementors, the 5.4 precedent), returning
+  `rakka-agent` domain types directly. The expired window travels as the
+  reply's own arm rather than an error, because a caller that must resynchronize
+  still needs to know *where* to resume. The reconnect cursor is the
+  subscription contract: there is no watcher for domain history and live push
+  stays out of scope.
+- **Six derived struggle signals, read-time only** (`AgentStruggleSignal`,
+  `AgentStruggleSignalKind`, `AgentStrugglePolicy` in `query.rs`): approaching
+  budgets, repeated iteration failure, repeated result rejection, stuck
+  dependencies, stalled team claims, moderation exhaustion. Pure over the
+  authoritative snapshots, deriving twice gives the same answer, thresholds are
+  deployment policy and never durable, and nothing they observe can mutate
+  correctness state. The stuck-dependency signal is gated on
+  `dependency_stall_millis` (default 15 minutes) against the task's
+  `updated_at`: an unsettled registration is *normally* one settle pass wide,
+  so an ungated derivation would report every freshly blocked task as stuck in
+  the window between its own commit and its settle.
+- **The two notification exchanges 5.2 and 5.3 parked here are re-parked
+  explicitly** (user-directed): they are write-path choreography, not event
+  replay, and leaving them implicitly owed to a slice that no longer covers them
+  is how a debt disappears. Slice 5.5b below owns them.
+- Proof roster: `tests/coordination_replay.rs` (7: the cursor resuming across
+  task, team, and conversation with no gap or repeat; the idempotent page,
+  including across a re-driven flush; the foreign-scope, cross-tenant, and
+  substrate-shaped cursor refusals; the agent scope refused rather than answered
+  empty; the store conformance harness bounded and unbounded across all three
+  logs; the reported floor resuming for real; the kind-label injectivity pin),
+  `tests/decision_events.rs`'s `a_dropped_decision_is_a_declared_gap_not_a_silent_one`
+  (which fails against the pre-slice sink — verified by reverting the walk), and
+  `rakka-a2a`'s `tests/coordination_surface.rs` (5: the scoped cursor paging over
+  the real service core, the tenant and scope fences, per-operation authorization
+  with the claim asserted inside the authorizer, the owner's positive read plus
+  the clamped budget and the four-way deny-is-absent equality against it, and
+  the two unserved scopes refused by name), plus two struggle-signal proofs in
+  `tests/operational_query.rs` (the stall threshold telling a young registration
+  from a stuck one, and a parked conversation reported without the projection
+  changing anything it observed). Owed onward:
+  the coordination-read metric consumer, the PostgreSQL history backends (now
+  covered by the harness), the goal view's team and conversation dimensions, and
+  live push.
+
+### Slice 5.5b — Terminal coordination notifications
+
+Spec: [8.10](spec.md#810-team-coordination), [8.11](spec.md#811-moderation),
+[14.2](spec.md#142-task-identity-and-projection).
+
+The two write-path debts slices 5.2 and 5.3 recorded against 5.5, re-parked
+here on 2026-08-13 because 5.5 became a read contract and 5.6 is acceptance
+only. Neither is implicitly owed any longer.
+
+- **Task → team terminal notification.** A terminal or foreign task currently
+  closes its board entry lazily, through a claim refusal (`Done` + code), so a
+  board can hold an entry for a task that ended minutes ago. The notification
+  exchange closes it eagerly.
+- **Conversation → task terminal notification**, plus the task-side
+  conversation provenance cell and the projection echo. Slice 5.3 pre-wired the
+  conversation entity with an exchange host, a refuse-all participant, and an
+  empty journal precisely so this is a code change rather than a schema
+  migration.
+- Both ride the established idioms: a new `AgentExchangeKind` with sender
+  fencing at both ends, a settled marker as the once-guard past the journal
+  window, an owed-derivation consult point, and the courier's
+  `UnsettleableRefusal` posture for a receiver that cannot yet answer. Each new
+  kind joins `AgentExchangeKind::ALL`, so `tests/choreography.rs`'s failure
+  windows cover it by construction.
+
+Done when: a terminal task closes its board entry without a claim attempt, and
+a terminated conversation is observable from its governing task.
+
+**Amended as implemented (2026-08-14).** Landed as specified — two new
+exchange kinds (`TeamTerminalNotice`, `ConversationTerminalNotice`;
+`AgentExchangeKind::ALL` is 18) riding the established idioms whole — with
+the in-slice decisions resolved as follows (scope decisions user-approved):
+
+- **Terminal-only** (user-approved): the handoff-refresh of the board's
+  owner echo that slice 5.2's owed list bundled into this entry is *not*
+  included — the echo is observational and a refresh is not absorbing the
+  way terminality is, so it needs its own idempotence design. It is
+  re-parked explicitly below, no longer implicitly owed.
+- **The provenance cell is not a task transition.** Recording it leaves
+  `AgentTaskState::updated_at` alone, because that field means the time of
+  the last accepted transition *of this task* and is the sole clock the
+  board-governed unclaimed horizon runs on. Code review found the cell
+  advancing it, which let any conversation naming a never-claimed task
+  postpone its expiry — and a task keeps no registry of the conversations
+  it governs, so it cannot tell a legitimate one from a series minted to
+  keep it alive. The record still changes and still persists; it simply
+  does not claim to be a transition, and any later echo about another
+  entity must follow the same rule.
+- **The round coordinate is a count, and named one.** `rounds_completed`
+  on both the notice and the task cell. `AgentConversation::round` is a
+  next-expected cursor that advances once per closed round, so on a
+  terminated conversation it counts the rounds that finished — but both
+  projections documented it as "the round it ended in", which is wrong
+  under `RoundsComplete`, the one flip that closes its final round before
+  ending. The value never changed; the name and the docs did, and the
+  public `conversation-rounds` echo already read as a count.
+- **The `team-not-found` / `task-not-created` divergence is documented**
+  on the classifier rather than left to look like an oversight: a
+  conversation is created against an existing task, so an early notice is
+  a race that waiting resolves; a team is trusted wiring created ahead of
+  the tasks naming it, so a task naming a missing one is a mistake the
+  unclaimed horizon already surfaces, and waiting would trade it for an
+  exchange owed forever. The cost of settling — a later-created team
+  holding an `Open` entry that closes the old lazy way — is named beside
+  it.
+- **Every growth point checks its bound, including the close.** The
+  terminal close writes the reason code onto the entry, and
+  `terminal_reason` is a free-form wire string capped only at
+  `AGENT_TEAM_DETAIL_MAX_LENGTH` — so an entry no claim ever named grows,
+  and thirty-two of them carry up to sixteen kilobytes against an
+  effective cap of twenty-eight. Code review found this the one growth
+  point that skipped `check_bounds`, which meant its overflow committed
+  and surfaced at the next `post_task` or `add_member`. Validate-then-
+  mutate is now literal here, the `record_team_claim` discipline, and the
+  refusal stays outstanding because board eviction is what lets a re-drive
+  converge.
+- **The two `check_bounds` exits classify opposite ways** at the task's
+  conversation arm. The size bound waits (the growth reserve relaxes when
+  the task terminalizes); `task-dependency-limit-exceeded` is definitive,
+  because the dependency map only grows and this arm never touches it, so
+  an unclassified forever-refusal would re-run the receiving arm's durable
+  write on every settle pass for the life of both entities.
+- **The settle precheck asks the derivation, not a copy of it.** The
+  conversation's owed-notice precheck restated `owed_terminal_notice`'s
+  bail-outs by hand and missed the reason-less terminal record; since
+  `initiate` persists even for an empty owed vector, that wrote
+  byte-identical state on every pass forever. It now calls the derivation,
+  so the two cannot drift, and the derivation's error surfaces before the
+  revision it would otherwise have cost.
+- **The eager close stands behind two payload fences.** The notice must be
+  initiated by the task it names *and* report that task as ended. Code
+  review found the second missing: `AgentTeamTerminalNotice.status` was
+  decoded and never read, so the irreversible close rested on a fence that
+  proves *who* sent the notice — and a task's own entity is the legitimate
+  sender whatever the payload says. A non-terminally populated notice
+  therefore cleared it trivially and evicted a working member from live
+  work permanently. `team-terminal-notice-not-terminal` joins the shared
+  classifier as definitive: the courier re-delivers the stored envelope
+  rather than re-deriving it, so a payload failing on its own face answers
+  the same way for as long as it exists.
+- **`Done` is absorbing under `settle_claim_action`, by its own guard.**
+  The eager close bumps the entry's claim epoch, which design review found
+  load-bearing because the `(Release, "team-claim-already-owned")` settle
+  arm restored an entry `Active` with none of the `claim_is_current` guard
+  its five siblings carry. Code review then found the other half: the
+  *lazy* close — the `team-claim-task-terminal` / `-task-unknown` /
+  `-wrong-team` arm — closes at the entry's **current** epoch, so the epoch
+  guard could not absorb a second reply for that same decision, and a
+  `Done` entry could be rewritten `Active` around a claim no task ever
+  accepted. `Done` has no way back (eviction only removes closed entries;
+  claim, release, and transfer all refuse one), and the terminal notice is
+  owed exactly once, so the entry would be wedged for the board's
+  lifetime. Both halves are now structural: an explicit terminal guard
+  after the epoch guard, and the missing currency check on the arm that
+  lacked it — after which the epoch bump is defense in depth rather than
+  the only defense. Pinned by two unit tests, each verified to fail with
+  its own guard removed. A missing or already-`Done` entry accepts
+  idempotently with no board write; no `require_active` gate (the board is
+  data — an expired team's entry still closes); a re-posted entry after
+  eviction closes lazily exactly as before.
+- **The task→team notice rides `owed_child_reports`** (the one terminal
+  consult point, counted into the exchange budget) plus a settle-pass twin
+  covering the terminals that never consult it — goal exhaustion,
+  stagnation, human-path rejection exhaustion — and deliberately
+  back-filling pre-slice terminal tasks, whose unset marker closes their
+  stale board entries once. Operation id pure over `(tenant, team, task)`;
+  the payload carries status + terminal-reason code, echoed on
+  `last_code`.
+- **An already-terminal task still records the conversation provenance
+  cell** (user-approved): the cell is observational provenance, not new
+  work, and the common race is the conversation completing beside the
+  task's own result acceptance — a deliberate, documented deviation from
+  `apply_dependency_outcome`'s no-mutation-at-terminal posture. The
+  recording keeps validate-then-mutate literal (both fields restored on a
+  bounds refusal, the `record_team_claim` pin duplicated for it) and a
+  pre-terminal record passes the growth reserve so the cell can never eat
+  the room the task's own lifecycle still needs.
+- **Latest-only cell + history chain** (user-approved):
+  `AgentTask::conversation` (`AgentTaskConversation` — identity, terminal
+  status/reason, round/turn coordinates, `ended_at`; never transcript
+  content) + a `conversations` lifetime counter, the handoff/team-claim
+  precedent; the chain is `conversation-terminal-recorded` history. The
+  cell's `ended_at` is **strictly monotonic**, and the counter rides that
+  guard because it counts notices recorded: code review found the
+  latest-only past-window hazard was not merely a re-record but a
+  *regression* — a duplicate replayed past the applied window after a
+  second conversation overwrote the cell took the cell back and
+  re-incremented, and `get_task` then healed the public echo to the older
+  conversation on every read. What remains is the opposite direction, and
+  it is documented on the type with the bounded-map alternative named: an
+  older conversation whose first delivery arrives after a newer one is
+  accepted without being materialized, absent from the cell it could never
+  have won and from the count, still readable through its own entity and
+  the replay surface.
+- **The conversation owes the notice in all three terminal CAS's** — the
+  `transition()` wrapper covers rounds-complete and the early end in one
+  owing point, `observe_expiry` owes in its own flip — plus the
+  settle-pass consult as crash backstop and pre-slice back-fill. The 5.3
+  pre-wiring held: the exchange host, refuse-all participant, and journal
+  needed no schema change. Delivery is pumped by whatever drives the
+  conversation's settle pass — including the conversation store's own
+  `apply`, which couriers best-effort after the command that flipped it,
+  because the sharded entity's `Command` arm sends itself no `Settle`, a
+  terminal conversation accepts no further command, and it runs no timer:
+  the flipping command is the last drive the notice would otherwise get.
+  Beyond it, the A2A surface after every conversation operation, the
+  application sweep, and recovery — stated in the kind's doc and in the
+  rewritten `rakka-a2a` service comment that previously said "no courier
+  hop this slice".
+- **One shared refusal classifier per kind** (`coordination.rs`), used by
+  the initiator's settle rule *and* the receiver's memoization gate — the
+  5.4 two-sides-agree-by-construction rule made literal. On the team side
+  `team-not-found`/expired/disbanded/forged are definitive and flip the
+  markers, so a notice to a team that never existed settles rather than
+  re-driving forever. On the conversation side only `forged` is: both
+  `task-not-created` (the dependency-registration posture) and
+  `task-state-too-large` stay outstanding and unmemoized, because neither
+  is the task saying *never*. The bound is the sharper case — the receiver
+  charges a pre-terminal task the `AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`
+  headroom its own lifecycle still needs and a terminal task nothing, so
+  the very cell refused today fits once the task ends; settling on it
+  would quiesce both ends over a refusal the receiver is about to stop
+  making.
+- **Wire**: no new A2A operations — the exchanges are in-fabric. The task
+  projection's `io.rakka.collaboration` echo gained the conversation
+  cluster (`conversation`, `conversation-status`, `conversation-reason`,
+  `conversation-rounds`, `conversation-turns`) beside the
+  delegation/handoff/team echoes, healed by `sync_agent_status` on read
+  and write paths. Audit: new history kinds `team-task-closed` and
+  `conversation-terminal-recorded`, flowing into the 5.5 replay surface
+  under scope-qualified labels; metric: `rakka.agent.team.operations`
+  {`close`, `applied`} once per fresh application at the accept boundary.
+  Both snapshots expose their settled markers.
+- Proof roster: `tests/team_terminal_notice.rs` (8: the Active entry
+  closing without a claim attempt — the done-when — the unclaimed close,
+  the never-posted idempotent no-op, the closed-entry regression pin
+  (every precondition of its interleaving asserted, and failing only with
+  all three guards removed), marker
+  quiescence, the committed-but-unsent window under an injected lost
+  delivery, and self-covering crash sweeps over every team- and task-store
+  write of the terminal flow), `tests/conversation_terminal_notice.rs` (9:
+  all three terminal flips recording the cell, the already-terminal task
+  still recording, the racing-creation notice outstanding then converging,
+  the second conversation overwriting the cell with the chain in history,
+  quiescence, and crash sweeps over both stores), the missing-team
+  definitive settle in `tests/task_unclaimed_expiry.rs`, the
+  bounds-restore pin beside `record_team_claim`'s, the `close` counter in
+  `tests/agent_metrics.rs`, the label pins in `tests/coordination_replay.rs`,
+  both kinds in `tests/choreography.rs`'s failure windows by construction,
+  and `rakka-a2a`'s `tests/conversation_surface.rs` end-to-end echo test
+  over the public surface. Owed onward (explicitly, per this slice's own
+  rule): the handoff-refresh of the board owner echo; board rewake parking
+  (the team-side wake-timer affordance — the eager close runs on the
+  task's clock and does not need it); the goal/collaboration-view team and
+  conversation dimensions; the Postgres team/conversation history
+  backends; the team and moderation otel span rows; the model-visible
+  team/moderation tool doors.
 
 ### Slice 5.6 — M5 acceptance
 
 Spec: [Coordination Capability Milestone](spec.md#coordination-capability-milestone-m5).
 
-- Deterministic model/tool scripts plus fault injection covering every task,
-  handoff, claim, turn, and effect boundary.
-- Walk the coordination milestone checklist end to end.
+- Deterministic model/tool scripts plus fault injection covering every
+  task, handoff, claim, turn, and effect boundary; walk the coordination
+  milestone checklist end to end.
+- Acceptance example on the `multi-agent-goal-acceptance` pattern: pinned
+  transcript, sharded entities, real in-process A2A, pod loss over the new
+  coordination CAS points.
+- Re-prove "per-run setup cannot widen the envelope" with coordination
+  capabilities as the widened dimension.
+- Scope fence: the 4.4/4.6 crash-sweep debt stays in Phase 6.1
+  (user-confirmed); 5.6 sweeps only the CAS points Phase 5 introduces.
 
 Done when: the checklist is demonstrated and all M5 scenarios pass under
 fault injection.
+
+**Amended as implemented (2026-08-17):**
+
+- **Two of the seven checklist bullets did not hold, and the walk could not
+  honestly print them until they did.** The `CoordinationCapability` envelope
+  dimension had been subset-checked since 1.2, but only `Delegation` and
+  `Handoff` were ever consulted at a runtime door (`delegation.rs`,
+  `tools.rs`, `run.rs`); `Team` and `Moderation` were declared and never
+  read, so a board claim and a moderated turn rested on their roster alone.
+  Both doors now exist and both read the agent's durable definition rather
+  than asking its entity — the assignment decision's own read path, for its
+  own reason. The team door is one field on `AgentAssignmentReadiness`
+  (`permits_team_coordination`) applied in `decide_assignment` *only* where
+  `team_claim_pending` already is, so a direct assignment spends no
+  coordination capability and is untouched; the refusal
+  (`team-coordination-unauthorized`) routes through
+  `resolve_team_claim_refusal`, keeping the single-attempt posture — the
+  entry reopens for a member that may, rather than parking the task. The
+  moderation door cost `AgentConversationEntityStore` a third generic (the
+  agents store, symmetric with `AgentTaskEntityStore`) and no new generic on
+  `RakkaAgentA2AService`, which already carried one and now forwards it. The
+  dense-ledger echo still answers first: a committed turn converges on its
+  recorded outcome even under a since-narrowed definition, because re-judging
+  it would make recovery depend on a record the turn never consulted. An
+  unreadable speaker record is separately retryable
+  (`conversation-participant-record-unreadable`), never a definitive refusal.
+- **The walk found one defect in shipped code.** `AgentTeamEntityStore::ensure_recovered`
+  trusted its own flag rather than asking the host whether it still held the
+  authoritative record — the rule the task, run, and conversation stores all
+  carry, missed only here. A board has two writers by construction (the
+  resident sharded entity and the A2A service's own store, which is how every
+  wire claim reaches it), so the loser of one compare-and-set answered
+  `exchange-not-recovered` for the rest of its residency. This example is the
+  first deployment-shaped consumer to drive a board through both paths.
+- **The scope fence held, and the two families it names are swept.** Slice 5.1
+  had swept only the run store's committed-but-unsent fence window; the
+  task-side resolution machine and the whole dependents registry had no crash
+  injection. `tests/handoff_recovery.rs` sweeps both stores across the full
+  transfer and asserts the *convergence property* rather than one outcome —
+  a transfer has two correct endings, which one a window produces depends on
+  whether the offer had committed, and the sweep asserts it reached one of
+  them whole with the send attempted once either way, plus that it covered
+  both arms. `tests/dependency_registry.rs` gained the matching sweep over
+  the declaration, the upstream edge, and the two settled markers, and the
+  `ExchangeFault` triple now covers `HandoffResult`, `DependencyRegistration`,
+  and `DependencyOutcome` at the real entity rather than the synthetic probe.
+- **The milestone's done-when is `examples/coordination-capability-acceptance`**:
+  a 16-line transcript pinned three ways, one continuous story over all five
+  sharded entity types and the real in-process A2A core — board post, atomic
+  wire claim with the loser failing closed, zero-resident wait, same-task
+  transfer committed in one CAS and terminalized only after durable
+  acceptance with the two runs' memory namespaces proven disjoint, an owner
+  death injected inside the transfer, a human-owned approval unblocking its
+  dependent over the wire, a moderated conversation absorbing a replayed turn
+  and surviving an owner death mid-round, and the terminal task closing its
+  board entry with the claim epoch bumped. Two beats are the envelope bullet
+  and both are refusals. The consequential effect stays checkpoint-parked and
+  uninvoked throughout. The task history is deliberately bounded so the
+  replay bullet demonstrates both arms. Deployment facts the walk enforced:
+  every settle and read re-materializes from the durable record (an entity
+  sharing its store with a second writer that believes it owes nothing never
+  writes, never conflicts, and so never re-reads), and the sentinel sweep
+  covers what content must not *cross onto* — board, replay pages, metrics —
+  while a turn body in the conversation's own ring and a typed result on its
+  task are the contract working.
+- Proof roster: `examples/coordination-capability-acceptance` (2 tests: the
+  README-to-const pin and the walk plus its typed facts),
+  `tests/handoff_recovery.rs` (3), the registry sweeps and fault triple in
+  `tests/dependency_registry.rs` (2 added), the live envelope refusals in
+  `tests/team_claim_assignment.rs` and `tests/conversation_turns.rs`, the
+  coordination-widening admission proof in `tests/autonomy_admission.rs`, and
+  the missing positive control plus per-kind coverage in
+  `tests/definition_setup_envelope.rs`. Owed onward: the handoff-refresh of
+  the board owner echo; board rewake parking; the goal/collaboration-view
+  team and conversation dimensions; the PostgreSQL team and conversation
+  history backends; the team and moderation otel span rows; the model-visible
+  team and moderation tool doors; and `DeterministicModelAdapter`
+  conditioning on prior messages and tool results rather than turn number
+  alone. The 4.4/4.6 crash-sweep debt stays in Phase 6.1.
 
 ---
 

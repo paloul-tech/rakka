@@ -331,6 +331,7 @@ async fn delegated_child_world(
                 input: AgentTaskContent::inline(json!({ "ticket": 1 }))
                     .expect("the input is inline-bounded"),
                 assignee: Some(common::agent_id()),
+                team: None,
                 goal: None,
                 goal_mode: Default::default(),
                 goal_spec: None,
@@ -577,6 +578,7 @@ async fn an_incoherent_ancestry_refuses_the_child_creation() {
                 input: AgentTaskContent::inline(json!({ "ticket": 1 }))
                     .expect("the input is inline-bounded"),
                 assignee: Some(common::agent_id()),
+                team: None,
                 goal: None,
                 goal_mode: Default::default(),
                 goal_spec: None,
@@ -635,6 +637,7 @@ async fn the_definition_ceiling_caps_a_forged_root_grant() {
                 input: AgentTaskContent::inline(json!({ "ticket": 1 }))
                     .expect("the input is inline-bounded"),
                 assignee: Some(common::agent_id()),
+                team: None,
                 goal: None,
                 goal_mode: Default::default(),
                 goal_spec: None,

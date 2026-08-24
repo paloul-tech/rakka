@@ -880,7 +880,9 @@ impl AgentEffectPolicies {
             AgentRunEffectRequest::Compensation { .. } => &self.compensation,
             AgentRunEffectRequest::MemoryPromotion { .. } => &self.memory_promotion,
             AgentRunEffectRequest::Evaluation { .. } => &self.goal_evaluation,
-            AgentRunEffectRequest::A2aSend { .. } => &self.a2a_send,
+            AgentRunEffectRequest::A2aSend { .. } | AgentRunEffectRequest::A2aHandoff { .. } => {
+                &self.a2a_send
+            }
             AgentRunEffectRequest::WorkflowStart { .. } => &self.workflow_start,
             AgentRunEffectRequest::WorkflowCancel { .. } => &self.workflow_cancel,
             AgentRunEffectRequest::ClaimAppend { .. } => &self.claim_append,
@@ -1406,6 +1408,19 @@ pub enum AgentRunEffectRequest {
         /// The delegation record the send carries.
         delegation: Box<crate::delegation::AgentDelegationRecord>,
     },
+    /// Send one durable handoff to the task's surface over `rakka-a2a`
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)): an
+    /// idempotent durable effect whose payload *is* the handoff record
+    /// persisted alongside it — what was persisted is exactly what is sent,
+    /// and a replay re-sends it verbatim, converging on the recorded
+    /// transfer through the derived deduplication key.
+    ///
+    /// This variant is constructible only by the loop's handoff
+    /// interception; model output can never produce it.
+    A2aHandoff {
+        /// The handoff record the send carries.
+        handoff: Box<crate::coordination::AgentHandoffRecord>,
+    },
     /// Start — or adopt — the one durable child workflow run of a
     /// workflow-tool invocation
     /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)): an
@@ -1460,7 +1475,7 @@ impl AgentRunEffectRequest {
             Self::Compensation { .. } => AgentRunEffectKind::CompensationCall,
             Self::MemoryPromotion { .. } => AgentRunEffectKind::MemoryPromotionCall,
             Self::Evaluation { .. } => AgentRunEffectKind::GoalEvaluationCall,
-            Self::A2aSend { .. } => AgentRunEffectKind::A2aSendCall,
+            Self::A2aSend { .. } | Self::A2aHandoff { .. } => AgentRunEffectKind::A2aSendCall,
             Self::WorkflowStart { .. } => AgentRunEffectKind::WorkflowStartCall,
             Self::WorkflowCancel { .. } => AgentRunEffectKind::WorkflowCancelCall,
             Self::ClaimAppend { .. } => AgentRunEffectKind::ClaimAppendCall,
@@ -1476,6 +1491,7 @@ impl AgentRunEffectRequest {
             | Self::MemoryPromotion { .. }
             | Self::Evaluation { .. }
             | Self::A2aSend { .. }
+            | Self::A2aHandoff { .. }
             | Self::WorkflowStart { .. }
             | Self::WorkflowCancel { .. }
             | Self::ClaimAppend { .. } => None,
@@ -1557,6 +1573,15 @@ impl AgentRunEffectRequest {
                 attributes: BTreeMap::from([
                     ("skill".to_string(), delegation.requested_skill.to_string()),
                     ("delegation".to_string(), delegation.delegation.to_string()),
+                ]),
+            },
+            Self::A2aHandoff { handoff } => AgentEffectTarget {
+                target_type: "a2a-peer".to_string(),
+                name: handoff.resolved.agent.to_string(),
+                address: handoff.resolved.endpoint.clone(),
+                attributes: BTreeMap::from([
+                    ("skill".to_string(), handoff.requested_skill.to_string()),
+                    ("handoff".to_string(), handoff.handoff.to_string()),
                 ]),
             },
             Self::WorkflowStart { invocation } => AgentEffectTarget {
@@ -2086,6 +2111,15 @@ pub enum AgentRunEffectOutcome {
         /// The bounded receipt: identities and a status label only.
         receipt: crate::delegation::AgentA2aSendReceipt,
     },
+    /// An outbound handoff send durably recorded — or replayed onto — its
+    /// one logical transfer at the task
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)). Never
+    /// proof the target accepted: acceptance returns later through the
+    /// handoff-result exchange.
+    A2aHandoff {
+        /// The bounded receipt: identities and a status label only.
+        receipt: crate::coordination::AgentA2aHandoffReceipt,
+    },
     /// A workflow start durably created — or adopted — its one logical child
     /// run ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
     WorkflowStart {
@@ -2148,6 +2182,7 @@ impl AgentRunEffectOutcome {
                 | Self::MemoryPromotion { .. }
                 | Self::Evaluation { .. }
                 | Self::A2aSend { .. }
+                | Self::A2aHandoff { .. }
                 | Self::WorkflowStart { .. }
                 | Self::WorkflowCancel { .. }
                 | Self::ClaimAppend { .. }
@@ -2163,6 +2198,7 @@ impl AgentRunEffectOutcome {
             | Self::MemoryPromotion { .. }
             | Self::Evaluation { .. }
             | Self::A2aSend { .. }
+            | Self::A2aHandoff { .. }
             | Self::WorkflowStart { .. }
             | Self::WorkflowCancel { .. }
             | Self::ClaimAppend { .. } => AgentRunEffectStatus::Succeeded,
@@ -2241,6 +2277,13 @@ impl AgentRunEffectOutcome {
                     })
             }
             Self::A2aSend { receipt } => {
+                receipt
+                    .validate()
+                    .map_err(|error| AgentEffectError::InvalidPolicy {
+                        message: error.to_string(),
+                    })
+            }
+            Self::A2aHandoff { receipt } => {
                 receipt
                     .validate()
                     .map_err(|error| AgentEffectError::InvalidPolicy {

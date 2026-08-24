@@ -29,10 +29,11 @@ use serde_json::Value;
 
 use a2a::AgentExtension;
 use rakka_agent::{
-    AgentCapabilityId, AgentCredentialBindingRef, AgentDelegationId, AgentDelegationRecord,
-    AgentEnvironmentRef, AgentGoalDelegationBudget, AgentGoalId, AgentId, AgentRevisionNumber,
-    AgentRunScope, AgentSchemaId, AgentSchemaRef, AgentTaskDelegationProvenance, AgentTaskId,
-    KnowledgeSpaceId,
+    AgentAssignmentGeneration, AgentCapabilityId, AgentCredentialBindingRef, AgentDelegationId,
+    AgentDelegationRecord, AgentEnvironmentRef, AgentGoalDelegationBudget, AgentGoalId,
+    AgentHandoffId, AgentHandoffRecord, AgentId, AgentRevisionNumber, AgentRunId, AgentRunScope,
+    AgentSchemaId, AgentSchemaRef, AgentTaskDelegationProvenance, AgentTaskHandoff,
+    AgentTaskHandoffRequest, AgentTaskId, KnowledgeSpaceId,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -332,6 +333,332 @@ impl AgentCollaborationMetadata {
     }
 }
 
+/// One versioned handoff envelope: the same-task transfer cluster of the
+/// collaboration extension ([specification 8.9](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It rides under the same [`META_COLLABORATION`] key and extension URI as
+/// the delegation envelope, discriminated by its `handoff` field. A receiver
+/// that predates the cluster fails to parse it — the mandated fail-closed
+/// posture for collaboration metadata a peer cannot honor — while ordinary
+/// clients that never engage the extension remain untouched. Every field is
+/// a *claim* the task's transition re-validates against durable state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AgentHandoffCollaborationMetadata {
+    /// Envelope schema version; must equal
+    /// [`AGENT_COLLABORATION_SCHEMA_VERSION`].
+    pub schema: u32,
+    /// The handoff identity the source run derived.
+    pub handoff: String,
+    /// The agent the source run claims to be.
+    pub source_agent: String,
+    /// The source run id claiming the transfer.
+    pub source_run: String,
+    /// The assignment generation the source claims to serve.
+    pub source_generation: u64,
+    /// The agent the transfer targets.
+    pub target_agent: String,
+    /// The task definition the resolved target serves.
+    pub target_task_definition: String,
+    /// The result schema the resolved target expects, when its catalog entry
+    /// declares one.
+    #[serde(default)]
+    pub result_schema: Option<AgentCollaborationSchemaRef>,
+    /// The bounded reason the source's model supplied.
+    pub reason: String,
+    /// The handoff policy revision that authorized the transfer.
+    pub policy_revision: u64,
+    /// Explicit context/artifact references projected to the target — never
+    /// content, never memory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<String>,
+    /// The communal knowledge spaces the catalog explicitly delegates to the
+    /// target. Omitted when empty, with the delegation envelope's
+    /// cross-version posture: a grant must never be silently dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub knowledge_spaces: Vec<String>,
+}
+
+impl AgentHandoffCollaborationMetadata {
+    /// Builds the wire envelope from the handoff record a source run
+    /// persisted — the sender side of the cluster.
+    #[must_use]
+    pub fn from_record(record: &AgentHandoffRecord) -> Self {
+        Self {
+            schema: AGENT_COLLABORATION_SCHEMA_VERSION,
+            handoff: record.handoff.as_str().to_string(),
+            source_agent: record.source_run.agent().as_str().to_string(),
+            source_run: record.source_run.run().as_str().to_string(),
+            source_generation: record.source_generation.get(),
+            target_agent: record.resolved.agent.as_str().to_string(),
+            target_task_definition: record.resolved.task_definition.as_str().to_string(),
+            result_schema: record.resolved.result_schema.as_ref().map(|schema| {
+                AgentCollaborationSchemaRef {
+                    id: schema.schema_id.as_str().to_string(),
+                    revision: schema.version.get(),
+                }
+            }),
+            reason: record.reason.clone(),
+            policy_revision: record.policy_revision.get(),
+            context: record.context.clone(),
+            knowledge_spaces: record
+                .resolved
+                .knowledge_spaces
+                .iter()
+                .map(|space| space.as_str().to_string())
+                .collect(),
+        }
+    }
+
+    /// The JSON value that rides under [`META_COLLABORATION`].
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    /// Validates the envelope into the typed request the task's transition
+    /// re-validates against durable state — the receiver side of the cluster.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on any identity that cannot key a durable scope.
+    pub fn to_request(&self) -> RakkaAgentA2AResult<AgentTaskHandoffRequest> {
+        let mut knowledge_spaces = std::collections::BTreeSet::new();
+        for space in &self.knowledge_spaces {
+            knowledge_spaces.insert(KnowledgeSpaceId::new(space)?);
+        }
+        Ok(AgentTaskHandoffRequest {
+            handoff: AgentHandoffId::new(&self.handoff)?,
+            source_agent: AgentId::new(&self.source_agent)?,
+            source_run: AgentRunId::new(&self.source_run)?,
+            source_generation: AgentAssignmentGeneration::new(self.source_generation),
+            target: AgentId::new(&self.target_agent)?,
+            target_task_definition: rakka_agent::AgentTaskDefinitionId::new(
+                &self.target_task_definition,
+            )?,
+            result_schema: self
+                .result_schema
+                .as_ref()
+                .map(|schema| {
+                    Ok::<_, RakkaAgentA2AError>(AgentSchemaRef::new(
+                        AgentSchemaId::new(&schema.id)?,
+                        AgentRevisionNumber::new(schema.revision),
+                    ))
+                })
+                .transpose()?,
+            reason: self.reason.clone(),
+            policy_revision: AgentRevisionNumber::new(self.policy_revision),
+            context: self.context.clone(),
+            knowledge_spaces,
+        })
+    }
+}
+
+/// The bounded verb vocabulary of one team cluster
+/// ([specification 8.10](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Creation and disband are deliberately absent: a team is trusted
+/// application data, and the wire cannot mint or destroy one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentTeamWireOperation {
+    /// Claim a board entry for a member.
+    Claim,
+    /// Release a pending claim.
+    Release,
+    /// Transfer a pending claim to another member.
+    Transfer,
+    /// Post an existing task to the board.
+    PostTask,
+    /// Append a mediated peer message to the durable ring.
+    Message,
+    /// Add a member, fenced on the lifecycle revision.
+    Join,
+    /// Remove a member, fenced on the lifecycle revision.
+    Leave,
+}
+
+impl AgentTeamWireOperation {
+    /// Stable kebab-case label for authorization claims and metrics.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Claim => "claim",
+            Self::Release => "release",
+            Self::Transfer => "transfer",
+            Self::PostTask => "post-task",
+            Self::Message => "message",
+            Self::Join => "join",
+            Self::Leave => "leave",
+        }
+    }
+}
+
+/// One versioned team cluster: the durable board/membership command shape of
+/// the collaboration extension
+/// ([specification 8.10](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It rides under the same [`META_COLLABORATION`] key and extension URI as
+/// the delegation envelope and the handoff cluster, discriminated by its
+/// `team` field — checked *before* the handoff discriminator, and
+/// `deny_unknown_fields` makes a payload carrying both fail the send whole.
+/// A receiver that predates the cluster fails to parse it (the mandated
+/// fail-closed posture); ordinary clients that never engage the extension
+/// remain untouched. Every field is a *claim* the team entity's transition
+/// re-validates against durable state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AgentTeamCollaborationMetadata {
+    /// Envelope schema version; must equal
+    /// [`AGENT_COLLABORATION_SCHEMA_VERSION`].
+    pub schema: u32,
+    /// The team the command addresses — the cluster's discriminator field.
+    pub team: String,
+    /// The board or membership verb.
+    pub operation: AgentTeamWireOperation,
+    /// The board task the operation touches, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// The member the caller acts as: the claimant, releaser, poster,
+    /// sender, or the joining/leaving member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    /// The member a transfer targets or a message addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_member: Option<String>,
+    /// The board entry's claim epoch the command observed; a stale
+    /// expectation fails closed at the entity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_epoch: Option<u64>,
+    /// The lifecycle revision a membership change expects to succeed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_lifecycle_revision: Option<u64>,
+    /// The capability scopes a joining member is admitted under.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_scopes: Vec<String>,
+    /// The bounded message body, on a message append.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+impl AgentTeamCollaborationMetadata {
+    /// The JSON value that rides under [`META_COLLABORATION`].
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// The bounded verb vocabulary of one conversation cluster
+/// ([specification 8.11](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Creation is deliberately absent: a conversation is trusted application
+/// data, and the wire cannot mint one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentConversationWireOperation {
+    /// Submit the next turn as the current authorized participant.
+    SubmitTurn,
+    /// End the conversation early under the moderator's policy, fenced on
+    /// the round.
+    End,
+}
+
+impl AgentConversationWireOperation {
+    /// Stable kebab-case label for authorization claims and metrics.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::SubmitTurn => "submit-turn",
+            Self::End => "end",
+        }
+    }
+}
+
+/// One versioned conversation cluster: the moderated turn-protocol command
+/// shape of the collaboration extension
+/// ([specification 8.11](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It rides under the same [`META_COLLABORATION`] key and extension URI as
+/// the other clusters, discriminated by its `conversation` field — checked
+/// *before* the team and handoff discriminators, and `deny_unknown_fields`
+/// makes a payload carrying more than one discriminator fail the send whole.
+/// A receiver that predates the cluster fails to parse it (the mandated
+/// fail-closed posture); ordinary clients that never engage the extension
+/// remain untouched. Every field is a *claim* the conversation entity's
+/// transition re-validates against durable state — the roster gate and the
+/// cursor's derived owner fence decide, never the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AgentConversationCollaborationMetadata {
+    /// Envelope schema version; must equal
+    /// [`AGENT_COLLABORATION_SCHEMA_VERSION`].
+    pub schema: u32,
+    /// The conversation the command addresses — the cluster's discriminator
+    /// field.
+    pub conversation: String,
+    /// The turn-protocol verb.
+    pub operation: AgentConversationWireOperation,
+    /// The claimed speaker of a submitted turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<String>,
+    /// The round a submitted turn claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u64>,
+    /// The turn index a submitted turn claims within its round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
+    /// The bounded turn body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// The tokens the speaker's run reports having consumed producing the
+    /// turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_consumed: Option<u64>,
+    /// The roster participant a moderator-directed moderator turn
+    /// designates as the next speaker. Mutually exclusive with
+    /// [`Self::close_round`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub designate: Option<String>,
+    /// Whether a moderator-directed moderator turn closes the round.
+    /// Mutually exclusive with [`Self::designate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_round: Option<bool>,
+    /// The round an end decision was made against; a stale expectation
+    /// fails closed at the entity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_round: Option<u64>,
+    /// The bounded early-end reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl AgentConversationCollaborationMetadata {
+    /// The JSON value that rides under [`META_COLLABORATION`].
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// One parsed engagement of the collaboration extension: a delegation
+/// envelope, a handoff cluster, a team cluster, or a conversation cluster,
+/// discriminated by shape under the one [`META_COLLABORATION`] key.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentCollaborationEnvelope {
+    /// A delegation send creating a child task.
+    Delegation(AgentCollaborationMetadata),
+    /// A handoff send transferring responsibility for the same task.
+    Handoff(AgentHandoffCollaborationMetadata),
+    /// A team board or membership command.
+    Team(AgentTeamCollaborationMetadata),
+    /// A moderated-conversation turn-protocol command.
+    Conversation(AgentConversationCollaborationMetadata),
+}
+
 /// True when the message declares any version of the collaboration extension.
 #[must_use]
 pub fn is_collaboration_message(message: &a2a::Message) -> bool {
@@ -360,6 +687,47 @@ pub fn parse_collaboration_metadata(
     message: &a2a::Message,
     metadata: &std::collections::HashMap<String, Value>,
 ) -> RakkaAgentA2AResult<Option<AgentCollaborationMetadata>> {
+    match parse_collaboration_envelope(message, metadata)? {
+        None => Ok(None),
+        Some(AgentCollaborationEnvelope::Delegation(envelope)) => Ok(Some(envelope)),
+        // A caller expecting only delegation metadata must not silently drop
+        // a transfer or a board command: half-understood collaboration
+        // metadata fails closed.
+        Some(AgentCollaborationEnvelope::Handoff(_)) => Err(RakkaAgentA2AError::Unsupported {
+            operation: "agent-collaboration",
+            reason: "a handoff envelope reached a delegation-only surface",
+        }),
+        Some(AgentCollaborationEnvelope::Team(_)) => Err(RakkaAgentA2AError::Unsupported {
+            operation: "agent-collaboration",
+            reason: "a team envelope reached a delegation-only surface",
+        }),
+        Some(AgentCollaborationEnvelope::Conversation(_)) => Err(RakkaAgentA2AError::Unsupported {
+            operation: "agent-collaboration",
+            reason: "a conversation envelope reached a delegation-only surface",
+        }),
+    }
+}
+
+/// Parses the collaboration engagement of one send — delegation envelope,
+/// handoff cluster, team cluster, or conversation cluster — failing closed
+/// on every half-formed shape.
+///
+/// Returns `None` for an ordinary send that neither declares the extension
+/// nor carries the metadata key. The clusters are discriminated by their
+/// fields — `conversation`, then `team`, then `handoff`, with delegation the
+/// fallback — and each shape's `deny_unknown_fields` makes a payload
+/// carrying more than one discriminator fail the send whole.
+///
+/// # Errors
+///
+/// Fails closed when the message declares an unsupported collaboration
+/// version, declares v1 without the [`META_COLLABORATION`] object, carries
+/// the object without declaring the extension, or carries an envelope that
+/// does not parse under schema version 1.
+pub fn parse_collaboration_envelope(
+    message: &a2a::Message,
+    metadata: &std::collections::HashMap<String, Value>,
+) -> RakkaAgentA2AResult<Option<AgentCollaborationEnvelope>> {
     let extensions = message.extensions.as_deref().unwrap_or_default();
     let declared = extensions
         .iter()
@@ -393,6 +761,89 @@ pub fn parse_collaboration_metadata(
             reason: "a collaboration send must carry the io.rakka.collaboration metadata object",
         });
     };
+    // `io.rakka.collaboration` carries two directions: this inbound command
+    // envelope, and the bounded echo the task projection writes back out.
+    // Every cluster shape below requires `schema`; no echo carries one. So
+    // the version declaration is checked *before* the discriminators, and
+    // that ordering is what keeps this surface from classifying an echo as a
+    // command: `team_echo` and `handoff_echo` key their identity on the bare
+    // cluster names discriminated on here, and both are shipped
+    // compatibility surface that cannot be renamed. Without this gate, a
+    // client or relay that round-tripped a task's collaboration object onto
+    // a send was refused under whichever cluster its echoes happened to trip
+    // first — so the answer it got depended on that task's collaboration
+    // history rather than on what it sent, and a task that both handed off
+    // and governed a conversation changed branches. Refused either way; the
+    // point is that the refusal now names the real defect.
+    let declares_schema = payload
+        .as_object()
+        .is_some_and(|object| object.contains_key("schema"));
+    if !declares_schema {
+        return Err(RakkaAgentA2AError::Unsupported {
+            operation: "agent-collaboration",
+            reason: "the collaboration metadata object declares no schema version; a task \
+                     projection's collaboration echo is not a collaboration command",
+        });
+    }
+    // The conversation cluster discriminates first, then the team cluster,
+    // then the handoff cluster: each shape's `deny_unknown_fields` makes a
+    // payload carrying more than one discriminator fail the send whole
+    // rather than parse as any of them.
+    let is_conversation = payload
+        .as_object()
+        .is_some_and(|object| object.contains_key("conversation"));
+    if is_conversation {
+        let envelope: AgentConversationCollaborationMetadata =
+            serde_json::from_value(payload.clone()).map_err(|_| {
+                RakkaAgentA2AError::Unsupported {
+                    operation: "agent-collaboration",
+                    reason: "the conversation envelope does not parse under schema version 1",
+                }
+            })?;
+        if envelope.schema != AGENT_COLLABORATION_SCHEMA_VERSION {
+            return Err(RakkaAgentA2AError::Unsupported {
+                operation: "agent-collaboration",
+                reason: "the conversation envelope names an unsupported schema version",
+            });
+        }
+        return Ok(Some(AgentCollaborationEnvelope::Conversation(envelope)));
+    }
+    let is_team = payload
+        .as_object()
+        .is_some_and(|object| object.contains_key("team"));
+    if is_team {
+        let envelope: AgentTeamCollaborationMetadata = serde_json::from_value(payload.clone())
+            .map_err(|_| RakkaAgentA2AError::Unsupported {
+                operation: "agent-collaboration",
+                reason: "the team envelope does not parse under schema version 1",
+            })?;
+        if envelope.schema != AGENT_COLLABORATION_SCHEMA_VERSION {
+            return Err(RakkaAgentA2AError::Unsupported {
+                operation: "agent-collaboration",
+                reason: "the team envelope names an unsupported schema version",
+            });
+        }
+        return Ok(Some(AgentCollaborationEnvelope::Team(envelope)));
+    }
+    let is_handoff = payload
+        .as_object()
+        .is_some_and(|object| object.contains_key("handoff"));
+    if is_handoff {
+        let envelope: AgentHandoffCollaborationMetadata = serde_json::from_value(payload.clone())
+            .map_err(|_| {
+            RakkaAgentA2AError::Unsupported {
+                operation: "agent-collaboration",
+                reason: "the handoff envelope does not parse under schema version 1",
+            }
+        })?;
+        if envelope.schema != AGENT_COLLABORATION_SCHEMA_VERSION {
+            return Err(RakkaAgentA2AError::Unsupported {
+                operation: "agent-collaboration",
+                reason: "the handoff envelope names an unsupported schema version",
+            });
+        }
+        return Ok(Some(AgentCollaborationEnvelope::Handoff(envelope)));
+    }
     let envelope: AgentCollaborationMetadata =
         serde_json::from_value(payload.clone()).map_err(|_| RakkaAgentA2AError::Unsupported {
             operation: "agent-collaboration",
@@ -404,7 +855,7 @@ pub fn parse_collaboration_metadata(
             reason: "the collaboration envelope names an unsupported schema version",
         });
     }
-    Ok(Some(envelope))
+    Ok(Some(AgentCollaborationEnvelope::Delegation(envelope)))
 }
 
 /// The bounded collaboration echo the public task projection carries:
@@ -416,5 +867,68 @@ pub fn collaboration_echo(provenance: &AgentTaskDelegationProvenance) -> Value {
         "delegation": provenance.delegation.as_str(),
         "parent-task": provenance.parent_task.as_str(),
         "depth": provenance.depth,
+    })
+}
+
+/// The bounded handoff echo the public task projection carries: handoff
+/// identity, status label, and target — enough for observability and the
+/// source's identity check past the deduplication window, never the whole
+/// record ([specification 8.9](../../../../docs/plans/rakka-agent/spec.md)).
+#[must_use]
+pub fn handoff_echo(handoff: &AgentTaskHandoff) -> Value {
+    serde_json::json!({
+        "handoff": handoff.handoff.as_str(),
+        "handoff-status": handoff.status.as_label(),
+        "handoff-target": handoff.target.as_str(),
+        "handoff-target-generation": handoff
+            .target_generation
+            .map(rakka_agent::AgentAssignmentGeneration::get),
+    })
+}
+
+/// The bounded team echo the public task projection carries: claim
+/// identity, status label, and member — enough for observability and the
+/// board's identity check past the deduplication window, never the whole
+/// record ([specification 8.10](../../../../docs/plans/rakka-agent/spec.md)).
+#[must_use]
+pub fn team_echo(claim: &rakka_agent::AgentTaskTeamClaim) -> Value {
+    serde_json::json!({
+        "team": claim.team.team().as_str(),
+        "team-claim": claim.claim.as_str(),
+        "team-claim-status": claim.status.as_label(),
+        "team-claim-member": claim.member.as_str(),
+        "team-claim-epoch": claim.epoch,
+        "team-claim-generation": claim
+            .target_generation
+            .map(rakka_agent::AgentAssignmentGeneration::get),
+    })
+}
+
+/// The bounded conversation echo the public task projection carries: the
+/// latest terminated conversation's identity, terminal status and reason,
+/// and its round/turn coordinates — identity and coordinates only, never
+/// transcript content
+/// ([specification 8.11](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The identity key is `conversation-id`, **not** the bare `conversation`
+/// its delegation, handoff, and team siblings use, and that is deliberate:
+/// `io.rakka.collaboration` is one key carrying two directions, the outbound
+/// projection echo and the inbound command envelope, and
+/// [`parse_collaboration_envelope`] discriminates the inbound clusters on
+/// exactly those bare names. An echo keyed `conversation` would sit ahead of
+/// `team` and `handoff` in that order, so a task's own echo object decided
+/// which cluster a round-tripped send was read as. The two older echoes
+/// cannot be renamed — they are shipped compatibility surface — so the
+/// parser gates on the `schema` no echo carries; this key keeps the newest
+/// echo out of the collision to begin with. Any echo added later must do
+/// the same.
+#[must_use]
+pub fn conversation_echo(cell: &rakka_agent::AgentTaskConversation) -> Value {
+    serde_json::json!({
+        "conversation-id": cell.conversation.as_str(),
+        "conversation-status": cell.status.as_label(),
+        "conversation-reason": cell.terminal_reason.code(),
+        "conversation-rounds": cell.rounds_completed,
+        "conversation-turns": cell.turns,
     })
 }

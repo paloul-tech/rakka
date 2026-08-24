@@ -79,10 +79,7 @@ use rakka_sharding::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::budget::{
-    AgentBudgetAllocation, AgentBudgetExhaustion, AgentRunBudget,
-    AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
-};
+use crate::budget::{AgentBudgetAllocation, AgentBudgetExhaustion, AgentRunBudget};
 use crate::checkpoints::{
     AgentCheckpoint, AgentCheckpointDecision, AgentCheckpointError, AgentCheckpointKind,
     AgentCheckpointOutcome, AgentCheckpointTimerOutcome, AgentCompensationRef,
@@ -111,11 +108,12 @@ use crate::memory::{
 };
 use crate::model::AgentModelError;
 use crate::observability::{
-    record_agent_domain_counter, record_agent_domain_gauge, AgentDecisionDraft,
-    AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource, METRIC_AGENT_DECISIONS,
-    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
-    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    record_agent_domain_counter, record_agent_domain_gauge, record_unsettleable_exchanges,
+    AgentDecisionDraft, AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
+    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_FAN_IN_RESOLUTIONS,
+    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
+    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
     METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WORKFLOW_RESULTS,
 };
 use crate::schema::{
@@ -227,6 +225,13 @@ const AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES: usize = 4 * 1024;
 /// entry, and the invocation's share of the resolution table recorded as the
 /// awaiting call's tool result.
 const AGENT_WORKFLOW_INVOCATION_COMMIT_OVERHEAD_BYTES: usize = 4 * 1024;
+
+/// What one committed handoff adds to the run's durable record beyond twice
+/// its serialized record bytes: the effect envelope around the payload, the
+/// cell's status fields, the target generation the receipt later marks on the
+/// cell, and the resolution recorded as the call's bounded tool result when
+/// the task's handoff-result exchange settles it.
+const AGENT_HANDOFF_COMMIT_OVERHEAD_BYTES: usize = 4 * 1024;
 
 const DEFAULT_AGENT_RUN_PASSIVATION_BUFFER_DURATION: Duration = Duration::from_millis(25);
 
@@ -484,6 +489,17 @@ pub enum AgentRunTerminalReason {
         /// The stable decoding error code.
         code: String,
     },
+    /// The run handed its task to another agent, and the target's assignment
+    /// was durably accepted ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    /// Recorded only by the handoff-result exchange's settle — never by the
+    /// fence, the send, or the receipt — so `HandedOff` is strictly after
+    /// durable target acceptance.
+    HandedOff {
+        /// The handoff that transferred responsibility.
+        handoff: crate::identity::AgentHandoffId,
+        /// The agent that now owns the task.
+        target: AgentId,
+    },
 }
 
 impl AgentRunTerminalReason {
@@ -504,6 +520,7 @@ impl AgentRunTerminalReason {
                 AgentTaskStatus::Completed => AgentRunStatus::Superseded,
                 _ => AgentRunStatus::Failed,
             },
+            Self::HandedOff { .. } => AgentRunStatus::HandedOff,
             Self::ResultRejectionsExhausted
             | Self::BudgetExhausted { .. }
             | Self::EffectFailed { .. }
@@ -525,6 +542,7 @@ impl AgentRunTerminalReason {
             Self::EffectCompensated { .. } => "effect-compensated",
             Self::CancellationRequested { .. } => "cancellation-requested",
             Self::UndecodableDecision { .. } => "undecodable-decision",
+            Self::HandedOff { .. } => "handed-off",
         }
     }
 }
@@ -1572,6 +1590,221 @@ fn accept_run_cancel(
     )
 }
 
+/// Applies the task's [`AgentExchangeKind::HandoffResult`] notice
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)): the
+/// receiving half of the task → source-run resolution leg.
+///
+/// An accepted resolution settles the cell, records the call's bounded
+/// success result, and stamps the `HandedOff` terminal reason — all in this
+/// one compare-and-set, which is what makes `HandedOff` strictly after
+/// durable target acceptance. A refusal settles the cell, releases the
+/// fence, and resumes the turn with the failed tool result the model
+/// corrects course from. A settled cell answers idempotently — it is the
+/// durable fence past the journal's bounded deduplication window — with one
+/// exception: an accepted resolution contradicting a cell that settled
+/// under a *local* failure corrects the record instead of being absorbed,
+/// because the task's durable acceptance is where responsibility actually
+/// went. On a live run the correction applies as a first resolution would;
+/// on an already-terminal run only the cell is corrected — the terminal
+/// status is history and stands.
+fn accept_handoff_result(
+    state: &mut AgentRunState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeResult {
+    let notice: crate::task::AgentHandoffResultNotice = match envelope
+        .payload()
+        .decode(crate::task::AGENT_HANDOFF_RESULT_PAYLOAD_TYPE)
+    {
+        Ok(notice) => notice,
+        // Version skew, not the receiver answering: the task's settle rule
+        // leaves the exchange outstanding, and it converges after upgrade.
+        Err(error) => return refuse("handoff-result-undecodable", error.to_string()),
+    };
+    // The sender must be the very task this run serves, in its own tenant:
+    // anything else is a forgery, whatever it claims.
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Task(scope) => scope,
+        other => {
+            return refuse(
+                "handoff-forged",
+                format!("a handoff result cannot originate from {other}"),
+            )
+        }
+    };
+    if sender.tenant() != state.scope.tenant() || *sender != notice.task {
+        return refuse(
+            "handoff-forged",
+            format!(
+                "the handoff result claims task {}, but was sent by {}",
+                notice.task.task(),
+                sender.task()
+            ),
+        );
+    }
+    let Some(run) = state.run.as_ref() else {
+        // Definitive: the task owes a handoff result only to the source run
+        // its provenance records, so an unassigned entity here is a misroute
+        // the task settles past rather than re-driving forever.
+        return refuse("handoff-not-held", "the addressed run was never assigned");
+    };
+    if *sender.task() != *run.task() {
+        return refuse(
+            "handoff-forged",
+            format!("the run serves task {}, not {}", run.task(), sender.task()),
+        );
+    }
+    let Some(cell) = run.loop_state.handoff() else {
+        // Definitive for the same reason: a run without a handoff cell never
+        // initiated one, and the provenance that owed this notice names a
+        // source that cannot be this run.
+        return refuse("handoff-not-held", "the run holds no handoff");
+    };
+    if cell.record.handoff != notice.handoff {
+        // The one check with no cancel analog: the notice must resolve the
+        // very handoff this run committed.
+        return refuse(
+            "handoff-forged",
+            format!(
+                "the run's handoff is {}, not {}",
+                cell.record.handoff, notice.handoff
+            ),
+        );
+    }
+    if cell.status.is_settled() {
+        // A settled cell absorbs duplicates past the journal's bounded
+        // window — with one exception. An `Accepted` resolution arriving at
+        // a cell that settled under a *local* failure — a fenced wind-down,
+        // a reconciliation decision an ambiguously failed write later
+        // contradicted — is not a duplicate: the task's durable record says
+        // responsibility transferred, and the run's local belief must not
+        // absorb it. The contradiction falls through so the acceptance
+        // corrects the record; everything else answers idempotently.
+        let contradicted = matches!(
+            &notice.resolution,
+            crate::task::AgentHandoffResolutionNotice::Accepted { .. }
+        ) && !matches!(
+            cell.status,
+            crate::coordination::AgentHandoffStatus::Accepted { .. }
+        );
+        if !contradicted {
+            return AgentExchangeResult::accepted(AgentExchangePayload::empty(
+                crate::task::AGENT_HANDOFF_RESULT_RECEIPT_PAYLOAD_TYPE,
+            ));
+        }
+        if run.status.is_terminal() {
+            // The run already terminalized under the wind-down that settled
+            // this cell; its terminal status and reason are history and
+            // stand. The cell alone is corrected, so the collaboration and
+            // goal views carry the durable truth: responsibility moved to
+            // the target.
+            let correct = |state: &mut AgentRunState| -> AgentRunResult<()> {
+                let crate::task::AgentHandoffResolutionNotice::Accepted {
+                    target_run,
+                    generation,
+                } = &notice.resolution
+                else {
+                    return Ok(());
+                };
+                let run = state.run_mut()?;
+                if let Some(cell) = run.loop_state.handoff_mut() {
+                    cell.correct_accepted(target_run.clone(), *generation, now);
+                }
+                Ok(())
+            };
+            if let Err(error) = correct(state) {
+                return refuse("handoff-result-failed", error.to_string());
+            }
+            state.updated_at = now;
+            return AgentExchangeResult::accepted(AgentExchangePayload::empty(
+                crate::task::AGENT_HANDOFF_RESULT_RECEIPT_PAYLOAD_TYPE,
+            ));
+        }
+        // A live run falls through: the acceptance applies exactly as a
+        // first resolution would, correcting the cell and terminalizing
+        // `HandedOff` — the earlier failed tool result stands (results
+        // deduplicate by call), and the run stops spending budget on a task
+        // it no longer owns.
+    }
+    let call_id = cell.record.call_id.clone();
+    let target = cell.record.resolved.agent.clone();
+    let winding_down = run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling;
+    let apply = || -> AgentRunResult<()> {
+        match &notice.resolution {
+            crate::task::AgentHandoffResolutionNotice::Accepted {
+                target_run,
+                generation,
+            } => {
+                let run = state.run_mut()?;
+                if let Some(cell) = run.loop_state.handoff_mut() {
+                    // `correct_accepted`, not `settle_accepted`: on the
+                    // ordinary unsettled path the two act identically, and
+                    // on the contradicted path above only the correction may
+                    // rewrite the locally settled failure.
+                    cell.correct_accepted(target_run.clone(), *generation, now);
+                }
+                let content = AgentTaskContent::inline(serde_json::json!({
+                    "handoff": notice.handoff.as_str(),
+                    "target_run": target_run.as_str(),
+                    "status": "accepted",
+                }))
+                .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                run.loop_state.record_tool_result(AgentToolResult {
+                    call_id,
+                    content,
+                    recorded_at: now,
+                });
+                // Responsibility durably moved, so `HandedOff` wins over any
+                // standing wind-down reason: recording `Cancelled` — or a
+                // resumed-run failure — here would claim the task's work
+                // stopped with this run, which the task's own durable record
+                // contradicts.
+                run.terminal_reason = Some(AgentRunTerminalReason::HandedOff {
+                    handoff: notice.handoff.clone(),
+                    target,
+                });
+                Ok(())
+            }
+            crate::task::AgentHandoffResolutionNotice::Refused { code } => {
+                let run = state.run_mut()?;
+                if let Some(cell) = run.loop_state.handoff_mut() {
+                    cell.settle_refused(bounded_detail(code.clone()), now);
+                }
+                let content = AgentTaskContent::inline(serde_json::json!({
+                    "error": bounded_detail(code.clone()),
+                    "message": "the handoff was refused; the run continues to own its task",
+                }))
+                .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                run.loop_state.record_tool_result(AgentToolResult {
+                    call_id,
+                    content,
+                    recorded_at: now,
+                });
+                if !winding_down && !run.loop_state.awaits_effect() {
+                    // The fence released, so the turn rests where any other
+                    // resolved call leaves it and the model corrects course.
+                    let (phase, status) = turn_rest(&run.loop_state);
+                    run.loop_state.set_phase(phase);
+                    run.status = status;
+                }
+                Ok(())
+            }
+        }
+    };
+    if let Err(error) = apply() {
+        return refuse("handoff-result-failed", error.to_string());
+    }
+    // The settlement may have completed the run — terminalizing `HandedOff`
+    // on acceptance, or releasing a winding-down source into its cancellation
+    // terminal on refusal.
+    if let Err(error) = settle_run_disposition(state, now) {
+        debug_assert!(false, "disposition settle failed: {error}");
+    }
+    AgentExchangeResult::accepted(AgentExchangePayload::empty(
+        crate::task::AGENT_HANDOFF_RESULT_RECEIPT_PAYLOAD_TYPE,
+    ))
+}
+
 /// The bounded reason a chased child's cancellation marker records.
 fn chase_reason(run: &AgentRun) -> String {
     match &run.terminal_reason {
@@ -2526,6 +2759,118 @@ fn plan_delegation_call(
     Ok(Box::new(record))
 }
 
+/// Plans one handoff tool call into its durable record, or the refusal the
+/// model corrects course from
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every check is envelope-local or cell-derived, like the delegation door,
+/// and the target resolves once — through the same application-owned catalog
+/// delegation uses (open decision 6's disposition) — inside the committing
+/// compare-and-set, so a replay never re-resolves. Deliberately absent, both
+/// ways the delegation door differs:
+///
+/// - no descendants debit and no fan-in membership — the transfer keeps the
+///   same task, so no child exists to escrow for or await; and
+/// - no ancestor cycle check — returning a task to a previous agent is a
+///   legitimate transfer, bounded by the task's own handoff limit rather
+///   than refused structurally.
+///
+/// There is also deliberately no escrow affordability pre-check: the task's
+/// ledger is not readable at this door, so an unaffordable handoff
+/// generation is refused by the task's own assignment decision and returns
+/// as the handoff-result refusal the source survives.
+#[allow(clippy::too_many_arguments)]
+fn plan_handoff_call(
+    scope: &AgentRunScope,
+    config: &crate::delegation::AgentRunDelegationConfig,
+    policy: &crate::coordination::AgentHandoffPolicy,
+    envelope: Option<&crate::delegation::AgentRunDelegationEnvelope>,
+    call: &crate::model::AgentToolCallRequest,
+    source_generation: AgentAssignmentGeneration,
+    turn: u64,
+    slot: usize,
+    goal: Option<AgentGoalId>,
+    task: AgentTaskId,
+    definition_revision: AgentRevisionNumber,
+    settings_revision: AgentRevisionNumber,
+    telemetry: AgentTelemetryContext,
+    now: AgentTimestampMillis,
+) -> Result<Box<crate::coordination::AgentHandoffRecord>, (String, String)> {
+    use crate::coordination::{handoff_id_for, AgentHandoffRecord, AgentHandoffToolCall};
+    use crate::delegation::AgentDelegationResolutionError;
+
+    let parsed = AgentHandoffToolCall::parse(&call.arguments)
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    if let Some(env) = envelope {
+        if !env.allowed_skills.is_empty() && !env.allowed_skills.contains(&parsed.skill) {
+            return Err((
+                "handoff-skill-not-allowed".to_string(),
+                format!(
+                    "the goal does not allow handing off to the skill {}",
+                    parsed.skill
+                ),
+            ));
+        }
+    }
+    let target = config
+        .catalog
+        .resolve(scope.tenant(), &parsed.skill)
+        .map_err(|error| {
+            let code = match &error {
+                AgentDelegationResolutionError::UnknownSkill { .. } => "handoff-skill-unknown",
+                AgentDelegationResolutionError::NotAuthorized { .. } => {
+                    "handoff-skill-not-authorized"
+                }
+                AgentDelegationResolutionError::Ambiguous { .. } => "handoff-target-ambiguous",
+                AgentDelegationResolutionError::Unavailable { code, .. } => code.as_str(),
+            };
+            (code.to_string(), error.to_string())
+        })?;
+    target
+        .validate()
+        .map_err(|error| ("handoff-target-invalid".to_string(), error.to_string()))?;
+    if target.agent == *scope.agent() {
+        return Err((
+            "handoff-target-self".to_string(),
+            format!(
+                "the skill {} resolves to this run's own agent; a handoff must transfer \
+                 responsibility to another agent",
+                parsed.skill
+            ),
+        ));
+    }
+    let handoff_id = handoff_id_for(scope, turn, slot)
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    let effect = effect_id_for(scope, turn, slot)
+        .map_err(|error| ("handoff-identity-invalid".to_string(), error.to_string()))?;
+    let record = AgentHandoffRecord {
+        handoff: handoff_id.clone(),
+        goal,
+        task,
+        source_run: scope.clone(),
+        source_generation,
+        requested_skill: parsed.skill,
+        resolved: target,
+        reason: parsed.reason,
+        policy_revision: policy.revision,
+        definition_revision,
+        settings_revision,
+        context: parsed.context,
+        a2a_message_id: handoff_id.as_str().to_string(),
+        deduplication_key: handoff_id.as_str().to_string(),
+        turn,
+        slot,
+        effect,
+        call_id: call.call_id.clone(),
+        telemetry,
+        created_at: now,
+    };
+    record
+        .validate()
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    Ok(Box::new(record))
+}
+
 /// Plans one workflow-tool call into its durable invocation record, or the
 /// refusal the model corrects course from
 /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
@@ -2721,6 +3066,24 @@ fn evaluate_model_output(
         .held
         .saturating_add(state.run_mut()?.loop_state.workflow_invocation_count());
     let settings_revision = state.run_mut()?.loop_state.agent_settings_revision();
+    // What the handoff door reads before anything commits: the run's owned
+    // generation — the source half of the transfer's identity — and the
+    // exclusivity facts a transfer must hold against. A handoff moves
+    // responsibility for the whole task, so it refuses beside outstanding
+    // children, an unresolved group, a live or ambiguous effect, or another
+    // handoff ([specification 8.9]: an ambiguous handoff must never authorize
+    // replay of an opaque non-idempotent source effect).
+    let (source_generation, handoff_fenced, children_outstanding, effects_outstanding) = {
+        let run = state.run_mut()?;
+        (
+            run.generation,
+            run.loop_state.handoff_fenced(),
+            run.loop_state.awaits_children() || run.loop_state.awaits_fan_in(),
+            run.loop_state.outstanding_effects().count() > 0
+                || run.loop_state.has_indeterminate_effect(),
+        )
+    };
+    let mut handoff_planned = false;
     // A committed delegation is held twice in the run's durable record — the
     // cell and the effect payload — so its admission is priced against the
     // materialized bound before anything commits. Refusing here keeps an
@@ -2742,6 +3105,19 @@ fn evaluate_model_output(
     let mut next_slot = slot_base;
     let mut await_planned = false;
     for call in calls {
+        if handoff_planned {
+            // The transfer is the turn's only work: a call planned after the
+            // handoff would schedule work for a run whose responsibility is
+            // already committed to move.
+            planned.push(PlannedCall::Refused {
+                call_id: call.call_id,
+                code: "handoff-already-pending".to_string(),
+                message: "this turn already committed a handoff; the transfer must be the \
+                          turn's only work"
+                    .to_string(),
+            });
+            continue;
+        }
         if let Some(config) = delegation {
             // The declared await verb closes the fan-in group: parsed under
             // its closed vocabulary here, applied by the commit loop below in
@@ -2753,6 +3129,22 @@ fn evaluate_model_output(
                 .as_ref()
                 .is_some_and(|tool| call.tool == *tool)
             {
+                if !config
+                    .coordination
+                    .contains(&crate::definition::AgentCoordinationCapabilityKind::Delegation)
+                {
+                    // The config is wirable for handoff alone; its delegation
+                    // vocabulary — the fan-in close included — stays inert
+                    // without the capability that authorizes it.
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: "delegation-capability-missing".to_string(),
+                        message: "the definition does not declare the delegation coordination \
+                                  capability"
+                            .to_string(),
+                    });
+                    continue;
+                }
                 match crate::fan_in::AgentFanInToolCall::parse(&call.arguments) {
                     Ok(parsed) => {
                         // The deadline is the one model-supplied value that
@@ -2791,6 +3183,22 @@ fn evaluate_model_output(
                 continue;
             }
             if call.tool == config.tool {
+                if !config
+                    .coordination
+                    .contains(&crate::definition::AgentCoordinationCapabilityKind::Delegation)
+                {
+                    // Same inert-door refusal as the fan-in arm: a
+                    // handoff-only configuration names a delegation tool it
+                    // may never serve.
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: "delegation-capability-missing".to_string(),
+                        message: "the definition does not declare the delegation coordination \
+                                  capability"
+                            .to_string(),
+                    });
+                    continue;
+                }
                 if await_planned {
                     // The await planned earlier in this turn closes the run's
                     // one fan-out group, and the commit loop applies calls in
@@ -2864,6 +3272,117 @@ fn evaluate_model_output(
                             let request = AgentRunEffectRequest::A2aSend { delegation: record };
                             let spec = policies.spec_for(&request).clone();
                             next_slot += 1;
+                            planned.push(PlannedCall::Effect(request, spec));
+                        }
+                    }
+                    Err((code, message)) => planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code,
+                        message,
+                    }),
+                }
+                continue;
+            }
+            // A call naming the declared handoff tool is intercepted into a
+            // same-task transfer ([specification 8.9]): parsed under its
+            // closed vocabulary, narrowed by the goal's allowed skills,
+            // resolved through the same catalog as delegation, and committed
+            // as the handoff record plus its send effect in this one
+            // compare-and-set. The transfer must be the turn's only work,
+            // beside no live children, group, effect, or earlier handoff.
+            if let Some(policy) = config
+                .handoff
+                .as_ref()
+                .filter(|policy| call.tool == policy.tool)
+            {
+                let refusal = if await_planned {
+                    Some((
+                        "handoff-after-await",
+                        "this turn already closed its fan-out group; a handoff must wait for \
+                         the fan-in to resolve"
+                            .to_string(),
+                    ))
+                } else if planned.iter().any(|planned| {
+                    matches!(
+                        planned,
+                        PlannedCall::Effect(..) | PlannedCall::AwaitFanIn { .. }
+                    )
+                }) {
+                    Some((
+                        "handoff-with-planned-calls",
+                        "this turn already planned other work; a handoff must be the turn's \
+                         only call"
+                            .to_string(),
+                    ))
+                } else if handoff_fenced {
+                    Some((
+                        "handoff-already-pending",
+                        "the run already holds an unresolved handoff".to_string(),
+                    ))
+                } else if children_outstanding {
+                    Some((
+                        "handoff-children-outstanding",
+                        "the run holds unsettled children or an unresolved fan-in group; await \
+                         or cancel them before handing off"
+                            .to_string(),
+                    ))
+                } else if effects_outstanding {
+                    Some((
+                        "handoff-with-pending-effects",
+                        "the run holds an outstanding or indeterminate effect; a handoff may \
+                         not transfer work whose external outcome is still open"
+                            .to_string(),
+                    ))
+                } else {
+                    None
+                };
+                if let Some((code, message)) = refusal {
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: code.to_string(),
+                        message,
+                    });
+                    continue;
+                }
+                match plan_handoff_call(
+                    scope,
+                    config,
+                    policy,
+                    envelope.as_ref(),
+                    &call,
+                    source_generation,
+                    turn,
+                    next_slot,
+                    run_goal.clone(),
+                    run_task.clone(),
+                    definition_revision,
+                    settings_revision,
+                    telemetry.clone(),
+                    now,
+                ) {
+                    Ok(record) => {
+                        let record_bytes = serde_json::to_vec(record.as_ref())
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(usize::MAX);
+                        let cost = record_bytes
+                            .saturating_mul(2)
+                            .saturating_add(AGENT_HANDOFF_COMMIT_OVERHEAD_BYTES);
+                        if cost > delegation_headroom {
+                            planned.push(PlannedCall::Refused {
+                                call_id: call.call_id,
+                                code: "handoff-headroom-exceeded".to_string(),
+                                message: format!(
+                                    "committing this handoff would add {cost} bytes to the \
+                                     run's durable record, which exceeds its \
+                                     {delegation_headroom} bytes of remaining headroom"
+                                ),
+                            });
+                        } else {
+                            delegation_headroom -= cost;
+                            let request = AgentRunEffectRequest::A2aHandoff { handoff: record };
+                            let spec = policies.spec_for(&request).clone();
+                            next_slot += 1;
+                            handoff_planned = true;
                             planned.push(PlannedCall::Effect(request, spec));
                         }
                     }
@@ -3051,6 +3570,19 @@ fn evaluate_model_output(
                     );
                     run.loop_state.join_fan_in(fan_in_policy, member, turn, now);
                 }
+                if let AgentRunEffectRequest::A2aHandoff { handoff } = &request {
+                    // The handoff record and its cell commit with the send
+                    // effect in this one compare-and-set — persisted strictly
+                    // before the settle pass can hand anything to the sink.
+                    // The cell joins no fan-out group: the transfer is not a
+                    // child, and its resolution returns through the task's
+                    // handoff-result exchange.
+                    let run = state.run_mut()?;
+                    run.loop_state
+                        .record_handoff(crate::coordination::AgentHandoffCell::pending(
+                            handoff.clone(),
+                        ));
+                }
                 if let AgentRunEffectRequest::WorkflowStart { invocation } = &request {
                     // The invocation record and its cell commit with the
                     // start effect in this same discipline, and the cell
@@ -3208,7 +3740,16 @@ fn turn_rest(loop_state: &AgentLoopState) -> (AgentLoopPhase, AgentRunStatus) {
             AgentLoopPhase::AwaitingTools,
             checkpoint_wait_status(loop_state),
         )
-    } else if loop_state.awaits_fan_in() {
+    } else if loop_state.awaits_fan_in()
+        || loop_state
+            .handoff()
+            .is_some_and(|cell| cell.status.awaits_target())
+    {
+        // An unresolved handoff rests exactly like an awaiting fan-in: the
+        // run is waiting for the task's durable handoff-result exchange,
+        // which the choreography re-drives, and the fence keeps the turn
+        // open until the resolution records the call's result
+        // ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
         (AgentLoopPhase::AwaitingChildren, AgentRunStatus::Running)
     } else {
         (AgentLoopPhase::RecordingTurn, AgentRunStatus::Running)
@@ -3566,6 +4107,35 @@ fn apply_effect_outcome(
                 run.status = status;
             }
         }
+        AgentRunEffectOutcome::A2aHandoff { receipt } => {
+            // The task durably recorded the transfer and offered the target
+            // its generation. The effect succeeds and the handoff cell marks
+            // `Sent` in this same compare-and-set. Deliberately no tool
+            // result yet — the call's result is recorded when the handoff
+            // *resolves* through the task's handoff-result exchange, so the
+            // turn stays open across the wait and the fence derived from the
+            // cell keeps the source from any new work
+            // ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+            effect.status = AgentRunEffectStatus::Succeeded;
+            let run = state.run_mut()?;
+            let held = run
+                .loop_state
+                .handoff()
+                .is_some_and(|cell| cell.record.handoff == receipt.handoff);
+            if !held {
+                return Err(AgentRunError::UnknownHandoff {
+                    handoff: receipt.handoff.clone(),
+                });
+            }
+            if let Some(cell) = run.loop_state.handoff_mut() {
+                cell.mark_sent(receipt.target_generation);
+            }
+            if !winding_down && !run.loop_state.awaits_effect() {
+                let (phase, status) = turn_rest(&run.loop_state);
+                run.loop_state.set_phase(phase);
+                run.status = status;
+            }
+        }
         AgentRunEffectOutcome::WorkflowStart { receipt } => {
             // The start durably reached — or adopted — its one logical child
             // run. The effect succeeds and the invocation cell settles in
@@ -3659,6 +4229,73 @@ fn apply_effect_outcome(
             effect.last_error_code = Some(bounded_detail(code.clone()));
             let failed_kind = effect.kind();
             let code = code.clone();
+            // A handoff send resolves before the shared wind-down logic: the
+            // run *survives* its definitive failure — the transfer was never
+            // recorded, the cell settles, the fence releases, and the model
+            // sees the failed tool result ([specification 8.9]: refusals are
+            // survivable). An *exhausted* send is different: the executor's
+            // probe could not establish whether the task recorded the
+            // transfer, and resuming beside a possibly-live transfer is the
+            // ambiguity the specification forbids — the generation parks
+            // `Indeterminate` for a reconciliation decision instead, with
+            // the cell still holding the fence.
+            let handoff_held = failed_kind == AgentRunEffectKind::A2aSendCall
+                && state.run().is_some_and(|run| {
+                    run.loop_state
+                        .handoff()
+                        .is_some_and(|cell| cell.record.effect == *effect_id)
+                });
+            if handoff_held {
+                let exhausted = matches!(outcome, AgentRunEffectOutcome::Exhausted { .. });
+                let run = state.run_mut()?;
+                if exhausted {
+                    if let Some(effect) = run.loop_state.effect_mut(effect_id) {
+                        effect.status = AgentRunEffectStatus::Indeterminate;
+                    }
+                } else {
+                    let call_id = run
+                        .loop_state
+                        .handoff()
+                        .map(|cell| cell.record.call_id.clone());
+                    if let Some(cell) = run.loop_state.handoff_mut() {
+                        cell.settle_failed(bounded_detail(code.clone()), now);
+                    }
+                    if let Some(call_id) = call_id {
+                        let content = AgentTaskContent::inline(serde_json::json!({
+                            "error": bounded_detail(code.clone()),
+                            "message": "the handoff send failed definitively; no transfer was \
+                                        recorded",
+                        }))
+                        .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                        run.loop_state.record_tool_result(AgentToolResult {
+                            call_id,
+                            content,
+                            recorded_at: now,
+                        });
+                    }
+                    if !winding_down && !run.loop_state.awaits_effect() {
+                        let (phase, status) = turn_rest(&run.loop_state);
+                        run.loop_state.set_phase(phase);
+                        run.status = status;
+                    }
+                }
+                if first_resolution {
+                    let reservation = {
+                        let run = state.run_mut()?;
+                        run.loop_state
+                            .effect_mut(effect_id)
+                            .map(|effect| (effect.max_attempts, effect.attempts))
+                    };
+                    if let Some((reserved, made)) = reservation {
+                        let run = state.run_mut()?;
+                        run.loop_state.budget_mut().settle_effect(reserved, made);
+                    }
+                }
+                let run = state.run_mut()?;
+                run.check_bounds(0)?;
+                state.updated_at = now;
+                return Ok(());
+            }
             // A failed memory promotion is one exception to the wind-down:
             // memory is never the correctness source
             // ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)),
@@ -3841,6 +4478,19 @@ fn apply_effect_outcome(
                     });
                 if let Some(delegation_id) = held {
                     if let Some(cell) = run.loop_state.delegation_mut(&delegation_id) {
+                        cell.settle_failed("run-winding-down", now);
+                    }
+                }
+                // A fenced handoff send settles its cell the same way: the
+                // winding-down source never recorded the transfer at the
+                // task, and recovery after the wind-down uses a new handoff,
+                // never this one.
+                let handoff_held = run
+                    .loop_state
+                    .handoff()
+                    .is_some_and(|cell| cell.record.effect == *effect_id);
+                if handoff_held {
+                    if let Some(cell) = run.loop_state.handoff_mut() {
                         cell.settle_failed("run-winding-down", now);
                     }
                 }
@@ -4062,7 +4712,12 @@ fn apply_indeterminate_resolution(
                 // reconciled delegation send settles its cell in the same
                 // compare-and-set — proven never executed means the child was
                 // never created, and recovery after the wind-down uses a new
-                // delegation, never this one.
+                // delegation, never this one. A reconciled handoff or
+                // workflow start settles its cell the same way — the
+                // transfer was never recorded, the child run never reached —
+                // because a cell left `Pending` here has no exchange left
+                // that could ever settle it, and `awaits_children` would
+                // hold the wind-down open forever.
                 effect.status = AgentRunEffectStatus::Cancelled;
                 let cancelled_kind = effect.kind();
                 if cancelled_kind == AgentRunEffectKind::A2aSendCall {
@@ -4072,6 +4727,30 @@ fn apply_indeterminate_resolution(
                     });
                     if let Some(delegation_id) = held {
                         if let Some(cell) = run.loop_state.delegation_mut(&delegation_id) {
+                            cell.settle_failed("run-winding-down", now);
+                        }
+                    }
+                    let handoff_held = run
+                        .loop_state
+                        .handoff()
+                        .is_some_and(|cell| cell.record.effect == *effect_id);
+                    if handoff_held {
+                        if let Some(cell) = run.loop_state.handoff_mut() {
+                            cell.settle_failed("run-winding-down", now);
+                        }
+                    }
+                }
+                if cancelled_kind == AgentRunEffectKind::WorkflowStartCall {
+                    let run = state.run_mut()?;
+                    let held =
+                        run.loop_state
+                            .workflow_invocations()
+                            .iter()
+                            .find_map(|(id, cell)| {
+                                (cell.record.effect == *effect_id).then(|| id.clone())
+                            });
+                    if let Some(invocation_id) = held {
+                        if let Some(cell) = run.loop_state.workflow_invocation_mut(&invocation_id) {
                             cell.settle_failed("run-winding-down", now);
                         }
                     }
@@ -4511,6 +5190,12 @@ fn promote_memory(
         // authorizes past the fence.
         return Err(AgentRunError::MemoryPromotionFenced { status: run.status });
     }
+    if run.loop_state.handoff_fenced() {
+        // New work is equally fenced by an unresolved handoff: the run's
+        // responsibility is committed to move
+        // ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+        return Err(AgentRunError::HandoffPending { status: run.status });
+    }
     if !session_wired {
         return Err(AgentRunError::SessionMemoryUnwired);
     }
@@ -4586,6 +5271,11 @@ fn append_claim(
     if run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling {
         // An append is new work, which the wind-down fence forbids.
         return Err(AgentRunError::ClaimAppendFenced { status: run.status });
+    }
+    if run.loop_state.handoff_fenced() {
+        // New work is equally fenced by an unresolved handoff
+        // ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+        return Err(AgentRunError::HandoffPending { status: run.status });
     }
     append
         .validate()
@@ -4673,6 +5363,11 @@ fn evaluate_goal(
         }
         if run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling {
             return Err(AgentRunError::GoalEvaluationFenced { status: run.status });
+        }
+        if run.loop_state.handoff_fenced() {
+            // New work is equally fenced by an unresolved handoff
+            // ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+            return Err(AgentRunError::HandoffPending { status: run.status });
         }
         evaluation
             .validate()
@@ -5148,6 +5843,25 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 }
                 return transition;
             }
+            AgentExchangeKind::HandoffResult => {
+                let result = accept_handoff_result(state, envelope, now);
+                // The resolution may have terminalized the source —
+                // `HandedOff` on acceptance, the standing cancellation on a
+                // refused transfer's wind-down — and whatever the
+                // terminalization owes commits in this same compare-and-set.
+                let mut transition = AgentExchangeTransition::new(result);
+                match owed_run_exchanges(state, now) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert!(false, "owed-exchange construction failed: {error}");
+                    }
+                }
+                return transition;
+            }
             kind => refuse(
                 "unsupported-exchange",
                 format!("a run entity does not receive a {kind} exchange"),
@@ -5201,19 +5915,19 @@ impl AgentExchangeParticipant for AgentRunParticipant {
             kind @ (AgentExchangeKind::BudgetSettlement | AgentExchangeKind::BudgetReturn)
                 if !result.is_accepted() =>
             {
-                // A rejected settlement or return settles only when the refusal
-                // is the ledger's own replay answer: `escrow-child-unknown`
-                // proves the escrow was already settled and returned, so this
-                // step is done. Any other refusal — an `unsupported-exchange`
-                // from a task owner that predates the ledger, a payload it
-                // could not decode — is the receiver's inability, not the
-                // ledger answering. Settling on it would mark the run
-                // `Settled`/`Returned` while the task never recorded the
-                // consumption, leaking the child's escrow forever; the exchange
-                // stays outstanding instead and is re-driven until an owner
-                // that can answer it does.
+                // The initiator half of the shared classifier: a rejected
+                // settlement or return settles only when the refusal is the
+                // ledger's own replay answer, which proves the escrow was
+                // already settled and returned. Any other refusal is the
+                // receiver's inability, not the ledger answering — and the
+                // task's receiver half of the same classifier keeps that
+                // class unmemoized, so the re-drive actually re-runs the arm
+                // instead of replaying the inability for the whole applied
+                // window.
                 match result.status().rejection_code() {
-                    Some(AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN) => Ok(()),
+                    Some(code) if crate::coordination::escrow_settlement_refusal_settles(code) => {
+                        Ok(())
+                    }
                     code => Err(AgentChoreographyError::UnsettleableRefusal {
                         kind,
                         code: code.unwrap_or_default().to_string(),
@@ -5221,17 +5935,78 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 }
             }
             AgentExchangeKind::DelegationCancel if !result.is_accepted() => {
-                // A refused delegation-cancel settles only under the child's
-                // definitive answers: the sender was not its recorded parent,
-                // or it carries no such delegation. Every other refusal — an
-                // `unsupported-exchange` from an owner that predates the
-                // kind, a payload it could not decode — leaves the exchange
-                // outstanding for re-drive until an owner that can answer it
-                // does (the rolling-upgrade rule).
+                // The initiator half of the shared classifier: a refused
+                // delegation-cancel settles only under the child's definitive
+                // answers — the sender was not its recorded parent, or it
+                // carries no such delegation. Every other refusal leaves the
+                // exchange outstanding for re-drive (the rolling-upgrade
+                // rule), and the child task's receiver half keeps that class
+                // unmemoized so the re-drive actually re-runs the arm.
                 match result.status().rejection_code() {
-                    Some("delegation-cancel-forged" | "delegation-cancel-not-delegated") => Ok(()),
+                    Some(code) if crate::coordination::delegation_cancel_refusal_settles(code) => {
+                        Ok(())
+                    }
                     code => Err(AgentChoreographyError::UnsettleableRefusal {
                         kind: AgentExchangeKind::DelegationCancel,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
+            AgentExchangeKind::DelegationResult if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the run is this
+                // exchange's receiver, and the host memoizes only the
+                // refusals classified definitive here. Both refusals this
+                // binary mints outside that set therefore re-run on the next
+                // drive instead of answering every re-drive from the journal
+                // — the version-skew `delegation-result-undecodable`, and
+                // `delegation-result-early`, which this run mints when its
+                // own send receipt has not settled the delegation cell yet.
+                // Memoizing the early refusal would wedge in-version: the
+                // child re-drives a result this run already refused once and
+                // can no longer re-answer, while the fan-in member it belongs
+                // to waits forever.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::delegation_result_refusal_settles(code) => {
+                        Ok(())
+                    }
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind: AgentExchangeKind::DelegationResult,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
+            AgentExchangeKind::RunCancel if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the host
+                // memoizes only the refusals classified definitive here, so
+                // the version-skew `run-cancel-undecodable` and the transient
+                // `run-cancel-failed` stay unmemoized and re-run once the
+                // wind-down can start — instead of leaving the task's
+                // cancellation propagating forever against a journal entry
+                // that answers for it.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::run_cancel_refusal_settles(code) => Ok(()),
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind: AgentExchangeKind::RunCancel,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
+            AgentExchangeKind::HandoffResult if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the run is
+                // this exchange's receiver, and the host memoizes only the
+                // refusals classified definitive here. The arm's own
+                // version-skew refusal, `handoff-result-undecodable`,
+                // therefore re-runs on the next drive instead of answering
+                // every re-drive from the journal for the whole applied
+                // window — which would leave the task re-driving an owed
+                // result forever while the run never terminalizes
+                // `HandedOff`.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::handoff_result_refusal_settles(code) => {
+                        Ok(())
+                    }
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind: AgentExchangeKind::HandoffResult,
                         code: code.unwrap_or_default().to_string(),
                     }),
                 }
@@ -5505,6 +6280,16 @@ where
         Ok(state)
     }
 
+    /// Re-reads the durable record unconditionally, without the public
+    /// recovery counter: a sweep's re-materialization is residency hygiene,
+    /// not a recovery event, and counting every sweep would drown the
+    /// signal the recovery metric exists to surface.
+    async fn rematerialize(&mut self, now: AgentTimestampMillis) -> AgentRunResult<()> {
+        self.host.recover(now).await?;
+        self.recovered = true;
+        Ok(())
+    }
+
     /// The currently recovered state.
     pub fn state(&self) -> AgentRunResult<&AgentRunState> {
         Ok(self.host.state()?)
@@ -5541,7 +6326,29 @@ where
         // transition commits before the settle pass, so a resolution can be
         // durable even when the call fails.
         let resolution_before = self.fan_in_resolution();
-        let reply = self.apply_command(command, router, now).await;
+        let reverify = command.clone();
+        let reply = match self.apply_command(command, router, now).await {
+            // A command that *commits* is fenced by its own compare-and-set:
+            // it is written at the cached record's revision, so a second
+            // writer that moved the durable record first makes the write
+            // lose, drops the cache, and the retry re-reads. A command that
+            // is *refused* writes nothing, so that fence never engages — and
+            // a run has two writers by construction, this resident facade and
+            // the courier reaching the same durable record through its own
+            // store handle. A generation, fence, or effect-attempt guard
+            // answered from a cache the other writer has already moved past
+            // is a definitive-looking refusal that, writing nothing, would
+            // never correct itself for the whole residency. So a refusal is
+            // re-answered against a re-materialized record — bounded to one
+            // extra pass, whose verdict is authoritative whatever it says.
+            // The happy path pays nothing, which is the point of a resident
+            // entity at all.
+            Err(error) if run_refusal_may_be_stale(&error) => {
+                self.rematerialize(now).await?;
+                self.apply_command(reverify, router, now).await
+            }
+            other => other,
+        };
         self.record_fan_in_resolution(resolution_before);
         reply
     }
@@ -5794,6 +6601,20 @@ where
             )
             .ok();
         }
+        if envelope.kind() == AgentExchangeKind::HandoffResult {
+            let outcome = if reply.result().is_accepted() {
+                "accepted"
+            } else {
+                "rejected"
+            };
+            record_agent_domain_counter(
+                self.metrics.as_ref(),
+                crate::observability::METRIC_AGENT_HANDOFF_RESULTS,
+                1,
+                &[("outcome", outcome)],
+            )
+            .ok();
+        }
         // Accepting a delivered exchange makes *local* progress only: it cranks
         // the loop and hands new effects to the sink. It does **not** deliver the
         // cross-entity exchanges that crank may have committed to the run's
@@ -5891,10 +6712,11 @@ where
     /// Cranks the loop from durable state alone: advance, dispatch, drive.
     ///
     /// It is safe to call at any time and from any node, because every step reads
-    /// what it needs from the durable record. Calling it after a transition, after
-    /// recovery, or from a sweep are the same operation — which is exactly what
-    /// makes a run that was lost between persisting a wait and dispatching the
-    /// effect it waits on recoverable.
+    /// what it needs from the durable record — the pass re-materializes that
+    /// record first, so a sweep never trusts this facade's cache. Calling it
+    /// after a transition, after recovery, or from a sweep are the same
+    /// operation — which is exactly what makes a run that was lost between
+    /// persisting a wait and dispatching the effect it waits on recoverable.
     ///
     /// Each *advance* is one bounded transition and one compare-and-set, and the
     /// pass stops as soon as the loop reaches a durable wait. Both fences —
@@ -5906,7 +6728,16 @@ where
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentRunProgress> {
-        self.ensure_recovered(now).await?;
+        // Re-materialized unconditionally, not merely healed: a run has two
+        // writers by construction — the exchange couriers reach it through
+        // transports holding their *own* store handles. The command path
+        // survives a stale cache because its compare-and-set loses, drops
+        // the record, and the retry re-reads — but a sweep that decides it
+        // owes nothing from a stale cache performs zero writes, never
+        // conflicts, and so would never re-read. `apply` stays on the inner
+        // pass: its transition just committed through this facade, so its
+        // cache is the head it wrote.
+        self.rematerialize(now).await?;
         // A sweep can resolve the group too — an await that closed over
         // members which had all already settled advances here, and a member
         // send that fails definitively settles here — so a direct sweep
@@ -5945,6 +6776,8 @@ where
             progress.decisions_flushed += decisions;
             progress.settled += report.settled;
             progress.failed += report.failed;
+            progress.unsettleable += report.unsettleable.len();
+            record_unsettleable_exchanges(self.metrics.as_ref(), &report.unsettleable);
 
             if advanced == 0
                 && cancels == 0
@@ -6593,6 +7426,8 @@ pub struct AgentRunProgress {
     pub settled: usize,
     /// How many delivery attempts failed, leaving their exchange outstanding.
     pub failed: usize,
+    /// How many of those were refusals no re-drive can settle.
+    pub unsettleable: usize,
     /// How many exchanges the run still owes.
     pub outstanding: usize,
 }
@@ -7463,6 +8298,28 @@ where
     entity
 }
 
+/// Whether a refused command's verdict could have been computed from a stale
+/// cached record, and so must be re-answered against durable state.
+///
+/// Infrastructure faults are excluded deliberately, and not merely because
+/// re-reading would not change them: a run's settlement runs *after* its
+/// transition commits, so a post-commit dispatch or persistence failure
+/// surfaces from a command that already applied. Re-driving such a command
+/// would answer it `Duplicate` from the operation log and swallow the fault
+/// the caller must see. Only a domain refusal — a verdict derived from the
+/// record's own fences, which by construction wrote nothing — is re-answered.
+fn run_refusal_may_be_stale(error: &AgentRunError) -> bool {
+    !matches!(
+        error,
+        AgentRunError::Identity(_)
+            | AgentRunError::Schema(_)
+            | AgentRunError::Choreography(_)
+            | AgentRunError::Persistence(_)
+            | AgentRunError::Effect(_)
+            | AgentRunError::Model(_)
+    )
+}
+
 /// Returns a sharded reference to one run entity.
 pub fn agent_run_entity_ref(
     sharding: &ClusterSharding,
@@ -7527,6 +8384,11 @@ pub enum AgentRunError {
     UnknownDelegation {
         /// The delegation the receipt named.
         delegation: crate::identity::AgentDelegationId,
+    },
+    /// A send receipt named a handoff the run does not hold.
+    UnknownHandoff {
+        /// The handoff the receipt named.
+        handoff: crate::identity::AgentHandoffId,
     },
     /// A start receipt named a workflow invocation the run does not hold.
     UnknownWorkflowInvocation {
@@ -7633,6 +8495,14 @@ pub enum AgentRunError {
         /// The status the run held.
         status: AgentRunStatus,
     },
+    /// New work was requested of a run whose unresolved handoff fences it:
+    /// the run's responsibility is committed to move, and only the task's
+    /// handoff-result exchange releases or terminalizes it
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    HandoffPending {
+        /// The status the run held.
+        status: AgentRunStatus,
+    },
     /// An evaluation named a goal this run is not bound to — or the run is
     /// bound to no goal at all.
     GoalEvaluationUnbound {
@@ -7700,6 +8570,7 @@ impl AgentRunError {
             Self::Terminal { .. } => "run-terminal",
             Self::UnknownEffect { .. } => "run-unknown-effect",
             Self::UnknownDelegation { .. } => "run-unknown-delegation",
+            Self::UnknownHandoff { .. } => "run-unknown-handoff",
             Self::UnknownWorkflowInvocation { .. } => "run-unknown-workflow-invocation",
             Self::WorkflowResultRefused { code, .. } => code,
             Self::Checkpoint(error) => error.code(),
@@ -7716,6 +8587,7 @@ impl AgentRunError {
             Self::MemoryConsolidationInvalid => "run-memory-consolidation-invalid",
             Self::MemoryPromotionUnaffordable { .. } => "run-memory-promotion-unaffordable",
             Self::GoalEvaluationFenced { .. } => "run-goal-evaluation-fenced",
+            Self::HandoffPending { .. } => "run-handoff-pending",
             Self::GoalEvaluationUnbound { .. } => "run-goal-evaluation-unbound",
             Self::GoalEvaluationInvalid { .. } => "run-goal-evaluation-invalid",
             Self::GoalEvaluationOutstanding => "run-goal-evaluation-outstanding",
@@ -7753,6 +8625,10 @@ impl Display for AgentRunError {
             Self::UnknownDelegation { delegation } => write!(
                 f,
                 "a send receipt named delegation {delegation}, which this run does not hold"
+            ),
+            Self::UnknownHandoff { handoff } => write!(
+                f,
+                "a send receipt named handoff {handoff}, which this run does not hold"
             ),
             Self::UnknownWorkflowInvocation { invocation } => write!(
                 f,
@@ -7818,6 +8694,11 @@ impl Display for AgentRunError {
             Self::GoalEvaluationFenced { status } => write!(
                 f,
                 "the run is {status} and winding down; an evaluation is new work the fence forbids"
+            ),
+            Self::HandoffPending { status } => write!(
+                f,
+                "the run is {status} with an unresolved handoff; new work is fenced until the \
+                 transfer resolves"
             ),
             Self::GoalEvaluationUnbound { goal } => write!(
                 f,
@@ -8128,7 +9009,8 @@ mod tests {
         });
         run.loop_state.set_accepted_result(AgentAcceptedResult {
             proposal_id,
-            run: scope.run().clone(),
+            run: Some(scope.run().clone()),
+            principal: None,
             definition_id: definition.definition_id.clone(),
             definition_version: definition.version,
             result_schema: definition.result_schema,
@@ -8345,6 +9227,201 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&unwired.metrics, &metrics),
             "an unwired deployment measures through the no-op default"
+        );
+    }
+
+    /// An accepted resolution contradicting a locally settled failure
+    /// corrects the record instead of being absorbed: the task's durable
+    /// acceptance is where responsibility actually went. On a live run the
+    /// source terminalizes `HandedOff`; on an already-terminal run the cell
+    /// alone is corrected and the terminal state stands; a genuine duplicate
+    /// — the cell already accepted — still absorbs idempotently.
+    #[test]
+    fn a_contradicted_accepted_resolution_corrects_the_settled_cell() {
+        use crate::coordination::{AgentHandoffCell, AgentHandoffRecord, AgentHandoffStatus};
+
+        let now = AgentTimestampMillis::new(10);
+        let scope = AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support-agent").expect("the agent id is valid"),
+            AgentRunId::new("ticket-1-gen-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let task = AgentTaskId::new("ticket-1").expect("the task id is valid");
+        let task_scope = AgentTaskScope::new(scope.tenant().clone(), task.clone())
+            .expect("the task scope is valid");
+        let schema = AgentSchemaRef::new(
+            AgentSchemaId::new("result").expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        );
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("resolve-ticket").expect("the definition id is valid"),
+            "The correction fixture.",
+            schema.clone(),
+            schema,
+        )
+        .expect("the definition is valid");
+        let handoff_id =
+            crate::coordination::handoff_id_for(&scope, 1, 0).expect("the handoff id derives");
+        let record = AgentHandoffRecord {
+            handoff: handoff_id.clone(),
+            goal: None,
+            task: task.clone(),
+            source_run: scope.clone(),
+            source_generation: AgentAssignmentGeneration::new(1),
+            requested_skill: crate::AgentCapabilityId::new("billing")
+                .expect("the skill id is valid"),
+            resolved: crate::delegation::AgentDelegationTarget::new(
+                AgentId::new("billing-agent").expect("the agent id is valid"),
+                AgentTaskDefinitionId::new("resolve-ticket").expect("the definition id is valid"),
+            ),
+            reason: "needs billing authority".to_string(),
+            policy_revision: AgentRevisionNumber::INITIAL,
+            definition_revision: AgentRevisionNumber::INITIAL,
+            settings_revision: AgentRevisionNumber::INITIAL,
+            context: Vec::new(),
+            a2a_message_id: handoff_id.as_str().to_string(),
+            deduplication_key: handoff_id.as_str().to_string(),
+            turn: 1,
+            slot: 0,
+            effect: AgentEffectId::new("effect-1"),
+            call_id: AgentToolCallId::new("call-1").expect("the call id is valid"),
+            telemetry: Default::default(),
+            created_at: now,
+        };
+        let build_state = |status: AgentRunStatus,
+                           terminal_reason: Option<AgentRunTerminalReason>,
+                           cell_status: AgentHandoffStatus| {
+            let budget = AgentRunBudget::allocate(
+                crate::budget::AgentBudgetGrant::from_ceilings(&definition.budgets),
+                now,
+            );
+            let mut loop_state = AgentLoopState::started(
+                task.clone(),
+                None,
+                AgentRevisionNumber::INITIAL,
+                AgentRevisionNumber::INITIAL,
+                definition.version,
+                budget,
+            );
+            let mut cell = AgentHandoffCell::pending(Box::new(record.clone()));
+            cell.status = cell_status;
+            cell.settled_at = Some(now);
+            loop_state.record_handoff(cell);
+            let mut state = AgentRunState::unassigned(scope.clone(), now);
+            state.run = Some(AgentRun {
+                binding: AgentRunBinding::new(scope.clone(), task.clone()),
+                generation: AgentAssignmentGeneration::new(1),
+                definition: definition.clone(),
+                input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                    .expect("the input is inline-bounded"),
+                status,
+                loop_state,
+                terminal_reason,
+                settlement: AgentRunSettlementStatus::Owed,
+                accepted_at: now,
+            });
+            state
+        };
+        let operation_id =
+            crate::coordination::handoff_result_operation_id(scope.tenant(), &handoff_id)
+                .expect("the operation id derives");
+        let target_run = AgentRunId::new("ticket-1-gen-2").expect("the run id is valid");
+        let notice = crate::task::AgentHandoffResultNotice {
+            task: task_scope.clone(),
+            handoff: handoff_id.clone(),
+            resolution: crate::task::AgentHandoffResolutionNotice::Accepted {
+                target_run: target_run.clone(),
+                generation: AgentAssignmentGeneration::new(2),
+            },
+        };
+        let envelope = AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::HandoffResult,
+            AgentEntityAddress::Task(task_scope),
+            AgentEntityAddress::Run(scope.clone()),
+            AgentExchangePayload::encode(crate::task::AGENT_HANDOFF_RESULT_PAYLOAD_TYPE, &notice)
+                .expect("the payload encodes"),
+            rakka_agent_workflow::AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )
+        .expect("the envelope builds");
+
+        // A live run whose cell settled under a local failure: the
+        // acceptance applies as a first resolution would, and the source
+        // terminalizes `HandedOff` instead of spending budget on a task it
+        // no longer owns.
+        let mut live = build_state(
+            AgentRunStatus::Running,
+            None,
+            AgentHandoffStatus::Failed {
+                code: "run-winding-down".to_string(),
+            },
+        );
+        let result = accept_handoff_result(&mut live, &envelope, now);
+        assert!(result.is_accepted(), "the correction settles the exchange");
+        let run = live.run().expect("the run survives");
+        assert!(
+            matches!(
+                run.loop_state.handoff().expect("the cell survives").status,
+                AgentHandoffStatus::Accepted { .. }
+            ),
+            "the cell is corrected to the durable acceptance"
+        );
+        assert!(
+            matches!(
+                run.terminal_reason,
+                Some(AgentRunTerminalReason::HandedOff { .. })
+            ),
+            "responsibility durably moved, so the source hands off"
+        );
+        assert_eq!(run.status, AgentRunStatus::HandedOff);
+
+        // An already-terminal run: the terminal state is history and stands,
+        // but the cell is corrected so the views carry the durable truth.
+        let mut terminal = build_state(
+            AgentRunStatus::Cancelled,
+            Some(AgentRunTerminalReason::CancellationRequested {
+                reason: "cancelled".to_string(),
+            }),
+            AgentHandoffStatus::Failed {
+                code: "run-winding-down".to_string(),
+            },
+        );
+        let result = accept_handoff_result(&mut terminal, &envelope, now);
+        assert!(result.is_accepted(), "the correction settles the exchange");
+        let run = terminal.run().expect("the run survives");
+        assert!(
+            matches!(
+                run.loop_state.handoff().expect("the cell survives").status,
+                AgentHandoffStatus::Accepted { .. }
+            ),
+            "the cell is corrected to the durable acceptance"
+        );
+        assert_eq!(run.status, AgentRunStatus::Cancelled, "history stands");
+        assert!(matches!(
+            run.terminal_reason,
+            Some(AgentRunTerminalReason::CancellationRequested { .. })
+        ));
+
+        // A genuine duplicate absorbs idempotently: an accepted cell keeps
+        // its resolution untouched.
+        let mut duplicate = build_state(
+            AgentRunStatus::HandedOff,
+            Some(AgentRunTerminalReason::HandedOff {
+                handoff: handoff_id.clone(),
+                target: AgentId::new("billing-agent").expect("the agent id is valid"),
+            }),
+            AgentHandoffStatus::Accepted {
+                target_run,
+                generation: AgentAssignmentGeneration::new(2),
+            },
+        );
+        let result = accept_handoff_result(&mut duplicate, &envelope, now);
+        assert!(result.is_accepted(), "the duplicate answers idempotently");
+        assert_eq!(
+            duplicate.run().expect("the run survives").status,
+            AgentRunStatus::HandedOff
         );
     }
 }

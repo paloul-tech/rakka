@@ -174,6 +174,7 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
                         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                             .expect("the input is inline-bounded"),
                         assignee: Some(agent_id()),
+                        team: None,
                         goal: None,
                         goal_mode: Default::default(),
                         goal_spec: None,

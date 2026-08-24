@@ -532,6 +532,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
                     input: AgentTaskContent::inline(serde_json::json!({ "mission": 1 }))
                         .expect("the input is inline-bounded"),
                     assignee: Some(agent(COORDINATOR)),
+                    team: None,
                     goal: None,
                     goal_mode: Default::default(),
                     goal_spec: Some(Box::new(AgentGoalSpecDraft {

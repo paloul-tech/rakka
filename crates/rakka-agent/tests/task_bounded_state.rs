@@ -253,6 +253,7 @@ impl Fixture {
             definition: task_definition(),
             input,
             assignee: Some(agent_id()),
+            team: None,
             goal,
             goal_mode,
             goal_spec,
@@ -465,6 +466,7 @@ async fn the_widest_transition_never_loses_a_history_entry() {
         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
             .expect("the input is inline-bounded"),
         assignee: Some(agent_id()),
+        team: None,
         goal: None,
         goal_mode: Default::default(),
         goal_spec: None,
@@ -709,6 +711,7 @@ async fn an_agent_owned_task_id_reserves_room_for_its_derived_run_ids() {
                         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                             .expect("the input is inline-bounded"),
                         assignee: Some(agent_id()),
+                        team: None,
                         goal: None,
                         goal_mode: Default::default(),
                         goal_spec: None,
@@ -861,6 +864,7 @@ async fn an_admitted_task_reserves_growth_headroom_for_its_own_lifecycle() {
                         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                             .expect("the input is inline-bounded"),
                         assignee: Some(agent_id()),
+                        team: None,
                         goal: None,
                         goal_mode: Default::default(),
                         goal_spec: None,
@@ -1310,6 +1314,7 @@ async fn the_widest_delegation_provenance_fits_the_task_record() {
         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
             .expect("the input is inline-bounded"),
         assignee: Some(agent_id()),
+        team: None,
         goal: None,
         goal_mode: Default::default(),
         goal_spec: None,
@@ -1425,6 +1430,7 @@ async fn an_oversized_delegation_provenance_refuses_the_creation() {
         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
             .expect("the input is inline-bounded"),
         assignee: Some(agent_id()),
+        team: None,
         goal: None,
         goal_mode: Default::default(),
         goal_spec: None,
@@ -1496,6 +1502,7 @@ async fn a_cross_tenant_parent_run_refuses_the_creation() {
         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
             .expect("the input is inline-bounded"),
         assignee: Some(agent_id()),
+        team: None,
         goal: None,
         goal_mode: Default::default(),
         goal_spec: None,

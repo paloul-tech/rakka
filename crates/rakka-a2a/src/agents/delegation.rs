@@ -19,8 +19,6 @@
 //! identity is reported as the explicit conflict of specification 6.6, never
 //! adopted.
 
-use std::sync::Arc;
-
 use a2a::{Message, Part, PartContent, Role, SendMessageRequest, Task, TaskState};
 use a2a_server::ServiceParams;
 use rakka_agent::{
@@ -39,30 +37,76 @@ use super::collaboration::{
 };
 use super::error::RakkaAgentA2AError;
 use super::ingress::{META_AGENT_ID, META_TASK_DEFINITION};
-use super::service::RakkaAgentA2AService;
+use super::service::SharedRakkaAgentA2AService;
 
 /// In-process [`AgentA2aSendExecutor`] over the agents-surface service core.
-pub struct A2AAgentDelegationSendExecutor<Tasks, Agents, History, Runs>
-where
+pub struct A2AAgentDelegationSendExecutor<
+    Tasks,
+    Agents,
+    History,
+    Runs,
+    Teams,
+    TeamHistory,
+    Conversations,
+    ConversationHistory,
+> where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
-    service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs>>,
+    service: SharedRakkaAgentA2AService<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >,
     principal: Option<PrincipalRef>,
 }
 
-impl<Tasks, Agents, History, Runs> A2AAgentDelegationSendExecutor<Tasks, Agents, History, Runs>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
+    A2AAgentDelegationSendExecutor<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
     /// Wraps a service.
     #[must_use]
-    pub const fn new(service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs>>) -> Self {
+    pub const fn new(
+        service: SharedRakkaAgentA2AService<
+            Tasks,
+            Agents,
+            History,
+            Runs,
+            Teams,
+            TeamHistory,
+            Conversations,
+            ConversationHistory,
+        >,
+    ) -> Self {
         Self {
             service,
             principal: None,
@@ -113,12 +157,14 @@ where
             AgentCollaborationMetadata::from_record(record).to_value(),
         );
         if let Some(principal) = self.principal.as_ref() {
-            let mut encoded = format!("{}:{}", principal.principal_type, principal.principal_id);
-            if let Some(display) = &principal.display_name {
-                encoded.push(':');
-                encoded.push_str(display);
-            }
-            metadata.insert(META_PRINCIPAL_REF.to_string(), Value::String(encoded));
+            // The shared encoder keeps colon-free principals on the compact
+            // string and spells colon-bearing ids (SPIFFE, ARN) as the
+            // object form, so the identity the authorizer binds is the one
+            // that was configured, never a truncation at the first colon.
+            metadata.insert(
+                META_PRINCIPAL_REF.to_string(),
+                crate::mapping::principal_ref_to_value(principal),
+            );
         }
         // Egress injection (specification 17.5): the record's committed
         // context rides the standard W3C keys; invalid context injects
@@ -181,9 +227,9 @@ fn echoes_delegation(task: &Task, delegation: &AgentDelegationRecord) -> bool {
 /// attempt errors under the effect's idempotent attempt bound, which the
 /// derived deduplication key makes safe. `task-already-created` never reaches
 /// this map from the send path: the executor disambiguates it against the
-/// held task's collaboration echo first, because the child's deduplication
-/// window is bounded and an aged-out replay of this delegation's own send
-/// earns the same refusal a genuine conflict does.
+/// held task's durable delegation provenance first, because the child's
+/// deduplication window is bounded and an aged-out replay of this
+/// delegation's own send earns the same refusal a genuine conflict does.
 fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, AgentDispatchError> {
     match error {
         RakkaAgentA2AError::Unsupported {
@@ -193,16 +239,28 @@ fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, A
             code: "collaboration-version-unsupported".to_string(),
             message: reason.to_string(),
         }),
-        RakkaAgentA2AError::Task(error) => match &error {
-            AgentTaskError::Persistence(_) => Err(AgentDispatchError::Invocation {
-                code: error.code(),
-                message: error.to_string(),
-            }),
-            _ => Ok(AgentA2aSendFinding::Refused {
-                code: error.code().to_string(),
-                message: error.to_string(),
-            }),
-        },
+        // The same ambiguity rule as the handoff executor's: a store failure
+        // may have struck *after* the child's durable creation committed —
+        // the entity applies commit-before-settle, and the facade surfaces a
+        // settle-pass write failure through the choreography host — so
+        // settling it as a definitive refusal would strand a durably created
+        // child while the parent records the delegation as refused. The
+        // retryable error keeps the deduplicated send re-driving, and the
+        // `AlreadyCreated` echo-disambiguation converges it on the child it
+        // already owns.
+        RakkaAgentA2AError::Task(error) => {
+            if super::handoff::task_error_is_ambiguous(&error) {
+                Err(AgentDispatchError::Invocation {
+                    code: error.code(),
+                    message: error.to_string(),
+                })
+            } else {
+                Ok(AgentA2aSendFinding::Refused {
+                    code: error.code().to_string(),
+                    message: error.to_string(),
+                })
+            }
+        }
         RakkaAgentA2AError::Entity(_)
         | RakkaAgentA2AError::Run(_)
         | RakkaAgentA2AError::Projection(_) => Err(AgentDispatchError::Invocation {
@@ -216,13 +274,27 @@ fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, A
     }
 }
 
-impl<Tasks, Agents, History, Runs> AgentA2aSendExecutor
-    for A2AAgentDelegationSendExecutor<Tasks, Agents, History, Runs>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
+    AgentA2aSendExecutor
+    for A2AAgentDelegationSendExecutor<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
     fn execute<'a>(
         &'a self,
@@ -252,36 +324,69 @@ where
                     // refusal has two honest readings: a genuine conflict, or
                     // a replay of this delegation's own send whose create
                     // operation aged out of the child's operation log. The
-                    // held task's collaboration echo — recorded at its
-                    // durable creation — decides which: an echoing child is
-                    // this delegation's, converged exactly as an in-window
-                    // replay would have been, and only a child this identity
-                    // does not own is reported as the conflict of
-                    // specification 6.6.
-                    let held = match self
+                    // held task's durable delegation provenance — recorded at
+                    // its creation — decides which: a child naming this
+                    // delegation is its own, converged exactly as an
+                    // in-window replay would have been, and only a child this
+                    // identity does not own is reported as the conflict of
+                    // specification 6.6. The probe reads the durable snapshot
+                    // directly — never `tasks/get`, whose deployment
+                    // authorization gates external callers while this probe
+                    // is the deployment's own recovery step: an authorizer
+                    // that denies the principal-less read must not convert an
+                    // aged-out replay into a definitive refusal that strands
+                    // the durably created child. A probe that cannot answer
+                    // stays a retryable attempt for the same reason.
+                    return match self
                         .service
-                        .get_task(
-                            &ServiceParams::new(),
-                            Some(scope.tenant().as_str()),
-                            scope.task().as_str(),
-                            None,
-                        )
+                        .authoritative_task_view(scope.tenant().as_str(), scope.task().as_str())
                         .await
                     {
-                        Ok(held) => held,
-                        Err(error) => return finding_for_error(error),
-                    };
-                    if !echoes_delegation(&held, delegation) {
-                        return Ok(AgentA2aSendFinding::Conflict {
-                            code: "delegation-child-conflict".to_string(),
+                        Ok(Some((snapshot, run))) => {
+                            let owned = snapshot.delegation.as_deref().is_some_and(|provenance| {
+                                provenance.delegation == delegation.delegation
+                            });
+                            if !owned {
+                                return Ok(AgentA2aSendFinding::Conflict {
+                                    code: "delegation-child-conflict".to_string(),
+                                    message: format!(
+                                        "the peer holds already-created task {}, which this \
+                                         delegation's identity does not own",
+                                        snapshot.scope.task()
+                                    ),
+                                });
+                            }
+                            let child_task = snapshot.scope.task().clone();
+                            let peer_status =
+                                peer_status_label(&super::projection::agent_task_state(
+                                    super::projection::AgentTaskCondition {
+                                        task: snapshot.status,
+                                        run,
+                                    },
+                                ));
+                            Ok(AgentA2aSendFinding::Sent {
+                                child_task,
+                                child_run: None,
+                                peer_status: peer_status.to_string(),
+                            })
+                        }
+                        // The entity said the child exists, but its durable
+                        // record cannot be read yet: contradiction, not
+                        // proof — the attempt stays retryable rather than
+                        // resuming the parent beside a child it may own.
+                        Ok(None) => Err(AgentDispatchError::Invocation {
+                            code: "delegation-child-unreadable",
                             message: format!(
-                                "the peer holds already-created task {}, which this delegation's \
-                                 identity does not own",
-                                held.id
+                                "the peer reported task {} already created, but its durable \
+                                 state is not readable yet; the deduplicated send re-drives",
+                                scope.task()
                             ),
-                        });
-                    }
-                    held
+                        }),
+                        Err(error) => Err(AgentDispatchError::Invocation {
+                            code: error.code(),
+                            message: error.to_string(),
+                        }),
+                    };
                 }
                 Err(error) => return finding_for_error(error),
             };
@@ -310,5 +415,31 @@ where
                 peer_status: peer_status_label(&task.status.state).to_string(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store failure surfaced through the choreography host is the
+    /// post-commit half of the entity's commit-before-settle ordering: the
+    /// child's creation may already be durable when the settle pass's write
+    /// fails, so the classification must stay a retryable attempt — a
+    /// definitive refusal would strand the created child while the parent
+    /// records the delegation as refused, and the deduplicated re-send's
+    /// `AlreadyCreated` echo-disambiguation would never run.
+    #[test]
+    fn a_choreography_persistence_failure_stays_retryable() {
+        let error = RakkaAgentA2AError::Task(AgentTaskError::Choreography(Box::new(
+            rakka_agent::AgentChoreographyError::Persistence(
+                rakka_persistence::DurableError::store("memory", "write failed after the commit"),
+            ),
+        )));
+        let finding = finding_for_error(error);
+        assert!(
+            matches!(finding, Err(AgentDispatchError::Invocation { .. })),
+            "a post-commit store failure is ambiguous, got {finding:?}"
+        );
     }
 }

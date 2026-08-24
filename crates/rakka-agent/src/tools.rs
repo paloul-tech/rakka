@@ -1149,6 +1149,9 @@ impl AgentToolAuthority {
             AgentRunEffectRequest::A2aSend { .. } => {
                 self.authorize_a2a_send(context, scope, task, goal, intent, now)
             }
+            AgentRunEffectRequest::A2aHandoff { .. } => {
+                self.authorize_a2a_handoff(context, scope, task, goal, intent, now)
+            }
             AgentRunEffectRequest::WorkflowStart { invocation } => {
                 self.authorize_workflow_start(context, scope, task, goal, intent, invocation, now)
             }
@@ -1630,6 +1633,7 @@ impl AgentToolAuthority {
                 | AgentRunEffectRequest::MemoryPromotion { .. }
                 | AgentRunEffectRequest::Evaluation { .. }
                 | AgentRunEffectRequest::A2aSend { .. }
+                | AgentRunEffectRequest::A2aHandoff { .. }
                 | AgentRunEffectRequest::WorkflowStart { .. }
                 | AgentRunEffectRequest::WorkflowCancel { .. }
                 | AgentRunEffectRequest::ClaimAppend { .. } => None,
@@ -1828,6 +1832,72 @@ impl AgentToolAuthority {
         intent: &AgentRunEffect,
         now: AgentTimestampMillis,
     ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one outbound handoff send attempt
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the handoff record is its
+    /// authorization, as with a delegation send — plus the envelope door
+    /// re-checked per attempt, the workflow-start posture: dropping the
+    /// handoff capability from the definition revokes the very next attempt
+    /// ([specification 7.3](../../../docs/plans/rakka-agent/spec.md)) —
+    /// transferring responsibility for a task is a coordination transition,
+    /// not a routine send.
+    fn authorize_a2a_handoff(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if !context
+            .definition
+            .envelope()
+            .coordination_capabilities
+            .contains(&crate::definition::AgentCoordinationCapabilityKind::Handoff)
+        {
+            return Err(AgentAuthorityRefusal::of(
+                AgentEnvelopeDimension::CoordinationCapability.as_label(),
+                "the definition does not declare the handoff coordination capability",
+            ));
+        }
+        if let Some(setup) = context.setup {
+            if !setup
+                .envelope()
+                .coordination_capabilities
+                .contains(&crate::definition::AgentCoordinationCapabilityKind::Handoff)
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    AgentEnvelopeDimension::CoordinationCapability.as_label(),
+                    "the run's setup does not select the handoff coordination capability",
+                ));
+            }
+        }
         if let Some(credential) = &intent.credential_binding {
             self.check_credential(context, credential)?;
         }

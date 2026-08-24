@@ -85,6 +85,10 @@ pub type Service = RakkaAgentA2AService<
     InMemoryDurableStateStore<AgentEntityState>,
     InMemoryAgentTaskHistoryStore,
     CrashingStateStore<AgentRunState>,
+    InMemoryDurableStateStore<rakka_agent::AgentTeamState>,
+    rakka_agent::InMemoryAgentTeamHistoryStore,
+    InMemoryDurableStateStore<rakka_agent::AgentConversationState>,
+    rakka_agent::InMemoryAgentConversationHistoryStore,
 >;
 
 /// The production dispatch pipeline over this world's stores.
@@ -170,6 +174,7 @@ pub fn delegation_config() -> AgentRunDelegationConfig {
     )
     .expect("the delegation configuration declares the capability")
     .with_fan_in_tool(AgentToolId::new(AWAIT_TOOL).expect("the tool id is valid"))
+    .expect("the fan-in tool id does not collide")
 }
 
 /// The versioned descriptor under which the compiled refund workflow appears
@@ -537,6 +542,10 @@ impl World {
                 agents.clone(),
                 history.clone(),
                 runs.clone(),
+                InMemoryDurableStateStore::default(),
+                rakka_agent::InMemoryAgentTeamHistoryStore::new(),
+                InMemoryDurableStateStore::<rakka_agent::AgentConversationState>::default(),
+                rakka_agent::InMemoryAgentConversationHistoryStore::new(),
                 router.clone(),
                 Arc::new(
                     A2AStaticAgentCatalog::new()

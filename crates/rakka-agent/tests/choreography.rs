@@ -20,8 +20,8 @@ use rakka_agent::testkit::{
 use rakka_agent::{
     drive_pending_exchanges, AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeHost,
     AgentExchangeInitiation, AgentExchangeKind, AgentExchangePayload, AgentExchangeReply,
-    AgentExchangeSettlement, AgentId, AgentOperationId, AgentOperationKind, AgentRunId,
-    AgentRunScope, AgentTaskId, AgentTaskScope, TenantId, AGENT_EXCHANGE_LOG_CAPACITY,
+    AgentExchangeSettlement, AgentExchangeState, AgentId, AgentOperationId, AgentOperationKind,
+    AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope, TenantId, AGENT_EXCHANGE_LOG_CAPACITY,
     AGENT_EXCHANGE_PAYLOAD_MAX_BYTES, AGENT_EXCHANGE_PENDING_CAPACITY,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
@@ -570,6 +570,73 @@ async fn a_delivery_failure_leaves_the_exchange_outstanding() {
 }
 
 #[tokio::test]
+async fn a_structurally_undeliverable_envelope_costs_one_revision_not_one_per_sweep() {
+    // `exchange-no-route` is the delivery failure whose answer never moves:
+    // for as long as the deployment hosts no route for the target class,
+    // every sweep gets the identical error, and nothing classifies a delivery
+    // failure the way the settle rules classify a refusal, so no ceiling ever
+    // ends it. A terminal task naming a governing team in a deployment that
+    // wires no `Team` route owes its terminal notice exactly this way.
+    //
+    // The exchange must stay outstanding — a route can appear on the next
+    // deploy, and delivering is the only thing that discovers it — so the
+    // cost has to be bounded some other way: an unchanged failure code
+    // persists nothing, the `record_unsettleable_refusal` rule.
+    let fx = Fixture::new();
+    let mut initiator = fx.host(run_address()).await;
+
+    let envelope = fx.envelope(AgentExchangeKind::Creation, "creation");
+    let operation_id = envelope.operation_id().clone();
+    initiate(&mut initiator, envelope, fx.now()).await;
+
+    // A router with no routes at all: the target class is simply unhosted.
+    let unrouted = rakka_agent::AgentExchangeRouter::new();
+    let mut revisions = Vec::new();
+    const SWEEPS: usize = 5;
+    for sweep in 0..SWEEPS {
+        let report = drive_pending_exchanges(&mut initiator, &unrouted, fx.now())
+            .await
+            .expect("one undeliverable envelope does not fail the pass");
+        assert_eq!(report.failed, 1, "sweep {sweep}");
+        assert_eq!(report.settled, 0, "sweep {sweep}");
+        revisions.push(revision_of(&fx, run_address()).await);
+    }
+
+    // Legible: the code is on the record and every sweep counts the failure,
+    // so a standing wedge is alertable as a rate.
+    let pending = initiator
+        .state()
+        .expect("recovered")
+        .journal()
+        .pending_exchange(&operation_id)
+        .expect("the exchange is still outstanding")
+        .clone();
+    assert_eq!(pending.last_failure_code(), Some("exchange-no-route"));
+    assert_eq!(
+        pending.attempts(),
+        1,
+        "an unchanged delivery failure writes nothing further"
+    );
+
+    // And free: only the first sweep moved the durable revision.
+    assert!(
+        revisions.windows(2).all(|pair| pair[0] == pair[1]),
+        "standing undeliverable is not also a standing write: {revisions:?}"
+    );
+}
+
+/// The durable revision one participant's record currently stands at.
+async fn revision_of(fx: &Fixture, address: AgentEntityAddress) -> rakka_persistence::Revision {
+    use rakka_persistence::DurableStateStore;
+
+    DurableStateStore::load(&fx.store, &address.persistence_id())
+        .await
+        .expect("the record loads")
+        .expect("the participant has durable state")
+        .revision
+}
+
+#[tokio::test]
 async fn a_replay_older_than_the_deduplication_window_is_refused_by_the_domain_fence() {
     // Durable state is bounded, so the journal's deduplication ring is bounded
     // too. A replay that has aged out of it reaches the participant's `apply` —
@@ -759,6 +826,65 @@ async fn an_entity_may_not_owe_more_exchanges_than_durable_state_holds() {
         .await
         .expect_err("an entity may not owe an unbounded number of exchanges");
     assert_eq!(error.code(), "exchange-pending-overflow");
+}
+
+#[tokio::test]
+async fn a_withdrawn_exchange_frees_its_slot_and_is_never_re_driven() {
+    // Withdrawal is the escape valve for an exchange whose result the
+    // initiator can no longer consume: the slot returns to the bounded pending
+    // list, and the envelope is gone from the re-drive list for good.
+    let fx = Fixture::new();
+    let mut host = fx.host(run_address()).await;
+
+    for index in 0..AGENT_EXCHANGE_PENDING_CAPACITY {
+        let envelope = fx.envelope(
+            AgentExchangeKind::BudgetSettlement,
+            &format!("owed-{index}"),
+        );
+        initiate(&mut host, envelope, fx.now()).await;
+    }
+    let withdrawn = operation("owed-0");
+
+    host.initiate(fx.now(), |state| {
+        assert!(state.exchange_journal_mut().withdraw(&withdrawn));
+        // Withdrawing what is not owed reports it, and changes nothing.
+        assert!(!state
+            .exchange_journal_mut()
+            .withdraw(&operation("never-owed")));
+        Ok(Vec::new())
+    })
+    .await
+    .expect("the withdrawal commits");
+
+    let outstanding = host.outstanding().expect("the participant is recovered");
+    assert_eq!(outstanding.len(), AGENT_EXCHANGE_PENDING_CAPACITY - 1);
+    assert!(
+        !outstanding
+            .iter()
+            .any(|pending| pending.operation_id() == &operation("owed-0")),
+        "the withdrawn envelope left the re-drive list"
+    );
+
+    // The freed slot is usable, which is the point of the withdrawal.
+    let replacement = fx.envelope(AgentExchangeKind::BudgetSettlement, "replacement");
+    initiate(&mut host, replacement, fx.now()).await;
+    assert_eq!(
+        host.outstanding()
+            .expect("the participant is recovered")
+            .len(),
+        AGENT_EXCHANGE_PENDING_CAPACITY
+    );
+
+    // And it survives passivation: withdrawal is a durable edit, not a
+    // materialized one.
+    let recovered = fx.host(run_address()).await;
+    assert_eq!(
+        recovered
+            .outstanding()
+            .expect("the participant is recovered")
+            .len(),
+        AGENT_EXCHANGE_PENDING_CAPACITY
+    );
 }
 
 #[test]

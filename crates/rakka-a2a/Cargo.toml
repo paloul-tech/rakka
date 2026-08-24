@@ -80,5 +80,9 @@ required-features = ["agents"]
 name = "collaboration_surface"
 required-features = ["agents"]
 
+[[test]]
+name = "human_task_surface"
+required-features = ["agents"]
+
 [lints]
 workspace = true

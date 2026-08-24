@@ -27,6 +27,7 @@ use rakka_agent::testkit::{
     sweep_crash_points, CrashingStateStore, DeferredExchangeRouter, InProcessRunEntityTransport,
     InProcessTaskEntityTransport, ScriptedDispatcher,
 };
+use rakka_agent::InMemoryAgentTeamHistoryStore;
 use rakka_agent::{
     run_id_for_assignment, AgentAssignmentGeneration, AgentAuthorityEnvelope,
     AgentClientManagementCommand, AgentClientManagementResponse, AgentClientTaskRequest,
@@ -47,7 +48,18 @@ use rakka_persistence::InMemoryDurableStateStore;
 type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = CrashingStateStore<AgentRunState>;
-type Service = RakkaAgentA2AService<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore, RunStore>;
+type Service = RakkaAgentA2AService<
+    TaskStore,
+    AgentStore,
+    InMemoryAgentTaskHistoryStore,
+    RunStore,
+    TeamStore,
+    InMemoryAgentTeamHistoryStore,
+    ConversationStore,
+    rakka_agent::InMemoryAgentConversationHistoryStore,
+>;
+type TeamStore = InMemoryDurableStateStore<rakka_agent::AgentTeamState>;
+type ConversationStore = InMemoryDurableStateStore<rakka_agent::AgentConversationState>;
 
 const TENANT: &str = "acme";
 const AGENT: &str = "support-agent";
@@ -169,6 +181,10 @@ impl Fixture {
                 agents.clone(),
                 history.clone(),
                 runs.clone(),
+                TeamStore::default(),
+                InMemoryAgentTeamHistoryStore::new(),
+                ConversationStore::default(),
+                rakka_agent::InMemoryAgentConversationHistoryStore::new(),
                 router.clone(),
                 Arc::new(catalog),
                 Arc::new(InMemoryA2ATaskProjectionStore::local()),
@@ -480,14 +496,14 @@ async fn duplicate_sends_create_one_task_one_run_one_turn() {
     // to it monotonically.
     let task = fixture
         .service
-        .get_task(&params(), Some(TENANT), &task_id, None)
+        .get_task(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("the task should read");
     assert_eq!(task.status.state, TaskState::Completed);
 
     let events = fixture
         .service
-        .replay_task_events(&params(), Some(TENANT), &task_id, None)
+        .replay_task_events(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("events should replay");
     assert!(!events.is_empty());
@@ -811,7 +827,7 @@ async fn cancellation_projects_the_authoritative_condition() {
 
     let final_view = fixture
         .service
-        .get_task(&params(), Some(TENANT), &task_id, None)
+        .get_task(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("the task should read");
     let mut task = fixture.task(&task_id);
@@ -826,6 +842,57 @@ async fn cancellation_projects_the_authoritative_condition() {
     } else {
         assert!(!final_view.status.state.is_terminal());
     }
+}
+
+/// A metadata refresh keeps the projection's stored identity. `tasks/get`
+/// and `tasks/cancel` normalize with a `context_id` *derived from the task
+/// id* — they carry no context of their own — so a refresh their sync path
+/// triggers must re-snapshot under the context the task was created with,
+/// never the caller's derived default.
+#[tokio::test]
+async fn a_metadata_refresh_preserves_the_created_context() {
+    let fixture = Fixture::new(ScriptedDispatcher::new());
+    fixture.instantiate_agent().await;
+
+    let mut message = task_message("msg-context");
+    message.context_id = Some("conv-42".to_string());
+    let created = fixture
+        .service
+        .send_message(&params(), &send_request(&message))
+        .await
+        .expect("the send should be accepted");
+    assert_eq!(created.context_id, "conv-42");
+    let task_id = created.id.clone();
+
+    // The cancellation changes the authoritative condition, so its sync pass
+    // refreshes the projection's metadata — normalized under the task-id
+    // context default.
+    let cancelled = fixture
+        .service
+        .cancel_task(
+            &params(),
+            &a2a::CancelTaskRequest {
+                id: task_id.clone(),
+                metadata: None,
+                tenant: Some(TENANT.to_string()),
+            },
+        )
+        .await
+        .expect("the cancel should be accepted");
+    assert_eq!(
+        cancelled.context_id, "conv-42",
+        "the refresh keeps the created context"
+    );
+
+    // The read path derives the same default; the projection still answers
+    // the created context, and the refreshed condition metadata rode the
+    // refresh rather than being lost with it.
+    let read = fixture
+        .service
+        .get_task(&params(), Some(TENANT), &task_id, None, None)
+        .await
+        .expect("the task should read");
+    assert_eq!(read.context_id, "conv-42");
 }
 
 /// Scenario 1 under the owner-kill sweep: kill the run's owner, then the

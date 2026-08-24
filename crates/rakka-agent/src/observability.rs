@@ -401,6 +401,31 @@ pub enum AgentDecisionWriteStatus {
     Duplicate,
 }
 
+/// One bounded page of retained decision events.
+///
+/// `has_more` is the sink's own explicit answer, never inferred from the page
+/// size: the read contract only promises *up to* `limit` events, so a page
+/// shorter than the limit proves nothing about what the sink still retains —
+/// a reader that guessed from the length would silently stop short of the
+/// retained tail.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct AgentDecisionEventPage {
+    /// The events, contiguous from the cursor, oldest first.
+    pub events: Vec<AgentDecisionEvent>,
+    /// Whether the sink retains more events past this page — cut by the
+    /// limit, or by a hole in the stream the next read will be refused at.
+    pub has_more: bool,
+}
+
+impl AgentDecisionEventPage {
+    /// A page holding `events`, with `has_more` as the sink's explicit answer.
+    #[must_use]
+    pub const fn new(events: Vec<AgentDecisionEvent>, has_more: bool) -> Self {
+        Self { events, has_more }
+    }
+}
+
 /// Where decision events go after the transition that decided them committed
 /// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -420,17 +445,31 @@ pub trait AgentDecisionEventSink: Send + Sync + 'static {
     ) -> AgentObservabilityFuture<'a, AgentDecisionWriteStatus>;
 
     /// Reads retained events with sequence strictly greater than `after`, in
-    /// sequence order, up to `limit`.
+    /// sequence order, up to `limit`, reporting explicitly whether more are
+    /// retained past the page.
     ///
-    /// A cursor that predates the retained window fails with
-    /// [`AgentObservabilityError::ReplayWindowExpired`] so a reader resyncs
-    /// from authoritative state instead of silently missing events.
+    /// The page MUST be contiguous from `after + 1`. The run's outbox drops
+    /// its oldest unflushed event after that event consumed a sequence, so a
+    /// hole can sit anywhere in the stream; an implementation MUST stop the
+    /// page *before* such a hole — reporting `has_more` so the reader comes
+    /// back — rather than page across it or discard the deliverable prefix,
+    /// whose depth must never depend on the reader's page size.
+    ///
+    /// A read is refused with
+    /// [`AgentObservabilityError::ReplayWindowExpired`] — naming the first
+    /// retained sequence past the hole as the floor to resume from — exactly
+    /// when nothing contiguous can be delivered: the first retained event
+    /// past `after` is not `after + 1` (the hole sits at the read head), or
+    /// `after` lies beyond the newest retained sequence, a cursor this log
+    /// never issued that an empty page would silently vouch for. Either way
+    /// the reader resyncs from authoritative state instead of silently
+    /// missing events.
     fn read<'a>(
         &'a self,
         scope: &'a AgentRunScope,
         after: u64,
         limit: usize,
-    ) -> AgentObservabilityFuture<'a, Vec<AgentDecisionEvent>>;
+    ) -> AgentObservabilityFuture<'a, AgentDecisionEventPage>;
 }
 
 /// Decision-event sink and read errors.
@@ -439,7 +478,8 @@ pub trait AgentDecisionEventSink: Send + Sync + 'static {
 pub enum AgentObservabilityError {
     /// The read cursor predates the retained window; resync from durable state.
     ReplayWindowExpired {
-        /// Oldest sequence still retained, if any event is.
+        /// The floor to resume from: the oldest sequence still retained at or
+        /// past the reader's position, when anything is retained there.
         oldest_retained: Option<u64>,
     },
     /// The sink rejected or failed the operation.
@@ -553,32 +593,55 @@ impl AgentDecisionEventSink for InMemoryAgentDecisionEventSink {
         scope: &'a AgentRunScope,
         after: u64,
         limit: usize,
-    ) -> AgentObservabilityFuture<'a, Vec<AgentDecisionEvent>> {
+    ) -> AgentObservabilityFuture<'a, AgentDecisionEventPage> {
         Box::pin(async move {
             let events = self
                 .events
                 .lock()
                 .expect("the decision sink lock is not poisoned");
-            let retained = events.get(scope.key().as_str());
-            let oldest = retained.and_then(|held| held.first().map(|event| event.sequence));
-            if let Some(oldest) = oldest {
-                // A cursor of N promises the reader has seen sequence N; if the
-                // oldest retained is N+2 or later, something between was evicted.
-                if after.saturating_add(1) < oldest {
-                    return Err(AgentObservabilityError::ReplayWindowExpired {
-                        oldest_retained: Some(oldest),
-                    });
-                }
+            let held = events
+                .get(scope.key().as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            // A cursor past the newest retained sequence is one this log never
+            // issued: an empty page would stamp "you are current" over
+            // sequences the reader has not seen, and once the log grows past
+            // the cursor the reader would resume across them silently.
+            let newest = held.last().map_or(0, |event| event.sequence);
+            if after > newest {
+                return Err(AgentObservabilityError::ReplayWindowExpired {
+                    oldest_retained: held.first().map(|event| event.sequence),
+                });
             }
-            Ok(retained
-                .map(|held| {
-                    held.iter()
-                        .filter(|event| event.sequence > after)
-                        .take(limit)
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default())
+            // The outbox is a ring that drops its oldest *unflushed* event
+            // after that event already consumed a sequence, so a hole can sit
+            // anywhere in the stream. The page is the contiguous prefix from
+            // the cursor: a hole at the read head is refused with the floor
+            // past it, and a hole further in truncates the page with
+            // `has_more` — the reader's next read starts at the hole and gets
+            // the refusal — so every retained event is deliverable whatever
+            // the reader's page size.
+            let mut page: Vec<AgentDecisionEvent> = Vec::new();
+            let mut has_more = false;
+            let mut expected = after.saturating_add(1);
+            for event in held.iter().filter(|event| event.sequence > after) {
+                if event.sequence != expected {
+                    if page.is_empty() {
+                        return Err(AgentObservabilityError::ReplayWindowExpired {
+                            oldest_retained: Some(event.sequence),
+                        });
+                    }
+                    has_more = true;
+                    break;
+                }
+                if page.len() == limit {
+                    has_more = true;
+                    break;
+                }
+                page.push(event.clone());
+                expected = event.sequence.saturating_add(1);
+            }
+            Ok(AgentDecisionEventPage::new(page, has_more))
         })
     }
 }
@@ -678,6 +741,11 @@ pub const METRIC_AGENT_GOAL_STAGNATION: &str = "rakka.agent.goal.stagnation";
 /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
 pub const METRIC_AGENT_DELEGATION_RESULTS: &str = "rakka.agent.delegation.results";
 
+/// Counter: handoff resolutions accepted or refused at the source run's door,
+/// labeled by bounded `outcome`
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+pub const METRIC_AGENT_HANDOFF_RESULTS: &str = "rakka.agent.handoff.results";
+
 /// Counter: fan-in groups resolved, labeled by the bounded resolution code
 /// (`all-settled` / `any-satisfied` / `quorum-satisfied` / `unsatisfiable` /
 /// `timed-out`) as `outcome`
@@ -690,6 +758,83 @@ pub const METRIC_AGENT_FAN_IN_RESOLUTIONS: &str = "rakka.agent.fan_in.resolution
 /// delivery is a non-committing error and is not counted here.
 pub const METRIC_AGENT_WORKFLOW_RESULTS: &str = "rakka.agent.workflow.results";
 
+/// Counter: team board and lifecycle operations committed at the team
+/// entity's door, labeled by bounded `operation` (the command's closed
+/// label, plus the out-of-band `expire` for the lazy expiry flip and
+/// `close` for a task's terminal notice closing its board entry) and
+/// `outcome` (`applied` / `refused` / `activated` / `reopened`)
+/// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)). A
+/// duplicate command answered from the operation log records nothing, so a
+/// replay never double-counts.
+pub const METRIC_AGENT_TEAM_OPERATIONS: &str = "rakka.agent.team.operations";
+
+/// Counter: moderated-conversation turn and lifecycle operations committed at
+/// the conversation entity's door, labeled by bounded `operation` (the
+/// command's closed label) and `outcome` (`applied` / `refused`)
+/// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)). A
+/// duplicate command answered from the operation log — including a
+/// past-window replay echoed from the turn ledger — records nothing, so a
+/// replay never double-counts. The bounded `mode` label is owed to the slice
+/// that lands the model-visible moderation tool.
+pub const METRIC_AGENT_MODERATION_TURNS: &str = "rakka.agent.moderation.turns";
+
+/// Counter: authenticated human-result submissions decided at the task
+/// entity's door, labeled by bounded `outcome`
+/// (`accepted` / `rejected` / `exhausted`)
+/// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)). Counted
+/// as the difference of the task's durable result cells across the committed
+/// transition — the admitted-epoch idiom — so duplicates, durable echoes,
+/// and non-committing refusals record nothing.
+pub const METRIC_AGENT_HUMAN_RESULTS: &str = "rakka.agent.human.results";
+
+/// Counter: dependency outcomes durably applied at the dependent task's
+/// door, labeled by bounded `outcome` (`completed` / `failed` / `cancelled`)
+/// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)). Counted
+/// as the difference of the task's resolved-edge count across the committed
+/// transition, whichever path — registry exchange or application relay —
+/// resolved the edge; a replayed or conflicting delivery records nothing.
+pub const METRIC_AGENT_DEPENDENCY_OUTCOMES: &str = "rakka.agent.dependency.outcomes";
+
+/// Counter: exchange replies a settle pass could not settle, labeled by
+/// bounded `operation` (the [`crate::choreography::AgentExchangeKind`] label)
+/// and `error_code` (the receiver's stable refusal code)
+/// ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The receiver *answered*; its answer is one no re-drive can settle until a
+/// different receiver answers — an upstream that gets created, an owner
+/// upgraded past the kind. The courier deliberately does not fail the pass
+/// over it, since one unanswerable envelope must not wedge every other
+/// exchange the entity owes, so this counter is what keeps a durably wedged
+/// entity distinguishable from a healthy one. It is emitted per pass, not per
+/// durable transition: a standing wedge counts on every sweep, which is what
+/// makes it alertable as a rate. The exchange that is stuck, and since when,
+/// are on the journal's own pending record.
+pub const METRIC_AGENT_EXCHANGE_UNSETTLEABLE: &str = "rakka.agent.exchange.unsettleable";
+
+/// Emits one [`METRIC_AGENT_EXCHANGE_UNSETTLEABLE`] count per refusal a settle
+/// pass could not settle.
+///
+/// Every entity that drives the courier calls this with its own pass report,
+/// so a durably wedged exchange is measured wherever it happens rather than
+/// only where someone remembered to look for it.
+pub fn record_unsettleable_exchanges(
+    metrics: &dyn MetricsRecorder,
+    unsettleable: &[crate::choreography::AgentExchangeUnsettleable],
+) {
+    for refusal in unsettleable {
+        record_agent_domain_counter(
+            metrics,
+            METRIC_AGENT_EXCHANGE_UNSETTLEABLE,
+            1,
+            &[
+                ("operation", refusal.kind.as_label()),
+                ("error_code", refusal.code.as_str()),
+            ],
+        )
+        .ok();
+    }
+}
+
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///
 /// The metric-vocabulary boundary is by layer (slice 1.13 resolution): the
@@ -701,6 +846,7 @@ pub const AGENT_METRIC_FIELDS: &[&str] = &[
     "backend",
     "decision_kind",
     "decision_source",
+    "operation",
     "outcome",
     "phase",
     "safety_class",
@@ -881,6 +1027,7 @@ mod tests {
             "phase",
             "effect_kind",
             "safety_class",
+            "operation",
             "outcome",
             "signal",
         ];

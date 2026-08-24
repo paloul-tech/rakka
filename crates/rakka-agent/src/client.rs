@@ -25,7 +25,9 @@ use serde_json::Value;
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 
 use crate::definition::{AgentRevisionNumber, AgentSettingsChange};
+use crate::events::AgentCoordinationReplay;
 use crate::identity::AgentTaskId;
+use crate::query::AgentGoalView;
 
 /// Result alias for client operations.
 pub type AgentClientResult<T> = Result<T, AgentClientError>;
@@ -155,6 +157,54 @@ pub struct AgentClientTaskRequest {
     /// created task's segments link back to the caller's
     /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)). An
     /// absent context sends nothing and the session starts a root.
+    pub telemetry: Option<rakka_agent_workflow::AgentTelemetryContext>,
+}
+
+/// A typed-result submission completing a human-owned task
+/// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md),
+/// [14.5](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, Default)]
+pub struct AgentClientTaskResultRequest {
+    /// The task the submission completes.
+    pub task: String,
+    /// The typed result, validated by the task's deterministic rules.
+    pub result: Value,
+    /// The task-definition id the result claims to fulfill; a mismatch is a
+    /// committed rejection.
+    pub definition: String,
+    /// The claimed revision of that definition.
+    pub definition_version: u64,
+    /// The schema the result is expressed in.
+    pub result_schema: String,
+    /// The claimed revision of that schema.
+    pub result_schema_version: u64,
+    /// The claimed evidence digest, when the caller carries one. Advisory
+    /// for the deployment authorizer; the surface accepts no evidence
+    /// artifacts yet.
+    pub evidence_digest: Option<String>,
+    /// The conversation this submission belongs to, forwarded as the A2A
+    /// `context_id` exactly as [`AgentClientTaskRequest::context`] is. Left
+    /// unset, the surface correlates the task with itself, which silently
+    /// drops it from whatever conversation created it.
+    pub context: Option<String>,
+    /// Explicit durable deduplication key. A retry that reuses it converges
+    /// on the original decision — a recorded rejection included; a corrected
+    /// resubmission after a rejection must carry a new key.
+    ///
+    /// Left unset, the transport derives one from the submission's own
+    /// content, so an ordinary retry still converges: the durable identity of
+    /// a submission is what it says, not when it was sent. Deriving it is the
+    /// safe default precisely because the alternative — a fresh id per call —
+    /// spends a rejection per retry and can walk a task to
+    /// `ResultRejectionsExhausted` on a submission the caller only ever made
+    /// once. Set it explicitly when two submissions carrying identical
+    /// content must be told apart.
+    pub deduplication_key: Option<String>,
+    /// Authenticated principal submitting the result. Required by the
+    /// surface: a human-owned task completes only under an authenticated
+    /// human or service.
+    pub principal: Option<PrincipalRef>,
+    /// The caller's trace context, injected into the egress request.
     pub telemetry: Option<rakka_agent_workflow::AgentTelemetryContext>,
 }
 
@@ -292,6 +342,13 @@ pub trait AgentClientTransport: Send + Sync + 'static {
         request: AgentClientTaskRequest,
     ) -> AgentClientFuture<'_, AgentClientTaskView>;
 
+    /// Submits an authenticated typed result to a human-owned task
+    /// (specification 8.12).
+    fn submit_task_result(
+        &self,
+        request: AgentClientTaskResultRequest,
+    ) -> AgentClientFuture<'_, AgentClientTaskView>;
+
     /// Reads one task's public view, or `None` when it does not exist.
     fn task<'a>(&'a self, task: &'a str) -> AgentClientFuture<'a, Option<AgentClientTaskView>>;
 
@@ -315,6 +372,38 @@ pub trait AgentClientTransport: Send + Sync + 'static {
         task: &'a str,
         after_cursor: Option<&'a str>,
     ) -> AgentClientFuture<'a, Vec<AgentClientTaskEvent>>;
+
+    /// Replays one coordination scope's durable event log after an optional
+    /// cursor ([specification 17.13](../../../docs/plans/rakka-agent/spec.md);
+    /// scenario 45).
+    ///
+    /// `scope` is an [`AgentEntityAddress`](crate::choreography::AgentEntityAddress) key — `task/<tenant>/<id>`,
+    /// `team/<tenant>/<id>`, `conversation/<tenant>/<id>`, or
+    /// `run/<tenant>/<agent>/<id>`. Unlike [`Self::task_events`], an expired
+    /// window is *not* an error: it is the
+    /// [`AgentCoordinationReplay::WindowExpired`] arm, which names the cursor to
+    /// resume from once the caller has resynchronized from authoritative state.
+    /// A caller that ignores the distinction and pages on would silently skip
+    /// what the window dropped, which is the whole hazard.
+    fn coordination_events<'a>(
+        &'a self,
+        scope: &'a str,
+        after_cursor: Option<&'a str>,
+        limit: usize,
+    ) -> AgentClientFuture<'a, AgentCoordinationReplay>;
+
+    /// Reads the authorized goal view, or `None` when the caller may not see it.
+    ///
+    /// A caller who is not the goal's owner receives `None` byte-identical to a
+    /// goal that does not exist — the deny-is-absent contract
+    /// [`crate::query::authorized_agent_goal_view`] keeps, carried out to the
+    /// wire so authorization never becomes an existence oracle. `max_tasks`
+    /// bounds the traversal and is clamped by the server.
+    fn goal_view<'a>(
+        &'a self,
+        goal: &'a str,
+        max_tasks: Option<usize>,
+    ) -> AgentClientFuture<'a, Option<AgentGoalView>>;
 }
 
 /// The typed facade applications use to drive Rakka Agents.
@@ -350,6 +439,31 @@ impl<T: AgentClientTransport> RakkaAgentClient<T> {
         request: AgentClientTaskRequest,
     ) -> AgentClientResult<AgentClientTaskView> {
         self.transport.create_task(request).await
+    }
+
+    /// Submits an authenticated typed result to a human-owned task
+    /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// An acceptance returns a terminal `Completed` view. A *committed
+    /// validation rejection* returns `Ok` too — the nonterminal
+    /// `InputRequired` view (or terminal `Failed`, when the rejection
+    /// exhausted the budget) carrying the rule code in the view's
+    /// `io.rakka.agent.last-rejection` metadata: the decision durably
+    /// committed, and an error reply would misreport it as "nothing
+    /// happened". A retry under the same deduplication key converges on the
+    /// original decision; a corrected resubmission must carry a new key.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`AgentClientError::Refused`] on the non-committing
+    /// refusals — an unknown task, an agent-owned target
+    /// (`task-not-human-owned`), a terminal or cancelling task — and with
+    /// transport failures.
+    pub async fn submit_task_result(
+        &self,
+        request: AgentClientTaskResultRequest,
+    ) -> AgentClientResult<AgentClientTaskView> {
+        self.transport.submit_task_result(request).await
     }
 
     /// Reads one task's public view.
@@ -398,6 +512,43 @@ impl<T: AgentClientTransport> RakkaAgentClient<T> {
         after_cursor: Option<&str>,
     ) -> AgentClientResult<Vec<AgentClientTaskEvent>> {
         self.transport.task_events(task, after_cursor).await
+    }
+
+    /// Replays one coordination scope's durable event log after an optional
+    /// cursor ([specification 17.13](../../../docs/plans/rakka-agent/spec.md);
+    /// scenario 45).
+    ///
+    /// The answer is either a page contiguous from the cursor or an explicit
+    /// [`AgentCoordinationReplay::WindowExpired`] naming where to resume — never
+    /// a short page a caller could mistake for the whole log.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a malformed cursor, a cursor naming a different scope, an
+    /// unreplayable scope class, or a transport fault.
+    pub async fn coordination_events(
+        &self,
+        scope: &str,
+        after_cursor: Option<&str>,
+        limit: usize,
+    ) -> AgentClientResult<AgentCoordinationReplay> {
+        self.transport
+            .coordination_events(scope, after_cursor, limit)
+            .await
+    }
+
+    /// Reads the authorized goal view, or `None` when the caller may not see it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates transport faults. Authorization is not one: a denied caller
+    /// gets `None`, exactly as for a goal that does not exist.
+    pub async fn goal_view(
+        &self,
+        goal: &str,
+        max_tasks: Option<usize>,
+    ) -> AgentClientResult<Option<AgentGoalView>> {
+        self.transport.goal_view(goal, max_tasks).await
     }
 
     /// Creates one task and polls it to a terminal state — the

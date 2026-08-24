@@ -374,14 +374,23 @@ impl AgentExchangeParticipant for ChoreographyProbe {
                 apply_ledger(state, envelope, 1)
             }
             AgentExchangeKind::BudgetSettlement => apply_ledger(state, envelope, -1),
-            // An epoch result, a goal evaluation, a delegation result, or a
-            // cancellation request is a durable transition but not a balance
-            // movement: the probe records the application without crediting.
+            // An epoch result, a goal evaluation, a delegation result, a
+            // cancellation request, a handoff resolution, a team-board
+            // exchange, a dependency edge, or a terminal notice is a durable
+            // transition but not a balance movement: the probe records the
+            // application without crediting.
             AgentExchangeKind::EpochResult
             | AgentExchangeKind::GoalEvaluation
             | AgentExchangeKind::DelegationResult
             | AgentExchangeKind::RunCancel
-            | AgentExchangeKind::DelegationCancel => apply_ledger(state, envelope, 0),
+            | AgentExchangeKind::DelegationCancel
+            | AgentExchangeKind::HandoffResult
+            | AgentExchangeKind::TeamClaim
+            | AgentExchangeKind::TeamClaimResult
+            | AgentExchangeKind::DependencyRegistration
+            | AgentExchangeKind::DependencyOutcome
+            | AgentExchangeKind::TeamTerminalNotice
+            | AgentExchangeKind::ConversationTerminalNotice => apply_ledger(state, envelope, 0),
         };
 
         // Every applied exchange is a transition, whether it accepted or
@@ -1020,6 +1029,319 @@ fn task_delivery_error(error: AgentTaskError) -> AgentExchangeDeliveryError {
     AgentExchangeDeliveryError::new(error.code(), error.to_string())
 }
 
+/// Delivers exchanges to a real [`crate::team::AgentTeamEntityStore`] over a shared
+/// durable store, exactly as [`InProcessTaskEntityTransport`] does for
+/// tasks: every delivery re-materializes the entity from durable state
+/// alone, so it exercises the passivate-anytime contract, and the same
+/// [`ExchangeFault`] queue injects the failure windows.
+pub struct InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    store: Store,
+    history: History,
+    router: AgentExchangeRouter,
+    clock: Arc<AtomicU64>,
+    faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    acceptances: Arc<AtomicUsize>,
+}
+
+impl<Store, History> Clone for InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            history: self.history.clone(),
+            router: self.router.clone(),
+            clock: self.clock.clone(),
+            faults: self.faults.clone(),
+            acceptances: self.acceptances.clone(),
+        }
+    }
+}
+
+impl<Store, History> InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    /// Creates a transport that delivers to team entities in one durable
+    /// store.
+    #[must_use]
+    pub fn new(
+        store: Store,
+        history: History,
+        router: AgentExchangeRouter,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            store,
+            history,
+            router,
+            clock,
+            faults: Arc::new(Mutex::new(VecDeque::new())),
+            acceptances: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Queues a fault to inject into the next delivery.
+    pub fn inject(&self, fault: ExchangeFault) {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .push_back(fault);
+    }
+
+    /// How many envelopes reached a team entity's durable accept path,
+    /// including the ones whose reply was then lost.
+    #[must_use]
+    pub fn acceptances(&self) -> usize {
+        self.acceptances.load(Ordering::SeqCst)
+    }
+
+    fn take_fault(&self) -> Option<ExchangeFault> {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .pop_front()
+    }
+
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+impl<Store, History> AgentExchangeTransport for InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    fn deliver<'a>(
+        &'a self,
+        envelope: &'a AgentExchangeEnvelope,
+    ) -> AgentExchangeDeliveryFuture<'a> {
+        let fault = self.take_fault();
+
+        Box::pin(async move {
+            if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-envelope",
+                    "the envelope never reached the team entity",
+                ));
+            }
+
+            let AgentEntityAddress::Team(scope) = envelope.target().clone() else {
+                return Err(AgentExchangeDeliveryError::new(
+                    "exchange-no-route",
+                    "this transport serves team entities only",
+                ));
+            };
+
+            let mut entity = crate::team::AgentTeamEntityStore::new(
+                scope,
+                self.store.clone(),
+                self.history.clone(),
+            );
+
+            self.acceptances.fetch_add(1, Ordering::SeqCst);
+            let now = self.now();
+            let mut reply = entity
+                .accept(envelope, &self.router, now)
+                .await
+                .map_err(team_delivery_error)?;
+
+            if matches!(fault, Some(ExchangeFault::DeliverTwice)) {
+                self.acceptances.fetch_add(1, Ordering::SeqCst);
+                let now = self.now();
+                reply = entity
+                    .accept(envelope, &self.router, now)
+                    .await
+                    .map_err(team_delivery_error)?;
+            }
+
+            if matches!(fault, Some(ExchangeFault::LoseReply)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-reply",
+                    "the team accepted the exchange, and its reply was lost",
+                ));
+            }
+
+            Ok(reply)
+        })
+    }
+}
+
+fn team_delivery_error(error: crate::team::AgentTeamError) -> AgentExchangeDeliveryError {
+    AgentExchangeDeliveryError::new(error.code(), error.to_string())
+}
+
+/// Delivers exchanges to a real
+/// [`crate::conversation::AgentConversationEntityStore`] over a shared durable
+/// store, exactly as [`InProcessTaskEntityTransport`] does for tasks: every
+/// delivery re-materializes the entity from durable state alone, so it
+/// exercises the passivate-anytime contract, and the same [`ExchangeFault`]
+/// queue injects the failure windows.
+pub struct InProcessConversationEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    store: Store,
+    agents: Agents,
+    history: History,
+    router: AgentExchangeRouter,
+    clock: Arc<AtomicU64>,
+    faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    acceptances: Arc<AtomicUsize>,
+}
+
+impl<Store, Agents, History> Clone for InProcessConversationEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            agents: self.agents.clone(),
+            history: self.history.clone(),
+            router: self.router.clone(),
+            clock: self.clock.clone(),
+            faults: self.faults.clone(),
+            acceptances: self.acceptances.clone(),
+        }
+    }
+}
+
+impl<Store, Agents, History> InProcessConversationEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    /// Creates a transport that delivers to conversation entities in one
+    /// durable store.
+    #[must_use]
+    pub fn new(
+        store: Store,
+        agents: Agents,
+        history: History,
+        router: AgentExchangeRouter,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            store,
+            agents,
+            history,
+            router,
+            clock,
+            faults: Arc::new(Mutex::new(VecDeque::new())),
+            acceptances: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Queues a fault to inject into the next delivery.
+    pub fn inject(&self, fault: ExchangeFault) {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .push_back(fault);
+    }
+
+    /// How many envelopes reached a conversation entity's durable accept
+    /// path, including the ones whose reply was then lost.
+    #[must_use]
+    pub fn acceptances(&self) -> usize {
+        self.acceptances.load(Ordering::SeqCst)
+    }
+
+    fn take_fault(&self) -> Option<ExchangeFault> {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .pop_front()
+    }
+
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+impl<Store, Agents, History> AgentExchangeTransport
+    for InProcessConversationEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    fn deliver<'a>(
+        &'a self,
+        envelope: &'a AgentExchangeEnvelope,
+    ) -> AgentExchangeDeliveryFuture<'a> {
+        let fault = self.take_fault();
+
+        Box::pin(async move {
+            if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-envelope",
+                    "the envelope never reached the conversation entity",
+                ));
+            }
+
+            let AgentEntityAddress::Conversation(scope) = envelope.target().clone() else {
+                return Err(AgentExchangeDeliveryError::new(
+                    "exchange-no-route",
+                    "this transport serves conversation entities only",
+                ));
+            };
+
+            let mut entity = crate::conversation::AgentConversationEntityStore::new(
+                scope,
+                self.store.clone(),
+                self.agents.clone(),
+                self.history.clone(),
+            );
+
+            self.acceptances.fetch_add(1, Ordering::SeqCst);
+            let now = self.now();
+            let mut reply = entity
+                .accept(envelope, &self.router, now)
+                .await
+                .map_err(conversation_delivery_error)?;
+
+            if matches!(fault, Some(ExchangeFault::DeliverTwice)) {
+                self.acceptances.fetch_add(1, Ordering::SeqCst);
+                let now = self.now();
+                reply = entity
+                    .accept(envelope, &self.router, now)
+                    .await
+                    .map_err(conversation_delivery_error)?;
+            }
+
+            if matches!(fault, Some(ExchangeFault::LoseReply)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-reply",
+                    "the conversation accepted the exchange, and its reply was lost",
+                ));
+            }
+
+            Ok(reply)
+        })
+    }
+}
+
+fn conversation_delivery_error(
+    error: crate::conversation::AgentConversationError,
+) -> AgentExchangeDeliveryError {
+    AgentExchangeDeliveryError::new(error.code(), error.to_string())
+}
+
 /// Delivers wake admission commands to a real [`AgentTaskEntityStore`] over a
 /// shared durable store.
 ///
@@ -1654,6 +1976,7 @@ pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
     promotions: Arc<Mutex<Option<Arc<dyn AgentMemoryPromotionExecutor>>>>,
     evaluations: Arc<Mutex<Option<Arc<dyn AgentGoalEvaluationExecutor>>>>,
     a2a_sends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentA2aSendExecutor>>>>,
+    a2a_handoffs: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentA2aHandoffSendExecutor>>>>,
     workflow_starts: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowStartExecutor>>>>,
     workflow_cancels: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowCancelExecutor>>>>,
     claim_appends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentClaimAppendExecutor>>>>,
@@ -1749,6 +2072,7 @@ where
             promotions: Arc::new(Mutex::new(None)),
             evaluations: Arc::new(Mutex::new(None)),
             a2a_sends: Arc::new(Mutex::new(None)),
+            a2a_handoffs: Arc::new(Mutex::new(None)),
             workflow_starts: Arc::new(Mutex::new(None)),
             workflow_cancels: Arc::new(Mutex::new(None)),
             claim_appends: Arc::new(Mutex::new(None)),
@@ -1841,6 +2165,22 @@ where
             .a2a_sends
             .lock()
             .expect("the A2A send executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes outbound handoff send effects through the given executor. An
+    /// unwired handoff fails with the real pipeline's
+    /// `a2a-handoff-executor-missing` code, exactly as the real dispatcher
+    /// fails closed.
+    #[must_use]
+    pub fn with_a2a_handoff_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentA2aHandoffSendExecutor>,
+    ) -> Self {
+        *self
+            .a2a_handoffs
+            .lock()
+            .expect("the A2A handoff executor slot should not be poisoned") = Some(executor);
         self
     }
 
@@ -2106,6 +2446,58 @@ where
                         // model-adapter precedent above.
                         Err(error) => AgentRunEffectOutcome::Failed {
                             code: "a2a-send-attempt-failed".to_string(),
+                            message: error.to_string(),
+                        },
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::A2aHandoff { handoff } => {
+                // The record carries its own source scope, so the send needs
+                // nothing `answer` does not hold. Memoized like a tool call:
+                // a re-invocation of the same generation returns the same
+                // receipt, which is exactly what the derived deduplication
+                // key promises.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .a2a_handoffs
+                    .lock()
+                    .expect("the A2A handoff executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::Failed {
+                        code: "a2a-handoff-executor-missing".to_string(),
+                        message: "no A2A handoff executor is wired into this dispatcher"
+                            .to_string(),
+                    },
+                    Some(executor) => match executor
+                        .execute(&handoff.source_run, effect, handoff, None)
+                        .await
+                    {
+                        Ok(crate::dispatch::AgentA2aHandoffFinding::Recorded {
+                            target_generation,
+                            peer_status,
+                        }) => AgentRunEffectOutcome::A2aHandoff {
+                            receipt: crate::coordination::AgentA2aHandoffReceipt {
+                                handoff: handoff.handoff.clone(),
+                                target_generation,
+                                peer_status,
+                            },
+                        },
+                        Ok(crate::dispatch::AgentA2aHandoffFinding::Conflict { code, message })
+                        | Ok(crate::dispatch::AgentA2aHandoffFinding::Refused { code, message }) => {
+                            AgentRunEffectOutcome::Failed { code, message }
+                        }
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as an *exhausted* effect
+                        // — the real pipeline's spent retry budget — so the
+                        // run parks indeterminate rather than resuming beside
+                        // a possibly-recorded transfer.
+                        Err(error) => AgentRunEffectOutcome::Exhausted {
+                            code: "a2a-handoff-attempt-failed".to_string(),
                             message: error.to_string(),
                         },
                     },
@@ -3321,7 +3713,9 @@ impl DeferredExchangeRouter {
         AgentExchangeRouter::new()
             .with_route(AgentEntityClass::Agent, transport.clone())
             .with_route(AgentEntityClass::Task, transport.clone())
-            .with_route(AgentEntityClass::Run, transport)
+            .with_route(AgentEntityClass::Run, transport.clone())
+            .with_route(AgentEntityClass::Team, transport.clone())
+            .with_route(AgentEntityClass::Conversation, transport)
     }
 }
 
@@ -3623,6 +4017,620 @@ impl crate::retrieval::AgentPrivateMemoryRetriever for ScriptedPrivateMemoryRetr
                 })
         })
     }
+}
+
+/// How much history a backend under test keeps.
+///
+/// The contract splits on it, because the two halves are different promises: an
+/// unbounded backend must never lose an entry, and a bounded one must *say* it
+/// lost them rather than answer a short page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryRetention {
+    /// The backend keeps everything appended to it.
+    Unbounded,
+    /// The backend keeps at most this many entries per scope, evicting oldest.
+    Bounded(usize),
+}
+
+/// How many entries a conformance run appends.
+///
+/// Comfortably past the default page size, so paging is exercised for real
+/// rather than in one page that happens to hold everything.
+const HISTORY_CONTRACT_ENTRIES: u64 = 24;
+
+/// Page size the contract reads with: small enough that the log needs several.
+const HISTORY_CONTRACT_PAGE: usize = 5;
+
+fn history_contract_operation(sequence: u64) -> AgentOperationId {
+    // Segments cannot carry the scope separator, so the scope key itself is not
+    // one; the contract only needs distinct ids per sequence.
+    AgentOperationId::new(
+        crate::identity::AgentOperationKind::Command,
+        ["history-contract", &sequence.to_string()],
+    )
+    .expect("the harness derives a legal operation id")
+}
+
+/// Asserts one [`AgentTaskHistoryStore`] keeps the contract every backend owes
+/// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The store must be empty for `scope`. The harness appends its own entries, so
+/// a backend in another crate can prove itself without reaching into this one's
+/// record constructors — the duplication that let the substrate's two projection
+/// backends drift apart.
+///
+/// What it proves: appends are idempotent on `(scope, sequence)` and a *different*
+/// entry at an occupied sequence fails closed; a cursor pages the whole log in
+/// order, once each, with no gap; under
+/// [`HistoryRetention::Bounded`] — a cursor preceding the retained window answers
+/// [`AgentTaskError::HistoryWindowExpired`] naming a floor the reader can
+/// actually resume from, rather than a short page it would mistake for the truth;
+/// and a hole *inside* the log — the discontinuity a durable backend can grow
+/// through TTL or manual deletion — delivers the retained prefix whole, refuses
+/// the read that starts at the hole with the floor past it, and resumes cleanly
+/// from that floor.
+///
+/// # Panics
+///
+/// On any breach of that contract, naming what it observed.
+pub async fn assert_task_history_store_contract<Store>(
+    store: &Store,
+    scope: &AgentTaskScope,
+    retention: HistoryRetention,
+) where
+    Store: AgentTaskHistoryStore,
+{
+    use crate::task::{
+        AgentTaskHistoryCursor, AgentTaskHistoryEntry, AgentTaskHistoryKind,
+        AgentTaskHistorySequence, AgentTaskStatus,
+    };
+
+    let entry = |sequence: u64| {
+        AgentTaskHistoryEntry::new(
+            AgentTaskHistorySequence::new(sequence),
+            AgentTaskHistoryKind::Created,
+            history_contract_operation(sequence),
+            AgentTaskStatus::Created,
+            AgentTimestampMillis::new(sequence),
+        )
+    };
+
+    let first = entry(AgentTaskHistorySequence::FIRST.get());
+    store
+        .append(scope, &first)
+        .await
+        .expect("the first append succeeds");
+    store
+        .append(scope, &first)
+        .await
+        .expect("re-driving an interrupted flush writes the same entry to the same slot");
+    let mut conflicting = entry(AgentTaskHistorySequence::FIRST.get());
+    conflicting.kind = AgentTaskHistoryKind::Terminated;
+    store
+        .append(scope, &conflicting)
+        .await
+        .expect_err("a different entry at an occupied sequence fails closed");
+
+    for sequence in (AgentTaskHistorySequence::FIRST.get() + 1)..=HISTORY_CONTRACT_ENTRIES {
+        store
+            .append(scope, &entry(sequence))
+            .await
+            .expect("appends succeed in sequence order");
+    }
+
+    let floor = match retention {
+        HistoryRetention::Unbounded => AgentTaskHistorySequence::FIRST.get(),
+        HistoryRetention::Bounded(kept) => {
+            // The store's documented zero-means-one clamp applies to the
+            // harness's own arithmetic too, so `Bounded(0)` proves the clamp
+            // instead of panicking on an off-by-one floor.
+            let kept = (kept as u64).max(1);
+            assert!(
+                kept < HISTORY_CONTRACT_ENTRIES,
+                "a bounded contract run must append past the window to exercise it"
+            );
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept + 1;
+            match store
+                .read(scope, AgentTaskHistoryCursor::start())
+                .await
+                .expect_err("a cursor before the retained window is refused, never short-paged")
+            {
+                AgentTaskError::HistoryWindowExpired {
+                    oldest_retained: Some(oldest),
+                } => {
+                    assert_eq!(
+                        oldest.get(),
+                        expected_floor,
+                        "the reported floor is the oldest entry actually retained"
+                    );
+                    oldest.get()
+                }
+                other => panic!("an expired window names its floor, got {other:?}"),
+            }
+        }
+    };
+
+    let mut cursor = AgentTaskHistoryCursor::start()
+        .resuming_at(AgentTaskHistorySequence::new(floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        let page = store
+            .read(scope, cursor)
+            .await
+            .expect("the reported floor is a legal resume point");
+        pages += 1;
+        assert!(
+            page.entries.len() <= HISTORY_CONTRACT_PAGE,
+            "a page never exceeds the size the cursor asked for"
+        );
+        seen.extend(page.entries.iter().map(|held| held.sequence.get()));
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 64, "paging must terminate");
+    }
+
+    let expected: Vec<u64> = (floor..=HISTORY_CONTRACT_ENTRIES).collect();
+    assert_eq!(
+        seen, expected,
+        "the cursor pages the retained log in order, once each, with no gap"
+    );
+    // Only meaningful when the retained window is larger than a page; a
+    // tightly bounded store legitimately answers in one.
+    if expected.len() > HISTORY_CONTRACT_PAGE {
+        assert!(
+            pages > 1,
+            "a log longer than a page must need more than one to prove the cursor"
+        );
+    }
+
+    // A hole *inside* the log: an entry that never lands while a later one
+    // does — the shape a durable backend can grow through TTL or manual
+    // deletion, and the shape a reader must never be paged across silently.
+    // The retained prefix before the hole is delivered whole, the read that
+    // starts at the hole is refused naming the floor past it, and resuming at
+    // that floor delivers the tail.
+    let after_hole = HISTORY_CONTRACT_ENTRIES + 2;
+    store
+        .append(scope, &entry(after_hole))
+        .await
+        .expect("an append past an unfilled sequence succeeds");
+    // A bounded window evicts its oldest for the new entry, moving the floor.
+    let prefix_floor = match retention {
+        HistoryRetention::Unbounded => floor,
+        HistoryRetention::Bounded(_) => floor + 1,
+    };
+    let mut cursor = AgentTaskHistoryCursor::start()
+        .resuming_at(AgentTaskHistorySequence::new(prefix_floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut prefix: Vec<u64> = Vec::new();
+    let mut probes = 0_usize;
+    let refusal = loop {
+        match store.read(scope, cursor).await {
+            Ok(page) => {
+                prefix.extend(page.entries.iter().map(|held| held.sequence.get()));
+                match page.next {
+                    Some(next) => cursor = next,
+                    None => panic!("a reader must be refused at the hole, not run off the end"),
+                }
+            }
+            Err(error) => break error,
+        }
+        probes += 1;
+        assert!(probes < 64, "paging toward the hole must terminate");
+    };
+    assert_eq!(
+        prefix,
+        (prefix_floor..=HISTORY_CONTRACT_ENTRIES).collect::<Vec<u64>>(),
+        "the retained prefix before the hole is delivered whole"
+    );
+    match refusal {
+        AgentTaskError::HistoryWindowExpired {
+            oldest_retained: Some(oldest),
+        } => assert_eq!(
+            oldest.get(),
+            after_hole,
+            "the refusal names the first entry past the hole"
+        ),
+        other => panic!("the read at the hole answers an expired window, got {other:?}"),
+    }
+    let tail = store
+        .read(
+            scope,
+            AgentTaskHistoryCursor::start()
+                .resuming_at(AgentTaskHistorySequence::new(after_hole))
+                .with_limit(HISTORY_CONTRACT_PAGE),
+        )
+        .await
+        .expect("the floor past the hole is a legal resume point");
+    assert_eq!(
+        tail.entries
+            .iter()
+            .map(|held| held.sequence.get())
+            .collect::<Vec<u64>>(),
+        vec![after_hole],
+        "resuming past the hole delivers the tail"
+    );
+    assert!(tail.next.is_none(), "the tail is the end of the log");
+}
+
+/// Asserts one [`AgentTeamHistoryStore`] keeps the same contract.
+///
+/// See [`assert_task_history_store_contract`] for what is proven and why.
+///
+/// [`AgentTeamHistoryStore`]: crate::team::AgentTeamHistoryStore
+///
+/// # Panics
+///
+/// On any breach of that contract, naming what it observed.
+pub async fn assert_team_history_store_contract<Store>(
+    store: &Store,
+    scope: &crate::identity::AgentTeamScope,
+    retention: HistoryRetention,
+) where
+    Store: crate::team::AgentTeamHistoryStore,
+{
+    use crate::team::{
+        AgentTeamError, AgentTeamHistoryCursor, AgentTeamHistoryEntry, AgentTeamHistoryKind,
+        AgentTeamHistorySequence,
+    };
+
+    let entry = |sequence: u64| {
+        AgentTeamHistoryEntry::new(
+            AgentTeamHistorySequence::new(sequence),
+            AgentTeamHistoryKind::Created,
+            history_contract_operation(sequence),
+            AgentTimestampMillis::new(sequence),
+        )
+    };
+
+    let first = entry(AgentTeamHistorySequence::FIRST.get());
+    store
+        .append(scope, &first)
+        .await
+        .expect("the first append succeeds");
+    store
+        .append(scope, &first)
+        .await
+        .expect("re-driving an interrupted flush writes the same entry to the same slot");
+    let mut conflicting = entry(AgentTeamHistorySequence::FIRST.get());
+    conflicting.kind = AgentTeamHistoryKind::Disbanded;
+    store
+        .append(scope, &conflicting)
+        .await
+        .expect_err("a different entry at an occupied sequence fails closed");
+
+    for sequence in (AgentTeamHistorySequence::FIRST.get() + 1)..=HISTORY_CONTRACT_ENTRIES {
+        store
+            .append(scope, &entry(sequence))
+            .await
+            .expect("appends succeed in sequence order");
+    }
+
+    let floor = match retention {
+        HistoryRetention::Unbounded => AgentTeamHistorySequence::FIRST.get(),
+        HistoryRetention::Bounded(kept) => {
+            // The store's documented zero-means-one clamp applies to the
+            // harness's own arithmetic too, so `Bounded(0)` proves the clamp
+            // instead of panicking on an off-by-one floor.
+            let kept = (kept as u64).max(1);
+            assert!(
+                kept < HISTORY_CONTRACT_ENTRIES,
+                "a bounded contract run must append past the window to exercise it"
+            );
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept + 1;
+            match store
+                .read(scope, AgentTeamHistoryCursor::start())
+                .await
+                .expect_err("a cursor before the retained window is refused, never short-paged")
+            {
+                AgentTeamError::HistoryWindowExpired {
+                    oldest_retained: Some(oldest),
+                } => {
+                    assert_eq!(oldest.get(), expected_floor, "the reported floor is real");
+                    oldest.get()
+                }
+                other => panic!("an expired window names its floor, got {other:?}"),
+            }
+        }
+    };
+
+    let mut cursor = AgentTeamHistoryCursor::start()
+        .resuming_at(AgentTeamHistorySequence::new(floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        let page = store
+            .read(scope, cursor)
+            .await
+            .expect("the reported floor is a legal resume point");
+        pages += 1;
+        assert!(
+            page.entries.len() <= HISTORY_CONTRACT_PAGE,
+            "a page never exceeds the size the cursor asked for"
+        );
+        seen.extend(page.entries.iter().map(|held| held.sequence.get()));
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 64, "paging must terminate");
+    }
+
+    let expected: Vec<u64> = (floor..=HISTORY_CONTRACT_ENTRIES).collect();
+    assert_eq!(
+        seen, expected,
+        "the cursor pages the retained log in order, once each, with no gap"
+    );
+    // Only meaningful when the retained window is larger than a page; a
+    // tightly bounded store legitimately answers in one.
+    if expected.len() > HISTORY_CONTRACT_PAGE {
+        assert!(
+            pages > 1,
+            "a log longer than a page must need more than one to prove the cursor"
+        );
+    }
+
+    // A hole *inside* the log: an entry that never lands while a later one
+    // does — the shape a durable backend can grow through TTL or manual
+    // deletion, and the shape a reader must never be paged across silently.
+    // The retained prefix before the hole is delivered whole, the read that
+    // starts at the hole is refused naming the floor past it, and resuming at
+    // that floor delivers the tail.
+    let after_hole = HISTORY_CONTRACT_ENTRIES + 2;
+    store
+        .append(scope, &entry(after_hole))
+        .await
+        .expect("an append past an unfilled sequence succeeds");
+    // A bounded window evicts its oldest for the new entry, moving the floor.
+    let prefix_floor = match retention {
+        HistoryRetention::Unbounded => floor,
+        HistoryRetention::Bounded(_) => floor + 1,
+    };
+    let mut cursor = AgentTeamHistoryCursor::start()
+        .resuming_at(AgentTeamHistorySequence::new(prefix_floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut prefix: Vec<u64> = Vec::new();
+    let mut probes = 0_usize;
+    let refusal = loop {
+        match store.read(scope, cursor).await {
+            Ok(page) => {
+                prefix.extend(page.entries.iter().map(|held| held.sequence.get()));
+                match page.next {
+                    Some(next) => cursor = next,
+                    None => panic!("a reader must be refused at the hole, not run off the end"),
+                }
+            }
+            Err(error) => break error,
+        }
+        probes += 1;
+        assert!(probes < 64, "paging toward the hole must terminate");
+    };
+    assert_eq!(
+        prefix,
+        (prefix_floor..=HISTORY_CONTRACT_ENTRIES).collect::<Vec<u64>>(),
+        "the retained prefix before the hole is delivered whole"
+    );
+    match refusal {
+        AgentTeamError::HistoryWindowExpired {
+            oldest_retained: Some(oldest),
+        } => assert_eq!(
+            oldest.get(),
+            after_hole,
+            "the refusal names the first entry past the hole"
+        ),
+        other => panic!("the read at the hole answers an expired window, got {other:?}"),
+    }
+    let tail = store
+        .read(
+            scope,
+            AgentTeamHistoryCursor::start()
+                .resuming_at(AgentTeamHistorySequence::new(after_hole))
+                .with_limit(HISTORY_CONTRACT_PAGE),
+        )
+        .await
+        .expect("the floor past the hole is a legal resume point");
+    assert_eq!(
+        tail.entries
+            .iter()
+            .map(|held| held.sequence.get())
+            .collect::<Vec<u64>>(),
+        vec![after_hole],
+        "resuming past the hole delivers the tail"
+    );
+    assert!(tail.next.is_none(), "the tail is the end of the log");
+}
+
+/// Asserts one [`AgentConversationHistoryStore`] keeps the same contract.
+///
+/// See [`assert_task_history_store_contract`] for what is proven and why.
+///
+/// [`AgentConversationHistoryStore`]: crate::conversation::AgentConversationHistoryStore
+///
+/// # Panics
+///
+/// On any breach of that contract, naming what it observed.
+pub async fn assert_conversation_history_store_contract<Store>(
+    store: &Store,
+    scope: &crate::identity::AgentConversationScope,
+    retention: HistoryRetention,
+) where
+    Store: crate::conversation::AgentConversationHistoryStore,
+{
+    use crate::conversation::{
+        AgentConversationError, AgentConversationHistoryCursor, AgentConversationHistoryEntry,
+        AgentConversationHistoryKind, AgentConversationHistorySequence,
+    };
+
+    let entry = |sequence: u64| {
+        AgentConversationHistoryEntry::new(
+            AgentConversationHistorySequence::new(sequence),
+            AgentConversationHistoryKind::Created,
+            history_contract_operation(sequence),
+            AgentTimestampMillis::new(sequence),
+        )
+    };
+
+    let first = entry(AgentConversationHistorySequence::FIRST.get());
+    store
+        .append(scope, &first)
+        .await
+        .expect("the first append succeeds");
+    store
+        .append(scope, &first)
+        .await
+        .expect("re-driving an interrupted flush writes the same entry to the same slot");
+    let mut conflicting = entry(AgentConversationHistorySequence::FIRST.get());
+    conflicting.kind = AgentConversationHistoryKind::Ended;
+    store
+        .append(scope, &conflicting)
+        .await
+        .expect_err("a different entry at an occupied sequence fails closed");
+
+    for sequence in (AgentConversationHistorySequence::FIRST.get() + 1)..=HISTORY_CONTRACT_ENTRIES {
+        store
+            .append(scope, &entry(sequence))
+            .await
+            .expect("appends succeed in sequence order");
+    }
+
+    let floor = match retention {
+        HistoryRetention::Unbounded => AgentConversationHistorySequence::FIRST.get(),
+        HistoryRetention::Bounded(kept) => {
+            // The store's documented zero-means-one clamp applies to the
+            // harness's own arithmetic too, so `Bounded(0)` proves the clamp
+            // instead of panicking on an off-by-one floor.
+            let kept = (kept as u64).max(1);
+            assert!(
+                kept < HISTORY_CONTRACT_ENTRIES,
+                "a bounded contract run must append past the window to exercise it"
+            );
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept + 1;
+            match store
+                .read(scope, AgentConversationHistoryCursor::start())
+                .await
+                .expect_err("a cursor before the retained window is refused, never short-paged")
+            {
+                AgentConversationError::HistoryWindowExpired {
+                    oldest_retained: Some(oldest),
+                } => {
+                    assert_eq!(oldest.get(), expected_floor, "the reported floor is real");
+                    oldest.get()
+                }
+                other => panic!("an expired window names its floor, got {other:?}"),
+            }
+        }
+    };
+
+    let mut cursor = AgentConversationHistoryCursor::start()
+        .resuming_at(AgentConversationHistorySequence::new(floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        let page = store
+            .read(scope, cursor)
+            .await
+            .expect("the reported floor is a legal resume point");
+        pages += 1;
+        assert!(
+            page.entries.len() <= HISTORY_CONTRACT_PAGE,
+            "a page never exceeds the size the cursor asked for"
+        );
+        seen.extend(page.entries.iter().map(|held| held.sequence.get()));
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 64, "paging must terminate");
+    }
+
+    let expected: Vec<u64> = (floor..=HISTORY_CONTRACT_ENTRIES).collect();
+    assert_eq!(
+        seen, expected,
+        "the cursor pages the retained log in order, once each, with no gap"
+    );
+    // Only meaningful when the retained window is larger than a page; a
+    // tightly bounded store legitimately answers in one.
+    if expected.len() > HISTORY_CONTRACT_PAGE {
+        assert!(
+            pages > 1,
+            "a log longer than a page must need more than one to prove the cursor"
+        );
+    }
+
+    // A hole *inside* the log: an entry that never lands while a later one
+    // does — the shape a durable backend can grow through TTL or manual
+    // deletion, and the shape a reader must never be paged across silently.
+    // The retained prefix before the hole is delivered whole, the read that
+    // starts at the hole is refused naming the floor past it, and resuming at
+    // that floor delivers the tail.
+    let after_hole = HISTORY_CONTRACT_ENTRIES + 2;
+    store
+        .append(scope, &entry(after_hole))
+        .await
+        .expect("an append past an unfilled sequence succeeds");
+    // A bounded window evicts its oldest for the new entry, moving the floor.
+    let prefix_floor = match retention {
+        HistoryRetention::Unbounded => floor,
+        HistoryRetention::Bounded(_) => floor + 1,
+    };
+    let mut cursor = AgentConversationHistoryCursor::start()
+        .resuming_at(AgentConversationHistorySequence::new(prefix_floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut prefix: Vec<u64> = Vec::new();
+    let mut probes = 0_usize;
+    let refusal = loop {
+        match store.read(scope, cursor).await {
+            Ok(page) => {
+                prefix.extend(page.entries.iter().map(|held| held.sequence.get()));
+                match page.next {
+                    Some(next) => cursor = next,
+                    None => panic!("a reader must be refused at the hole, not run off the end"),
+                }
+            }
+            Err(error) => break error,
+        }
+        probes += 1;
+        assert!(probes < 64, "paging toward the hole must terminate");
+    };
+    assert_eq!(
+        prefix,
+        (prefix_floor..=HISTORY_CONTRACT_ENTRIES).collect::<Vec<u64>>(),
+        "the retained prefix before the hole is delivered whole"
+    );
+    match refusal {
+        AgentConversationError::HistoryWindowExpired {
+            oldest_retained: Some(oldest),
+        } => assert_eq!(
+            oldest.get(),
+            after_hole,
+            "the refusal names the first entry past the hole"
+        ),
+        other => panic!("the read at the hole answers an expired window, got {other:?}"),
+    }
+    let tail = store
+        .read(
+            scope,
+            AgentConversationHistoryCursor::start()
+                .resuming_at(AgentConversationHistorySequence::new(after_hole))
+                .with_limit(HISTORY_CONTRACT_PAGE),
+        )
+        .await
+        .expect("the floor past the hole is a legal resume point");
+    assert_eq!(
+        tail.entries
+            .iter()
+            .map(|held| held.sequence.get())
+            .collect::<Vec<u64>>(),
+        vec![after_hole],
+        "resuming past the hole delivers the tail"
+    );
+    assert!(tail.next.is_none(), "the tail is the end of the log");
 }
 
 #[cfg(test)]

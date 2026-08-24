@@ -1064,14 +1064,20 @@ pub struct AgentRunDelegationEnvelope {
     pub knowledge_spaces: Option<BTreeSet<crate::identity::KnowledgeSpaceId>>,
 }
 
-/// The wiring one run entity needs to serve delegation
-/// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+/// The wiring one run entity needs to serve delegation and handoff
+/// ([specification 8.4 and 8.9](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// Construction refuses a configuration whose coordination set does not
-/// declare [`AgentCoordinationCapabilityKind::Delegation`]: the capability is
-/// trusted definition data, and requiring it here means a deployment cannot
-/// wire the delegation tool while forgetting the capability that authorizes
-/// it — the same construction-time obligation the guardrail chains carry.
+/// Construction refuses a configuration whose coordination set declares
+/// neither [`AgentCoordinationCapabilityKind::Delegation`] nor
+/// [`AgentCoordinationCapabilityKind::Handoff`]: the capabilities are
+/// trusted definition data, and requiring one here means a deployment cannot
+/// wire a coordination tool while forgetting every capability that could
+/// authorize it — the same construction-time obligation the guardrail
+/// chains carry. The two kinds stay independent: a handoff-only agent wires
+/// this config for [`Self::with_handoff`] alone, and the loop refuses its
+/// delegation and fan-in tools at plan time under
+/// `delegation-capability-missing` rather than serving a capability the
+/// definition never declared.
 #[derive(Clone)]
 pub struct AgentRunDelegationConfig {
     /// The one declared coordination tool the loop intercepts.
@@ -1087,17 +1093,31 @@ pub struct AgentRunDelegationConfig {
     pub catalog: Arc<dyn AgentDelegationCatalog>,
     /// The coordination capabilities the agent definition declares.
     pub coordination: BTreeSet<AgentCoordinationCapabilityKind>,
+    /// The handoff policy the loop intercepts under, when the deployment
+    /// wires one ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    /// Handoff resolves targets through the same catalog as delegation
+    /// (open decision 6's disposition). Unwired, the run never hands off.
+    pub handoff: Option<crate::coordination::AgentHandoffPolicy>,
 }
 
 impl AgentRunDelegationConfig {
-    /// Creates the wiring, refusing a coordination set without
-    /// [`AgentCoordinationCapabilityKind::Delegation`].
+    /// Creates the wiring, refusing a coordination set that declares neither
+    /// [`AgentCoordinationCapabilityKind::Delegation`] nor
+    /// [`AgentCoordinationCapabilityKind::Handoff`].
+    ///
+    /// A set without `Delegation` is legal — the envelope treats the kinds
+    /// independently, and a handoff-only agent must remain wirable without
+    /// declaring a capability it was never meant to have — but the
+    /// delegation tool it names is then inert: the loop refuses calls to it
+    /// at plan time.
     pub fn new(
         tool: AgentToolId,
         catalog: Arc<dyn AgentDelegationCatalog>,
         coordination: BTreeSet<AgentCoordinationCapabilityKind>,
     ) -> AgentDelegationResult<Self> {
-        if !coordination.contains(&AgentCoordinationCapabilityKind::Delegation) {
+        if !coordination.contains(&AgentCoordinationCapabilityKind::Delegation)
+            && !coordination.contains(&AgentCoordinationCapabilityKind::Handoff)
+        {
             return Err(AgentDelegationError::CapabilityMissing);
         }
         Ok(Self {
@@ -1106,14 +1126,72 @@ impl AgentRunDelegationConfig {
             default_fan_in: crate::fan_in::AgentFanInPolicy::default(),
             catalog,
             coordination,
+            handoff: None,
         })
     }
 
-    /// Declares the await verb the loop intercepts into a fan-in close.
-    #[must_use]
-    pub fn with_fan_in_tool(mut self, tool: AgentToolId) -> Self {
+    /// Declares the await verb the loop intercepts into a fan-in close,
+    /// refusing an id already spent on the delegation or handoff tool: the
+    /// loop intercepts the first matching vocabulary, so a shared id would
+    /// silently shadow one door behind another.
+    pub fn with_fan_in_tool(mut self, tool: AgentToolId) -> AgentDelegationResult<Self> {
+        if tool == self.tool
+            || self
+                .handoff
+                .as_ref()
+                .is_some_and(|policy| policy.tool == tool)
+        {
+            return Err(AgentDelegationError::ToolCollision { tool });
+        }
         self.fan_in_tool = Some(tool);
-        self
+        Ok(self)
+    }
+
+    /// Declares the handoff policy the loop intercepts under, refusing a
+    /// coordination set without
+    /// [`AgentCoordinationCapabilityKind::Handoff`] — the same
+    /// construction-time obligation [`Self::new`] places on delegation
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)) — and
+    /// refusing a policy tool id already spent on the delegation or fan-in
+    /// tool, which the loop's interception order would otherwise silently
+    /// shadow: every model handoff call would parse under the wrong
+    /// vocabulary and the run could never hand off.
+    pub fn with_handoff(
+        mut self,
+        policy: crate::coordination::AgentHandoffPolicy,
+    ) -> AgentDelegationResult<Self> {
+        if !self
+            .coordination
+            .contains(&AgentCoordinationCapabilityKind::Handoff)
+        {
+            return Err(AgentDelegationError::HandoffCapabilityMissing);
+        }
+        if policy.tool == self.tool || self.fan_in_tool.as_ref() == Some(&policy.tool) {
+            return Err(AgentDelegationError::ToolCollision {
+                tool: policy.tool.clone(),
+            });
+        }
+        self.handoff = Some(policy);
+        Ok(self)
+    }
+
+    /// Derives the delegation capability descriptor this wiring realizes
+    /// ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The descriptor mirrors the declared surface — tool ids and the given
+    /// policy revision — while the catalog stays runtime wiring: trusted
+    /// config is never duplicated into descriptor data.
+    #[must_use]
+    pub fn descriptor(
+        &self,
+        revision: AgentRevisionNumber,
+    ) -> crate::coordination::AgentCoordinationCapability {
+        let mut policy =
+            crate::coordination::AgentDelegationPolicy::new(self.tool.clone(), revision);
+        if let Some(fan_in_tool) = &self.fan_in_tool {
+            policy = policy.with_fan_in_tool(fan_in_tool.clone());
+        }
+        crate::coordination::AgentCoordinationCapability::Delegation(policy)
     }
 
     /// Sets the fan-in policy used when the goal's envelope declares none,
@@ -1141,9 +1219,20 @@ impl Debug for AgentRunDelegationConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AgentDelegationError {
-    /// The configuration's coordination set does not declare the delegation
-    /// capability.
+    /// The configuration's coordination set declares neither the delegation
+    /// nor the handoff capability, or a delegation door was exercised
+    /// without the delegation capability.
     CapabilityMissing,
+    /// The configuration's coordination set does not declare the handoff
+    /// capability.
+    HandoffCapabilityMissing,
+    /// Two declared coordination tool ids collide. The loop intercepts the
+    /// first matching vocabulary — fan-in, then delegation, then handoff —
+    /// so a shared id would silently shadow one door behind another.
+    ToolCollision {
+        /// The colliding tool id.
+        tool: AgentToolId,
+    },
     /// The requested skill is outside the goal's allowed set.
     SkillNotAllowed {
         /// The skill the model requested.
@@ -1267,6 +1356,8 @@ impl AgentDelegationError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::CapabilityMissing => "delegation-capability-missing",
+            Self::HandoffCapabilityMissing => "handoff-capability-missing",
+            Self::ToolCollision { .. } => "coordination-tool-collision",
             Self::SkillNotAllowed { .. } => "delegation-skill-not-allowed",
             Self::InvalidArguments { .. } => "delegation-invalid-arguments",
             Self::LimitExceeded { .. } => "delegation-limit-exceeded",
@@ -1293,8 +1384,17 @@ impl Display for AgentDelegationError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::CapabilityMissing => f.write_str(
-                "the delegation configuration's coordination set does not declare the delegation \
+                "the delegation configuration's coordination set declares neither the delegation \
+                 nor the handoff capability",
+            ),
+            Self::HandoffCapabilityMissing => f.write_str(
+                "the delegation configuration's coordination set does not declare the handoff \
                  capability",
+            ),
+            Self::ToolCollision { tool } => write!(
+                f,
+                "the coordination tool id {tool} is already declared by another door of this \
+                 configuration; the loop would silently shadow one vocabulary behind the other"
             ),
             Self::SkillNotAllowed { skill } => {
                 write!(f, "the goal does not allow delegating the skill {skill}")
@@ -1499,14 +1599,60 @@ mod tests {
     }
 
     #[test]
-    fn construction_requires_the_delegation_capability() {
+    fn construction_requires_a_coordination_capability() {
+        // Neither capability: nothing this config wires is authorized.
         let error = AgentRunDelegationConfig::new(
+            AgentToolId::new("delegate").expect("tool id"),
+            Arc::new(StaticAgentDelegationCatalog::new()),
+            BTreeSet::new(),
+        )
+        .expect_err("capability missing");
+        assert_eq!(error.code(), "delegation-capability-missing");
+
+        // Handoff alone is a legal envelope combination: the config must be
+        // wirable for `with_handoff` without declaring a delegation
+        // capability the agent was never meant to have.
+        AgentRunDelegationConfig::new(
             AgentToolId::new("delegate").expect("tool id"),
             Arc::new(StaticAgentDelegationCatalog::new()),
             BTreeSet::from([AgentCoordinationCapabilityKind::Handoff]),
         )
-        .expect_err("capability missing");
-        assert_eq!(error.code(), "delegation-capability-missing");
+        .expect("a handoff-only coordination set constructs")
+        .with_handoff(crate::coordination::AgentHandoffPolicy::new(
+            AgentToolId::new("transfer").expect("tool id"),
+            AgentRevisionNumber::INITIAL,
+        ))
+        .expect("the handoff policy attaches without the delegation capability");
+    }
+
+    #[test]
+    fn colliding_coordination_tool_ids_fail_construction() {
+        // The loop intercepts fan-in, delegation, then handoff in order: a
+        // shared id would silently shadow one vocabulary behind another, so
+        // the collision refuses at construction whichever door declares
+        // second.
+        let config = AgentRunDelegationConfig::new(
+            AgentToolId::new("transfer").expect("tool id"),
+            Arc::new(StaticAgentDelegationCatalog::new()),
+            BTreeSet::from([
+                AgentCoordinationCapabilityKind::Delegation,
+                AgentCoordinationCapabilityKind::Handoff,
+            ]),
+        )
+        .expect("the coordination set constructs");
+        let error = config
+            .clone()
+            .with_handoff(crate::coordination::AgentHandoffPolicy::new(
+                AgentToolId::new("transfer").expect("tool id"),
+                AgentRevisionNumber::INITIAL,
+            ))
+            .expect_err("the handoff tool collides with the delegation tool");
+        assert_eq!(error.code(), "coordination-tool-collision");
+
+        let error = config
+            .with_fan_in_tool(AgentToolId::new("transfer").expect("tool id"))
+            .expect_err("the fan-in tool collides with the delegation tool");
+        assert_eq!(error.code(), "coordination-tool-collision");
     }
 
     #[test]

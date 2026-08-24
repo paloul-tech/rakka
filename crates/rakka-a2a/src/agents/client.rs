@@ -2,13 +2,11 @@
 //!
 //! `rakka-agent` defines [`rakka_agent::RakkaAgentClient`] over a durable
 //! command port; this module is the port's transport. Every call encodes
-//! onto the same [`RakkaAgentA2AService`] operations an external A2A caller
+//! onto the same [`super::service::RakkaAgentA2AService`] operations an external A2A caller
 //! uses — the same normalization, authorization, durable deduplicated
 //! acceptance, and projection — so a client call and a network call are
 //! indistinguishable to the entities. There is no local actor shortcut
 //! (specification 14.5).
-
-use std::sync::Arc;
 
 use a2a::{
     CancelTaskRequest, Message, Part, PartContent, Role, SendMessageRequest, Task, TaskState,
@@ -17,8 +15,9 @@ use a2a_server::ServiceParams;
 use rakka_agent::{
     AgentClientAgentStatus, AgentClientError, AgentClientFuture, AgentClientManagementCommand,
     AgentClientManagementResponse, AgentClientTaskEvent, AgentClientTaskRequest,
-    AgentClientTaskState, AgentClientTaskView, AgentClientTransport, AgentEntityState,
-    AgentRunState, AgentTaskHistoryStore, AgentTaskId, AgentTaskState,
+    AgentClientTaskState, AgentClientTaskView, AgentClientTransport, AgentCoordinationReplay,
+    AgentEntityState, AgentGoalView, AgentRunState, AgentTaskHistoryStore, AgentTaskId,
+    AgentTaskState,
 };
 use rakka_agent_workflow::PrincipalRef;
 use rakka_persistence::DurableStateStore;
@@ -33,34 +32,80 @@ use super::management::{
     management_request_message, parse_management_response, AgentManagementCommand,
     AgentManagementRequest, AgentManagementResponse, AGENT_MANAGEMENT_SCHEMA_VERSION,
 };
-use super::service::RakkaAgentA2AService;
+use super::service::SharedRakkaAgentA2AService;
 
 /// A2A-backed transport for [`rakka_agent::RakkaAgentClient`].
 ///
 /// Wraps the agents-surface service core with a fixed caller identity: the
 /// service params, tenant, and default principal every call carries.
-pub struct A2AAgentClientTransport<Tasks, Agents, History, Runs>
-where
+pub struct A2AAgentClientTransport<
+    Tasks,
+    Agents,
+    History,
+    Runs,
+    Teams,
+    TeamHistory,
+    Conversations,
+    ConversationHistory,
+> where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
-    service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs>>,
+    service: SharedRakkaAgentA2AService<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >,
     tenant: Option<String>,
     principal: Option<PrincipalRef>,
 }
 
-impl<Tasks, Agents, History, Runs> A2AAgentClientTransport<Tasks, Agents, History, Runs>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
+    A2AAgentClientTransport<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
     /// Wraps a service.
     #[must_use]
-    pub const fn new(service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs>>) -> Self {
+    pub const fn new(
+        service: SharedRakkaAgentA2AService<
+            Tasks,
+            Agents,
+            History,
+            Runs,
+            Teams,
+            TeamHistory,
+            Conversations,
+            ConversationHistory,
+        >,
+    ) -> Self {
         Self {
             service,
             tenant: None,
@@ -86,13 +131,36 @@ where
         ServiceParams::new()
     }
 
+    /// The durable identity of a submission whose caller supplied none.
+    ///
+    /// Pure over what the submission *claims* — the task it completes, the
+    /// contract it declares, and the content itself — so a retry of the same
+    /// submission converges on the decision already recorded, and a corrected
+    /// resubmission carries a different identity without the caller having to
+    /// remember to change one. The entity behind this call is built entirely
+    /// around operation-id convergence; a wrapper that mints a fresh id per
+    /// call opts its callers out of that silently.
+    fn derived_submission_key(request: &rakka_agent::AgentClientTaskResultRequest) -> String {
+        let claim = serde_json::json!({
+            "task": request.task,
+            "definition": request.definition,
+            "definition-version": request.definition_version,
+            "result-schema": request.result_schema,
+            "result-schema-version": request.result_schema_version,
+            "result": request.result,
+        });
+        format!(
+            "derived-{}",
+            rakka_agent::AgentContentDigest::of_json(&claim).value
+        )
+    }
+
     fn principal_metadata(principal: &PrincipalRef) -> Value {
-        let mut encoded = format!("{}:{}", principal.principal_type, principal.principal_id);
-        if let Some(display) = &principal.display_name {
-            encoded.push(':');
-            encoded.push_str(display);
-        }
-        Value::String(encoded)
+        // The shared encoder keeps colon-free principals on the compact
+        // string and spells colon-bearing ids (SPIFFE, ARN) as the object
+        // form, so the identity the authorizer binds is the one that was
+        // configured, never a truncation at the first colon.
+        crate::mapping::principal_ref_to_value(principal)
     }
 }
 
@@ -213,13 +281,27 @@ fn management_command(
     })
 }
 
-impl<Tasks, Agents, History, Runs> AgentClientTransport
-    for A2AAgentClientTransport<Tasks, Agents, History, Runs>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
+    AgentClientTransport
+    for A2AAgentClientTransport<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
     fn create_task(
         &self,
@@ -281,11 +363,100 @@ where
         })
     }
 
+    fn submit_task_result(
+        &self,
+        request: rakka_agent::AgentClientTaskResultRequest,
+    ) -> AgentClientFuture<'_, AgentClientTaskView> {
+        Box::pin(async move {
+            // Derived when the caller supplies none, and derived *before*
+            // anything moves. `Message::new` mints a fresh random id per
+            // call and the ingress falls back to it as the deduplication
+            // discriminator, so an unset key would make every retry a
+            // different durable submission — spending a rejection each time,
+            // and walking a task to `ResultRejectionsExhausted` over a
+            // submission its caller only ever made once.
+            let deduplication_key = request
+                .deduplication_key
+                .clone()
+                .unwrap_or_else(|| Self::derived_submission_key(&request));
+            let mut message = Message::new(
+                Role::User,
+                vec![Part {
+                    content: PartContent::Data(request.result),
+                    filename: None,
+                    media_type: Some("application/json".to_string()),
+                    metadata: None,
+                }],
+            );
+            message.task_id = Some(request.task);
+            message.context_id = request.context;
+            let mut metadata = serde_json::Map::new();
+            metadata.insert(
+                META_DEDUPLICATION_KEY.to_string(),
+                Value::String(deduplication_key),
+            );
+            let mut binding = serde_json::Map::new();
+            binding.insert("definition".to_string(), Value::String(request.definition));
+            binding.insert(
+                "definition-version".to_string(),
+                Value::Number(request.definition_version.into()),
+            );
+            binding.insert(
+                "result-schema".to_string(),
+                Value::String(request.result_schema),
+            );
+            binding.insert(
+                "result-schema-version".to_string(),
+                Value::Number(request.result_schema_version.into()),
+            );
+            if let Some(digest) = request.evidence_digest {
+                binding.insert("evidence-digest".to_string(), Value::String(digest));
+            }
+            metadata.insert(
+                super::ingress::META_AGENT_RESULT.to_string(),
+                Value::Object(binding),
+            );
+            if let Some(principal) = request.principal.as_ref().or(self.principal.as_ref()) {
+                metadata.insert(
+                    META_PRINCIPAL_REF.to_string(),
+                    Self::principal_metadata(principal),
+                );
+            }
+            if let Some(telemetry) = request.telemetry.as_ref() {
+                let mut carrier = rakka_agent_workflow::AgentAttributes::new();
+                if rakka_agent_workflow::inject_agent_trace_context(telemetry, &mut carrier).is_ok()
+                {
+                    for (key, value) in carrier {
+                        metadata.insert(key, Value::String(value));
+                    }
+                }
+            }
+            let send = SendMessageRequest {
+                message,
+                configuration: None,
+                metadata: Some(metadata.into_iter().collect()),
+                tenant: self.tenant.clone(),
+            };
+            let task = self
+                .service
+                .send_message(&Self::params(), &send)
+                .await
+                .map_err(client_error)?;
+            client_view(&task)
+        })
+    }
+
     fn task<'a>(&'a self, task: &'a str) -> AgentClientFuture<'a, Option<AgentClientTaskView>> {
         Box::pin(async move {
             match self
                 .service
-                .get_task(&Self::params(), self.tenant.as_deref(), task, None)
+                .get_task(
+                    &Self::params(),
+                    self.tenant.as_deref(),
+                    task,
+                    self.principal.as_ref(),
+                    None,
+                )
                 .await
             {
                 Ok(task) => client_view(&task).map(Some),
@@ -299,9 +470,19 @@ where
 
     fn cancel_task<'a>(&'a self, task: &'a str) -> AgentClientFuture<'a, AgentClientTaskView> {
         Box::pin(async move {
+            // The configured identity rides the request metadata exactly as
+            // it does on every send: the transport documents a fixed caller
+            // identity, and a cancellation authorized as no one would
+            // silently diverge from that contract.
+            let metadata = self.principal.as_ref().map(|principal| {
+                std::collections::HashMap::from([(
+                    META_PRINCIPAL_REF.to_string(),
+                    Self::principal_metadata(principal),
+                )])
+            });
             let request = CancelTaskRequest {
                 id: task.to_string(),
-                metadata: None,
+                metadata,
                 tenant: self.tenant.clone(),
             };
             let task = self
@@ -368,7 +549,13 @@ where
         Box::pin(async move {
             let events = self
                 .service
-                .replay_task_events(&Self::params(), self.tenant.as_deref(), task, after_cursor)
+                .replay_task_events(
+                    &Self::params(),
+                    self.tenant.as_deref(),
+                    task,
+                    self.principal.as_ref(),
+                    after_cursor,
+                )
                 .await
                 .map_err(client_error)?;
             Ok(events
@@ -384,6 +571,51 @@ where
                     occurred_at: event.occurred_at,
                 })
                 .collect())
+        })
+    }
+
+    fn coordination_events<'a>(
+        &'a self,
+        scope: &'a str,
+        after_cursor: Option<&'a str>,
+        limit: usize,
+    ) -> AgentClientFuture<'a, AgentCoordinationReplay> {
+        Box::pin(async move {
+            // The expired window travels as the reply's own arm, not as an
+            // error: a caller that must resynchronize still learns exactly
+            // where to resume, which an error code cannot carry. The
+            // transport's principal rides the read so a deployment authorizer
+            // can grant coordination history per-principal.
+            self.service
+                .replay_coordination_events(
+                    &Self::params(),
+                    self.tenant.as_deref(),
+                    scope,
+                    self.principal.as_ref(),
+                    after_cursor,
+                    limit,
+                )
+                .await
+                .map_err(client_error)
+        })
+    }
+
+    fn goal_view<'a>(
+        &'a self,
+        goal: &'a str,
+        max_tasks: Option<usize>,
+    ) -> AgentClientFuture<'a, Option<AgentGoalView>> {
+        Box::pin(async move {
+            self.service
+                .agent_goal_view(
+                    &Self::params(),
+                    self.tenant.as_deref(),
+                    goal,
+                    self.principal.as_ref(),
+                    max_tasks,
+                )
+                .await
+                .map_err(client_error)
         })
     }
 }

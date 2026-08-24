@@ -800,6 +800,9 @@ async fn counter_binary_handler(
     Ok(Bytes::from(encoded))
 }
 
+// `tonic::Status` is the protocol's error type the service handler answers
+// with, so the helper's error is not ours to box.
+#[allow(clippy::result_large_err)]
 async fn ask_cart(
     region: &ShardRegion<CartCommand>,
     entity: &EntityRef<CartCommand>,

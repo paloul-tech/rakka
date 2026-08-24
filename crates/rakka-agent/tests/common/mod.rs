@@ -59,6 +59,10 @@ pub type RunStore = CrashingStateStore<AgentRunState>;
 /// Durable store for the shared wake-timer index; a pass-through until a
 /// crash point is armed.
 pub type WakeStore = CrashingStateStore<AgentWakeTimerStoreState>;
+
+/// The crash-armable team store every fixture wires.
+pub type TeamStore = CrashingStateStore<rakka_agent::AgentTeamState>;
+pub type ConversationStore = CrashingStateStore<rakka_agent::AgentConversationState>;
 /// The wake delivery the scanner injects admission commands through.
 pub type WakeDelivery = InProcessWakeDelivery<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore>;
 /// The scanner the wake tests drive.
@@ -97,6 +101,35 @@ pub fn run_scope() -> AgentRunScope {
     )
     .expect("the run id should be derivable");
     AgentRunScope::new(tenant(), agent_id(), run).expect("run scope should be valid")
+}
+
+/// The `Instantiate` operation id for one scope, derived from the envelope
+/// it applies.
+///
+/// Derived, never fixed: the agent entity answers a repeated `Instantiate`
+/// under the *same* operation id as `Duplicate`-Ok without applying the new
+/// envelope, while a different id refuses `AlreadyInstantiated`. A fixed
+/// discriminator made every fixture helper's id identical, so a capability
+/// helper called after a plain instantiate on the same scope silently
+/// granted nothing while its `.expect` passed — and the test then asserted
+/// against the guard it believed it had armed. Deriving the discriminator
+/// from the envelope keeps same-envelope replays idempotent and makes a
+/// differing-envelope re-instantiate fail loudly at the fixture.
+pub fn instantiate_operation_id(
+    scope: &AgentScope,
+    envelope: &AgentAuthorityEnvelope,
+) -> AgentOperationId {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(envelope)
+        .expect("the envelope serializes")
+        .hash(&mut hasher);
+    AgentOperationId::for_agent(
+        AgentOperationKind::DefinitionUpdate,
+        scope,
+        format!("{:016x}", hasher.finish()),
+    )
+    .expect("operation id should be derivable")
 }
 
 pub fn task_definition_id() -> AgentTaskDefinitionId {
@@ -250,6 +283,7 @@ pub fn goal_task_creation_command(
             input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                 .expect("the input is inline-bounded"),
             assignee: Some(agent_id()),
+            team: None,
             goal: None,
             goal_mode: Default::default(),
             goal_spec: Some(Box::new(draft)),
@@ -308,6 +342,80 @@ pub fn delegation_config() -> rakka_agent::AgentRunDelegationConfig {
     .expect("the delegation configuration declares the capability")
 }
 
+/// The coordination tool the handoff fixture declares.
+pub const HANDOFF_TOOL: &str = "transfer";
+
+/// The skill the fixture goal may hand off to.
+pub const HANDOFF_SKILL: &str = "billing";
+
+/// The agent the fixture catalog resolves the handoff skill to.
+pub const HANDOFF_TARGET: &str = "billing-agent";
+
+pub fn handoff_tool_id() -> rakka_agent::AgentToolId {
+    rakka_agent::AgentToolId::new(HANDOFF_TOOL).expect("tool id should be valid")
+}
+
+pub fn handoff_skill_id() -> rakka_agent::AgentCapabilityId {
+    rakka_agent::AgentCapabilityId::new(HANDOFF_SKILL).expect("capability id should be valid")
+}
+
+pub fn handoff_target_id() -> AgentId {
+    AgentId::new(HANDOFF_TARGET).expect("agent id should be valid")
+}
+
+pub fn handoff_target_scope() -> AgentScope {
+    AgentScope::new(tenant(), handoff_target_id()).expect("agent scope should be valid")
+}
+
+/// The target the fixture catalog resolves [`handoff_skill_id`] to: another
+/// agent serving the *same* task definition — specification 8.9's contract
+/// validation requires it.
+pub fn handoff_target() -> rakka_agent::AgentDelegationTarget {
+    rakka_agent::AgentDelegationTarget::new(handoff_target_id(), task_definition_id())
+}
+
+/// The run scope of the handoff target's generation-two run: the same task,
+/// one generation later, under the target agent.
+pub fn handoff_target_run_scope() -> AgentRunScope {
+    let run = rakka_agent::run_id_for_assignment(
+        task_scope().task(),
+        rakka_agent::AgentAssignmentGeneration::new(2),
+    )
+    .expect("the run id should be derivable");
+    AgentRunScope::new(tenant(), handoff_target_id(), run).expect("run scope should be valid")
+}
+
+/// The delegation-and-handoff wiring the fixture run entity serves: the
+/// declared coordination tools, a static catalog serving both skills, and
+/// both capabilities.
+pub fn handoff_config() -> rakka_agent::AgentRunDelegationConfig {
+    rakka_agent::AgentRunDelegationConfig::new(
+        delegation_tool_id(),
+        Arc::new(
+            rakka_agent::StaticAgentDelegationCatalog::new()
+                .with_target(skill_id(), delegation_target())
+                .with_target(handoff_skill_id(), handoff_target()),
+        ),
+        std::collections::BTreeSet::from([
+            rakka_agent::AgentCoordinationCapabilityKind::Delegation,
+            rakka_agent::AgentCoordinationCapabilityKind::Handoff,
+        ]),
+    )
+    .expect("the delegation configuration declares the capability")
+    .with_handoff(rakka_agent::AgentHandoffPolicy::new(
+        handoff_tool_id(),
+        AgentRevisionNumber::INITIAL,
+    ))
+    .expect("the handoff configuration declares the capability")
+}
+
+/// The fixture goal contract allowing the handoff skill.
+pub fn goal_spec_with_handoff() -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec();
+    spec.allowed_skills = std::collections::BTreeSet::from([skill_id(), handoff_skill_id()]);
+    spec
+}
+
 /// The await verb the fan-in fixture declares.
 pub const FAN_IN_TOOL: &str = "await_children";
 
@@ -350,6 +458,7 @@ pub fn delegation_config_with_fan_in() -> rakka_agent::AgentRunDelegationConfig 
     )
     .expect("the delegation configuration declares the capability")
     .with_fan_in_tool(fan_in_tool_id())
+    .expect("the fan-in tool id does not collide")
 }
 
 /// The fixture goal contract narrowed to delegating [`skill_id`] only.
@@ -477,6 +586,7 @@ pub fn continuous_control_creation_command(goal_mode: AgentGoalMode) -> AgentTas
             input: AgentTaskContent::inline(serde_json::json!({ "goal": 1 }))
                 .expect("the input is inline-bounded"),
             assignee: None,
+            team: None,
             goal: Some(goal_id()),
             goal_mode,
             goal_spec: None,
@@ -504,6 +614,7 @@ pub fn continuous_goal_control_creation_command(
             input: AgentTaskContent::inline(serde_json::json!({ "goal": 1 }))
                 .expect("the input is inline-bounded"),
             assignee: None,
+            team: None,
             goal: Some(goal_id()),
             goal_mode,
             goal_spec: Some(Box::new(draft)),
@@ -662,11 +773,32 @@ pub struct Fixture<
     /// through — over the same durable wake index the scanner scans.
     pub rewake_parker: std::sync::Arc<dyn rakka_agent::AgentWakeRewakeParker>,
     pub history: InMemoryAgentTaskHistoryStore,
+    /// The team entity's durable store, crash-armable like every other.
+    pub teams: TeamStore,
+    /// The team history sink the team entities flush to.
+    pub team_history: rakka_agent::InMemoryAgentTeamHistoryStore,
+    /// The conversation entity's durable store, crash-armable like every
+    /// other.
+    pub conversations: ConversationStore,
+    /// The conversation history sink the conversation entities flush to.
+    pub conversation_history: rakka_agent::InMemoryAgentConversationHistoryStore,
     pub effects: S,
     pub policies: AgentEffectPolicies,
     pub router: AgentExchangeRouter,
     pub task_transport:
         InProcessTaskEntityTransport<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore>,
+    /// The transport the router delivers team-bound exchanges through.
+    pub team_transport: rakka_agent::testkit::InProcessTeamEntityTransport<
+        TeamStore,
+        rakka_agent::InMemoryAgentTeamHistoryStore,
+    >,
+    /// The transport the router delivers conversation-bound exchanges
+    /// through.
+    pub conversation_transport: rakka_agent::testkit::InProcessConversationEntityTransport<
+        ConversationStore,
+        AgentStore,
+        rakka_agent::InMemoryAgentConversationHistoryStore,
+    >,
     /// The transport the router delivers run-bound exchanges through. Held so a
     /// test's memory wiring reaches the run entities the transport builds — the
     /// acceptance path advances the loop on those, not on the entity the test
@@ -718,6 +850,10 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         let runs = RunStore::new();
         let wakes = WakeStore::new();
         let history = InMemoryAgentTaskHistoryStore::new();
+        let teams = TeamStore::new();
+        let team_history = rakka_agent::InMemoryAgentTeamHistoryStore::new();
+        let conversations = ConversationStore::new();
+        let conversation_history = rakka_agent::InMemoryAgentConversationHistoryStore::new();
 
         // The task and the run exchange with each other, so each transport needs
         // the router the other lives in. The deferred router is that late binding
@@ -737,9 +873,28 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             clock.clone(),
         )
         .with_effect_policies(policies.clone());
+        let team_transport = rakka_agent::testkit::InProcessTeamEntityTransport::new(
+            teams.clone(),
+            team_history.clone(),
+            deferred.as_router(),
+            clock.clone(),
+        );
+        let conversation_transport =
+            rakka_agent::testkit::InProcessConversationEntityTransport::new(
+                conversations.clone(),
+                agents.clone(),
+                conversation_history.clone(),
+                deferred.as_router(),
+                clock.clone(),
+            );
         let router = AgentExchangeRouter::new()
             .with_route(AgentEntityClass::Task, Arc::new(task_transport.clone()))
-            .with_route(AgentEntityClass::Run, Arc::new(run_transport.clone()));
+            .with_route(AgentEntityClass::Run, Arc::new(run_transport.clone()))
+            .with_route(AgentEntityClass::Team, Arc::new(team_transport.clone()))
+            .with_route(
+                AgentEntityClass::Conversation,
+                Arc::new(conversation_transport.clone()),
+            );
         deferred.install(router.clone());
         let rewake_parker: std::sync::Arc<dyn rakka_agent::AgentWakeRewakeParker> =
             std::sync::Arc::new(rakka_agent::SharedWakeTimerParker::new(wakes.clone()));
@@ -760,10 +915,16 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             wake_delivery,
             rewake_parker,
             history,
+            teams,
+            team_history,
+            conversations,
+            conversation_history,
             effects,
             policies,
             router,
             task_transport,
+            team_transport,
+            conversation_transport,
             run_transport,
             dispatcher,
             clock,
@@ -841,6 +1002,76 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     /// Instantiates the agent under an explicit authority envelope, for tests
     /// whose dispatches must pass the slice 1.8 authority gate.
     pub async fn instantiate_agent_with_envelope(&self, envelope: AgentAuthorityEnvelope) {
+        self.instantiate_agent_with_envelope_at(agent_scope(), envelope)
+            .await;
+    }
+
+    /// Instantiates an agent at an explicit scope — the handoff target the
+    /// transfer tests offer the task to.
+    pub async fn instantiate_agent_at(&self, scope: AgentScope) {
+        let mut envelope = AgentAuthorityEnvelope::empty();
+        envelope.task_definitions.insert(task_definition_id());
+        self.instantiate_agent_with_envelope_at(scope, envelope)
+            .await;
+    }
+
+    /// Instantiates every named agent as a moderated-conversation
+    /// participant: the plain envelope plus the `Moderation` coordination
+    /// capability the turn door reads
+    /// ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A conversation's roster is trusted application wiring and never an
+    /// authority source of its own, so a speaker the roster admits but whose
+    /// definition does not grant `Moderation` — including one with no durable
+    /// record at all — is refused `conversation-moderation-unauthorized`.
+    pub async fn instantiate_conversation_participants(&self, participants: &[&str]) {
+        for participant in participants {
+            let scope = AgentScope::new(
+                tenant(),
+                AgentId::new(*participant).expect("the agent id should be valid"),
+            )
+            .expect("the agent scope should be valid");
+            let mut envelope = AgentAuthorityEnvelope::empty();
+            envelope.task_definitions.insert(task_definition_id());
+            envelope
+                .coordination_capabilities
+                .insert(rakka_agent::AgentCoordinationCapabilityKind::Moderation);
+            self.instantiate_agent_with_envelope_at(scope, envelope)
+                .await;
+        }
+    }
+
+    /// Instantiates an agent that may claim work off a shared team board: the
+    /// plain envelope plus the `Team` coordination capability the claim's
+    /// assignment door reads
+    /// ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Board membership is trusted application wiring and never an authority
+    /// source of its own, so a member that skips this is refused
+    /// `team-coordination-unauthorized` at the door and its board entry
+    /// reopens.
+    pub async fn instantiate_team_member_at(&self, scope: AgentScope) {
+        let mut envelope = AgentAuthorityEnvelope::empty();
+        envelope.task_definitions.insert(task_definition_id());
+        envelope
+            .coordination_capabilities
+            .insert(rakka_agent::AgentCoordinationCapabilityKind::Team);
+        self.instantiate_agent_with_envelope_at(scope, envelope)
+            .await;
+    }
+
+    /// Instantiates an agent at an explicit scope under an explicit envelope.
+    ///
+    /// The operation id derives from the envelope (see
+    /// [`instantiate_operation_id`]), so re-instantiating the same scope
+    /// under a *different* envelope refuses `AlreadyInstantiated` loudly
+    /// instead of answering `Duplicate`-Ok and silently granting nothing.
+    pub async fn instantiate_agent_with_envelope_at(
+        &self,
+        scope: AgentScope,
+        envelope: AgentAuthorityEnvelope,
+    ) {
+        let operation_id = instantiate_operation_id(&scope, &envelope);
         let definition = AgentDefinition::new(
             AgentDefinitionId::new("support-v1").expect("definition id should be valid"),
             "Resolves customer support tickets end to end.",
@@ -848,16 +1079,11 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         )
         .expect("the agent definition should be valid");
 
-        let mut agent = AgentEntityStore::new(agent_scope(), self.agents.clone());
+        let mut agent = AgentEntityStore::new(scope.clone(), self.agents.clone());
         agent.recover().await.expect("the agent should recover");
         agent
             .apply(AgentEntityCommand::Instantiate {
-                operation_id: AgentOperationId::for_agent(
-                    AgentOperationKind::DefinitionUpdate,
-                    &agent_scope(),
-                    "1",
-                )
-                .expect("operation id should be derivable"),
+                operation_id,
                 definition: Box::new(definition),
                 settings: Box::new(AgentSettings::default()),
                 provenance: Box::new(provenance(1)),
@@ -914,6 +1140,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                             .expect("the input is inline-bounded"),
                         assignee: Some(agent_id()),
+                        team: None,
                         goal: None,
                         goal_mode: Default::default(),
                         goal_spec: None,
@@ -979,6 +1206,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                             .expect("the input is inline-bounded"),
                         assignee: Some(agent_id()),
+                        team: None,
                         goal: Some(goal_id()),
                         goal_mode,
                         goal_spec: None,
@@ -1113,6 +1341,165 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         task.settle_side_effects(&self.router, self.now())
             .await
             .map_err(|error| error.code().to_string())
+    }
+
+    /// Applies one command to a team entity at an explicit scope, rebuilding
+    /// the entity from durable state — every call is already a restart.
+    pub async fn apply_team_command_at(
+        &self,
+        scope: &rakka_agent::AgentTeamScope,
+        command: rakka_agent::AgentTeamEntityCommand,
+    ) -> Result<rakka_agent::AgentTeamEntityReply, rakka_agent::AgentTeamError> {
+        let mut team = rakka_agent::AgentTeamEntityStore::new(
+            scope.clone(),
+            self.teams.clone(),
+            self.team_history.clone(),
+        );
+        if let Some(metrics) = &self.metrics {
+            team = team.with_metrics(metrics.clone());
+        }
+        let now = self.now();
+        team.recover(now).await?;
+        team.apply(command, &self.router, self.now()).await
+    }
+
+    /// Settles one team entity at an explicit scope, the way a recovery
+    /// sweep would: expiry observation, history flush, and the courier.
+    pub async fn settle_team_at(
+        &self,
+        scope: &rakka_agent::AgentTeamScope,
+    ) -> Result<rakka_agent::AgentTeamProgress, String> {
+        let mut team = rakka_agent::AgentTeamEntityStore::new(
+            scope.clone(),
+            self.teams.clone(),
+            self.team_history.clone(),
+        );
+        if let Some(metrics) = &self.metrics {
+            team = team.with_metrics(metrics.clone());
+        }
+        let now = self.now();
+        team.recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        team.settle_side_effects(&self.router, self.now())
+            .await
+            .map_err(|error| error.code().to_string())
+    }
+
+    /// The bounded projection of one team entity, rebuilt from durable state.
+    pub async fn team_snapshot_at(
+        &self,
+        scope: &rakka_agent::AgentTeamScope,
+    ) -> Option<rakka_agent::AgentTeamSnapshot> {
+        let mut team = rakka_agent::AgentTeamEntityStore::new(
+            scope.clone(),
+            self.teams.clone(),
+            self.team_history.clone(),
+        );
+        let now = self.now();
+        team.recover(now).await.ok()?;
+        team.snapshot().ok().flatten()
+    }
+
+    /// Applies one command to a conversation entity at an explicit scope,
+    /// rebuilding the entity from durable state — every call is already a
+    /// restart.
+    pub async fn apply_conversation_command_at(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+        command: rakka_agent::AgentConversationEntityCommand,
+    ) -> Result<rakka_agent::AgentConversationEntityReply, rakka_agent::AgentConversationError>
+    {
+        let mut conversation = rakka_agent::AgentConversationEntityStore::new(
+            scope.clone(),
+            self.conversations.clone(),
+            self.agents.clone(),
+            self.conversation_history.clone(),
+        );
+        if let Some(metrics) = &self.metrics {
+            conversation = conversation.with_metrics(metrics.clone());
+        }
+        let now = self.now();
+        conversation.recover(now).await?;
+        conversation.apply(command, &self.router, self.now()).await
+    }
+
+    /// Settles one conversation entity at an explicit scope, the way a
+    /// recovery sweep would: expiry observation, history flush, and the
+    /// courier.
+    pub async fn settle_conversation_at(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> Result<rakka_agent::AgentConversationProgress, String> {
+        let mut conversation = rakka_agent::AgentConversationEntityStore::new(
+            scope.clone(),
+            self.conversations.clone(),
+            self.agents.clone(),
+            self.conversation_history.clone(),
+        );
+        if let Some(metrics) = &self.metrics {
+            conversation = conversation.with_metrics(metrics.clone());
+        }
+        let now = self.now();
+        conversation
+            .recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        conversation
+            .settle_side_effects(&self.router, self.now())
+            .await
+            .map_err(|error| error.code().to_string())
+    }
+
+    /// The bounded projection of one conversation entity, rebuilt from
+    /// durable state.
+    pub async fn conversation_snapshot_at(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> Option<rakka_agent::AgentConversationSnapshot> {
+        let mut conversation = rakka_agent::AgentConversationEntityStore::new(
+            scope.clone(),
+            self.conversations.clone(),
+            self.agents.clone(),
+            self.conversation_history.clone(),
+        );
+        let now = self.now();
+        conversation.recover(now).await.ok()?;
+        conversation.snapshot().ok().flatten()
+    }
+
+    /// The serialized size of one conversation's persisted state — the whole
+    /// record the compare-and-set writes, which is what the state bound
+    /// governs.
+    pub async fn conversation_state_bytes(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> Option<usize> {
+        use rakka_persistence::DurableStateStore;
+
+        let record = self
+            .conversations
+            .load(&scope.persistence_id())
+            .await
+            .ok()??;
+        serde_json::to_vec(&record.state)
+            .ok()
+            .map(|bytes| bytes.len())
+    }
+
+    /// How many history entries one conversation still owes its sink.
+    pub async fn conversation_pending_history(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> Option<usize> {
+        use rakka_persistence::DurableStateStore;
+
+        let record = self
+            .conversations
+            .load(&scope.persistence_id())
+            .await
+            .ok()??;
+        Some(record.state.pending_history().len())
     }
 
     /// Drives the root controller, one epoch task, and that epoch's run until
@@ -1299,6 +1686,15 @@ pub struct ShardedWorld {
     pub tasks: TaskStore,
     /// Durable run-entity store.
     pub runs: RunStore,
+    /// Durable team-entity store.
+    pub teams: TeamStore,
+    /// The team history sink the sharded team entities flush to.
+    pub team_history: rakka_agent::InMemoryAgentTeamHistoryStore,
+    /// Durable conversation-entity store.
+    pub conversations: ConversationStore,
+    /// The conversation history sink the sharded conversation entities
+    /// flush to.
+    pub conversation_history: rakka_agent::InMemoryAgentConversationHistoryStore,
     /// The scripted model/tool answers a test drives ready effects with.
     pub dispatcher: ScriptedDispatcher,
     /// The agent entity type's sharding registration.
@@ -1307,6 +1703,10 @@ pub struct ShardedWorld {
     pub task_registration: rakka_agent::AgentTaskEntityRegistration,
     /// The run entity type's sharding registration.
     pub run_registration: rakka_agent::AgentRunEntityRegistration,
+    /// The team entity type's sharding registration.
+    pub team_registration: rakka_agent::AgentTeamEntityRegistration,
+    /// The conversation entity type's sharding registration.
+    pub conversation_registration: rakka_agent::AgentConversationEntityRegistration,
 }
 
 impl ShardedWorld {
@@ -1325,11 +1725,15 @@ impl ShardedWorld {
     ) -> Self {
         use rakka_agent::testkit::LocalShardedExchangeRoute;
         use rakka_agent::{
-            agent_entity_type_key, agent_run_entity_type_key, agent_task_entity_type_key,
-            init_agent_entity_sharding, init_agent_run_entity_sharding,
-            init_agent_task_entity_sharding, AgentEntityShardingSettings, AgentRunEntityMessage,
-            AgentRunEntityShardingSettings, AgentTaskEntityMessage,
-            AgentTaskEntityShardingSettings,
+            agent_conversation_entity_type_key, agent_entity_type_key, agent_run_entity_type_key,
+            agent_task_entity_type_key, agent_team_entity_type_key,
+            init_agent_conversation_entity_sharding, init_agent_entity_sharding,
+            init_agent_run_entity_sharding, init_agent_task_entity_sharding,
+            init_agent_team_entity_sharding, AgentConversationEntityMessage,
+            AgentConversationEntityShardingSettings, AgentEntityShardingSettings,
+            AgentRunEntityMessage, AgentRunEntityShardingSettings, AgentTaskEntityMessage,
+            AgentTaskEntityShardingSettings, AgentTeamEntityMessage,
+            AgentTeamEntityShardingSettings,
         };
 
         let system = rakka_core::ActorSystem::new(name);
@@ -1337,6 +1741,10 @@ impl ShardedWorld {
         let agents = AgentStore::new();
         let tasks = TaskStore::new();
         let runs = RunStore::new();
+        let teams = TeamStore::new();
+        let team_history = rakka_agent::InMemoryAgentTeamHistoryStore::new();
+        let conversations = ConversationStore::new();
+        let conversation_history = rakka_agent::InMemoryAgentConversationHistoryStore::new();
         let history = InMemoryAgentTaskHistoryStore::new();
         let effects = InMemoryAgentRunEffectSink::new();
         let clock = Arc::new(AtomicU64::new(1));
@@ -1380,6 +1788,37 @@ impl ShardedWorld {
             run_settings,
         )
         .expect("run entity sharding initializes");
+        let team_registration = init_agent_team_entity_sharding(
+            &sharding,
+            teams.clone(),
+            team_history.clone(),
+            deferred.as_router(),
+            AgentTeamEntityShardingSettings::new(agent_team_entity_type_key())
+                .with_idle_passivation(idle)
+                .with_clock({
+                    let clock = clock.clone();
+                    Arc::new(move || {
+                        AgentTimestampMillis::new(clock.fetch_add(1, Ordering::SeqCst))
+                    })
+                }),
+        )
+        .expect("team entity sharding initializes");
+        let conversation_registration = init_agent_conversation_entity_sharding(
+            &sharding,
+            conversations.clone(),
+            agents.clone(),
+            conversation_history.clone(),
+            deferred.as_router(),
+            AgentConversationEntityShardingSettings::new(agent_conversation_entity_type_key())
+                .with_idle_passivation(idle)
+                .with_clock({
+                    let clock = clock.clone();
+                    Arc::new(move || {
+                        AgentTimestampMillis::new(clock.fetch_add(1, Ordering::SeqCst))
+                    })
+                }),
+        )
+        .expect("conversation entity sharding initializes");
 
         let router = AgentExchangeRouter::new()
             .with_route(
@@ -1405,6 +1844,30 @@ impl ShardedWorld {
                         reply_to,
                     },
                 )),
+            )
+            .with_route(
+                AgentEntityClass::Team,
+                Arc::new(LocalShardedExchangeRoute::new(
+                    sharding.clone(),
+                    team_registration.key().clone(),
+                    Self::ASK_TIMEOUT,
+                    |envelope, reply_to| AgentTeamEntityMessage::Exchange {
+                        envelope: Box::new(envelope),
+                        reply_to,
+                    },
+                )),
+            )
+            .with_route(
+                AgentEntityClass::Conversation,
+                Arc::new(LocalShardedExchangeRoute::new(
+                    sharding.clone(),
+                    conversation_registration.key().clone(),
+                    Self::ASK_TIMEOUT,
+                    |envelope, reply_to| AgentConversationEntityMessage::Exchange {
+                        envelope: Box::new(envelope),
+                        reply_to,
+                    },
+                )),
             );
         deferred.install(router);
 
@@ -1414,16 +1877,66 @@ impl ShardedWorld {
             agents,
             tasks,
             runs,
+            teams,
+            team_history,
+            conversations,
+            conversation_history,
             dispatcher,
             agent_registration,
             task_registration,
             run_registration,
+            team_registration,
+            conversation_registration,
         }
     }
 
     /// The sharded ref for one agent scope.
     pub fn agent_ref(&self, scope: &AgentScope) -> rakka_agent::AgentEntityRef {
         rakka_agent::registered_agent_entity_ref(&self.agent_registration, scope)
+    }
+
+    /// Instantiates every named agent as a moderated-conversation
+    /// participant on the real sharded agent entity — the `Fixture` helper of
+    /// the same name, over the deployment-shaped wiring.
+    ///
+    /// The conversation entity reads these records durably rather than asking
+    /// the entity, so they stay readable while every agent is passivated,
+    /// which is exactly what the passivation tests need.
+    pub async fn instantiate_conversation_participants(&self, participants: &[&str]) {
+        for participant in participants {
+            let scope = AgentScope::new(
+                tenant(),
+                AgentId::new(*participant).expect("the agent id should be valid"),
+            )
+            .expect("the agent scope should be valid");
+            let mut envelope = AgentAuthorityEnvelope::empty();
+            envelope.task_definitions.insert(task_definition_id());
+            envelope
+                .coordination_capabilities
+                .insert(rakka_agent::AgentCoordinationCapabilityKind::Moderation);
+            // Envelope-derived operation id, for the reason
+            // `instantiate_operation_id` gives: a mixed-helper
+            // re-instantiate must fail loudly, never silently grant
+            // nothing.
+            let operation_id = instantiate_operation_id(&scope, &envelope);
+            let definition = AgentDefinition::new(
+                AgentDefinitionId::new("support-v1").expect("the definition id should be valid"),
+                "Resolves customer support tickets end to end.",
+                envelope,
+            )
+            .expect("the agent definition should be valid");
+            let mut agent = AgentEntityStore::new(scope.clone(), self.agents.clone());
+            agent.recover().await.expect("the agent should recover");
+            agent
+                .apply(AgentEntityCommand::Instantiate {
+                    operation_id,
+                    definition: Box::new(definition),
+                    settings: Box::new(AgentSettings::default()),
+                    provenance: Box::new(provenance(1)),
+                })
+                .await
+                .expect("the agent should instantiate");
+        }
     }
 
     /// The sharded ref for one task scope.
@@ -1434,6 +1947,22 @@ impl ShardedWorld {
     /// The sharded ref for one run scope.
     pub fn run_ref(&self, scope: &AgentRunScope) -> rakka_agent::AgentRunEntityRef {
         rakka_agent::registered_agent_run_entity_ref(&self.run_registration, scope)
+    }
+
+    /// The sharded ref for one team scope.
+    pub fn team_ref(&self, scope: &rakka_agent::AgentTeamScope) -> rakka_agent::AgentTeamEntityRef {
+        rakka_agent::registered_agent_team_entity_ref(&self.team_registration, scope)
+    }
+
+    /// The sharded ref for one conversation scope.
+    pub fn conversation_ref(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> rakka_agent::AgentConversationEntityRef {
+        rakka_agent::registered_agent_conversation_entity_ref(
+            &self.conversation_registration,
+            scope,
+        )
     }
 
     /// How many entity actors of any class are resident on this node.
@@ -1453,6 +1982,159 @@ impl ShardedWorld {
             .registration_state(self.run_registration.key())
             .expect("the run registration exists")
             .local_entity_count();
-        agent + task + run
+        let team = self
+            .sharding
+            .registration_state(self.team_registration.key())
+            .expect("the team registration exists")
+            .local_entity_count();
+        let conversation = self
+            .sharding
+            .registration_state(self.conversation_registration.key())
+            .expect("the conversation registration exists")
+            .local_entity_count();
+        agent + task + run + team + conversation
+    }
+}
+
+/// The in-fixture twin of the A2A handoff ingress: builds the deduplicated
+/// `RecordHandoff` command from the record — exactly the claims the wire
+/// cluster carries — and applies it to the task entity over the fixture's
+/// durable stores. The exchanges the transfer owes stay in the journal for
+/// the courier (`pump`) to drive, exactly as production drains an outbox.
+pub struct ApplyingHandoffExecutor {
+    tasks: TaskStore,
+    agents: AgentStore,
+    history: rakka_agent::InMemoryAgentTaskHistoryStore,
+    rewake: Arc<dyn rakka_agent::AgentWakeRewakeParker>,
+    clock: Arc<AtomicU64>,
+    pub seen: std::sync::Mutex<Vec<rakka_agent::AgentHandoffRecord>>,
+}
+
+impl ApplyingHandoffExecutor {
+    pub fn over(fixture: &Fixture) -> Arc<Self> {
+        Arc::new(Self {
+            tasks: fixture.tasks.clone(),
+            agents: fixture.agents.clone(),
+            history: fixture.history.clone(),
+            rewake: fixture.rewake_parker.clone(),
+            clock: fixture.clock.clone(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn request_for(
+        record: &rakka_agent::AgentHandoffRecord,
+    ) -> rakka_agent::AgentTaskHandoffRequest {
+        rakka_agent::AgentTaskHandoffRequest {
+            handoff: record.handoff.clone(),
+            source_agent: record.source_run.agent().clone(),
+            source_run: record.source_run.run().clone(),
+            source_generation: record.source_generation,
+            target: record.resolved.agent.clone(),
+            target_task_definition: record.resolved.task_definition.clone(),
+            result_schema: record.resolved.result_schema.clone(),
+            reason: record.reason.clone(),
+            policy_revision: record.policy_revision,
+            context: record.context.clone(),
+            knowledge_spaces: record.resolved.knowledge_spaces.clone(),
+        }
+    }
+
+    pub async fn apply(
+        &self,
+        record: &rakka_agent::AgentHandoffRecord,
+    ) -> rakka_agent::AgentA2aHandoffFinding {
+        let scope = rakka_agent::AgentTaskScope::new(
+            record.source_run.tenant().clone(),
+            record.task.clone(),
+        )
+        .expect("the task scope is valid");
+        let operation_id = rakka_agent::AgentOperationId::new(
+            rakka_agent::AgentOperationKind::Handoff,
+            [
+                record.source_run.tenant().as_str(),
+                record.task.as_str(),
+                record.deduplication_key.as_str(),
+            ],
+        )
+        .expect("the operation id derives");
+        let mut store = rakka_agent::AgentTaskEntityStore::new(
+            scope,
+            self.tasks.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        )
+        .with_wake_timers(self.rewake.clone());
+        let now = rakka_agent_workflow::AgentTimestampMillis::new(
+            self.clock.fetch_add(1, Ordering::SeqCst),
+        );
+        if let Err(error) = store.recover(now).await {
+            return rakka_agent::AgentA2aHandoffFinding::Refused {
+                code: error.code().to_string(),
+                message: error.to_string(),
+            };
+        }
+        // The owed exchanges deliberately stay journaled: the executor
+        // returns a receipt, and the courier drains the choreography later —
+        // never synchronously from inside the send.
+        let router = rakka_agent::AgentExchangeRouter::new();
+        let reply = store
+            .apply(
+                rakka_agent::AgentTaskEntityCommand::RecordHandoff {
+                    operation_id,
+                    request: Box::new(Self::request_for(record)),
+                },
+                &router,
+                rakka_agent_workflow::AgentTimestampMillis::new(
+                    self.clock.fetch_add(1, Ordering::SeqCst),
+                ),
+            )
+            .await;
+        let echo = store.snapshot().ok().flatten().and_then(|snapshot| {
+            snapshot
+                .handoff
+                .filter(|handoff| handoff.handoff == record.handoff)
+                .map(|handoff| handoff.target_generation)
+        });
+        match reply {
+            Ok(
+                rakka_agent::AgentTaskEntityReply::Applied { .. }
+                | rakka_agent::AgentTaskEntityReply::Duplicate { .. },
+            ) => rakka_agent::AgentA2aHandoffFinding::Recorded {
+                target_generation: echo.flatten(),
+                peer_status: "working".to_string(),
+            },
+            Ok(other) => rakka_agent::AgentA2aHandoffFinding::Refused {
+                code: "unexpected-reply".to_string(),
+                message: format!("unexpected entity reply {other:?}"),
+            },
+            // The probe posture: an error after the durable commit still
+            // echoes the recorded transfer; only an unrecorded transfer is a
+            // definitive refusal.
+            Err(_) if echo.is_some() => rakka_agent::AgentA2aHandoffFinding::Recorded {
+                target_generation: echo.flatten(),
+                peer_status: "working".to_string(),
+            },
+            Err(error) => rakka_agent::AgentA2aHandoffFinding::Refused {
+                code: error.code().to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
+impl rakka_agent::AgentA2aHandoffSendExecutor for ApplyingHandoffExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a rakka_agent::AgentRunScope,
+        _intent: &'a rakka_agent::AgentRunEffect,
+        handoff: &'a rakka_agent::AgentHandoffRecord,
+        _credential: Option<&'a rakka_agent_workflow::AgentEphemeralCredential>,
+    ) -> rakka_agent::AgentDispatchFuture<'a, rakka_agent::AgentA2aHandoffFinding> {
+        self.seen
+            .lock()
+            .expect("the record log should not be poisoned")
+            .push(handoff.clone());
+        Box::pin(async move { Ok(self.apply(handoff).await) })
     }
 }

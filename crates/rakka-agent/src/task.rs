@@ -113,11 +113,11 @@ use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
     AgentExchangeHost, AgentExchangeJournal, AgentExchangeKind, AgentExchangeParticipant,
     AgentExchangePayload, AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter,
-    AgentExchangeState, AgentExchangeTransition,
+    AgentExchangeState, AgentExchangeTransition, AGENT_EXCHANGE_PENDING_CAPACITY,
 };
 use crate::definition::{
-    AgentBudgetCeilings, AgentCapabilityId, AgentOperationClass, AgentPolicyRefs,
-    AgentRevisionNumber, AgentRevisionProvenance, AgentTaskDefinitionId,
+    AgentBudgetCeilings, AgentCapabilityId, AgentCoordinationCapabilityKind, AgentOperationClass,
+    AgentPolicyRefs, AgentRevisionNumber, AgentRevisionProvenance, AgentTaskDefinitionId,
 };
 use crate::evaluation::{
     AgentGoalEvaluationRecord, AgentGoalStagnationAction, AgentGoalStagnationPolicy,
@@ -135,8 +135,9 @@ use crate::identity::{
     AgentWakeId, TenantId, AGENT_IDENTITY_MAX_LENGTH,
 };
 use crate::observability::{
-    record_agent_domain_counter, METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE,
-    METRIC_AGENT_GOAL_STAGNATION, METRIC_AGENT_GOAL_STATUS, METRIC_AGENT_WAKE_DISPOSITIONS,
+    record_agent_domain_counter, record_unsettleable_exchanges, METRIC_AGENT_DEPENDENCY_OUTCOMES,
+    METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION,
+    METRIC_AGENT_GOAL_STATUS, METRIC_AGENT_HUMAN_RESULTS, METRIC_AGENT_WAKE_DISPOSITIONS,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -193,6 +194,10 @@ pub const AGENT_TASK_MATERIALIZED_MAX_BYTES: usize = 32 * 1024;
 /// [`AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH`] makes for derived run ids.
 pub const AGENT_TASK_STATE_GROWTH_RESERVE_BYTES: usize = 6 * 1024;
 
+/// Default horizon, in milliseconds, a board-governed task may wait unclaimed
+/// before the settle pass expires it: one day.
+pub const AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS: u64 = 86_400_000;
+
 /// Maximum number of deterministic result rules one task definition may carry.
 pub const AGENT_TASK_MAX_RESULT_RULES: usize = 32;
 
@@ -214,6 +219,30 @@ pub const AGENT_TASK_MAX_DEPENDENCIES: usize = 32;
 /// read: a task refuses a dependency that already lists the task itself as an
 /// ancestor. The chain is bounded because durable state is.
 pub const AGENT_TASK_MAX_DEPENDENCY_DEPTH: usize = 32;
+
+/// Maximum number of dependents one task may durably register.
+///
+/// Symmetric with [`AGENT_TASK_MAX_DEPENDENCIES`]: the reverse edges are
+/// bounded exactly like the forward edges, so neither side of the dependency
+/// graph can grow a task's materialized record without bound. Entries are
+/// never pruned, so the ceiling counts every dependent that ever registered
+/// while the task was nonterminal, not the ones still live.
+///
+/// The thirty-third registration is refused definitively — and the refusal is
+/// an answer, not silence: the refused dependent resolves that forward edge
+/// *failed* and applies the policy the edge declared, because an upstream that
+/// holds no registry entry for it can never send it an outcome.
+pub const AGENT_TASK_MAX_DEPENDENTS: usize = 32;
+
+/// How many rejected human-submission operation ids the task remembers past
+/// the operation log's bounded window.
+///
+/// The ring is what keeps a replayed rejected submission from spending the
+/// rejection budget twice: the most recent rejection echoes from the task's
+/// materialized `last_rejection`, and an older replay found in the ring is
+/// refused without a second validation decision. The rejection *limit* is
+/// definition-declared with no upper bound, so the echo needs its own cap.
+pub const AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY: usize = 32;
 
 /// Maximum number of evidence artifact references one result proposal may carry.
 pub const AGENT_TASK_MAX_EVIDENCE_ARTIFACTS: usize = 8;
@@ -286,6 +315,36 @@ pub const AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE: &str = "rakka.agent.DelegationCa
 pub const AGENT_DELEGATION_CANCEL_RECEIPT_PAYLOAD_TYPE: &str =
     "rakka.agent.DelegationCancelReceipt";
 
+/// Payload type of an [`AgentExchangeKind::HandoffResult`] exchange notice.
+pub const AGENT_HANDOFF_RESULT_PAYLOAD_TYPE: &str = "rakka.agent.HandoffResult";
+
+/// Payload type of the source run's receipt replying to an
+/// [`AgentExchangeKind::HandoffResult`].
+pub const AGENT_HANDOFF_RESULT_RECEIPT_PAYLOAD_TYPE: &str = "rakka.agent.HandoffResultReceipt";
+
+/// Payload type of an [`AgentExchangeKind::DependencyRegistration`] exchange
+/// command.
+pub const AGENT_DEPENDENCY_REGISTRATION_PAYLOAD_TYPE: &str = "rakka.agent.DependencyRegistration";
+
+/// Payload type of the upstream task's receipt replying to a
+/// [`AgentExchangeKind::DependencyRegistration`].
+pub const AGENT_DEPENDENCY_REGISTRATION_RECEIPT_PAYLOAD_TYPE: &str =
+    "rakka.agent.DependencyRegistrationReceipt";
+
+/// Payload type of an [`AgentExchangeKind::DependencyOutcome`] exchange
+/// notice.
+pub const AGENT_DEPENDENCY_OUTCOME_PAYLOAD_TYPE: &str = "rakka.agent.DependencyOutcome";
+
+/// Payload type of the dependent task's receipt replying to a
+/// [`AgentExchangeKind::DependencyOutcome`].
+pub const AGENT_DEPENDENCY_OUTCOME_RECEIPT_PAYLOAD_TYPE: &str =
+    "rakka.agent.DependencyOutcomeReceipt";
+
+/// Payload type of the governing task's receipt replying to a
+/// [`AgentExchangeKind::ConversationTerminalNotice`].
+pub const AGENT_CONVERSATION_TERMINAL_RECEIPT_PAYLOAD_TYPE: &str =
+    "rakka.agent.ConversationTerminalReceipt";
+
 /// Payload type of an [`AgentRunAssignment`] exchange command.
 pub const AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE: &str = "rakka.agent.RunAssignment";
 
@@ -319,6 +378,20 @@ pub const AGENT_TASK_REFUSAL_STALE_GENERATION: &str = "stale-assignment-generati
 /// cancellation from the status alone; this code is what it reads. The string
 /// is wire and durable surface — it never changes.
 pub const AGENT_TASK_REFUSAL_CANCEL_REQUESTED: &str = "task-cancel-requested";
+
+/// Resolution code of a handoff the terminal transition settled because the
+/// task ended while the transfer was still unresolved
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)'s
+/// single-attempt rule, terminal arm).
+///
+/// A pending transfer must not cross the terminal boundary unresolved — the
+/// owed handoff result derives only from a settled provenance — so the
+/// terminalization settles it. A result accepted from the transfer's own
+/// minted generation settles `Accepted`; every other terminal flavor settles
+/// `Refused` under this code, which reaches the source run through its
+/// handoff-result notice. The string is wire and durable surface — it never
+/// changes.
+pub const AGENT_TASK_HANDOFF_TERMINAL_CODE: &str = "handoff-task-terminal";
 
 /// Payload type of the [`AgentTaskOutcome`] an accepted
 /// [`AgentExchangeKind::Creation`] reply carries.
@@ -1197,8 +1270,15 @@ pub enum AgentTaskOwnership {
     Agent,
     /// An authenticated human or service, through the same typed validation
     /// path. The task is deliberately never assigned to an agent
-    /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)); the
-    /// authenticated completion command lands with slice 5.4.
+    /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)); it
+    /// waits `WaitingForInput` for an authenticated
+    /// [`AgentHumanResultSubmission`].
+    ///
+    /// A human-owned task is a work product with a typed result, never a
+    /// substitute for an effect-bound checkpoint: a decision that approves,
+    /// authorizes, or reconciles a *specific effect* must ride
+    /// [`crate::checkpoints::AgentCheckpoint`], bound to the exact effect
+    /// intent — a human task's result binds to nothing it could gate.
     Human,
 }
 
@@ -1233,17 +1313,59 @@ pub struct AgentTaskLimits {
     pub max_assignments: u32,
     /// How many dependencies the task may declare.
     pub max_dependencies: usize,
+    /// How many handoffs the task may record over its lifetime
+    /// ([specification 9.6](../../../docs/plans/rakka-agent/spec.md):
+    /// handoffs/reassignments are bounded; this is also what bounds an
+    /// A→B→A oscillation deterministically). Definitions persisted before
+    /// this field load with the default bound.
+    #[serde(default = "default_max_handoffs")]
+    pub max_handoffs: u32,
+    /// How many team board claims the task may record over its lifetime
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)): the
+    /// deterministic bound on claim/refuse cycles, the handoff bound's
+    /// precedent. Definitions persisted before this field load with the
+    /// default bound.
+    #[serde(default = "default_max_team_claims")]
+    pub max_team_claims: u32,
+    /// How long, in milliseconds, a board-governed task may wait unclaimed
+    /// and unassigned before the settle pass expires it
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)): the
+    /// bounded replacement for the assignee fail-fast a team creation
+    /// forgoes — a team id that never produces a claim surfaces as a
+    /// cancelled task instead of parking silently, escrow locked, forever.
+    /// `None` waits unbounded, explicitly. Definitions persisted before this
+    /// field load with the default horizon.
+    #[serde(default = "default_max_unclaimed_millis")]
+    pub max_unclaimed_millis: Option<u64>,
+}
+
+/// The default handoff bound of [`AgentTaskLimits`].
+const fn default_max_handoffs() -> u32 {
+    4
+}
+
+/// The default team-claim bound of [`AgentTaskLimits`].
+const fn default_max_team_claims() -> u32 {
+    4
+}
+
+/// The default unclaimed-wait horizon of [`AgentTaskLimits`].
+const fn default_max_unclaimed_millis() -> Option<u64> {
+    Some(AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS)
 }
 
 impl AgentTaskLimits {
-    /// The default bounds: three rejections, three assignments, and the
-    /// crate-level dependency maximum.
+    /// The default bounds: three rejections, three assignments, four
+    /// handoffs, and the crate-level dependency maximum.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             max_result_rejections: 3,
             max_assignments: 3,
             max_dependencies: AGENT_TASK_MAX_DEPENDENCIES,
+            max_handoffs: default_max_handoffs(),
+            max_team_claims: default_max_team_claims(),
+            max_unclaimed_millis: default_max_unclaimed_millis(),
         }
     }
 
@@ -1268,10 +1390,40 @@ impl AgentTaskLimits {
         self
     }
 
+    /// Sets how many handoffs the task may record over its lifetime.
+    #[must_use]
+    pub const fn with_max_handoffs(mut self, maximum: u32) -> Self {
+        self.max_handoffs = maximum;
+        self
+    }
+
+    /// Sets how long the task may wait unclaimed on a team board, `None` for
+    /// an explicitly unbounded wait.
+    #[must_use]
+    pub const fn with_max_unclaimed_millis(mut self, horizon: Option<u64>) -> Self {
+        self.max_unclaimed_millis = horizon;
+        self
+    }
+
     fn validate(&self) -> AgentTaskResult<()> {
         if self.max_result_rejections == 0 {
             return Err(AgentTaskError::InvalidDefinition {
                 detail: "a task must tolerate at least one result rejection".to_string(),
+            });
+        }
+        if self.max_result_rejections as usize > AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY {
+            // The echo ring is what keeps a replayed rejection from spending
+            // the budget a second time, and it remembers a bounded number of
+            // submissions. A budget larger than the ring would let a replay
+            // evicted from it re-spend — so the budget is refused where it is
+            // declared, rather than the guard silently covering only part of
+            // what it claims to.
+            return Err(AgentTaskError::InvalidDefinition {
+                detail: format!(
+                    "a task may tolerate at most {AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY} \
+                     result rejections: that is how many rejected submissions the echo ring \
+                     remembers, and a budget past it could be spent twice by one replay"
+                ),
             });
         }
         if self.max_assignments == 0 {
@@ -1284,6 +1436,11 @@ impl AgentTaskLimits {
                 detail: format!(
                     "a task may not raise the dependency bound above {AGENT_TASK_MAX_DEPENDENCIES}"
                 ),
+            });
+        }
+        if self.max_unclaimed_millis == Some(0) {
+            return Err(AgentTaskError::InvalidDefinition {
+                detail: "a task's unclaimed horizon must be positive when set".to_string(),
             });
         }
         Ok(())
@@ -1514,6 +1671,29 @@ impl AgentTaskDefinition {
         for rule in &self.result_rules {
             rule.check.validate()?;
         }
+        if !self.is_agent_owned()
+            && self
+                .result_rules
+                .iter()
+                .any(|rule| matches!(rule.check, AgentTaskResultCheck::EvidenceRequired))
+        {
+            // A rule no submission can satisfy is worse than no rule: every
+            // attempt is a *committed* rejection, so the task walks its
+            // budget down to `ResultRejectionsExhausted` and takes its
+            // dependents with it. The human submission door carries no
+            // evidence — the A2A binding's evidence field is advisory and the
+            // surface accepts no artifacts until the artifact strategy lands
+            // — so the contradiction is refused where it is declared, at
+            // definition time, rather than discovered when someone's approval
+            // is silently spent. Lift this when evidence can travel to a
+            // human.
+            return Err(AgentTaskError::InvalidDefinition {
+                detail: "a human-owned task may not require evidence: no submission surface \
+                         carries evidence artifacts yet, so the rule could never be satisfied \
+                         and every attempt would spend the rejection budget"
+                    .to_string(),
+            });
+        }
         self.limits.validate()
     }
 
@@ -1523,48 +1703,76 @@ impl AgentTaskDefinition {
         matches!(self.ownership, AgentTaskOwnership::Agent)
     }
 
-    /// Validates a proposed result against the definition's schema reference,
+    /// Validates a claimed result against the definition's schema reference,
     /// revision, and every deterministic rule, returning the first rule that
     /// refused it.
     ///
-    /// It is a pure function: the same proposal always produces the same
-    /// decision, on any node, after any restart.
-    fn validate_proposal(
-        &self,
-        proposal: &AgentTaskResultProposal,
-    ) -> Result<(), AgentTaskRejectionCause> {
-        if proposal.definition_id != self.definition_id
-            || proposal.definition_version != self.version
-        {
+    /// It is a pure function: the same claim always produces the same
+    /// decision, on any node, after any restart — which is what lets a run's
+    /// proposal and a human's submission share it verbatim
+    /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md): the
+    /// same typed validation path).
+    fn validate_result(&self, claim: &AgentResultClaim<'_>) -> Result<(), AgentTaskRejectionCause> {
+        if claim.definition_id != &self.definition_id || claim.definition_version != self.version {
             return Err(AgentTaskRejectionCause::definition_mismatch(format!(
                 "the result was proposed under task definition {}@{} but the task runs {}@{}",
-                proposal.definition_id,
-                proposal.definition_version,
-                self.definition_id,
-                self.version
+                claim.definition_id, claim.definition_version, self.definition_id, self.version
             )));
         }
-        if proposal.result_schema != self.result_schema {
+        if claim.result_schema != &self.result_schema {
             return Err(AgentTaskRejectionCause::schema_mismatch(format!(
                 "the result was proposed under schema {} but the task requires {}",
-                proposal.result_schema, self.result_schema
+                claim.result_schema, self.result_schema
             )));
         }
-        if let Err(error) = proposal.content.validate() {
+        if let Err(error) = claim.content.validate() {
             return Err(AgentTaskRejectionCause::malformed(error.to_string()));
         }
-        if proposal.evidence.len() > AGENT_TASK_MAX_EVIDENCE_ARTIFACTS {
+        if claim.evidence.len() > AGENT_TASK_MAX_EVIDENCE_ARTIFACTS {
             return Err(AgentTaskRejectionCause::malformed(format!(
                 "a proposal may carry at most {AGENT_TASK_MAX_EVIDENCE_ARTIFACTS} evidence artifacts"
             )));
         }
 
         for rule in &self.result_rules {
-            if let Some(detail) = rule.evaluate(&proposal.content, &proposal.evidence) {
+            if let Some(detail) = rule.evaluate(claim.content, claim.evidence) {
                 return Err(AgentTaskRejectionCause::rule(rule, detail));
             }
         }
         Ok(())
+    }
+}
+
+/// The origin-neutral borrow of one claimed result, shared by the run's
+/// proposal and the human's submission so both travel the identical
+/// deterministic validation.
+struct AgentResultClaim<'a> {
+    definition_id: &'a AgentTaskDefinitionId,
+    definition_version: AgentRevisionNumber,
+    result_schema: &'a AgentSchemaRef,
+    content: &'a AgentTaskContent,
+    evidence: &'a [ArtifactRef],
+}
+
+impl<'a> AgentResultClaim<'a> {
+    fn from_proposal(proposal: &'a AgentTaskResultProposal) -> Self {
+        Self {
+            definition_id: &proposal.definition_id,
+            definition_version: proposal.definition_version,
+            result_schema: &proposal.result_schema,
+            content: &proposal.content,
+            evidence: &proposal.evidence,
+        }
+    }
+
+    fn from_submission(submission: &'a AgentHumanResultSubmission) -> Self {
+        Self {
+            definition_id: &submission.definition_id,
+            definition_version: submission.definition_version,
+            result_schema: &submission.result_schema,
+            content: &submission.content,
+            evidence: &submission.evidence,
+        }
     }
 }
 
@@ -1881,6 +2089,23 @@ impl AgentTaskDependencyOutcome {
     pub const fn is_satisfied(self) -> bool {
         matches!(self, Self::Completed)
     }
+
+    /// The outcome a terminal task status reports to its dependents, `None`
+    /// for a nonterminal status.
+    ///
+    /// Mapping from *status* — not from the terminal reason — keeps
+    /// transitive propagation exact: a mid-chain dependent cancelled by its
+    /// own policy reports `Cancelled` onward, and each downstream edge
+    /// applies its own declared [`AgentDependencyFailurePolicy`].
+    #[must_use]
+    pub const fn from_terminal_status(status: AgentTaskStatus) -> Option<Self> {
+        match status {
+            AgentTaskStatus::Completed => Some(Self::Completed),
+            AgentTaskStatus::Failed => Some(Self::Failed),
+            AgentTaskStatus::Cancelled => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
 }
 
 impl Display for AgentTaskDependencyOutcome {
@@ -1964,6 +2189,14 @@ pub struct AgentTaskDependency {
     pub declared_by: AgentOperationId,
     /// When the edge was declared.
     pub declared_at: AgentTimestampMillis,
+    /// Whether the registration exchange toward the upstream has settled:
+    /// the durable once-guard past the exchange journal's bounded window.
+    /// Edges persisted before the dependents registry load unsettled, so an
+    /// unresolved pre-registry edge registers itself on the next settle pass
+    /// — and an already-terminal upstream answers the late registration with
+    /// its outcome directly.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub registration_settled: bool,
 }
 
 impl AgentTaskDependency {
@@ -1992,6 +2225,28 @@ impl AgentTaskDependency {
         matches!(self.policy, AgentDependencyFailurePolicy::CancelDependents)
             && self.outcome.is_some_and(|outcome| !outcome.is_satisfied())
     }
+}
+
+/// One registered reverse dependency edge: a task that depends on this one
+/// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The registry is what the upstream's terminal transition walks to owe each
+/// dependent its [`AgentExchangeKind::DependencyOutcome`] notification. It is
+/// bounded by [`AGENT_TASK_MAX_DEPENDENTS`] and populated only by the
+/// dependent's own [`AgentExchangeKind::DependencyRegistration`] — the
+/// upstream never guesses who depends on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskDependentRecord {
+    /// The dependent task.
+    pub dependent: AgentTaskId,
+    /// The registration that recorded it.
+    pub registered_by: AgentOperationId,
+    /// When it was recorded.
+    pub registered_at: AgentTimestampMillis,
+    /// Whether the outcome notification toward this dependent has settled:
+    /// the durable once-guard past the exchange journal's bounded window.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub outcome_settled: bool,
 }
 
 /// Whether the run an assignment created has durably accepted it.
@@ -2075,6 +2330,263 @@ pub struct AgentTaskAssignment {
     pub operation_id: AgentOperationId,
     /// When the decision was recorded.
     pub assigned_at: AgentTimestampMillis,
+}
+
+/// The task's *latest* handoff: the bounded materialized provenance of one
+/// same-task transfer ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Only the latest hop is materialized — the chain is history, exactly as
+/// superseded assignments are ([specification 9.6](../../../docs/plans/rakka-agent/spec.md))
+/// — and this record is load-bearing three ways:
+///
+/// - it is the deduplication **echo past the journal's bounded window**: a
+///   replayed handoff command matching [`Self::handoff`] answers with the
+///   recorded target rather than minting a second transfer;
+/// - it is the **source address** every owed derivation reads — the current
+///   assignment names the target after the transfer, so without this record
+///   nothing could reach the source run again; and
+/// - it is the goal view's **source-run join**, the one thing that keeps a
+///   handed-off generation out of the earlier-generations gap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskHandoff {
+    /// The handoff identity, derived by the source run.
+    pub handoff: crate::identity::AgentHandoffId,
+    /// The source assignment, stashed whole at the transfer so a refused
+    /// handoff restores it exactly — the source never stopped being its
+    /// generation's accepted owner, and its escrow child was never touched.
+    pub source_assignment: Box<AgentTaskAssignment>,
+    /// The agent the transfer targets.
+    pub target: AgentId,
+    /// The assignment generation minted toward the target, once the decision
+    /// ran.
+    #[serde(default)]
+    pub target_generation: Option<AgentAssignmentGeneration>,
+    /// The bounded reason the source's model supplied.
+    pub reason: String,
+    /// The handoff policy revision that authorized the transfer.
+    pub policy_revision: AgentRevisionNumber,
+    /// Explicit context/artifact references projected to the target — never
+    /// content, never memory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<String>,
+    /// The communal knowledge spaces the catalog explicitly delegates to the
+    /// target ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+    /// The envelope derivation intersects the task's own grant with this
+    /// statement, so a handoff can never widen communal access.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
+    /// Where the transfer stands.
+    pub status: AgentTaskHandoffStatus,
+    /// Whether the handoff-result exchange to the source has settled: the
+    /// durable once-guard past the journal's bounded deduplication window,
+    /// the delegation cell's `cancel` precedent.
+    #[serde(default)]
+    pub result_settled: bool,
+    /// When the transfer was recorded.
+    pub recorded_at: AgentTimestampMillis,
+    /// When the transfer settled, when it has.
+    #[serde(default)]
+    pub settled_at: Option<AgentTimestampMillis>,
+}
+
+impl AgentTaskHandoff {
+    /// Whether the transfer has resolved, accepted or refused.
+    #[must_use]
+    pub const fn is_settled(&self) -> bool {
+        !matches!(self.status, AgentTaskHandoffStatus::Initiated)
+    }
+}
+
+/// Where one recorded handoff stands on the task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentTaskHandoffStatus {
+    /// Recorded: the source assignment is stashed and the target's
+    /// generation is offered or about to be.
+    Initiated,
+    /// The target's assignment was durably accepted: responsibility has
+    /// transferred.
+    Accepted,
+    /// The transfer resolved without an accepted target; the source
+    /// assignment was restored.
+    Refused {
+        /// Stable machine-readable refusal code.
+        code: String,
+    },
+}
+
+impl AgentTaskHandoffStatus {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::Initiated => "initiated",
+            Self::Accepted => "accepted",
+            Self::Refused { .. } => "refused",
+        }
+    }
+}
+
+/// The request an [`AgentTaskEntityCommand::RecordHandoff`] command carries
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Built by the A2A ingress from the collaboration metadata's handoff
+/// cluster. Every field is a *claim* the transition re-validates against the
+/// task's durable state — the source must be the current accepted
+/// assignment, the target contract must match — so forged metadata fails
+/// closed at the transition, never by trusting the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskHandoffRequest {
+    /// The handoff identity the source run derived.
+    pub handoff: crate::identity::AgentHandoffId,
+    /// The agent the source run claims to be.
+    pub source_agent: AgentId,
+    /// The source run claiming the transfer.
+    pub source_run: AgentRunId,
+    /// The assignment generation the source claims to serve.
+    pub source_generation: AgentAssignmentGeneration,
+    /// The agent the transfer targets.
+    pub target: AgentId,
+    /// The task definition the resolved target serves — the contract half of
+    /// specification 8.9's target-acceptance validation.
+    pub target_task_definition: crate::definition::AgentTaskDefinitionId,
+    /// The result schema the resolved target expects, when its catalog entry
+    /// declares one.
+    #[serde(default)]
+    pub result_schema: Option<AgentSchemaRef>,
+    /// The bounded reason the source's model supplied.
+    pub reason: String,
+    /// The handoff policy revision that authorized the transfer.
+    pub policy_revision: AgentRevisionNumber,
+    /// Explicit context/artifact references projected to the target.
+    #[serde(default)]
+    pub context: Vec<String>,
+    /// The communal knowledge spaces the catalog explicitly delegates to the
+    /// target.
+    #[serde(default)]
+    pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
+}
+
+/// The task's *latest* team board claim: the bounded materialized provenance
+/// of one board-driven assignment
+/// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Only the latest claim is materialized — the chain is history, exactly as
+/// superseded assignments and handoffs are — and this record is load-bearing
+/// the same three ways [`AgentTaskHandoff`] is: it is the deduplication echo
+/// past the journal's bounded window, the address the owed claim-result
+/// derivation reads, and the durable claim fence's provenance. The board
+/// never holds ownership: the assignment-generation fence stays the
+/// one-normal-owner guarantee, and this record only mirrors the claim that
+/// drove it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskTeamClaim {
+    /// The claim identity the team's board decision derived.
+    pub claim: crate::identity::AgentTeamClaimId,
+    /// The team whose board drove it.
+    pub team: crate::identity::AgentTeamScope,
+    /// The claiming member.
+    pub member: AgentId,
+    /// The board entry's claim epoch at the decision — the value the task's
+    /// claim fence records.
+    pub epoch: u64,
+    /// The assignment generation minted toward the claimant, once the
+    /// decision ran.
+    #[serde(default)]
+    pub target_generation: Option<AgentAssignmentGeneration>,
+    /// Where the claim stands.
+    pub status: AgentTaskTeamClaimStatus,
+    /// Whether the claim-result exchange to the team has settled: the
+    /// durable once-guard past the journal's bounded deduplication window.
+    #[serde(default)]
+    pub result_settled: bool,
+    /// When the claim was recorded.
+    pub recorded_at: AgentTimestampMillis,
+    /// When the claim settled, when it has.
+    #[serde(default)]
+    pub settled_at: Option<AgentTimestampMillis>,
+}
+
+impl AgentTaskTeamClaim {
+    /// Whether the claim has resolved, accepted or refused.
+    #[must_use]
+    pub const fn is_settled(&self) -> bool {
+        !matches!(self.status, AgentTaskTeamClaimStatus::Initiated)
+    }
+}
+
+/// Where one recorded team claim stands on the task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentTaskTeamClaimStatus {
+    /// Recorded: the claimant is the assignee and its generation is offered
+    /// or about to be.
+    Initiated,
+    /// The claimant's assignment was durably accepted.
+    Accepted,
+    /// The claim resolved without an accepted assignment; the assignee was
+    /// cleared back to the board-pending posture.
+    Refused {
+        /// Stable machine-readable refusal code.
+        code: String,
+    },
+}
+
+impl AgentTaskTeamClaimStatus {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::Initiated => "initiated",
+            Self::Accepted => "accepted",
+            Self::Refused { .. } => "refused",
+        }
+    }
+}
+
+/// The task's *latest* terminated conversation: the bounded materialized
+/// provenance one conversation-terminal notice records
+/// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Only the latest conversation is materialized — the chain is history,
+/// exactly as superseded handoffs and team claims are — and the cell is the
+/// deduplication echo past the journal's bounded window for a redelivered
+/// notice about the *same* conversation. Identity and coordinates only,
+/// never transcript content.
+///
+/// [`Self::ended_at`] is strictly monotonic on this cell: a notice from a
+/// different conversation takes it only by being newer, so a replay that
+/// aged out of the applied window cannot regress the projected latest or
+/// re-count itself after another conversation has recorded. What the
+/// latest-only shape still costs is the other direction, accepted with the
+/// same eyes-open posture as [`AgentTaskHandoff`]: an older conversation
+/// whose *first* delivery arrives after a newer one is accepted without
+/// being materialized, so it appears in neither the cell nor the count —
+/// bounded, observational-only, and still fully readable through its own
+/// conversation entity and the coordination replay surface. A bounded
+/// per-conversation map is the alternative if a future slice needs every
+/// exact echo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskConversation {
+    /// The terminated conversation.
+    pub conversation: crate::identity::AgentConversationId,
+    /// Its terminal status.
+    pub status: crate::conversation::AgentConversationStatus,
+    /// Why it terminated.
+    pub terminal_reason: crate::conversation::AgentConversationTerminalReason,
+    /// How many rounds *completed* before it ended — what the public
+    /// `conversation-rounds` echo carries, and a count rather than the
+    /// round index it was once documented as. See
+    /// [`crate::coordination::AgentConversationTerminalNotice::rounds_completed`].
+    pub rounds_completed: u64,
+    /// How many turns it recorded over its life.
+    pub turns: u64,
+    /// When its terminal flip committed, by the conversation's owner clock.
+    pub ended_at: AgentTimestampMillis,
+    /// When this task recorded the notice.
+    pub recorded_at: AgentTimestampMillis,
 }
 
 /// Why an assignment decision refused an agent.
@@ -2226,8 +2738,24 @@ pub struct AgentTaskRejection {
 pub struct AgentAcceptedResult {
     /// The proposal that produced it.
     pub proposal_id: AgentOperationId,
-    /// The run that proposed it.
-    pub run: AgentRunId,
+    /// The run that proposed it, when a run did. A human-owned task's
+    /// accepted result carries a principal instead; every record persisted
+    /// before human submissions existed carries the run.
+    ///
+    /// Absent rather than `null` when there is no run, like every other
+    /// optional cell on this record: a serialized `null` for a field that
+    /// used to be a required `AgentRunId` is the shape an older binary
+    /// cannot decode, and one that is simply missing is at least the shape a
+    /// `serde(default)` could absorb. Nothing is deployed on the older shape,
+    /// so [`CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION`] is deliberately not
+    /// bumped for it; a post-release change of this kind would need one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<AgentRunId>,
+    /// The authenticated principal that submitted it, when a human or
+    /// external service did ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+    /// Records persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
     /// The task definition it was validated under.
     pub definition_id: AgentTaskDefinitionId,
     /// The revision of that definition.
@@ -2268,6 +2796,14 @@ pub enum AgentTaskHistoryKind {
     DependencyDeclared,
     /// A dependency resolved.
     DependencyResolved,
+    /// A dependent task registered itself for outcome notification
+    /// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)); the
+    /// detail carries the dependent's id.
+    DependentRegistered,
+    /// This task's registration toward an upstream it depends on was
+    /// definitively refused; the detail carries the refusal code, and the
+    /// edge stays resolvable only through the application relay.
+    DependentRegistrationRefused,
     /// An assignment generation was decided.
     AssignmentDecided,
     /// An assignment was refused, and no generation was consumed.
@@ -2276,6 +2812,37 @@ pub enum AgentTaskHistoryKind {
     AssignmentAccepted,
     /// The assigned run refused its assignment, retiring the generation.
     AssignmentReleased,
+    /// A handoff was recorded: the source assignment was stashed and a
+    /// generation offered toward the target
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)). The
+    /// entry carries the source assignment; the detail carries the handoff
+    /// id and target agent — this is where handoff lineage lands in
+    /// authorized task history ([specification 14.2](../../../docs/plans/rakka-agent/spec.md)).
+    HandoffInitiated,
+    /// The handoff's target assignment was durably accepted: responsibility
+    /// transferred.
+    HandoffAccepted,
+    /// The handoff resolved without an accepted target; the source
+    /// assignment was restored. The detail carries the refusal code.
+    HandoffRefused,
+    /// A team board claim was recorded: the claimant became the assignee and
+    /// a generation is about to be offered
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)). The
+    /// detail carries the claim id and member.
+    TeamClaimRecorded,
+    /// The claim's assignment was durably accepted: the claimant owns the
+    /// task under the assignment fence.
+    TeamClaimAccepted,
+    /// The claim resolved without an accepted assignment; the detail carries
+    /// the refusal code and the assignee cleared back to the board-pending
+    /// posture.
+    TeamClaimRefused,
+    /// A governed conversation reported its terminal flip; the detail
+    /// carries the conversation id and its terminal-reason code
+    /// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)). The
+    /// materialized cell holds only the latest conversation — this chain is
+    /// the full record.
+    ConversationTerminalRecorded,
     /// A run proposed a typed result.
     ResultProposed,
     /// A proposal passed every deterministic rule.
@@ -2339,10 +2906,19 @@ impl AgentTaskHistoryKind {
             Self::Created => "created",
             Self::DependencyDeclared => "dependency-declared",
             Self::DependencyResolved => "dependency-resolved",
+            Self::DependentRegistered => "dependent-registered",
+            Self::DependentRegistrationRefused => "dependent-registration-refused",
             Self::AssignmentDecided => "assignment-decided",
             Self::AssignmentRefused => "assignment-refused",
             Self::AssignmentAccepted => "assignment-accepted",
             Self::AssignmentReleased => "assignment-released",
+            Self::HandoffInitiated => "handoff-initiated",
+            Self::HandoffAccepted => "handoff-accepted",
+            Self::HandoffRefused => "handoff-refused",
+            Self::TeamClaimRecorded => "team-claim-recorded",
+            Self::TeamClaimAccepted => "team-claim-accepted",
+            Self::TeamClaimRefused => "team-claim-refused",
+            Self::ConversationTerminalRecorded => "conversation-terminal-recorded",
             Self::ResultProposed => "result-proposed",
             Self::ResultAccepted => "result-accepted",
             Self::ResultRejected => "result-rejected",
@@ -2399,6 +2975,12 @@ pub struct AgentTaskHistoryEntry {
     pub run: Option<AgentRunId>,
     /// The fingerprint of the content involved, when there was any.
     pub digest: Option<AgentContentDigest>,
+    /// The authenticated principal involved, when one was: a human-owned
+    /// task's submission rows carry the submitter
+    /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+    /// Entries persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
     /// Bounded detail: the rejection reason, the refusal code, the terminal
     /// reason.
     pub detail: String,
@@ -2407,7 +2989,7 @@ pub struct AgentTaskHistoryEntry {
 }
 
 impl AgentTaskHistoryEntry {
-    fn new(
+    pub(crate) fn new(
         sequence: AgentTaskHistorySequence,
         kind: AgentTaskHistoryKind,
         operation_id: AgentOperationId,
@@ -2424,6 +3006,7 @@ impl AgentTaskHistoryEntry {
             agent: None,
             run: None,
             digest: None,
+            principal: None,
             detail: String::new(),
             at,
         }
@@ -2438,6 +3021,11 @@ impl AgentTaskHistoryEntry {
 
     fn with_digest(mut self, digest: AgentContentDigest) -> Self {
         self.digest = Some(digest);
+        self
+    }
+
+    fn with_principal(mut self, principal: impl Into<String>) -> Self {
+        self.principal = Some(principal.into());
         self
     }
 
@@ -2484,6 +3072,21 @@ impl AgentTaskHistoryCursor {
             after: Some(sequence),
             limit: AGENT_TASK_HISTORY_DEFAULT_PAGE_SIZE,
         }
+    }
+
+    /// Repositions this cursor so `sequence` is the next entry it expects.
+    ///
+    /// The companion of [`AgentTaskError::HistoryWindowExpired`]: a reader
+    /// handed a retained floor resumes *at* it, keeping its page size. Sequences
+    /// start at [`AgentTaskHistorySequence::FIRST`], so a zero resumes from the
+    /// beginning.
+    #[must_use]
+    pub const fn resuming_at(mut self, sequence: AgentTaskHistorySequence) -> Self {
+        self.after = match sequence.get() {
+            0 => None,
+            value => Some(AgentTaskHistorySequence::new(value - 1)),
+        };
+        self
     }
 
     /// Sets the page size, clamped to [`AGENT_TASK_HISTORY_MAX_PAGE_SIZE`].
@@ -2563,7 +3166,29 @@ pub trait AgentTaskHistoryStore: Clone + Send + Sync + 'static {
         entry: &'a AgentTaskHistoryEntry,
     ) -> AgentTaskHistoryFuture<'a, ()>;
 
-    /// Reads one bounded page.
+    /// Reads one bounded page, contiguous from the cursor.
+    ///
+    /// A backend MUST fail a read with
+    /// [`AgentTaskError::HistoryWindowExpired`] — naming the oldest entry the
+    /// reader can actually resume from — whenever answering would otherwise
+    /// vouch for entries the reader has not seen, so it resynchronizes from
+    /// authoritative state instead of silently skipping them
+    /// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)):
+    ///
+    /// - a cursor preceding the retained window (bounded retention evicted
+    ///   entries past it);
+    /// - a discontinuity at the read head (the entry the cursor expects next
+    ///   is not retained, however it was lost); and
+    /// - a cursor past the newest retained entry, which this log never
+    ///   issued — an empty page would read as "you are current" and turn into
+    ///   a permanent silent skip once the log grows past it.
+    ///
+    /// A discontinuity *inside* the page truncates it before the hole with a
+    /// `next` cursor instead: the retained prefix is delivered whole — its
+    /// depth must never depend on the reader's page size — and the next read
+    /// starts at the hole and gets the refusal above.
+    /// [`crate::testkit::assert_task_history_store_contract`] is the harness
+    /// that proves all of it.
     fn read<'a>(
         &'a self,
         scope: &'a AgentTaskScope,
@@ -2574,22 +3199,54 @@ pub trait AgentTaskHistoryStore: Clone + Send + Sync + 'static {
 /// An in-memory task history, for tests and single-process deployments.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryAgentTaskHistoryStore {
-    entries: Arc<Mutex<BTreeMap<String, BTreeMap<u64, AgentTaskHistoryEntry>>>>,
+    inner: Arc<Mutex<InMemoryTaskHistoryInner>>,
+}
+
+/// The shared state behind every clone of one in-memory task history.
+///
+/// Retention lives *inside* the shared state, beside the log it bounds: the
+/// store is `Clone` by contract, and a bound that lived per-handle would let a
+/// clone taken before `with_retention` keep appending to the same shared log
+/// unbounded — the retention contract silently failing to hold.
+#[derive(Debug, Default)]
+struct InMemoryTaskHistoryInner {
+    entries: BTreeMap<String, BTreeMap<u64, AgentTaskHistoryEntry>>,
+    retention: Option<usize>,
 }
 
 impl InMemoryAgentTaskHistoryStore {
-    /// Creates an empty history.
+    /// Creates an empty history that retains everything appended to it.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Bounds the history retained per task, evicting the oldest entries.
+    ///
+    /// Retention is off by default because this log is also the audit record
+    /// [specification 17.13](../../../docs/plans/rakka-agent/spec.md) requires,
+    /// and the entity refuses a transition rather than lose an entry. Enabling
+    /// it forfeits that audit obligation for whatever the window drops, in
+    /// exchange for a bounded log and the explicit expired-window answer a
+    /// replay cursor needs. A limit of zero is treated as one. The bound is
+    /// shared state: clones share the log, so they share its retention,
+    /// whichever handle set it.
+    #[must_use]
+    pub fn with_retention(self, entries: usize) -> Self {
+        self.inner
+            .lock()
+            .expect("the task history should not be poisoned")
+            .retention = Some(entries.max(1));
+        self
+    }
+
     /// How many entries one task has.
     #[must_use]
     pub fn len(&self, scope: &AgentTaskScope) -> usize {
-        self.entries
+        self.inner
             .lock()
             .expect("the task history should not be poisoned")
+            .entries
             .get(&scope.key())
             .map_or(0, BTreeMap::len)
     }
@@ -2612,11 +3269,12 @@ impl AgentTaskHistoryStore for InMemoryAgentTaskHistoryStore {
         entry: &'a AgentTaskHistoryEntry,
     ) -> AgentTaskHistoryFuture<'a, ()> {
         Box::pin(async move {
-            let mut entries = self
-                .entries
+            let mut inner = self
+                .inner
                 .lock()
                 .expect("the task history should not be poisoned");
-            let task = entries.entry(scope.key()).or_default();
+            let retention = inner.retention;
+            let task = inner.entries.entry(scope.key()).or_default();
             match task.get(&entry.sequence.get()) {
                 // A re-driven flush writes the same entry to the same slot.
                 Some(existing) if existing == entry => Ok(()),
@@ -2625,6 +3283,15 @@ impl AgentTaskHistoryStore for InMemoryAgentTaskHistoryStore {
                 }),
                 None => {
                     task.insert(entry.sequence.get(), entry.clone());
+                    if let Some(retention) = retention {
+                        while task.len() > retention {
+                            let oldest = *task
+                                .keys()
+                                .next()
+                                .expect("a history longer than its retention holds an entry");
+                            task.remove(&oldest);
+                        }
+                    }
                     Ok(())
                 }
             }
@@ -2637,27 +3304,75 @@ impl AgentTaskHistoryStore for InMemoryAgentTaskHistoryStore {
         cursor: AgentTaskHistoryCursor,
     ) -> AgentTaskHistoryFuture<'a, AgentTaskHistoryPage> {
         Box::pin(async move {
-            let entries = self
-                .entries
+            let inner = self
+                .inner
                 .lock()
                 .expect("the task history should not be poisoned");
-            let Some(task) = entries.get(&scope.key()) else {
+            let Some(task) = inner.entries.get(&scope.key()) else {
+                // A positioned cursor into a scope with no log at all is a
+                // cursor this store never issued; an empty page would vouch
+                // for entries the reader believes it has seen. Only the
+                // start-of-log read is honestly empty here.
+                if cursor.position().is_some_and(|after| after.get() > 0) {
+                    return Err(AgentTaskError::HistoryWindowExpired {
+                        oldest_retained: None,
+                    });
+                }
                 return Ok(AgentTaskHistoryPage {
                     entries: Vec::new(),
                     next: None,
                 });
             };
 
-            let start = cursor.position().map_or(0, |after| after.get() + 1);
-            let mut page: Vec<AgentTaskHistoryEntry> = task
-                .range(start..)
-                .map(|(_, entry)| entry.clone())
-                .take(cursor.limit() + 1)
-                .collect();
-
-            let next = (page.len() > cursor.limit())
+            // The sequence the reader expects next: one past its cursor, or the
+            // very first entry when it is starting from the beginning.
+            let start = cursor
+                .position()
+                .map_or(AgentTaskHistorySequence::FIRST.get(), |after| {
+                    after.get().saturating_add(1)
+                });
+            // A cursor past the newest retained entry was never issued by this
+            // log: an empty page would stamp "you are current" over sequences
+            // the reader has not seen, and once the log grows past the cursor
+            // the reader would resume across them silently.
+            let newest = task.keys().next_back().copied().unwrap_or_default();
+            if start > newest.saturating_add(1) {
+                return Err(AgentTaskError::HistoryWindowExpired {
+                    oldest_retained: task
+                        .keys()
+                        .next()
+                        .copied()
+                        .map(AgentTaskHistorySequence::new),
+                });
+            }
+            // History sequences are dense — the transition that consumes one
+            // pushes its entry in the same step — so a missing entry means the
+            // window moved (or a durable backend lost it). A hole at the read
+            // head is refused with the floor past it; a hole further in
+            // truncates the page instead, so the retained prefix is delivered
+            // whole whatever the reader's page size, and the *next* read
+            // starts at the hole and gets the refusal.
+            if let Some((&first, _)) = task.range(start..).next() {
+                if first != start {
+                    return Err(AgentTaskError::HistoryWindowExpired {
+                        oldest_retained: Some(AgentTaskHistorySequence::new(first)),
+                    });
+                }
+            }
+            let mut page: Vec<AgentTaskHistoryEntry> = Vec::new();
+            let mut expected = start;
+            for (&sequence, entry) in task.range(start..) {
+                if sequence != expected || page.len() == cursor.limit() {
+                    break;
+                }
+                page.push(entry.clone());
+                expected = sequence.saturating_add(1);
+            }
+            let next = task
+                .range(expected..)
+                .next()
+                .is_some()
                 .then(|| {
-                    page.pop();
                     page.last().map(|entry| {
                         AgentTaskHistoryCursor::after(entry.sequence).with_limit(cursor.limit())
                     })
@@ -2687,6 +3402,13 @@ pub struct AgentTaskCreation {
     pub input: AgentTaskContent,
     /// The agent the task should be assigned to, when it is agent-owned.
     pub assignee: Option<AgentId>,
+    /// The team whose shared board will govern the assignment
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)). An
+    /// agent-owned creation carrying a team may omit the assignee: the task
+    /// waits on the board until a claim names one. Records persisted before
+    /// this field load without one.
+    #[serde(default)]
+    pub team: Option<crate::identity::AgentTeamId>,
     /// The collaborative goal it contributes to.
     pub goal: Option<AgentGoalId>,
     /// Whether the task coordinates a finite or continuous goal
@@ -2833,6 +3555,119 @@ pub struct AgentRunCancelReceipt {
     pub status: crate::run::AgentRunStatus,
 }
 
+/// The notice an [`AgentExchangeKind::HandoffResult`] exchange carries to the
+/// source run: how its handoff resolved
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed by the task whose handoff provenance settled — accepted when the
+/// target's assignment was durably accepted, refused when the transfer
+/// resolved without one — and re-derived by every settle pass until the
+/// exchange settles, so a lost notice is re-owed rather than gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHandoffResultNotice {
+    /// The task reporting the resolution.
+    pub task: AgentTaskScope,
+    /// The handoff this notice resolves. The source run's arm matches it
+    /// against its own cell's record: a mismatch is a forgery, whatever the
+    /// sender claims.
+    pub handoff: crate::identity::AgentHandoffId,
+    /// How the handoff resolved.
+    pub resolution: AgentHandoffResolutionNotice,
+}
+
+/// How a handoff resolved, as its result notice reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentHandoffResolutionNotice {
+    /// The target's assignment was durably accepted: responsibility has
+    /// transferred, and the source terminalizes `HandedOff`.
+    Accepted {
+        /// The target run now serving the task.
+        target_run: AgentRunId,
+        /// The accepted assignment generation.
+        generation: AgentAssignmentGeneration,
+    },
+    /// The transfer resolved without an accepted target: the source
+    /// assignment was restored and the source resumes with the failed tool
+    /// result this code reaches the model as.
+    Refused {
+        /// Stable machine-readable refusal code.
+        code: String,
+    },
+}
+
+/// The command an [`AgentExchangeKind::DependencyRegistration`] exchange
+/// carries to the upstream task: record the sender as a dependent so the
+/// upstream's terminal transition can notify it
+/// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed by the dependent in the same compare-and-set that records the
+/// forward edge. The policy travels for the record only: the *dependent*
+/// applies its own declared policy when the outcome arrives — an upstream
+/// enforcing another task's policy would be deciding with facts it does not
+/// own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDependencyRegistration {
+    /// The dependent registering itself. The upstream's arm matches it
+    /// against the envelope's initiator: a mismatch is a forgery, whatever
+    /// the sender claims.
+    pub dependent: AgentTaskScope,
+    /// The upstream task the sender depends on.
+    pub upstream: AgentTaskId,
+    /// The failure policy the dependent declared for this edge.
+    pub policy: AgentDependencyFailurePolicy,
+}
+
+/// The upstream task's durable receipt replying to an
+/// [`AgentExchangeKind::DependencyRegistration`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDependencyRegistrationReceipt {
+    /// The upstream that answered.
+    pub upstream: AgentTaskScope,
+    /// The upstream's terminal outcome, when it was already terminal at
+    /// registration: the dependent applies it from the receipt, because the
+    /// upstream owes no notification for an edge it never recorded.
+    pub outcome: Option<AgentTaskDependencyOutcome>,
+    /// The terminal-reason code behind that outcome, when one was recorded.
+    pub terminal_reason: Option<String>,
+    /// The accepted result's fingerprint, when the upstream completed.
+    pub result_digest: Option<AgentContentDigest>,
+}
+
+/// The notice an [`AgentExchangeKind::DependencyOutcome`] exchange carries to
+/// one registered dependent: how the upstream terminalized
+/// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed immediately by the terminal transition — status, terminal reason,
+/// and result digest are all absorbing the moment the terminal commits, so
+/// unlike a delegation result nothing here waits for the escrow ledger to
+/// close.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDependencyOutcomeNotice {
+    /// The upstream reporting its terminal outcome. The dependent's arm
+    /// matches it against its own forward edge: an unknown or mismatched
+    /// upstream is refused, whatever the sender claims.
+    pub upstream: AgentTaskScope,
+    /// How the upstream resolved.
+    pub outcome: AgentTaskDependencyOutcome,
+    /// The terminal-reason code, for the dependent's records.
+    pub terminal_reason: Option<String>,
+    /// The accepted result's fingerprint, when the upstream completed.
+    pub result_digest: Option<AgentContentDigest>,
+}
+
+/// The dependent task's durable receipt replying to an
+/// [`AgentExchangeKind::DependencyOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDependencyOutcomeReceipt {
+    /// The dependent that applied the outcome.
+    pub dependent: AgentTaskScope,
+    /// The dependent's status after applying it: unblocked, cancelling under
+    /// its declared policy, or unchanged for an echoed replay.
+    pub status: AgentTaskStatus,
+}
+
 /// A run's report of what it finally consumed, carried by an
 /// [`AgentExchangeKind::BudgetSettlement`] exchange
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
@@ -2947,6 +3782,44 @@ pub struct AgentTaskResultProposal {
     pub proposed_at: AgentTimestampMillis,
 }
 
+/// An authenticated human or external service's typed-result submission to a
+/// human-owned task ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It travels the same deterministic validation path as a run's
+/// [`AgentTaskResultProposal`] — definition binding, schema binding, content
+/// bounds, and every applicable result rule — differing only in provenance: a
+/// principal instead of an assignment. A human task is a work product with a
+/// typed result, never a substitute for an effect-bound checkpoint: a
+/// decision that approves, authorizes, or reconciles a *specific effect*
+/// stays bound to the exact effect intent through
+/// [`crate::checkpoints::AgentCheckpoint`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentHumanResultSubmission {
+    /// The authenticated principal submitting the result, as the
+    /// deployment's stable `type:id` reference. Attribution, never
+    /// authorization: the caller authenticated at the public boundary before
+    /// the command was built. At most [`AGENT_IDENTITY_MAX_LENGTH`] bytes.
+    pub principal: String,
+    /// The task definition the submission claims to fulfill. A mismatch
+    /// fails closed.
+    pub definition_id: AgentTaskDefinitionId,
+    /// The claimed revision of that definition.
+    pub definition_version: AgentRevisionNumber,
+    /// The schema the result is expressed in.
+    pub result_schema: AgentSchemaRef,
+    /// The bounded submitted content.
+    pub content: AgentTaskContent,
+    /// Evidence artifacts supporting the result.
+    pub evidence: Vec<ArtifactRef>,
+    /// What caused the submission. At most [`AGENT_IDENTITY_MAX_LENGTH`]
+    /// bytes: a rejection persists it, and a longer id is refused without a
+    /// validation decision.
+    pub causation_id: AgentCausationId,
+    /// When the submission entered the accepting boundary, by that
+    /// boundary's clock.
+    pub submitted_at: AgentTimestampMillis,
+}
+
 /// The task's durable decision on one result proposal, returned as the
 /// proposal exchange's reply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3006,6 +3879,16 @@ pub struct AgentAssignmentReadiness {
     /// Whether the agent's definition envelope declares every skill the task
     /// requires.
     pub declares_required_skills: bool,
+    /// Whether the agent's definition envelope grants
+    /// [`AgentCoordinationCapabilityKind::Team`] — the authority a board claim
+    /// spends ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// It is carried rather than folded into [`Self::refusal`] because it
+    /// bounds exactly one path: a claim-driven assignment. A member may be
+    /// perfectly authorized for a task it is assigned directly and still not be
+    /// authorized to *claim* it off a shared board, so the generic decision must
+    /// not consult this.
+    pub permits_team_coordination: bool,
     /// Why the agent's autonomy admission does not admit this work, when it
     /// does not ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
     ///
@@ -3053,6 +3936,9 @@ impl AgentAssignmentReadiness {
                     .values()
                     .any(|tool| tool.capabilities.contains(skill))
             }),
+            permits_team_coordination: envelope
+                .coordination_capabilities
+                .contains(&AgentCoordinationCapabilityKind::Team),
             admission_refusal: definition
                 .operation_class
                 .is_unattended()
@@ -3092,6 +3978,7 @@ impl AgentAssignmentReadiness {
             permits_task_definition: false,
             permits_operation_class: false,
             declares_required_skills: false,
+            permits_team_coordination: false,
             admission_refusal: Some(AgentAdmissionRefusal::Missing),
         }
     }
@@ -3205,6 +4092,12 @@ pub struct AgentTask {
     pub assignee: Option<AgentId>,
     /// The bounded dependency summary.
     pub dependencies: BTreeMap<AgentTaskId, AgentTaskDependency>,
+    /// The bounded dependents registry: tasks that registered a dependency
+    /// on this one, walked at terminalization to owe each its outcome
+    /// notification ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
+    /// Records persisted before this field load with none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dependents: BTreeMap<AgentTaskId, AgentTaskDependentRecord>,
     /// The escrow this task holds and debits every run it assigns from
     /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
     ///
@@ -3219,6 +4112,55 @@ pub struct AgentTask {
     pub assignment_generation: AgentAssignmentGeneration,
     /// How many assignment generations the task has consumed.
     pub assignments: u32,
+    /// The latest handoff, when one was recorded
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)); the
+    /// chain is history. Records persisted before this field load without
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Box<AgentTaskHandoff>>,
+    /// How many handoffs the task has recorded over its lifetime.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub handoffs: u32,
+    /// The team whose shared board governs this task's assignment, when one
+    /// does ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    /// Creation-time provenance: a task created for a board waits unassigned
+    /// until a claim names its assignee. Records persisted before this field
+    /// load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<crate::identity::AgentTeamId>,
+    /// The latest board claim, when a team drove one; the chain is history.
+    /// Records persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_claim: Option<Box<AgentTaskTeamClaim>>,
+    /// How many board claims the task has recorded over its lifetime.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub team_claims: u32,
+    /// The claim-epoch fence: a team-claim exchange whose epoch is not above
+    /// this refuses, so a courier-reordered stale board decision can never
+    /// revive a superseded claim. Records persisted before this field load
+    /// with the fence at zero.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub team_claim_fence: u64,
+    /// Whether the terminal notice to the governing team's board has
+    /// settled: the durable once-guard past the journal's bounded
+    /// deduplication window. Records persisted before this field load with
+    /// it unset — so a pre-slice task that is already terminal owes the
+    /// notice once on its next settle pass, deliberately: that is what
+    /// closes a board entry left stale from before the exchange existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub team_terminal_notice_settled: bool,
+    /// The latest terminated conversation governed by this task, when one
+    /// has reported itself; the chain is history
+    /// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+    /// Records persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Box<AgentTaskConversation>>,
+    /// How many conversation-terminal notices the task has *recorded* over
+    /// its lifetime — one per notice that took the cell. A redelivery, and a
+    /// notice older than the cell already standing, are both accepted
+    /// without recording, so neither counts.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub conversations: u32,
     /// The most recent assignment refusal.
     pub last_refusal: Option<AgentAssignmentRefusal>,
     /// The accepted typed result.
@@ -3227,6 +4169,17 @@ pub struct AgentTask {
     pub rejection_count: u32,
     /// The most recent rejection decision. Earlier ones are history.
     pub last_rejection: Option<Box<AgentTaskRejection>>,
+    /// Fingerprints ([`AgentContentDigest::of_bytes`] values) of rejected
+    /// human-submission operation ids, oldest first, bounded by
+    /// [`AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY`]: the durable echo
+    /// past the operation log's window, so a replayed rejected submission is
+    /// refused without spending the rejection budget twice. Fingerprints —
+    /// not full operation ids — because the ring lives inside the bounded
+    /// materialized record; a collision merely refuses a fresh submission,
+    /// which retries under a new deduplication key. Records persisted before
+    /// this field load with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_submissions: Vec<String>,
     /// Why the task reached its terminal status.
     pub terminal_reason: Option<AgentTaskTerminalReason>,
     /// The nonterminal cancellation request the task carries while its
@@ -3322,6 +4275,109 @@ impl AgentTask {
     }
 }
 
+/// The `skip_serializing_if` predicate of the task's handoff counter: a task
+/// that never handed off serializes byte-identically to one persisted before
+/// the field existed.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// The `skip_serializing_if` predicate of the task's claim fence: a task no
+/// board ever touched serializes byte-identically to one persisted before
+/// the field existed.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+/// The `skip_serializing_if` predicate of the dependency settled markers: an
+/// unsettled record serializes byte-identically to one persisted before the
+/// field existed.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// How a human submission's validation decided
+/// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentTaskSubmissionDisposition {
+    /// The submission passed every deterministic rule; the task completed.
+    Accepted,
+    /// A deterministic rule refused the submission; the rejection is a
+    /// durable decision.
+    Rejected,
+}
+
+impl AgentTaskSubmissionDisposition {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// The bounded summary of one human submission's validation decision,
+/// carried on the [`AgentTaskOutcome`] of the transition that decided it.
+///
+/// A summary, never the content: the outcome rides the operation log inside
+/// the bounded materialized record, so it carries codes, counts, and the
+/// digest — the accepted content itself lives on the task's accepted-result
+/// cell, and rejected content is never retained at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskSubmissionDecision {
+    /// Whether the submission was accepted or rejected.
+    pub disposition: AgentTaskSubmissionDisposition,
+    /// The rejection cause code, when rejected.
+    pub code: Option<String>,
+    /// Bounded sanitized feedback, when rejected.
+    pub feedback: String,
+    /// How many further submissions the task will still consider. On a
+    /// rejected decision, zero means this rejection exhausted the budget and
+    /// the task failed.
+    pub remaining_attempts: u32,
+    /// The fingerprint of the decided content.
+    pub digest: AgentContentDigest,
+}
+
+/// What a command transition attaches to its recorded [`AgentTaskOutcome`]
+/// beyond the state-derived fields.
+///
+/// The attachment rides the outcome into the operation log, so a duplicate
+/// reply inside the window answers with the very decision the original
+/// transition carried.
+struct AgentTaskOutcomeExtras {
+    wake: Option<AgentWakeOutcome>,
+    submission: Option<Box<AgentTaskSubmissionDecision>>,
+}
+
+impl AgentTaskOutcomeExtras {
+    const NONE: Self = Self {
+        wake: None,
+        submission: None,
+    };
+
+    fn wake(wake: AgentWakeOutcome) -> Self {
+        Self {
+            wake: Some(wake),
+            submission: None,
+        }
+    }
+
+    fn submission(decision: AgentTaskSubmissionDecision) -> Self {
+        Self {
+            wake: None,
+            submission: Some(Box::new(decision)),
+        }
+    }
+}
+
 /// The compact result of one accepted task transition.
 ///
 /// A replayed operation returns this again rather than transitioning twice.
@@ -3347,6 +4403,11 @@ pub struct AgentTaskOutcome {
     /// persisted before this field load without it.
     #[serde(default)]
     pub goal: Option<AgentGoalOutcome>,
+    /// The human submission decision this outcome answers, when it answers
+    /// one ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+    /// Outcomes persisted before this field load without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<Box<AgentTaskSubmissionDecision>>,
 }
 
 /// Bounded log of resolved operation ids and the outcome each produced.
@@ -3472,6 +4533,13 @@ impl AgentTaskState {
     }
 
     /// The time of the last accepted transition.
+    ///
+    /// A transition of *this task* — its status, assignment, result, goal,
+    /// or ledger. A record it keeps about another entity, such as the
+    /// conversation provenance cell, changes the record without advancing
+    /// this clock, because the unclaimed-expiry horizon runs on it and must
+    /// measure how long the task has waited rather than how recently
+    /// anything touched it.
     #[must_use]
     pub const fn updated_at(&self) -> AgentTimestampMillis {
         self.updated_at
@@ -3490,6 +4558,7 @@ impl AgentTaskState {
                 dependencies_satisfied: true,
                 wake: None,
                 goal: None,
+                submission: None,
             };
         };
         AgentTaskOutcome {
@@ -3510,6 +4579,7 @@ impl AgentTaskState {
                 status: goal.status(),
                 status_revision: goal.status_revision(),
             }),
+            submission: None,
         }
     }
 
@@ -3525,6 +4595,14 @@ impl AgentTaskState {
             goal: task.goal.clone(),
             parent: task.parent.clone(),
             delegation: task.delegation.clone(),
+            handoff: task.handoff.clone(),
+            handoffs: task.handoffs,
+            team: task.team.clone(),
+            team_claim: task.team_claim.clone(),
+            team_claims: task.team_claims,
+            team_terminal_notice_settled: task.team_terminal_notice_settled,
+            conversation: task.conversation.clone(),
+            conversations: task.conversations,
             assignment: task.assignment.clone(),
             assignment_generation: task.assignment_generation,
             dependencies: task.dependencies.values().cloned().collect(),
@@ -3692,6 +4770,41 @@ pub struct AgentTaskSnapshot {
     /// created it. Snapshots persisted before this field load without one.
     #[serde(default)]
     pub delegation: Option<Box<crate::delegation::AgentTaskDelegationProvenance>>,
+    /// The latest handoff, when one was recorded
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    /// Snapshots persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Box<AgentTaskHandoff>>,
+    /// How many handoffs the task has recorded over its lifetime.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub handoffs: u32,
+    /// The team whose shared board governs the assignment, when one does
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    /// Snapshots persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<crate::identity::AgentTeamId>,
+    /// The latest board claim, when a team drove one. Snapshots persisted
+    /// before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_claim: Option<Box<AgentTaskTeamClaim>>,
+    /// How many board claims the task has recorded over its lifetime.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub team_claims: u32,
+    /// Whether the terminal notice to the governing team's board has
+    /// settled. Snapshots persisted before this field load with it unset.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub team_terminal_notice_settled: bool,
+    /// The latest terminated conversation governed by this task, when one
+    /// has reported itself ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+    /// Snapshots persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Box<AgentTaskConversation>>,
+    /// How many conversation-terminal notices the task has *recorded* over
+    /// its lifetime — one per notice that took the cell. A redelivery, and a
+    /// notice older than the cell already standing, are both accepted
+    /// without recording, so neither counts.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub conversations: u32,
     /// Its current assignment.
     pub assignment: Option<AgentTaskAssignment>,
     /// The highest assignment generation it has decided.
@@ -3819,6 +4932,59 @@ pub fn run_cancel_operation_id(
     )
 }
 
+/// Derives the stable operation id of one authenticated human-result
+/// submission ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Pure over `(tenant, task, discriminator)`: a retried submission re-derives
+/// the identical operation and converges on the original decision — a
+/// recorded rejection included — while a corrected resubmission after a
+/// rejection carries a new discriminator and is a new logical operation.
+pub fn human_result_operation_id(
+    tenant: &TenantId,
+    task: &AgentTaskId,
+    discriminator: &str,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::ResultSubmission,
+        [tenant.as_str(), task.as_str(), discriminator],
+    )
+}
+
+/// Derives the stable operation id of the one dependency registration a
+/// dependent ever owes one upstream.
+///
+/// Pure over `(tenant, upstream, dependent)`: an edge's policy is immutable
+/// once declared — a conflicting redeclaration fails closed — so one logical
+/// registration exists per edge, ever, and every re-drive after any loss
+/// owes the identical operation.
+pub fn dependency_registration_operation_id(
+    tenant: &TenantId,
+    upstream: &AgentTaskId,
+    dependent: &AgentTaskId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::DependencyRegistration,
+        [tenant.as_str(), upstream.as_str(), dependent.as_str()],
+    )
+}
+
+/// Derives the stable operation id of the one dependency-outcome
+/// notification an upstream ever owes one registered dependent.
+///
+/// Pure over `(tenant, upstream, dependent)`: a dependency resolves exactly
+/// once — a conflicting second outcome fails closed as a conflict, never a
+/// correction — so one logical notification exists per edge, ever.
+pub fn dependency_outcome_operation_id(
+    tenant: &TenantId,
+    upstream: &AgentTaskId,
+    dependent: &AgentTaskId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::DependencyOutcome,
+        [tenant.as_str(), upstream.as_str(), dependent.as_str()],
+    )
+}
+
 /// The granted delegation ceilings min-narrowed to the definition's own
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): parent and
 /// definition ceilings enforce at allocation and admission time). `None` on
@@ -3847,6 +5013,47 @@ fn narrowed_delegation_budget(
 /// definition's own ceilings when the definition declares any: without an
 /// envelope the delegation door would enforce nothing for these runs.
 fn delegation_envelope_for(
+    task: &AgentTask,
+) -> Option<Box<crate::delegation::AgentRunDelegationEnvelope>> {
+    let mut envelope = delegation_envelope_base(task);
+    // The handoff post-step ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)):
+    // a transfer preserves the task's own lineage, depth, and narrowing —
+    // the same task is the same node in the tree, so no fourth branch — but
+    // the target's communal grant is the task's own statement intersected
+    // with what the catalog explicitly delegates to that target, so a
+    // handoff can never widen communal access. Ancestors deliberately do not
+    // gain the source agent: the chains stay parallel to the lineage, and
+    // returning a task to a previous agent is bounded by the handoff limit,
+    // not refused structurally.
+    if let Some(handoff) = task
+        .handoff
+        .as_deref()
+        .filter(|handoff| !matches!(handoff.status, AgentTaskHandoffStatus::Refused { .. }))
+    {
+        if let Some(env) = envelope.as_deref_mut() {
+            env.knowledge_spaces = Some(match env.knowledge_spaces.take() {
+                Some(granted) => handoff
+                    .knowledge_spaces
+                    .intersection(&granted)
+                    .cloned()
+                    .collect(),
+                // A chain without its own grant statement cannot prove what
+                // it may pass on: deny-when-unknown, the ancestry-gap
+                // posture the delegation door takes.
+                None if !env.lineage.is_empty() => BTreeSet::new(),
+                // At the root the definition envelope still bounds every
+                // append, and the catalog's explicit statement becomes the
+                // grant — the delegation door's root posture.
+                None => handoff.knowledge_spaces.clone(),
+            });
+        }
+    }
+    envelope
+}
+
+/// The base envelope of [`delegation_envelope_for`]: the three creation-shape
+/// arms, before the handoff post-step.
+fn delegation_envelope_base(
     task: &AgentTask,
 ) -> Option<Box<crate::delegation::AgentRunDelegationEnvelope>> {
     if let Some(goal_state) = task.goal_state.as_deref() {
@@ -3996,6 +5203,7 @@ fn create_task(
                 outcome: None,
                 declared_by: operation_id.clone(),
                 declared_at: now,
+                registration_settled: false,
             },
         ) {
             // The same rule as a post-creation redeclaration: repeating an edge
@@ -4036,8 +5244,27 @@ fn create_task(
     }
 
     let agent_owned = creation.definition.is_agent_owned();
-    if agent_owned && creation.assignee.is_none() {
+    // A board-governed creation may defer its assignee: the task waits
+    // unassigned — no generation ever mints without an assignee — until a
+    // team claim names one ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    // The wait is bounded by the definition's unclaimed horizon, observed by
+    // the settle pass: a team that never claims expires the task instead of
+    // parking it silently forever.
+    if agent_owned && creation.assignee.is_none() && creation.team.is_none() {
         return Err(AgentTaskError::MissingAssignee);
+    }
+    if !agent_owned && creation.team.is_some() {
+        // The board exists to decide which *agent* serves a task: a claim
+        // records an assignee and mints toward an assignment generation,
+        // neither of which a human-owned task has. Admitting the pairing
+        // would strand every claim `Initiated` forever — the assignment
+        // decision requires agent ownership, so no claim ever resolves, no
+        // claim result is ever owed back to the board, and the unclaimed
+        // horizon requires `Created`, so the wait never expires either.
+        // Refused at the door, where the caller can still drop the binding;
+        // `record_team_claim` guards the same invariant for a record
+        // persisted before this door existed.
+        return Err(AgentTaskError::TeamNotAgentOwned);
     }
     if agent_owned && state.scope.task().as_str().len() > AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH {
         // Every assignment derives a run id from this id plus a generation
@@ -4155,14 +5382,25 @@ fn create_task(
         delegation: creation.delegation,
         assignee: creation.assignee,
         dependencies,
+        dependents: BTreeMap::new(),
         escrow,
         assignment: None,
         assignment_generation: AgentAssignmentGeneration::UNASSIGNED,
         assignments: 0,
+        handoff: None,
+        handoffs: 0,
+        team: creation.team,
+        team_claim: None,
+        team_claims: 0,
+        team_claim_fence: 0,
+        team_terminal_notice_settled: false,
+        conversation: None,
+        conversations: 0,
         last_refusal: None,
         accepted_result: None,
         rejection_count: 0,
         last_rejection: None,
+        rejected_submissions: Vec::new(),
         terminal_reason: None,
         cancellation: None,
         created_at: now,
@@ -4274,10 +5512,17 @@ fn declare_dependency(
             outcome: None,
             declared_by: operation_id.clone(),
             declared_at: now,
+            registration_settled: false,
         },
     );
-    // A task that has become dependent again is no longer eligible.
-    if matches!(task.status, AgentTaskStatus::Created) {
+    // A task that has become dependent again is no longer eligible — and a
+    // human-owned one is demoted the same way, because `WaitingForInput` is
+    // exactly what the submission door reads as "the graph permits this now".
+    // `record_dependency_outcome` reopens the door when the edge resolves.
+    if matches!(
+        task.status,
+        AgentTaskStatus::Created | AgentTaskStatus::WaitingForInput
+    ) {
         task.status = AgentTaskStatus::Blocked;
     }
     // A late edge grows the admitted record, so it keeps the same growth
@@ -4526,7 +5771,45 @@ fn request_task_cancellation(
         );
     }
 
-    let mut owed: Vec<AgentExchangeEnvelope> = owed_run_cancel(state, now)?.into_iter().collect();
+    // A pending handoff whose target generation was never minted resolves
+    // refused here, in the same compare-and-set as the marker: the restored
+    // source assignment is the accepted one the run-cancel below reaches,
+    // and the source's fence releases into its wind-down through the owed
+    // handoff result. A minted, still-offered generation is left to its
+    // Assignment settle — acceptance routes the cancel to the target and the
+    // result to the source; refusal restores the source exactly as here
+    // ([specification 8.7 and 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    let unminted_handoff = state.task.as_ref().is_some_and(|task| {
+        task.handoff
+            .as_deref()
+            .is_some_and(|handoff| !handoff.is_settled() && handoff.target_generation.is_none())
+    });
+    let mut owed: Vec<AgentExchangeEnvelope> = Vec::new();
+    if unminted_handoff {
+        owed.extend(resolve_handoff_refusal(
+            state,
+            AGENT_TASK_REFUSAL_CANCEL_REQUESTED,
+            now,
+        )?);
+    }
+    // A pending board claim whose generation was never minted resolves
+    // refused in the same compare-and-set as the marker, exactly as the
+    // handoff does: the owed claim result reopens the board entry under the
+    // cancellation code. A minted, still-offered generation is left to its
+    // Assignment settle.
+    let unminted_claim = state.task.as_ref().is_some_and(|task| {
+        task.team_claim
+            .as_deref()
+            .is_some_and(|claim| !claim.is_settled() && claim.target_generation.is_none())
+    });
+    if unminted_claim {
+        owed.extend(resolve_team_claim_refusal(
+            state,
+            "team-claim-task-cancelling",
+            now,
+        )?);
+    }
+    owed.extend(owed_run_cancel(state, now)?);
     owed.extend(finalize_task_cancellation(state, operation_id, now)?);
     Ok(owed)
 }
@@ -4618,7 +5901,7 @@ fn finalize_task_cancellation(
     }
     let reason = cancellation.reason.clone();
     terminate(state, operation_id, reason, now)?;
-    owed_child_reports(state, now)
+    owed_child_reports(state, now, 0)
 }
 
 /// Moves the task to a terminal status and records why.
@@ -4641,6 +5924,43 @@ fn terminate(
             status: task.status,
         });
     }
+    // A pending transfer must not cross the terminal boundary unresolved:
+    // every handoff-result derivation gates on a settled provenance, so an
+    // `Initiated` cell surviving the terminal would leave the owed exchange
+    // underivable and the stashed source run fenced forever, with no
+    // converging re-drive. The resolution is decided here, at the one
+    // terminalization choke point, from durable facts. A result accepted
+    // from the very generation the transfer minted is the target durably
+    // holding responsibility — its acceptance reply may still be in flight,
+    // and that reply's settle is a no-op once the assignment retires below —
+    // so the transfer settles `Accepted`. Every other terminal flavor
+    // resolves the single-attempt offer without an accepted target: the
+    // task ended first, and the source resumes from the refusal exactly as
+    // it does from any other definitive resolution.
+    let resolved_handoff = if task.handoff.as_deref().is_some_and(|h| !h.is_settled()) {
+        let accepted_by_target = matches!(reason, AgentTaskTerminalReason::ResultAccepted)
+            && task
+                .assignment
+                .as_ref()
+                .zip(task.handoff.as_deref())
+                .is_some_and(|(assignment, handoff)| {
+                    handoff.target_generation == Some(assignment.generation)
+                });
+        let assignment = task.assignment.clone();
+        task.handoff.as_deref_mut().map(|handoff| {
+            if accepted_by_target {
+                handoff.status = AgentTaskHandoffStatus::Accepted;
+            } else {
+                handoff.status = AgentTaskHandoffStatus::Refused {
+                    code: AGENT_TASK_HANDOFF_TERMINAL_CODE.to_string(),
+                };
+            }
+            handoff.settled_at = Some(now);
+            (accepted_by_target, handoff.handoff.clone(), assignment)
+        })
+    } else {
+        None
+    };
     task.status = reason.status();
     task.terminal_reason = Some(reason.clone());
     // A terminal task fences its run: the assignment is retired, so a late
@@ -4660,6 +5980,30 @@ fn terminate(
         )
         .with_detail(reason.code())
     });
+    if let Some((accepted, handoff_id, assignment)) = resolved_handoff {
+        state.record_history(|sequence| {
+            let entry = AgentTaskHistoryEntry::new(
+                sequence,
+                if accepted {
+                    AgentTaskHistoryKind::HandoffAccepted
+                } else {
+                    AgentTaskHistoryKind::HandoffRefused
+                },
+                operation_id.clone(),
+                status,
+                now,
+            )
+            .with_detail(if accepted {
+                handoff_id.to_string()
+            } else {
+                AGENT_TASK_HANDOFF_TERMINAL_CODE.to_string()
+            });
+            match &assignment {
+                Some(assignment) => entry.with_assignment(assignment),
+                None => entry,
+            }
+        });
+    }
     if let Some(detail) = goal_row {
         record_wake_history(
             state,
@@ -4669,7 +6013,1012 @@ fn terminate(
             now,
         );
     }
+    // No upstream outcome can move a terminal task, so the registrations its
+    // forward edges still owe are moot. They are withdrawn in this same
+    // compare-and-set, which is what leaves the journal room for the outcome
+    // notifications this terminal now owes its own dependents.
+    withdraw_moot_registrations(state);
     Ok(())
+}
+
+/// Whether the task carries an unresolved handoff
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+fn task_handoff_pending(task: &AgentTask) -> bool {
+    task.handoff
+        .as_deref()
+        .is_some_and(|handoff| !handoff.is_settled())
+}
+
+/// Records one handoff: validates the claim against durable state, stashes
+/// the source assignment whole, and points the task at the target — the
+/// same-task transfer of [specification 8.9](../../../docs/plans/rakka-agent/spec.md).
+///
+/// Atomically validate-then-mutate: a refusal leaves the task exactly as it
+/// found it, which is what lets the source treat a definitive refusal as
+/// proof no transfer was recorded. A replay matching the recorded handoff id
+/// accepts idempotently — the materialized provenance is the deduplication
+/// echo past the journal's bounded window.
+fn record_handoff(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    request: &AgentTaskHandoffRequest,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let task = state.task_mut()?;
+    if let Some(existing) = task.handoff.as_deref() {
+        if existing.handoff == request.handoff {
+            // First-writer-wins echo: the transfer is already recorded, and
+            // the reply carries the recorded outcome rather than minting a
+            // second one. Checked before every guard — including the
+            // terminal one — because this is the deduplication echo past the
+            // journal's bounded window: a re-dispatched send replaying after
+            // the target completed the task must converge on the recorded
+            // transfer, not be refused as if none was recorded.
+            return Ok(());
+        }
+    }
+    if task.status.is_terminal() {
+        return Err(AgentTaskError::Terminal {
+            status: task.status,
+        });
+    }
+    if let Some(existing) = task.handoff.as_deref() {
+        if !existing.is_settled() {
+            return Err(AgentTaskError::HandoffRefused {
+                code: "handoff-conflict",
+                message: format!(
+                    "the task already carries the unresolved handoff {}",
+                    existing.handoff
+                ),
+            });
+        }
+    }
+    // The structural re-validation the request's contract promises ("every
+    // field is a claim the transition re-validates"): the wire's context
+    // projection re-passes the sender-side reference bounds, and the whole
+    // claim re-passes the record's serialized ceiling, so an oversized
+    // cluster can never consume the task's bounded materialized headroom and
+    // wedge later transitions that need it.
+    if let Err(error) = crate::coordination::check_context_refs(&request.context) {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-context-invalid",
+            message: error.to_string(),
+        });
+    }
+    let request_bytes = serde_json::to_vec(request)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if request_bytes > crate::coordination::AGENT_HANDOFF_RECORD_MAX_BYTES {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-request-too-large",
+            message: format!(
+                "the handoff cluster serializes to {request_bytes} bytes; at most {} are accepted",
+                crate::coordination::AGENT_HANDOFF_RECORD_MAX_BYTES
+            ),
+        });
+    }
+    if task.cancellation.is_some() {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-task-cancelling",
+            message: "the task's cancellation is propagating; no transfer can be recorded"
+                .to_string(),
+        });
+    }
+    if !task.definition.is_agent_owned() {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-not-agent-owned",
+            message: "only an agent-owned task can be handed off".to_string(),
+        });
+    }
+    let Some(assignment) = task.assignment.as_ref() else {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-source-not-current",
+            message: "the task has no current assignment to transfer from".to_string(),
+        });
+    };
+    if assignment.status != AgentAssignmentStatus::Accepted
+        || assignment.agent != request.source_agent
+        || assignment.run != request.source_run
+        || assignment.generation != request.source_generation
+    {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-source-not-current",
+            message: format!(
+                "the claimed source {}/{} generation {} is not the current accepted assignment",
+                request.source_agent, request.source_run, request.source_generation
+            ),
+        });
+    }
+    if task.handoffs >= task.definition.limits.max_handoffs {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-limit-exceeded",
+            message: format!(
+                "the task already recorded its maximum of {} handoffs",
+                task.definition.limits.max_handoffs
+            ),
+        });
+    }
+    // The target-acceptance validation of specification 8.9: the resolved
+    // target must serve this task's typed contract. The definition identity
+    // must match, and a target that declares an expected result schema must
+    // declare *this* task's.
+    if request.target_task_definition != task.definition.definition_id {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-contract-mismatch",
+            message: format!(
+                "the target serves task definition {}, not {}",
+                request.target_task_definition, task.definition.definition_id
+            ),
+        });
+    }
+    if let Some(schema) = request.result_schema.as_ref() {
+        if *schema != task.definition.result_schema {
+            return Err(AgentTaskError::HandoffRefused {
+                code: "handoff-contract-mismatch",
+                message: "the target's expected result schema is not this task's".to_string(),
+            });
+        }
+    }
+
+    let source_assignment = Box::new(assignment.clone());
+    let entry_assignment = assignment.clone();
+    task.handoff = Some(Box::new(AgentTaskHandoff {
+        handoff: request.handoff.clone(),
+        source_assignment,
+        target: request.target.clone(),
+        target_generation: None,
+        reason: bounded_detail(request.reason.clone()),
+        policy_revision: request.policy_revision,
+        context: request.context.clone(),
+        knowledge_spaces: request.knowledge_spaces.clone(),
+        status: AgentTaskHandoffStatus::Initiated,
+        result_settled: false,
+        recorded_at: now,
+        settled_at: None,
+    }));
+    task.handoffs += 1;
+    // The source assignment leaves the record — stashed, never released: the
+    // source run is still live, its escrow child stays open, and its late
+    // proposals are fenced by the stale-generation fence once the target's
+    // generation mints. The task dips to its assignable posture so the very
+    // next decision offers the target.
+    task.assignment = None;
+    task.assignee = Some(request.target.clone());
+    task.status = if task.dependencies_satisfied() {
+        AgentTaskStatus::Created
+    } else {
+        AgentTaskStatus::Blocked
+    };
+    let status = task.status;
+    let handoff_id = request.handoff.clone();
+    let target = request.target.clone();
+    task.check_bounds(0)?;
+    state.updated_at = now;
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::HandoffInitiated,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_assignment(&entry_assignment)
+        .with_detail(format!("{handoff_id} -> {target}"))
+    });
+    Ok(())
+}
+
+/// Resolves a pending handoff as refused: restores the stashed source
+/// assignment — the source never stopped being its generation's accepted
+/// owner, so the ledger is already consistent — and returns the owed
+/// handoff-result exchange that releases the source's fence
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md): "or resolve
+/// through explicit recovery").
+///
+/// The handoff offer gets exactly one assignment-generation attempt; every
+/// definitive refusal of that attempt — the target's own refusal, a
+/// readiness or affordability refusal, an exhausted assignment budget, a
+/// cancellation arriving before the generation minted — resolves through
+/// this one helper. Escrow is deliberately untouched: the caller that
+/// released a refused generation already released it, and no other caller
+/// minted one.
+fn resolve_handoff_refusal(
+    state: &mut AgentTaskState,
+    code: &str,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let task = state.task_mut()?;
+    let Some(handoff) = task
+        .handoff
+        .as_deref_mut()
+        .filter(|handoff| !handoff.is_settled())
+    else {
+        return Ok(Vec::new());
+    };
+    let detail = bounded_detail(code);
+    handoff.status = AgentTaskHandoffStatus::Refused {
+        code: detail.clone(),
+    };
+    handoff.settled_at = Some(now);
+    let source = handoff.source_assignment.as_ref().clone();
+    let operation_id =
+        crate::coordination::handoff_result_operation_id(scope.tenant(), &handoff.handoff)?;
+    // The restore. The generation counter is deliberately NOT rolled back:
+    // the refused generation was durably offered, and a later decision must
+    // mint a fresh one rather than reuse an identity a run entity may have
+    // already seen.
+    task.assignee = Some(source.agent.clone());
+    task.assignment = Some(source.clone());
+    task.status = AgentTaskStatus::InProgress;
+    let status = task.status;
+    state.updated_at = now;
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::HandoffRefused,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_assignment(&source)
+        .with_detail(detail)
+    });
+    Ok(owed_handoff_result(state, now)?.into_iter().collect())
+}
+
+/// The handoff-result exchange the task owes its source run, when it owes
+/// one now ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed exactly once per handoff — the resolution is absorbing, first writer
+/// wins — and re-derived by every settle pass until the exchange settles:
+/// the journal's initiation record is the once-guard inside its bounded
+/// window, and the provenance's `result_settled` marker is the durable
+/// once-guard past it.
+fn owed_handoff_result(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
+    let Some(handoff) = task.handoff.as_deref() else {
+        return Ok(None);
+    };
+    if !handoff.is_settled() || handoff.result_settled {
+        return Ok(None);
+    }
+    let operation_id =
+        crate::coordination::handoff_result_operation_id(state.scope.tenant(), &handoff.handoff)?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let resolution = match &handoff.status {
+        AgentTaskHandoffStatus::Initiated => return Ok(None),
+        AgentTaskHandoffStatus::Accepted => {
+            let Some(generation) = handoff.target_generation else {
+                // An accepted transfer always recorded its minted generation;
+                // absent one there is nothing coherent to report.
+                return Ok(None);
+            };
+            AgentHandoffResolutionNotice::Accepted {
+                target_run: run_id_for_assignment(state.scope.task(), generation)?,
+                generation,
+            }
+        }
+        AgentTaskHandoffStatus::Refused { code } => {
+            AgentHandoffResolutionNotice::Refused { code: code.clone() }
+        }
+    };
+    let source = handoff.source_assignment.as_ref();
+    let source_scope = AgentRunScope::new(
+        state.scope.tenant().clone(),
+        source.agent.clone(),
+        source.run.clone(),
+    )?;
+    let notice = AgentHandoffResultNotice {
+        task: state.scope.clone(),
+        handoff: handoff.handoff.clone(),
+        resolution,
+    };
+    let payload = AgentExchangePayload::encode(AGENT_HANDOFF_RESULT_PAYLOAD_TYPE, &notice)?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::HandoffResult,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Run(source_scope),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
+}
+
+/// Marks the handoff-result exchange settled on the provenance: the durable
+/// once-guard past the journal's bounded deduplication window.
+///
+/// The marker settles only when the settled envelope's operation id is the
+/// one the *currently materialized* handoff derives: a settled provenance
+/// can be replaced by a successor hop, and a late settlement of the previous
+/// hop's exchange must not quiesce the successor's owed result — that would
+/// strand its fenced source run forever.
+fn settle_handoff_result_exchange(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) {
+    let owed = state
+        .task()
+        .and_then(|task| task.handoff.as_deref())
+        .and_then(|handoff| {
+            crate::coordination::handoff_result_operation_id(state.scope.tenant(), &handoff.handoff)
+                .ok()
+        });
+    if owed.as_ref() != Some(envelope.operation_id()) {
+        return;
+    }
+    let mut settled = false;
+    if let Ok(task) = state.task_mut() {
+        if let Some(handoff) = task.handoff.as_deref_mut() {
+            if handoff.is_settled() && !handoff.result_settled {
+                handoff.result_settled = true;
+                settled = true;
+            }
+        }
+    }
+    if settled {
+        state.updated_at = now;
+    }
+}
+
+fn task_team_claim_pending(task: &AgentTask) -> bool {
+    task.team_claim
+        .as_deref()
+        .is_some_and(|claim| !claim.is_settled())
+}
+
+/// Refuses a board decision over a task whose assignment record still
+/// stands: an accepted generation is owned, and an offered one is in
+/// flight. Claim and release arbitrate the same board entry through this
+/// one guard so the two can never diverge; only the in-flight code differs
+/// per action — a refused claim reopens the entry, a refused release
+/// restores it pending — so the caller names it.
+fn check_assignment_free(task: &AgentTask, inflight_code: &'static str) -> AgentTaskResult<()> {
+    let Some(assignment) = task.assignment.as_ref() else {
+        return Ok(());
+    };
+    if assignment.status == AgentAssignmentStatus::Accepted {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-already-owned",
+            message: format!(
+                "generation {} is accepted by {}",
+                assignment.generation, assignment.agent
+            ),
+        });
+    }
+    Err(AgentTaskError::TeamClaimRefused {
+        code: inflight_code,
+        message: format!(
+            "generation {} is offered and undecided",
+            assignment.generation
+        ),
+    })
+}
+
+/// Whether a board-governed task has waited unclaimed past its horizon
+/// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// This is the bounded-wait replacement for the assignee fail-fast a team
+/// creation forgoes: a wrong team id, a task never posted, or a board that
+/// expired before any claim would otherwise park the task — and lock its
+/// delegated escrow — silently forever. The wait re-arms from the task's
+/// last transition, so a refused claim's reopened window starts fresh.
+///
+/// `updated_at` is that clock, which is why a record the task keeps about
+/// *another* entity must not advance it: this horizon would otherwise be
+/// extendable by anything that can write to the task, including a peer the
+/// task has no way to vet.
+fn task_unclaimed_expired(
+    task: &AgentTask,
+    updated_at: AgentTimestampMillis,
+    now: AgentTimestampMillis,
+) -> bool {
+    if task.status != AgentTaskStatus::Created {
+        return false;
+    }
+    if task.team.is_none()
+        || task.assignee.is_some()
+        || task.assignment.is_some()
+        || task.cancellation.is_some()
+    {
+        return false;
+    }
+    if task_team_claim_pending(task) || task_handoff_pending(task) {
+        return false;
+    }
+    let Some(horizon) = task.definition.limits.max_unclaimed_millis else {
+        return false;
+    };
+    now.as_millis() >= updated_at.as_millis().saturating_add(horizon)
+}
+
+/// The bounded outcome echo one applied team-claim exchange returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTeamClaimApplyOutcome {
+    /// The task's status once the transition committed.
+    pub status: AgentTaskStatus,
+    /// The claim the arbitration recorded or echoed.
+    pub claim: crate::identity::AgentTeamClaimId,
+    /// The task's claim fence after the transition.
+    pub epoch: u64,
+}
+
+/// Payload type of the team-claim outcome echo.
+pub const AGENT_TEAM_CLAIM_OUTCOME_PAYLOAD_TYPE: &str = "rakka.agent.TeamClaimOutcome";
+
+/// Applies one delivered team-claim exchange: the task-side arbitration of a
+/// board decision ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The reply means "claim recorded", never "assignment made" — the receiving
+/// entity's local-progress pass decides the assignment right after this, and
+/// the outcome returns by the claim-result exchange.
+fn apply_team_claim(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeResult {
+    let command: crate::coordination::AgentTeamClaimCommand = match envelope
+        .payload()
+        .decode(crate::coordination::AGENT_TEAM_CLAIM_PAYLOAD_TYPE)
+    {
+        Ok(command) => command,
+        Err(error) => return refuse(state, error.code(), error.to_string()),
+    };
+    // The initiator must be the team the command names: a board decision
+    // about team T sent by anything but T's entity is forged.
+    match envelope.initiator() {
+        AgentEntityAddress::Team(scope) if scope == &command.team => {}
+        _ => {
+            return refuse(
+                state,
+                "team-claim-forged",
+                "a team claim must be initiated by the team it names".to_string(),
+            )
+        }
+    }
+    let applied = match &command.action {
+        crate::coordination::AgentTeamClaimAction::Claim { member } => {
+            record_team_claim(state, envelope.operation_id(), &command, member, now)
+        }
+        crate::coordination::AgentTeamClaimAction::Release => {
+            release_team_claim(state, envelope.operation_id(), &command, now)
+        }
+    };
+    match applied {
+        Ok(outcome) => AgentExchangeResult::accepted(
+            AgentExchangePayload::encode(AGENT_TEAM_CLAIM_OUTCOME_PAYLOAD_TYPE, &outcome)
+                .unwrap_or_else(|_| {
+                    AgentExchangePayload::empty(AGENT_TEAM_CLAIM_OUTCOME_PAYLOAD_TYPE)
+                }),
+        ),
+        Err(error) => refuse(state, error.code(), error.to_string()),
+    }
+}
+
+/// Records one board claim: validates the decision against durable state and
+/// points the task's assignee at the claimant
+/// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Atomically validate-then-mutate: a refusal leaves the task exactly as it
+/// found it, which is what lets the board treat a definitive refusal as
+/// proof no claim was recorded. A replay matching the recorded claim id
+/// accepts idempotently — the materialized claim is the deduplication echo
+/// past the journal's bounded window, checked before every guard including
+/// the terminal one. The epoch fence closes courier reordering: a stale
+/// board decision refuses however well formed it is.
+fn record_team_claim(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    command: &crate::coordination::AgentTeamClaimCommand,
+    member: &AgentId,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<AgentTeamClaimApplyOutcome> {
+    let task = state
+        .task
+        .as_mut()
+        .ok_or(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-task-unknown",
+            message: "no task exists under this scope".to_string(),
+        })?;
+    if let Some(existing) = task.team_claim.as_deref() {
+        if existing.claim == command.claim {
+            return Ok(AgentTeamClaimApplyOutcome {
+                status: task.status,
+                claim: existing.claim.clone(),
+                epoch: task.team_claim_fence,
+            });
+        }
+    }
+    if task.team.as_ref() != Some(command.team.team()) {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-wrong-team",
+            message: "the task is not governed by this team's board".to_string(),
+        });
+    }
+    if !task.definition.is_agent_owned() {
+        // The record-level half of the door `create_task` now closes (the
+        // human-owned + team pairing is refused at creation): a claim
+        // accepted here would latch `Initiated` forever, because the
+        // assignment decision requires agent ownership and so never runs,
+        // no claim result is ever owed back to the board, and the unclaimed
+        // horizon requires `Created` — all while durably falsifying
+        // `assignee` on a task a human answers. Deliberately refused under
+        // the *registered* wrong-team code rather than a fresh one: the
+        // team's `check_settle` enumerates the claim codes it may settle,
+        // so a code deployed boards do not know would leave the claim
+        // exchange re-driving forever, while `team-claim-wrong-team`
+        // already closes the board entry `Done` — exactly right for a task
+        // no board can ever assign. The message carries the true reason.
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-wrong-team",
+            message: "the task is human-owned; a board claim can only assign an agent-owned task"
+                .to_string(),
+        });
+    }
+    if command.epoch <= task.team_claim_fence {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-stale-epoch",
+            message: format!(
+                "the decision's epoch {} is not above the recorded fence {}",
+                command.epoch, task.team_claim_fence
+            ),
+        });
+    }
+    if task.status.is_terminal() {
+        let detail = task.terminal_reason.as_ref().map_or_else(
+            || task.status.to_string(),
+            |reason| reason.code().to_string(),
+        );
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-task-terminal",
+            message: format!("the task is terminal: {detail}"),
+        });
+    }
+    if task.cancellation.is_some() {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-task-cancelling",
+            message: "the task's cancellation is propagating; no claim can be recorded".to_string(),
+        });
+    }
+    if task_handoff_pending(task) {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-handoff-pending",
+            message: "the task carries an unresolved handoff".to_string(),
+        });
+    }
+    // An offered generation belongs to the decision the board is
+    // superseding; refusing keeps exactly one generation in flight
+    // ever, and the board reopens for a retry after the offer resolves.
+    check_assignment_free(task, "team-claim-assignment-inflight")?;
+    if task.team_claims >= task.definition.limits.max_team_claims {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-limit-exceeded",
+            message: format!(
+                "the task already recorded its maximum of {} board claims",
+                task.definition.limits.max_team_claims
+            ),
+        });
+    }
+
+    // A superseding claim replaces a pending predecessor whose generation
+    // never minted — a transfer's prior claimant, or an expired-lease steal.
+    // The board recorded the supersession in the same compare-and-set that
+    // committed this decision, so the predecessor has no board slot left to
+    // report into and its materialized record is simply replaced; the chain
+    // is history.
+    //
+    // Bounds are checked over the fully recorded claim, and a failure
+    // restores every touched field before the refusal leaves: the accept
+    // path persists state even under a refusal, and the board treats a
+    // definitive refusal as proof no claim was recorded.
+    let previous_claim = task.team_claim.take();
+    let previous_claims = task.team_claims;
+    let previous_fence = task.team_claim_fence;
+    let previous_assignee = task.assignee.take();
+    let previous_refusal = task.last_refusal.take();
+    task.team_claim = Some(Box::new(AgentTaskTeamClaim {
+        claim: command.claim.clone(),
+        team: command.team.clone(),
+        member: member.clone(),
+        epoch: command.epoch,
+        target_generation: None,
+        status: AgentTaskTeamClaimStatus::Initiated,
+        result_settled: false,
+        recorded_at: now,
+        settled_at: None,
+    }));
+    task.team_claims += 1;
+    task.team_claim_fence = command.epoch;
+    task.assignee = Some(member.clone());
+    let status = task.status;
+    if let Err(error) = task.check_bounds(0) {
+        task.team_claim = previous_claim;
+        task.team_claims = previous_claims;
+        task.team_claim_fence = previous_fence;
+        task.assignee = previous_assignee;
+        task.last_refusal = previous_refusal;
+        return Err(error);
+    }
+    state.updated_at = now;
+    let claim_id = command.claim.clone();
+    let member = member.clone();
+    let operation = operation_id.clone();
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::TeamClaimRecorded,
+            operation,
+            status,
+            now,
+        )
+        .with_detail(format!("{claim_id} -> {member}"))
+    });
+    Ok(AgentTeamClaimApplyOutcome {
+        status,
+        claim: command.claim.clone(),
+        epoch: command.epoch,
+    })
+}
+
+/// Releases one pending board claim before its assignment accepted.
+///
+/// Valid only pre-mint: an offered generation refuses in-flight (the entry
+/// restores and the release may be retried once the offer resolves), and an
+/// accepted assignment refuses owned — ownership leaves the board only
+/// through task-side outcomes. The release's outcome rides the reply home;
+/// no claim-result exchange is owed for it.
+fn release_team_claim(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    command: &crate::coordination::AgentTeamClaimCommand,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<AgentTeamClaimApplyOutcome> {
+    let task = state
+        .task
+        .as_mut()
+        .ok_or(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-task-unknown",
+            message: "no task exists under this scope".to_string(),
+        })?;
+    let Some(existing) = task
+        .team_claim
+        .as_deref()
+        .filter(|claim| claim.claim == command.claim)
+    else {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-release-unknown",
+            message: "the task holds no such claim to release".to_string(),
+        });
+    };
+    if existing.status == AgentTaskTeamClaimStatus::Accepted {
+        // Ownership leaves the board only through task-side outcomes: a
+        // release that raced the acceptance refuses owned even though the
+        // claim is settled, so the board marks the entry owned instead of
+        // reopening an entry whose task is durably in progress.
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-already-owned",
+            message: format!(
+                "claim {} is accepted by {}",
+                existing.claim, existing.member
+            ),
+        });
+    }
+    if existing.is_settled() {
+        // The release replayed past the journal window; the recorded
+        // resolution stands.
+        return Ok(AgentTeamClaimApplyOutcome {
+            status: task.status,
+            claim: existing.claim.clone(),
+            epoch: task.team_claim_fence,
+        });
+    }
+    if command.epoch <= task.team_claim_fence {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-stale-epoch",
+            message: format!(
+                "the release's epoch {} is not above the recorded fence {}",
+                command.epoch, task.team_claim_fence
+            ),
+        });
+    }
+    check_assignment_free(task, "team-release-assignment-inflight")?;
+
+    let claim = task
+        .team_claim
+        .as_deref_mut()
+        .expect("the claim was matched above");
+    claim.status = AgentTaskTeamClaimStatus::Refused {
+        code: "team-claim-released".to_string(),
+    };
+    claim.settled_at = Some(now);
+    claim.result_settled = true;
+    let claim_id = claim.claim.clone();
+    let member = claim.member.clone();
+    task.team_claim_fence = command.epoch;
+    task.assignee = None;
+    let status = task.status;
+    state.updated_at = now;
+    let operation = operation_id.clone();
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::TeamClaimRefused,
+            operation,
+            status,
+            now,
+        )
+        .with_detail(format!("{claim_id} released by {member}"))
+    });
+    Ok(AgentTeamClaimApplyOutcome {
+        status,
+        claim: command.claim.clone(),
+        epoch: command.epoch,
+    })
+}
+
+/// Resolves the pending team claim as refused: clears the assignee back to
+/// the board-pending posture and settles the claim under a stable code.
+///
+/// The claim gets exactly one assignment-generation attempt — the handoff
+/// single-attempt precedent: every definitive refusal of that attempt (the
+/// run's own refusal, a readiness or affordability refusal, an exhausted
+/// assignment budget, a cancellation arriving before the generation minted)
+/// resolves through this one helper, and the owed claim-result exchange
+/// carries the code back to the board, which reopens the entry. Escrow is
+/// deliberately untouched: the caller that released a refused generation
+/// already released it, and no other caller minted one.
+fn resolve_team_claim_refusal(
+    state: &mut AgentTaskState,
+    code: &str,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let task = state.task_mut()?;
+    let Some(claim) = task
+        .team_claim
+        .as_deref_mut()
+        .filter(|claim| !claim.is_settled())
+    else {
+        return Ok(Vec::new());
+    };
+    let detail = bounded_detail(code);
+    claim.status = AgentTaskTeamClaimStatus::Refused {
+        code: detail.clone(),
+    };
+    claim.settled_at = Some(now);
+    let claim_id = claim.claim.clone();
+    let member = claim.member.clone();
+    let operation_id =
+        crate::coordination::team_claim_result_operation_id(scope.tenant(), &claim_id)?;
+    task.assignee = None;
+    let status = task.status;
+    state.updated_at = now;
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::TeamClaimRefused,
+            operation_id,
+            status,
+            now,
+        )
+        .with_detail(format!("{claim_id} {member}: {detail}"))
+    });
+    Ok(owed_team_claim_result(state, now)?.into_iter().collect())
+}
+
+/// The claim-result exchange the task owes its claim's team, when it owes
+/// one now ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed exactly once per claim — the resolution is absorbing, first writer
+/// wins — and re-derived by every settle pass until the exchange settles:
+/// the journal's initiation record is the once-guard inside its bounded
+/// window, and the claim's `result_settled` marker is the durable
+/// once-guard past it.
+fn owed_team_claim_result(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
+    let Some(claim) = task.team_claim.as_deref() else {
+        return Ok(None);
+    };
+    if !claim.is_settled() || claim.result_settled {
+        return Ok(None);
+    }
+    let operation_id =
+        crate::coordination::team_claim_result_operation_id(state.scope.tenant(), &claim.claim)?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let outcome = match &claim.status {
+        AgentTaskTeamClaimStatus::Initiated => return Ok(None),
+        AgentTaskTeamClaimStatus::Accepted => {
+            let Some(generation) = claim.target_generation else {
+                // An accepted claim always recorded its minted generation;
+                // absent one there is nothing coherent to report.
+                return Ok(None);
+            };
+            crate::coordination::AgentTeamClaimOutcome::Activated {
+                generation,
+                run: run_id_for_assignment(state.scope.task(), generation)?,
+                member: claim.member.clone(),
+            }
+        }
+        AgentTaskTeamClaimStatus::Refused { code } => {
+            crate::coordination::AgentTeamClaimOutcome::Refused { code: code.clone() }
+        }
+    };
+    let notice = crate::coordination::AgentTeamClaimResultNotice {
+        task: state.scope.clone(),
+        claim: claim.claim.clone(),
+        epoch: claim.epoch,
+        outcome,
+    };
+    let payload = AgentExchangePayload::encode(
+        crate::coordination::AGENT_TEAM_CLAIM_RESULT_PAYLOAD_TYPE,
+        &notice,
+    )?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::TeamClaimResult,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Team(claim.team.clone()),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
+}
+
+/// Marks the claim-result exchange settled on the claim provenance: the
+/// durable once-guard past the journal's bounded deduplication window.
+///
+/// The marker settles only when the settled envelope's operation id is the
+/// one the *currently materialized* claim derives, exactly as the handoff
+/// marker does: a settled claim can be replaced by a successor, and a late
+/// settlement of the predecessor's exchange must not quiesce the
+/// successor's owed result.
+fn settle_team_claim_result_exchange(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) {
+    let owed = state
+        .task()
+        .and_then(|task| task.team_claim.as_deref())
+        .and_then(|claim| {
+            crate::coordination::team_claim_result_operation_id(state.scope.tenant(), &claim.claim)
+                .ok()
+        });
+    if owed.as_ref() != Some(envelope.operation_id()) {
+        return;
+    }
+    let mut settled = false;
+    if let Ok(task) = state.task_mut() {
+        if let Some(claim) = task.team_claim.as_deref_mut() {
+            if claim.is_settled() && !claim.result_settled {
+                claim.result_settled = true;
+                settled = true;
+            }
+        }
+    }
+    if settled {
+        state.updated_at = now;
+    }
+}
+
+/// The terminal notice the task owes its governing team's board, when it
+/// owes one now ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed exactly once per task — terminality is absorbing and the governing
+/// team is immutable creation provenance — and re-derived by every settle
+/// pass until the exchange settles: the journal's initiation record is the
+/// once-guard inside its bounded window, and the task's
+/// `team_terminal_notice_settled` marker is the durable once-guard past it.
+/// This is what closes the board entry eagerly; before it, a terminal
+/// task's entry closed only through a member's refused claim attempt.
+fn owed_team_terminal_notice(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
+    let Some(team) = task.team.as_ref() else {
+        return Ok(None);
+    };
+    if !task.status.is_terminal() || task.team_terminal_notice_settled {
+        return Ok(None);
+    }
+    let operation_id = crate::coordination::team_terminal_notice_operation_id(
+        state.scope.tenant(),
+        team,
+        state.scope.task(),
+    )?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let notice = crate::coordination::AgentTeamTerminalNotice {
+        task: state.scope.clone(),
+        status: task.status,
+        terminal_reason: task
+            .terminal_reason
+            .as_ref()
+            .map(AgentTaskTerminalReason::code)
+            .unwrap_or("terminal")
+            .to_string(),
+    };
+    let payload = AgentExchangePayload::encode(
+        crate::coordination::AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE,
+        &notice,
+    )?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::TeamTerminalNotice,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Team(crate::identity::AgentTeamScope::new(
+                state.scope.tenant().clone(),
+                team.clone(),
+            )?),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
+}
+
+/// Marks the team terminal notice settled on the task: the durable
+/// once-guard past the journal's bounded deduplication window.
+///
+/// The marker settles only when the settled envelope's operation id is the
+/// one the task currently derives — the same discipline as the claim-result
+/// marker, kept even though `(team, task)` is immutable, so the guard never
+/// depends on that immutability holding elsewhere.
+fn settle_team_terminal_notice_exchange(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) {
+    let owed = state.task().and_then(|task| {
+        let team = task.team.as_ref()?;
+        crate::coordination::team_terminal_notice_operation_id(
+            state.scope.tenant(),
+            team,
+            state.scope.task(),
+        )
+        .ok()
+    });
+    if owed.as_ref() != Some(envelope.operation_id()) {
+        return;
+    }
+    let mut settled = false;
+    if let Ok(task) = state.task_mut() {
+        if task.status.is_terminal() && !task.team_terminal_notice_settled {
+            task.team_terminal_notice_settled = true;
+            settled = true;
+        }
+    }
+    if settled {
+        state.updated_at = now;
+    }
 }
 
 /// The continuous root control task a wake command must address, or the
@@ -4910,17 +7259,222 @@ fn owed_delegation_result(
     ))
 }
 
+/// The dependency-registration exchanges this task owes its upstreams right
+/// now: one per unresolved forward edge whose registration has not settled
+/// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Pure over durable state: the journal's initiation record guards the
+/// bounded window, and the edge's `registration_settled` marker quiesces the
+/// derivation past it. A terminal or cancelling task registers nothing — an
+/// outcome could no longer move it. Edges persisted before the registry
+/// existed carry an unsettled marker, so an unresolved pre-registry edge
+/// registers itself on the next settle pass.
+fn owed_dependency_registrations(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if task.status.is_terminal() || task.cancellation.is_some() {
+        return Ok(Vec::new());
+    }
+    let mut owed = Vec::new();
+    for edge in task.dependencies.values() {
+        if edge.outcome.is_some() || edge.registration_settled {
+            continue;
+        }
+        let operation_id = dependency_registration_operation_id(
+            state.scope.tenant(),
+            &edge.dependency,
+            state.scope.task(),
+        )?;
+        if state.journal.has_initiated(&operation_id) {
+            continue;
+        }
+        let upstream = AgentTaskScope::new(state.scope.tenant().clone(), edge.dependency.clone())?;
+        let registration = AgentDependencyRegistration {
+            dependent: state.scope.clone(),
+            upstream: edge.dependency.clone(),
+            policy: edge.policy,
+        };
+        let payload = AgentExchangePayload::encode(
+            AGENT_DEPENDENCY_REGISTRATION_PAYLOAD_TYPE,
+            &registration,
+        )?;
+        owed.push(
+            AgentExchangeEnvelope::new(
+                operation_id.clone(),
+                AgentExchangeKind::DependencyRegistration,
+                AgentEntityAddress::Task(state.scope.clone()),
+                AgentEntityAddress::Task(upstream),
+                payload,
+                AgentCorrelationId::new(operation_id.as_str()),
+                now,
+            )?
+            .with_telemetry(task.telemetry.clone()),
+        );
+    }
+    Ok(owed)
+}
+
+/// The dependency-outcome notifications a terminal task owes its registered
+/// dependents right now
+/// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)) — owed
+/// immediately at the terminal commit, with no escrow gate: the status, the
+/// terminal reason, and the result digest are all absorbing the moment
+/// [`terminate`] commits, unlike a delegation report's consumption-derived
+/// fields. The journal's initiation record guards the bounded window; the
+/// registry entry's `outcome_settled` marker quiesces the derivation past
+/// it.
+///
+/// At most `budget` notifications are derived per call, so a registry larger
+/// than the journal's free pending slots defers the remainder to a later pass
+/// rather than failing the terminal transition outright
+/// ([`owed_exchange_budget`]).
+fn owed_dependent_outcomes(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+    budget: usize,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if !task.status.is_terminal() {
+        return Ok(Vec::new());
+    }
+    let Some(outcome) = AgentTaskDependencyOutcome::from_terminal_status(task.status) else {
+        return Ok(Vec::new());
+    };
+    let mut owed = Vec::new();
+    for record in task.dependents.values() {
+        if owed.len() >= budget {
+            // Out of journal headroom, not out of dependents: the rest are
+            // owed by a later pass. See [`owed_exchange_budget`].
+            break;
+        }
+        if record.outcome_settled {
+            continue;
+        }
+        let operation_id = dependency_outcome_operation_id(
+            state.scope.tenant(),
+            state.scope.task(),
+            &record.dependent,
+        )?;
+        if state.journal.has_initiated(&operation_id) {
+            continue;
+        }
+        let dependent =
+            AgentTaskScope::new(state.scope.tenant().clone(), record.dependent.clone())?;
+        let notice = AgentDependencyOutcomeNotice {
+            upstream: state.scope.clone(),
+            outcome,
+            terminal_reason: task
+                .terminal_reason
+                .as_ref()
+                .map(|reason| reason.code().to_string()),
+            result_digest: task
+                .accepted_result
+                .as_ref()
+                .map(|accepted| accepted.digest.clone()),
+        };
+        let payload = AgentExchangePayload::encode(AGENT_DEPENDENCY_OUTCOME_PAYLOAD_TYPE, &notice)?;
+        owed.push(
+            AgentExchangeEnvelope::new(
+                operation_id.clone(),
+                AgentExchangeKind::DependencyOutcome,
+                AgentEntityAddress::Task(state.scope.clone()),
+                AgentEntityAddress::Task(dependent),
+                payload,
+                AgentCorrelationId::new(operation_id.as_str()),
+                now,
+            )?
+            .with_telemetry(task.telemetry.clone()),
+        );
+    }
+    Ok(owed)
+}
+
+/// How many further exchanges this task may owe in one transition without
+/// overflowing the journal's bounded pending list, given the `reserved`
+/// envelopes the calling transition already owes.
+///
+/// Recording an owed exchange fails the *whole* transition on overflow rather
+/// than dropping the exchange, so a derivation that produces a batch — the
+/// outcome notifications a terminal task owes its dependents — has to fit
+/// itself to what is free, or a task with a full dependency graph could not
+/// terminalize at all. The dependent registry and the forward edges are each
+/// bounded by their own ceiling and share one pending list, and a terminal
+/// task's registrations are withdrawn before this is consulted
+/// ([`withdraw_moot_registrations`]), so in practice the budget binds only a
+/// task that owes an unusual amount of other work at the same moment.
+///
+/// Fitting is safe because the derivation is pure over durable state: the
+/// registry entry's `outcome_settled` marker survives the transition, so a
+/// notification that does not fit here is owed by the next settle pass
+/// instead. Deferral, never loss.
+fn owed_exchange_budget(state: &AgentTaskState, reserved: usize) -> usize {
+    AGENT_EXCHANGE_PENDING_CAPACITY
+        .saturating_sub(state.journal.outstanding_count())
+        .saturating_sub(reserved)
+}
+
+/// Withdraws the dependency registrations a task can no longer act on, and
+/// reports how many it dropped.
+///
+/// A registration exists to make an upstream owe this task an outcome
+/// notification. A terminal task consumes no outcome — [`owed_dependency_registrations`]
+/// already derives nothing for one — so an outstanding registration is dead
+/// weight holding a pending slot that this task's *own* notifications to its
+/// dependents need. Both sides of the graph are bounded by the same ceiling
+/// and the pending list is smaller than their sum, which is exactly the case
+/// this reclaims.
+fn withdraw_moot_registrations(state: &mut AgentTaskState) -> usize {
+    let Some(task) = state.task.as_ref() else {
+        return 0;
+    };
+    if !task.status.is_terminal() {
+        return 0;
+    }
+    let operations: Vec<AgentOperationId> = task
+        .dependencies
+        .values()
+        .filter_map(|edge| {
+            dependency_registration_operation_id(
+                state.scope.tenant(),
+                &edge.dependency,
+                state.scope.task(),
+            )
+            .ok()
+        })
+        .collect();
+    operations
+        .iter()
+        .filter(|operation| state.journal.withdraw(operation))
+        .count()
+}
+
 /// Every child report a terminal task owes right now: the epoch result to a
-/// wake controller, the delegation result to a delegating parent run. One
-/// consult point, so every transition that can close a terminal task's
-/// ledger owes both from the same compare-and-set.
+/// wake controller, the delegation result to a delegating parent run, the
+/// terminal notice to its governing team's board, and the dependency
+/// outcomes its registered dependents wait on. One consult point, so every
+/// transition that can terminalize a task or close its ledger owes all of
+/// them from the same compare-and-set.
+///
+/// `reserved` is how many envelopes the calling transition already owes; the
+/// dependent notifications fit themselves into what is left of the journal's
+/// pending list ([`owed_exchange_budget`]).
 fn owed_child_reports(
     state: &AgentTaskState,
     now: AgentTimestampMillis,
+    reserved: usize,
 ) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
     let mut owed = Vec::new();
     owed.extend(owed_epoch_result(state, now)?);
     owed.extend(owed_delegation_result(state, now)?);
+    owed.extend(owed_team_terminal_notice(state, now)?);
+    let budget = owed_exchange_budget(state, reserved.saturating_add(owed.len()));
+    owed.extend(owed_dependent_outcomes(state, now, budget)?);
     Ok(owed)
 }
 
@@ -5348,6 +7902,8 @@ fn owe_epoch_creation(
         definition: epoch_spec.definition.clone(),
         input,
         assignee: Some(epoch_spec.assignee.clone()),
+        // An epoch is admitted by its own controller, never board-claimed.
+        team: None,
         goal: Some(goal),
         goal_mode: AgentGoalMode::Finite,
         // An epoch task contributes to the goal; it never coordinates it, so
@@ -6679,13 +9235,60 @@ fn decide_assignment(
         return Ok(Vec::new());
     }
 
+    // The handoff single-attempt rule ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)):
+    // the transfer's target gets exactly one assignment-generation attempt,
+    // and every definitive refusal of it resolves the handoff — restoring the
+    // stashed source — rather than parking the task in a refusal loop or
+    // terminalizing it over a source run that is fenced-alive awaiting the
+    // resolution.
+    let handoff_pending = task_handoff_pending(task);
+    // The claim single-attempt rule mirrors the handoff's: the claimant gets
+    // exactly one assignment-generation attempt, and every definitive
+    // refusal of it resolves the claim — reopening the board entry through
+    // the owed claim result — rather than parking the task in a refusal
+    // loop.
+    let team_claim_pending = task_team_claim_pending(task);
     if let Some((reason, detail)) = readiness.refusal() {
+        if handoff_pending {
+            return resolve_handoff_refusal(state, reason.code(), now);
+        }
+        if team_claim_pending {
+            return resolve_team_claim_refusal(state, reason.code(), now);
+        }
         return Ok(refuse_assignment(state, readiness, reason, detail, now)?
             .into_iter()
             .collect());
     }
 
+    // The board claim's own authority door
+    // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)): a claim
+    // spends the `Team` coordination capability, so a member whose *definition*
+    // never granted it may not buy an assignment generation off a shared board
+    // — however the board's membership was wired. Membership is trusted
+    // application data and deliberately not an authority source of its own; the
+    // envelope is, and this is the door it is read at, the same door the task
+    // definition and operation class are read at.
+    //
+    // It is checked only for a claim. A direct assignment of the same task to
+    // the same agent is untouched, because it spends no coordination capability.
+    if team_claim_pending && !readiness.permits_team_coordination {
+        // Definitive by construction: no re-drive can produce a different
+        // answer while the definition stands, so the claim resolves — reopening
+        // the entry for a member that *is* authorized — instead of parking the
+        // task in a refusal loop.
+        return resolve_team_claim_refusal(state, "team-coordination-unauthorized", now);
+    }
+
     if task.assignments >= task.definition.limits.max_assignments {
+        if handoff_pending {
+            return resolve_handoff_refusal(state, "handoff-assignments-exhausted", now);
+        }
+        if team_claim_pending {
+            // The claim resolves rather than the task terminating: the
+            // board's members decide what an unassignable entry means, and
+            // the claim ceiling bounds how often they may ask.
+            return resolve_team_claim_refusal(state, "team-claim-assignments-exhausted", now);
+        }
         let assignments = task.assignments;
         let operation_id = assignment_operation_id(&scope, task.assignment_generation)?;
         terminate(
@@ -6699,7 +9302,7 @@ fn decide_assignment(
         // outstanding — and a delegated child's parent is parked awaiting
         // exactly this outcome: the reports the terminal task owes upward
         // are accurate now, and owed from this same compare-and-set.
-        return owed_child_reports(state, now);
+        return owed_child_reports(state, now, 0);
     }
 
     let (agent_definition_revision, agent_settings_revision) =
@@ -6727,6 +9330,22 @@ fn decide_assignment(
     // the headroom, so this takes the same path a suspended agent's refusal
     // takes.
     if let Some((reason, detail)) = task_budget_refusal(task) {
+        if handoff_pending {
+            // The source's escrow child is still open — settlement travels
+            // only post-terminal, and the source is fenced non-terminal — so
+            // an exact-fit budget cannot afford the target's generation. Fail
+            // closed: the handoff resolves refused and the source resumes
+            // with the failed tool result, rather than the task parking over
+            // a fenced-alive source (the user-approved posture; a reserved
+            // handoff allowance is a recorded policy hook, not this slice).
+            return resolve_handoff_refusal(state, "handoff-budget-unaffordable", now);
+        }
+        if team_claim_pending {
+            // Fail closed exactly as the handoff does: the claim resolves
+            // refused and the board reopens, rather than the task parking a
+            // claim over headroom that may never return.
+            return resolve_team_claim_refusal(state, "team-claim-budget-unaffordable", now);
+        }
         // A refusal no settlement can relieve — zero headroom and nothing
         // outstanding to return — is the goal scope's own exhaustion, and the
         // goal's persisted policy decides what it does about it.
@@ -6790,6 +9409,28 @@ fn decide_assignment(
     task.status = AgentTaskStatus::Assigned;
     task.last_refusal = None;
     task.assignment = Some(assignment.clone());
+    // A pending handoff records the generation it minted, in this same
+    // compare-and-set: the provenance's target generation is what the
+    // acceptance flip and the result notice key on.
+    if let Some(handoff) = task.handoff.as_deref_mut() {
+        if !handoff.is_settled()
+            && handoff.target == assignment.agent
+            && handoff.target_generation.is_none()
+        {
+            handoff.target_generation = Some(generation);
+        }
+    }
+    // A pending board claim records the generation it minted the same way:
+    // the claim's target generation is what the acceptance flip and the
+    // claim-result notice key on.
+    if let Some(claim) = task.team_claim.as_deref_mut() {
+        if !claim.is_settled()
+            && claim.member == assignment.agent
+            && claim.target_generation.is_none()
+        {
+            claim.target_generation = Some(generation);
+        }
+    }
     // The assignment spends growth headroom admission reserved, so it checks
     // the full bound: it cannot fail for a record admission accepted.
     task.check_bounds(0)?;
@@ -6909,10 +9550,90 @@ fn apply_result_proposal(
     });
 
     let task = state.task.as_ref().expect("the task exists on this path");
-    match task.definition.validate_proposal(&proposal) {
+    match task
+        .definition
+        .validate_result(&AgentResultClaim::from_proposal(&proposal))
+    {
         Ok(()) => accept_result(state, &proposal, digest, now),
         Err(cause) => reject_result(state, &proposal, digest, cause, now),
     }
+}
+
+/// How the origin-neutral acceptance core resolved.
+enum ResultAcceptanceCore {
+    /// The result committed and the task terminalized `Completed`.
+    Accepted,
+    /// The accepted result would push the materialized record past its
+    /// bound; the write was rolled back and nothing committed.
+    Bounds(AgentTaskError),
+    /// The task turned terminal under the acceptance — a defensive shield
+    /// the fence ladders make unreachable.
+    AlreadyTerminal,
+}
+
+/// Commits one validated result: the accepted-result cell, the `Completed`
+/// terminal, and the `ResultAccepted` history row.
+///
+/// Origin-neutral — the run's proposal wrapper passes no principal and the
+/// human submission passes its authenticated one — so both commit the
+/// identical transition. The caller ensures the task exists.
+fn accept_result_core(
+    state: &mut AgentTaskState,
+    accepted: &AgentAcceptedResult,
+    principal: Option<&str>,
+    now: AgentTimestampMillis,
+) -> ResultAcceptanceCore {
+    let bounded = {
+        let task = state.task.as_mut().expect("the task exists on this path");
+        task.accepted_result = Some(Box::new(accepted.clone()));
+        // An accepted result is not covered by the admission reserve: unlike
+        // an assignment or a rejection, an oversized one has a graceful retry
+        // — the submitter resubmits it behind an artifact reference.
+        task.check_bounds(0)
+    };
+    if let Err(error) = bounded {
+        // The accepted result would push the materialized record past its bound.
+        // Refusing is the only safe answer: a task must never persist a record it
+        // cannot bound, and the submitter must resubmit the result behind an
+        // artifact reference.
+        state
+            .task
+            .as_mut()
+            .expect("the task exists on this path")
+            .accepted_result = None;
+        return ResultAcceptanceCore::Bounds(error);
+    }
+
+    let proposal_id = accepted.proposal_id.clone();
+    if terminate(
+        state,
+        &proposal_id,
+        AgentTaskTerminalReason::ResultAccepted,
+        now,
+    )
+    .is_err()
+    {
+        return ResultAcceptanceCore::AlreadyTerminal;
+    }
+
+    let digest = accepted.digest.clone();
+    let principal = principal.map(str::to_string);
+    state.record_history(|sequence| {
+        let entry = AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::ResultAccepted,
+            proposal_id.clone(),
+            AgentTaskStatus::Completed,
+            now,
+        )
+        .with_digest(digest.clone());
+        match &principal {
+            Some(principal) => entry.with_principal(principal.clone()),
+            None => entry,
+        }
+    });
+    state.updated_at = now;
+    ResultAcceptanceCore::Accepted
 }
 
 fn accept_result(
@@ -6923,12 +9644,13 @@ fn accept_result(
 ) -> AgentExchangeResult {
     let accepted = AgentAcceptedResult {
         proposal_id: proposal.proposal_id.clone(),
-        run: proposal.run.clone(),
+        run: Some(proposal.run.clone()),
+        principal: None,
         definition_id: proposal.definition_id.clone(),
         definition_version: proposal.definition_version,
         result_schema: proposal.result_schema.clone(),
         content: proposal.content.clone(),
-        digest: digest.clone(),
+        digest,
         evidence: proposal.evidence.clone(),
         accepted_at: now,
     };
@@ -6941,58 +9663,110 @@ fn accept_result(
         );
     }
 
-    let bounded = {
-        let task = state.task.as_mut().expect("the task exists on this path");
-        task.accepted_result = Some(Box::new(accepted.clone()));
-        // An accepted result is not covered by the admission reserve: unlike
-        // an assignment or a rejection, an oversized one has a graceful retry
-        // — the run resubmits it behind an artifact reference.
-        task.check_bounds(0)
-    };
-    if let Err(error) = bounded {
-        // The accepted result would push the materialized record past its bound.
-        // Refusing is the only safe answer: a task must never persist a record it
-        // cannot bound, and the run must resubmit the result behind an artifact
-        // reference.
-        state
-            .task
-            .as_mut()
-            .expect("the task exists on this path")
-            .accepted_result = None;
-        return refuse(state, error.code(), error.to_string());
-    }
-
-    let proposal_id = proposal.proposal_id.clone();
-    if terminate(
-        state,
-        &proposal_id,
-        AgentTaskTerminalReason::ResultAccepted,
-        now,
-    )
-    .is_err()
-    {
-        return refuse(
+    match accept_result_core(state, &accepted, None, now) {
+        ResultAcceptanceCore::Accepted => decision(AgentTaskDecision::Accepted {
+            result: Box::new(accepted),
+        }),
+        ResultAcceptanceCore::Bounds(error) => refuse(state, error.code(), error.to_string()),
+        ResultAcceptanceCore::AlreadyTerminal => refuse(
             state,
             "task-terminal",
             "the task is already terminal".to_string(),
-        );
+        ),
     }
+}
 
+/// What the origin-neutral rejection core committed.
+struct ResultRejectionCore {
+    /// The durable rejection decision.
+    rejection: AgentTaskRejection,
+    /// How many further proposals the task will still consider.
+    remaining: u32,
+    /// The task's status after the decision: unchanged, or `Failed` when
+    /// this rejection exhausted the budget.
+    status_after: AgentTaskStatus,
+}
+
+/// Commits one validation rejection: the counter, the materialized
+/// `last_rejection`, the exhaustion terminal when the budget is spent, and
+/// the `ResultRejected` history row.
+///
+/// Origin-neutral exactly like [`accept_result_core`]. The caller ensures
+/// the task exists.
+fn reject_result_core(
+    state: &mut AgentTaskState,
+    proposal_id: &AgentOperationId,
+    causation_id: &AgentCausationId,
+    digest: AgentContentDigest,
+    cause: &AgentTaskRejectionCause,
+    principal: Option<&str>,
+    now: AgentTimestampMillis,
+) -> ResultRejectionCore {
+    let task = state.task.as_mut().expect("the task exists on this path");
+
+    task.rejection_count += 1;
+    let rejection = AgentTaskRejection {
+        proposal_id: proposal_id.clone(),
+        digest: digest.clone(),
+        cause: cause.clone(),
+        rejection_count: task.rejection_count,
+        causation_id: causation_id.clone(),
+        rejected_at: now,
+    };
+    task.last_rejection = Some(Box::new(rejection.clone()));
+
+    let exhausted = task.rejection_count >= task.definition.limits.max_result_rejections;
+    let remaining = task
+        .definition
+        .limits
+        .max_result_rejections
+        .saturating_sub(task.rejection_count);
+    let rejections = task.rejection_count;
+
+    let status_after = if exhausted {
+        // The rejection budget is spent. The task fails; it never silently
+        // accepts the proposal it just refused
+        // ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
+        let _ = terminate(
+            state,
+            proposal_id,
+            AgentTaskTerminalReason::ResultRejectionsExhausted { rejections },
+            now,
+        );
+        AgentTaskStatus::Failed
+    } else {
+        state
+            .task
+            .as_ref()
+            .map_or(AgentTaskStatus::Failed, |task| task.status)
+    };
+
+    let cause_reason = cause.reason.clone();
+    let cause_detail = cause.detail.clone();
+    let proposal_id = proposal_id.clone();
+    let principal = principal.map(str::to_string);
     state.record_history(|sequence| {
-        AgentTaskHistoryEntry::new(
+        let entry = AgentTaskHistoryEntry::new(
             sequence,
-            AgentTaskHistoryKind::ResultAccepted,
+            AgentTaskHistoryKind::ResultRejected,
             proposal_id.clone(),
-            AgentTaskStatus::Completed,
+            status_after,
             now,
         )
-        .with_digest(digest)
+        .with_digest(digest.clone())
+        .with_detail(format!("{cause_reason}: {cause_detail}"));
+        match &principal {
+            Some(principal) => entry.with_principal(principal.clone()),
+            None => entry,
+        }
     });
     state.updated_at = now;
 
-    decision(AgentTaskDecision::Accepted {
-        result: Box::new(accepted),
-    })
+    ResultRejectionCore {
+        rejection,
+        remaining,
+        status_after,
+    }
 }
 
 fn reject_result(
@@ -7009,71 +9783,287 @@ fn reject_result(
             "the task does not exist".to_string(),
         );
     }
-    let task = state.task.as_mut().expect("the task exists on this path");
 
-    task.rejection_count += 1;
-    let rejection = AgentTaskRejection {
-        proposal_id: proposal.proposal_id.clone(),
-        digest: digest.clone(),
-        cause: cause.clone(),
-        rejection_count: task.rejection_count,
-        causation_id: proposal.causation_id.clone(),
-        rejected_at: now,
-    };
-    task.last_rejection = Some(Box::new(rejection.clone()));
-
-    let exhausted = task.rejection_count >= task.definition.limits.max_result_rejections;
-    let remaining = task
-        .definition
-        .limits
-        .max_result_rejections
-        .saturating_sub(task.rejection_count);
-    let rejections = task.rejection_count;
-    let proposal_id = proposal.proposal_id.clone();
-
-    let status_after = if exhausted {
-        // The rejection budget is spent. The task fails; it never silently
-        // accepts the proposal it just refused
-        // ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
-        let _ = terminate(
-            state,
-            &proposal_id,
-            AgentTaskTerminalReason::ResultRejectionsExhausted { rejections },
-            now,
-        );
-        AgentTaskStatus::Failed
-    } else {
-        state
-            .task
-            .as_ref()
-            .map_or(AgentTaskStatus::Failed, |task| task.status)
-    };
-
-    state.record_history(|sequence| {
-        AgentTaskHistoryEntry::new(
-            sequence,
-            AgentTaskHistoryKind::ResultRejected,
-            proposal_id.clone(),
-            status_after,
-            now,
-        )
-        .with_digest(digest)
-        .with_detail(format!("{}: {}", cause.reason, cause.detail))
-    });
-    state.updated_at = now;
+    let committed = reject_result_core(
+        state,
+        &proposal.proposal_id,
+        &proposal.causation_id,
+        digest,
+        &cause,
+        None,
+        now,
+    );
 
     let feedback = bounded_detail(format!("{}: {}", cause.reason, cause.detail));
     let code = cause.reason.clone();
     let payload = decision_payload(&AgentTaskDecision::Rejected {
-        rejection: Box::new(rejection),
+        rejection: Box::new(committed.rejection),
         feedback,
-        remaining_iterations: remaining,
-        status: status_after,
+        remaining_iterations: committed.remaining,
+        status: committed.status_after,
     });
     // A rule rejection is a durable *decision*, not a failure: it travels home as
     // the exchange's result, is returned unchanged on replay, and the run settles
     // on it.
     AgentExchangeResult::rejected(code, "the proposed result was refused", payload)
+}
+
+/// The bounded fingerprint under which a rejected submission's operation id
+/// enters the task's echo ring.
+fn submission_fingerprint(operation_id: &AgentOperationId) -> String {
+    AgentContentDigest::of_bytes(operation_id.as_str().as_bytes()).value
+}
+
+/// The decision a human submission's operation id already has on record, as a
+/// pure read over durable state — `None` when it has none and must be decided.
+///
+/// This is the whole echo ladder, lifted out of the transition so the entity
+/// can answer it *before* it takes any lock on the world: the accepted result
+/// and the latest rejection replay idempotently past the operation log's
+/// bounded window, and an older rejection is recognized from the bounded
+/// fingerprint ring. First-writer-wins — the replay's content is never
+/// re-read, so the probe needs only the operation id.
+///
+/// Answering it early is what keeps a durable decision reachable while the
+/// *history sink* — pure observability — is backed up. See the call in
+/// [`AgentTaskEntityStore::apply`].
+fn probe_human_submission_echo(
+    state: &AgentTaskState,
+    operation_id: &AgentOperationId,
+) -> Option<AgentTaskResult<AgentTaskSubmissionDecision>> {
+    let task = state.task.as_ref()?;
+    let remaining = task
+        .definition
+        .limits
+        .max_result_rejections
+        .saturating_sub(task.rejection_count);
+    if let Some(accepted) = task.accepted_result.as_deref() {
+        if accepted.proposal_id == *operation_id {
+            return Some(Ok(AgentTaskSubmissionDecision {
+                disposition: AgentTaskSubmissionDisposition::Accepted,
+                code: None,
+                feedback: String::new(),
+                remaining_attempts: remaining,
+                digest: accepted.digest.clone(),
+            }));
+        }
+    }
+    if let Some(last) = task.last_rejection.as_deref() {
+        if last.proposal_id == *operation_id {
+            return Some(Ok(AgentTaskSubmissionDecision {
+                disposition: AgentTaskSubmissionDisposition::Rejected,
+                code: Some(last.cause.reason.clone()),
+                feedback: bounded_detail(format!("{}: {}", last.cause.reason, last.cause.detail)),
+                remaining_attempts: remaining,
+                digest: last.digest.clone(),
+            }));
+        }
+    }
+    if task
+        .rejected_submissions
+        .contains(&submission_fingerprint(operation_id))
+    {
+        // An older rejection evicted from the materialized record: the
+        // decision stands, the budget is not re-spent, and the caller
+        // resubmits corrected content under a new discriminator.
+        return Some(Err(AgentTaskError::SubmissionRefused {
+            code: "submission-already-rejected",
+            message: "this submission was already rejected; a corrected resubmission \
+                      carries a new deduplication key"
+                .to_string(),
+        }));
+    }
+    None
+}
+
+/// Applies one authenticated human-result submission
+/// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The ladder answers every durable echo *before* any guard, the terminal
+/// one included — see [`probe_human_submission_echo`] — and every refusal is
+/// non-committing: a rejected transition never reaches the store, so a
+/// corrected retry under the same operation id is still accepted.
+fn submit_human_result(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    submission: &AgentHumanResultSubmission,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<(AgentTaskOutcomeExtras, Vec<AgentExchangeEnvelope>)> {
+    if submission.principal.is_empty() {
+        return Err(AgentTaskError::SubmissionRefused {
+            code: "submission-principal-missing",
+            message: "a human-result submission requires an authenticated principal".to_string(),
+        });
+    }
+    if submission.principal.len() > AGENT_IDENTITY_MAX_LENGTH {
+        return Err(AgentTaskError::SubmissionRefused {
+            code: "submission-principal-too-long",
+            message: format!(
+                "the submission's principal is {} bytes, and the task persists at most \
+                 {AGENT_IDENTITY_MAX_LENGTH}",
+                submission.principal.len()
+            ),
+        });
+    }
+    if submission.causation_id.as_str().len() > AGENT_IDENTITY_MAX_LENGTH {
+        // The same rationale as the run proposal's causation guard: a
+        // rejection persists the id, and the growth reserve is sized against
+        // bounded fields only.
+        return Err(AgentTaskError::SubmissionRefused {
+            code: "submission-causation-too-long",
+            message: format!(
+                "the submission's causation id is {} bytes, and the task persists at most \
+                 {AGENT_IDENTITY_MAX_LENGTH}",
+                submission.causation_id.as_str().len()
+            ),
+        });
+    }
+
+    // The durable echoes, before every guard including the terminal one (the
+    // handoff-provenance ordering): a past-window replay of a decided
+    // submission converges on its recorded decision instead of refusing.
+    if let Some(echo) = probe_human_submission_echo(state, operation_id) {
+        return echo.map(|decision| (AgentTaskOutcomeExtras::submission(decision), Vec::new()));
+    }
+
+    let Some(task) = state.task.as_ref() else {
+        return Err(AgentTaskError::NotCreated {
+            scope: state.scope.clone(),
+        });
+    };
+    if task.definition.is_agent_owned() {
+        return Err(AgentTaskError::SubmissionRefused {
+            code: "task-not-human-owned",
+            message: "the task is agent-owned; its result arrives from its assigned run"
+                .to_string(),
+        });
+    }
+    if task.status.is_terminal() {
+        return Err(AgentTaskError::Terminal {
+            status: task.status,
+        });
+    }
+    if !task.dependencies_satisfied() {
+        // Status-independent, exactly as `awaits_assignment` re-tests it on
+        // the agent-owned path. The status is a projection of the graph, and
+        // a projection is the wrong thing to gate determinism on: any path
+        // that leaves a demoted status behind — a record persisted before a
+        // late declaration demoted it, a future transition that forgets to —
+        // would otherwise let a human complete a task whose declared inputs
+        // have not resolved
+        // ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+        return Err(AgentTaskError::SubmissionRefused {
+            code: "task-dependencies-unresolved",
+            message: "the task's declared dependencies have not all resolved".to_string(),
+        });
+    }
+    if !matches!(task.status, AgentTaskStatus::WaitingForInput) {
+        return Err(AgentTaskError::SubmissionRefused {
+            code: "task-not-awaiting-input",
+            message: format!("the task is {}, not waiting for input", task.status),
+        });
+    }
+    if task.cancellation.is_some() {
+        return Err(AgentTaskError::SubmissionRefused {
+            code: AGENT_TASK_REFUSAL_CANCEL_REQUESTED,
+            message: "the task's cancellation is propagating; no submission can be validated"
+                .to_string(),
+        });
+    }
+
+    let digest = submission.content.digest();
+    let status_before = task.status;
+    let principal = submission.principal.clone();
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::ResultProposed,
+            operation_id.clone(),
+            status_before,
+            now,
+        )
+        .with_digest(digest.clone())
+        .with_principal(principal.clone())
+    });
+
+    let task = state.task.as_ref().expect("the task exists on this path");
+    match task
+        .definition
+        .validate_result(&AgentResultClaim::from_submission(submission))
+    {
+        Ok(()) => {
+            let accepted = AgentAcceptedResult {
+                proposal_id: operation_id.clone(),
+                run: None,
+                principal: Some(submission.principal.clone()),
+                definition_id: submission.definition_id.clone(),
+                definition_version: submission.definition_version,
+                result_schema: submission.result_schema.clone(),
+                content: submission.content.clone(),
+                digest: digest.clone(),
+                evidence: submission.evidence.clone(),
+                accepted_at: now,
+            };
+            match accept_result_core(state, &accepted, Some(&submission.principal), now) {
+                ResultAcceptanceCore::Accepted => {
+                    let remaining = state.task.as_ref().map_or(0, |task| {
+                        task.definition
+                            .limits
+                            .max_result_rejections
+                            .saturating_sub(task.rejection_count)
+                    });
+                    let decision = AgentTaskSubmissionDecision {
+                        disposition: AgentTaskSubmissionDisposition::Accepted,
+                        code: None,
+                        feedback: String::new(),
+                        remaining_attempts: remaining,
+                        digest,
+                    };
+                    let owed = owed_child_reports(state, now, 0)?;
+                    Ok((AgentTaskOutcomeExtras::submission(decision), owed))
+                }
+                ResultAcceptanceCore::Bounds(error) => Err(error),
+                ResultAcceptanceCore::AlreadyTerminal => {
+                    let status = state
+                        .task
+                        .as_ref()
+                        .map_or(AgentTaskStatus::Completed, |task| task.status);
+                    Err(AgentTaskError::Terminal { status })
+                }
+            }
+        }
+        Err(cause) => {
+            let committed = reject_result_core(
+                state,
+                operation_id,
+                &submission.causation_id,
+                digest.clone(),
+                &cause,
+                Some(&submission.principal),
+                now,
+            );
+            // The rejection's fingerprint enters the bounded echo ring, so a
+            // replay that outlives both the operation log and the
+            // materialized `last_rejection` still cannot re-spend the budget.
+            let task = state.task.as_mut().expect("the task exists on this path");
+            let fingerprint = submission_fingerprint(operation_id);
+            if !task.rejected_submissions.contains(&fingerprint) {
+                task.rejected_submissions.push(fingerprint);
+                if task.rejected_submissions.len() > AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY {
+                    task.rejected_submissions.remove(0);
+                }
+            }
+            let decision = AgentTaskSubmissionDecision {
+                disposition: AgentTaskSubmissionDisposition::Rejected,
+                code: Some(committed.rejection.cause.reason.clone()),
+                feedback: bounded_detail(format!("{}: {}", cause.reason, cause.detail)),
+                remaining_attempts: committed.remaining,
+                digest,
+            };
+            let owed = owed_child_reports(state, now, 0)?;
+            Ok((AgentTaskOutcomeExtras::submission(decision), owed))
+        }
+    }
 }
 
 /// The task's half of the three ledger exchanges
@@ -7301,6 +10291,671 @@ fn apply_delegation_cancel(
     }
 }
 
+/// Records one dependent's registration in the upstream task's bounded
+/// registry ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The sender fence is the envelope's initiator matched against the claimed
+/// dependent; the receiver's own registry entry is the durable echo past the
+/// journal's bounded window. An already-terminal upstream accepts without
+/// recording — the receipt carries the outcome directly, so a late
+/// registration never waits for a notification the upstream will not owe.
+fn apply_dependency_registration(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeTransition {
+    let registration: AgentDependencyRegistration = match envelope
+        .payload()
+        .decode(AGENT_DEPENDENCY_REGISTRATION_PAYLOAD_TYPE)
+    {
+        Ok(registration) => registration,
+        Err(error) => {
+            // Non-settling, so a newer binary's payload converges after a
+            // rolling upgrade instead of being refused for good.
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "dependency-registration-undecodable",
+                error.to_string(),
+            ));
+        }
+    };
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Task(scope) => scope,
+        other => {
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "dependency-registration-forged",
+                format!("a dependency registration cannot originate from {other}"),
+            ))
+        }
+    };
+    if *sender != registration.dependent
+        || sender.tenant() != state.scope.tenant()
+        || sender.task() == state.scope.task()
+    {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "dependency-registration-forged",
+            format!(
+                "the registration claims dependent {}, sent by {}",
+                registration.dependent.task(),
+                sender.task()
+            ),
+        ));
+    }
+    if registration.upstream != *state.scope.task() {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "dependency-registration-forged",
+            format!(
+                "the registration names upstream {}, but this task is {}",
+                registration.upstream,
+                state.scope.task()
+            ),
+        ));
+    }
+    let Some(task) = state.task.as_ref() else {
+        // Retryable by classification, and unmemoized because of it: the host
+        // does not record an unsettleable refusal in the applied log, so the
+        // next re-drive re-runs this arm rather than replaying the answer, and
+        // a racing create converges. A never-created upstream leaves the
+        // dependent durably `Blocked` — the documented stuck-dependency
+        // posture.
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "task-not-created",
+            "the upstream task does not exist yet".to_string(),
+        ));
+    };
+    let receipt = |state: &AgentTaskState| {
+        let (outcome, terminal_reason, result_digest) =
+            state.task().map_or((None, None, None), |task| {
+                (
+                    AgentTaskDependencyOutcome::from_terminal_status(task.status),
+                    task.terminal_reason
+                        .as_ref()
+                        .map(|reason| reason.code().to_string()),
+                    task.accepted_result
+                        .as_ref()
+                        .map(|accepted| accepted.digest.clone()),
+                )
+            });
+        let receipt = AgentDependencyRegistrationReceipt {
+            upstream: state.scope.clone(),
+            outcome,
+            terminal_reason,
+            result_digest,
+        };
+        AgentExchangeResult::accepted(
+            AgentExchangePayload::encode(
+                AGENT_DEPENDENCY_REGISTRATION_RECEIPT_PAYLOAD_TYPE,
+                &receipt,
+            )
+            .unwrap_or_else(|_| {
+                AgentExchangePayload::empty(AGENT_DEPENDENCY_REGISTRATION_RECEIPT_PAYLOAD_TYPE)
+            }),
+        )
+    };
+    if task.dependents.contains_key(sender.task()) {
+        // The durable echo past the journal window: a replay finds the entry
+        // recorded and accepts idempotently — carrying the outcome when the
+        // task has since terminalized, which the dependent applies exactly
+        // as it would the notification.
+        return AgentExchangeTransition::new(receipt(state));
+    }
+    if task.status.is_terminal() {
+        // A moot registration grows nothing: the receipt carries the outcome
+        // directly, and no registry entry — hence no owed notification —
+        // exists for it.
+        return AgentExchangeTransition::new(receipt(state));
+    }
+    if task.dependents.len() >= AGENT_TASK_MAX_DEPENDENTS {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "task-dependents-exhausted",
+            format!("the task already registers {AGENT_TASK_MAX_DEPENDENTS} dependents"),
+        ));
+    }
+    let dependent = sender.task().clone();
+    let record = AgentTaskDependentRecord {
+        dependent: dependent.clone(),
+        registered_by: envelope.operation_id().clone(),
+        registered_at: now,
+        outcome_settled: false,
+    };
+    let bounded = {
+        let task = state.task.as_mut().expect("the task exists on this path");
+        task.dependents.insert(dependent.clone(), record);
+        // A registration grows the admitted record, so it keeps the same
+        // growth headroom a late dependency declaration does.
+        task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)
+    };
+    if let Err(error) = bounded {
+        state
+            .task
+            .as_mut()
+            .expect("the task exists on this path")
+            .dependents
+            .remove(&dependent);
+        return AgentExchangeTransition::new(refuse(state, error.code(), error.to_string()));
+    }
+    let status = state
+        .task
+        .as_ref()
+        .map_or(AgentTaskStatus::Created, |task| task.status);
+    let operation_id = envelope.operation_id().clone();
+    // `state.updated_at` is deliberately *not* advanced, for the same
+    // load-bearing reason the conversation-terminal record below leaves it
+    // alone: recording what a *peer* did is not a transition of this task —
+    // its status, assignment, result, and goal are exactly where they were —
+    // and that clock is the sole input to the board-governed unclaimed
+    // horizon (`task_unclaimed_expired`). Advancing it here would let each
+    // of up to [`AGENT_TASK_MAX_DEPENDENTS`] registrations re-arm the
+    // horizon, so a never-claimed task and its delegated escrow could be
+    // parked far past the bound by exactly the peers with an interest in
+    // keeping it alive. The registry entry still changes and still
+    // persists; it simply does not claim to be a transition.
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::DependentRegistered,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_detail(dependent.to_string())
+    });
+    AgentExchangeTransition::new(receipt(state))
+}
+
+/// Applies an upstream's terminal outcome to this dependent's forward edge
+/// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)), through
+/// the same core the `RecordDependencyOutcome` relay command uses — which is
+/// what guarantees a failing edge takes the cancellation *request* path over
+/// a live run, never a direct terminalization.
+fn apply_dependency_outcome(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeTransition {
+    let notice: AgentDependencyOutcomeNotice = match envelope
+        .payload()
+        .decode(AGENT_DEPENDENCY_OUTCOME_PAYLOAD_TYPE)
+    {
+        Ok(notice) => notice,
+        Err(error) => {
+            // Non-settling: the rolling-upgrade posture.
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "dependency-outcome-undecodable",
+                error.to_string(),
+            ));
+        }
+    };
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Task(scope) => scope,
+        other => {
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "dependency-outcome-forged",
+                format!("a dependency outcome cannot originate from {other}"),
+            ))
+        }
+    };
+    if *sender != notice.upstream || sender.tenant() != state.scope.tenant() {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "dependency-outcome-forged",
+            format!(
+                "the notice claims upstream {}, sent by {}",
+                notice.upstream.task(),
+                sender.task()
+            ),
+        ));
+    }
+    let receipt = |state: &AgentTaskState| {
+        let status = state.status().unwrap_or(AgentTaskStatus::Created);
+        let receipt = AgentDependencyOutcomeReceipt {
+            dependent: state.scope.clone(),
+            status,
+        };
+        AgentExchangeResult::accepted(
+            AgentExchangePayload::encode(AGENT_DEPENDENCY_OUTCOME_RECEIPT_PAYLOAD_TYPE, &receipt)
+                .unwrap_or_else(|_| {
+                    AgentExchangePayload::empty(AGENT_DEPENDENCY_OUTCOME_RECEIPT_PAYLOAD_TYPE)
+                }),
+        )
+    };
+    let Some(task) = state.task.as_ref() else {
+        // Definitive for this kind: a dependent that registered exists, so
+        // absence is misroute-shaped and re-driving cannot repair it.
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "task-not-created",
+            "the addressed dependent does not exist".to_string(),
+        ));
+    };
+    // The forward edge is the durable record the sender is fenced against
+    // *and* the echo past the journal window.
+    let Some(edge) = task.dependencies.get(sender.task()) else {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "task-unknown-dependency",
+            format!("the task declares no dependency on {}", sender.task()),
+        ));
+    };
+    match edge.outcome {
+        Some(existing) if existing == notice.outcome => {
+            return AgentExchangeTransition::new(receipt(state));
+        }
+        Some(_) => {
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "task-dependency-conflict",
+                "the dependency already resolved with a different outcome; a conflict, not a \
+                 correction"
+                    .to_string(),
+            ));
+        }
+        None => {}
+    }
+    if task.status.is_terminal() {
+        // The dependent settled first — nothing left for the outcome to
+        // move; the upstream just needs its settlement.
+        return AgentExchangeTransition::new(receipt(state));
+    }
+    match record_dependency_outcome(
+        state,
+        envelope.operation_id(),
+        sender.task(),
+        notice.outcome,
+        now,
+    ) {
+        Ok(mut owed) => {
+            // The terminalization a cancelling edge may have finalized owes
+            // its own child reports in this same compare-and-set — the
+            // transitive-chain recursion point.
+            match owed_child_reports(state, now, owed.len()) {
+                Ok(reports) => owed.extend(reports),
+                Err(error) => {
+                    debug_assert!(false, "child-report construction failed: {error}");
+                }
+            }
+            let mut transition = AgentExchangeTransition::new(receipt(state));
+            for envelope in owed {
+                transition = transition.owing(envelope);
+            }
+            transition
+        }
+        Err(error) => AgentExchangeTransition::new(refuse(state, error.code(), error.to_string())),
+    }
+}
+
+/// Applies a conversation's terminal notice to its governing task
+/// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)): records
+/// the bounded conversation provenance cell, which is what makes the
+/// terminated conversation observable from the task.
+///
+/// The cell is observational provenance, never new work, so — deliberately
+/// unlike a dependency outcome — an already-terminal task still records it:
+/// the common race is the conversation's completion landing beside the
+/// task's own result acceptance, and skipping the record there would lose
+/// exactly the observability this exchange exists to provide.
+fn apply_conversation_terminal(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeTransition {
+    let notice: crate::coordination::AgentConversationTerminalNotice = match envelope
+        .payload()
+        .decode(crate::coordination::AGENT_CONVERSATION_TERMINAL_NOTICE_PAYLOAD_TYPE)
+    {
+        Ok(notice) => notice,
+        Err(error) => {
+            // Non-settling, so a newer binary's payload converges after a
+            // rolling upgrade instead of being refused for good.
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "conversation-terminal-notice-undecodable",
+                error.to_string(),
+            ));
+        }
+    };
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Conversation(scope) => scope,
+        other => {
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "conversation-terminal-notice-forged",
+                format!("a conversation terminal notice cannot originate from {other}"),
+            ))
+        }
+    };
+    if *sender != notice.conversation || sender.tenant() != state.scope.tenant() {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "conversation-terminal-notice-forged",
+            format!(
+                "the notice claims conversation {}, sent by {}",
+                notice.conversation.conversation(),
+                sender.conversation()
+            ),
+        ));
+    }
+    if notice.task != *state.scope.task() {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "conversation-terminal-notice-forged",
+            format!(
+                "the notice names governing task {}, but this task is {}",
+                notice.task,
+                state.scope.task()
+            ),
+        ));
+    }
+    let Some(task) = state.task.as_ref() else {
+        // Retryable by classification, and unmemoized because of it — the
+        // dependency-registration posture: a notice racing its task's
+        // creation converges on a later re-drive instead of memoizing the
+        // miss.
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "task-not-created",
+            "the governing task does not exist yet".to_string(),
+        ));
+    };
+    let receipt = || {
+        AgentExchangeResult::accepted(AgentExchangePayload::empty(
+            AGENT_CONVERSATION_TERMINAL_RECEIPT_PAYLOAD_TYPE,
+        ))
+    };
+    let conversation = notice.conversation.conversation().clone();
+    if task
+        .conversation
+        .as_deref()
+        .is_some_and(|cell| cell.conversation == conversation)
+    {
+        // The durable echo past the journal window: a replay about the same
+        // conversation finds the cell recorded and accepts idempotently. A
+        // conversation terminalizes at most once, so a same-id notice never
+        // carries a different resolution.
+        return AgentExchangeTransition::new(receipt());
+    }
+    // A *different* conversation only takes the cell by being newer than the
+    // one already in it. The cell is latest-only, and `ended_at` — stamped by
+    // the conversation's owner when its terminal flip committed — is the only
+    // ordering the task has, so making it strictly monotonic is what makes
+    // "latest" mean latest rather than last-delivered.
+    //
+    // Without this, an older conversation's notice re-driven after its
+    // operation rolled out of the bounded applied ring — its reply lost, and
+    // 64 exchanges later on a task with dependents and board traffic — would
+    // overwrite a newer conversation's cell and re-increment the lifetime
+    // counter. `get_task` would then echo the older conversation's status,
+    // reason, rounds, and turns, and `agent_metadata_from_snapshot` would
+    // heal the projection to that wrong value on every read.
+    //
+    // The counter rides the same guard because it counts notices *recorded*,
+    // and a notice this arm declines to record is not one. What that costs is
+    // narrow and observational: a genuinely out-of-order first delivery of an
+    // older conversation is accepted without being materialized, so it is
+    // absent from the cell it could never have won and from the count. It
+    // stays observable through its own conversation entity and the
+    // coordination replay surface. Ties keep the cell they found, so a
+    // re-drive can never disturb a settled one.
+    if task
+        .conversation
+        .as_deref()
+        .is_some_and(|cell| notice.ended_at.as_millis() <= cell.ended_at.as_millis())
+    {
+        return AgentExchangeTransition::new(receipt());
+    }
+    // A pre-terminal record keeps the growth headroom the task's own
+    // lifecycle still needs — the cell must never eat the room reserved for
+    // the assignment, result, and terminal reason. Once the task is
+    // terminal that growth already happened, so the record only needs to
+    // fit the bound itself.
+    //
+    // That asymmetry is what makes a bounds refusal here *transient*, and
+    // `conversation_terminal_notice_refusal_settles` depends on it: the
+    // refusal is neither settled at the conversation nor memoized here, so
+    // the notice waits out the window this task is about to close.
+    let reserve = if task.status.is_terminal() {
+        0
+    } else {
+        AGENT_TASK_STATE_GROWTH_RESERVE_BYTES
+    };
+    let recorded = AgentTaskConversation {
+        conversation: conversation.clone(),
+        status: notice.status,
+        terminal_reason: notice.terminal_reason,
+        rounds_completed: notice.rounds_completed,
+        turns: notice.turns_recorded,
+        ended_at: notice.ended_at,
+        recorded_at: now,
+    };
+    let bounded = {
+        let task = state.task.as_mut().expect("the task exists on this path");
+        let previous_cell = task.conversation.replace(Box::new(recorded));
+        let previous_count = task.conversations;
+        task.conversations = previous_count.saturating_add(1);
+        task.check_bounds(reserve).map_err(|error| {
+            // Validate-then-mutate must be literal: the accept path persists
+            // state even under a refusal, and the conversation treats this
+            // refusal as proof nothing was recorded.
+            //
+            // `check_bounds` has two exits and they classify opposite ways,
+            // so the code is forwarded as the shared classifier's input
+            // rather than as a single "too big" answer. The size bound is
+            // transient (the reserve above relaxes when the task
+            // terminalizes); the dependency ceiling is not, because the map
+            // only grows and this arm never touches it — an unclassified
+            // forever-refusal would re-run this write on every settle pass
+            // for the life of both entities.
+            (error, previous_cell, previous_count)
+        })
+    };
+    if let Err((error, previous_cell, previous_count)) = bounded {
+        let task = state.task.as_mut().expect("the task exists on this path");
+        task.conversation = previous_cell;
+        task.conversations = previous_count;
+        return AgentExchangeTransition::new(refuse(state, error.code(), error.to_string()));
+    }
+    let status = state
+        .task
+        .as_ref()
+        .map_or(AgentTaskStatus::Created, |task| task.status);
+    let reason = notice.terminal_reason.code();
+    let operation_id = envelope.operation_id().clone();
+    // `state.updated_at` is deliberately *not* advanced. It means the time of
+    // the last accepted transition, and recording what some other entity did
+    // is not one — the task's status, assignment, result, and goal are all
+    // exactly where they were. The distinction is load-bearing rather than
+    // pedantic, because that clock is the sole input to the board-governed
+    // unclaimed horizon (`task_unclaimed_expired`), which re-arms from the
+    // task's last transition so a refused claim's reopened window starts
+    // fresh. Advancing it here would let a conversation postpone an unrelated
+    // task's expiry — and since a task keeps no registry of the conversations
+    // it governs, it cannot tell one that legitimately names it from a series
+    // minted to keep it alive, so a never-claimed task and its delegated
+    // escrow could be parked indefinitely by exactly the wait this horizon
+    // exists to bound. The record still changes and still persists; it simply
+    // does not claim to be a transition. Any later echo about another entity
+    // must do the same.
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::ConversationTerminalRecorded,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_detail(format!("{conversation} {reason}"))
+    });
+    AgentExchangeTransition::new(receipt())
+}
+
+/// Settles the upstream's answer to a dependency registration at the
+/// dependent: the edge's marker flips, and the answer resolves the edge when
+/// it decides it — a receipt carrying an already-terminal upstream's outcome,
+/// or a definitive refusal, which means no notification can ever arrive. Both
+/// resolve through the same core the notification would.
+///
+/// An accepted receipt is decoded *before* the marker flips: the marker
+/// quiesces both re-derivation sites, so settling first and reading second
+/// would drop an undecodable receipt's carried outcome — the only answer a
+/// moot registration ever gets — with nothing left to arrive. `check_settle`
+/// already keeps such a reply outstanding, so the early return here is the
+/// same decision enforced where the settle actually reads.
+fn settle_dependency_registration_exchange(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    result: &AgentExchangeResult,
+    now: AgentTimestampMillis,
+) -> Vec<AgentExchangeEnvelope> {
+    let upstream = match envelope.target() {
+        AgentEntityAddress::Task(scope) => scope.task().clone(),
+        _ => return Vec::new(),
+    };
+    let expected =
+        dependency_registration_operation_id(state.scope.tenant(), &upstream, state.scope.task())
+            .ok();
+    if expected.as_ref() != Some(envelope.operation_id()) {
+        return Vec::new();
+    }
+    {
+        let Ok(task) = state.task_mut() else {
+            return Vec::new();
+        };
+        let Some(edge) = task.dependencies.get_mut(&upstream) else {
+            return Vec::new();
+        };
+        if edge.registration_settled {
+            return Vec::new();
+        }
+    }
+    let settle_marker = |state: &mut AgentTaskState| {
+        if let Ok(task) = state.task_mut() {
+            if let Some(edge) = task.dependencies.get_mut(&upstream) {
+                edge.registration_settled = true;
+            }
+        }
+        state.updated_at = now;
+    };
+    if result.is_accepted() {
+        let receipt: Result<AgentDependencyRegistrationReceipt, _> = result
+            .payload()
+            .decode(AGENT_DEPENDENCY_REGISTRATION_RECEIPT_PAYLOAD_TYPE);
+        let Ok(receipt) = receipt else {
+            // Unreadable: the exchange stays unsettled — and the marker
+            // unset — so the re-drive fetches a fresh receipt once a binary
+            // that can read it is asking.
+            return Vec::new();
+        };
+        settle_marker(state);
+        if let Some(outcome) = receipt.outcome {
+            return apply_registration_outcome(state, &upstream, outcome, now);
+        }
+        return Vec::new();
+    }
+    settle_marker(state);
+    // A refusal `check_settle` classified definitive: the upstream will never
+    // hold a registry entry for this dependent, so the notification the
+    // forward edge waits on can never be sent. The refusal is recorded, and
+    // then the edge resolves *failed* — through the same core an upstream
+    // failure takes, so the policy the edge declared decides what that means:
+    // cancellation under the default, evidence under `ContinueWithEvidence`.
+    // Leaving the edge unresolved instead would hold the dependent `Blocked`
+    // forever with no terminal status, no policy applied, and no signal beyond
+    // the history row below.
+    let code = result
+        .status()
+        .rejection_code()
+        .unwrap_or("dependency-registration-refused")
+        .to_string();
+    let status = state.status().unwrap_or(AgentTaskStatus::Created);
+    let operation_id = envelope.operation_id().clone();
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::DependentRegistrationRefused,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_detail(code.clone())
+    });
+    apply_registration_outcome(state, &upstream, AgentTaskDependencyOutcome::Failed, now)
+}
+
+/// Resolves one forward edge from what its registration exchange returned —
+/// an already-terminal upstream's carried outcome, or the failure a
+/// definitively refused registration implies — and returns whatever the
+/// resolution now owes.
+///
+/// It runs the relay command's own core, so a registration-derived resolution
+/// and an application-relayed one are the same transition: the same conflict
+/// fence, the same cancellation *request* over a live run, the same history
+/// row, and the same durable counters the outcome metric is measured from.
+fn apply_registration_outcome(
+    state: &mut AgentTaskState,
+    upstream: &AgentTaskId,
+    outcome: AgentTaskDependencyOutcome,
+    now: AgentTimestampMillis,
+) -> Vec<AgentExchangeEnvelope> {
+    let Ok(operation_id) =
+        dependency_outcome_operation_id(state.scope.tenant(), upstream, state.scope.task())
+    else {
+        return Vec::new();
+    };
+    match record_dependency_outcome(state, &operation_id, upstream, outcome, now) {
+        Ok(mut owed) => {
+            match owed_child_reports(state, now, owed.len()) {
+                Ok(reports) => owed.extend(reports),
+                Err(error) => {
+                    debug_assert!(false, "child-report construction failed: {error}");
+                }
+            }
+            owed
+        }
+        // The dependent turned terminal meanwhile, or the relay resolved the
+        // edge first — either way nothing is owed here, and the record that
+        // already stands is the one that counts.
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Settles the dependent's answer to an outcome notification at the
+/// upstream: the registry entry's marker flips — the durable once-guard that
+/// quiesces the owed derivation past the journal's bounded window.
+fn settle_dependency_outcome_exchange(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) {
+    let dependent = match envelope.target() {
+        AgentEntityAddress::Task(scope) => scope.task().clone(),
+        _ => return,
+    };
+    let expected =
+        dependency_outcome_operation_id(state.scope.tenant(), state.scope.task(), &dependent).ok();
+    if expected.as_ref() != Some(envelope.operation_id()) {
+        return;
+    }
+    let mut settled = false;
+    if let Ok(task) = state.task_mut() {
+        if let Some(record) = task.dependents.get_mut(&dependent) {
+            if !record.outcome_settled {
+                record.outcome_settled = true;
+                settled = true;
+            }
+        }
+    }
+    if settled {
+        state.updated_at = now;
+    }
+}
+
 /// Refuses an exchange without making a validation decision.
 fn refuse(state: &AgentTaskState, code: &str, message: String) -> AgentExchangeResult {
     let status = state.status().unwrap_or(AgentTaskStatus::Created);
@@ -7351,8 +11006,45 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
         now: AgentTimestampMillis,
     ) -> AgentExchangeTransition {
         let result = match envelope.kind() {
-            AgentExchangeKind::Creation => apply_creation_exchange(state, envelope, now),
-            AgentExchangeKind::ResultProposal => apply_result_proposal(state, envelope, now),
+            AgentExchangeKind::Creation => {
+                let result = apply_creation_exchange(state, envelope, now);
+                // The created task's forward edges register with their
+                // upstreams in this same compare-and-set, exactly as the
+                // command-path creation owes them.
+                let mut transition = AgentExchangeTransition::new(result);
+                match owed_dependency_registrations(state, now) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert!(false, "registration construction failed: {error}");
+                    }
+                }
+                return transition;
+            }
+            AgentExchangeKind::ResultProposal => {
+                let result = apply_result_proposal(state, envelope, now);
+                // The decision may have terminalized the task — an accepted
+                // result, or an exhausting rejection — and the reports the
+                // terminal owes commit in this same compare-and-set. The
+                // dependents' outcome notifications wait for no escrow;
+                // the epoch and delegation reports self-gate on ledger
+                // closure, so a surviving rejection owes nothing.
+                let mut transition = AgentExchangeTransition::new(result);
+                match owed_child_reports(state, now, 0) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert!(false, "child-report construction failed: {error}");
+                    }
+                }
+                return transition;
+            }
             AgentExchangeKind::BudgetAllocation
             | AgentExchangeKind::BudgetSettlement
             | AgentExchangeKind::BudgetReturn => {
@@ -7367,8 +11059,10 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                 // so the finalization commits here too; its own child
                 // reports deduplicate against the consult below.
                 let mut transition = AgentExchangeTransition::new(result);
+                let mut reserved = 0;
                 match finalize_task_cancellation(state, envelope.operation_id(), now) {
                     Ok(owed) => {
+                        reserved = owed.len();
                         for envelope in owed {
                             transition = transition.owing(envelope);
                         }
@@ -7377,7 +11071,7 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                         debug_assert!(false, "cancellation finalization failed: {error}");
                     }
                 }
-                match owed_child_reports(state, now) {
+                match owed_child_reports(state, now, reserved) {
                     Ok(owed) => {
                         for envelope in owed {
                             transition = transition.owing(envelope);
@@ -7403,6 +11097,16 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             AgentExchangeKind::DelegationCancel => {
                 return apply_delegation_cancel(state, envelope, now)
             }
+            AgentExchangeKind::DependencyRegistration => {
+                return apply_dependency_registration(state, envelope, now)
+            }
+            AgentExchangeKind::DependencyOutcome => {
+                return apply_dependency_outcome(state, envelope, now)
+            }
+            AgentExchangeKind::ConversationTerminalNotice => {
+                return apply_conversation_terminal(state, envelope, now)
+            }
+            AgentExchangeKind::TeamClaim => apply_team_claim(state, envelope, now),
             kind => refuse(
                 state,
                 "unsupported-exchange",
@@ -7419,22 +11123,21 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
     ) -> Result<(), crate::choreography::AgentChoreographyError> {
         match envelope.kind() {
             AgentExchangeKind::DelegationResult if !result.is_accepted() => {
-                // A refused delegation result settles only under the parent's
-                // definitive answers: the delegation is unknown, forged, not
+                // The initiator half of the shared classifier: a refused
+                // delegation result settles only under the parent's
+                // definitive answers — the delegation is unknown, forged, not
                 // owned, or the run never existed — undeliverable however
                 // often it is re-driven. Every other refusal is the
                 // receiver's inability — a `delegation-result-early` receipt
                 // race, an `unsupported-exchange` from an owner that predates
                 // the kind, a payload it could not decode — and the exchange
-                // stays outstanding for re-drive until an owner that can
-                // answer it does.
+                // stays outstanding for re-drive, which the run's receiver
+                // half of the same classifier keeps answerable by declining
+                // to memoize that class.
                 match result.status().rejection_code() {
-                    Some(
-                        "delegation-result-unknown-run"
-                        | "delegation-result-unknown-delegation"
-                        | "delegation-result-forged"
-                        | "delegation-result-not-owned",
-                    ) => Ok(()),
+                    Some(code) if crate::coordination::delegation_result_refusal_settles(code) => {
+                        Ok(())
+                    }
                     code => Err(
                         crate::choreography::AgentChoreographyError::UnsettleableRefusal {
                             kind: AgentExchangeKind::DelegationResult,
@@ -7444,22 +11147,279 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                 }
             }
             AgentExchangeKind::RunCancel if !result.is_accepted() => {
-                // A refused run-cancel settles only under the run's definitive
-                // answers: the sender was not its task, the run never received
-                // the generation, or the generation is not the one it serves.
-                // Every other refusal — an `unsupported-exchange` from an
-                // owner that predates the kind, a payload it could not decode
-                // — leaves the exchange outstanding for re-drive until an
-                // owner that can answer it does (the rolling-upgrade rule).
+                // The initiator half of the shared classifier: a refused
+                // run-cancel settles only under the run's definitive answers
+                // — the sender was not its task, the run never received the
+                // generation, or the generation is not the one it serves.
+                // Every other refusal leaves the exchange outstanding for
+                // re-drive (the rolling-upgrade rule), and the run's receiver
+                // half keeps that class unmemoized so the re-drive actually
+                // re-runs the arm.
                 match result.status().rejection_code() {
-                    Some(
-                        "run-cancel-forged"
-                        | "run-cancel-unassigned"
-                        | "run-cancel-stale-generation",
-                    ) => Ok(()),
+                    Some(code) if crate::coordination::run_cancel_refusal_settles(code) => Ok(()),
                     code => Err(
                         crate::choreography::AgentChoreographyError::UnsettleableRefusal {
                             kind: AgentExchangeKind::RunCancel,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::DelegationCancel if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the task is
+                // this exchange's receiver, and the host memoizes only the
+                // refusals classified definitive here. This arm's own
+                // version-skew refusal, `delegation-cancel-undecodable`,
+                // therefore re-runs on the next drive instead of answering
+                // every re-drive from the journal — which would quiesce the
+                // parent's subtree cancellation against a child that never
+                // learned it was cancelled.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::delegation_cancel_refusal_settles(code) => {
+                        Ok(())
+                    }
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::DelegationCancel,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            kind @ (AgentExchangeKind::BudgetSettlement | AgentExchangeKind::BudgetReturn)
+                if !result.is_accepted() =>
+            {
+                // The receiver half of the shared classifier: the task is
+                // this exchange's receiver, and the host memoizes only the
+                // ledger's own replay answer. Every other refusal this arm
+                // mints is an inability — a payload it could not decode, a
+                // record too full to record the settlement right now — and
+                // memoizing one would answer every re-drive from the journal
+                // while the child run's escrow leaked, unsettleable at the
+                // run because its initiator half keeps exactly this class
+                // outstanding.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::escrow_settlement_refusal_settles(code) => {
+                        Ok(())
+                    }
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::HandoffResult if !result.is_accepted() => {
+                // The initiator half of the shared classifier: a refused
+                // handoff result settles only under the source run's
+                // definitive answers — it holds no such handoff, or the
+                // notice was forged — undeliverable however often it is
+                // re-driven. Every other refusal — an `unsupported-exchange`
+                // from an owner that predates the kind, a payload it could
+                // not decode — leaves the exchange outstanding for re-drive
+                // until an owner that can answer it does (the
+                // rolling-upgrade rule), and the run's receiver half of the
+                // same classifier keeps that class unmemoized so the
+                // re-drive actually re-runs the arm.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::handoff_result_refusal_settles(code) => {
+                        Ok(())
+                    }
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::HandoffResult,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::TeamClaim if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the task is
+                // this exchange's receiver, and the host memoizes only the
+                // refusals classified definitive here. A claim command this
+                // binary cannot decode therefore re-runs on the next drive
+                // instead of answering every re-drive from the journal for
+                // the whole applied window — which would leave the board's
+                // decision unarbitrated forever while the entry waits on an
+                // answer that can no longer change.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::team_claim_refusal_settles(code) => Ok(()),
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::TeamClaim,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::TeamClaimResult if !result.is_accepted() => {
+                // The initiator half of the shared classifier: a refused
+                // claim result settles only under the team's definitive
+                // answers — no team exists, the board holds no such entry,
+                // or the notice was forged — undeliverable however often it
+                // is re-driven. Every other refusal leaves the exchange
+                // outstanding for re-drive (the rolling-upgrade rule), and
+                // the team's receiver half keeps that class unmemoized so
+                // the re-drive actually re-runs the arm.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::team_claim_result_refusal_settles(code) => {
+                        Ok(())
+                    }
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::TeamClaimResult,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::DependencyRegistration if result.is_accepted() => {
+                // An accepted receipt settles the edge's registration marker
+                // and may carry an already-terminal upstream's outcome — the
+                // only answer a moot registration will ever get, because the
+                // upstream records no registry entry for it and so owes no
+                // notification. A receipt this binary cannot decode (a newer
+                // peer's payload mid rolling upgrade, or the upstream's
+                // encode-failure fallback, whose empty bytes never decode)
+                // must therefore leave the exchange outstanding instead of
+                // settling into a durable guess that strands the dependent
+                // `Blocked` with nothing left to arrive: the upstream
+                // answers the re-drive idempotently from its registry echo
+                // or its terminal-answer path, and a binary that can read
+                // the receipt settles it — the same fail-closed rule this
+                // hook applies to a refusal payload it cannot interpret.
+                result
+                    .payload()
+                    .decode::<AgentDependencyRegistrationReceipt>(
+                        AGENT_DEPENDENCY_REGISTRATION_RECEIPT_PAYLOAD_TYPE,
+                    )
+                    .map(|_| ())
+                    .map_err(
+                        |_| crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::DependencyRegistration,
+                            code: "dependency-registration-receipt-undecodable".to_string(),
+                        },
+                    )
+            }
+            AgentExchangeKind::DependencyRegistration if !result.is_accepted() => {
+                // A refused registration settles only under the upstream's
+                // definitive answers, and the dependent then resolves the
+                // edge itself on settlement. `dependency-registration-forged`
+                // is identity — no re-drive changes it.
+                // `task-dependents-exhausted` is the registry ceiling: the
+                // registry only ever grows, so pre-terminal the refusal
+                // repeats identically for as long as both entities live, and
+                // the edge resolves failed now rather than re-driving
+                // unbounded — the `task-dependency-limit-exceeded` precedent
+                // of `conversation_terminal_notice_refusal_settles`. Two
+                // refusals deliberately stay outstanding instead, because
+                // the upstream is saying *not yet*, never *never*.
+                // `task-not-created`: the upstream may yet be created, and
+                // the receiver does not memoize this class of refusal, so a
+                // racing create converges on the next re-drive.
+                // `task-state-too-large`: the bound that refused is one the
+                // upstream itself relaxes — a pre-terminal task charges a
+                // registration the growth-reserve headroom its remaining
+                // lifecycle still needs, the terminal-answer path sits
+                // before the bounds check, and a terminal task charges
+                // nothing — so the very registration that will not fit today
+                // is answered once the upstream terminalizes, with an
+                // accepted receipt carrying the true outcome. Settling on it
+                // would fail the edge — and cancel the dependent under the
+                // default policy — over a refusal the upstream is about to
+                // stop making, when the upstream may yet complete. A
+                // never-created or never-terminalizing upstream leaves the
+                // dependent durably `Blocked`, the documented
+                // stuck-dependency struggle signal.
+                // `task-dependency-limit-exceeded` — the other exit of the
+                // same bound check — stays outstanding here for the same
+                // reason, and deliberately classifies the *opposite* way
+                // from `team_claim_refusal_settles`: this arm answers a
+                // terminal upstream with its outcome receipt *before* it
+                // reaches the bound at all, so the upstream's own
+                // terminalization turns the refusal into a real answer,
+                // whereas the claim path answers a terminal task under
+                // `team-claim-task-terminal` and can never reach past the
+                // bound. Both ends of this exchange are this same
+                // participant, so the arm is the receiver's classifier too:
+                // an upstream over its ceiling declines to memoize, and the
+                // no-op guard in the choreography host keeps that costing
+                // nothing durable.
+                match result.status().rejection_code() {
+                    Some("dependency-registration-forged" | "task-dependents-exhausted") => Ok(()),
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::DependencyRegistration,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::DependencyOutcome if !result.is_accepted() => {
+                // A refused outcome settles only under the dependent's
+                // definitive answers: forged, no such task, no such edge, or
+                // a conflicting resolution — undeliverable however often it
+                // is re-driven. An undecodable payload or a pre-slice
+                // receiver stays outstanding (the rolling-upgrade rule).
+                match result.status().rejection_code() {
+                    Some(
+                        "dependency-outcome-forged"
+                        | "task-not-created"
+                        | "task-unknown-dependency"
+                        | "task-dependency-conflict",
+                    ) => Ok(()),
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::DependencyOutcome,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::TeamTerminalNotice if !result.is_accepted() => {
+                // A refused terminal notice settles only under the team's
+                // definitive answers — no team, a closed team, or a payload
+                // the board rejects on its face (forged, or reporting a task
+                // that has not ended) — through the one classifier both ends
+                // of the exchange share. Every other refusal, including an
+                // `unsupported-exchange` from an owner that predates the
+                // kind, leaves the exchange outstanding for re-drive (the
+                // rolling-upgrade rule).
+                match result.status().rejection_code() {
+                    Some(code)
+                        if crate::coordination::team_terminal_notice_refusal_settles(code) =>
+                    {
+                        Ok(())
+                    }
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::TeamTerminalNotice,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::ConversationTerminalNotice if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the task is
+                // this exchange's receiver, and the host memoizes only the
+                // refusals classified definitive here. Both of this arm's
+                // *not yet* answers therefore re-run on the next drive
+                // instead of replaying the miss for the whole applied
+                // window — a notice racing the task's creation, and one
+                // refused on the bound, which this task's own terminal flip
+                // relaxes by dropping the growth reserve to zero.
+                match result.status().rejection_code() {
+                    Some(code)
+                        if crate::coordination::conversation_terminal_notice_refusal_settles(
+                            code,
+                        ) =>
+                    {
+                        Ok(())
+                    }
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::ConversationTerminalNotice,
                             code: code.unwrap_or_default().to_string(),
                         },
                     ),
@@ -7479,9 +11439,49 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
         if envelope.kind() == AgentExchangeKind::Assignment {
             settle_assignment(state, envelope, result, now);
         }
+        if envelope.kind() == AgentExchangeKind::HandoffResult {
+            // The source run answered — accepted, or refused under a code
+            // `check_settle` classified definitive. Either way the marker
+            // settles on the provenance: the durable once-guard that
+            // quiesces the owed derivation past the journal's bounded window.
+            settle_handoff_result_exchange(state, envelope, now);
+        }
+        if envelope.kind() == AgentExchangeKind::TeamClaimResult {
+            // The team answered — the board settlement applied, or refused
+            // under a definitive code. The marker settles on the claim
+            // provenance exactly as the handoff marker does.
+            settle_team_claim_result_exchange(state, envelope, now);
+        }
+        if envelope.kind() == AgentExchangeKind::TeamTerminalNotice {
+            // The team answered — the entry closed, was already closed or
+            // gone, or the notice refused under a definitive code. The
+            // task's marker settles either way: the durable once-guard that
+            // quiesces the owed derivation past the journal's bounded
+            // window.
+            settle_team_terminal_notice_exchange(state, envelope, now);
+        }
+        if envelope.kind() == AgentExchangeKind::DependencyRegistration {
+            // The upstream answered — recorded, answered with its terminal
+            // outcome, or refused under a definitive code. The edge's marker
+            // settles once the answer is readable — `check_settle` keeps an
+            // unreadable receipt outstanding, and the hook re-checks before
+            // it flips — and an outcome carried on the receipt applies here,
+            // owing whatever the application owes.
+            return settle_dependency_registration_exchange(state, envelope, result, now);
+        }
+        if envelope.kind() == AgentExchangeKind::DependencyOutcome {
+            // The dependent answered — applied, echoed, or refused under a
+            // definitive code. The registry entry's marker settles, so the
+            // derivation quiesces past the journal's bounded window.
+            settle_dependency_outcome_exchange(state, envelope, now);
+            return Vec::new();
+        }
         if !matches!(
             envelope.kind(),
-            AgentExchangeKind::Assignment | AgentExchangeKind::RunCancel
+            AgentExchangeKind::Assignment
+                | AgentExchangeKind::RunCancel
+                | AgentExchangeKind::HandoffResult
+                | AgentExchangeKind::TeamClaimResult
         ) {
             return Vec::new();
         }
@@ -7490,13 +11490,27 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
         // deferred, a refusal released the generation's escrow, and a receipt
         // may have found the run already settled — so the propagation and the
         // finalization it permits are owed from this same compare-and-set.
-        // Settling may not fail; a construction failure is a bug surfaced
-        // loudly in tests and skipped here.
+        // A settled assignment may equally have resolved a pending handoff,
+        // owing the source its handoff result. Settling may not fail; a
+        // construction failure is a bug surfaced loudly in tests and skipped
+        // here.
         let mut owed = Vec::new();
         match owed_run_cancel(state, now) {
             Ok(envelopes) => owed.extend(envelopes),
             Err(error) => {
                 debug_assert!(false, "run-cancel construction failed: {error}");
+            }
+        }
+        match owed_handoff_result(state, now) {
+            Ok(envelopes) => owed.extend(envelopes),
+            Err(error) => {
+                debug_assert!(false, "handoff-result construction failed: {error}");
+            }
+        }
+        match owed_team_claim_result(state, now) {
+            Ok(envelopes) => owed.extend(envelopes),
+            Err(error) => {
+                debug_assert!(false, "team-claim-result construction failed: {error}");
             }
         }
         match finalize_task_cancellation(state, envelope.operation_id(), now) {
@@ -7565,6 +11579,32 @@ fn settle_assignment(
         assignment.status = AgentAssignmentStatus::Accepted;
         let assignment = assignment.clone();
         task.status = AgentTaskStatus::InProgress;
+        // The handoff acceptance flip ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)):
+        // when the accepted generation is the one a pending handoff minted,
+        // responsibility has durably transferred — the provenance settles
+        // `Accepted` in this same compare-and-set, and the settle pass owes
+        // the source its handoff result.
+        let mut handoff_accepted = None;
+        if let Some(handoff) = task.handoff.as_deref_mut() {
+            if !handoff.is_settled() && handoff.target_generation == Some(assignment.generation) {
+                handoff.status = AgentTaskHandoffStatus::Accepted;
+                handoff.settled_at = Some(now);
+                handoff_accepted = Some(handoff.handoff.clone());
+            }
+        }
+        // The claim acceptance flip ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)):
+        // when the accepted generation is the one a pending board claim
+        // minted, the claimant owns the task under the assignment fence —
+        // the claim settles `Accepted` in this same compare-and-set, and the
+        // settle pass owes the board its claim result.
+        let mut claim_accepted = None;
+        if let Some(claim) = task.team_claim.as_deref_mut() {
+            if !claim.is_settled() && claim.target_generation == Some(assignment.generation) {
+                claim.status = AgentTaskTeamClaimStatus::Accepted;
+                claim.settled_at = Some(now);
+                claim_accepted = Some(claim.claim.clone());
+            }
+        }
         state.updated_at = now;
         state.record_history(|sequence| {
             AgentTaskHistoryEntry::new(
@@ -7576,6 +11616,32 @@ fn settle_assignment(
             )
             .with_assignment(&assignment)
         });
+        if let Some(handoff_id) = handoff_accepted {
+            state.record_history(|sequence| {
+                AgentTaskHistoryEntry::new(
+                    sequence,
+                    AgentTaskHistoryKind::HandoffAccepted,
+                    operation_id.clone(),
+                    AgentTaskStatus::InProgress,
+                    now,
+                )
+                .with_assignment(&assignment)
+                .with_detail(handoff_id.to_string())
+            });
+        }
+        if let Some(claim_id) = claim_accepted {
+            state.record_history(|sequence| {
+                AgentTaskHistoryEntry::new(
+                    sequence,
+                    AgentTaskHistoryKind::TeamClaimAccepted,
+                    operation_id.clone(),
+                    AgentTaskStatus::InProgress,
+                    now,
+                )
+                .with_assignment(&assignment)
+                .with_detail(claim_id.to_string())
+            });
+        }
         return;
     }
 
@@ -7632,8 +11698,43 @@ fn settle_assignment(
             now,
         )
         .with_assignment(&assignment)
-        .with_detail(code)
+        .with_detail(code.clone())
     });
+    // The handoff single-attempt rule: a refused handoff generation resolves
+    // the transfer — restoring the stashed source — rather than re-offering
+    // toward a target that just refused. The refused generation's escrow was
+    // released above; the restored source's child was never touched. The
+    // owed handoff-result exchange is collected by the participant's settle
+    // pass, which runs right after this.
+    let refused_handoff_generation = state.task.as_ref().is_some_and(|task| {
+        task.handoff.as_deref().is_some_and(|handoff| {
+            !handoff.is_settled() && handoff.target_generation == Some(assignment.generation)
+        })
+    });
+    if refused_handoff_generation {
+        let resolved = resolve_handoff_refusal(state, &code, now);
+        debug_assert!(
+            resolved.is_ok(),
+            "handoff refusal resolution failed: {resolved:?}"
+        );
+    }
+    // The claim single-attempt rule, the handoff precedent: a refused claim
+    // generation resolves the claim — clearing the assignee back to the
+    // board-pending posture — rather than re-offering toward a member whose
+    // run just refused. The owed claim-result exchange is collected by the
+    // participant's settle pass, which runs right after this.
+    let refused_claim_generation = state.task.as_ref().is_some_and(|task| {
+        task.team_claim.as_deref().is_some_and(|claim| {
+            !claim.is_settled() && claim.target_generation == Some(assignment.generation)
+        })
+    });
+    if refused_claim_generation {
+        let resolved = resolve_team_claim_refusal(state, &code, now);
+        debug_assert!(
+            resolved.is_ok(),
+            "team-claim refusal resolution failed: {resolved:?}"
+        );
+    }
 }
 
 /// The durable facade over one typed-task entity.
@@ -7777,6 +11878,37 @@ where
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentTaskResult<AgentTaskEntityReply> {
+        let reverify = command.clone();
+        match self.apply_once(command, router, now).await {
+            // A command that *commits* is fenced by its own compare-and-set:
+            // it is written at the cached record's revision, so a second
+            // writer that moved the durable record first makes the write
+            // lose, drops the cache, and the retry re-reads. A command that
+            // is *refused* writes nothing, so that fence never engages — and
+            // a task has two writers by construction, this resident facade
+            // and the A2A service's own store handle. An assignment
+            // generation, claim epoch, or submission fence answered from a
+            // cache the other writer has already moved past is a
+            // definitive-looking refusal that, writing nothing, would never
+            // correct itself for the whole residency. So a refusal is
+            // re-answered against a re-materialized record — bounded to one
+            // extra pass, whose verdict is authoritative whatever it says.
+            // The happy path pays nothing, which is the point of a resident
+            // entity at all.
+            Err(error) if task_refusal_may_be_stale(&error) => {
+                self.recover(now).await?;
+                self.apply_once(reverify, router, now).await
+            }
+            other => other,
+        }
+    }
+
+    async fn apply_once(
+        &mut self,
+        command: AgentTaskEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<AgentTaskEntityReply> {
         self.ensure_recovered(now).await?;
 
         if let Some(operation_id) = command.operation_id() {
@@ -7799,6 +11931,29 @@ where
                 self.snapshot()?.map(Box::new),
             ));
         }
+
+        // The past-window submission echo is answered before every other
+        // guard, the history-headroom one included: it writes nothing at all,
+        // so a resubmission must converge on the decision already on record
+        // even while the history sink — pure observability — is unavailable.
+        // Refusing an idempotent convergence with `task-history-backlog`
+        // would tell a caller whose submission durably completed the task
+        // that nothing happened, and the correction it then sends under a
+        // fresh key is refused `task-terminal`. Same rule, same reason, as
+        // the conversation ledger's echo.
+        if let AgentTaskEntityCommand::SubmitHumanResult { operation_id, .. } = &command {
+            if let Some(echo) = probe_human_submission_echo(self.state()?, operation_id) {
+                return match echo {
+                    Ok(decision) => {
+                        let mut outcome = self.state()?.outcome();
+                        outcome.submission = Some(Box::new(decision));
+                        Ok(AgentTaskEntityReply::Duplicate { outcome })
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+        }
+
         self.require_history_headroom(now).await?;
 
         // The agent's durable admission state is read *before* the transition, so
@@ -7833,7 +11988,10 @@ where
             } => {
                 self.transition(now, readiness, move |state| {
                     create_task(state, &operation_id, *creation, now)?;
-                    Ok((operation_id, None, Vec::new()))
+                    // The declared forward edges register with their
+                    // upstreams in this same compare-and-set.
+                    let owed = owed_dependency_registrations(state, now)?;
+                    Ok((operation_id, AgentTaskOutcomeExtras::NONE, owed))
                 })
                 .await?
             }
@@ -7843,7 +12001,10 @@ where
             } => {
                 self.transition(now, readiness, move |state| {
                     declare_dependency(state, &operation_id, &declaration, now)?;
-                    Ok((operation_id, None, Vec::new()))
+                    // The late edge registers with its upstream in this same
+                    // compare-and-set, exactly as a creation-time edge does.
+                    let owed = owed_dependency_registrations(state, now)?;
+                    Ok((operation_id, AgentTaskOutcomeExtras::NONE, owed))
                 })
                 .await?
             }
@@ -7852,19 +12013,28 @@ where
                 dependency,
                 outcome,
             } => {
-                self.transition(now, readiness, move |state| {
-                    // A failed dependency requests the dependent's
-                    // cancellation rather than terminalizing it: with no live
-                    // generation that finalizes here, owing the terminal
-                    // reports upward in this same transition; with an
-                    // accepted run it owes the run-cancel exchange and stays
-                    // nonterminal until its ledger closes.
-                    let mut owed =
-                        record_dependency_outcome(state, &operation_id, &dependency, outcome, now)?;
-                    owed.extend(owed_child_reports(state, now)?);
-                    Ok((operation_id, None, owed))
-                })
-                .await?
+                let resolved_before = self.dependency_outcome_totals();
+                let reply = self
+                    .transition(now, readiness, move |state| {
+                        // A failed dependency requests the dependent's
+                        // cancellation rather than terminalizing it: with no live
+                        // generation that finalizes here, owing the terminal
+                        // reports upward in this same transition; with an
+                        // accepted run it owes the run-cancel exchange and stays
+                        // nonterminal until its ledger closes.
+                        let mut owed = record_dependency_outcome(
+                            state,
+                            &operation_id,
+                            &dependency,
+                            outcome,
+                            now,
+                        )?;
+                        owed.extend(owed_child_reports(state, now, owed.len())?);
+                        Ok((operation_id, AgentTaskOutcomeExtras::NONE, owed))
+                    })
+                    .await?;
+                self.record_dependency_outcomes(resolved_before);
+                reply
             }
             AgentTaskEntityCommand::Cancel {
                 operation_id,
@@ -7885,9 +12055,44 @@ where
                         },
                         now,
                     )?;
-                    Ok((operation_id, None, owed))
+                    Ok((operation_id, AgentTaskOutcomeExtras::NONE, owed))
                 })
                 .await?
+            }
+            AgentTaskEntityCommand::RecordHandoff {
+                operation_id,
+                request,
+            } => {
+                self.transition(now, readiness, move |state| {
+                    // The transfer records, and — with the target's readiness
+                    // read before the transition — the wrapper's inline
+                    // assignment decision mints the target's generation in
+                    // this same compare-and-set. A refused readiness resolves
+                    // the handoff refused through the same inline decision
+                    // ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+                    record_handoff(state, &operation_id, &request, now)?;
+                    Ok((operation_id, AgentTaskOutcomeExtras::NONE, Vec::new()))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::SubmitHumanResult {
+                operation_id,
+                submission,
+            } => {
+                let decided_before = self.submission_decision_snapshot();
+                let reply = self
+                    .transition(now, None, move |state| {
+                        // A terminal decision — acceptance, or an exhausting
+                        // rejection — owes its child reports in this same
+                        // compare-and-set; the derivations self-gate, so a
+                        // surviving rejection owes nothing.
+                        let (extras, owed) =
+                            submit_human_result(state, &operation_id, &submission, now)?;
+                        Ok((operation_id, extras, owed))
+                    })
+                    .await?;
+                self.record_submission_decision(decided_before);
+                reply
             }
             AgentTaskEntityCommand::AdmitWake {
                 operation_id,
@@ -7895,7 +12100,7 @@ where
             } => {
                 self.transition(now, None, move |state| {
                     let (wake, owed) = admit_wake(state, &operation_id, *binding, now)?;
-                    Ok((operation_id, Some(wake), owed))
+                    Ok((operation_id, AgentTaskOutcomeExtras::wake(wake), owed))
                 })
                 .await?
             }
@@ -7903,7 +12108,7 @@ where
                 self.transition(now, None, move |state| {
                     let (outcome, owed) =
                         complete_wake_occurrence(state, &operation_id, &wake, now)?;
-                    Ok((operation_id, Some(outcome), owed))
+                    Ok((operation_id, AgentTaskOutcomeExtras::wake(outcome), owed))
                 })
                 .await?
             }
@@ -7920,7 +12125,11 @@ where
                         wake_policy.map(|policy| *policy),
                         now,
                     )?;
-                    Ok((operation_id, Some(outcome), Vec::new()))
+                    Ok((
+                        operation_id,
+                        AgentTaskOutcomeExtras::wake(outcome),
+                        Vec::new(),
+                    ))
                 })
                 .await?
             }
@@ -7939,7 +12148,11 @@ where
                         *provenance,
                         now,
                     )?;
-                    Ok((operation_id, Some(outcome), Vec::new()))
+                    Ok((
+                        operation_id,
+                        AgentTaskOutcomeExtras::wake(outcome),
+                        Vec::new(),
+                    ))
                 })
                 .await?
             }
@@ -7956,7 +12169,7 @@ where
                         *provenance,
                         now,
                     )?;
-                    Ok((operation_id, Some(outcome), owed))
+                    Ok((operation_id, AgentTaskOutcomeExtras::wake(outcome), owed))
                 })
                 .await?
             }
@@ -7975,7 +12188,11 @@ where
                         *provenance,
                         now,
                     )?;
-                    Ok((operation_id, Some(outcome), Vec::new()))
+                    Ok((
+                        operation_id,
+                        AgentTaskOutcomeExtras::wake(outcome),
+                        Vec::new(),
+                    ))
                 })
                 .await?
             }
@@ -7992,7 +12209,11 @@ where
                         *provenance,
                         now,
                     )?;
-                    Ok((operation_id, Some(outcome), Vec::new()))
+                    Ok((
+                        operation_id,
+                        AgentTaskOutcomeExtras::wake(outcome),
+                        Vec::new(),
+                    ))
                 })
                 .await?
             }
@@ -8011,7 +12232,7 @@ where
                         *provenance,
                         now,
                     )?;
-                    Ok((operation_id, None, owed))
+                    Ok((operation_id, AgentTaskOutcomeExtras::NONE, owed))
                 })
                 .await?
             }
@@ -8021,7 +12242,7 @@ where
             } => {
                 self.transition(now, None, move |state| {
                     record_goal_decision(state, &operation_id, *decision, now)?;
-                    Ok((operation_id, None, Vec::new()))
+                    Ok((operation_id, AgentTaskOutcomeExtras::NONE, Vec::new()))
                 })
                 .await?
             }
@@ -8042,7 +12263,7 @@ where
                         *provenance,
                         now,
                     )?;
-                    Ok((operation_id, None, Vec::new()))
+                    Ok((operation_id, AgentTaskOutcomeExtras::NONE, Vec::new()))
                 })
                 .await?
             }
@@ -8063,7 +12284,7 @@ where
                         *provenance,
                         now,
                     )?;
-                    Ok((operation_id, None, owed))
+                    Ok((operation_id, AgentTaskOutcomeExtras::NONE, owed))
                 })
                 .await?
             }
@@ -8192,12 +12413,34 @@ where
                     .is_agent_owned()
                     .then(|| creation.definition.clone()),
             ),
+            // A handoff reads the *target's* readiness — the request names
+            // it — so the transfer and the generation it offers the target
+            // commit in one compare-and-set. The current assignment (the
+            // source's) does not block the read: the transition clears it.
+            AgentTaskEntityCommand::RecordHandoff { request, .. } => {
+                let Some(task) = self.state()?.task() else {
+                    return Ok(None);
+                };
+                if task.status.is_terminal() {
+                    return Ok(None);
+                }
+                (
+                    Some(request.target.clone()),
+                    task.definition
+                        .is_agent_owned()
+                        .then(|| task.definition.clone()),
+                )
+            }
             // Wake transitions never change assignability, so they read no
             // agent state at all: a scanner delivering to a passivated
             // controller costs one entity transition, not an extra durable
             // read.
+            // A human-owned task never assigns, so its submission reads no
+            // agent state either; the ownership refusal for an agent-owned
+            // target needs no readiness to answer.
             AgentTaskEntityCommand::Describe
             | AgentTaskEntityCommand::Cancel { .. }
+            | AgentTaskEntityCommand::SubmitHumanResult { .. }
             | AgentTaskEntityCommand::AdmitWake { .. }
             | AgentTaskEntityCommand::CompleteWakeOccurrence { .. }
             | AgentTaskEntityCommand::UpdateContinuousSchedule { .. }
@@ -8274,12 +12517,14 @@ where
         let stagnation_before = self.wake_stagnation_totals();
         let lifecycle_before = self.goal_lifecycle_status();
         let goal_before = self.goal_contract_status();
+        let resolved_before = self.dependency_outcome_totals();
         let reply = self.host.accept(envelope, now).await?;
         self.record_admitted_epochs(admitted_before);
         self.record_stagnation_trips(stagnation_before);
         self.record_lifecycle_transition(lifecycle_before);
         self.record_goal_status_transition(goal_before);
         self.record_epoch_settlement(envelope, &reply);
+        self.record_dependency_outcomes(resolved_before);
         // Accepting a delivered exchange makes *local* progress only: it may
         // decide an assignment freed escrow now permits and flush the history it
         // owes, both of which touch only the task's own state and its history
@@ -8307,10 +12552,295 @@ where
     async fn make_local_progress(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
         self.require_history_headroom(now).await?;
         self.observe_goal_deadline(now).await?;
+        self.observe_unclaimed_expiry(now).await?;
         self.settle_requested_cancellation(now).await?;
+        self.settle_handoff_resolution(now).await?;
+        self.settle_team_claim_resolution(now).await?;
+        self.settle_team_terminal_notice(now).await?;
+        self.settle_dependency_registrations(now).await?;
+        self.settle_dependent_notifications(now).await?;
         self.decide_assignment(now).await?;
         self.flush_history(now).await?;
         self.park_owed_rewakes(now).await?;
+        Ok(())
+    }
+
+    /// Re-owes the handoff-result exchange a settled handoff still owes its
+    /// source run ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// This is the courier half of the resolution machine: the transition
+    /// that settled the provenance owed the exchange in its own
+    /// compare-and-set, but a crash between that commit and the initiation —
+    /// or a lost initiation — must not strand the fenced source forever. The
+    /// derivation is pure over durable state, the journal's initiation
+    /// record guards the bounded window, and the provenance's
+    /// `result_settled` marker quiesces it past that window.
+    async fn settle_handoff_resolution(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            match state.task() {
+                None => false,
+                Some(task) => task.handoff.as_deref().is_some_and(|handoff| {
+                    handoff.is_settled()
+                        && !handoff.result_settled
+                        && crate::coordination::handoff_result_operation_id(
+                            state.scope.tenant(),
+                            &handoff.handoff,
+                        )
+                        .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+                }),
+            }
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| match owed_handoff_result(state, now) {
+                Ok(owed) => Ok(owed.into_iter().collect()),
+                Err(error) => {
+                    let carried = AgentChoreographyError::from(error.clone());
+                    rejection = Some(error);
+                    Err(carried)
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        Ok(())
+    }
+
+    /// Re-owes the claim-result exchange a settled board claim still owes
+    /// its team ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The `settle_handoff_resolution` twin: the transition that settled the
+    /// claim owed the exchange in its own compare-and-set, but a crash
+    /// between that commit and the initiation must not strand the board's
+    /// pending entry forever. The derivation is pure over durable state, the
+    /// journal's initiation record guards the bounded window, and the
+    /// claim's `result_settled` marker quiesces it past that window.
+    async fn settle_team_claim_resolution(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            match state.task() {
+                None => false,
+                Some(task) => task.team_claim.as_deref().is_some_and(|claim| {
+                    claim.is_settled()
+                        && !claim.result_settled
+                        && crate::coordination::team_claim_result_operation_id(
+                            state.scope.tenant(),
+                            &claim.claim,
+                        )
+                        .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+                }),
+            }
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| match owed_team_claim_result(state, now) {
+                Ok(owed) => Ok(owed.into_iter().collect()),
+                Err(error) => {
+                    let carried = AgentChoreographyError::from(error.clone());
+                    rejection = Some(error);
+                    Err(carried)
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        Ok(())
+    }
+
+    /// Re-owes the terminal notice a terminal board-governed task still owes
+    /// its team ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The `settle_team_claim_resolution` twin, and the sole owing point for
+    /// the terminal transitions that never consult the child reports — goal
+    /// budget exhaustion, stagnation, and the human path's exhausted
+    /// rejections — as well as the back-fill for a task that terminalized
+    /// before this exchange existed. The derivation is pure over durable
+    /// state, the journal's initiation record guards the bounded window,
+    /// and the task's `team_terminal_notice_settled` marker quiesces it
+    /// past that window.
+    async fn settle_team_terminal_notice(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            match state.task() {
+                None => false,
+                Some(task) => task.team.as_ref().is_some_and(|team| {
+                    task.status.is_terminal()
+                        && !task.team_terminal_notice_settled
+                        && crate::coordination::team_terminal_notice_operation_id(
+                            state.scope.tenant(),
+                            team,
+                            state.scope.task(),
+                        )
+                        .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+                }),
+            }
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| match owed_team_terminal_notice(state, now) {
+                Ok(owed) => Ok(owed.into_iter().collect()),
+                Err(error) => {
+                    let carried = AgentChoreographyError::from(error.clone());
+                    rejection = Some(error);
+                    Err(carried)
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        Ok(())
+    }
+
+    /// Re-owes the dependency registrations this task's unresolved edges
+    /// still owe their upstreams
+    /// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The courier half of the registry: the declaring transition owed the
+    /// exchange in its own compare-and-set, but a crash between that commit
+    /// and the initiation — or an edge persisted before the registry
+    /// existed — must not strand the dependent. The derivation is pure over
+    /// durable state, the journal guards the bounded window, and the edge's
+    /// `registration_settled` marker quiesces it past that window.
+    async fn settle_dependency_registrations(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            match state.task() {
+                None => false,
+                Some(task) => {
+                    !task.status.is_terminal()
+                        && task.cancellation.is_none()
+                        && task.dependencies.values().any(|edge| {
+                            edge.outcome.is_none()
+                                && !edge.registration_settled
+                                && dependency_registration_operation_id(
+                                    state.scope.tenant(),
+                                    &edge.dependency,
+                                    state.scope.task(),
+                                )
+                                .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+                        })
+                }
+            }
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| {
+                match owed_dependency_registrations(state, now) {
+                    Ok(owed) => Ok(owed),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        Ok(())
+    }
+
+    /// Re-owes the outcome notifications a terminal task still owes its
+    /// registered dependents
+    /// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The courier half of the notification: every terminal transition owes
+    /// the exchanges through [`owed_child_reports`] in its own
+    /// compare-and-set, but the goal-budget and stagnation terminals commit
+    /// inside transitions that predate the registry's consult — and any
+    /// crash between a terminal commit and the initiation lands here. The
+    /// registry entry's `outcome_settled` marker quiesces the derivation
+    /// past the journal's bounded window.
+    ///
+    /// It is also where a notification the terminal transition had no journal
+    /// headroom for is finally owed: the pass first withdraws the forward-edge
+    /// registrations the terminal task can no longer act on, which is what
+    /// frees the slots for it.
+    async fn settle_dependent_notifications(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            match state.task() {
+                None => false,
+                Some(task) => {
+                    task.status.is_terminal()
+                        && task.dependents.values().any(|record| {
+                            !record.outcome_settled
+                                && dependency_outcome_operation_id(
+                                    state.scope.tenant(),
+                                    state.scope.task(),
+                                    &record.dependent,
+                                )
+                                .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+                        })
+                }
+            }
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| {
+                // A task that terminalized under a binary predating the
+                // withdrawal — or one whose registrations were still owed when
+                // it terminalized — reclaims their slots here, before the
+                // budget is measured.
+                withdraw_moot_registrations(state);
+                match owed_dependent_outcomes(state, now, owed_exchange_budget(state, 0)) {
+                    Ok(owed) => Ok(owed),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
         Ok(())
     }
 
@@ -8374,6 +12904,76 @@ where
                 };
                 match observe(state) {
                     Ok(()) => Ok(Vec::new()),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        self.record_goal_status_transition(goal_before);
+        Ok(())
+    }
+
+    /// Expires a board-governed task that has waited unclaimed past its
+    /// definition's horizon ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)),
+    /// observed lazily like every board expiry — no timer ever fires. The
+    /// request rides the cancellation machinery whole: with no claim, no
+    /// assignment, and no children, the marker finalizes in the same
+    /// transition, the terminal report reaches a delegating parent, and the
+    /// locked escrow settles home.
+    ///
+    /// The write is skipped entirely while nothing would expire, so a sweep
+    /// over a healthy task burns no revision.
+    async fn observe_unclaimed_expiry(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
+        let would_expire = {
+            let state = self.state()?;
+            let updated_at = state.updated_at;
+            state
+                .task()
+                .is_some_and(|task| task_unclaimed_expired(task, updated_at, now))
+        };
+        if !would_expire {
+            return Ok(());
+        }
+        let operation_id = AgentOperationId::new(
+            AgentOperationKind::Command,
+            [
+                self.scope.tenant().as_str(),
+                self.scope.task().as_str(),
+                "unclaimed-expiry",
+            ],
+        )?;
+        let goal_before = self.goal_contract_status();
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| {
+                let step =
+                    |state: &mut AgentTaskState| -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+                        let updated_at = state.updated_at;
+                        let Some(task) = state.task.as_ref() else {
+                            return Ok(Vec::new());
+                        };
+                        if !task_unclaimed_expired(task, updated_at, now) {
+                            return Ok(Vec::new());
+                        }
+                        request_task_cancellation(
+                            state,
+                            &operation_id,
+                            AgentTaskTerminalReason::CancellationRequested {
+                                reason: "unclaimed-expired".to_string(),
+                            },
+                            now,
+                        )
+                    };
+                match step(state) {
+                    Ok(owed) => Ok(owed),
                     Err(error) => {
                         let carried = AgentChoreographyError::from(error.clone());
                         rejection = Some(error);
@@ -8514,15 +13114,27 @@ where
     /// Decides the assignment when the task awaits one, flushes the history the
     /// task owes, and drives the exchanges it owes.
     ///
-    /// It is safe to call at any time and from any node: every step reads what it
-    /// needs from durable state, so calling it after a transition, after recovery,
-    /// or on a timer are the same operation.
+    /// It is safe to call at any time and from any node: the pass
+    /// re-materializes the durable record first, so every step reads what it
+    /// needs from durable state — not from this facade's cache — and calling
+    /// it after a transition, after recovery, or on a timer are the same
+    /// operation.
     pub async fn settle_side_effects(
         &mut self,
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentTaskResult<AgentTaskProgress> {
-        self.ensure_recovered(now).await?;
+        // Re-materialized unconditionally, not merely healed: a task has two
+        // writers by construction — every wire command reaches it through
+        // the A2A service's *own* store handle. The command path survives a
+        // stale cache because its compare-and-set loses, drops the record,
+        // and the retry re-reads — but a sweep that decides it owes nothing
+        // from a stale cache performs zero writes, never conflicts, and so
+        // would never re-read, leaving an owed decision stalled on an
+        // otherwise idle task until an unrelated command happened to lose a
+        // race. The durable-outbox re-drive guarantee is only as good as
+        // this read.
+        self.recover(now).await?;
         // The settle pass commits transitions of its own — an assignment
         // decision here, a settlement inside the drive — so it stands behind
         // the same headroom fence as every command and exchange: a backlog is
@@ -8530,16 +13142,26 @@ where
         // pending-history bound.
         self.require_history_headroom(now).await?;
         self.observe_goal_deadline(now).await?;
+        self.observe_unclaimed_expiry(now).await?;
         self.settle_requested_cancellation(now).await?;
+        self.settle_handoff_resolution(now).await?;
+        self.settle_team_claim_resolution(now).await?;
+        self.settle_team_terminal_notice(now).await?;
+        self.settle_dependency_registrations(now).await?;
+        self.settle_dependent_notifications(now).await?;
         let assigned = self.decide_assignment(now).await?;
         let flushed = self.flush_history(now).await?;
         let rewakes_parked = self.park_owed_rewakes(now).await?;
+        let resolved_before = self.dependency_outcome_totals();
         let report = drive_pending_exchanges(&mut self.host, router, now).await?;
+        self.record_dependency_outcomes(resolved_before);
+        record_unsettleable_exchanges(self.metrics.as_ref(), &report.unsettleable);
         Ok(AgentTaskProgress {
             assigned,
             history_flushed: flushed,
             settled: report.settled,
             failed: report.failed,
+            unsettleable: report.unsettleable.len(),
             outstanding: self.host.outstanding()?.len(),
             rewakes_parked,
         })
@@ -8764,7 +13386,7 @@ where
             &mut AgentTaskState,
         ) -> AgentTaskResult<(
             AgentOperationId,
-            Option<AgentWakeOutcome>,
+            AgentTaskOutcomeExtras,
             Vec<AgentExchangeEnvelope>,
         )>,
     {
@@ -8778,7 +13400,7 @@ where
             .initiate(now, |state| {
                 let assign =
                     |state: &mut AgentTaskState| -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
-                        let (operation_id, wake, mut owed) = transition(state)?;
+                        let (operation_id, extras, mut owed) = transition(state)?;
                         // The command's own transition may have made the task
                         // eligible. Deciding here means the assignment, the run-creation
                         // command it owes, and the transition that caused it all commit
@@ -8789,7 +13411,8 @@ where
                             owed.extend(decide_assignment(state, readiness, now)?);
                         }
                         let mut result = state.outcome();
-                        result.wake = wake;
+                        result.wake = extras.wake;
+                        result.submission = extras.submission;
                         state
                             .applied_operations
                             .record(operation_id, result.clone());
@@ -8835,6 +13458,91 @@ where
                 &[("outcome", "admitted")],
             )
             .ok();
+        }
+    }
+
+    /// The task's durable result cells a human submission can move: whether a
+    /// result is accepted, the rejection count, and whether the task failed.
+    fn submission_decision_snapshot(&self) -> (bool, u32, bool) {
+        self.state()
+            .ok()
+            .and_then(|state| state.task())
+            .map_or((false, 0, false), |task| {
+                (
+                    task.accepted_result.is_some(),
+                    task.rejection_count,
+                    matches!(task.status, AgentTaskStatus::Failed),
+                )
+            })
+    }
+
+    /// Emits one human-result decision count as the difference of the task's
+    /// durable result cells across the committed transition — so duplicates,
+    /// durable echoes, and non-committing refusals emit nothing.
+    fn record_submission_decision(&self, before: (bool, u32, bool)) {
+        let (had_result, rejections_before, failed_before) = before;
+        let (has_result, rejections, failed) = self.submission_decision_snapshot();
+        let outcome = if !had_result && has_result {
+            Some("accepted")
+        } else if rejections > rejections_before {
+            Some(if failed && !failed_before {
+                "exhausted"
+            } else {
+                "rejected"
+            })
+        } else {
+            None
+        };
+        if let Some(outcome) = outcome {
+            record_agent_domain_counter(
+                self.metrics.as_ref(),
+                METRIC_AGENT_HUMAN_RESULTS,
+                1,
+                &[("outcome", outcome)],
+            )
+            .ok();
+        }
+    }
+
+    /// The task's per-outcome resolved-dependency totals: completed, failed,
+    /// cancelled.
+    fn dependency_outcome_totals(&self) -> (usize, usize, usize) {
+        self.state()
+            .ok()
+            .and_then(|state| state.task())
+            .map_or((0, 0, 0), |task| {
+                let mut totals = (0, 0, 0);
+                for edge in task.dependencies.values() {
+                    match edge.outcome {
+                        Some(AgentTaskDependencyOutcome::Completed) => totals.0 += 1,
+                        Some(AgentTaskDependencyOutcome::Failed) => totals.1 += 1,
+                        Some(AgentTaskDependencyOutcome::Cancelled) => totals.2 += 1,
+                        None => {}
+                    }
+                }
+                totals
+            })
+    }
+
+    /// Emits one dependency-outcome count per edge the just-committed work
+    /// durably resolved, measured as the difference of the per-outcome
+    /// totals — so a replayed or conflicting delivery emits nothing.
+    fn record_dependency_outcomes(&self, before: (usize, usize, usize)) {
+        let after = self.dependency_outcome_totals();
+        for (count, outcome) in [
+            (after.0.saturating_sub(before.0), "completed"),
+            (after.1.saturating_sub(before.1), "failed"),
+            (after.2.saturating_sub(before.2), "cancelled"),
+        ] {
+            if count > 0 {
+                record_agent_domain_counter(
+                    self.metrics.as_ref(),
+                    METRIC_AGENT_DEPENDENCY_OUTCOMES,
+                    count as u64,
+                    &[("outcome", outcome)],
+                )
+                .ok();
+            }
         }
     }
 
@@ -8965,6 +13673,11 @@ pub struct AgentTaskProgress {
     pub settled: usize,
     /// How many delivery attempts failed, leaving their exchange outstanding.
     pub failed: usize,
+    /// How many of those `failed` attempts were refusals no re-drive can
+    /// settle — the task is durably wedged on them until something outside it
+    /// changes, even though the pass itself succeeded.
+    #[serde(default)]
+    pub unsettleable: usize,
     /// How many exchanges the task still owes.
     pub outstanding: usize,
     /// How many controller-originated re-wakes it parked durably.
@@ -9016,6 +13729,39 @@ pub enum AgentTaskEntityCommand {
         operation_id: AgentOperationId,
         /// A bounded, stable reason.
         reason: String,
+    },
+    /// Record one handoff: transfer responsibility for this same task from
+    /// its current accepted assignment to a target agent
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)). The
+    /// operation id comes from the A2A ingress, derived under
+    /// [`crate::identity::AgentOperationKind::Handoff`] from the handoff's
+    /// deduplication key.
+    RecordHandoff {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The transfer to record, validated against durable state.
+        request: Box<AgentTaskHandoffRequest>,
+    },
+    /// Submit an authenticated human or external service's typed result to a
+    /// human-owned task, through the same validation core as a run's
+    /// proposal ([specification 8.12](../../../docs/plans/rakka-agent/spec.md);
+    /// scenario 41) — the ingress door slice 1.12 deferred. The operation id
+    /// comes from the authenticated, deduplicated ingress, derived by
+    /// [`human_result_operation_id`]: pure over
+    /// `(tenant, task, discriminator)`, so a retried send converges on the
+    /// original decision and a corrected resubmission after a rejection
+    /// carries a new discriminator.
+    ///
+    /// A human task never substitutes for an effect-bound checkpoint
+    /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)):
+    /// approving, authorizing, or reconciling a specific effect stays bound
+    /// to the exact effect intent through
+    /// [`crate::checkpoints::AgentCheckpoint`].
+    SubmitHumanResult {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The submission to validate.
+        submission: Box<AgentHumanResultSubmission>,
     },
     /// Deliver one wake occurrence to the continuous goal's controller.
     ///
@@ -9169,6 +13915,8 @@ impl AgentTaskEntityCommand {
             | Self::DeclareDependency { operation_id, .. }
             | Self::RecordDependencyOutcome { operation_id, .. }
             | Self::Cancel { operation_id, .. }
+            | Self::RecordHandoff { operation_id, .. }
+            | Self::SubmitHumanResult { operation_id, .. }
             | Self::AdmitWake { operation_id, .. }
             | Self::CompleteWakeOccurrence { operation_id, .. }
             | Self::UpdateContinuousSchedule { operation_id, .. }
@@ -9681,6 +14429,27 @@ where
     entity
 }
 
+/// Whether a refused command's verdict could have been computed from a stale
+/// cached record, and so must be re-answered against durable state.
+///
+/// Infrastructure faults are excluded deliberately, and not merely because
+/// re-reading would not change them: a task's settlement runs *after* its
+/// transition commits, so a post-commit history or persistence failure
+/// surfaces from a command that already applied. Re-driving such a command
+/// would answer it `Duplicate` from the operation log and swallow the fault
+/// the caller must see. Only a domain refusal — a verdict derived from the
+/// record's own fences, which by construction wrote nothing — is re-answered.
+fn task_refusal_may_be_stale(error: &AgentTaskError) -> bool {
+    !matches!(
+        error,
+        AgentTaskError::Identity(_)
+            | AgentTaskError::Schema(_)
+            | AgentTaskError::Choreography(_)
+            | AgentTaskError::Persistence(_)
+            | AgentTaskError::AgentRead { .. }
+    )
+}
+
 /// Returns a sharded reference to one typed-task entity.
 pub fn agent_task_entity_ref(
     sharding: &ClusterSharding,
@@ -9744,6 +14513,43 @@ pub enum AgentTaskError {
     },
     /// An agent-owned task was created without an assignee.
     MissingAssignee,
+    /// A human-owned creation carried a team binding: a board claim exists to
+    /// name the *agent* that serves a task, so it can never resolve a
+    /// human-owned one.
+    TeamNotAgentOwned,
+    /// A handoff command was refused without recording a transfer
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Non-committing: the transition validates before it mutates, so this
+    /// refusal proves the task is exactly as the command found it — which is
+    /// what lets the source run settle its cell failed and resume.
+    HandoffRefused {
+        /// The stable machine-readable refusal code.
+        code: &'static str,
+        /// Bounded human-readable detail.
+        message: String,
+    },
+    /// A team board claim was refused by the task's arbitration
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    TeamClaimRefused {
+        /// The stable machine-readable refusal code.
+        code: &'static str,
+        /// Bounded human-readable detail.
+        message: String,
+    },
+    /// A human-result submission was refused without a validation decision
+    /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Non-committing: the transition validates before it mutates, so this
+    /// refusal proves the task is exactly as the command found it, no
+    /// rejection budget was spent, and a corrected retry under the same
+    /// operation id is still accepted.
+    SubmissionRefused {
+        /// The stable machine-readable refusal code.
+        code: &'static str,
+        /// Bounded human-readable detail.
+        message: String,
+    },
     /// A creation carried delegation provenance that violates its structural
     /// bounds.
     DelegationProvenanceInvalid {
@@ -9864,6 +14670,15 @@ pub enum AgentTaskError {
         /// The contested sequence.
         sequence: AgentTaskHistorySequence,
     },
+    /// The read cursor precedes the history the backend still retains, so
+    /// resuming from it would silently skip entries
+    /// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)). The
+    /// reader resynchronizes from authoritative state and resumes at the floor.
+    HistoryWindowExpired {
+        /// The floor to resume from: the oldest sequence still retained at or
+        /// past the reader's position, when anything is retained there.
+        oldest_retained: Option<AgentTaskHistorySequence>,
+    },
     /// The task owes its history sink more entries than it may hold, so it
     /// cannot transition again until the sink accepts them.
     HistoryBacklog {
@@ -9924,6 +14739,10 @@ impl AgentTaskError {
             Self::AlreadyCreated { .. } => "task-already-created",
             Self::Terminal { .. } => "task-terminal",
             Self::MissingAssignee => "task-missing-assignee",
+            Self::TeamNotAgentOwned => "task-team-not-agent-owned",
+            Self::HandoffRefused { code, .. } => code,
+            Self::SubmissionRefused { code, .. } => code,
+            Self::TeamClaimRefused { code, .. } => code,
             Self::DelegationProvenanceInvalid { .. } => "task-delegation-provenance-invalid",
             Self::ContinuousWithoutGoal => "task-continuous-without-goal",
             Self::EpochWithoutParent => "task-epoch-without-parent",
@@ -9950,6 +14769,7 @@ impl AgentTaskError {
             Self::ContentTooLarge { .. } => "task-content-too-large",
             Self::MaterializedStateTooLarge { .. } => "task-state-too-large",
             Self::HistoryConflict { .. } => "task-history-conflict",
+            Self::HistoryWindowExpired { .. } => "task-history-window-expired",
             Self::HistoryBacklog { .. } => "task-history-backlog",
             Self::AgentRead { .. } => "task-agent-read-failed",
             Self::DefinitionMismatch { .. } => "task-definition-mismatch",
@@ -9980,6 +14800,20 @@ impl Display for AgentTaskError {
             ),
             Self::MissingAssignee => {
                 write!(f, "an agent-owned task must name the agent it is created for")
+            }
+            Self::TeamNotAgentOwned => write!(
+                f,
+                "a board-governed creation requires an agent-owned definition; a human-owned \
+                 task takes no assignee for a claim to name"
+            ),
+            Self::HandoffRefused { code, message } => {
+                write!(f, "the handoff was refused ({code}): {message}")
+            }
+            Self::SubmissionRefused { code, message } => {
+                write!(f, "the submission was refused ({code}): {message}")
+            }
+            Self::TeamClaimRefused { code, message } => {
+                write!(f, "the team claim was refused ({code}): {message}")
             }
             Self::DelegationProvenanceInvalid { message } => {
                 write!(f, "the creation's delegation provenance is invalid: {message}")
@@ -10075,6 +14909,15 @@ impl Display for AgentTaskError {
                 f,
                 "history sequence {sequence} already holds a different entry"
             ),
+            Self::HistoryWindowExpired { oldest_retained } => match oldest_retained {
+                Some(oldest) => write!(
+                    f,
+                    "the history cursor precedes the retained window, which starts at sequence {oldest}; resynchronize from authoritative state"
+                ),
+                None => f.write_str(
+                    "the history cursor precedes the retained window, which holds nothing; resynchronize from authoritative state",
+                ),
+            },
             Self::HistoryBacklog { pending, maximum } => write!(
                 f,
                 "the task owes its history sink {pending} entries, the most it may hold is {maximum}, and it may not transition again until the sink accepts them"
@@ -10172,6 +15015,455 @@ impl From<AgentTaskError> for AgentChoreographyError {
 }
 
 #[cfg(test)]
+mod team_claim_bounds_tests {
+    use super::*;
+    use crate::coordination::{
+        team_claim_id_for, team_claim_operation_id, AgentTeamClaimAction, AgentTeamClaimCommand,
+        AGENT_TEAM_CLAIM_PAYLOAD_TYPE,
+    };
+    use crate::identity::{AgentTeamId, AgentTeamScope};
+
+    #[test]
+    fn a_claim_refused_for_bounds_persists_no_partial_mutation() {
+        let tenant = TenantId::new("acme");
+        let task_id = AgentTaskId::new("board-task").expect("the task id is valid");
+        let scope =
+            AgentTaskScope::new(tenant.clone(), task_id.clone()).expect("the scope is valid");
+        let team_scope = AgentTeamScope::new(
+            tenant.clone(),
+            AgentTeamId::new("support-team").expect("the team id is valid"),
+        )
+        .expect("the team scope is valid");
+        let member = AgentId::new("worker-a").expect("the member id is valid");
+
+        let mut state = AgentTaskState::uncreated(scope.clone(), AgentTimestampMillis::new(1));
+        let create_op = AgentOperationId::new(
+            AgentOperationKind::TaskCreation,
+            ["acme", "board-task", "1"],
+        )
+        .expect("the operation id derives");
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("triage").expect("the definition id is valid"),
+            "Triage one ticket.",
+            AgentSchemaRef::new(
+                AgentSchemaId::new("in").expect("the schema id is valid"),
+                AgentRevisionNumber::INITIAL,
+            ),
+            AgentSchemaRef::new(
+                AgentSchemaId::new("out").expect("the schema id is valid"),
+                AgentRevisionNumber::INITIAL,
+            ),
+        )
+        .expect("the definition is valid");
+        let creation = AgentTaskCreation {
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: None,
+            team: Some(team_scope.team().clone()),
+            goal: None,
+            goal_mode: Default::default(),
+            goal_spec: None,
+            parent: None,
+            dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
+            delegation: None,
+            telemetry: Default::default(),
+        };
+        create_task(
+            &mut state,
+            &create_op,
+            creation,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the board task creates");
+
+        // Inflate the record to one byte under its cap, bypassing the
+        // admission reserve the way a lifetime of zero-reserve growth would:
+        // the recorded claim itself must push it over.
+        {
+            let task = state.task.as_mut().expect("the task exists");
+            let size = task.materialized_size_bytes();
+            let previous = task.definition.description.len();
+            task.definition.description =
+                "x".repeat(AGENT_TASK_MATERIALIZED_MAX_BYTES - 1 - size + previous);
+        }
+
+        let claim =
+            team_claim_id_for(&team_scope, &task_id, &member, 1).expect("the claim id derives");
+        let command = AgentTeamClaimCommand {
+            team: team_scope.clone(),
+            claim: claim.clone(),
+            task: task_id,
+            epoch: 1,
+            action: AgentTeamClaimAction::Claim {
+                member: member.clone(),
+            },
+            policy_revision: AgentRevisionNumber::INITIAL,
+            lease_expires_at: AgentTimestampMillis::new(300_000),
+        };
+        let operation = team_claim_operation_id(&tenant, &claim).expect("the operation derives");
+        let envelope = AgentExchangeEnvelope::new(
+            operation.clone(),
+            AgentExchangeKind::TeamClaim,
+            AgentEntityAddress::Team(team_scope),
+            AgentEntityAddress::Task(scope),
+            AgentExchangePayload::encode(AGENT_TEAM_CLAIM_PAYLOAD_TYPE, &command)
+                .expect("the payload encodes"),
+            AgentCorrelationId::new(operation.as_str()),
+            AgentTimestampMillis::new(2),
+        )
+        .expect("the envelope builds");
+
+        let before = state.clone();
+        let result = apply_team_claim(&mut state, &envelope, AgentTimestampMillis::new(2));
+        assert_eq!(
+            result.status().rejection_code(),
+            Some("task-state-too-large"),
+            "the oversized record refuses the claim"
+        );
+        assert_eq!(
+            state, before,
+            "a bounds refusal persists no partial mutation: the board treats \
+             a definitive refusal as proof no claim was recorded"
+        );
+    }
+
+    #[test]
+    fn a_conversation_notice_refused_for_bounds_persists_no_partial_mutation() {
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        // Inflate the record to one byte under its cap, so the recorded cell
+        // itself must push it over.
+        inflate_record_to(&mut state, AGENT_TASK_MATERIALIZED_MAX_BYTES - 1);
+        let envelope = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "design-review",
+            AgentTimestampMillis::new(2),
+        );
+
+        let before = state.clone();
+        let result =
+            apply_conversation_terminal(&mut state, &envelope, AgentTimestampMillis::new(2));
+        assert_eq!(
+            result.result().status().rejection_code(),
+            Some("task-state-too-large"),
+            "the oversized record refuses the notice"
+        );
+        assert_eq!(
+            state, before,
+            "a bounds refusal persists no partial mutation: the conversation \
+             treats this refusal as proof nothing was recorded"
+        );
+    }
+
+    #[test]
+    fn a_conversation_notice_refused_on_the_reserve_converges_once_the_task_terminalizes() {
+        // The receiver's own bound is what moves: a pre-terminal task is
+        // charged the growth headroom its remaining lifecycle needs, and a
+        // terminal one is charged nothing, so a record inside the reserve
+        // window refuses the cell now and admits the byte-identical cell
+        // once the task ends. That is why the shared classifier leaves
+        // `task-state-too-large` outstanding — settling on it would quiesce
+        // both ends over a refusal the receiver is about to stop making, and
+        // the provenance would be lost for good.
+        const SLACK: usize = 3 * 1024;
+        const {
+            assert!(
+                SLACK < AGENT_TASK_STATE_GROWTH_RESERVE_BYTES,
+                "the record must sit inside the reserve window and still under the cap"
+            );
+        }
+
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        inflate_record_to(&mut state, AGENT_TASK_MATERIALIZED_MAX_BYTES - SLACK);
+        let envelope = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "design-review",
+            AgentTimestampMillis::new(2),
+        );
+
+        let pre_terminal = state.clone();
+        let refused =
+            apply_conversation_terminal(&mut state, &envelope, AgentTimestampMillis::new(2));
+        assert_eq!(
+            refused.result().status().rejection_code(),
+            Some("task-state-too-large"),
+            "a live task is charged the growth reserve its own lifecycle needs"
+        );
+        assert_eq!(state, pre_terminal, "the refusal recorded nothing");
+        assert!(
+            !crate::coordination::conversation_terminal_notice_refusal_settles(
+                "task-state-too-large"
+            ),
+            "so the notice stays outstanding at the conversation, and the \
+             receiver never memoizes it, instead of both ends quiescing"
+        );
+
+        // The task terminalizes. The growth the reserve was held for has
+        // happened, the reserve drops to zero, and the same cell fits.
+        state.task.as_mut().expect("the task exists").status = AgentTaskStatus::Completed;
+        let accepted =
+            apply_conversation_terminal(&mut state, &envelope, AgentTimestampMillis::new(3));
+        assert!(
+            accepted.result().is_accepted(),
+            "the terminal task admits the very cell it just refused"
+        );
+        let task = state.task.as_ref().expect("the task exists");
+        assert_eq!(
+            task.conversation
+                .as_deref()
+                .expect("the provenance cell stands")
+                .conversation
+                .as_str(),
+            "design-review"
+        );
+        assert_eq!(task.conversations, 1);
+    }
+
+    #[test]
+    fn a_stale_notice_never_regresses_the_latest_conversation_cell() {
+        // The cell is latest-only and `ended_at` is the only ordering the
+        // task has, so it must be monotonic. An older conversation's notice
+        // re-driven after its operation aged out of the bounded applied ring
+        // — its reply lost, 64 exchanges ago on a task with dependents and
+        // board traffic — must not take the cell back from a newer
+        // conversation or re-count itself. `get_task` reassembles the public
+        // echo from this cell on every read, so a regression heals the
+        // projection to the wrong conversation for as long as the task lives.
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        let early = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "design-review",
+            AgentTimestampMillis::new(10),
+        );
+        let late = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "retro",
+            AgentTimestampMillis::new(20),
+        );
+
+        for (envelope, at) in [(&early, 11), (&late, 21)] {
+            assert!(
+                apply_conversation_terminal(&mut state, envelope, AgentTimestampMillis::new(at))
+                    .result()
+                    .is_accepted(),
+                "both conversations record in order"
+            );
+        }
+        let task = state.task.as_ref().expect("the task exists");
+        assert_eq!(
+            task.conversation
+                .as_deref()
+                .expect("the cell stands")
+                .conversation
+                .as_str(),
+            "retro"
+        );
+        assert_eq!(task.conversations, 2);
+
+        // The older conversation re-drives past the applied window.
+        let settled = state.clone();
+        let replayed =
+            apply_conversation_terminal(&mut state, &early, AgentTimestampMillis::new(30));
+        assert!(
+            replayed.result().is_accepted(),
+            "a stale notice still settles — it simply records nothing"
+        );
+        assert_eq!(
+            state, settled,
+            "the cell and the counter stay exactly where the newer notice left them"
+        );
+    }
+
+    #[test]
+    fn a_notice_refused_on_the_dependency_ceiling_settles_definitively() {
+        // `check_bounds` has two exits and they classify opposite ways. The
+        // size bound relaxes when the task terminalizes, so it waits. The
+        // dependency ceiling never does: the map only grows, and recording a
+        // conversation cell does not touch it, so this refusal is identical
+        // forever. Left unclassified it would re-run this arm — and the
+        // durable write the accept path makes even under a refusal — on
+        // every settle pass for the life of both entities.
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        // A definition refresh that lowered the ceiling under a record
+        // already holding a dependency; the record itself is well within its
+        // size bound.
+        {
+            let task = state.task.as_mut().expect("the task exists");
+            let upstream = AgentTaskId::new("upstream").expect("the task id is valid");
+            task.dependencies.insert(
+                upstream.clone(),
+                AgentTaskDependency {
+                    dependency: upstream,
+                    policy: AgentDependencyFailurePolicy::default(),
+                    outcome: None,
+                    declared_by: AgentOperationId::new(
+                        AgentOperationKind::TaskCreation,
+                        ["acme", "board-task", "1"],
+                    )
+                    .expect("the operation id derives"),
+                    declared_at: AgentTimestampMillis::new(1),
+                    registration_settled: false,
+                },
+            );
+            task.definition.limits.max_dependencies = 0;
+        }
+
+        let before = state.clone();
+        let refusal = apply_conversation_terminal(
+            &mut state,
+            &conversation_notice(
+                &tenant,
+                &task_id,
+                &scope,
+                "design-review",
+                AgentTimestampMillis::new(2),
+            ),
+            AgentTimestampMillis::new(3),
+        );
+        assert_eq!(
+            refusal.result().status().rejection_code(),
+            Some("task-dependency-limit-exceeded"),
+            "the other bound exit answers under its own code"
+        );
+        assert_eq!(state, before, "and records nothing");
+        assert!(
+            crate::coordination::conversation_terminal_notice_refusal_settles(
+                "task-dependency-limit-exceeded"
+            ),
+            "a bound this exchange can never satisfy is definitive, unlike \
+             the size bound it merely has to wait out"
+        );
+        assert!(
+            !crate::coordination::conversation_terminal_notice_refusal_settles(
+                "task-state-too-large"
+            ),
+            "the two exits of one check must not classify the same way"
+        );
+    }
+
+    /// One created, board-governed task and the coordinates its conversation
+    /// notices are addressed with.
+    fn board_task_world() -> (TenantId, AgentTaskId, AgentTaskScope, AgentTaskState) {
+        let tenant = TenantId::new("acme");
+        let task_id = AgentTaskId::new("board-task").expect("the task id is valid");
+        let scope =
+            AgentTaskScope::new(tenant.clone(), task_id.clone()).expect("the scope is valid");
+
+        let mut state = AgentTaskState::uncreated(scope.clone(), AgentTimestampMillis::new(1));
+        let create_op = AgentOperationId::new(
+            AgentOperationKind::TaskCreation,
+            ["acme", "board-task", "1"],
+        )
+        .expect("the operation id derives");
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("triage").expect("the definition id is valid"),
+            "Triage one ticket.",
+            AgentSchemaRef::new(
+                AgentSchemaId::new("in").expect("the schema id is valid"),
+                AgentRevisionNumber::INITIAL,
+            ),
+            AgentSchemaRef::new(
+                AgentSchemaId::new("out").expect("the schema id is valid"),
+                AgentRevisionNumber::INITIAL,
+            ),
+        )
+        .expect("the definition is valid");
+        let creation = AgentTaskCreation {
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: None,
+            team: Some(AgentTeamId::new("support-team").expect("the id is valid")),
+            goal: None,
+            goal_mode: Default::default(),
+            goal_spec: None,
+            parent: None,
+            dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
+            delegation: None,
+            telemetry: Default::default(),
+        };
+        create_task(
+            &mut state,
+            &create_op,
+            creation,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the board task creates");
+        (tenant, task_id, scope, state)
+    }
+
+    /// Pads the task's description until its materialized record measures
+    /// exactly `bytes`, so a bound check lands where the test needs it.
+    fn inflate_record_to(state: &mut AgentTaskState, bytes: usize) {
+        let task = state.task.as_mut().expect("the task exists");
+        let size = task.materialized_size_bytes();
+        let previous = task.definition.description.len();
+        task.definition.description = "x".repeat(bytes - size + previous);
+        assert_eq!(
+            task.materialized_size_bytes(),
+            bytes,
+            "the padding lands on the byte the test asked for"
+        );
+    }
+
+    /// The terminal-notice envelope one conversation drives onto the task.
+    fn conversation_notice(
+        tenant: &TenantId,
+        task_id: &AgentTaskId,
+        task: &AgentTaskScope,
+        conversation: &str,
+        ended_at: AgentTimestampMillis,
+    ) -> AgentExchangeEnvelope {
+        let conversation_scope = crate::identity::AgentConversationScope::new(
+            tenant.clone(),
+            crate::identity::AgentConversationId::new(conversation)
+                .expect("the conversation id is valid"),
+        )
+        .expect("the conversation scope is valid");
+        let notice = crate::coordination::AgentConversationTerminalNotice {
+            conversation: conversation_scope.clone(),
+            task: task_id.clone(),
+            status: crate::conversation::AgentConversationStatus::Ended,
+            terminal_reason: crate::conversation::AgentConversationTerminalReason::RoundsComplete,
+            rounds_completed: 1,
+            turns_recorded: 2,
+            ended_at,
+        };
+        let operation = crate::coordination::conversation_terminal_notice_operation_id(
+            tenant,
+            conversation_scope.conversation(),
+        )
+        .expect("the operation derives");
+        AgentExchangeEnvelope::new(
+            operation.clone(),
+            AgentExchangeKind::ConversationTerminalNotice,
+            AgentEntityAddress::Conversation(conversation_scope),
+            AgentEntityAddress::Task(task.clone()),
+            AgentExchangePayload::encode(
+                crate::coordination::AGENT_CONVERSATION_TERMINAL_NOTICE_PAYLOAD_TYPE,
+                &notice,
+            )
+            .expect("the payload encodes"),
+            AgentCorrelationId::new(operation.as_str()),
+            AgentTimestampMillis::new(2),
+        )
+        .expect("the envelope builds")
+    }
+}
+
+#[cfg(test)]
 mod epoch_result_tests {
     use rakka_agent_workflow::{AgentAuditEventId, PrincipalRef};
 
@@ -10261,6 +15553,7 @@ mod epoch_result_tests {
             input: AgentTaskContent::inline(serde_json::json!({ "goal": 1 }))
                 .expect("the input is inline-bounded"),
             assignee: None,
+            team: None,
             goal: Some(AgentGoalId::new("nightly").expect("the goal id is valid")),
             goal_mode: continuous_mode(),
             goal_spec: None,
