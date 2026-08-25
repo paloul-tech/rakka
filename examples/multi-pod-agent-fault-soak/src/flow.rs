@@ -1,5 +1,10 @@
 //! The workload one pod runs, and the durable facts the driver asserts on.
 //!
+//! Some of the fixture below restates `crates/rakka-agent/tests/common/mod.rs`.
+//! That module is a test target of another crate and cannot be imported here;
+//! sharing it would mean promoting the fixture into `rakka_agent::testkit`,
+//! which is owed work rather than a copy to delete.
+//!
 //! A pod drives only the entities whose shards it owns. That is the deployment
 //! shape [specification 15](../../../docs/plans/rakka-agent/spec.md) describes —
 //! recovery scanning routes to the current owner — and it is what makes the
@@ -264,9 +269,6 @@ fn task_store(
     )
 }
 
-/// Whether this pod ever reconciled itself as the only member.
-pub static TOOK_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// The file a departing pod's absence is announced through.
 ///
 /// A real deployment learns this from its membership provider — etcd, DNS, the
@@ -332,7 +334,6 @@ pub async fn drive(
     rounds: usize,
     deadline: Duration,
 ) -> Result<DriveOutcome, String> {
-    let _ = &TOOK_OVER;
     let mut started = std::time::Instant::now();
     let mut took_over = false;
     let mut errors = DriveErrors::default();
@@ -345,13 +346,13 @@ pub async fn drive(
                 terminal: terminal(&pod.stores.tasks).await,
                 last_error: errors.last,
                 lost_writes: errors.lost_writes,
+                took_over,
             });
         }
         if !took_over && peer_departed(pod) {
             match take_over(pod) {
                 Ok(()) => {
                     took_over = true;
-                    TOOK_OVER.store(true, Ordering::SeqCst);
                     // The deadline restarts here. It was measured from this
                     // pod's own boot, so the later its peer died the less time
                     // it had left for the recovery the window exists to prove
@@ -423,6 +424,7 @@ pub async fn drive(
                 terminal: true,
                 last_error: errors.last,
                 lost_writes: errors.lost_writes,
+                took_over,
             });
         }
         if !progressed {
@@ -433,6 +435,7 @@ pub async fn drive(
         terminal: terminal(&pod.stores.tasks).await,
         last_error: errors.last,
         lost_writes: errors.lost_writes,
+        took_over,
     })
 }
 
@@ -444,6 +447,12 @@ pub struct DriveOutcome {
     pub last_error: Option<String>,
     /// How many rounds lost their compare-and-set to the other pod.
     pub lost_writes: usize,
+    /// Whether this pod downed a departed peer and took over its shards.
+    ///
+    /// Returned rather than published through a static. The static existed
+    /// because the caller prints it after `drive` has returned, which is what
+    /// the return value is for.
+    pub took_over: bool,
 }
 
 /// The errors a drive loop saw, reported once each.

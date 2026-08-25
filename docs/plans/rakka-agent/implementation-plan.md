@@ -4376,8 +4376,16 @@ Spec: [20](spec.md#20-compatibility-and-migration).
   in `docs/rakka-api-boundary-inventory.md`, `CHANGELOG.md` entries, N/N+1
   compatibility notes, and the pinned A2A/Rig/GenAI revision matrix.
 
-Done when: every shipped-phase scenario passes under fault injection at the
-fidelity its claim requires, and the documentation set is current.
+Done when: every shipped-phase scenario passes under in-process fault
+injection; every scenario the fault-injection matrix names as requiring
+multi-pod fidelity passes there too; and the documentation set is current.
+
+Stated that way because it is checkable. "At the fidelity its claim requires"
+named no artifact that says, per scenario, what fidelity that is — and the
+matrix enumerates the multi-pod subset (currently scenarios 1's
+creation-deduplication half, 2, and 60) rather than all sixty-one. The matrix
+is the authority for that subset; a scenario added to it is added to this
+criterion.
 
 The multi-process harness carries the claims an in-process kill structurally
 cannot reach — a durable store outside the dying process, real shard movement

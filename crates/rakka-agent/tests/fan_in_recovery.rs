@@ -29,7 +29,7 @@ use common::{
     proposing_turn, Fixture, SkillNamedExecutor,
 };
 use rakka_agent::testkit::{
-    CrashPoint, DeterministicModelAdapter, ExchangeFault, ScriptedDispatcher,
+    sweep_crash_points, DeterministicModelAdapter, ExchangeFault, ScriptedDispatcher,
 };
 use rakka_agent::{
     AgentDelegationId, AgentDelegationStatus, AgentExchangeEnvelope, AgentExchangeTransport,
@@ -202,25 +202,24 @@ async fn the_fan_out_converges_across_every_run_store_crash_point() {
          (the committing turn, two child results, the proposal), saw {run_writes}"
     );
 
-    for point in 1..=run_writes {
-        for window in [CrashPoint::BeforeWrite, CrashPoint::AfterWrite] {
-            let (fixture, executor) = fan_out_world().await;
-            fixture.runs.reset_writes();
-            fixture.runs.crash_at(point, window);
-            drive(&fixture).await;
-            fixture.runs.assert_crash_fired(point, window);
-            fixture.runs.survive();
+    sweep_crash_points(run_writes, |point, window| async move {
+        let (fixture, executor) = fan_out_world().await;
+        fixture.runs.reset_writes();
+        fixture.runs.crash_at(point, window);
+        drive(&fixture).await;
+        fixture.runs.assert_crash_fired(point, window);
+        fixture.runs.survive();
 
-            // A new owner, with nothing but the durable record.
-            drive(&fixture).await;
-            assert_converged(
-                &fixture,
-                &executor,
-                &format!("run-store crash at write {point} ({window:?})"),
-            )
-            .await;
-        }
-    }
+        // A new owner, with nothing but the durable record.
+        drive(&fixture).await;
+        assert_converged(
+            &fixture,
+            &executor,
+            &format!("run-store crash at write {point} ({window:?})"),
+        )
+        .await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -232,24 +231,23 @@ async fn the_fan_out_converges_across_every_task_store_crash_point() {
          (the assignment decision, the accepted result), saw {task_writes}"
     );
 
-    for point in 1..=task_writes {
-        for window in [CrashPoint::BeforeWrite, CrashPoint::AfterWrite] {
-            let (fixture, executor) = fan_out_world().await;
-            fixture.tasks.reset_writes();
-            fixture.tasks.crash_at(point, window);
-            drive(&fixture).await;
-            fixture.tasks.assert_crash_fired(point, window);
-            fixture.tasks.survive();
+    sweep_crash_points(task_writes, |point, window| async move {
+        let (fixture, executor) = fan_out_world().await;
+        fixture.tasks.reset_writes();
+        fixture.tasks.crash_at(point, window);
+        drive(&fixture).await;
+        fixture.tasks.assert_crash_fired(point, window);
+        fixture.tasks.survive();
 
-            drive(&fixture).await;
-            assert_converged(
-                &fixture,
-                &executor,
-                &format!("task-store crash at write {point} ({window:?})"),
-            )
-            .await;
-        }
-    }
+        drive(&fixture).await;
+        assert_converged(
+            &fixture,
+            &executor,
+            &format!("task-store crash at write {point} ({window:?})"),
+        )
+        .await;
+    })
+    .await;
 }
 
 #[tokio::test]

@@ -128,6 +128,10 @@ fn error(message: impl Into<String>) -> std::io::Error {
 
 /// Two distinct free loopback ports.
 ///
+/// Not `rakka_process::testkit::available_tcp_port`: it returns one port and
+/// drops its listener before the next call, which is the collision this exists
+/// to avoid.
+///
 /// Both listeners are held at once and dropped together, so the kernel cannot
 /// hand the same port to both pods — which binding and dropping one at a time
 /// allowed, and which made pod B fail to bind. The window in which another
@@ -249,7 +253,7 @@ async fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         pod.stores.runs.writes(),
         pod.owns_task(flow::task_scope().entity_id().as_str()),
         pod.owns_run(flow::run_scope().entity_id().as_str()),
-        flow::TOOK_OVER.load(std::sync::atomic::Ordering::SeqCst),
+        outcome.took_over,
         outcome.lost_writes,
         flow::task_status(&root).await,
     );

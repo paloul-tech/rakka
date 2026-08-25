@@ -1,7 +1,7 @@
 [package]
 name = "rakka-example-multi-pod-agent-fault-soak"
 version = "0.1.0"
-description = "Multi-pod fault and soak validation for the durable agent domain: real node processes, a shared durable substrate, and owner/dispatcher kills at every durable boundary."
+description = "Multi-pod fault and soak validation for the durable agent domain: real node processes, a shared durable substrate, and owner kills at every task-store and run-store write."
 edition.workspace = true
 repository.workspace = true
 homepage.workspace = true

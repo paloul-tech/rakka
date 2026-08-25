@@ -44,7 +44,7 @@ cargo test -p rakka-k8s --test kubernetes_manifests
 Optional gated checks:
 
 ```sh
-RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix optional_multi_process_compatibility_example_is_gated -- --nocapture
+RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
 RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image-n> RAKKA_K8S_NEXT_IMAGE=<image-n-plus-one> examples/kubernetes/local-cluster-scenario.sh
 ```
 

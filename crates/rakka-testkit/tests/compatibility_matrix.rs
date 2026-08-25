@@ -444,6 +444,11 @@ fn optional_multi_pod_agent_fault_harness_is_gated() {
     // compatibility example above proves two nodes can talk; this one proves
     // the durable agent entities recover on a *different pod* when the one
     // holding them dies, which is what specification 15 actually requires.
+    //
+    // The only copy. The example carried an identical test — same name, gate,
+    // command and marker — so under the gate the ~2 minute sweep ran twice, and
+    // the two had already drifted on how they treat the skip. This is the copy
+    // CLAUDE.md documents as the entry point.
     if std::env::var("RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY")
         .ok()
         .as_deref()
@@ -468,10 +473,13 @@ fn optional_multi_pod_agent_fault_harness_is_gated() {
         "multi-pod agent fault harness failed:\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    if stdout.contains("skipped: loopback binding is unavailable") {
+        eprintln!("multi-pod harness skipped: loopback binding is unavailable");
+        return;
+    }
     assert!(
-        stdout.contains("converged from the shared record")
-            || stdout.contains("skipped: loopback binding is unavailable"),
-        "expected the sweep marker or an explicit skip in stdout:\n{stdout}"
+        stdout.contains("converged from the shared record"),
+        "expected the sweep's convergence marker in stdout:\n{stdout}"
     );
 }
 

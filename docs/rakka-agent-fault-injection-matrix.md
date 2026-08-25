@@ -49,7 +49,9 @@ Harness: [`examples/multi-pod-agent-fault-soak`](../examples/multi-pod-agent-fau
 | A pod is gone but not yet downed | The survivor refuses to drive shards it does not own rather than becoming a second writer. | Ownership gate in `flow::drive` |
 
 Specification 18 scenarios this re-proves at multi-pod fidelity: **1** (the
-creation-deduplication half), **2**, and **60**. It also satisfies section 18's
+creation-deduplication half), **2**, and **60**. That list is the authority for
+slice 6.4's done-when: every other shipped scenario is proven in-process, and a
+scenario moves here only when its claim cannot be reached by an in-process kill. It also satisfies section 18's
 closing fault-injection directive — kill the owner at every durable effect
 boundary, including after a test external system commits but before it returns
 the receipt.

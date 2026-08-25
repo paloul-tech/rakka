@@ -26,7 +26,7 @@ use common::{
     committed_children, create_fan_out_task, create_real_child, fan_out_fixture, task_scope,
     Fixture, SkillNamedExecutor, SKILL, SKILL_2, TENANT,
 };
-use rakka_agent::testkit::CrashPoint;
+use rakka_agent::testkit::sweep_crash_points;
 use rakka_agent::{
     AgentCancellationProgress, AgentDelegationCancelOutcome, AgentRunStatus, AgentTaskScope,
     AgentTaskStatus, TenantId,
@@ -265,26 +265,25 @@ async fn the_cancellation_converges_across_every_task_store_crash_point() {
          saw {task_writes}"
     );
 
-    for point in 1..=task_writes {
-        for window in [CrashPoint::BeforeWrite, CrashPoint::AfterWrite] {
-            let (fixture, executor, children) = cancelling_world().await;
-            fixture.tasks.reset_writes();
-            fixture.tasks.crash_at(point, window);
-            drive(&fixture, &children).await;
-            fixture.tasks.assert_crash_fired(point, window);
-            fixture.tasks.survive();
+    sweep_crash_points(task_writes, |point, window| async move {
+        let (fixture, executor, children) = cancelling_world().await;
+        fixture.tasks.reset_writes();
+        fixture.tasks.crash_at(point, window);
+        drive(&fixture, &children).await;
+        fixture.tasks.assert_crash_fired(point, window);
+        fixture.tasks.survive();
 
-            // A new owner, with nothing but the durable record.
-            drive(&fixture, &children).await;
-            assert_converged(
-                &fixture,
-                &executor,
-                &children,
-                &format!("task-store crash at write {point} ({window:?})"),
-            )
-            .await;
-        }
-    }
+        // A new owner, with nothing but the durable record.
+        drive(&fixture, &children).await;
+        assert_converged(
+            &fixture,
+            &executor,
+            &children,
+            &format!("task-store crash at write {point} ({window:?})"),
+        )
+        .await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -298,23 +297,22 @@ async fn the_cancellation_converges_across_every_run_store_crash_point() {
          (the wind-down, two chases, the quiescence), saw {run_writes}"
     );
 
-    for point in 1..=run_writes {
-        for window in [CrashPoint::BeforeWrite, CrashPoint::AfterWrite] {
-            let (fixture, executor, children) = cancelling_world().await;
-            fixture.runs.reset_writes();
-            fixture.runs.crash_at(point, window);
-            drive(&fixture, &children).await;
-            fixture.runs.assert_crash_fired(point, window);
-            fixture.runs.survive();
+    sweep_crash_points(run_writes, |point, window| async move {
+        let (fixture, executor, children) = cancelling_world().await;
+        fixture.runs.reset_writes();
+        fixture.runs.crash_at(point, window);
+        drive(&fixture, &children).await;
+        fixture.runs.assert_crash_fired(point, window);
+        fixture.runs.survive();
 
-            drive(&fixture, &children).await;
-            assert_converged(
-                &fixture,
-                &executor,
-                &children,
-                &format!("run-store crash at write {point} ({window:?})"),
-            )
-            .await;
-        }
-    }
+        drive(&fixture, &children).await;
+        assert_converged(
+            &fixture,
+            &executor,
+            &children,
+            &format!("run-store crash at write {point} ({window:?})"),
+        )
+        .await;
+    })
+    .await;
 }

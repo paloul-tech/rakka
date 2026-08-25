@@ -159,6 +159,22 @@ where
         Ok(newest)
     }
 
+    /// Unlinks every revision of `persistence_id` below `keep`.
+    ///
+    /// Best effort: a file that cannot be removed is left behind rather than
+    /// failing a commit that already succeeded, and `current_revision` reads the
+    /// newest regardless.
+    fn prune_older_revisions(&self, persistence_id: &PersistenceId, keep: Revision) {
+        let Ok(records) = self.record_files() else {
+            return;
+        };
+        for (id, revision, path) in records {
+            if id == persistence_id.as_str() && revision < keep {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
     fn current_revision(&self, persistence_id: &PersistenceId) -> DurableResult<Revision> {
         Ok(self
             .current_revision_file(persistence_id)?
@@ -314,6 +330,13 @@ where
             }
             let record = StateRecord::new(state, expected_revision.next());
             self.commit_record(persistence_id, &record)?;
+            // The superseded revisions go once the new one is committed. The
+            // store this is forked from prunes; dropping it left every revision
+            // of every entity in one directory that `record_files` re-scans one
+            // to four times per operation, so a sweep grew its own cost.
+            // Pruning cannot race the fence: it only ever removes revisions
+            // *below* the one just committed, and the claim is always above.
+            self.prune_older_revisions(persistence_id, record.revision);
             Ok(record)
         })
     }

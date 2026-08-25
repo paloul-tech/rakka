@@ -20,7 +20,7 @@ use common::{
     goal_task_creation_command, run_scope, skill_id, task_definition, Fixture, SKILL, SKILL_2,
     TENANT,
 };
-use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, ScriptedDispatcher};
+use rakka_agent::testkit::{sweep_crash_points, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::SessionMemoryStore;
 use rakka_agent::{
     AgentA2aSendExecutor, AgentA2aSendFinding, AgentDelegationRecord, AgentDispatchFuture,
@@ -819,26 +819,25 @@ async fn the_descendants_ceiling_stays_exact_across_every_coordinator_loss() {
          terminal fold and the effects each settle), saw {run_writes}"
     );
 
-    for point in 1..=run_writes {
-        for window in [CrashPoint::BeforeWrite, CrashPoint::AfterWrite] {
-            let world = ceiling_world_unpumped(AgentGoalDelegationBudget {
-                max_descendants: Some(1),
-                ..Default::default()
-            })
-            .await;
-            world.fixture.runs.reset_writes();
-            world.fixture.runs.crash_at(point, window);
-            let _ = world.fixture.pump().await;
-            world.fixture.runs.assert_crash_fired(point, window);
-            world.fixture.runs.survive();
+    sweep_crash_points(run_writes, |point, window| async move {
+        let world = ceiling_world_unpumped(AgentGoalDelegationBudget {
+            max_descendants: Some(1),
+            ..Default::default()
+        })
+        .await;
+        world.fixture.runs.reset_writes();
+        world.fixture.runs.crash_at(point, window);
+        let _ = world.fixture.pump().await;
+        world.fixture.runs.assert_crash_fired(point, window);
+        world.fixture.runs.survive();
 
-            // A new coordinator, with nothing but the durable record.
-            let _ = world.fixture.pump().await;
+        // A new coordinator, with nothing but the durable record.
+        let _ = world.fixture.pump().await;
 
-            let context = format!("run-store crash at write {point} ({window:?})");
-            assert_ceiling_exact(&world, &context).await;
-        }
-    }
+        let context = format!("run-store crash at write {point} ({window:?})");
+        assert_ceiling_exact(&world, &context).await;
+    })
+    .await;
 }
 
 /// The ceiling turn's exactness: one cell, one charged descendant, one logical

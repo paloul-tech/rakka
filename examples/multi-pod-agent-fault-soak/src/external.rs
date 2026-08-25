@@ -1,10 +1,16 @@
 //! The external system, outside every pod.
 //!
 //! [Specification 18](../../../docs/plans/rakka-agent/spec.md) closes its
-//! recovery scenarios with the fault-injection directive this harness exists
-//! to satisfy: kill the dispatcher or owner pod at every durable effect
-//! boundary, *including after a test external system commits but before it
-//! returns the receipt*. The in-process
+//! recovery scenarios with a fault-injection directive: kill the dispatcher or
+//! owner pod at every durable effect boundary, *including after a test external
+//! system commits but before it returns the receipt*. This ledger is what makes
+//! that last clause observable across the death of the pod that committed.
+//!
+//! The harness satisfies the clause, not the whole directive. It kills the
+//! *owner* at every task-store and run-store write; the durable workflow outbox
+//! and the agent store are not armed, and effects are driven by the testkit's
+//! `ScriptedDispatcher`, which models no leases, fences, attempts, or ambiguity
+//! recovery. Dispatcher-side kills are the in-process matrix's job. The in-process
 //! [`rakka_agent::testkit::RecordingToolExecutor`] records invocations in a
 //! `Mutex` — which dies with the pod that made them, so a pod killed after the
 //! external commit leaves no evidence the commit happened.
@@ -24,6 +30,10 @@ use rakka_agent::{
 const LEDGER: &str = "external.log";
 
 /// Appends one line to the shared ledger, creating it if needed.
+///
+/// Not `rakka_process::testkit::append_line`: it writes with `writeln!`, which
+/// is the torn-line hazard described below. That helper serves tests whose
+/// writers exit cleanly; this harness aborts its pods mid-write.
 ///
 /// One `write_all` of the line *and* its newline, never `writeln!`. `writeln!`
 /// on an unbuffered file issues one write per format piece — the payload, then

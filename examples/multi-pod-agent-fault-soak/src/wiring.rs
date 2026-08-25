@@ -161,6 +161,10 @@ pub struct Pod {
     /// This pod's actor system. Dropping it stops every hosted entity.
     pub system: ActorSystem,
     /// The sharding facade the five entity classes registered through.
+    ///
+    /// Held, not read: dropping it would take the shard regions the entity
+    /// actors are hosted in down with it, so the pod owns it for as long as it
+    /// serves exchanges.
     pub sharding: ClusterSharding,
     /// The router every cross-entity exchange resolves its owner through.
     pub router: AgentExchangeRouter,

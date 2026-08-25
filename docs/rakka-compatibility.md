@@ -135,5 +135,5 @@ cargo test -p rakka-k8s --test kubernetes_manifests
 Run the gated multi-process loopback compatibility check:
 
 ```sh
-RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix optional_multi_process_compatibility_example_is_gated -- --nocapture
+RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
 ```
