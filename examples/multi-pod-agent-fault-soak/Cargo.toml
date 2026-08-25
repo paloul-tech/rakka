@@ -1,0 +1,36 @@
+[package]
+name = "rakka-example-multi-pod-agent-fault-soak"
+version = "0.1.0"
+description = "Multi-pod fault and soak validation for the durable agent domain: real node processes, a shared durable substrate, and owner/dispatcher kills at every durable boundary."
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+license-file.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "rakka-example-multi-pod-agent-fault-soak"
+path = "src/main.rs"
+doc = false
+
+[lib]
+name = "rakka_example_multi_pod_agent_fault_soak"
+path = "src/lib.rs"
+
+[dependencies]
+rakka-agent = { path = "../../crates/rakka-agent" }
+rakka-agent-workflow = { path = "../../crates/rakka-agent-workflow" }
+rakka-cluster = { path = "../../crates/rakka-cluster" }
+rakka-core = { path = "../../crates/rakka-core" }
+rakka-persistence = { path = "../../crates/rakka-persistence" }
+rakka-remote = { path = "../../crates/rakka-remote" }
+rakka-sharding = { path = "../../crates/rakka-sharding" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -438,6 +438,43 @@ fn optional_multi_process_compatibility_example_is_gated() {
     );
 }
 
+#[test]
+fn optional_multi_pod_agent_fault_harness_is_gated() {
+    // The agent domain's own multi-process gate, added by slice 6.1. The
+    // compatibility example above proves two nodes can talk; this one proves
+    // the durable agent entities recover on a *different pod* when the one
+    // holding them dies, which is what specification 15 actually requires.
+    if std::env::var("RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping the multi-pod agent fault harness; set \
+             RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1"
+        );
+        return;
+    }
+
+    let output = Command::new("cargo")
+        .args(["run", "-p", "rakka-example-multi-pod-agent-fault-soak"])
+        .current_dir(repo_root())
+        .output()
+        .expect("the multi-pod agent fault harness should run when enabled");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "multi-pod agent fault harness failed:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("converged from the shared record")
+            || stdout.contains("skipped: loopback binding is unavailable"),
+        "expected the sweep marker or an explicit skip in stdout:\n{stdout}"
+    );
+}
+
 fn assert_readiness_reports_compatibility_failure(local_node_id: NodeId, message: String) {
     let health = KubernetesNodeHealth::new(local_node_id);
     health.record_compatibility_failure(message);

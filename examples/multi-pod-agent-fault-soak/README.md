@@ -1,0 +1,115 @@
+# Multi-Pod Agent Fault and Soak Harness
+
+Slice 6.1 of the [`rakka-agent` plan](../../docs/plans/rakka-agent/implementation-plan.md).
+Two real OS processes, one shared durable directory, and the durable agent
+entities killed at every write they make.
+
+## What it proves that no other test can
+
+Every other agent proof in this repository runs in one process over one
+in-memory store. That proves entities *re-materialize*: the fixture drops the
+entity facade and builds a new one, so "every call is already a restart". What
+it cannot reach is the claim
+[specification 15](../../docs/plans/rakka-agent/spec.md) actually makes —
+durable state must be sufficient to recover an agent, task, or run **on a
+different pod, without node-local memory**. A store that lives in the dying
+process's memory cannot test that, because the store dies too.
+
+Three things here are firsts for the repository:
+
+1. **All five sharded entity classes register through their *remote*
+   registrations.** `init_agent_entity_remote_sharding` and its four siblings
+   were defined, exported, and called nowhere before this example.
+2. **A real agent entity's exchanges travel the production
+   `ShardedExchangeRoute`.** Every acceptance example uses the testkit's
+   `LocalShardedExchangeRoute`, whose own documentation says it is "the local
+   arm ... without the `rakka-remote` ask client the other arm needs".
+3. **The durable store is outside every pod.** Each committed revision is a
+   file, and the commit is a `hard_link` claim: two pods racing one
+   compare-and-set cannot both win, so stale-owner rejection is real rather
+   than simulated.
+
+## Run
+
+```sh
+cargo run -p rakka-example-multi-pod-agent-fault-soak
+```
+
+Expected output, with the write counts varying by shard layout:
+
+```
+Rakka multi-pod agent fault harness
+reference: two pods completed the task; pod-a wrote tasks=3 runs=10, pod-b wrote tasks=3 runs=0
+swept 32 pod-loss windows; every one converged from the shared record
+```
+
+Set `RAKKA_MULTI_POD_VERBOSE=1` to see each pod's exit line — which entities it
+owned, whether it took over from a departed peer, and what the durable record
+said when it stopped.
+
+Through the gate, alongside the repository's other multi-process check:
+
+```sh
+RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 \
+  cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
+```
+
+## The shape of one run
+
+The driver picks two loopback ports and re-execs itself twice — the idiom
+`examples/multi-node-sharding` established here. Each pod boots an
+`ActorSystem`, a `TcpRemoteTransport`, and `ClusterSharding`, registers all five
+entity classes for remote hosting, and installs one production
+`ShardedExchangeRoute` per class.
+
+Both pods then seed: they instantiate the agent and create the task. The
+commands deduplicate on derived operation ids, so two pods issuing them produce
+one agent and one task — which is also what an ingress redelivering to whichever
+pod is up actually does.
+
+Each pod drives only the entities whose shards it own. In practice the task and
+the run land on different pods, so the task's owed run-creation exchange has to
+cross the wire; the run's result proposal has to cross back. The model call goes
+to an adapter that appends to a shared ledger file **before** it answers, which
+is [specification 18](../../docs/plans/rakka-agent/spec.md)'s window: the
+external system has committed and no receipt exists anywhere.
+
+When one pod exits — killed, or finished — the driver announces its departure
+and the survivor calls `mark_down` on it. `mark_down`, not `mark_leaving`: a
+killed pod never got to leave, and a downing decision is what an operator or a
+failure detector produces for one. The shards move, the entities re-materialize
+from the shared directory, and the survivor finishes the work.
+
+## The sweep
+
+The crash-free reference run reports how many durable writes each pod made. The
+sweep then replays the world once per `(pod, store, write ordinal, window)`,
+arming that pod to `abort()` at exactly that write. `abort()` rather than a
+panic: a panic unwinds, runs destructors, and lets the harness observe an
+orderly failure, and a pod loss is none of those.
+
+Each window asserts, from the shared directory after every pod is gone:
+
+- the task's durable status is `Completed`;
+- the external ledger was reached, and reached for exactly **one logical turn**
+  — a pod killed after the external commit may legitimately cause a *retry* of
+  that turn, but never a second turn under a different identity.
+
+## Deliberate limits
+
+- **The shared directory stands in for a shared durable backend.** Specification
+  15 forbids pod-local state as the production source of truth; a shared volume
+  is not what it means by "pod-local", but neither is it a database. Production
+  is PostgreSQL through `PostgresDurableStateStore`, which is already generic
+  over the state type, so that is a substitution rather than a rewrite.
+- **Departure is announced, not detected.** A real deployment learns it from
+  etcd, DNS, or the Kubernetes API. Announcing it makes shard movement happen at
+  a determined moment instead of a timing-dependent one — and until the survivor
+  reconciles, it correctly refuses to drive shards it does not own.
+- **History sinks are per-pod.** Task, team, and conversation history is bounded
+  observability behind an authorized cursor, never the correctness source, and
+  this harness asserts convergence only from durable entity state. A file-backed
+  history that passes `assert_task_history_store_contract` is owed work.
+- **Team and conversation entities are registered but not exercised by the
+  workload.** Registering them is what proves the remote registration path; a
+  coordination workload across pods is owed work.

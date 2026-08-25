@@ -2104,6 +2104,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-multi-pod-agent-fault-soak"
+version = "0.1.0"
+dependencies = [
+ "rakka-agent",
+ "rakka-agent-workflow",
+ "rakka-cluster",
+ "rakka-core",
+ "rakka-persistence",
+ "rakka-remote",
+ "rakka-sharding",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-pool-router"
 version = "0.1.0"
 dependencies = [
