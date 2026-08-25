@@ -106,8 +106,10 @@ rather than unreachable. And the second owner's *own* recovery writes have their
 own world: every other row kills the pod that natively owns what it is writing,
 while that one kills the pod that inherited it — pod A dies at its first
 task-store write so pod B must take the run's shard over, pod B is armed at its
-`nth` run-store write, and a third pod replaces it, downs both, and finishes.
-Still owed: the second owner's outbox writes, which that world does not arm.
+`nth` write, and a third pod replaces it, downs both, and finishes. It runs once
+per store the second owner touches after inheriting the shard — run state and
+effect outbox — so specification 18's named boundary is swept on the inheriting
+pod as well as on the original owner.
 
 ## In-process matrix added by slice 6.1
 

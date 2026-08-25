@@ -37,12 +37,19 @@ const POD_DEADLINE: Duration = Duration::from_secs(20);
 /// a bounded sweep as an exhaustive one.
 const SWEEP_CEILING: usize = 64;
 
-/// The fewest windows the second owner's own writes must fire.
+/// The fewest windows the second owner's own *run-store* writes must fire.
 ///
 /// Measured at 20 — the second owner redrives the whole run from the record, so
 /// it writes about as often as the first owner does. Well under that, and far
 /// over a two-arming world that has stopped reaching the inherited shard.
-const TAKEOVER_ROW_FLOOR: usize = 12;
+const TAKEOVER_RUNS_FLOOR: usize = 12;
+
+/// The fewest windows the second owner's own *outbox* writes must fire.
+///
+/// A thin row, like the first owner's outbox row: the effects of one redriven
+/// run are few. Thin is not absent — this is the effect boundary specification
+/// 18's directive names, reached by the pod that inherited it.
+const TAKEOVER_WORKFLOW_FLOOR: usize = 1;
 
 /// The fewest windows that must move a shard to the surviving pod.
 ///
@@ -89,7 +96,7 @@ const SWEEP_ROWS: [SweepRow; 8] = [
     SweepRow::unreachable(
         Armed::PodB,
         CrashTarget::Workflow,
-        "pod B emits no effects until it owns the run; the second-owner row sweeps its run writes, its outbox writes are still owed",
+        "pod B emits no effects until it owns the run; the second-owner rows sweep them",
     ),
     // Unreachable *by a single arming*, and printed rather than hidden: pod B
     // drives the run only once pod A is gone, and pod A goes only when it is
@@ -537,11 +544,12 @@ enum Takeover {
 /// is what lets it down them.
 async fn run_takeover_world(
     root: &Path,
+    target: CrashTarget,
     nth: usize,
     window: PodCrash,
 ) -> Result<Takeover, Box<dyn Error>> {
     for _attempt in 0..WORLD_BIND_ATTEMPTS {
-        match run_takeover_world_once(root, nth, window).await? {
+        match run_takeover_world_once(root, target, nth, window).await? {
             Takeover::PortTaken => {
                 let _ = std::fs::remove_dir_all(root);
                 std::fs::create_dir_all(root)?;
@@ -557,6 +565,7 @@ async fn run_takeover_world(
 
 async fn run_takeover_world_once(
     root: &Path,
+    target: CrashTarget,
     nth: usize,
     window: PodCrash,
 ) -> Result<Takeover, Box<dyn Error>> {
@@ -604,7 +613,7 @@ async fn run_takeover_world_once(
         "uid-b",
         port_b,
         format!("rakka-0:uid-a:{port_a}"),
-        Some((CrashTarget::Runs, nth, window)),
+        Some((target, nth, window)),
     )?;
 
     let status_a = match tokio::time::timeout(WORLD_DEADLINE, pod_a.wait()).await {
@@ -678,6 +687,73 @@ async fn run_takeover_world_once(
         return Err(error("the replacement pod never reported its writes").into());
     }
     Ok(Takeover::Crashed)
+}
+
+/// Sweeps the second owner's own writes to one store.
+///
+/// The loop is the same shape as the single-arming rows — walk ordinals until
+/// two consecutive ones fire nothing, hold the row to a floor — over the
+/// two-arming world instead. `run_takeover_world` arms the *second* owner in
+/// `target`, and the second owner touches no store until it inherits the run's
+/// shard, so every ordinal here is a write it made as the inheritor.
+async fn sweep_second_owner(target: CrashTarget, floor: usize) -> Result<usize, Box<dyn Error>> {
+    let mut fired = 0usize;
+    let mut dry_streak = 0usize;
+    let mut last_firing = 0usize;
+    let mut nth = 1usize;
+    while nth <= SWEEP_CEILING && dry_streak < DRY_ORDINALS_TO_STOP {
+        let mut reached = false;
+        for window in [PodCrash::BeforeWrite, PodCrash::AfterWrite] {
+            let label = format!("takeover-{}-{nth}-{}", target.as_label(), window.as_label());
+            let context = format!(
+                "the second owner killed at {} write {nth} ({})",
+                target.as_label(),
+                window.as_label()
+            );
+            let root = fresh_root(&label)?;
+            // `OneIdentity` in both arms: the first pod dies in this world
+            // either way, so a retry of the same turn is legitimate.
+            match run_takeover_world(&root, target, nth, window).await? {
+                Takeover::Crashed => {
+                    assert_converged(&root, &context, Ledger::OneIdentity).await?;
+                    reached = true;
+                    fired += 1;
+                }
+                Takeover::Survived => {
+                    assert_converged(
+                        &root,
+                        &format!("{context}, which never fired"),
+                        Ledger::OneIdentity,
+                    )
+                    .await?;
+                }
+                Takeover::PortTaken => {
+                    unreachable!("run_takeover_world retries or fails on a taken port")
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        if reached {
+            last_firing = nth;
+            dry_streak = 0;
+        } else {
+            dry_streak += 1;
+        }
+        nth += 1;
+    }
+    println!(
+        "  second owner {}: {fired} windows, ordinals 1-{last_firing}",
+        target.as_label()
+    );
+    if fired < floor {
+        return Err(error(format!(
+            "the second owner's {} writes fired {fired} windows, below the floor of {floor}: \
+             the two-arming world stopped reaching them",
+            target.as_label()
+        ))
+        .into());
+    }
+    Ok(fired)
 }
 
 /// A pod whose work is evidence must have exited cleanly.
@@ -1083,59 +1159,20 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
         swept.push(fired);
     }
 
-    // The row no single-arming world can reach: the second owner's own writes.
+    // The rows no single-arming world can reach: the second owner's own writes,
+    // to each store it touches after inheriting the shard.
     let mut takeover = 0usize;
-    let mut dry_streak = 0usize;
-    let mut last_firing = 0usize;
-    let mut nth = 1usize;
-    while nth <= SWEEP_CEILING && dry_streak < DRY_ORDINALS_TO_STOP {
-        let mut reached = false;
-        for window in [PodCrash::BeforeWrite, PodCrash::AfterWrite] {
-            let label = format!("takeover-runs-{nth}-{}", window.as_label());
-            let context = format!(
-                "the second owner killed at run write {nth} ({})",
-                window.as_label()
-            );
-            let root = fresh_root(&label)?;
-            // `OneIdentity` in both arms: pod A dies in this world either way,
-            // so a retry of the same turn is legitimate.
-            match run_takeover_world(&root, nth, window).await? {
-                Takeover::Crashed => {
-                    assert_converged(&root, &context, Ledger::OneIdentity).await?;
-                    reached = true;
-                    takeover += 1;
-                }
-                Takeover::Survived => {
-                    assert_converged(
-                        &root,
-                        &format!("{context}, which never fired"),
-                        Ledger::OneIdentity,
-                    )
-                    .await?;
-                }
-                Takeover::PortTaken => {
-                    unreachable!("run_takeover_world retries or fails on a taken port")
-                }
-            }
-            let _ = std::fs::remove_dir_all(&root);
-        }
-        if reached {
-            last_firing = nth;
-            dry_streak = 0;
-        } else {
-            dry_streak += 1;
-        }
-        nth += 1;
-    }
-    println!("  second owner runs: {takeover} windows, ordinals 1-{last_firing}");
-    if takeover < TAKEOVER_ROW_FLOOR {
-        return Err(error(format!(
-            "the second owner's own writes fired {takeover} windows, below the floor of \
-             {TAKEOVER_ROW_FLOOR}: the two-arming world stopped reaching them"
-        ))
-        .into());
+    for (target, floor) in [
+        (CrashTarget::Runs, TAKEOVER_RUNS_FLOOR),
+        (CrashTarget::Workflow, TAKEOVER_WORKFLOW_FLOOR),
+    ] {
+        takeover += sweep_second_owner(target, floor).await?;
     }
     swept.push(takeover);
+    // Every one of these moved a shard, twice: the second owner inherited the
+    // run from the first, and the replacement inherited it from the second and
+    // could not have converged without downing both.
+    took_over += takeover;
 
     // No `windows == 0` guard: every reachable row has already been held to its
     // own floor above, which is strictly stronger. A total of zero now fails

@@ -84,8 +84,9 @@ see only each other, so while they run the cluster is the same two-node shape
 every other row sweeps; the replacement joins knowing all three, which is what
 lets it down them.
 
-Still owed: the second owner's *outbox* writes. The two-arming world arms its
-run store, not its workflow store.
+It runs once per store the second owner touches after inheriting the shard — its
+run state and its effect outbox — so the boundary specification 18's directive
+names is swept on the inheriting pod as well as on the original owner.
 
 Set `RAKKA_MULTI_POD_VERBOSE=1` to see each pod's exit line — which entities it
 owned, whether it took over from a departed peer, how many rounds lost their
