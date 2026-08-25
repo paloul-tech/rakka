@@ -4,7 +4,7 @@
 //! module adds a fleet-level index for cross-run discovery, leases, fencing,
 //! target concurrency limits, and bounded health snapshots.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
@@ -1018,8 +1018,98 @@ pub struct AgentDispatchClaimBatch {
     pub backpressure_limited: bool,
     /// Entries skipped because target concurrency was exhausted.
     pub concurrency_limited: usize,
+    /// Entries this worker's claim filter refused, because they name an
+    /// execution class it does not serve.
+    ///
+    /// A persistently non-zero value beside a non-zero `due_dispatch_count`
+    /// is what distinguishes "waiting for the worker that serves this class"
+    /// from "no worker in the fleet serves it" — the anti-stall signal a
+    /// heterogeneous fleet needs, and one that costs no durable write.
+    pub class_filtered: usize,
     /// Claims issued to the worker.
     pub claims: Vec<AgentDispatchClaim>,
+}
+
+/// Which dispatch work one worker may claim, by a bounded target attribute.
+///
+/// The fleet index is one shared record: every worker registers into it and
+/// every worker reads it, which is what makes the durable backlog recoverable
+/// on any pod. Isolation is therefore enforced where the work is *taken* —
+/// here — and again where it is *authorized*, by the agent domain's dispatch
+/// authority. It is never enforced by hiding the index, which carries only
+/// bounded routing metadata and no secret material
+/// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md),
+/// [16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Filtering at claim time rather than refusing after the claim is what makes
+/// a heterogeneous fleet work at all. A worker that refused *after* claiming
+/// would hold the entry's lease while it did so, starving the worker that can
+/// actually run it; and a refusal is a durable write, so every worker would
+/// pay one per class it does not serve.
+///
+/// The attribute is matched against [`AgentEffectTarget::attributes`]. An
+/// entry that does not carry the attribute at all is accepted by default:
+/// unclassified work routes anywhere, and refusing it is a policy decision
+/// belonging to the authorization layer, not to the fleet. A deployment that
+/// wants the stricter rule at this layer too says so with
+/// [`Self::without_unclassified`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentDispatchClaimFilter {
+    attribute: Option<String>,
+    accepted: BTreeSet<String>,
+    accept_unclassified: bool,
+}
+
+impl AgentDispatchClaimFilter {
+    /// A filter that accepts every entry.
+    ///
+    /// The default, and the behaviour of every worker built before this filter
+    /// existed: a homogeneous fleet needs no routing, and one that has not
+    /// declared its classes must not silently stop claiming work.
+    #[must_use]
+    pub fn any() -> Self {
+        Self {
+            attribute: None,
+            accepted: BTreeSet::new(),
+            accept_unclassified: true,
+        }
+    }
+
+    /// Accepts only entries whose `attribute` names one of `accepted`.
+    ///
+    /// An empty `accepted` set means this worker serves no classified work at
+    /// all — which is a coherent thing to configure for a worker that exists
+    /// only to run unclassified effects.
+    #[must_use]
+    pub fn by_target_attribute(
+        attribute: impl Into<String>,
+        accepted: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            attribute: Some(attribute.into()),
+            accepted: accepted.into_iter().map(Into::into).collect(),
+            accept_unclassified: true,
+        }
+    }
+
+    /// Refuses an entry that does not carry the attribute.
+    #[must_use]
+    pub fn without_unclassified(mut self) -> Self {
+        self.accept_unclassified = false;
+        self
+    }
+
+    /// Whether this worker may claim the entry.
+    #[must_use]
+    pub fn accepts(&self, entry: &AgentDispatchEntry) -> bool {
+        let Some(attribute) = self.attribute.as_ref() else {
+            return true;
+        };
+        match entry.target.attributes.get(attribute) {
+            Some(value) => self.accepted.contains(value),
+            None => self.accept_unclassified,
+        }
+    }
 }
 
 /// Durable dispatcher fleet facade.
@@ -1032,6 +1122,7 @@ where
     store: Store,
     clock: Clock,
     settings: AgentDispatcherFleetSettings,
+    claim_filter: AgentDispatchClaimFilter,
     metrics: Arc<dyn MetricsRecorder>,
     record: Option<StateRecord<AgentDispatcherFleetState>>,
 }
@@ -1065,6 +1156,19 @@ where
     Store: DurableStateStore<AgentDispatcherFleetState>,
     Clock: WorkflowClock,
 {
+    /// Restricts what this worker's handle may claim.
+    ///
+    /// Per *worker*, not per fleet: two workers over one shared index have
+    /// different filters, which is the entire point. It deliberately does not
+    /// live on [`AgentDispatcherFleetSettings`], which is serialized as part
+    /// of the fleet's configuration and describes the fleet rather than the
+    /// caller.
+    #[must_use]
+    pub fn with_claim_filter(mut self, filter: AgentDispatchClaimFilter) -> Self {
+        self.claim_filter = filter;
+        self
+    }
+
     /// Creates a dispatcher fleet with explicit dependencies.
     #[must_use]
     pub const fn with_clock_and_metrics(
@@ -1079,6 +1183,11 @@ where
             store,
             clock,
             settings,
+            claim_filter: AgentDispatchClaimFilter {
+                attribute: None,
+                accepted: BTreeSet::new(),
+                accept_unclassified: true,
+            },
             metrics,
             record: None,
         }
@@ -1203,9 +1312,16 @@ where
 
         let mut claims = Vec::new();
         let mut concurrency_limited = 0;
+        let mut class_filtered = 0;
         for entry in claimable {
             if claims.len() >= self.settings.max_batch_size {
                 break;
+            }
+            // Before the lease, not after it: a worker that cannot run this
+            // entry must not hold it away from one that can.
+            if !self.claim_filter.accepts(&entry) {
+                class_filtered += 1;
+                continue;
             }
             let class_count = in_flight_by_class
                 .get(&entry.target_class)
@@ -1237,6 +1353,9 @@ where
             self.persist(record.revision, next).await?;
         }
         self.record_metric("claim", "claimed", "none", claims.len() as u64);
+        if class_filtered > 0 {
+            self.record_metric("claim", "class-filtered", "none", class_filtered as u64);
+        }
         self.record_gauges(now);
         Ok(AgentDispatchClaimBatch {
             worker_id,
@@ -1244,6 +1363,7 @@ where
             due_dispatch_count,
             backpressure_limited,
             concurrency_limited,
+            class_filtered,
             claims,
         })
     }
