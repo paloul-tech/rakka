@@ -20,7 +20,7 @@ use common::{
     goal_task_creation_command, run_scope, skill_id, task_definition, Fixture, SKILL, SKILL_2,
     TENANT,
 };
-use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
+use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::SessionMemoryStore;
 use rakka_agent::{
     AgentA2aSendExecutor, AgentA2aSendFinding, AgentDelegationRecord, AgentDispatchFuture,
@@ -112,16 +112,32 @@ struct CeilingWorld {
 }
 
 /// A goal-rooted world under explicit delegation ceilings, scripted with a
-/// two-delegation turn and a proposing turn.
+/// two-delegation turn and a proposing turn, driven to quiescence.
 async fn ceiling_world(budget: AgentGoalDelegationBudget) -> CeilingWorld {
+    let world = ceiling_world_unpumped(budget).await;
+    world
+        .fixture
+        .pump()
+        .await
+        .expect("the loop should converge");
+    world
+}
+
+/// The same world, stopped before the loop runs, so a sweep can arm a crash
+/// across the turn that spends the ceiling.
+///
+/// The model is scripted by *turn number*: a crash that rolls the delegating
+/// turn's commit back re-asks for that same turn, and an adapter scripted by
+/// call order would answer the next one.
+async fn ceiling_world_unpumped(budget: AgentGoalDelegationBudget) -> CeilingWorld {
     let executor = CountingExecutor::new();
     let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
     let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
     let fixture = Fixture::new(
         ScriptedDispatcher::with_adapter(
             DeterministicModelAdapter::new()
-                .with_turn(two_delegation_turn())
-                .with_turn(proposing_turn()),
+                .with_turn_for(1, two_delegation_turn())
+                .with_turn_for(2, proposing_turn()),
         )
         .with_a2a_send_executor(executor.clone()),
     )
@@ -135,7 +151,6 @@ async fn ceiling_world(budget: AgentGoalDelegationBudget) -> CeilingWorld {
         ))
         .await
         .expect("the goal task should create");
-    fixture.pump().await.expect("the loop should converge");
     CeilingWorld {
         fixture,
         executor,
@@ -763,4 +778,107 @@ async fn a_delegated_creation_carrying_a_goal_spec_is_refused() {
         .await
         .expect_err("a delegated child cannot institute its own goal");
     assert_eq!(error.code(), "task-delegation-provenance-invalid");
+}
+
+/// Scenario 34's recovery clause, made a hard fact rather than an inference.
+///
+/// The module doc above argues that re-materializing every entity from its
+/// store is already a coordinator loss, and for the *read* path it is. What it
+/// cannot reach is a loss **inside** the compare-and-set that spends the
+/// ceiling: the turn that commits one delegation, refuses the second, and
+/// escrows the descendants quota is one durable transition, and a coordinator
+/// that dies within it must not come back having charged the quota twice, nor
+/// having lost the refusal the model needs to correct course.
+///
+/// Slice 6.1 sweeps every durable write of that turn on the run's own ledger.
+/// The assertion is exactness, not survival: one cell, one charged descendant,
+/// and a refusal still on the record.
+#[tokio::test]
+async fn the_descendants_ceiling_stays_exact_across_every_coordinator_loss() {
+    let reference = ceiling_world_unpumped(AgentGoalDelegationBudget {
+        max_descendants: Some(1),
+        ..Default::default()
+    })
+    .await;
+    reference.fixture.runs.reset_writes();
+    let _ = reference.fixture.pump().await;
+    let run_writes = reference.fixture.runs.writes();
+    assert!(
+        run_writes >= 2,
+        "the ceiling turn writes the run store at least twice \
+         (the committing turn, the terminal fold), saw {run_writes}"
+    );
+
+    for point in 1..=run_writes {
+        for window in [CrashPoint::BeforeWrite, CrashPoint::AfterWrite] {
+            let world = ceiling_world_unpumped(AgentGoalDelegationBudget {
+                max_descendants: Some(1),
+                ..Default::default()
+            })
+            .await;
+            world.fixture.runs.reset_writes();
+            world.fixture.runs.crash_at(point, window);
+            let _ = world.fixture.pump().await;
+            world.fixture.runs.assert_crash_fired(point, window);
+            world.fixture.runs.survive();
+
+            // A new coordinator, with nothing but the durable record.
+            let _ = world.fixture.pump().await;
+
+            let context = format!("run-store crash at write {point} ({window:?})");
+            let mut run = world.fixture.run();
+            run.recover(world.fixture.now())
+                .await
+                .unwrap_or_else(|error| panic!("{context}: the run recovers: {error}"));
+            let state = run
+                .state()
+                .unwrap_or_else(|error| panic!("{context}: the run state reads: {error}"));
+            assert!(
+                state
+                    .status()
+                    .unwrap_or_else(|| panic!("{context}: the run exists"))
+                    .is_terminal(),
+                "{context}: the run reached a terminal status"
+            );
+            let loop_state = state
+                .loop_state()
+                .unwrap_or_else(|| panic!("{context}: the loop state survives"));
+            assert_eq!(
+                loop_state.delegation_count(),
+                1,
+                "{context}: the ceiling admitted exactly one child"
+            );
+            assert_eq!(
+                loop_state.budget().consumption().descendants,
+                1,
+                "{context}: the descendants quota is charged once, never twice"
+            );
+
+            // A redispatched send is a retry of one logical delegation, so the
+            // identity — not the invocation count — is what must stay at one.
+            let sent: std::collections::BTreeSet<_> = world
+                .executor
+                .seen
+                .lock()
+                .expect("the record log should not be poisoned")
+                .iter()
+                .map(|record| record.delegation.clone())
+                .collect();
+            assert_eq!(
+                sent.len(),
+                1,
+                "{context}: one logical child, however often the send retried"
+            );
+
+            // The refusal the model corrects course from survives, and survives
+            // exactly once: a replayed turn must not append a second tool
+            // result to the run's session memory (scenario 16).
+            let codes = session_refusal_codes(&world.session).await;
+            assert_eq!(
+                codes,
+                vec!["delegation-descendants-exhausted".to_string()],
+                "{context}: one refusal on the record, neither lost nor doubled"
+            );
+        }
+    }
 }
