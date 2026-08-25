@@ -74,8 +74,13 @@ pub struct PodStores {
     pub teams: SharedFileStore<AgentTeamState>,
     /// The conversation's durable store.
     pub conversations: SharedFileStore<AgentConversationState>,
-    /// The durable workflow outbox every effect ticket lands in.
-    pub workflow: SharedFileStore<WorkflowState>,
+    /// The durable workflow outbox every effect ticket lands in, armable to
+    /// kill this pod.
+    ///
+    /// This is the effect boundary specification 18's directive names, so
+    /// leaving it unarmable meant the one store whose windows the directive
+    /// asks for by name was the one store no window could reach.
+    pub workflow: PodCrashStore<WorkflowState>,
     /// Per-pod history sinks; see the struct documentation.
     pub task_history: InMemoryAgentTaskHistoryStore,
     /// Per-pod team history sink.
@@ -97,6 +102,7 @@ impl PodStores {
         let agents = PodCrashStore::new(SharedFileStore::new(root.join("agents")));
         let tasks = PodCrashStore::new(SharedFileStore::new(root.join("tasks")));
         let runs = PodCrashStore::new(SharedFileStore::new(root.join("runs")));
+        let workflow = PodCrashStore::new(SharedFileStore::new(root.join("workflow")));
         Self {
             agents: match arm(CrashTarget::Agents) {
                 Some((nth, point)) => agents.armed_at(nth, point, root.join(CRASHED)),
@@ -112,7 +118,10 @@ impl PodStores {
             },
             teams: SharedFileStore::new(root.join("teams")),
             conversations: SharedFileStore::new(root.join("conversations")),
-            workflow: SharedFileStore::new(root.join("workflow")),
+            workflow: match arm(CrashTarget::Workflow) {
+                Some((nth, point)) => workflow.armed_at(nth, point, root.join(CRASHED)),
+                None => workflow,
+            },
             task_history: InMemoryAgentTaskHistoryStore::new(),
             team_history: InMemoryAgentTeamHistoryStore::new(),
             conversation_history: InMemoryAgentConversationHistoryStore::new(),
@@ -129,6 +138,8 @@ pub enum CrashTarget {
     Tasks,
     /// The run entity's store.
     Runs,
+    /// The durable workflow outbox every effect ticket lands in.
+    Workflow,
 }
 
 impl CrashTarget {
@@ -139,6 +150,7 @@ impl CrashTarget {
             "agents" => Some(Self::Agents),
             "tasks" => Some(Self::Tasks),
             "runs" => Some(Self::Runs),
+            "workflow" => Some(Self::Workflow),
             _ => None,
         }
     }
@@ -150,6 +162,7 @@ impl CrashTarget {
             Self::Agents => "agents",
             Self::Tasks => "tasks",
             Self::Runs => "runs",
+            Self::Workflow => "workflow",
         }
     }
 }

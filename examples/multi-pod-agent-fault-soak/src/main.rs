@@ -37,6 +37,13 @@ const POD_DEADLINE: Duration = Duration::from_secs(20);
 /// a bounded sweep as an exhaustive one.
 const SWEEP_CEILING: usize = 64;
 
+/// The fewest windows the second owner's own writes must fire.
+///
+/// Measured at 20 — the second owner redrives the whole run from the record, so
+/// it writes about as often as the first owner does. Well under that, and far
+/// over a two-arming world that has stopped reaching the inherited shard.
+const TAKEOVER_ROW_FLOOR: usize = 12;
+
 /// The fewest windows that must move a shard to the surviving pod.
 ///
 /// Not every window can. An armed pod that dies after finishing its own part
@@ -63,19 +70,35 @@ const DRY_ORDINALS_TO_STOP: usize = 2;
 /// cannot tell an intended zero from a regression that stopped a row dead. Each
 /// floor sits well under what the flow actually does — the rows measured 6, 19
 /// and 6 windows — and well over nothing.
-const SWEEP_ROWS: [SweepRow; 4] = [
+const SWEEP_ROWS: [SweepRow; 8] = [
     SweepRow::reachable(Armed::PodA, CrashTarget::Tasks, 4),
     SweepRow::reachable(Armed::PodA, CrashTarget::Runs, 12),
     SweepRow::reachable(Armed::PodB, CrashTarget::Tasks, 4),
-    // Structurally unreachable, and printed rather than hidden. Pod B drives
-    // the run only once pod A is gone, and pod A goes only when it is the
-    // armed pod, so no world that arms pod B ever reaches pod B's run writes.
-    // Sweeping the second owner's own recovery writes needs a world with two
-    // armings, which this harness does not build.
+    // Thin rows: each of these stores takes exactly one write from the pod
+    // that reaches it, so the floor is one window rather than a whole ordinal's
+    // pair. Thin is not the same as absent — the workflow outbox is the effect
+    // boundary specification 18's directive names, and it could not be armed at
+    // all until now.
+    SweepRow::reachable(Armed::PodA, CrashTarget::Agents, 1),
+    SweepRow::reachable(Armed::PodA, CrashTarget::Workflow, 1),
+    SweepRow::unreachable(
+        Armed::PodB,
+        CrashTarget::Agents,
+        "pod A seeds 150ms earlier, so pod B's identical instantiation deduplicates on the same derived operation id and commits nothing",
+    ),
+    SweepRow::unreachable(
+        Armed::PodB,
+        CrashTarget::Workflow,
+        "pod B emits no effects until it owns the run; the second-owner row sweeps its run writes, its outbox writes are still owed",
+    ),
+    // Unreachable *by a single arming*, and printed rather than hidden: pod B
+    // drives the run only once pod A is gone, and pod A goes only when it is
+    // the armed pod. The second-owner row below builds the world with two
+    // armings that does reach them.
     SweepRow::unreachable(
         Armed::PodB,
         CrashTarget::Runs,
-        "pod B reaches its run writes only after taking over, which no world that arms pod B does",
+        "pod B reaches its run writes only after taking over; the second-owner row sweeps them",
     ),
 ];
 
@@ -138,13 +161,14 @@ fn error(message: impl Into<String>) -> std::io::Error {
 /// process can take one of them is not closable this way (the transport does
 /// its own bind), so a pod that finds its port taken says so and the driver
 /// retries the world with fresh ports rather than reporting a skip.
-fn unused_ports() -> std::io::Result<(u16, u16)> {
-    let first = TcpListener::bind(("127.0.0.1", 0))?;
-    let second = TcpListener::bind(("127.0.0.1", 0))?;
-    let ports = (first.local_addr()?.port(), second.local_addr()?.port());
-    drop(first);
-    drop(second);
-    Ok(ports)
+fn unused_ports(count: usize) -> std::io::Result<Vec<u16>> {
+    let listeners = (0..count)
+        .map(|_| TcpListener::bind(("127.0.0.1", 0)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    listeners
+        .iter()
+        .map(|listener| Ok(listener.local_addr()?.port()))
+        .collect()
 }
 
 /// Whether this environment permits loopback binding at all.
@@ -159,10 +183,10 @@ fn loopback_available() -> bool {
 
 /// One pod process: boot, join, do its duty, exit.
 async fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let [logical, incarnation, root, port, peer_logical, peer_incarnation, peer_port, prove, rest @ ..] =
-        args
-    else {
-        return Err(error("--node takes eight positional arguments").into());
+    // `peers` is a comma-separated `logical:incarnation:port` list rather than
+    // one fixed peer, because a world that replaces a lost pod has three.
+    let [logical, incarnation, root, port, peers, prove, rest @ ..] = args else {
+        return Err(error("--node takes six positional arguments").into());
     };
 
     let crash = match rest {
@@ -190,15 +214,26 @@ async fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         .await
         .map_err(error)?;
 
-    let peer = ClusterNode::new(
-        NodeId::new(peer_logical.as_str(), peer_incarnation.as_str()),
-        NodeAddress::new("127.0.0.1", peer_port.parse::<u16>()?),
-    )
-    .with_role(ROLE);
+    let mut members = vec![pod.runtime.local_node().clone()];
+    for peer in peers.split(',').filter(|peer| !peer.is_empty()) {
+        let mut parts = peer.split(':');
+        let (Some(peer_logical), Some(peer_incarnation), Some(peer_port)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(error(format!("malformed peer {peer:?}")).into());
+        };
+        members.push(
+            ClusterNode::new(
+                NodeId::new(peer_logical, peer_incarnation),
+                NodeAddress::new("127.0.0.1", peer_port.parse::<u16>()?),
+            )
+            .with_role(ROLE),
+        );
+    }
     pod.runtime.apply_discovery(DiscoverySnapshot::new(
         "multi-pod-agent-fault-soak",
         1,
-        [pod.runtime.local_node().clone(), peer],
+        members,
     ))?;
 
     // Both pods seed. The commands deduplicate on derived operation ids, so
@@ -252,7 +287,12 @@ async fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         pod.stores.tasks.writes(),
         pod.stores.runs.writes(),
         pod.owns_task(flow::task_scope().entity_id().as_str()),
-        pod.owns_run(flow::run_scope().entity_id().as_str()),
+        pod.owns_run(
+            flow::run_scope(&pod.stores.tasks)
+                .await
+                .entity_id()
+                .as_str(),
+        ),
         outcome.took_over,
         outcome.lost_writes,
         flow::task_status(&root).await,
@@ -306,15 +346,10 @@ async fn run_world_once(
     crash: Option<(Armed, CrashTarget, usize, PodCrash)>,
 ) -> Result<World, Box<dyn Error>> {
     let executable = std::env::current_exe()?;
-    let (port_a, port_b) = unused_ports()?;
+    let ports = unused_ports(2)?;
+    let (port_a, port_b) = (ports[0], ports[1]);
 
-    let node_args = |logical: &str,
-                     incarnation: &str,
-                     port: u16,
-                     peer_logical: &str,
-                     peer_incarnation: &str,
-                     peer_port: u16,
-                     armed: bool| {
+    let node_args = |logical: &str, incarnation: &str, port: u16, peers: &str, armed: bool| {
         // Only the crash-free reference world proves the agent entity's remote
         // command arm. Every armed world has a pod that dies, and asking a dead
         // peer costs an ask timeout per world for a property the reference has
@@ -326,9 +361,7 @@ async fn run_world_once(
             incarnation.to_string(),
             root.display().to_string(),
             port.to_string(),
-            peer_logical.to_string(),
-            peer_incarnation.to_string(),
-            peer_port.to_string(),
+            peers.to_string(),
             prove.to_string(),
         ];
         if armed {
@@ -346,9 +379,7 @@ async fn run_world_once(
             "rakka-0",
             "uid-a",
             port_a,
-            "rakka-1",
-            "uid-b",
-            port_b,
+            &format!("rakka-1:uid-b:{port_b}"),
             crash.is_some_and(|(armed, ..)| armed == Armed::PodA),
         ))
         .stdout(Stdio::piped())
@@ -364,9 +395,7 @@ async fn run_world_once(
             "rakka-1",
             "uid-b",
             port_b,
-            "rakka-0",
-            "uid-a",
-            port_a,
+            &format!("rakka-0:uid-a:{port_a}"),
             crash.is_some_and(|(armed, ..)| armed == Armed::PodB),
         ))
         .stdout(Stdio::piped())
@@ -474,6 +503,181 @@ async fn run_world_once(
         ))
         .into()),
     }
+}
+
+/// What the two-arming world did.
+#[derive(Debug)]
+enum Takeover {
+    /// The second owner reached its armed write and died, and the replacement
+    /// finished from the shared record.
+    Crashed,
+    /// The second owner never reached the armed write.
+    Survived,
+    /// A pod found its port taken.
+    PortTaken,
+}
+
+/// The world that sweeps the *second* owner's own durable writes.
+///
+/// Every other row kills the pod that natively owns what it is writing. This
+/// one kills the pod that **inherited** it, which no single-arming world can
+/// reach: pod B drives the run only after taking it over, and pod A gives it up
+/// only by dying — so arming pod B alone finds it with nothing to write, which
+/// is the `0 windows` row the sweep used to print and document as a limit.
+///
+/// Two armings and three pods. Pod A dies at its first task-store write, so it
+/// never drives anything and pod B must take the run's shard over. Pod B is
+/// armed at its `nth` run-store write, and because it makes no run-store writes
+/// until it owns that shard, every ordinal here is a write it made as the
+/// second owner — recovering from a record it did not create. Pod C replaces
+/// it, downs both departed pods, and finishes.
+///
+/// Pods A and B see only each other, so while they run the cluster is the same
+/// two-node shape every other row sweeps; pod C joins knowing all three, which
+/// is what lets it down them.
+async fn run_takeover_world(
+    root: &Path,
+    nth: usize,
+    window: PodCrash,
+) -> Result<Takeover, Box<dyn Error>> {
+    for _attempt in 0..WORLD_BIND_ATTEMPTS {
+        match run_takeover_world_once(root, nth, window).await? {
+            Takeover::PortTaken => {
+                let _ = std::fs::remove_dir_all(root);
+                std::fs::create_dir_all(root)?;
+            }
+            outcome => return Ok(outcome),
+        }
+    }
+    Err(error(format!(
+        "a pod found its port taken on all {WORLD_BIND_ATTEMPTS} attempts"
+    ))
+    .into())
+}
+
+async fn run_takeover_world_once(
+    root: &Path,
+    nth: usize,
+    window: PodCrash,
+) -> Result<Takeover, Box<dyn Error>> {
+    let executable = std::env::current_exe()?;
+    let ports = unused_ports(3)?;
+    let (port_a, port_b, port_c) = (ports[0], ports[1], ports[2]);
+
+    let spawn = |logical: &str,
+                 incarnation: &str,
+                 port: u16,
+                 peers: String,
+                 crash: Option<(CrashTarget, usize, PodCrash)>| {
+        let mut args = vec![
+            "--node".to_string(),
+            logical.to_string(),
+            incarnation.to_string(),
+            root.display().to_string(),
+            port.to_string(),
+            peers,
+            "no-prove".to_string(),
+        ];
+        if let Some((target, nth, window)) = crash {
+            args.push(target.as_label().to_string());
+            args.push(nth.to_string());
+            args.push(window.as_label().to_string());
+        }
+        Command::new(&executable)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+    };
+
+    let mut pod_a = spawn(
+        "rakka-0",
+        "uid-a",
+        port_a,
+        format!("rakka-1:uid-b:{port_b}"),
+        Some((CrashTarget::Tasks, 1, PodCrash::BeforeWrite)),
+    )?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut pod_b = spawn(
+        "rakka-1",
+        "uid-b",
+        port_b,
+        format!("rakka-0:uid-a:{port_a}"),
+        Some((CrashTarget::Runs, nth, window)),
+    )?;
+
+    let status_a = match tokio::time::timeout(WORLD_DEADLINE, pod_a.wait()).await {
+        Ok(status) => status?,
+        Err(_) => return Err(error("the first pod outlived the harness deadline").into()),
+    };
+    flow::announce_departure(root, "rakka-0", "uid-a")?;
+
+    let status_b = match tokio::time::timeout(WORLD_DEADLINE, pod_b.wait()).await {
+        Ok(status) => status?,
+        Err(_) => return Err(error("the second pod outlived the harness deadline").into()),
+    };
+
+    let out_a = drain(&mut pod_a).await;
+    let out_b = drain(&mut pod_b).await;
+    if out_a.contains("port-taken:") || out_b.contains("port-taken:") {
+        return Ok(Takeover::PortTaken);
+    }
+    for line in out_a.lines().chain(out_b.lines()) {
+        if line.contains("drive-error:") {
+            eprintln!("{line}");
+        }
+    }
+    if parse_report(&out_a).is_some() {
+        return Err(error(
+            "the first pod was armed at its first task-store write and did not die, so the \
+             second pod never inherited anything",
+        )
+        .into());
+    }
+    let _ = status_a;
+
+    // Pod B reported, so it outlived its armed write: the ordinal is past what
+    // the second owner actually writes. No replacement is needed, and the world
+    // still has to converge — pod A died in it.
+    if let Some(report) = parse_report(&out_b) {
+        require_success(Some(status_b), "the second owner")?;
+        if !report.took_over {
+            return Err(error(
+                "the second pod finished without taking over, so its writes were not the \
+                 second owner's",
+            )
+            .into());
+        }
+        return Ok(Takeover::Survived);
+    }
+
+    flow::announce_departure(root, "rakka-1", "uid-b")?;
+    let mut pod_c = spawn(
+        "rakka-2",
+        "uid-c",
+        port_c,
+        format!("rakka-0:uid-a:{port_a},rakka-1:uid-b:{port_b}"),
+        None,
+    )?;
+    let status_c = match tokio::time::timeout(WORLD_DEADLINE, pod_c.wait()).await {
+        Ok(status) => status?,
+        Err(_) => return Err(error("the replacement pod outlived the harness deadline").into()),
+    };
+    let out_c = drain(&mut pod_c).await;
+    if out_c.contains("port-taken:") {
+        return Ok(Takeover::PortTaken);
+    }
+    for line in out_c.lines() {
+        if line.contains("drive-error:") {
+            eprintln!("{line}");
+        }
+    }
+    require_success(Some(status_c), "the replacement pod-c")?;
+    if parse_report(&out_c).is_none() {
+        return Err(error("the replacement pod never reported its writes").into());
+    }
+    Ok(Takeover::Crashed)
 }
 
 /// A pod whose work is evidence must have exited cleanly.
@@ -878,6 +1082,60 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
         }
         swept.push(fired);
     }
+
+    // The row no single-arming world can reach: the second owner's own writes.
+    let mut takeover = 0usize;
+    let mut dry_streak = 0usize;
+    let mut last_firing = 0usize;
+    let mut nth = 1usize;
+    while nth <= SWEEP_CEILING && dry_streak < DRY_ORDINALS_TO_STOP {
+        let mut reached = false;
+        for window in [PodCrash::BeforeWrite, PodCrash::AfterWrite] {
+            let label = format!("takeover-runs-{nth}-{}", window.as_label());
+            let context = format!(
+                "the second owner killed at run write {nth} ({})",
+                window.as_label()
+            );
+            let root = fresh_root(&label)?;
+            // `OneIdentity` in both arms: pod A dies in this world either way,
+            // so a retry of the same turn is legitimate.
+            match run_takeover_world(&root, nth, window).await? {
+                Takeover::Crashed => {
+                    assert_converged(&root, &context, Ledger::OneIdentity).await?;
+                    reached = true;
+                    takeover += 1;
+                }
+                Takeover::Survived => {
+                    assert_converged(
+                        &root,
+                        &format!("{context}, which never fired"),
+                        Ledger::OneIdentity,
+                    )
+                    .await?;
+                }
+                Takeover::PortTaken => {
+                    unreachable!("run_takeover_world retries or fails on a taken port")
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        if reached {
+            last_firing = nth;
+            dry_streak = 0;
+        } else {
+            dry_streak += 1;
+        }
+        nth += 1;
+    }
+    println!("  second owner runs: {takeover} windows, ordinals 1-{last_firing}");
+    if takeover < TAKEOVER_ROW_FLOOR {
+        return Err(error(format!(
+            "the second owner's own writes fired {takeover} windows, below the floor of \
+             {TAKEOVER_ROW_FLOOR}: the two-arming world stopped reaching them"
+        ))
+        .into());
+    }
+    swept.push(takeover);
 
     // No `windows == 0` guard: every reachable row has already been held to its
     // own floor above, which is strictly stronger. A total of zero now fails

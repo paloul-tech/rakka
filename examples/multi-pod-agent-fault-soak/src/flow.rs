@@ -64,15 +64,34 @@ pub fn task_scope() -> AgentTaskScope {
     .expect("the task scope is valid")
 }
 
-/// The run's scope, derived from the task and its first assignment generation
-/// exactly as the task entity derives it.
+/// The run's scope for the task's *current* assignment generation.
+///
+/// Read from the durable record rather than pinned at generation 1. The run id
+/// is derived from the task and the generation exactly as the task entity
+/// derives it, so a task that is ever reassigned names a *different* run — and
+/// a pod that only ever looks for generation 1's run leaves the live one driven
+/// by nobody, on either pod, for the rest of the world.
+///
+/// A task not yet assigned reads as generation 1, which is the generation its
+/// first assignment will take.
+pub async fn run_scope<S>(tasks: &S) -> AgentRunScope
+where
+    S: rakka_persistence::DurableStateStore<rakka_agent::AgentTaskState>,
+{
+    let generation = load_agent_task_state(tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|state| state.task().map(|task| task.assignment_generation))
+        .unwrap_or_else(|| AgentAssignmentGeneration::new(1));
+    run_scope_for(generation)
+}
+
+/// The run scope one assignment generation names.
 #[must_use]
-pub fn run_scope() -> AgentRunScope {
-    let run = run_id_for_assignment(
-        &AgentTaskId::new(TASK).expect("valid"),
-        AgentAssignmentGeneration::new(1),
-    )
-    .expect("the run id derives");
+pub fn run_scope_for(generation: AgentAssignmentGeneration) -> AgentRunScope {
+    let run = run_id_for_assignment(&AgentTaskId::new(TASK).expect("valid"), generation)
+        .expect("the run id derives");
     AgentRunScope::new(TenantId::new(TENANT), agent_id(), run).expect("the run scope is valid")
 }
 
@@ -286,15 +305,30 @@ pub const DEPARTED: &str = "departed";
 /// third: a reader landing between the two sees an empty announcement, and
 /// `take_over` can only refuse it. The rename is the publish — the file never
 /// exists in a state a reader can observe as incomplete.
+/// One line per departure, oldest first. A world can lose more than one pod.
 pub fn announce_departure(root: &Path, logical: &str, incarnation: &str) -> std::io::Result<()> {
+    let mut announced = std::fs::read_to_string(root.join(DEPARTED)).unwrap_or_default();
+    announced.push_str(&format!("{logical} {incarnation}\n"));
     let temp = root.join(format!("{DEPARTED}.tmp"));
-    std::fs::write(&temp, format!("{logical} {incarnation}"))?;
+    std::fs::write(&temp, announced)?;
     std::fs::rename(&temp, root.join(DEPARTED))
 }
 
-/// Whether the driver has announced that the other pod is gone.
-fn peer_departed(pod: &Pod) -> bool {
-    pod.root.join(DEPARTED).exists()
+/// Every departure announced so far.
+fn announced_departures(pod: &Pod) -> Vec<(String, String)> {
+    std::fs::read_to_string(pod.root.join(DEPARTED))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some(logical), Some(incarnation)) => {
+                    Some((logical.to_string(), incarnation.to_string()))
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Downs the departed member, which refreshes ownership onto this pod.
@@ -304,21 +338,13 @@ fn peer_departed(pod: &Pod) -> bool {
 /// produces for one. The shards it hosted move here, and the entities are
 /// re-materialized from the shared record — which is the whole claim of
 /// [specification 15](../../../docs/plans/rakka-agent/spec.md).
-fn take_over(pod: &mut Pod) -> Result<(), String> {
-    let announcement =
-        std::fs::read_to_string(pod.root.join(DEPARTED)).map_err(|error| error.to_string())?;
-    let mut parts = announcement.split_whitespace();
-    let (Some(logical), Some(incarnation)) = (parts.next(), parts.next()) else {
-        return Err(format!(
-            "malformed departure announcement: {announcement:?}"
-        ));
-    };
+fn take_over(pod: &mut Pod, logical: &str, incarnation: &str) -> Result<(), String> {
     let departed = rakka_cluster::NodeId::new(logical, incarnation);
     let observed_at = pod.clock.fetch_add(1, Ordering::SeqCst);
     pod.runtime
         .mark_down(&departed, observed_at)
-        .map_err(|error| error.to_string())?;
-    Ok(())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Drives every entity this pod owns until the task is terminal, the deadline
@@ -336,6 +362,7 @@ pub async fn drive(
 ) -> Result<DriveOutcome, String> {
     let mut started = std::time::Instant::now();
     let mut took_over = false;
+    let mut downed = std::collections::BTreeSet::new();
     let mut errors = DriveErrors::default();
     let adapter = LedgerModelAdapter::new(pod.root.clone(), "resolved");
     let dispatcher = ScriptedDispatcher::with_adapter(adapter);
@@ -349,9 +376,15 @@ pub async fn drive(
                 took_over,
             });
         }
-        if !took_over && peer_departed(pod) {
-            match take_over(pod) {
+        // Every departure, not just the first: a world can lose one pod, have
+        // its survivor take over, and then lose the survivor too.
+        for (logical, incarnation) in announced_departures(pod) {
+            if downed.contains(&(logical.clone(), incarnation.clone())) {
+                continue;
+            }
+            match take_over(pod, &logical, &incarnation) {
                 Ok(()) => {
+                    downed.insert((logical, incarnation));
                     took_over = true;
                     // The deadline restarts here. It was measured from this
                     // pod's own boot, so the later its peer died the less time
@@ -388,9 +421,12 @@ pub async fn drive(
             }
         }
 
-        if pod.owns_run(run_scope().entity_id().as_str()) {
+        // Re-read each round: a reassignment between rounds moves the live run
+        // to a new id, and this is the loop that has to follow it.
+        let run_scope = run_scope(&pod.stores.tasks).await;
+        if pod.owns_run(run_scope.entity_id().as_str()) {
             let mut run = run_entity(
-                &run_scope(),
+                &run_scope,
                 &pod.stores.runs,
                 &rakka_agent::WorkflowAgentRunEffectSink::new(
                     pod.stores.workflow.clone(),

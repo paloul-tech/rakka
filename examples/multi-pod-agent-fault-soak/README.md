@@ -69,12 +69,23 @@ movement, so the harness holds the takeover count to a floor rather than
 counting markers and calling them recoveries.
 
 Each row also carries a floor, because `PodB runs: 0 windows` is legitimately
-zero: a bare "did anything fire?" guard cannot tell an intended zero from a
-regression that stopped a row dead. Pod B drives the run only once pod A is
-gone, and pod A only goes when *it* is the armed pod, so a world that arms pod B
-never reaches pod B's run writes. Sweeping the second owner's own recovery
-writes needs a world with two armings, which this harness does not yet build.
-It is the one durable transition here that nothing kills a pod inside.
+zero for a *single-arming* world: a bare "did anything fire?" guard cannot tell
+an intended zero from a regression that stopped a row dead. Pod B drives the run
+only once pod A is gone, and pod A only goes when *it* is the armed pod.
+
+**The second owner's own writes get their own world.** Every other row kills the
+pod that natively owns what it is writing; that one kills the pod that
+*inherited* it. Pod A is armed at its first task-store write, so it never drives
+anything and pod B must take the run's shard over; pod B is armed at its `nth`
+run-store write, and since it makes none until it owns that shard, every ordinal
+is a write it made as the second owner, redriving a record it did not create.
+A third pod replaces it, downs both departed pods, and finishes. Pods A and B
+see only each other, so while they run the cluster is the same two-node shape
+every other row sweeps; the replacement joins knowing all three, which is what
+lets it down them.
+
+Still owed: the second owner's *outbox* writes. The two-arming world arms its
+run store, not its workflow store.
 
 Set `RAKKA_MULTI_POD_VERBOSE=1` to see each pod's exit line — which entities it
 owned, whether it took over from a departed peer, how many rounds lost their

@@ -98,13 +98,16 @@ are owned by different pods before any of it is believed.
 Deliberate limits are documented in the harness README: the shared directory
 stands in for a shared durable backend (production is PostgreSQL), departure is
 announced rather than detected, history sinks are per-pod, and the team and
-conversation entities are registered but not exercised by the workload. Two
-more limits bound the sweep itself. Only the task and run stores are armed —
-the agent store and the durable workflow outbox are not — and the second
-owner's *own* recovery writes are never a window: a pod only takes over once
-its peer is armed and gone, so a world that arms the survivor never reaches the
-writes it makes after taking over. The harness prints that row as `0 windows`
-rather than hiding it. Both need a world with two armings, which is owed work.
+conversation entities are registered but not exercised by the workload.
+
+The agent store and the durable workflow outbox are armed alongside the task and
+run stores, so the effect boundary specification 18's directive names is swept
+rather than unreachable. And the second owner's *own* recovery writes have their
+own world: every other row kills the pod that natively owns what it is writing,
+while that one kills the pod that inherited it — pod A dies at its first
+task-store write so pod B must take the run's shard over, pod B is armed at its
+`nth` run-store write, and a third pod replaces it, downs both, and finishes.
+Still owed: the second owner's outbox writes, which that world does not arm.
 
 ## In-process matrix added by slice 6.1
 
