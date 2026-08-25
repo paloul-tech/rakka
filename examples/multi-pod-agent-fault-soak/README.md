@@ -77,8 +77,16 @@ writes needs a world with two armings, which this harness does not yet build.
 It is the one durable transition here that nothing kills a pod inside.
 
 Set `RAKKA_MULTI_POD_VERBOSE=1` to see each pod's exit line — which entities it
-owned, whether it took over from a departed peer, and what the durable record
-said when it stopped.
+owned, whether it took over from a departed peer, how many rounds lost their
+compare-and-set to the other pod, and what the durable record said when it
+stopped.
+
+Drive-loop errors are surfaced without the flag, because a loop that errored
+every round is the diagnosis for a world that failed to converge. A round that
+loses its compare-and-set to the other pod is not one of them: two pods writing
+one record is the topology here, so those are counted into `lost-writes=` and
+never printed. Printing them would bury the errors that matter under the ones
+that do not.
 
 Through the gate, alongside the repository's other multi-process check:
 
@@ -99,6 +107,21 @@ Both pods then seed: they instantiate the agent and create the task. The
 commands deduplicate on derived operation ids, so two pods issuing them produce
 one agent and one task — which is also what an ingress redelivering to whichever
 pod is up actually does.
+
+Both pods are `kill_on_drop` and both of the driver's waits are bounded, so an
+early return anywhere reaps them rather than leaving them running to their own
+deadline in a directory the driver has stopped watching. Each pod's exit status
+is checked: the surviving pod is the one that performs the recovery a window
+exists to prove, so one that panicked or was killed leaves a converged record
+nothing produced on purpose. Which pod is the survivor comes from the arming
+rather than from which one reported — an armed pod can reach its write inside
+`system.shutdown()`, after its work is done and its line already flushed, so
+"both pods reported" is a real and convergent outcome.
+
+A pod that takes over its peer's shards restarts its own deadline at that
+moment. Measured from boot, the later its peer died the less time it had for the
+recovery being tested, and running out reported as "the task did not converge on
+Completed" — pointing at the agent domain rather than at the harness's budget.
 
 **There is exactly one way this harness skips**, and it is settled before any
 world runs: if the sandbox refuses a loopback bind at all, the driver says so

@@ -327,22 +327,38 @@ fn take_over(pod: &mut Pod) -> Result<(), String> {
 /// other pod dies, it is the one that has to finish the work.
 ///
 /// Returns whether the task reached a terminal status.
-pub async fn drive(pod: &mut Pod, rounds: usize, deadline: Duration) -> Result<bool, String> {
+pub async fn drive(
+    pod: &mut Pod,
+    rounds: usize,
+    deadline: Duration,
+) -> Result<DriveOutcome, String> {
     let _ = &TOOK_OVER;
-    let started = std::time::Instant::now();
+    let mut started = std::time::Instant::now();
     let mut took_over = false;
+    let mut errors = DriveErrors::default();
     let adapter = LedgerModelAdapter::new(pod.root.clone(), "resolved");
     let dispatcher = ScriptedDispatcher::with_adapter(adapter);
 
     for _round in 0..rounds {
         if started.elapsed() >= deadline {
-            return Ok(terminal(&pod.stores.tasks).await);
+            return Ok(DriveOutcome {
+                terminal: terminal(&pod.stores.tasks).await,
+                last_error: errors.last,
+                lost_writes: errors.lost_writes,
+            });
         }
         if !took_over && peer_departed(pod) {
             match take_over(pod) {
                 Ok(()) => {
                     took_over = true;
                     TOOK_OVER.store(true, Ordering::SeqCst);
+                    // The deadline restarts here. It was measured from this
+                    // pod's own boot, so the later its peer died the less time
+                    // it had left for the recovery the window exists to prove
+                    // — and running out reported as "the task did not converge
+                    // on Completed", pointing at the agent domain rather than
+                    // at the harness's own budget.
+                    started = std::time::Instant::now();
                 }
                 // Not latched. `mark_down` refuses a node the membership has
                 // not admitted yet, and the shard coordinator lease has to be
@@ -359,10 +375,15 @@ pub async fn drive(pod: &mut Pod, rounds: usize, deadline: Duration) -> Result<b
 
         if pod.owns_task(task_scope().entity_id().as_str()) {
             let mut task = task_store(pod);
-            if task.recover(now(pod)).await.is_ok() {
-                if let Ok(progress) = task.settle_side_effects(&pod.router, now(pod)).await {
-                    progressed |= progress.settled > 0 || progress.assigned;
-                }
+            // `map(|_| ())` drops the state reference `recover` hands back,
+            // which borrows the entity the settle below needs.
+            let recovered = task.recover(now(pod)).await.map(|_| ());
+            match recovered {
+                Ok(()) => match task.settle_side_effects(&pod.router, now(pod)).await {
+                    Ok(progress) => progressed |= progress.settled > 0 || progress.assigned,
+                    Err(error) => errors.record("task settle", &error, task_lost_the_write(&error)),
+                },
+                Err(error) => errors.record("task recover", &error, task_lost_the_write(&error)),
             }
         }
 
@@ -375,24 +396,135 @@ pub async fn drive(pod: &mut Pod, rounds: usize, deadline: Duration) -> Result<b
                     SharedAtomicWorkflowClock::new(pod.clock.clone()),
                 ),
             );
-            if run.recover(now(pod)).await.is_ok() {
-                if let Ok(progress) = run.settle_side_effects(&pod.router, now(pod)).await {
-                    progressed |= progress.settled > 0 || progress.transitions > 0;
+            let recovered = run.recover(now(pod)).await.map(|_| ());
+            match recovered {
+                Ok(()) => {
+                    match run.settle_side_effects(&pod.router, now(pod)).await {
+                        Ok(progress) => {
+                            progressed |= progress.settled > 0 || progress.transitions > 0
+                        }
+                        Err(error) => {
+                            errors.record("run settle", &error, run_lost_the_write(&error))
+                        }
+                    }
+                    match dispatcher.drive(&mut run, &pod.router, now(pod)).await {
+                        Ok(answered) => progressed |= answered > 0,
+                        Err(error) => {
+                            errors.record("run drive", &error, run_lost_the_write(&error))
+                        }
+                    }
                 }
-                if let Ok(answered) = dispatcher.drive(&mut run, &pod.router, now(pod)).await {
-                    progressed |= answered > 0;
-                }
+                Err(error) => errors.record("run recover", &error, run_lost_the_write(&error)),
             }
         }
 
         if terminal(&pod.stores.tasks).await {
-            return Ok(true);
+            return Ok(DriveOutcome {
+                terminal: true,
+                last_error: errors.last,
+                lost_writes: errors.lost_writes,
+            });
         }
         if !progressed {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
-    Ok(terminal(&pod.stores.tasks).await)
+    Ok(DriveOutcome {
+        terminal: terminal(&pod.stores.tasks).await,
+        last_error: errors.last,
+        lost_writes: errors.lost_writes,
+    })
+}
+
+/// What a pod's drive loop ended up doing.
+pub struct DriveOutcome {
+    /// Whether the task reached a terminal status.
+    pub terminal: bool,
+    /// The last error any round produced that was not an ordinary lost write.
+    pub last_error: Option<String>,
+    /// How many rounds lost their compare-and-set to the other pod.
+    pub lost_writes: usize,
+}
+
+/// The errors a drive loop saw, reported once each.
+///
+/// Unlike the in-process sweeps — which swallow errors deliberately, because
+/// there the injected loss *is* a returned error — the loss injected here is
+/// `process::abort()`. A returned error is therefore never the fault and is
+/// always something genuinely wrong: a codec failure, a schema rejection, or a
+/// revision-conflict storm makes every round a silent no-op, the pod spins to
+/// its deadline, and the only symptom is "the task did not converge on
+/// Completed" with the code that named the subsystem already dropped.
+///
+/// Errors are not fatal. Two pods writing one record is the documented topology
+/// here, so a revision conflict is an ordinary round that lost and will be
+/// retried. What they must not be is invisible.
+#[derive(Default)]
+struct DriveErrors {
+    seen: std::collections::BTreeSet<String>,
+    lost_writes: usize,
+    last: Option<String>,
+}
+
+impl DriveErrors {
+    /// Records one error. `lost_write` marks the ordinary kind.
+    ///
+    /// Two pods writing one record is the documented topology here, so a round
+    /// that loses its compare-and-set is not a fault — it is counted and
+    /// retried, never printed. Printing it would bury the errors that matter
+    /// under the ones that do not, which is the same silence in a louder form.
+    fn record(&mut self, what: &str, error: &impl std::fmt::Display, lost_write: bool) {
+        if lost_write {
+            self.lost_writes += 1;
+            return;
+        }
+        let message = format!("{what}: {error}");
+        if self.seen.insert(message.clone()) {
+            eprintln!("drive error: {message}");
+        }
+        self.last = Some(message);
+    }
+}
+
+/// Whether a task error is this pod losing a compare-and-set to the other.
+///
+/// A settle reaches the store through the choreography host, so the conflict
+/// arrives nested rather than at the top level — matching only the direct
+/// variant classifies every real lost write as a fault.
+fn task_lost_the_write(error: &rakka_agent::AgentTaskError) -> bool {
+    use rakka_agent::AgentTaskError;
+    match error {
+        AgentTaskError::Persistence(persistence) => is_revision_conflict(persistence),
+        AgentTaskError::Choreography(nested) => choreography_lost_the_write(nested),
+        _ => false,
+    }
+}
+
+/// Whether a run error is this pod losing a compare-and-set to the other.
+fn run_lost_the_write(error: &rakka_agent::AgentRunError) -> bool {
+    use rakka_agent::AgentRunError;
+    match error {
+        AgentRunError::Persistence(persistence) => is_revision_conflict(persistence),
+        AgentRunError::Choreography(nested) => choreography_lost_the_write(nested),
+        AgentRunError::Task(nested) => task_lost_the_write(nested),
+        _ => false,
+    }
+}
+
+fn choreography_lost_the_write(error: &rakka_agent::AgentChoreographyError) -> bool {
+    match error {
+        rakka_agent::AgentChoreographyError::Persistence(persistence) => {
+            is_revision_conflict(persistence)
+        }
+        _ => false,
+    }
+}
+
+const fn is_revision_conflict(error: &rakka_persistence::DurableError) -> bool {
+    matches!(
+        error,
+        rakka_persistence::DurableError::RevisionConflict { .. }
+    )
 }
 
 async fn terminal<S>(store: &S) -> bool

@@ -2217,13 +2217,21 @@ impl AgentA2aSendExecutor for SkillNamedExecutor {
         delegation: &'a AgentDelegationRecord,
         _credential: Option<&'a AgentEphemeralCredential>,
     ) -> AgentDispatchFuture<'a, AgentA2aSendFinding> {
-        self.seen
-            .lock()
-            .expect("the record log should not be poisoned")
-            .push(delegation.clone());
+        let recorded = delegation.clone();
         let skill = delegation.requested_skill.as_str().to_string();
         let refused = self.fail_skill == Some(skill.as_str());
         Box::pin(async move {
+            // Recorded when the send runs, not when its future is built. Built
+            // outside the async block, a dispatch path that constructs this
+            // future and abandons it unpolled — an armed store crash between
+            // the intent commit and the await, a cancelled dispatch, a timeout
+            // — logged an invocation for a send that never reached the peer,
+            // while `cancellation_recovery.rs` and `delegation_limits.rs`
+            // assert at-most-once semantics off this very log.
+            self.seen
+                .lock()
+                .expect("the record log should not be poisoned")
+                .push(recorded);
             if refused {
                 return Ok(AgentA2aSendFinding::Refused {
                     code: "peer-unavailable".to_string(),
@@ -2280,12 +2288,19 @@ pub fn proposing_turn() -> AgentModelTurn {
 }
 
 /// A fixture whose scripted model fans out and then proposes.
+///
+/// Keyed by turn number rather than by call order. A crash sweep re-asks a turn
+/// whose commit was rolled back, and an order-keyed script answers that re-ask
+/// with the *next* entry — the proposing turn for a re-asked turn 1, then an
+/// empty turn once the queue drains — so the sweep would measure the script's
+/// position rather than the run's recovery. `fan_in_recovery.rs` builds this
+/// same world by hand for exactly that reason.
 pub fn fan_out_fixture(executor: Arc<SkillNamedExecutor>) -> Fixture {
     Fixture::new(
         ScriptedDispatcher::with_adapter(
             DeterministicModelAdapter::new()
-                .with_turn(fan_out_turn())
-                .with_turn(proposing_turn()),
+                .with_turn_for(1, fan_out_turn())
+                .with_turn_for(2, proposing_turn()),
         )
         .with_a2a_send_executor(executor),
     )

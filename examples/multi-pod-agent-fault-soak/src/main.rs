@@ -202,11 +202,23 @@ async fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // what an ingress that redelivers to whichever pod is up actually does. A
     // seed that loses its compare-and-set to the other pod is not an error:
     // the record it wanted already exists.
-    for _attempt in 0..5 {
-        if flow::seed(&pod).await.is_ok() {
-            break;
+    // Wider than the driver's own 150 ms spawn stagger, which the previous
+    // budget of five 20 ms attempts was not. A seed that loses its
+    // compare-and-set to the other pod is not an error — the record it wanted
+    // already exists — so this is not fatal; what it must not be is silent.
+    let mut seed_error = None;
+    for _attempt in 0..20 {
+        match flow::seed(&pod).await {
+            Ok(()) => {
+                seed_error = None;
+                break;
+            }
+            Err(error) => seed_error = Some(error),
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if let Some(error) = &seed_error {
+        eprintln!("pod {logical} never seeded: {error}");
     }
     // Before driving: replay the instantiation through the agent entity's
     // sharded command surface, which is the only path that exercises the
@@ -217,18 +229,28 @@ async fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         "skipped"
     };
 
-    let terminal = flow::drive(&mut pod, ROUNDS, POD_DEADLINE)
+    let outcome = flow::drive(&mut pod, ROUNDS, POD_DEADLINE)
         .await
         .map_err(error)?;
+    let terminal = outcome.terminal;
+
+    // On its own line, so the done line stays whitespace-parseable and the
+    // driver can echo the cause of a world that failed to converge instead of
+    // reporting only that it did.
+    if let Some(last_error) = &outcome.last_error {
+        println!("pod {logical} drive-error: {last_error}");
+    }
 
     println!(
         "pod {logical} done: terminal={terminal} task-writes={} run-writes={} \
-         owns-task={} owns-run={} took-over={} agent-command={agent_command} status={:?}",
+         owns-task={} owns-run={} took-over={} agent-command={agent_command} \
+         lost-writes={} status={:?}",
         pod.stores.tasks.writes(),
         pod.stores.runs.writes(),
         pod.owns_task(flow::task_scope().entity_id().as_str()),
         pod.owns_run(flow::run_scope().entity_id().as_str()),
         flow::TOOK_OVER.load(std::sync::atomic::Ordering::SeqCst),
+        outcome.lost_writes,
         flow::task_status(&root).await,
     );
     pod.system.shutdown();
@@ -327,6 +349,10 @@ async fn run_world_once(
         ))
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
+        // Tokio does not kill on drop by default, so every early `?` below used
+        // to return with both pods still running — to their own 20s deadline,
+        // in a directory the driver had stopped watching and never cleaned up.
+        .kill_on_drop(true)
         .spawn()?;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let mut pod_b = Command::new(&executable)
@@ -341,28 +367,54 @@ async fn run_world_once(
         ))
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .spawn()?;
 
     // Whichever pod leaves first — killed or finished — is announced to the
     // other. A survivor that guessed instead would be the second writer
     // specification 15 forbids.
-    let departed = tokio::select! {
-        status = pod_a.wait() => { status?; ("rakka-0", "uid-a") }
-        status = pod_b.wait() => { status?; ("rakka-1", "uid-b") }
+    //
+    // Bounded, like the wait below it. This select had no deadline and no kill
+    // path, so a pod wedged in an ask against a peer that bound but never
+    // answered, or blocked on a full 64KiB stdout pipe nothing drains until
+    // both waits return, hung the driver forever — and the gate tests shell out
+    // with no timeout of their own.
+    let mut status_a = None;
+    let mut status_b = None;
+    let departed = match tokio::time::timeout(WORLD_DEADLINE, async {
+        tokio::select! {
+            status = pod_a.wait() => (status, true),
+            status = pod_b.wait() => (status, false),
+        }
+    })
+    .await
+    {
+        Ok((status, true)) => {
+            status_a = Some(status?);
+            ("rakka-0", "uid-a")
+        }
+        Ok((status, false)) => {
+            status_b = Some(status?);
+            ("rakka-1", "uid-b")
+        }
+        Err(_) => return Err(error("neither pod exited before the harness deadline").into()),
     };
     flow::announce_departure(root, departed.0, departed.1)?;
 
-    let wait_both = async {
-        let _ = pod_a.wait().await;
-        let _ = pod_b.wait().await;
-    };
-    if tokio::time::timeout(Duration::from_secs(60), wait_both)
-        .await
-        .is_err()
-    {
-        let _ = pod_a.kill().await;
-        let _ = pod_b.kill().await;
-        return Err(error("a pod outlived the harness deadline").into());
+    let remaining = tokio::time::timeout(WORLD_DEADLINE, async {
+        if status_a.is_none() {
+            status_a = Some(pod_a.wait().await?);
+        }
+        if status_b.is_none() {
+            status_b = Some(pod_b.wait().await?);
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    match remaining {
+        Ok(Ok(())) => {}
+        Ok(Err(io)) => return Err(io.into()),
+        Err(_) => return Err(error("a pod outlived the harness deadline").into()),
     }
 
     let out_a = drain(&mut pod_a).await;
@@ -370,26 +422,45 @@ async fn run_world_once(
     if std::env::var("RAKKA_MULTI_POD_VERBOSE").is_ok() {
         eprintln!("pod-a: {}pod-b: {}", out_a, out_b);
     }
+    // Always, not only under the verbose flag: a drive loop that errored every
+    // round is the diagnosis for a world that does not converge, and it used to
+    // be discarded entirely.
+    for line in out_a.lines().chain(out_b.lines()) {
+        if line.contains("drive-error:") {
+            eprintln!("{line}");
+        }
+    }
     if out_a.contains("port-taken:") || out_b.contains("port-taken:") {
         return Ok(World::PortTaken);
     }
     if root.join(CRASHED).exists() {
-        // Exactly one pod survives an armed crash, and its own exit line is
-        // what says whether a shard actually moved.
-        return match (parse_report(&out_a), parse_report(&out_b)) {
-            (Some(survivor), None) | (None, Some(survivor)) => Ok(World::Crashed(survivor)),
-            (Some(_), Some(_)) => Err(error(
-                "a crash marker was written but both pods reported: the armed pod did not die",
-            )
-            .into()),
-            (None, None) => Err(error(
-                "a crash marker was written and neither pod reported: the survivor died too",
-            )
-            .into()),
+        // Which pod survived is the arming, not whichever one happens to have
+        // reported. An armed pod can reach its write inside `system.shutdown()`
+        // — after its work is done and its line already flushed — so "both pods
+        // reported" is a real and convergent outcome, not a contradiction.
+        let (report, status, who) = match crash.map(|(armed, ..)| armed) {
+            Some(Armed::PodA) => (parse_report(&out_b), status_b, "pod-b"),
+            Some(Armed::PodB) => (parse_report(&out_a), status_a, "pod-a"),
+            None => {
+                return Err(error("a crash marker was written in a world with no arming").into())
+            }
         };
+        let Some(survivor) = report else {
+            return Err(error(format!(
+                "a crash marker was written and the surviving {who} never reported: \
+                 it died too"
+            ))
+            .into());
+        };
+        require_success(status, &format!("the surviving {who}"))?;
+        return Ok(World::Crashed(survivor));
     }
     match (parse_report(&out_a), parse_report(&out_b)) {
-        (Some(pod_a), Some(pod_b)) => Ok(World::Survived(pod_a, pod_b)),
+        (Some(pod_a), Some(pod_b)) => {
+            require_success(status_a, "pod-a")?;
+            require_success(status_b, "pod-b")?;
+            Ok(World::Survived(pod_a, pod_b))
+        }
         // No skip, no crash marker, and a pod that never reported. Something
         // died that the harness did not arm, and reading that as a skip or as
         // a spent sweep row is how a real failure disappears into a green run.
@@ -398,6 +469,28 @@ async fn run_world_once(
              pod-a: {out_a}pod-b: {out_b}"
         ))
         .into()),
+    }
+}
+
+/// A pod whose work is evidence must have exited cleanly.
+///
+/// The survivor performs the recovery a window exists to prove, so one that
+/// panicked, returned an error, or was killed leaves a converged record nothing
+/// produced on purpose. Only the armed pod may exit abnormally, and it is the
+/// one that leaves no report to read. Neither status was inspected at all
+/// before: `status?` kept only the `io::Result` of waiting, and the second wait
+/// discarded both.
+fn require_success(
+    status: Option<std::process::ExitStatus>,
+    who: &str,
+) -> Result<(), Box<dyn Error>> {
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(error(format!(
+            "{who} exited with {status}, so what it did is not evidence of anything"
+        ))
+        .into()),
+        None => Err(error(format!("{who} never reported an exit status")).into()),
     }
 }
 
@@ -419,6 +512,13 @@ enum World {
 
 /// How many times a world is re-run when a pod finds its port taken.
 const WORLD_BIND_ATTEMPTS: usize = 4;
+
+/// How long the driver waits on either pod before giving up on the world.
+///
+/// Comfortably over `POD_DEADLINE`, which a pod restarts when it takes over its
+/// peer's shards, so a world that reaches this has stopped making progress
+/// rather than merely taken the long path.
+const WORLD_DEADLINE: Duration = Duration::from_secs(90);
 
 /// What one pod reported about the agent entity's sharded command surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

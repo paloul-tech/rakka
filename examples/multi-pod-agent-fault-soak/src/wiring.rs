@@ -13,7 +13,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +34,7 @@ use rakka_agent::{
     InMemoryAgentTeamHistoryStore, ShardedExchangeRoute, WorkflowAgentRunEffectSink,
 };
 use rakka_agent_workflow::substrate::WorkflowState;
+use rakka_agent_workflow::AgentTimestampMillis;
 use rakka_cluster::{ClusterNode, MembershipConfig, NodeAddress, NodeId};
 use rakka_core::{ActorSystem, Message, ReplyTo};
 use rakka_remote::{SerializationRegistry, TcpRemoteTransport, TcpRemoteTransportConfig};
@@ -329,6 +330,19 @@ pub async fn boot_pod(
     let stores = PodStores::open(root, crash);
     let counter = Arc::new(AtomicU64::new(1));
     let clock = SharedAtomicWorkflowClock::new(counter.clone());
+
+    // The same clock the drive loop stamps its transitions from. Left at
+    // `default()`, each entity actor stamps wall-clock milliseconds while
+    // `flow::now` stamps this counter — two writers putting values ~1.75e12
+    // apart into the same `updated_at`, so which one a record carries depends
+    // on who wrote last. Nothing reads elapsed time in this fixture today (no
+    // goal deadline, wake policy, escrow, or checkpoint), which is the only
+    // reason it is latent rather than wrong; every sibling acceptance example
+    // aligns the two, and so does this one now.
+    let entity_clock: Arc<dyn Fn() -> AgentTimestampMillis + Send + Sync> = {
+        let counter = counter.clone();
+        Arc::new(move || AgentTimestampMillis::new(counter.fetch_add(1, Ordering::SeqCst)))
+    };
     let ask_client = runtime.ask_client();
     let command_ask_client = runtime.ask_client();
 
@@ -401,7 +415,7 @@ pub async fn boot_pod(
         stores.agents.clone(),
         stores.task_history.clone(),
         router.clone(),
-        AgentTaskEntityShardingSettings::default(),
+        AgentTaskEntityShardingSettings::default().with_clock(entity_clock.clone()),
     )
     .map_err(|error| format!("registering the task entity for remote sharding: {error}"))?;
     let runs = init_agent_run_entity_remote_sharding(
@@ -410,7 +424,7 @@ pub async fn boot_pod(
         stores.runs.clone(),
         WorkflowAgentRunEffectSink::new(stores.workflow.clone(), clock.clone()),
         router.clone(),
-        AgentRunEntityShardingSettings::default(),
+        AgentRunEntityShardingSettings::default().with_clock(entity_clock.clone()),
     )
     .map_err(|error| format!("registering the run entity for remote sharding: {error}"))?;
     init_agent_team_entity_remote_sharding(
@@ -419,7 +433,7 @@ pub async fn boot_pod(
         stores.teams.clone(),
         stores.team_history.clone(),
         router.clone(),
-        AgentTeamEntityShardingSettings::default(),
+        AgentTeamEntityShardingSettings::default().with_clock(entity_clock.clone()),
     )
     .map_err(|error| format!("registering the team entity for remote sharding: {error}"))?;
     init_agent_conversation_entity_remote_sharding(
@@ -429,7 +443,7 @@ pub async fn boot_pod(
         stores.agents.clone(),
         stores.conversation_history.clone(),
         router.clone(),
-        AgentConversationEntityShardingSettings::default(),
+        AgentConversationEntityShardingSettings::default().with_clock(entity_clock),
     )
     .map_err(|error| format!("registering the conversation entity for remote sharding: {error}"))?;
 

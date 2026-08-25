@@ -63,6 +63,16 @@ reading as a short one. The totals themselves vary run to run, because the write
 counters move with TCP timing, membership convergence, and which pod wins the
 seed compare-and-set.
 
+All five entity classes share the drive loop's logical clock rather than the wall
+clock four of them default to, so the sharded actors and the drive loop no longer
+stamp one durable record with values ~1.75e12 apart. Every pod's exit status is
+checked, both children are `kill_on_drop` with both driver waits bounded, and a
+pod restarts its own deadline when it takes over its peer's shards rather than
+measuring it from boot. Drive-loop errors are reported rather than discarded,
+with a round that loses its compare-and-set to the other pod counted rather than
+printed — two pods writing one record is the documented topology here, not a
+fault, and printing it would bury the errors that are.
+
 The harness skips in exactly one case — the sandbox refusing a loopback bind,
 settled once before any world runs. Every other failure keeps its message and
 fails, including the eight wiring failures inside `boot_pod` that used to be
