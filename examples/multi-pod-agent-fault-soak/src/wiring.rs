@@ -25,6 +25,7 @@ use rakka_agent::{
     init_agent_task_entity_remote_sharding, init_agent_team_entity_remote_sharding,
     register_agent_exchange_codecs, AgentConversationEntityMessage,
     AgentConversationEntityShardingSettings, AgentConversationState, AgentEntityClass,
+    AgentEntityCommand, AgentEntityMessage, AgentEntityRegistration, AgentEntityReply,
     AgentEntityShardingSettings, AgentEntityState, AgentExchangeRouter, AgentRunEntityMessage,
     AgentRunEntityRegistration, AgentRunEntityShardingSettings, AgentRunState,
     AgentTaskEntityMessage, AgentTaskEntityRegistration, AgentTaskEntityShardingSettings,
@@ -41,6 +42,7 @@ use rakka_sharding::{
     EntityTypeRegistration, RemoteEntityAskClient,
 };
 
+use crate::codec::JsonPayloadCodec;
 use crate::stores::{PodCrash, PodCrashStore, SharedFileStore, CRASHED};
 
 /// The cluster role every pod in this harness joins under.
@@ -167,10 +169,15 @@ pub struct Pod {
     pub clock: Arc<AtomicU64>,
     /// The shared directory every pod reads and writes.
     pub root: std::path::PathBuf,
+    /// The agent entity's registration, used to resolve shard ownership and to
+    /// command the entity through its shard.
+    pub agents: AgentEntityRegistration,
     /// The task entity's registration, used to resolve shard ownership.
     pub tasks: AgentTaskEntityRegistration,
     /// The run entity's registration, used to resolve shard ownership.
     pub runs: AgentRunEntityRegistration,
+    /// The remote ask client the agent entity's command surface travels.
+    pub ask_client: RemoteEntityAskClient<TcpRemoteTransport>,
 }
 
 impl Pod {
@@ -186,6 +193,57 @@ impl Pod {
     #[must_use]
     pub fn owns_run(&self, entity_id: &str) -> bool {
         owns(&self.runs, entity_id)
+    }
+
+    /// Commands the agent entity through its shard, wherever it is hosted.
+    ///
+    /// Returns whether the command crossed the wire. This is the only path in
+    /// the harness that reaches `init_agent_entity_remote_sharding`'s remote
+    /// arm: the other four classes are addressed by exchange envelope through
+    /// [`AgentExchangeRouter`], while the agent class takes a serializable
+    /// [`AgentEntityCommand`] paired with a node-local reply channel on the
+    /// owner. Without it the registration is made and never exercised, and the
+    /// payload codecs it requires can be absent without anything noticing.
+    ///
+    /// The local and remote arms are the same decision `ShardedExchangeRoute`
+    /// makes for the other four classes: resolve the owner, then ask the local
+    /// entity or ask the owning node.
+    pub async fn command_agent_entity(
+        &self,
+        entity_id: &str,
+        command: AgentEntityCommand,
+    ) -> Result<bool, String> {
+        let entity = self.agents.entity_ref_for(entity_id);
+        let (owner, _shard) = entity
+            .region()
+            .resolve(entity.entity_ref())
+            .map_err(|error| format!("resolving the agent entity's owner: {error}"))?;
+        let is_local = entity
+            .region()
+            .local_node_id()
+            .is_some_and(|local| local == &owner);
+
+        if is_local {
+            entity
+                .ask(
+                    move |reply_to| AgentEntityMessage { command, reply_to },
+                    ASK_TIMEOUT,
+                )
+                .await
+                .map(|_reply: AgentEntityReply| false)
+                .map_err(|error| format!("asking the local agent entity: {error}"))
+        } else {
+            self.ask_client
+                .ask::<AgentEntityCommand, AgentEntityMessage, AgentEntityReply>(
+                    entity.region(),
+                    entity.entity_ref(),
+                    command,
+                    ASK_TIMEOUT,
+                )
+                .await
+                .map(|_reply| true)
+                .map_err(|error| format!("asking the agent entity on {owner:?}: {error}"))
+        }
     }
 }
 
@@ -207,18 +265,39 @@ fn owns<M: Message>(registration: &EntityTypeRegistration<M>, entity_id: &str) -
 
 /// Boots one pod and registers all five entity classes for remote hosting.
 ///
-/// Returns `None` when loopback binding is unavailable, which is how every
-/// networked test in this workspace skips in a restricted sandbox rather than
-/// failing.
+/// Every failure keeps its message. This used to funnel eight independent
+/// fallible steps — codec registration, the runtime build, `ClusterSharding`,
+/// and all five entity registrations — through `.ok()?` into one `None` the
+/// driver reported as "loopback binding is unavailable", so a duplicate entity
+/// key, a codec collision, or a renamed entity type made the whole gated
+/// harness exit 0 having proved nothing, with the real error already discarded.
+/// Whether the sandbox permits loopback binding is now settled once by the
+/// driver before any world runs, which is the only thing that may skip.
 pub async fn boot_pod(
     logical_id: &str,
     incarnation: &str,
     port: u16,
     root: &Path,
     crash: Option<(CrashTarget, usize, PodCrash)>,
-) -> Option<Pod> {
+) -> Result<Pod, String> {
     let mut registry = SerializationRegistry::new();
-    register_agent_exchange_codecs(&mut registry).ok()?;
+    register_agent_exchange_codecs(&mut registry)
+        .map_err(|error| format!("registering the agent exchange codecs: {error}"))?;
+
+    // `init_agent_entity_remote_sharding`'s documented precondition. The other
+    // four classes are addressed by exchange envelope, whose codecs the call
+    // above registers; the agent class takes a command, and without these two
+    // its remote arm cannot encode one.
+    registry
+        .register::<AgentEntityCommand, _>(JsonPayloadCodec::<AgentEntityCommand>::new(
+            "rakka.examples.multi_pod_agent_fault_soak.AgentEntityCommand",
+        ))
+        .map_err(|error| format!("registering the agent entity command codec: {error}"))?;
+    registry
+        .register::<AgentEntityReply, _>(JsonPayloadCodec::<AgentEntityReply>::new(
+            "rakka.examples.multi_pod_agent_fault_soak.AgentEntityReply",
+        ))
+        .map_err(|error| format!("registering the agent entity reply codec: {error}"))?;
 
     let node = ClusterNode::new(
         NodeId::new(logical_id, incarnation),
@@ -242,14 +321,16 @@ pub async fn boot_pod(
         .with_registry(registry)
         .build()
         .await
-        .ok()?;
+        .map_err(|error| format!("building the cluster node runtime on port {port}: {error}"))?;
 
     let system = ActorSystem::new(format!("rakka-multi-pod-{logical_id}"));
-    let sharding = ClusterSharding::for_node_runtime(&system, &runtime).ok()?;
+    let sharding = ClusterSharding::for_node_runtime(&system, &runtime)
+        .map_err(|error| format!("creating cluster sharding: {error}"))?;
     let stores = PodStores::open(root, crash);
     let counter = Arc::new(AtomicU64::new(1));
     let clock = SharedAtomicWorkflowClock::new(counter.clone());
     let ask_client = runtime.ask_client();
+    let command_ask_client = runtime.ask_client();
 
     // Every class routes through the same production route. Nothing below
     // knows or cares whether a target is local.
@@ -306,13 +387,13 @@ pub async fn boot_pod(
             )),
         );
 
-    init_agent_entity_remote_sharding(
+    let agents = init_agent_entity_remote_sharding(
         &sharding,
         &mut runtime,
         stores.agents.clone(),
         AgentEntityShardingSettings::default(),
     )
-    .ok()?;
+    .map_err(|error| format!("registering the agent entity for remote sharding: {error}"))?;
     let tasks = init_agent_task_entity_remote_sharding(
         &sharding,
         &mut runtime,
@@ -322,7 +403,7 @@ pub async fn boot_pod(
         router.clone(),
         AgentTaskEntityShardingSettings::default(),
     )
-    .ok()?;
+    .map_err(|error| format!("registering the task entity for remote sharding: {error}"))?;
     let runs = init_agent_run_entity_remote_sharding(
         &sharding,
         &mut runtime,
@@ -331,7 +412,7 @@ pub async fn boot_pod(
         router.clone(),
         AgentRunEntityShardingSettings::default(),
     )
-    .ok()?;
+    .map_err(|error| format!("registering the run entity for remote sharding: {error}"))?;
     init_agent_team_entity_remote_sharding(
         &sharding,
         &mut runtime,
@@ -340,7 +421,7 @@ pub async fn boot_pod(
         router.clone(),
         AgentTeamEntityShardingSettings::default(),
     )
-    .ok()?;
+    .map_err(|error| format!("registering the team entity for remote sharding: {error}"))?;
     init_agent_conversation_entity_remote_sharding(
         &sharding,
         &mut runtime,
@@ -350,9 +431,9 @@ pub async fn boot_pod(
         router.clone(),
         AgentConversationEntityShardingSettings::default(),
     )
-    .ok()?;
+    .map_err(|error| format!("registering the conversation entity for remote sharding: {error}"))?;
 
-    Some(Pod {
+    Ok(Pod {
         runtime,
         system,
         sharding,
@@ -360,8 +441,10 @@ pub async fn boot_pod(
         stores,
         clock: counter,
         root: root.to_path_buf(),
+        agents,
         tasks,
         runs,
+        ask_client: command_ask_client,
     })
 }
 

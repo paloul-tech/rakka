@@ -18,8 +18,15 @@ process's memory cannot test that, because the store dies too.
 Three things here are firsts for the repository:
 
 1. **All five sharded entity classes register through their *remote*
-   registrations.** `init_agent_entity_remote_sharding` and its four siblings
-   were defined, exported, and called nowhere before this example.
+   registrations, and all five are exercised.** `init_agent_entity_remote_sharding`
+   and its four siblings were defined, exported, and called nowhere before this
+   example. Four are addressed by exchange envelope through the router. The
+   fifth takes a serializable `AgentEntityCommand` instead, with payload codecs
+   the application must register — so it is the one that can be registered and
+   silently unreachable. The reference world replays the agent's instantiation
+   through its shard and asserts that exactly one pod's command crossed the
+   wire; without the codecs, the remote arm cannot encode and the harness
+   fails.
 2. **A real agent entity's exchanges travel the production
    `ShardedExchangeRoute`.** Every acceptance example uses the testkit's
    `LocalShardedExchangeRoute`, whose own documentation says it is "the local
@@ -43,7 +50,7 @@ line, one line per sweep row, and a total in which every window fired.
 
 ```
 Rakka multi-pod agent fault harness
-reference: two pods completed the task; pod-a wrote tasks=3 runs=10, pod-b wrote tasks=3 runs=0
+reference: two pods completed the task; pod-a wrote tasks=3 runs=9, pod-b wrote tasks=4 runs=0; the agent entity was commanded across the wire
   PodA tasks: 6 windows, ordinals 1-3
   PodA runs: 18 windows, ordinals 1-10
   PodB tasks: 6 windows, ordinals 1-3
@@ -92,6 +99,17 @@ Both pods then seed: they instantiate the agent and create the task. The
 commands deduplicate on derived operation ids, so two pods issuing them produce
 one agent and one task — which is also what an ingress redelivering to whichever
 pod is up actually does.
+
+**There is exactly one way this harness skips**, and it is settled before any
+world runs: if the sandbox refuses a loopback bind at all, the driver says so
+and stops. Everything after that point fails loudly with its own message. This
+used to be eight unrelated failures inside `boot_pod` — codec registration, the
+runtime build, `ClusterSharding`, and each of the five entity registrations —
+funnelled through `.ok()?` into one `None` reported as "loopback binding is
+unavailable" with an exit code of zero, which both gate tests accepted as a
+pass. A pod that finds its port taken between the driver choosing it and the
+pod binding it is neither a skip nor a failure: the driver re-runs that world on
+fresh ports.
 
 The reference world asserts that the task and the run are owned by *different*
 pods before any of this is believed. A shard-count or hashing change that

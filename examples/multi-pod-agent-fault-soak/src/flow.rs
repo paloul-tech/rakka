@@ -116,7 +116,15 @@ fn provenance(at: u64) -> AgentRevisionProvenance {
 /// Both commands deduplicate on derived operation ids, so a pod that dies part
 /// way through and is replaced by one that seeds again produces one agent and
 /// one task — never two.
-pub async fn seed(pod: &Pod) -> Result<(), String> {
+/// How many times the sharded agent command is retried while the peer starts.
+const AGENT_COMMAND_ATTEMPTS: usize = 5;
+
+/// The agent's instantiation, built from constants alone.
+///
+/// Every input is fixed, so the derived operation id is the same on every pod
+/// and on every call — which is what lets the same command be replayed through
+/// the sharded command surface without creating a second agent.
+fn instantiate_command() -> Result<AgentEntityCommand, String> {
     let mut envelope = AgentAuthorityEnvelope::empty();
     envelope
         .task_definitions
@@ -128,20 +136,76 @@ pub async fn seed(pod: &Pod) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
 
+    Ok(AgentEntityCommand::Instantiate {
+        operation_id: AgentOperationId::for_agent(
+            AgentOperationKind::DefinitionUpdate,
+            &agent_scope(),
+            "1",
+        )
+        .map_err(|error| error.to_string())?,
+        definition: Box::new(definition),
+        settings: Box::new(AgentSettings::default()),
+        provenance: Box::new(provenance(1)),
+    })
+}
+
+/// Replays the instantiation through the agent entity's *sharded* command
+/// surface, and reports whether it crossed the wire.
+///
+/// The instantiation above is a direct store write, which is what keeps seeding
+/// alive on a pod whose peer is dead. That path never touches
+/// `init_agent_entity_remote_sharding`, so the agent class's remote arm — and
+/// the payload codecs it requires — could be broken with nothing noticing. This
+/// replays the identical command through the shard: it deduplicates on the same
+/// derived operation id and returns the original outcome, so it changes no
+/// durable state, and on the pod that does not own the agent it travels the
+/// wire and back through both codecs.
+///
+/// Reported rather than asserted here, because in an armed world the owner may
+/// already be gone. The driver asserts it in the crash-free reference, where
+/// exactly one pod must report `remote`.
+pub async fn prove_remote_agent_command(pod: &Pod) -> &'static str {
+    let command = match instantiate_command() {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("building the agent command failed: {error}");
+            return "failed";
+        }
+    };
+    for attempt in 0..AGENT_COMMAND_ATTEMPTS {
+        match pod
+            .command_agent_entity(agent_scope().entity_id().as_str(), command.clone())
+            .await
+        {
+            Ok(true) => return "remote",
+            Ok(false) => return "local",
+            // The driver staggers the two pods, so the first one up resolves
+            // the agent's owner correctly and then asks a peer that is not
+            // listening yet. Only the crash-free reference world runs this, so
+            // the retries cost nothing in the sweep.
+            Err(error) if attempt + 1 == AGENT_COMMAND_ATTEMPTS => {
+                eprintln!("the sharded agent command failed: {error}");
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+    "failed"
+}
+
+/// Instantiates the agent and creates its task.
+///
+/// Both commands deduplicate on derived operation ids, so a pod that dies part
+/// way through and is replaced by one that seeds again produces one agent and
+/// one task — never two.
+///
+/// The agent's instantiation is a direct store write rather than a sharded
+/// command, which is what keeps seeding alive on a pod whose peer is gone;
+/// [`prove_remote_agent_command`] is what exercises the sharded surface.
+pub async fn seed(pod: &Pod) -> Result<(), String> {
     let mut agent = AgentEntityStore::new(agent_scope(), pod.stores.agents.clone());
     agent.recover().await.map_err(|error| error.to_string())?;
     agent
-        .apply(AgentEntityCommand::Instantiate {
-            operation_id: AgentOperationId::for_agent(
-                AgentOperationKind::DefinitionUpdate,
-                &agent_scope(),
-                "1",
-            )
-            .map_err(|error| error.to_string())?,
-            definition: Box::new(definition),
-            settings: Box::new(AgentSettings::default()),
-            provenance: Box::new(provenance(1)),
-        })
+        .apply(instantiate_command()?)
         .await
         .map_err(|error| error.to_string())?;
 

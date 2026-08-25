@@ -2,6 +2,7 @@
 //!
 //! See the crate README for what this harness proves and how to run it.
 
+pub mod codec;
 pub mod external;
 pub mod flow;
 pub mod stores;

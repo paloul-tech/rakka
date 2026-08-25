@@ -126,19 +126,39 @@ fn error(message: impl Into<String>) -> std::io::Error {
     std::io::Error::other(message.into())
 }
 
-fn unused_port() -> std::io::Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
+/// Two distinct free loopback ports.
+///
+/// Both listeners are held at once and dropped together, so the kernel cannot
+/// hand the same port to both pods — which binding and dropping one at a time
+/// allowed, and which made pod B fail to bind. The window in which another
+/// process can take one of them is not closable this way (the transport does
+/// its own bind), so a pod that finds its port taken says so and the driver
+/// retries the world with fresh ports rather than reporting a skip.
+fn unused_ports() -> std::io::Result<(u16, u16)> {
+    let first = TcpListener::bind(("127.0.0.1", 0))?;
+    let second = TcpListener::bind(("127.0.0.1", 0))?;
+    let ports = (first.local_addr()?.port(), second.local_addr()?.port());
+    drop(first);
+    drop(second);
+    Ok(ports)
+}
+
+/// Whether this environment permits loopback binding at all.
+///
+/// Settled once, before any world runs. It is the only thing that may turn the
+/// whole harness into a skip: every other failure now keeps its message and
+/// fails. Previously eight unrelated wiring failures inside `boot_pod` were all
+/// reported as this, so the gated harness could exit 0 having proved nothing.
+fn loopback_available() -> bool {
+    TcpListener::bind(("127.0.0.1", 0)).is_ok()
 }
 
 /// One pod process: boot, join, do its duty, exit.
 async fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let [logical, incarnation, root, port, peer_logical, peer_incarnation, peer_port, rest @ ..] =
+    let [logical, incarnation, root, port, peer_logical, peer_incarnation, peer_port, prove, rest @ ..] =
         args
     else {
-        return Err(error("--node takes seven positional arguments").into());
+        return Err(error("--node takes eight positional arguments").into());
     };
 
     let crash = match rest {
@@ -152,12 +172,19 @@ async fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
 
     let root = PathBuf::from(root);
-    let Some(mut pod) = boot_pod(logical, incarnation, port.parse::<u16>()?, &root, crash).await
-    else {
-        // Loopback binding is unavailable; the driver treats this as a skip.
-        println!("skip: loopback bind denied");
+    let port = port.parse::<u16>()?;
+
+    // The driver settled that loopback binding works before spawning anything,
+    // so a port that will not bind here is one another process took since. The
+    // driver retries the world with fresh ports; every other failure below is
+    // real and is returned with its message.
+    if TcpListener::bind(("127.0.0.1", port)).is_err() {
+        println!("port-taken: {port}");
         return Ok(());
-    };
+    }
+    let mut pod = boot_pod(logical, incarnation, port, &root, crash)
+        .await
+        .map_err(error)?;
 
     let peer = ClusterNode::new(
         NodeId::new(peer_logical.as_str(), peer_incarnation.as_str()),
@@ -181,13 +208,22 @@ async fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Before driving: replay the instantiation through the agent entity's
+    // sharded command surface, which is the only path that exercises the
+    // agent class's remote registration and its payload codecs.
+    let agent_command = if prove == "prove" {
+        flow::prove_remote_agent_command(&pod).await
+    } else {
+        "skipped"
+    };
+
     let terminal = flow::drive(&mut pod, ROUNDS, POD_DEADLINE)
         .await
         .map_err(error)?;
 
     println!(
         "pod {logical} done: terminal={terminal} task-writes={} run-writes={} \
-         owns-task={} owns-run={} took-over={} status={:?}",
+         owns-task={} owns-run={} took-over={} agent-command={agent_command} status={:?}",
         pod.stores.tasks.writes(),
         pod.stores.runs.writes(),
         pod.owns_task(flow::task_scope().entity_id().as_str()),
@@ -216,14 +252,35 @@ enum Armed {
 /// by the harness's structure, so the task owner and the run owner are both
 /// killable.
 ///
-/// Returns what the world did, which is what bounds the sweep.
+/// Runs one world, re-running it on fresh ports if a pod's port was taken.
 async fn run_world(
     root: &Path,
     crash: Option<(Armed, CrashTarget, usize, PodCrash)>,
 ) -> Result<World, Box<dyn Error>> {
+    for _attempt in 0..WORLD_BIND_ATTEMPTS {
+        match run_world_once(root, crash).await? {
+            // A pod that never bound may still have left a partly-seeded
+            // directory behind, and the retry has to start from nothing.
+            World::PortTaken => {
+                let _ = std::fs::remove_dir_all(root);
+                std::fs::create_dir_all(root)?;
+            }
+            outcome => return Ok(outcome),
+        }
+    }
+    Err(error(format!(
+        "a pod found its port taken on all {WORLD_BIND_ATTEMPTS} attempts"
+    ))
+    .into())
+}
+
+/// Returns what the world did, which is what bounds the sweep.
+async fn run_world_once(
+    root: &Path,
+    crash: Option<(Armed, CrashTarget, usize, PodCrash)>,
+) -> Result<World, Box<dyn Error>> {
     let executable = std::env::current_exe()?;
-    let port_a = unused_port()?;
-    let port_b = unused_port()?;
+    let (port_a, port_b) = unused_ports()?;
 
     let node_args = |logical: &str,
                      incarnation: &str,
@@ -232,6 +289,11 @@ async fn run_world(
                      peer_incarnation: &str,
                      peer_port: u16,
                      armed: bool| {
+        // Only the crash-free reference world proves the agent entity's remote
+        // command arm. Every armed world has a pod that dies, and asking a dead
+        // peer costs an ask timeout per world for a property the reference has
+        // already established for this binary.
+        let prove = if crash.is_none() { "prove" } else { "no-prove" };
         let mut args = vec![
             "--node".to_string(),
             logical.to_string(),
@@ -241,6 +303,7 @@ async fn run_world(
             peer_logical.to_string(),
             peer_incarnation.to_string(),
             peer_port.to_string(),
+            prove.to_string(),
         ];
         if armed {
             if let Some((_, target, nth, window)) = crash {
@@ -307,8 +370,8 @@ async fn run_world(
     if std::env::var("RAKKA_MULTI_POD_VERBOSE").is_ok() {
         eprintln!("pod-a: {}pod-b: {}", out_a, out_b);
     }
-    if out_a.contains("skip:") || out_b.contains("skip:") {
-        return Ok(World::Skipped);
+    if out_a.contains("port-taken:") || out_b.contains("port-taken:") {
+        return Ok(World::PortTaken);
     }
     if root.join(CRASHED).exists() {
         // Exactly one pod survives an armed crash, and its own exit line is
@@ -348,7 +411,26 @@ enum World {
     /// The armed pod reached its armed write and aborted inside the window,
     /// and the surviving pod reported what it owned and whether it took over.
     Crashed(PodReport),
-    /// The environment refused the world before either pod could run.
+    /// A pod found its port taken between the driver choosing it and the pod
+    /// binding it. Not a skip and not a failure — the world is re-run on fresh
+    /// ports.
+    PortTaken,
+}
+
+/// How many times a world is re-run when a pod finds its port taken.
+const WORLD_BIND_ATTEMPTS: usize = 4;
+
+/// What one pod reported about the agent entity's sharded command surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentCommandArm {
+    /// This pod owns the agent entity; the command was a local ask.
+    Local,
+    /// This pod does not own it; the command crossed the wire and came back,
+    /// through both payload codecs.
+    Remote,
+    /// The command did not complete. A failure wherever it was asked for.
+    Failed,
+    /// This world did not ask for the proof; only the reference world does.
     Skipped,
 }
 
@@ -371,6 +453,8 @@ struct PodReport {
     took_over: bool,
     /// Whether this pod saw the task reach a terminal status.
     terminal: bool,
+    /// Which arm of the agent entity's sharded command surface this pod took.
+    agent_command: AgentCommandArm,
 }
 
 async fn drain(child: &mut tokio::process::Child) -> String {
@@ -392,6 +476,7 @@ fn parse_report(stdout: &str) -> Option<PodReport> {
     let mut owns_run = None;
     let mut took_over = None;
     let mut terminal = None;
+    let mut agent_command = None;
     for field in line.split_whitespace() {
         if let Some(value) = field.strip_prefix("task-writes=") {
             task_writes = value.parse().ok();
@@ -411,6 +496,15 @@ fn parse_report(stdout: &str) -> Option<PodReport> {
         if let Some(value) = field.strip_prefix("terminal=") {
             terminal = value.parse().ok();
         }
+        if let Some(value) = field.strip_prefix("agent-command=") {
+            agent_command = match value {
+                "local" => Some(AgentCommandArm::Local),
+                "remote" => Some(AgentCommandArm::Remote),
+                "failed" => Some(AgentCommandArm::Failed),
+                "skipped" => Some(AgentCommandArm::Skipped),
+                _ => None,
+            };
+        }
     }
     Some(PodReport {
         task_writes: task_writes?,
@@ -419,6 +513,7 @@ fn parse_report(stdout: &str) -> Option<PodReport> {
         owns_run: owns_run?,
         took_over: took_over?,
         terminal: terminal?,
+        agent_command: agent_command?,
     })
 }
 
@@ -465,18 +560,24 @@ fn fresh_root(label: &str) -> std::io::Result<PathBuf> {
 async fn run_driver() -> Result<(), Box<dyn Error>> {
     println!("Rakka multi-pod agent fault harness");
 
+    // The only skip in the harness. Everything after this point that fails,
+    // fails loudly: a codec collision, a duplicate entity key, or a renamed
+    // entity type used to arrive here as this same message and an exit code of
+    // zero, which both gate tests accepted as a pass.
+    if !loopback_available() {
+        println!("skipped: loopback binding is unavailable in this environment");
+        return Ok(());
+    }
+
     // The crash-free reference: two pods, a shared directory, and the task
     // driven to completion across them.
     let root = fresh_root("reference")?;
     let (pod_a, pod_b) = match run_world(&root, None).await? {
         World::Survived(pod_a, pod_b) => (pod_a, pod_b),
-        World::Skipped => {
-            println!("skipped: loopback binding is unavailable in this environment");
-            return Ok(());
-        }
         World::Crashed(_) => {
             return Err(error("the crash-free reference world reported a crash").into())
         }
+        World::PortTaken => unreachable!("run_world retries or fails on a taken port"),
     };
     assert_converged(&root, "the crash-free reference").await?;
 
@@ -500,9 +601,28 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    // The agent entity is hosted by exactly one pod, so exactly one pod's
+    // command is a local ask and the other's crosses the wire. If the payload
+    // codecs `init_agent_entity_remote_sharding` documents were not registered,
+    // the remote arm cannot encode the command and this is what catches it —
+    // the registration is otherwise made and never exercised, because every
+    // other class is addressed by exchange envelope rather than by command.
+    let arms = (pod_a.agent_command, pod_b.agent_command);
+    if !matches!(
+        arms,
+        (AgentCommandArm::Local, AgentCommandArm::Remote)
+            | (AgentCommandArm::Remote, AgentCommandArm::Local)
+    ) {
+        return Err(error(format!(
+            "the agent entity's sharded command surface was not exercised across the wire: \
+             pod-a took the {:?} arm and pod-b the {:?} arm, where exactly one must be Remote",
+            arms.0, arms.1
+        ))
+        .into());
+    }
     println!(
         "reference: two pods completed the task; pod-a wrote tasks={} runs={}, \
-         pod-b wrote tasks={} runs={}",
+         pod-b wrote tasks={} runs={}; the agent entity was commanded across the wire",
         pod_a.task_writes, pod_a.run_writes, pod_b.task_writes, pod_b.run_writes
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -561,9 +681,8 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
                     World::Survived(_, _) => {
                         assert_converged(&root, &format!("{context}, which never fired")).await?;
                     }
-                    World::Skipped => {
-                        println!("skipped: loopback binding is unavailable in this environment");
-                        return Ok(());
+                    World::PortTaken => {
+                        unreachable!("run_world retries or fails on a taken port")
                     }
                 }
                 let _ = std::fs::remove_dir_all(&root);

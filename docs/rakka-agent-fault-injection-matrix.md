@@ -63,6 +63,18 @@ reading as a short one. The totals themselves vary run to run, because the write
 counters move with TCP timing, membership convergence, and which pod wins the
 seed compare-and-set.
 
+The harness skips in exactly one case — the sandbox refusing a loopback bind,
+settled once before any world runs. Every other failure keeps its message and
+fails, including the eight wiring failures inside `boot_pod` that used to be
+reported as that skip with an exit code of zero.
+
+The reference world also replays the agent's instantiation through its *shard*,
+asserting that exactly one pod's command crossed the wire. The agent class is
+the only one of the five addressed by a serializable command rather than an
+exchange envelope, so it is the only one whose remote registration can be made
+and never exercised — and whose required payload codecs can be absent with
+nothing noticing.
+
 A crash marker records that a pod died, not that a shard moved, and the harness
 reports the two separately. A window that moved a shard downed the departed pod,
 took over its shards, and re-materialized its entities on the survivor; a window
