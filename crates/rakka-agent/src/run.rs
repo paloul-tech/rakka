@@ -619,6 +619,24 @@ pub struct AgentRun {
     /// When the run durably accepted its assignment, stamped by the owner that
     /// wrote it.
     pub accepted_at: AgentTimestampMillis,
+    /// When the run first reached a terminal status, stamped by the owner that
+    /// wrote the terminal transition.
+    ///
+    /// This is the clock short-term retention is measured from
+    /// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md), open
+    /// decision 7), and it is deliberately not
+    /// [`AgentRunState::updated_at`]: that is the time of the *last accepted*
+    /// transition, which for a terminal run keeps moving as settlement and
+    /// return commands land, so a deadline measured from it could recede
+    /// indefinitely. It is stamped exactly once — the single terminal
+    /// transition's already-terminal guard is what keeps a replayed or
+    /// re-driven wind-down from moving it.
+    ///
+    /// `None` on a live run, and on a terminal record written before this
+    /// field existed; a retention discharge refuses such a record rather than
+    /// guessing a due time from a field that means something else.
+    #[serde(default)]
+    pub terminal_at: Option<AgentTimestampMillis>,
 }
 
 impl AgentRun {
@@ -870,6 +888,7 @@ impl AgentRunState {
             settlement: run.settlement,
             pending_top_up: run.loop_state.pending_top_up().copied(),
             accepted_at: run.accepted_at,
+            terminal_at: run.terminal_at,
             updated_at: self.updated_at,
         })
     }
@@ -953,6 +972,9 @@ pub struct AgentRunSnapshot {
     pub pending_top_up: Option<AgentPendingTopUp>,
     /// When it durably accepted its assignment.
     pub accepted_at: AgentTimestampMillis,
+    /// When it first reached a terminal status, and the clock its short-term
+    /// retention is measured from. `None` while it is live.
+    pub terminal_at: Option<AgentTimestampMillis>,
     /// The time of its last accepted transition.
     pub updated_at: AgentTimestampMillis,
 }
@@ -1129,6 +1151,10 @@ fn terminate(
     // means a run cancelled while waiting on a grant stops asking and settles.
     run.loop_state.clear_pending_top_up();
     run.terminal_reason = Some(reason);
+    // Stamped once, under the already-terminal guard above: the retention
+    // clock must not move when a re-driven wind-down re-enters this transition
+    // ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+    run.terminal_at = Some(now);
     state.updated_at = now;
     Ok(())
 }
@@ -1266,6 +1292,7 @@ fn accept_assignment(
         terminal_reason: None,
         settlement: AgentRunSettlementStatus::Owed,
         accepted_at: now,
+        terminal_at: None,
     };
     // Acceptance reserves growth headroom: a run admitted here must still be able
     // to hold the turn it was created to take.
@@ -7010,6 +7037,13 @@ where
                     ("reported", report.reported),
                     ("checkpoint-refused", report.checkpoint_refused),
                     ("rejected", report.rejected),
+                    // A ranked identity the authoritative store does not hold
+                    // in this scope. Counted separately from `rejected`
+                    // because it means the retriever and the store disagree
+                    // about what this agent has, which is a different — and
+                    // more alarming — condition than a record the query
+                    // simply does not admit.
+                    ("unverified", report.unverified),
                 ] {
                     if count > 0 {
                         record_agent_domain_counter(
@@ -8897,6 +8931,7 @@ mod tests {
             terminal_reason: None,
             settlement: AgentRunSettlementStatus::Owed,
             accepted_at: now,
+            terminal_at: None,
         };
         let baseline = run.materialized_size_bytes();
 
@@ -9317,6 +9352,7 @@ mod tests {
                     .expect("the input is inline-bounded"),
                 status,
                 loop_state,
+                terminal_at: terminal_reason.as_ref().map(|_| now),
                 terminal_reason,
                 settlement: AgentRunSettlementStatus::Owed,
                 accepted_at: now,

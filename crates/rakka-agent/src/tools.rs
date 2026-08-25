@@ -84,7 +84,7 @@ use crate::effect::{
 };
 use crate::guardrails::{
     AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailDisposition,
-    AgentGuardrailReport, AgentGuardrailTransform,
+    AgentGuardrailError, AgentGuardrailReport, AgentGuardrailTransform,
 };
 use crate::identity::{AgentGoalId, AgentRunScope, AgentTaskId};
 use crate::model::{AgentToolCallRequest, AGENT_TOOL_ARGUMENTS_MAX_BYTES};
@@ -127,6 +127,23 @@ pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 3] = [
     AgentGuardrailBoundary::ModelRequest,
     AgentGuardrailBoundary::ToolRequest,
     AgentGuardrailBoundary::MemoryIngress,
+];
+
+/// The boundaries [`AgentToolAuthority`] evaluates *on its own*, before every
+/// attempt's durable `Started`.
+///
+/// This is the honest half of [`AGENT_EVALUATED_GUARDRAIL_BOUNDARIES`], which
+/// names every boundary the runtime has an evaluation point for *somewhere*.
+/// An authority may only count the memory-ingress boundary once a deployment
+/// has attested — through [`AgentToolAuthority::with_memory_ingress`] — that
+/// its retrieval bundle carries the same declared chain. Until then a
+/// mandatory memory-ingress-only stage fails closed as
+/// `guardrail-stage-unevaluated`, which is the correct answer: this authority
+/// cannot see a retrieval bundle, so it cannot vouch for one it was never
+/// shown.
+pub const AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 2] = [
+    AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ToolRequest,
 ];
 
 /// Result type for tool registry operations.
@@ -1012,7 +1029,11 @@ pub trait AgentExecutionPolicyRouter: Send + Sync {
 pub struct AgentToolAuthority {
     registry: AgentToolRegistry,
     guardrails: Option<AgentGuardrailChain>,
+    /// Whether a deployment attested that its retrieval bundle evaluates the
+    /// memory-ingress boundary under this authority's own declared chain.
+    memory_ingress_attested: bool,
     execution_router: Option<Arc<dyn AgentExecutionPolicyRouter>>,
+    require_execution_policy: bool,
     grant_ttl_ms: u64,
 }
 
@@ -1024,22 +1045,106 @@ impl AgentToolAuthority {
         Self {
             registry,
             guardrails: None,
+            memory_ingress_attested: false,
             execution_router: None,
+            require_execution_policy: false,
             grant_ttl_ms: AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
         }
     }
 
     /// Uses the deployment's guardrail chain.
+    ///
+    /// Replacing the chain clears any memory-ingress attestation: an
+    /// attestation is about a *particular* declared chain, and a new one has
+    /// not been checked against the retrieval bundle.
     #[must_use]
     pub fn with_guardrails(mut self, chain: AgentGuardrailChain) -> Self {
         self.guardrails = Some(chain);
+        self.memory_ingress_attested = false;
         self
+    }
+
+    /// Attests that this deployment's retrieval bundle evaluates the
+    /// memory-ingress boundary under the *same declared chain* this authority
+    /// carries.
+    ///
+    /// The two enforcement points are structurally separate — the authority
+    /// evaluates model and tool requests before dispatch, the retrieval bundle
+    /// evaluates retrieved memory during snapshot assembly — and neither can
+    /// see the other's chain. So the deployment that wires both says so here,
+    /// and the claim is *checked* rather than taken: the two
+    /// [`AgentGuardrailChain::declaration_digest`]s must agree, which catches a
+    /// drifted revision and an empty bundle chain alike.
+    ///
+    /// Without this attestation the authority does not count `MemoryIngress`
+    /// among the boundaries it evaluates, so an envelope requiring a
+    /// memory-ingress-only stage refuses dispatch with the existing
+    /// `guardrail-stage-unevaluated`. A deployment that simply forgets to
+    /// attest therefore fails closed rather than silently losing the
+    /// protection ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentGuardrailError::ChainMismatch`] (`guardrail-chain-mismatch`)
+    /// when the two declarations differ, or when this authority carries no
+    /// chain at all. The refusal lands at wiring time, so a misconfigured
+    /// deployment fails at startup rather than at its first tool call.
+    pub fn with_memory_ingress(
+        mut self,
+        retrieval: &crate::retrieval::AgentMemoryRetrieval,
+    ) -> Result<Self, AgentGuardrailError> {
+        let bundle = retrieval.guardrails().declaration_digest();
+        let mine = self
+            .guardrails
+            .as_ref()
+            .map(AgentGuardrailChain::declaration_digest);
+        if mine.as_ref() != Some(&bundle) {
+            return Err(AgentGuardrailError::ChainMismatch {
+                authority: mine,
+                retrieval: bundle,
+            });
+        }
+        self.memory_ingress_attested = true;
+        Ok(self)
+    }
+
+    /// The boundaries this authority's coverage check treats as evaluated.
+    ///
+    /// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] plus
+    /// [`AgentGuardrailBoundary::MemoryIngress`] once a deployment has
+    /// attested its retrieval bundle.
+    #[must_use]
+    pub fn evaluated_boundaries(&self) -> &'static [AgentGuardrailBoundary] {
+        if self.memory_ingress_attested {
+            &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES
+        } else {
+            &AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES
+        }
     }
 
     /// Routes execution-policy references through the given router.
     #[must_use]
     pub fn with_execution_router(mut self, router: Arc<dyn AgentExecutionPolicyRouter>) -> Self {
         self.execution_router = Some(router);
+        self
+    }
+
+    /// Refuses any intent that carries no execution-policy reference.
+    ///
+    /// Off by default, because
+    /// [specification 11.8](../../../docs/plans/rakka-agent/spec.md) says an
+    /// intent *SHOULD* carry one and most deployments have a single trust
+    /// class, for which unclassified is the honest description.
+    ///
+    /// A deployment that *claims* workload isolation cannot have unclassified
+    /// effects, though — an intent naming no class runs on whichever worker
+    /// claims it, which is exactly the shared universally-privileged worker
+    /// [specification 16](../../../docs/plans/rakka-agent/spec.md) forbids
+    /// claiming isolation from. This is the switch that makes the claim
+    /// checkable rather than asserted.
+    #[must_use]
+    pub const fn with_required_execution_policy(mut self) -> Self {
+        self.require_execution_policy = true;
         self
     }
 
@@ -2307,6 +2412,16 @@ impl AgentToolAuthority {
         policy: Option<&AgentExecutionPolicyRef>,
     ) -> Result<(), AgentAuthorityRefusal> {
         let Some(policy) = policy else {
+            if self.require_execution_policy {
+                // Definitive, not transient: no worker will ever accept a
+                // class that does not exist, and clearing the condition means
+                // re-declaring the tool.
+                return Err(AgentAuthorityRefusal::of(
+                    "execution-policy-required",
+                    "this deployment routes every effect by trust class and the intent names \
+                     none; it stays undispatchable rather than running with ambient authority",
+                ));
+            }
             return Ok(());
         };
         let routable = self
@@ -2357,7 +2472,7 @@ impl AgentToolAuthority {
             ));
         };
         chain
-            .validate_covers(required, &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES)
+            .validate_covers(required, self.evaluated_boundaries())
             .map_err(|error| AgentAuthorityRefusal::of(error.code(), error.to_string()))
     }
 

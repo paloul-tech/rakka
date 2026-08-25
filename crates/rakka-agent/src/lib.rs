@@ -72,6 +72,8 @@ pub mod guardrails;
 pub mod identity;
 pub mod loop_runtime;
 pub mod memory;
+pub mod memory_conformance;
+pub mod memory_retention;
 pub mod model;
 pub mod observability;
 #[cfg(feature = "otel")]
@@ -154,7 +156,7 @@ pub use dispatch::{
     AgentReconciliationFinding, AgentRunEffectDispatcher, AgentRunResultDelivery,
     AgentRunSetupResolver, AgentWorkflowCancelExecutor, AgentWorkflowCancelFinding,
     AgentWorkflowStartExecutor, AgentWorkflowStartFinding, SessionMemoryPromotionExecutor,
-    WorkflowAgentRunEffectSink,
+    WorkflowAgentRunEffectSink, AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH,
 };
 pub use effect::{
     compensation_call_id, effect_id_for, external_idempotency_key_for, AgentClaimAppendProvenance,
@@ -218,6 +220,10 @@ pub use memory::{
     AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES, AGENT_SESSION_MEMORY_ENTRY_MAX_BYTES,
     AGENT_SESSION_WINDOW_MAX_ENTRIES, AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES,
     AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_ENTRIES,
+};
+pub use memory_retention::{
+    discharge_run_memory_retention, AgentMemoryRetentionReport, AgentMemoryRetentionSweep,
+    AgentRunRetentionOutcome,
 };
 pub use model::{
     AgentModelAdapter, AgentModelError, AgentModelFuture, AgentModelRequest, AgentModelResult,
@@ -514,9 +520,9 @@ pub use tools::{
     AgentEnvironmentConcurrencyProtocol, AgentExecutionPolicyRouter, AgentGrantDescriptor,
     AgentGrantedDispatch, AgentToolAuthority, AgentToolBinding, AgentToolDescriptor,
     AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResultBehavior,
-    AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
-    AGENT_TOOL_DESCRIPTION_MAX_LENGTH, AGENT_TOOL_PARAMETERS_MAX_BYTES,
-    AGENT_TOOL_REGISTRY_MAX_TOOLS,
+    AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
+    AGENT_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_TOOL_DESCRIPTION_MAX_LENGTH,
+    AGENT_TOOL_PARAMETERS_MAX_BYTES, AGENT_TOOL_REGISTRY_MAX_TOOLS,
 };
 pub use workflow_tool::{
     child_workflow_run_id, workflow_cancel_command, workflow_cancel_command_id,

@@ -69,6 +69,7 @@ use serde_json::Value;
 
 use crate::definition::{AgentGuardrailStageId, AgentPolicyRef, AgentRevisionNumber, AgentToolId};
 use crate::identity::AgentRunScope;
+use crate::task::AgentContentDigest;
 
 /// Most stages one guardrail chain may hold.
 pub const AGENT_GUARDRAIL_MAX_STAGES: usize = 32;
@@ -517,6 +518,45 @@ impl AgentGuardrailChain {
     /// not of the chain. A required stage that runs at none of them is refused
     /// (`guardrail-stage-unevaluated`).
     ///
+    /// A content-free fingerprint of what this chain *declares*: its
+    /// revision, its policy reference, and each stage's id, revision,
+    /// boundary set, and mandatory flag, in evaluation order.
+    ///
+    /// Two chains with equal digests declare the same evaluation. The rule
+    /// objects are deliberately not compared — `dyn AgentGuardrail` has no
+    /// equality, and could not have one — so a match is a *declaration*
+    /// match, not proof that two chains hold the same code.
+    ///
+    /// That is exactly the strength the wiring check it exists for needs. A
+    /// deployment that builds one chain and hands it to both enforcement
+    /// points passes. One that builds two differently declared chains —
+    /// including an empty chain at the same revision, which a revision
+    /// comparison alone would wave through — is refused.
+    #[must_use]
+    pub fn declaration_digest(&self) -> AgentContentDigest {
+        let declaration = serde_json::json!({
+            "revision": self.revision.get(),
+            "policy": self.policy.as_ref().map(AgentPolicyRef::as_str),
+            "stages": self
+                .stages
+                .iter()
+                .map(|stage| {
+                    serde_json::json!({
+                        "id": stage.id.as_str(),
+                        "revision": stage.revision.get(),
+                        "mandatory": stage.mandatory,
+                        "boundaries": stage
+                            .boundaries
+                            .iter()
+                            .map(|boundary| boundary.as_label())
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+        AgentContentDigest::of_json(&declaration)
+    }
+
     /// A stage that runs at *some* evaluated boundary satisfies coverage even
     /// when the evaluation in hand is at a different one: a stage bound to
     /// [`AgentGuardrailBoundary::ToolRequest`] is doing its job, and a model
@@ -778,6 +818,14 @@ pub enum AgentGuardrailError {
         /// The revision both chains would have shared.
         revision: AgentRevisionNumber,
     },
+    /// Two enforcement points were wired with differently declared chains, so
+    /// a stage required at one would not run at the other.
+    ChainMismatch {
+        /// The attesting authority's chain declaration, when it has a chain.
+        authority: Option<AgentContentDigest>,
+        /// The retrieval bundle's chain declaration.
+        retrieval: AgentContentDigest,
+    },
 }
 
 impl AgentGuardrailError {
@@ -792,6 +840,7 @@ impl AgentGuardrailError {
             Self::StageUnbound { .. } => "guardrail-stage-unbound",
             Self::StageNotEvaluated { .. } => "guardrail-stage-unevaluated",
             Self::NarrowedRevisionNotDistinct { .. } => "guardrail-narrowed-revision-not-distinct",
+            Self::ChainMismatch { .. } => "guardrail-chain-mismatch",
         }
     }
 }
@@ -828,6 +877,22 @@ impl Display for AgentGuardrailError {
                 "a narrowed chain must carry a revision distinct from its parent's ({revision}): \
                  a different stage set is a different evaluation"
             ),
+            Self::ChainMismatch {
+                authority,
+                retrieval,
+            } => match authority {
+                Some(authority) => write!(
+                    f,
+                    "the dispatch authority's guardrail chain ({authority}) and the retrieval \
+                     bundle's ({retrieval}) declare different evaluations, so a stage required at \
+                     one would not run at the other"
+                ),
+                None => write!(
+                    f,
+                    "the dispatch authority carries no guardrail chain, so it cannot attest that \
+                     the retrieval bundle's ({retrieval}) is the same one"
+                ),
+            },
         }
     }
 }
