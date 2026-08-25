@@ -44,6 +44,10 @@ use serde::{Deserialize, Serialize};
 /// is one that demonstrably fired.
 pub const CRASHED: &str = "crashed";
 
+/// How many times a load re-resolves the newest revision when the file it
+/// picked is unlinked under it before the read.
+const LOAD_RESOLVE_ATTEMPTS: usize = 8;
+
 /// Monotonic per-process suffix keeping temp file names collision-free.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -167,10 +171,30 @@ where
     S: DurableState + Serialize + DeserializeOwned,
 {
     fn load_record(&self, persistence_id: &PersistenceId) -> DurableResult<Option<StateRecord<S>>> {
-        let Some((_, path)) = self.current_revision_file(persistence_id)? else {
-            return Ok(None);
+        // Resolving the newest revision and reading it are two syscalls, and a
+        // delete on any pod unlinks between them. A file that vanishes under
+        // the read is an ordinary miss — re-resolve and read whatever is newest
+        // now — not the store fault a bare `?` would report it as.
+        let mut bytes = None;
+        for _attempt in 0..LOAD_RESOLVE_ATTEMPTS {
+            let Some((_, path)) = self.current_revision_file(persistence_id)? else {
+                return Ok(None);
+            };
+            match std::fs::read(&path) {
+                Ok(read) => {
+                    bytes = Some(read);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(store_error(error)),
+            }
+        }
+        let Some(bytes) = bytes else {
+            return Err(store_error(format!(
+                "the newest revision of {persistence_id} was unlinked under \
+                 {LOAD_RESOLVE_ATTEMPTS} consecutive reads"
+            )));
         };
-        let bytes = std::fs::read(&path).map_err(store_error)?;
         let stored: StoredStateRecord<S> = serde_json::from_slice(&bytes)
             .map_err(|error| DurableError::codec(error.to_string()))?;
         if stored.persistence_id != *persistence_id {
@@ -325,14 +349,18 @@ where
             let claim = StateRecord::new(current.state, expected_revision.next());
             self.commit_record(persistence_id, &claim)?;
 
-            // Holding the claim, no other pod can commit for this id, so every
-            // file left is one this delete is entitled to remove. The claim goes
+            // The claim fences the commit that *expects* `expected_revision`,
+            // and only that one: a pod that loads the claim itself sees a
+            // legitimate current revision and may commit on top of it. So this
+            // removes the revisions at or below the claim and nothing above —
+            // a revision stacked on the claim belongs to a writer that was
+            // told it won, and is not this delete's to unlink. The claim goes
             // last: a pod lost mid-delete leaves the record readable at the
             // claimed revision — a delete that did not happen — instead of a
             // hole an older revision resurrects through.
             let mut claim_path = None;
             for (id, revision, path) in self.record_files()? {
-                if id != persistence_id.as_str() {
+                if id != persistence_id.as_str() || revision > claim.revision {
                     continue;
                 }
                 if revision == claim.revision {
@@ -343,6 +371,20 @@ where
             }
             if let Some(path) = claim_path {
                 remove_record_file(&path)?;
+            }
+
+            // A commit that outlived the claim owns the id now. This delete
+            // removed what it was entitled to, but the record is not gone, so
+            // it must not answer as though it were — one of the two has to
+            // lose, and a `DELETE ... WHERE revision = $expected` racing an
+            // accepted update is the one that loses.
+            let remaining = self.current_revision(persistence_id)?;
+            if remaining != Revision::INITIAL {
+                return Err(DurableError::revision_conflict(
+                    persistence_id.clone(),
+                    expected_revision,
+                    remaining,
+                ));
             }
             // What both reference stores return, and what this store's own
             // `current_revision` reports now that every file is unlinked:
