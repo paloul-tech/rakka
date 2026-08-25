@@ -37,6 +37,81 @@ const POD_DEADLINE: Duration = Duration::from_secs(20);
 /// a bounded sweep as an exhaustive one.
 const SWEEP_CEILING: usize = 64;
 
+/// The fewest windows that must move a shard to the surviving pod.
+///
+/// Not every window can. An armed pod that dies after finishing its own part
+/// leaves a survivor that completes from the shared record without ever needing
+/// the dead pod's shards — a real recovery, but not a takeover. Measured at 25
+/// of 33 windows, so this floor sits well under what the sweep reaches and far
+/// above a sweep that has stopped downing peers altogether.
+const TAKEOVER_FLOOR: usize = 8;
+
+/// How many consecutive ordinals must fire nothing before a row is spent.
+///
+/// One is not enough. The write counters move with TCP timing, membership
+/// convergence, and which pod wins the seed compare-and-set, so an armed pod
+/// can miss ordinal `n` in the two worlds that arm it and still reach `n + 1`
+/// in the two that arm that. Stopping at the first miss silently truncates the
+/// row and reports the remainder as swept; walking past it turns the miss into
+/// a gap the row reports.
+const DRY_ORDINALS_TO_STOP: usize = 2;
+
+/// The sweep, and what each row is expected to reach.
+///
+/// The floor is what makes a collapsed row fail instead of reading as a short
+/// one: `PodB runs` is legitimately zero, so a bare "did anything fire?" guard
+/// cannot tell an intended zero from a regression that stopped a row dead. Each
+/// floor sits well under what the flow actually does — the rows measured 6, 19
+/// and 6 windows — and well over nothing.
+const SWEEP_ROWS: [SweepRow; 4] = [
+    SweepRow::reachable(Armed::PodA, CrashTarget::Tasks, 4),
+    SweepRow::reachable(Armed::PodA, CrashTarget::Runs, 12),
+    SweepRow::reachable(Armed::PodB, CrashTarget::Tasks, 4),
+    // Structurally unreachable, and printed rather than hidden. Pod B drives
+    // the run only once pod A is gone, and pod A goes only when it is the
+    // armed pod, so no world that arms pod B ever reaches pod B's run writes.
+    // Sweeping the second owner's own recovery writes needs a world with two
+    // armings, which this harness does not build.
+    SweepRow::unreachable(
+        Armed::PodB,
+        CrashTarget::Runs,
+        "pod B reaches its run writes only after taking over, which no world that arms pod B does",
+    ),
+];
+
+/// One row of the sweep.
+struct SweepRow {
+    /// The pod this row arms.
+    armed: Armed,
+    /// The durable class this row arms it inside.
+    target: CrashTarget,
+    /// The fewest windows the row must fire, or `None` with the reason when
+    /// the harness structurally cannot reach the row at all.
+    floor: Option<usize>,
+    /// Why an unreachable row is unreachable.
+    unreachable_because: Option<&'static str>,
+}
+
+impl SweepRow {
+    const fn reachable(armed: Armed, target: CrashTarget, floor: usize) -> Self {
+        Self {
+            armed,
+            target,
+            floor: Some(floor),
+            unreachable_because: None,
+        }
+    }
+
+    const fn unreachable(armed: Armed, target: CrashTarget, because: &'static str) -> Self {
+        Self {
+            armed,
+            target,
+            floor: None,
+            unreachable_because: Some(because),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -236,10 +311,22 @@ async fn run_world(
         return Ok(World::Skipped);
     }
     if root.join(CRASHED).exists() {
-        return Ok(World::Crashed);
+        // Exactly one pod survives an armed crash, and its own exit line is
+        // what says whether a shard actually moved.
+        return match (parse_report(&out_a), parse_report(&out_b)) {
+            (Some(survivor), None) | (None, Some(survivor)) => Ok(World::Crashed(survivor)),
+            (Some(_), Some(_)) => Err(error(
+                "a crash marker was written but both pods reported: the armed pod did not die",
+            )
+            .into()),
+            (None, None) => Err(error(
+                "a crash marker was written and neither pod reported: the survivor died too",
+            )
+            .into()),
+        };
     }
-    match (parse_writes(&out_a), parse_writes(&out_b)) {
-        (Some(pod_a), Some(pod_b)) => Ok(World::Survived(PodWrites { pod_a, pod_b })),
+    match (parse_report(&out_a), parse_report(&out_b)) {
+        (Some(pod_a), Some(pod_b)) => Ok(World::Survived(pod_a, pod_b)),
         // No skip, no crash marker, and a pod that never reported. Something
         // died that the harness did not arm, and reading that as a skip or as
         // a spent sweep row is how a real failure disappears into a green run.
@@ -256,19 +343,34 @@ async fn run_world(
 enum World {
     /// Both pods ran to completion and reported their writes: either nothing
     /// was armed, or the armed write is past the end of what this pod's flow
-    /// actually does.
-    Survived(PodWrites),
-    /// The armed pod reached its armed write and aborted inside the window.
-    Crashed,
+    /// actually does. Carries pod A's report and then pod B's.
+    Survived(PodReport, PodReport),
+    /// The armed pod reached its armed write and aborted inside the window,
+    /// and the surviving pod reported what it owned and whether it took over.
+    Crashed(PodReport),
     /// The environment refused the world before either pod could run.
     Skipped,
 }
 
-/// What each pod reported writing, `(tasks, runs)` per pod.
+/// What one pod reported when it stopped.
+///
+/// The pods have always printed which entities they owned and whether they
+/// downed a departed peer; the driver used to read only the write counts, so a
+/// window counted as a proven pod-loss recovery even when nothing moved.
 #[derive(Debug, Clone, Copy)]
-struct PodWrites {
-    pod_a: (usize, usize),
-    pod_b: (usize, usize),
+struct PodReport {
+    /// Durable writes this pod made to the task store.
+    task_writes: usize,
+    /// Durable writes this pod made to the run store.
+    run_writes: usize,
+    /// Whether this pod owned the task's shard when it stopped.
+    owns_task: bool,
+    /// Whether this pod owned the run's shard when it stopped.
+    owns_run: bool,
+    /// Whether this pod downed a departed peer and took over its shards.
+    took_over: bool,
+    /// Whether this pod saw the task reach a terminal status.
+    terminal: bool,
 }
 
 async fn drain(child: &mut tokio::process::Child) -> String {
@@ -282,19 +384,42 @@ async fn drain(child: &mut tokio::process::Child) -> String {
     buffer
 }
 
-fn parse_writes(stdout: &str) -> Option<(usize, usize)> {
+fn parse_report(stdout: &str) -> Option<PodReport> {
     let line = stdout.lines().find(|line| line.contains("task-writes="))?;
-    let mut tasks = None;
-    let mut runs = None;
+    let mut task_writes = None;
+    let mut run_writes = None;
+    let mut owns_task = None;
+    let mut owns_run = None;
+    let mut took_over = None;
+    let mut terminal = None;
     for field in line.split_whitespace() {
         if let Some(value) = field.strip_prefix("task-writes=") {
-            tasks = value.parse().ok();
+            task_writes = value.parse().ok();
         }
         if let Some(value) = field.strip_prefix("run-writes=") {
-            runs = value.parse().ok();
+            run_writes = value.parse().ok();
+        }
+        if let Some(value) = field.strip_prefix("owns-task=") {
+            owns_task = value.parse().ok();
+        }
+        if let Some(value) = field.strip_prefix("owns-run=") {
+            owns_run = value.parse().ok();
+        }
+        if let Some(value) = field.strip_prefix("took-over=") {
+            took_over = value.parse().ok();
+        }
+        if let Some(value) = field.strip_prefix("terminal=") {
+            terminal = value.parse().ok();
         }
     }
-    Some((tasks?, runs?))
+    Some(PodReport {
+        task_writes: task_writes?,
+        run_writes: run_writes?,
+        owns_task: owns_task?,
+        owns_run: owns_run?,
+        took_over: took_over?,
+        terminal: terminal?,
+    })
 }
 
 async fn assert_converged(root: &Path, context: &str) -> Result<(), Box<dyn Error>> {
@@ -343,21 +468,42 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
     // The crash-free reference: two pods, a shared directory, and the task
     // driven to completion across them.
     let root = fresh_root("reference")?;
-    let writes = match run_world(&root, None).await? {
-        World::Survived(writes) => writes,
+    let (pod_a, pod_b) = match run_world(&root, None).await? {
+        World::Survived(pod_a, pod_b) => (pod_a, pod_b),
         World::Skipped => {
             println!("skipped: loopback binding is unavailable in this environment");
             return Ok(());
         }
-        World::Crashed => {
+        World::Crashed(_) => {
             return Err(error("the crash-free reference world reported a crash").into())
         }
     };
     assert_converged(&root, "the crash-free reference").await?;
+
+    // The claim this harness rests on: the task and the run are hosted by
+    // different pods, so the task's owed run-creation and the run's result
+    // proposal cross the wire rather than a function call. A shard-count or
+    // hashing change that co-locates them takes that property away silently —
+    // every other assertion here still passes with both entities on one pod.
+    if pod_a.owns_task == pod_b.owns_task || pod_a.owns_run == pod_b.owns_run {
+        return Err(error(format!(
+            "each entity must be owned by exactly one pod; pod-a owns-task={} owns-run={}, \
+             pod-b owns-task={} owns-run={}",
+            pod_a.owns_task, pod_a.owns_run, pod_b.owns_task, pod_b.owns_run
+        ))
+        .into());
+    }
+    if pod_a.owns_task == pod_a.owns_run {
+        return Err(error(
+            "the task and the run landed on the same pod, so no exchange crosses the wire \
+             and the sweep proves nothing this repository's in-process tests do not",
+        )
+        .into());
+    }
     println!(
         "reference: two pods completed the task; pod-a wrote tasks={} runs={}, \
          pod-b wrote tasks={} runs={}",
-        writes.pod_a.0, writes.pod_a.1, writes.pod_b.0, writes.pod_b.1
+        pod_a.task_writes, pod_a.run_writes, pod_b.task_writes, pod_b.run_writes
     );
     let _ = std::fs::remove_dir_all(&root);
 
@@ -371,15 +517,15 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
     // would be a world that kills nothing and converges trivially. Here a
     // counted window is one whose pod left a crash marker, so it fired.
     let mut swept = Vec::new();
-    for (armed, target) in [
-        (Armed::PodA, CrashTarget::Tasks),
-        (Armed::PodA, CrashTarget::Runs),
-        (Armed::PodB, CrashTarget::Tasks),
-        (Armed::PodB, CrashTarget::Runs),
-    ] {
+    let mut took_over = 0usize;
+    for row in &SWEEP_ROWS {
+        let (armed, target) = (row.armed, row.target);
         let mut fired = 0usize;
+        let mut dry_streak = 0usize;
+        let mut last_firing = 0usize;
+        let mut gaps = 0usize;
         let mut nth = 1usize;
-        while nth <= SWEEP_CEILING {
+        while nth <= SWEEP_CEILING && dry_streak < DRY_ORDINALS_TO_STOP {
             let mut reached = false;
             for window in [PodCrash::BeforeWrite, PodCrash::AfterWrite] {
                 let label = format!(
@@ -394,15 +540,25 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
                 );
                 let root = fresh_root(&label)?;
                 match run_world(&root, Some((armed, target, nth, window))).await? {
-                    World::Crashed => {
+                    World::Crashed(survivor) => {
                         assert_converged(&root, &context).await?;
+                        if !survivor.terminal {
+                            return Err(error(format!(
+                                "{context}: the record converged but the surviving pod did not \
+                                 see it, so it stopped for another reason"
+                            ))
+                            .into());
+                        }
                         reached = true;
                         fired += 1;
+                        if survivor.took_over {
+                            took_over += 1;
+                        }
                     }
                     // The flow never reached this write, so the world is a
                     // crash-free one. It still has to converge — but it is not
                     // a pod-loss window and is not counted as one.
-                    World::Survived(_) => {
+                    World::Survived(_, _) => {
                         assert_converged(&root, &format!("{context}, which never fired")).await?;
                     }
                     World::Skipped => {
@@ -412,30 +568,87 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
                 }
                 let _ = std::fs::remove_dir_all(&root);
             }
-            if !reached {
-                break;
+            if reached {
+                // Every ordinal skipped since the last firing one was a miss
+                // this row walked past, not the end of the row.
+                gaps += nth - last_firing - 1;
+                last_firing = nth;
+                dry_streak = 0;
+            } else {
+                dry_streak += 1;
             }
             nth += 1;
         }
-        if nth > SWEEP_CEILING {
+        if dry_streak < DRY_ORDINALS_TO_STOP {
             println!(
                 "note: {armed:?} {} stopped at the {SWEEP_CEILING}-write ceiling rather than at \
                  the flow's last write; windows past it were not swept",
                 target.as_label()
             );
         }
-        swept.push((armed, target, fired));
+        if fired == 0 {
+            if let Some(because) = row.unreachable_because {
+                println!(
+                    "  {armed:?} {}: 0 windows — unreachable: {because}",
+                    target.as_label()
+                );
+                swept.push(fired);
+                continue;
+            }
+        }
+        let gap_note = if gaps == 0 {
+            String::new()
+        } else {
+            format!(", {gaps} ordinal(s) missed and walked past")
+        };
+        println!(
+            "  {armed:?} {}: {fired} windows, ordinals 1-{last_firing}{gap_note}",
+            target.as_label()
+        );
+        if let Some(floor) = row.floor {
+            if fired < floor {
+                return Err(error(format!(
+                    "{armed:?} {} fired {fired} windows, below its floor of {floor}: the row \
+                     collapsed rather than running short",
+                    target.as_label()
+                ))
+                .into());
+            }
+        } else if fired > 0 {
+            println!(
+                "note: {armed:?} {} was expected to be unreachable and fired {fired} windows; \
+                 the sweep gained coverage and the note above is stale",
+                target.as_label()
+            );
+        }
+        swept.push(fired);
     }
 
-    let windows: usize = swept.iter().map(|(_, _, fired)| fired).sum();
-    if windows == 0 {
-        return Err(error("no armed write was ever reached; the sweep would prove nothing").into());
+    // No `windows == 0` guard: every reachable row has already been held to its
+    // own floor above, which is strictly stronger. A total of zero now fails
+    // naming the row that collapsed rather than the sweep as a whole.
+    let windows: usize = swept.iter().sum();
+
+    // A crash marker says a pod died, not that a shard moved. A window whose
+    // armed pod died after finishing its own part is a real recovery — the
+    // survivor completes from the shared record — but nothing was taken over in
+    // it, so it exercises neither the downing, the shard movement, nor the
+    // re-materialization on another pod. Some window has to reach those, or the
+    // sweep proves only the cheaper half of what this harness claims.
+    if took_over < TAKEOVER_FLOOR {
+        return Err(error(format!(
+            "only {took_over} of {windows} windows moved a shard to the surviving pod, below \
+             the floor of {TAKEOVER_FLOOR}: the sweep is killing pods without exercising \
+             recovery on another pod"
+        ))
+        .into());
     }
-    for (armed, target, fired) in &swept {
-        println!("  {armed:?} {}: {fired} windows", target.as_label());
-    }
+
     println!(
-        "swept {windows} pod-loss windows; every one fired and converged from the shared record"
+        "swept {windows} pod-loss windows; every one fired and converged from the shared record \
+         ({took_over} moved a shard to the survivor, {} were finished by the surviving owner \
+         without one)",
+        windows - took_over
     );
     Ok(())
 }

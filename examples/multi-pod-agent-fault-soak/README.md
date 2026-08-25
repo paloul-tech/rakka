@@ -43,20 +43,31 @@ line, one line per sweep row, and a total in which every window fired.
 
 ```
 Rakka multi-pod agent fault harness
-reference: two pods completed the task; pod-a wrote tasks=3 runs=10, pod-b wrote tasks=4 runs=0
-  PodA tasks: 6 windows
-  PodA runs: 20 windows
-  PodB tasks: 6 windows
-  PodB runs: 0 windows
-swept 32 pod-loss windows; every one fired and converged from the shared record
+reference: two pods completed the task; pod-a wrote tasks=3 runs=10, pod-b wrote tasks=3 runs=0
+  PodA tasks: 6 windows, ordinals 1-3
+  PodA runs: 18 windows, ordinals 1-10
+  PodB tasks: 6 windows, ordinals 1-3
+  PodB runs: 0 windows — unreachable: pod B reaches its run writes only after taking over, which no world that arms pod B does
+swept 30 pod-loss windows; every one fired and converged from the shared record (25 moved a shard to the survivor, 5 were finished by the surviving owner without one)
 ```
 
-`PodB runs: 0 windows` is not a defect in the sweep, and it is printed rather
-than hidden: pod B only drives the run once pod A is gone, and pod A only goes
-when *it* is the armed pod — so a world that arms pod B never reaches pod B's
-run writes. Sweeping the second owner's own recovery writes needs a world with
-two armings, which this harness does not yet build. It is the one durable
-transition here that nothing kills a pod inside.
+**A crash marker says a pod died, not that a shard moved.** The two numbers in
+the summary are different claims. A window that *moved a shard* downed the
+departed pod, took over its shards, and re-materialized its entities on the
+survivor — the whole of specification 15. A window finished *without* a
+takeover is still a real recovery, but the armed pod had already done its part
+before dying, so the survivor completed from the shared record without ever
+needing the dead pod's shards. Both converge; only the first exercises shard
+movement, so the harness holds the takeover count to a floor rather than
+counting markers and calling them recoveries.
+
+Each row also carries a floor, because `PodB runs: 0 windows` is legitimately
+zero: a bare "did anything fire?" guard cannot tell an intended zero from a
+regression that stopped a row dead. Pod B drives the run only once pod A is
+gone, and pod A only goes when *it* is the armed pod, so a world that arms pod B
+never reaches pod B's run writes. Sweeping the second owner's own recovery
+writes needs a world with two armings, which this harness does not yet build.
+It is the one durable transition here that nothing kills a pod inside.
 
 Set `RAKKA_MULTI_POD_VERBOSE=1` to see each pod's exit line — which entities it
 owned, whether it took over from a departed peer, and what the durable record
@@ -82,6 +93,11 @@ commands deduplicate on derived operation ids, so two pods issuing them produce
 one agent and one task — which is also what an ingress redelivering to whichever
 pod is up actually does.
 
+The reference world asserts that the task and the run are owned by *different*
+pods before any of this is believed. A shard-count or hashing change that
+co-located them would take the cross-wire property away silently — every other
+assertion in the harness still passes with both entities on one pod.
+
 Each pod drives only the entities whose shards it own. In practice the task and
 the run land on different pods, so the task's owed run-creation exchange has to
 cross the wire; the run's result proposal has to cross back. The model call goes
@@ -105,7 +121,11 @@ orderly failure, and a pod loss is none of those.
 **Each row bounds itself.** A pod that reaches its armed write records the
 window in a `crashed` marker before aborting, so the driver can tell a window
 that fired from one whose armed write the flow never reached; a row walks its
-ordinals until neither window at that ordinal fires. Reading the row's length
+ordinals until two *consecutive* ordinals fire nothing. Two, not one: the write
+counters move with TCP timing and membership convergence, so an armed pod can
+miss ordinal `n` and still reach `n + 1`, and stopping at the first miss would
+truncate the row and report the rest as swept. An ordinal walked past this way
+is reported as a gap rather than absorbed. Reading the row's length
 off the crash-free reference run instead would measure one world and arm
 another — only an armed world ever loses a pod, downs it, and recovers its
 entities on the survivor — and the counts drift between runs on one machine
@@ -119,6 +139,8 @@ is still asserted; it is simply not counted as a pod-loss window.
 
 Each window asserts, from the shared directory after every pod is gone:
 
+- the surviving pod itself saw the task reach a terminal status, so a converged
+  record cannot be credited to a pod that stopped for some other reason;
 - the task's durable status is `Completed`;
 - the external ledger was reached, and reached for exactly **one logical turn**
   — a pod killed after the external commit may legitimately cause a *retry* of

@@ -55,10 +55,21 @@ boundary, including after a test external system commits but before it returns
 the receipt.
 
 Each sweep row bounds itself: a pod that reaches its armed write records it
-before aborting, and the row walks its ordinals until neither window at that
-ordinal fires, so every window in the reported total is one that fired. The
-totals themselves vary run to run, because the write counters move with TCP
-timing, membership convergence, and which pod wins the seed compare-and-set.
+before aborting, and the row walks its ordinals until two consecutive ordinals
+fire nothing, so every window in the reported total is one that fired and a
+single missed ordinal is reported as a gap rather than truncating the row. Each
+row carries a floor, so a row that collapses fails naming itself instead of
+reading as a short one. The totals themselves vary run to run, because the write
+counters move with TCP timing, membership convergence, and which pod wins the
+seed compare-and-set.
+
+A crash marker records that a pod died, not that a shard moved, and the harness
+reports the two separately. A window that moved a shard downed the departed pod,
+took over its shards, and re-materialized its entities on the survivor; a window
+that did not is still a real recovery, but its armed pod had finished its part
+before dying, so the survivor never needed the dead pod's shards. The takeover
+count is held to a floor, and the reference world asserts the task and the run
+are owned by different pods before any of it is believed.
 
 Deliberate limits are documented in the harness README: the shared directory
 stands in for a shared durable backend (production is PostgreSQL), departure is
