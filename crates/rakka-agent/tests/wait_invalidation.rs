@@ -441,20 +441,76 @@ async fn a_guardrail_upgrade_during_the_wait_refuses_the_pinned_intent() {
 // and a run-pinned one waits for a new run. Neither may disturb a parked wait.
 // ---------------------------------------------------------------------------
 
+/// The agent's current settings revision, read from its durable record.
+///
+/// What a settings change lands on. Reading it back is what separates "the
+/// change was applied and the run ignored it" from "the change was never
+/// applied" — the two are indistinguishable from the run's status alone.
+async fn current_settings(
+    fx: &AuthorityFixture,
+) -> (AgentRevisionNumber, rakka_agent::AgentSettings) {
+    let mut agent = rakka_agent::AgentEntityStore::new(agent_scope(), fx.fx.agents.clone());
+    agent.recover().await.expect("the agent recovers");
+    let state = agent
+        .state()
+        .expect("the state reads")
+        .expect("the agent exists");
+    (
+        state.settings().revision(),
+        state.settings().settings().clone(),
+    )
+}
+
 #[tokio::test]
 async fn a_turn_bound_change_during_the_wait_does_not_disturb_it() {
     let fx = parked_world(false).await;
     let checkpoint = open_checkpoint(&fx).await;
+
+    let (revision_before, settings_before) = current_settings(&fx).await;
+    let pinned_before = fx
+        .fx
+        .run_snapshot()
+        .await
+        .expect("the run exists")
+        .agent_settings_revision;
 
     fx.apply_settings(
         "retrieval-limit-during-wait",
         vec![AgentSettingsChange::RetrievalLimit(7)],
     )
     .await;
+
+    // Without this the test cannot tell a turn-bound change that was applied
+    // and correctly ignored from an `apply_settings` call that did nothing:
+    // deleting the call above left every remaining assertion passing.
+    let (revision_after, settings_after) = current_settings(&fx).await;
+    assert_ne!(
+        revision_after, revision_before,
+        "the settings change advanced the agent's settings revision"
+    );
+    assert_eq!(
+        settings_after.retrieval_limit,
+        Some(7),
+        "the turn-bound change landed on the agent's current settings"
+    );
+    assert_ne!(
+        settings_before.retrieval_limit,
+        Some(7),
+        "the fixture did not already carry the value under test"
+    );
     assert_eq!(
         fx.fx.run_snapshot().await.expect("the run exists").status,
         AgentRunStatus::WaitingForApproval,
         "a turn-bound change is not a wake and not an invalidation"
+    );
+    assert_eq!(
+        fx.fx
+            .run_snapshot()
+            .await
+            .expect("the run exists")
+            .agent_settings_revision,
+        pinned_before,
+        "a turn-bound change does not re-pin a run that is parked"
     );
 
     approve(&fx, checkpoint, None, "d1").await;
@@ -479,6 +535,19 @@ async fn a_run_pinned_change_during_the_wait_is_inert_for_the_live_run() {
     let fx = parked_world(false).await;
     let checkpoint = open_checkpoint(&fx).await;
 
+    let (revision_before, settings_before) = current_settings(&fx).await;
+    let pinned_before = fx
+        .fx
+        .run_snapshot()
+        .await
+        .expect("the run exists")
+        .agent_settings_revision;
+    assert_ne!(
+        settings_before.loop_state_schema_version,
+        Some(rakka_agent_workflow::StateSchemaVersion::new(2)),
+        "the fixture did not already carry the value under test"
+    );
+
     fx.apply_settings(
         "schema-bump-during-wait",
         vec![AgentSettingsChange::LoopStateSchemaVersion(
@@ -489,6 +558,32 @@ async fn a_run_pinned_change_during_the_wait_is_inert_for_the_live_run() {
     approve(&fx, checkpoint, None, "d1").await;
     fx.pump().await;
 
+    // The change landed on the agent...
+    let (revision_after, settings_after) = current_settings(&fx).await;
+    assert_ne!(
+        revision_after, revision_before,
+        "the settings change advanced the agent's settings revision"
+    );
+    assert_eq!(
+        settings_after.loop_state_schema_version,
+        Some(rakka_agent_workflow::StateSchemaVersion::new(2)),
+        "the run-pinned change landed on the agent's current settings"
+    );
+
+    // ...and the run in flight stayed on the revision it pinned. This is the
+    // assertion that keeps its meaning when a consumer of
+    // `loop_state_schema_version` arrives: status and invocation count are
+    // identical to the no-change control and cannot distinguish a run that
+    // stayed pinned from one that silently migrated.
+    assert_eq!(
+        fx.fx
+            .run_snapshot()
+            .await
+            .expect("the run exists")
+            .agent_settings_revision,
+        pinned_before,
+        "a run-pinned change does not re-pin a run that is already in flight"
+    );
     assert_eq!(
         fx.fx.run_snapshot().await.expect("the run exists").status,
         AgentRunStatus::Completed,

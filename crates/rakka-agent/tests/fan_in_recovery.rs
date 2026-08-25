@@ -32,8 +32,8 @@ use rakka_agent::testkit::{
     CrashPoint, DeterministicModelAdapter, ExchangeFault, ScriptedDispatcher,
 };
 use rakka_agent::{
-    AgentDelegationId, AgentDelegationStatus, AgentExchangeEnvelope, AgentRunStatus, AgentTaskId,
-    AgentTaskStatus,
+    AgentDelegationId, AgentDelegationStatus, AgentExchangeEnvelope, AgentExchangeTransport,
+    AgentRunStatus, AgentTaskId, AgentTaskStatus,
 };
 
 /// A fan-out world: the agent, the goal task, and a peer surface that names
@@ -78,12 +78,16 @@ async fn children(fixture: &Fixture) -> Vec<(AgentDelegationId, AgentTaskId)> {
 }
 
 /// Delivers one child's terminal report, tolerating an injected loss.
+///
+/// Through `run_transport`, which is where the faults are injected. Building a
+/// run entity here and calling `accept` on it reaches the same durable path but
+/// goes *around* the transport, so an injected `LoseEnvelope`, `LoseReply`, or
+/// `DeliverTwice` was consumed by whatever run-bound exchange the router
+/// delivered next — never by the `DelegationResult` this file exists to fault.
+/// The transport builds its own run entity from the same store, so the durable
+/// effect is unchanged; what changes is that the fault now lands here.
 async fn deliver(fixture: &Fixture, envelope: &AgentExchangeEnvelope) {
-    let mut run = fixture.run();
-    if run.recover(fixture.now()).await.is_err() {
-        return;
-    }
-    let _ = run.accept(envelope, &fixture.router, fixture.now()).await;
+    let _ = fixture.run_transport.deliver(envelope).await;
 }
 
 /// Drives the whole fan-out to quiescence, tolerating an injected loss: the
@@ -260,8 +264,17 @@ async fn the_delegation_result_survives_every_delivery_fault() {
         ExchangeFault::DeliverTwice,
     ] {
         let (fixture, executor) = fan_out_world().await;
+        let before = fixture.run_transport.deliveries();
         fixture.run_transport.inject(fault);
         drive(&fixture).await;
+
+        // Without this the test passes whether or not the envelope ever
+        // travelled the transport the fault was queued on, which is exactly how
+        // all three faults were no-ops here.
+        assert!(
+            fixture.run_transport.deliveries() > before,
+            "{fault:?}: the DelegationResult never travelled the faulted transport"
+        );
         assert_converged(&fixture, &executor, &format!("{fault:?}")).await;
     }
 }

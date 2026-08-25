@@ -517,7 +517,26 @@ fn parse_report(stdout: &str) -> Option<PodReport> {
     })
 }
 
-async fn assert_converged(root: &Path, context: &str) -> Result<(), Box<dyn Error>> {
+/// What the external ledger must show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ledger {
+    /// Exactly one call. A world with no crash has nothing to retry through,
+    /// so the exact count is known and free — and counting is the only thing
+    /// that catches a turn re-issued on every round, which the identity check
+    /// below cannot see because every line is identical.
+    ExactlyOnce,
+    /// One identity, however many times it was retried. A pod killed after the
+    /// external commit but before the receipt legitimately causes a retry of
+    /// the same turn under the same run; what it may never cause is a call
+    /// under a different one.
+    OneIdentity,
+}
+
+async fn assert_converged(
+    root: &Path,
+    context: &str,
+    ledger: Ledger,
+) -> Result<(), Box<dyn Error>> {
     let status = flow::task_status(root).await;
     if status != Some(AgentTaskStatus::Completed) {
         return Err(error(format!(
@@ -538,6 +557,14 @@ async fn assert_converged(root: &Path, context: &str) -> Result<(), Box<dyn Erro
         return Err(error(format!(
             "{context}: the external system saw {} distinct calls, expected one logical turn: {distinct:?}",
             distinct.len()
+        ))
+        .into());
+    }
+    if ledger == Ledger::ExactlyOnce && entries.len() != 1 {
+        return Err(error(format!(
+            "{context}: the external system was called {} times in a world with no crash to \
+             retry through, expected exactly one: {entries:?}",
+            entries.len()
         ))
         .into());
     }
@@ -579,7 +606,7 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
         }
         World::PortTaken => unreachable!("run_world retries or fails on a taken port"),
     };
-    assert_converged(&root, "the crash-free reference").await?;
+    assert_converged(&root, "the crash-free reference", Ledger::ExactlyOnce).await?;
 
     // The claim this harness rests on: the task and the run are hosted by
     // different pods, so the task's owed run-creation and the run's result
@@ -661,7 +688,7 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
                 let root = fresh_root(&label)?;
                 match run_world(&root, Some((armed, target, nth, window))).await? {
                     World::Crashed(survivor) => {
-                        assert_converged(&root, &context).await?;
+                        assert_converged(&root, &context, Ledger::OneIdentity).await?;
                         if !survivor.terminal {
                             return Err(error(format!(
                                 "{context}: the record converged but the surviving pod did not \
@@ -679,7 +706,12 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
                     // crash-free one. It still has to converge — but it is not
                     // a pod-loss window and is not counted as one.
                     World::Survived(_, _) => {
-                        assert_converged(&root, &format!("{context}, which never fired")).await?;
+                        assert_converged(
+                            &root,
+                            &format!("{context}, which never fired"),
+                            Ledger::ExactlyOnce,
+                        )
+                        .await?;
                     }
                     World::PortTaken => {
                         unreachable!("run_world retries or fails on a taken port")

@@ -803,10 +803,20 @@ async fn the_descendants_ceiling_stays_exact_across_every_coordinator_loss() {
     reference.fixture.runs.reset_writes();
     let _ = reference.fixture.pump().await;
     let run_writes = reference.fixture.runs.writes();
+
+    // The reference is asserted, not merely counted. Its outcome used to be
+    // discarded — `let _ = pump()` — so the only guard on the sweep was a floor
+    // of two against a flow that makes seventeen writes: a regression that
+    // short-circuited the ceiling turn would drop the count to two or three,
+    // pass the floor, quietly sweep a handful of windows instead of the whole
+    // compare-and-set, and leave no other trace because nothing looked at what
+    // the reference produced.
+    assert_ceiling_exact(&reference, "the crash-free reference").await;
     assert!(
-        run_writes >= 2,
-        "the ceiling turn writes the run store at least twice \
-         (the committing turn, the terminal fold), saw {run_writes}"
+        run_writes >= 12,
+        "the ceiling turn writes the run store far more than a handful of times \
+         (measured at 17: the committing turn, the refusal, the escrow, the \
+         terminal fold and the effects each settle), saw {run_writes}"
     );
 
     for point in 1..=run_writes {
@@ -826,59 +836,68 @@ async fn the_descendants_ceiling_stays_exact_across_every_coordinator_loss() {
             let _ = world.fixture.pump().await;
 
             let context = format!("run-store crash at write {point} ({window:?})");
-            let mut run = world.fixture.run();
-            run.recover(world.fixture.now())
-                .await
-                .unwrap_or_else(|error| panic!("{context}: the run recovers: {error}"));
-            let state = run
-                .state()
-                .unwrap_or_else(|error| panic!("{context}: the run state reads: {error}"));
-            assert!(
-                state
-                    .status()
-                    .unwrap_or_else(|| panic!("{context}: the run exists"))
-                    .is_terminal(),
-                "{context}: the run reached a terminal status"
-            );
-            let loop_state = state
-                .loop_state()
-                .unwrap_or_else(|| panic!("{context}: the loop state survives"));
-            assert_eq!(
-                loop_state.delegation_count(),
-                1,
-                "{context}: the ceiling admitted exactly one child"
-            );
-            assert_eq!(
-                loop_state.budget().consumption().descendants,
-                1,
-                "{context}: the descendants quota is charged once, never twice"
-            );
-
-            // A redispatched send is a retry of one logical delegation, so the
-            // identity — not the invocation count — is what must stay at one.
-            let sent: std::collections::BTreeSet<_> = world
-                .executor
-                .seen
-                .lock()
-                .expect("the record log should not be poisoned")
-                .iter()
-                .map(|record| record.delegation.clone())
-                .collect();
-            assert_eq!(
-                sent.len(),
-                1,
-                "{context}: one logical child, however often the send retried"
-            );
-
-            // The refusal the model corrects course from survives, and survives
-            // exactly once: a replayed turn must not append a second tool
-            // result to the run's session memory (scenario 16).
-            let codes = session_refusal_codes(&world.session).await;
-            assert_eq!(
-                codes,
-                vec!["delegation-descendants-exhausted".to_string()],
-                "{context}: one refusal on the record, neither lost nor doubled"
-            );
+            assert_ceiling_exact(&world, &context).await;
         }
     }
+}
+
+/// The ceiling turn's exactness: one cell, one charged descendant, one logical
+/// send, one refusal, and a terminal run.
+///
+/// Shared by the crash-free reference and by every crash window, so the
+/// reference cannot drift from what the sweep checks.
+async fn assert_ceiling_exact(world: &CeilingWorld, context: &str) {
+    let mut run = world.fixture.run();
+    run.recover(world.fixture.now())
+        .await
+        .unwrap_or_else(|error| panic!("{context}: the run recovers: {error}"));
+    let state = run
+        .state()
+        .unwrap_or_else(|error| panic!("{context}: the run state reads: {error}"));
+    assert!(
+        state
+            .status()
+            .unwrap_or_else(|| panic!("{context}: the run exists"))
+            .is_terminal(),
+        "{context}: the run reached a terminal status"
+    );
+    let loop_state = state
+        .loop_state()
+        .unwrap_or_else(|| panic!("{context}: the loop state survives"));
+    assert_eq!(
+        loop_state.delegation_count(),
+        1,
+        "{context}: the ceiling admitted exactly one child"
+    );
+    assert_eq!(
+        loop_state.budget().consumption().descendants,
+        1,
+        "{context}: the descendants quota is charged once, never twice"
+    );
+
+    // A redispatched send is a retry of one logical delegation, so the
+    // identity — not the invocation count — is what must stay at one.
+    let sent: std::collections::BTreeSet<_> = world
+        .executor
+        .seen
+        .lock()
+        .expect("the record log should not be poisoned")
+        .iter()
+        .map(|record| record.delegation.clone())
+        .collect();
+    assert_eq!(
+        sent.len(),
+        1,
+        "{context}: one logical child, however often the send retried"
+    );
+
+    // The refusal the model corrects course from survives, and survives
+    // exactly once: a replayed turn must not append a second tool result to
+    // the run's session memory (scenario 16).
+    let codes = session_refusal_codes(&world.session).await;
+    assert_eq!(
+        codes,
+        vec!["delegation-descendants-exhausted".to_string()],
+        "{context}: one refusal on the record, neither lost nor doubled"
+    );
 }

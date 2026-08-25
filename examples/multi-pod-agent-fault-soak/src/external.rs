@@ -24,6 +24,15 @@ use rakka_agent::{
 const LEDGER: &str = "external.log";
 
 /// Appends one line to the shared ledger, creating it if needed.
+///
+/// One `write_all` of the line *and* its newline, never `writeln!`. `writeln!`
+/// on an unbuffered file issues one write per format piece — the payload, then
+/// the newline — and this harness aborts pods from arbitrary threads: an abort
+/// landing between the two leaves a line with no terminator that the recovering
+/// pod's own append then merges with, so two external calls read back as one
+/// entry and the oracle below reports a clean single turn. Two pods appending
+/// concurrently can interleave the same way. Under `O_APPEND` a single write is
+/// atomic, which is what makes a line a line.
 fn append(root: &Path, line: &str) {
     use std::io::Write as _;
 
@@ -33,7 +42,7 @@ fn append(root: &Path, line: &str) {
         .append(true)
         .open(root.join(LEDGER))
     {
-        let _ = writeln!(file, "{line}");
+        let _ = file.write_all(format!("{line}\n").as_bytes());
         let _ = file.sync_all();
     }
 }
@@ -84,7 +93,21 @@ impl AgentModelAdapter for LedgerModelAdapter {
     fn call<'a>(&'a self, request: &'a AgentModelRequest) -> AgentModelFuture<'a> {
         Box::pin(async move {
             // The external commit, before the receipt exists anywhere.
-            append(&self.root, &format!("model-call turn={}", request.turn));
+            //
+            // The snapshot id is what makes this line an *identity* rather than
+            // a turn number. It is derived from the run's full scope and the
+            // turn, so a retry of this turn by a recovering pod appends a
+            // byte-identical line, while a second run under a different
+            // assignment generation — the thing recovery must never produce —
+            // derives a different one and shows up as a distinct entry.
+            append(
+                &self.root,
+                &format!(
+                    "model-call turn={} snapshot={}",
+                    request.turn,
+                    request.context.snapshot_id.as_str()
+                ),
+            );
             Ok(AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
                 .with_text("Resolved.")
                 .with_proposal(
