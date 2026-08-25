@@ -35,13 +35,28 @@ Three things here are firsts for the repository:
 cargo run -p rakka-example-multi-pod-agent-fault-soak
 ```
 
-Expected output, with the write counts varying by shard layout:
+Expected output. The write counts and the window totals vary run to run — the
+counter behind them is incremented by the sharded entity actors as well as the
+drive loop, so it moves with TCP timing, membership convergence, and which pod
+wins the seed compare-and-set. What does not vary is the shape: a reference
+line, one line per sweep row, and a total in which every window fired.
 
 ```
 Rakka multi-pod agent fault harness
-reference: two pods completed the task; pod-a wrote tasks=3 runs=10, pod-b wrote tasks=3 runs=0
-swept 32 pod-loss windows; every one converged from the shared record
+reference: two pods completed the task; pod-a wrote tasks=3 runs=10, pod-b wrote tasks=4 runs=0
+  PodA tasks: 6 windows
+  PodA runs: 20 windows
+  PodB tasks: 6 windows
+  PodB runs: 0 windows
+swept 32 pod-loss windows; every one fired and converged from the shared record
 ```
+
+`PodB runs: 0 windows` is not a defect in the sweep, and it is printed rather
+than hidden: pod B only drives the run once pod A is gone, and pod A only goes
+when *it* is the armed pod — so a world that arms pod B never reaches pod B's
+run writes. Sweeping the second owner's own recovery writes needs a world with
+two armings, which this harness does not yet build. It is the one durable
+transition here that nothing kills a pod inside.
 
 Set `RAKKA_MULTI_POD_VERBOSE=1` to see each pod's exit line — which entities it
 owned, whether it took over from a departed peer, and what the durable record
@@ -82,11 +97,25 @@ from the shared directory, and the survivor finishes the work.
 
 ## The sweep
 
-The crash-free reference run reports how many durable writes each pod made. The
-sweep then replays the world once per `(pod, store, write ordinal, window)`,
+The sweep replays the world once per `(pod, store, write ordinal, window)`,
 arming that pod to `abort()` at exactly that write. `abort()` rather than a
 panic: a panic unwinds, runs destructors, and lets the harness observe an
 orderly failure, and a pod loss is none of those.
+
+**Each row bounds itself.** A pod that reaches its armed write records the
+window in a `crashed` marker before aborting, so the driver can tell a window
+that fired from one whose armed write the flow never reached; a row walks its
+ordinals until neither window at that ordinal fires. Reading the row's length
+off the crash-free reference run instead would measure one world and arm
+another — only an armed world ever loses a pod, downs it, and recovers its
+entities on the survivor — and the counts drift between runs on one machine
+regardless. Ordinal `n` would then name whatever the reference's `n`th write
+happened to be, and every ordinal past the armed world's own last write would
+be a world that killed nothing and converged trivially. A window in the total
+is a window that fired.
+
+A world whose armed write is never reached is still a crash-free world, so it
+is still asserted; it is simply not counted as a pod-loss window.
 
 Each window asserts, from the shared directory after every pod is gone:
 

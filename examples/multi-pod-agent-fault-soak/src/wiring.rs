@@ -41,7 +41,7 @@ use rakka_sharding::{
     EntityTypeRegistration, RemoteEntityAskClient,
 };
 
-use crate::stores::{PodCrash, PodCrashStore, SharedFileStore};
+use crate::stores::{PodCrash, PodCrashStore, SharedFileStore, CRASHED};
 
 /// The cluster role every pod in this harness joins under.
 pub const ROLE: &str = "agent-multi-pod";
@@ -96,15 +96,15 @@ impl PodStores {
         let runs = PodCrashStore::new(SharedFileStore::new(root.join("runs")));
         Self {
             agents: match arm(CrashTarget::Agents) {
-                Some((nth, point)) => agents.armed_at(nth, point),
+                Some((nth, point)) => agents.armed_at(nth, point, root.join(CRASHED)),
                 None => agents,
             },
             tasks: match arm(CrashTarget::Tasks) {
-                Some((nth, point)) => tasks.armed_at(nth, point),
+                Some((nth, point)) => tasks.armed_at(nth, point, root.join(CRASHED)),
                 None => tasks,
             },
             runs: match arm(CrashTarget::Runs) {
-                Some((nth, point)) => runs.armed_at(nth, point),
+                Some((nth, point)) => runs.armed_at(nth, point, root.join(CRASHED)),
                 None => runs,
             },
             teams: SharedFileStore::new(root.join("teams")),

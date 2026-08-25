@@ -35,6 +35,15 @@ use rakka_persistence::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+/// The file a pod writes immediately before it aborts.
+///
+/// The sweep's termination condition, and its proof of work. A window whose
+/// armed write the flow never reached leaves no marker, which is how the driver
+/// knows a row is spent rather than guessing its length from a different run —
+/// and because the marker is written only on the abort path, a counted window
+/// is one that demonstrably fired.
+pub const CRASHED: &str = "crashed";
+
 /// Monotonic per-process suffix keeping temp file names collision-free.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -240,6 +249,15 @@ where
     }
 }
 
+/// Unlinks one revision file, tolerating one a concurrent pass already removed.
+fn remove_record_file(path: &std::path::Path) -> DurableResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
 impl<S> DurableStateStore<S> for SharedFileStore<S>
 where
     S: DurableState + Serialize + DeserializeOwned,
@@ -290,16 +308,50 @@ where
                     actual,
                 ));
             }
-            for (id, _, path) in self.record_files()? {
-                if id == persistence_id.as_str() {
-                    match std::fs::remove_file(path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(store_error(error)),
-                    }
+            let Some(current) = self.load_record(persistence_id)? else {
+                // `expected_revision` matched `Revision::INITIAL`: nothing was
+                // ever committed for this id, so there is nothing to fence and
+                // nothing to unlink.
+                return Ok(Revision::INITIAL);
+            };
+
+            // A delete mutates the record exactly as a commit does, so it takes
+            // the same claim: a `hard_link` on the next revision, won by exactly
+            // one pod. Without it the unlink loop below is a read-then-act — a
+            // pod that commits `expected + 1` between the revision check and the
+            // loop has its committed revision unlinked, which is the lost update
+            // the link exists to prevent and which a `DELETE ... WHERE revision
+            // = $expected` would have refused.
+            let claim = StateRecord::new(current.state, expected_revision.next());
+            self.commit_record(persistence_id, &claim)?;
+
+            // Holding the claim, no other pod can commit for this id, so every
+            // file left is one this delete is entitled to remove. The claim goes
+            // last: a pod lost mid-delete leaves the record readable at the
+            // claimed revision — a delete that did not happen — instead of a
+            // hole an older revision resurrects through.
+            let mut claim_path = None;
+            for (id, revision, path) in self.record_files()? {
+                if id != persistence_id.as_str() {
+                    continue;
                 }
+                if revision == claim.revision {
+                    claim_path = Some(path);
+                    continue;
+                }
+                remove_record_file(&path)?;
             }
-            Ok(expected_revision)
+            if let Some(path) = claim_path {
+                remove_record_file(&path)?;
+            }
+            // What both reference stores return, and what this store's own
+            // `current_revision` reports now that every file is unlinked:
+            // `InMemoryDurableStateStore::delete` removes the record and
+            // answers `Revision::INITIAL`, and `PostgresDurableStateStore`
+            // does the same on a row it deleted. Answering `expected_revision`
+            // instead hands the caller a revision no later
+            // `compare_and_set` can ever match.
+            Ok(Revision::INITIAL)
         })
     }
 
@@ -369,6 +421,7 @@ where
     inner: SharedFileStore<S>,
     writes: Arc<AtomicUsize>,
     armed: Option<(usize, PodCrash)>,
+    marker: Option<PathBuf>,
 }
 
 impl<S> PodCrashStore<S>
@@ -382,14 +435,20 @@ where
             inner,
             writes: Arc::new(AtomicUsize::new(0)),
             armed: None,
+            marker: None,
         }
     }
 
     /// Arms the pod to die at the `nth` write from now.
+    ///
+    /// `marker` is where the dying pod records the window it died in, so the
+    /// driver can tell a window that fired from one whose armed write this
+    /// pod's flow never reached.
     #[must_use]
-    pub fn armed_at(mut self, nth: usize, crash: PodCrash) -> Self {
+    pub fn armed_at(mut self, nth: usize, crash: PodCrash, marker: PathBuf) -> Self {
         debug_assert!(nth >= 1, "write ordinals are 1-based");
         self.armed = Some((nth, crash));
+        self.marker = Some(marker);
         self
     }
 
@@ -399,17 +458,25 @@ where
         self.writes.load(Ordering::SeqCst)
     }
 
-    /// Counts one write and dies if this is the armed one.
+    /// Reserves this write's ordinal.
     ///
-    /// The counter runs whether or not a crash is armed: the crash-free
-    /// reference run is what tells the driver how many windows there are to
-    /// sweep, so an unarmed pod still has to report its writes.
-    fn count_and_maybe_die(&self, before: bool) {
-        let ordinal = if before {
-            self.writes.fetch_add(1, Ordering::SeqCst) + 1
-        } else {
-            self.writes.load(Ordering::SeqCst)
-        };
+    /// The counter runs whether or not a crash is armed, so every pod can
+    /// report its writes in its exit line. Those counts are what a reader sizes
+    /// the flow by; the sweep no longer takes its row lengths from them, which
+    /// is what [`CRASHED`] is for.
+    ///
+    /// One store operation reserves one ordinal and carries it into both of
+    /// its crash windows. Reading the counter back for the after-write window
+    /// would name whatever ordinal the *last* write to start reserved: the
+    /// sharded entity actors and the drive loop write through clones of one
+    /// store, so a write that overlaps this one moves the counter between the
+    /// two windows — firing the abort inside the wrong write, or losing it.
+    fn reserve_write(&self) -> usize {
+        self.writes.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Dies if `ordinal` is the armed write and this is its armed window.
+    fn maybe_die(&self, ordinal: usize, before: bool) {
         let Some((nth, crash)) = self.armed else {
             return;
         };
@@ -419,6 +486,15 @@ where
                 PodCrash::AfterWrite => !before,
             };
         if dies {
+            // Recorded before the abort, not after: nothing runs after it. A
+            // marker that fails to land leaves a pod that never reported its
+            // writes and never announced a crash, which the driver refuses to
+            // read as either a spent sweep row or a skip.
+            if let Some(marker) = &self.marker {
+                if let Err(error) = std::fs::write(marker, format!("{nth} {}", crash.as_label())) {
+                    eprintln!("could not record the crash marker: {error}");
+                }
+            }
             // Not a panic: a panic unwinds, runs destructors, and lets the
             // harness observe an orderly failure. A pod loss is none of those.
             if std::env::var("RAKKA_MULTI_POD_VERBOSE").is_ok() {
@@ -438,6 +514,7 @@ where
             inner: self.inner.clone(),
             writes: self.writes.clone(),
             armed: self.armed,
+            marker: self.marker.clone(),
         }
     }
 }
@@ -464,13 +541,19 @@ where
         state: S,
     ) -> StoreFuture<'a, StateRecord<S>> {
         Box::pin(async move {
-            self.count_and_maybe_die(true);
+            let ordinal = self.reserve_write();
+            self.maybe_die(ordinal, true);
             let record = self
                 .inner
                 .compare_and_set(persistence_id, expected_revision, state)
-                .await?;
-            self.count_and_maybe_die(false);
-            Ok(record)
+                .await;
+            // Deliberately not `?` before the second window: the ordinal is
+            // spent either way, and a pod dies where it dies. A revision
+            // conflict is a write that reached the store and was refused, not
+            // a write that never happened — short-circuiting past the window
+            // would leave that ordinal in the sweep plan but silent.
+            self.maybe_die(ordinal, false);
+            record
         })
     }
 
@@ -480,10 +563,11 @@ where
         expected_revision: Revision,
     ) -> StoreFuture<'a, Revision> {
         Box::pin(async move {
-            self.count_and_maybe_die(true);
-            let revision = self.inner.delete(persistence_id, expected_revision).await?;
-            self.count_and_maybe_die(false);
-            Ok(revision)
+            let ordinal = self.reserve_write();
+            self.maybe_die(ordinal, true);
+            let revision = self.inner.delete(persistence_id, expected_revision).await;
+            self.maybe_die(ordinal, false);
+            revision
         })
     }
 

@@ -22,7 +22,7 @@ use rakka_agent::AgentTaskStatus;
 use rakka_cluster::{ClusterNode, DiscoverySnapshot, NodeAddress, NodeId};
 use rakka_example_multi_pod_agent_fault_soak::external::ledger_entries;
 use rakka_example_multi_pod_agent_fault_soak::flow;
-use rakka_example_multi_pod_agent_fault_soak::stores::PodCrash;
+use rakka_example_multi_pod_agent_fault_soak::stores::{PodCrash, CRASHED};
 use rakka_example_multi_pod_agent_fault_soak::wiring::{boot_pod, CrashTarget, ROLE};
 use tokio::process::Command;
 
@@ -31,6 +31,11 @@ const ROUNDS: usize = 4_000;
 
 /// How long a pod drives before reporting what the durable record says.
 const POD_DEADLINE: Duration = Duration::from_secs(20);
+
+/// The highest write ordinal a sweep row will arm before giving up on finding
+/// the flow's last write. A row that stops here says so rather than reporting
+/// a bounded sweep as an exhaustive one.
+const SWEEP_CEILING: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -136,11 +141,11 @@ enum Armed {
 /// by the harness's structure, so the task owner and the run owner are both
 /// killable.
 ///
-/// Returns the write counts each pod reported, when both survived to report.
+/// Returns what the world did, which is what bounds the sweep.
 async fn run_world(
     root: &Path,
     crash: Option<(Armed, CrashTarget, usize, PodCrash)>,
-) -> Result<Option<PodWrites>, Box<dyn Error>> {
+) -> Result<World, Box<dyn Error>> {
     let executable = std::env::current_exe()?;
     let port_a = unused_port()?;
     let port_b = unused_port()?;
@@ -207,10 +212,7 @@ async fn run_world(
         status = pod_a.wait() => { status?; ("rakka-0", "uid-a") }
         status = pod_b.wait() => { status?; ("rakka-1", "uid-b") }
     };
-    std::fs::write(
-        root.join(flow::DEPARTED),
-        format!("{} {}", departed.0, departed.1),
-    )?;
+    flow::announce_departure(root, departed.0, departed.1)?;
 
     let wait_both = async {
         let _ = pod_a.wait().await;
@@ -231,12 +233,35 @@ async fn run_world(
         eprintln!("pod-a: {}pod-b: {}", out_a, out_b);
     }
     if out_a.contains("skip:") || out_b.contains("skip:") {
-        return Ok(None);
+        return Ok(World::Skipped);
+    }
+    if root.join(CRASHED).exists() {
+        return Ok(World::Crashed);
     }
     match (parse_writes(&out_a), parse_writes(&out_b)) {
-        (Some(a), Some(b)) => Ok(Some(PodWrites { pod_a: a, pod_b: b })),
-        _ => Ok(None),
+        (Some(pod_a), Some(pod_b)) => Ok(World::Survived(PodWrites { pod_a, pod_b })),
+        // No skip, no crash marker, and a pod that never reported. Something
+        // died that the harness did not arm, and reading that as a skip or as
+        // a spent sweep row is how a real failure disappears into a green run.
+        _ => Err(error(format!(
+            "a pod exited without reporting its writes and without an armed crash\n\
+             pod-a: {out_a}pod-b: {out_b}"
+        ))
+        .into()),
     }
+}
+
+/// What one world did.
+#[derive(Debug)]
+enum World {
+    /// Both pods ran to completion and reported their writes: either nothing
+    /// was armed, or the armed write is past the end of what this pod's flow
+    /// actually does.
+    Survived(PodWrites),
+    /// The armed pod reached its armed write and aborted inside the window.
+    Crashed,
+    /// The environment refused the world before either pod could run.
+    Skipped,
 }
 
 /// What each pod reported writing, `(tasks, runs)` per pod.
@@ -318,9 +343,15 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
     // The crash-free reference: two pods, a shared directory, and the task
     // driven to completion across them.
     let root = fresh_root("reference")?;
-    let Some(writes) = run_world(&root, None).await? else {
-        println!("skipped: loopback binding is unavailable in this environment");
-        return Ok(());
+    let writes = match run_world(&root, None).await? {
+        World::Survived(writes) => writes,
+        World::Skipped => {
+            println!("skipped: loopback binding is unavailable in this environment");
+            return Ok(());
+        }
+        World::Crashed => {
+            return Err(error("the crash-free reference world reported a crash").into())
+        }
     };
     assert_converged(&root, "the crash-free reference").await?;
     println!(
@@ -330,45 +361,81 @@ async fn run_driver() -> Result<(), Box<dyn Error>> {
     );
     let _ = std::fs::remove_dir_all(&root);
 
-    // Every durable write either pod makes is a window. The pod that owns the
-    // task and the pod that owns the run are both killed, at both windows of
-    // every write, and the survivor has to finish the work from the record.
-    let plan = [
-        (Armed::PodA, CrashTarget::Tasks, writes.pod_a.0),
-        (Armed::PodA, CrashTarget::Runs, writes.pod_a.1),
-        (Armed::PodB, CrashTarget::Tasks, writes.pod_b.0),
-        (Armed::PodB, CrashTarget::Runs, writes.pod_b.1),
-    ];
-    if plan.iter().all(|(_, _, count)| *count == 0) {
-        return Err(error("neither pod wrote anything; the sweep would prove nothing").into());
-    }
-
-    let mut windows = 0usize;
-    for (armed, target, count) in plan {
-        for nth in 1..=count {
+    // Each row walks its write ordinals until the armed pod stops reaching
+    // them. Taking the length from the reference run instead measures one
+    // world and arms another: the two are shaped differently — only an armed
+    // world ever loses a pod, takes over its shards, and recovers its
+    // entities — and their write counts drift run to run on one machine
+    // anyway. Ordinal `n` would then name whatever the reference's `n`th write
+    // happened to be, and every ordinal past the armed world's own last write
+    // would be a world that kills nothing and converges trivially. Here a
+    // counted window is one whose pod left a crash marker, so it fired.
+    let mut swept = Vec::new();
+    for (armed, target) in [
+        (Armed::PodA, CrashTarget::Tasks),
+        (Armed::PodA, CrashTarget::Runs),
+        (Armed::PodB, CrashTarget::Tasks),
+        (Armed::PodB, CrashTarget::Runs),
+    ] {
+        let mut fired = 0usize;
+        let mut nth = 1usize;
+        while nth <= SWEEP_CEILING {
+            let mut reached = false;
             for window in [PodCrash::BeforeWrite, PodCrash::AfterWrite] {
                 let label = format!(
                     "{armed:?}-{}-{nth}-{}",
                     target.as_label(),
                     window.as_label()
                 );
+                let context = format!(
+                    "{armed:?} killed at {} write {nth} ({})",
+                    target.as_label(),
+                    window.as_label()
+                );
                 let root = fresh_root(&label)?;
-                let _ = run_world(&root, Some((armed, target, nth, window))).await?;
-                assert_converged(
-                    &root,
-                    &format!(
-                        "{armed:?} killed at {} write {nth} ({})",
-                        target.as_label(),
-                        window.as_label()
-                    ),
-                )
-                .await?;
+                match run_world(&root, Some((armed, target, nth, window))).await? {
+                    World::Crashed => {
+                        assert_converged(&root, &context).await?;
+                        reached = true;
+                        fired += 1;
+                    }
+                    // The flow never reached this write, so the world is a
+                    // crash-free one. It still has to converge — but it is not
+                    // a pod-loss window and is not counted as one.
+                    World::Survived(_) => {
+                        assert_converged(&root, &format!("{context}, which never fired")).await?;
+                    }
+                    World::Skipped => {
+                        println!("skipped: loopback binding is unavailable in this environment");
+                        return Ok(());
+                    }
+                }
                 let _ = std::fs::remove_dir_all(&root);
-                windows += 1;
             }
+            if !reached {
+                break;
+            }
+            nth += 1;
         }
+        if nth > SWEEP_CEILING {
+            println!(
+                "note: {armed:?} {} stopped at the {SWEEP_CEILING}-write ceiling rather than at \
+                 the flow's last write; windows past it were not swept",
+                target.as_label()
+            );
+        }
+        swept.push((armed, target, fired));
     }
 
-    println!("swept {windows} pod-loss windows; every one converged from the shared record");
+    let windows: usize = swept.iter().map(|(_, _, fired)| fired).sum();
+    if windows == 0 {
+        return Err(error("no armed write was ever reached; the sweep would prove nothing").into());
+    }
+    for (armed, target, fired) in &swept {
+        println!("  {armed:?} {}: {fired} windows", target.as_label());
+    }
+    println!(
+        "swept {windows} pod-loss windows; every one fired and converged from the shared record"
+    );
     Ok(())
 }

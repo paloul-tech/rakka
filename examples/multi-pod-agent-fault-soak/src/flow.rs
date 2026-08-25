@@ -213,6 +213,19 @@ pub static TOOK_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// that guessed would be the second writer specification 15 forbids.
 pub const DEPARTED: &str = "departed";
 
+/// Publishes `departed` as one atomic announcement.
+///
+/// `std::fs::write` creates the file at length zero and fills it in a second
+/// syscall, while the survivor tests only `peer_departed` and then reads in a
+/// third: a reader landing between the two sees an empty announcement, and
+/// `take_over` can only refuse it. The rename is the publish — the file never
+/// exists in a state a reader can observe as incomplete.
+pub fn announce_departure(root: &Path, logical: &str, incarnation: &str) -> std::io::Result<()> {
+    let temp = root.join(format!("{DEPARTED}.tmp"));
+    std::fs::write(&temp, format!("{logical} {incarnation}"))?;
+    std::fs::rename(&temp, root.join(DEPARTED))
+}
+
 /// Whether the driver has announced that the other pod is gone.
 fn peer_departed(pod: &Pod) -> bool {
     pod.root.join(DEPARTED).exists()
@@ -262,11 +275,21 @@ pub async fn drive(pod: &mut Pod, rounds: usize, deadline: Duration) -> Result<b
             return Ok(terminal(&pod.stores.tasks).await);
         }
         if !took_over && peer_departed(pod) {
-            if let Err(error) = take_over(pod) {
-                eprintln!("takeover failed: {error}");
+            match take_over(pod) {
+                Ok(()) => {
+                    took_over = true;
+                    TOOK_OVER.store(true, Ordering::SeqCst);
+                }
+                // Not latched. `mark_down` refuses a node the membership has
+                // not admitted yet, and the shard coordinator lease has to be
+                // reachable — both are states the next round can find changed.
+                // A takeover swallowed here is unrecoverable: the dead pod
+                // stays Up, this pod keeps resolving it as the owner and
+                // correctly refuses to drive shards it does not own, and the
+                // world fails as a convergence failure with the real cause
+                // gone.
+                Err(error) => eprintln!("takeover failed, retrying next round: {error}"),
             }
-            took_over = true;
-            TOOK_OVER.store(true, Ordering::SeqCst);
         }
         let mut progressed = false;
 

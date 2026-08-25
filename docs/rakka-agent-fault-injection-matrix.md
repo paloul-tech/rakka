@@ -39,8 +39,8 @@ Harness: [`examples/multi-pod-agent-fault-soak`](../examples/multi-pod-agent-fau
 
 | Failure | Expected result | Proof |
 | --- | --- | --- |
-| Owner pod dies before a durable write | The transition is lost; the surviving pod re-derives it from the shared record and the task still completes. | Sweep window `before-write`, every write of both pods |
-| Owner pod dies after a durable write, before acting on it | The record says one thing and nobody was told; the surviving pod finds it and finishes. | Sweep window `after-write`, every write of both pods |
+| Owner pod dies before a durable write | The transition is lost; the surviving pod re-derives it from the shared record and the task still completes. | Sweep window `before-write`, every task-store and run-store write the armed pod reaches |
+| Owner pod dies after a durable write, before acting on it | The record says one thing and nobody was told; the surviving pod finds it and finishes. | Sweep window `after-write`, every task-store and run-store write the armed pod reaches |
 | Owner pod dies after the external system commits, before any receipt exists | The external ledger holds the commit; recovery produces at most a *retry of the same logical turn*, never a second turn under a different identity. | The ledger adapter commits before it answers; every window asserts one distinct ledger entry |
 | The pod owning the task dies | The run's owner downs it, takes over the task's shard, and drives the task to `Completed`. | `Armed::PodB` rows of the sweep |
 | The pod owning the run dies | Symmetrically, the task's owner takes over the run. | `Armed::PodA` rows of the sweep |
@@ -54,10 +54,22 @@ closing fault-injection directive — kill the owner at every durable effect
 boundary, including after a test external system commits but before it returns
 the receipt.
 
+Each sweep row bounds itself: a pod that reaches its armed write records it
+before aborting, and the row walks its ordinals until neither window at that
+ordinal fires, so every window in the reported total is one that fired. The
+totals themselves vary run to run, because the write counters move with TCP
+timing, membership convergence, and which pod wins the seed compare-and-set.
+
 Deliberate limits are documented in the harness README: the shared directory
 stands in for a shared durable backend (production is PostgreSQL), departure is
 announced rather than detected, history sinks are per-pod, and the team and
-conversation entities are registered but not exercised by the workload.
+conversation entities are registered but not exercised by the workload. Two
+more limits bound the sweep itself. Only the task and run stores are armed —
+the agent store and the durable workflow outbox are not — and the second
+owner's *own* recovery writes are never a window: a pod only takes over once
+its peer is armed and gone, so a world that arms the survivor never reaches the
+writes it makes after taking over. The harness prints that row as `0 windows`
+rather than hiding it. Both need a world with two armings, which is owed work.
 
 ## In-process matrix added by slice 6.1
 
