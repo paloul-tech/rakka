@@ -50,6 +50,7 @@ RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres car
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-postgres
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-knowledge-graph-postgres
 RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
+cargo run -p rakka-example-multi-pod-agent-fault-soak   # multi-pod agent fault sweep; needs no gate
 RAKKA_K8S_SCENARIO_DRY_RUN=1 examples/kubernetes/local-cluster-scenario.sh         # preview, no cluster touched
 RAKKA_K8S_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s optional_kubectl_manifest_validation_is_gated -- --nocapture
 ```
