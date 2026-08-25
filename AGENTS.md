@@ -26,6 +26,7 @@
   - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres`
   - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-sharding-postgres`
   - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-knowledge-graph-postgres`
+  - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-postgres` — add `RAKKA_POSTGRES_PGVECTOR_REQUIRED=1` to refuse, rather than announce, a run whose image lacks the `vector` extension and so cannot exercise the three retriever conformance clauses
   - `RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture` (both multi-process gates: the loopback compatibility example and the multi-pod agent fault sweep)
   - `RAKKA_ETCD_TEST_ENDPOINTS=http://127.0.0.1:2379 cargo test -p rakka-discovery-etcd --test etcd_discovery -- --nocapture`
   - `RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image> examples/kubernetes/local-cluster-scenario.sh`
