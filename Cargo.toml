@@ -43,6 +43,7 @@ members = [
     "examples/clustered-counter-http",
     "examples/coordinated-shutdown",
     "examples/multi-agent-goal-acceptance",
+    "examples/multi-pod-agent-fault-soak",
     "examples/multi-node-sharding",
     "examples/sharded-cart-persistence",
     "examples/streams",

@@ -4269,6 +4269,87 @@ Spec: [15](spec.md#15-passivation-recovery-and-shard-movement),
   dispatchers at every durable boundary including after external commit.
 - Settings changes and credential revocation injected during waits.
 
+**Amended as implemented (2026-08-24):**
+
+- **The gap was wider than "add more crashes".** Five public functions —
+  `init_agent_{entity,task,run,team,conversation}_entity_remote_sharding` — were
+  defined, re-exported, and called nowhere; the production `ShardedExchangeRoute`
+  was exercised only by the synthetic `ChoreographyProbe`; and every agent proof
+  ran in one process over one in-memory store, which can demonstrate
+  re-materialization but not spec 15's actual requirement that durable state
+  suffice *on a different pod, without node-local memory*. The existing
+  `RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY` gate did no fault injection at all: it
+  shelled `examples/multi-node-sharding`, sent one hardcoded `CartCommand`, and
+  asserted a stdout marker.
+- **`examples/multi-pod-agent-fault-soak` is the answer, and it is the first
+  consumer of all five registrations and of the production route.** Two real OS
+  processes, one shared directory whose commits are `hard_link` claims (so two
+  pods racing one compare-and-set cannot both win), all five entity classes
+  registered remotely, the task and the run landing on different pods so their
+  exchanges cross TCP, and a model adapter that commits to a shared ledger
+  *before* it answers — spec 18's "after a test external system commits but
+  before it returns the receipt", made observable across the death of the pod
+  that committed it. The crash-free reference reports each pod's durable write
+  count and the sweep replays the world once per `(pod, store, ordinal, window)`,
+  arming that pod to `abort()` there. 32 pod-loss windows converge on
+  `Completed` from the shared record with exactly one logical external turn.
+  Departure is *announced* and the survivor calls `mark_down` — not
+  `mark_leaving`, because a killed pod never got to leave — after which the
+  shards move and the entities re-materialize.
+- **The parked 4.4 and 4.6 crash-sweep debt is closed.** `fan_in_recovery.rs`
+  sweeps every run- and task-store write of the fan-out → child-result → fan-in
+  resolution (46 windows) plus the `DelegationResult` fault triple at the real
+  entity; `cancellation_recovery.rs` sweeps every write of the propagation spine
+  (38 windows), asserting every child terminal under the requested reason, every
+  chase accepted, and no propagation leg replaying a send. `delegation_limits.rs`
+  gained scenario 34's recovery clause as a fact rather than an inference: its
+  module doc argued that re-materialization is already a coordinator loss, which
+  is true of the *read* path but says nothing about a loss inside the
+  compare-and-set that spends the ceiling. It is swept now, and the quota is
+  charged once.
+- **Revocation during a wait had no coverage at all.** Every scenario-13 proof
+  applied the change *before* the first dispatch pass, so the run was never
+  waiting when the operator acted. `wait_invalidation.rs` parks the run first:
+  all three `ImmediateSafety` change kinds, both orderings against the human
+  decision, an agent suspended mid-wait (which must *defer* without spending
+  budget, not fail closed), a grant that binds another credential than the
+  intent carries, a guardrail chain upgraded on the fleet while the intent stays
+  pinned, a definition narrowed while a task is blocked on a dependency, and the
+  whole revocation flow swept under owner loss.
+- **Two dispositions worth recording, because the slice plan predicted
+  otherwise.** `effective_settings_for_turn` is documented as the
+  pinned-versus-current resolution point and has no production call site — but
+  neither do the two `RunPinned` fields it resolves (`loop_state_schema_version`,
+  `memory_schema_version`), which are stored and read nowhere. Wiring it today
+  would change nothing observable, so the honest outcome is a behavioural test
+  that a run-pinned change is inert for a run in flight, and this note.
+  Separately, `AgentRunStatus::WaitingForTimer` is declared, labelled, and
+  counted by `is_waiting()` but never assigned: durable timers are owned by the
+  goal/wake layer, and it stays reserved rather than acquiring an invented park.
+- **Soak is a property test, not a timing one.** `agent_soak.rs` drives many
+  tasks through one agent and asserts what must *not* grow: the agent's durable
+  record (identical at 24 and 500 tasks), the metric series set (6 series while
+  observations grow from 192 to 4000), each task's materialized bound, and the
+  exchange journals settling empty. `RAKKA_AGENT_SOAK_ITERATIONS` scales it.
+- **Shared fixtures rather than a fourth copy.** `SkillNamedExecutor` and the
+  fan-out helpers were already duplicated across `fan_out_fan_in.rs` and
+  `cancellation_propagation.rs`; they, `create_real_child`, and the whole
+  `AuthorityFixture` (the only fixture that drives the *real* dispatch pipeline,
+  which is the only place an authority gate is consulted) moved to
+  `tests/common/mod.rs`. The fixture also gained a credential resolver, without
+  which an intent carrying a binding is refused `credential-resolver-missing`
+  before any later gate can be observed.
+- Proof roster: `examples/multi-pod-agent-fault-soak` (1 gated test plus the
+  driver), `tests/fan_in_recovery.rs` (3), `tests/cancellation_recovery.rs` (2),
+  `tests/wait_invalidation.rs` (12), `tests/agent_soak.rs` (1), the scenario-34
+  sweep in `tests/delegation_limits.rs`, and the second gated entry in
+  `crates/rakka-testkit/tests/compatibility_matrix.rs`. Documentation:
+  `docs/rakka-agent-fault-injection-matrix.md`. Owed onward: a file-backed task
+  history passing `assert_task_history_store_contract`, a coordination workload
+  across pods (team and conversation are registered but unexercised), a
+  PostgreSQL arm for the shared substrate, and detected rather than announced
+  departure.
+
 ### Slice 6.2 — Security validation
 
 Spec: [16](spec.md#16-security-and-authorization),
@@ -4295,8 +4376,25 @@ Spec: [20](spec.md#20-compatibility-and-migration).
   in `docs/rakka-api-boundary-inventory.md`, `CHANGELOG.md` entries, N/N+1
   compatibility notes, and the pinned A2A/Rig/GenAI revision matrix.
 
-Done when: all shipped-phase scenarios pass in the multi-process harness and
-the documentation set is current.
+Done when: every shipped-phase scenario passes under in-process fault
+injection; every scenario the fault-injection matrix names as requiring
+multi-pod fidelity passes there too; and the documentation set is current.
+
+Stated that way because it is checkable. "At the fidelity its claim requires"
+named no artifact that says, per scenario, what fidelity that is — and the
+matrix enumerates the multi-pod subset (currently scenarios 1's
+creation-deduplication half, 2, and 60) rather than all sixty-one. The matrix
+is the authority for that subset; a scenario added to it is added to this
+criterion.
+
+The multi-process harness carries the claims an in-process kill structurally
+cannot reach — a durable store outside the dying process, real shard movement
+after a downing decision, and an external commit that outlives its pod — and
+`docs/rakka-agent-fault-injection-matrix.md` records which scenarios are
+re-proven at that fidelity and which remain in-process. Porting all 61 scenarios
+into process-spawning form was considered and rejected: it would re-prove logic
+the in-process suite already covers, at a large cost in harness code and gated
+runtime, without adding a claim.
 
 ---
 

@@ -15,215 +15,25 @@
 mod common;
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 
 use common::{
-    delegation_config_with_fan_in, delegation_tool_id, fan_in_tool_id, goal_spec_draft,
-    goal_spec_with_fan_out, goal_task_creation_command, run_scope, task_definition, task_scope,
-    Fixture, SKILL, SKILL_2, TENANT,
+    child_result_envelope, committed_children, create_fan_out_task, create_real_child,
+    delegation_config_with_fan_in, delegation_tool_id, fan_in_tool_id, fan_out_fixture,
+    goal_spec_draft, goal_spec_with_fan_out, goal_task_creation_command, proposing_turn, run_scope,
+    task_definition, task_scope, Fixture, SkillNamedExecutor, SKILL, SKILL_2, TENANT,
 };
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    delegation_cancel_operation_id, run_cancel_operation_id, AgentA2aSendExecutor,
-    AgentA2aSendFinding, AgentCancellationProgress, AgentDelegationCancelOutcome,
-    AgentDelegationCancelRequest, AgentDelegationRecord, AgentDelegationStatus,
-    AgentDispatchFuture, AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeKind,
-    AgentExchangePayload, AgentFanInPolicy, AgentLoopPhase, AgentModelTurn, AgentRunCancelRequest,
-    AgentRunEffect, AgentRunEntityCommand, AgentRunScope, AgentRunStatus, AgentTaskContent,
+    delegation_cancel_operation_id, run_cancel_operation_id, AgentCancellationProgress,
+    AgentDelegationCancelOutcome, AgentDelegationCancelRequest, AgentEntityAddress,
+    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentFanInPolicy,
+    AgentLoopPhase, AgentModelTurn, AgentRunCancelRequest, AgentRunEntityCommand, AgentRunStatus,
     AgentTaskId, AgentTaskScope, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest, TenantId,
     AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE, AGENT_RUN_CANCEL_PAYLOAD_TYPE,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
-use rakka_agent_workflow::{AgentCorrelationId, AgentEphemeralCredential};
+use rakka_agent_workflow::AgentCorrelationId;
 use serde_json::json;
-
-/// A send executor that names each child after the skill it serves and logs
-/// every invocation: the at-most-once ledger scenario 29 asserts against.
-struct SkillNamedExecutor {
-    seen: Mutex<Vec<AgentDelegationRecord>>,
-}
-
-impl SkillNamedExecutor {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            seen: Mutex::new(Vec::new()),
-        })
-    }
-
-    fn invocations(&self) -> usize {
-        self.seen
-            .lock()
-            .expect("the record log should not be poisoned")
-            .len()
-    }
-}
-
-fn child_task_for(skill: &str) -> AgentTaskId {
-    AgentTaskId::new(format!("child-{skill}")).expect("task id should be valid")
-}
-
-impl AgentA2aSendExecutor for SkillNamedExecutor {
-    fn execute<'a>(
-        &'a self,
-        _scope: &'a AgentRunScope,
-        _intent: &'a AgentRunEffect,
-        delegation: &'a AgentDelegationRecord,
-        _credential: Option<&'a AgentEphemeralCredential>,
-    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding> {
-        self.seen
-            .lock()
-            .expect("the record log should not be poisoned")
-            .push(delegation.clone());
-        let skill = delegation.requested_skill.as_str().to_string();
-        Box::pin(async move {
-            Ok(AgentA2aSendFinding::Sent {
-                child_task: child_task_for(&skill),
-                child_run: None,
-                peer_status: "submitted".to_string(),
-            })
-        })
-    }
-}
-
-fn fan_out_turn() -> AgentModelTurn {
-    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
-        .with_text("Fanning out to both specialists and awaiting them.")
-        .with_tool_call(
-            AgentToolCallRequest::new(
-                AgentToolCallId::new("delegate-1").expect("call id should be valid"),
-                delegation_tool_id(),
-                json!({ "skill": SKILL, "input": { "text": "hello" } }),
-            )
-            .expect("the tool call is bounded"),
-        )
-        .with_tool_call(
-            AgentToolCallRequest::new(
-                AgentToolCallId::new("delegate-2").expect("call id should be valid"),
-                delegation_tool_id(),
-                json!({ "skill": SKILL_2, "input": { "text": "hello" } }),
-            )
-            .expect("the tool call is bounded"),
-        )
-        .with_tool_call(
-            AgentToolCallRequest::new(
-                AgentToolCallId::new("await-1").expect("call id should be valid"),
-                fan_in_tool_id(),
-                json!({}),
-            )
-            .expect("the tool call is bounded"),
-        )
-}
-
-fn proposing_turn() -> AgentModelTurn {
-    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
-        .with_text("Synthesizing the children's evidence.")
-        .with_proposal(
-            AgentTaskContent::inline(json!({ "answer": "synthesized" }))
-                .expect("the proposal is inline-bounded"),
-        )
-}
-
-fn fan_out_fixture(executor: Arc<SkillNamedExecutor>) -> Fixture {
-    Fixture::new(
-        ScriptedDispatcher::with_adapter(
-            DeterministicModelAdapter::new()
-                .with_turn(fan_out_turn())
-                .with_turn(proposing_turn()),
-        )
-        .with_a2a_send_executor(executor),
-    )
-    .with_delegation(delegation_config_with_fan_in())
-}
-
-async fn create_fan_out_task(fixture: &Fixture, policy: Option<AgentFanInPolicy>) {
-    fixture.instantiate_agent().await;
-    fixture
-        .apply_task_command(goal_task_creation_command(
-            task_definition(),
-            goal_spec_draft(goal_spec_with_fan_out(policy, None), true),
-        ))
-        .await
-        .expect("the goal task should create");
-}
-
-/// The committed members, read from the durable cells.
-async fn committed_children(
-    fixture: &Fixture,
-) -> Vec<(rakka_agent::AgentDelegationId, AgentTaskId)> {
-    let mut run = fixture.run();
-    run.recover(fixture.now()).await.expect("recover");
-    let state = run.state().expect("state");
-    let loop_state = state.loop_state().expect("the loop is running");
-    loop_state
-        .delegations()
-        .iter()
-        .filter_map(|(id, cell)| match &cell.status {
-            AgentDelegationStatus::ChildCreated { child_task, .. } => {
-                Some((id.clone(), child_task.clone()))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// Creates one real delegated child task under the provenance its creation
-/// validated, human-owned so it terminates without the assignment machinery.
-async fn create_real_child(
-    fixture: &Fixture,
-    delegation: &rakka_agent::AgentDelegationId,
-    child_task: &AgentTaskId,
-    skill: &str,
-) {
-    let tenant = TenantId::new(TENANT);
-    let scope = AgentTaskScope::new(tenant, child_task.clone()).expect("the scope is valid");
-    let provenance = rakka_agent::AgentTaskDelegationProvenance {
-        environments: Default::default(),
-        knowledge_spaces: Default::default(),
-        delegation: delegation.clone(),
-        parent_task: task_scope().task().clone(),
-        parent_run: run_scope(),
-        lineage: Vec::new(),
-        ancestors: Vec::new(),
-        depth: 1,
-        requested_skill: rakka_agent::AgentCapabilityId::new(skill)
-            .expect("capability id should be valid"),
-        capability_scopes: Default::default(),
-        credential_bindings: Vec::new(),
-        result_schema: None,
-        budget: None,
-        deadline: None,
-    };
-    fixture
-        .apply_task_command_at(
-            &scope,
-            rakka_agent::AgentTaskEntityCommand::Create {
-                operation_id: rakka_agent::AgentOperationId::new(
-                    rakka_agent::AgentOperationKind::TaskCreation,
-                    [TENANT, child_task.as_str(), "1"],
-                )
-                .expect("the operation id derives"),
-                creation: Box::new(rakka_agent::AgentTaskCreation {
-                    definition: task_definition()
-                        .with_ownership(rakka_agent::AgentTaskOwnership::Human),
-                    input: AgentTaskContent::inline(json!({ "text": "hello" }))
-                        .expect("the input is inline-bounded"),
-                    assignee: None,
-                    team: None,
-                    goal: None,
-                    goal_mode: Default::default(),
-                    goal_spec: None,
-                    parent: Some(task_scope().task().clone()),
-                    dependencies: Vec::new(),
-                    escrow: None,
-                    wake: None,
-                    delegation: Some(Box::new(provenance)),
-                    telemetry: Default::default(),
-                }),
-            },
-        )
-        .await
-        .expect("the child task creates");
-}
 
 /// Drives the root task, the coordinator run, and every named child scope
 /// until nothing moves: the multi-entity pump propagation needs.
@@ -285,49 +95,6 @@ async fn deliver_to_task(
         .status()
         .rejection_code()
         .map(ToString::to_string)
-}
-
-/// One child's terminal report, exactly as the child task's owed exchange
-/// carries it — the synthetic half a test uses when only the parent's side
-/// is under study.
-fn child_result_envelope(
-    fixture: &Fixture,
-    delegation: &rakka_agent::AgentDelegationId,
-    child_task: &AgentTaskId,
-    status: AgentTaskStatus,
-) -> AgentExchangeEnvelope {
-    let tenant = TenantId::new(TENANT);
-    let operation_id = rakka_agent::delegation_result_operation_id(&tenant, delegation)
-        .expect("the operation id derives");
-    let report = rakka_agent::AgentDelegationReport {
-        delegation: delegation.clone(),
-        child_task: child_task.clone(),
-        child_run: None,
-        status,
-        terminal_reason: (status != AgentTaskStatus::Completed)
-            .then(|| "cancellation-requested".to_string()),
-        result_digest: (status == AgentTaskStatus::Completed).then(|| {
-            AgentTaskContent::inline(json!({ "answer": "done" }))
-                .expect("the content is inline-bounded")
-                .digest()
-        }),
-        descendants_created: 0,
-    };
-    let payload =
-        AgentExchangePayload::encode(rakka_agent::AGENT_DELEGATION_RESULT_PAYLOAD_TYPE, &report)
-            .expect("the report encodes");
-    let child_scope =
-        AgentTaskScope::new(tenant, child_task.clone()).expect("the child scope is valid");
-    AgentExchangeEnvelope::new(
-        operation_id.clone(),
-        AgentExchangeKind::DelegationResult,
-        AgentEntityAddress::Task(child_scope),
-        AgentEntityAddress::Run(run_scope()),
-        payload,
-        AgentCorrelationId::new(operation_id.as_str()),
-        fixture.now(),
-    )
-    .expect("the envelope is valid")
 }
 
 async fn run_view(fixture: &Fixture) -> (Option<AgentRunStatus>, AgentCancellationProgress) {

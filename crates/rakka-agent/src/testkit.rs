@@ -1546,6 +1546,7 @@ where
     delegation: Arc<Mutex<Option<crate::delegation::AgentRunDelegationConfig>>>,
     workflow_tools: Arc<Mutex<Option<crate::workflow_tool::AgentRunWorkflowConfig>>>,
     faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    deliveries: Arc<AtomicUsize>,
     acceptances: Arc<AtomicUsize>,
 }
 
@@ -1567,6 +1568,7 @@ where
             delegation: self.delegation.clone(),
             workflow_tools: self.workflow_tools.clone(),
             faults: self.faults.clone(),
+            deliveries: self.deliveries.clone(),
             acceptances: self.acceptances.clone(),
         }
     }
@@ -1597,8 +1599,20 @@ where
             delegation: Arc::new(Mutex::new(None)),
             workflow_tools: Arc::new(Mutex::new(None)),
             faults: Arc::new(Mutex::new(VecDeque::new())),
+            deliveries: Arc::new(AtomicUsize::new(0)),
             acceptances: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// How many deliveries this transport was asked to make.
+    ///
+    /// Counted before an injected fault can swallow the envelope, so a test can
+    /// tell a fault that fired from one queued on a transport the envelope
+    /// never travelled — a delivery driven around this transport increments
+    /// nothing here, however much durable state it changes.
+    #[must_use]
+    pub fn deliveries(&self) -> usize {
+        self.deliveries.load(Ordering::SeqCst)
     }
 
     /// Wires every run entity this transport builds with a session-memory
@@ -1705,6 +1719,9 @@ where
         envelope: &'a AgentExchangeEnvelope,
     ) -> AgentExchangeDeliveryFuture<'a> {
         let fault = self.take_fault();
+        // Counted before the fault can swallow the envelope, so a test can tell
+        // "the fault fired" from "nothing was ever delivered here".
+        self.deliveries.fetch_add(1, Ordering::SeqCst);
 
         Box::pin(async move {
             if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
