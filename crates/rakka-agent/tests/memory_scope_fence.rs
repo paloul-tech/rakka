@@ -26,6 +26,7 @@
 //! `persist_context_snapshots`, which is the one production caller of
 //! `assemble_context`.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rakka_agent::testkit::{
@@ -36,9 +37,11 @@ use rakka_agent::{
     AgentPrivateMemory, AgentPrivateMemoryId, AgentPrivateMemoryKind, AgentPrivateMemoryStore,
     AgentRevisionNumber, AgentRunMemory, AgentScope, AgentTaskContent, ContextSnapshotStore,
     InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
-    MemoryClassification, MemoryContextSnapshot, MemoryOperationId, MemoryRetrievalOutcome,
-    MemoryTombstoneReason, PrivateMemoryExpectation, PrivateMemoryTombstoneRequest,
-    RetrievedPrivateMemory, TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    MemoryClassification, MemoryContextSnapshot, MemoryEmbeddingRef, MemoryError, MemoryFuture,
+    MemoryOperationId, MemoryRetrievalOutcome, MemoryTombstoneReason, PrivateMemoryCursor,
+    PrivateMemoryDeleteRequest, PrivateMemoryExpectation, PrivateMemoryPage,
+    PrivateMemoryTombstoneRequest, RetrievedPrivateMemory, SessionMemoryPromotionExecutor,
+    TenantId, AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -418,5 +421,359 @@ async fn dropped_identities_are_counted_and_observable() {
     assert!(
         !rendered.contains("other-corp"),
         "the metric carries the foreign tenant: {rendered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What the ranking may decide, and what a ranking may cost.
+// ---------------------------------------------------------------------------
+
+/// An authoritative store that counts its point reads and can start failing
+/// them, so a test can see how much I/O a ranking buys and what a store fault
+/// part-way through a walk costs.
+///
+/// Everything but `get` delegates: `get` is the whole resolution path.
+struct MeteredAuthority {
+    inner: Arc<InMemoryAgentPrivateMemoryStore>,
+    gets: AtomicUsize,
+    fail_after: Option<usize>,
+}
+
+impl MeteredAuthority {
+    fn over(inner: Arc<InMemoryAgentPrivateMemoryStore>) -> Self {
+        Self {
+            inner,
+            gets: AtomicUsize::new(0),
+            fail_after: None,
+        }
+    }
+
+    /// Answers the first `count` reads and fails every one after them.
+    fn failing_after(mut self, count: usize) -> Self {
+        self.fail_after = Some(count);
+        self
+    }
+
+    fn gets(&self) -> usize {
+        self.gets.load(Ordering::SeqCst)
+    }
+}
+
+impl AgentPrivateMemoryStore for MeteredAuthority {
+    fn backend_name(&self) -> &'static str {
+        "metered"
+    }
+
+    fn upsert<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        memory: &'a AgentPrivateMemory,
+        expected: PrivateMemoryExpectation,
+    ) -> MemoryFuture<'a, AgentPrivateMemory> {
+        self.inner.upsert(scope, memory, expected)
+    }
+
+    fn get<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        memory_id: &'a AgentPrivateMemoryId,
+        now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, Option<AgentPrivateMemory>> {
+        let seen = self.gets.fetch_add(1, Ordering::SeqCst) + 1;
+        let failed = self.fail_after.is_some_and(|after| seen > after);
+        Box::pin(async move {
+            if failed {
+                return Err(MemoryError::Backend {
+                    backend: "metered".to_string(),
+                    message: "the authoritative store is unreachable".to_string(),
+                });
+            }
+            self.inner.get(scope, memory_id, now).await
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        cursor: PrivateMemoryCursor,
+        now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, PrivateMemoryPage> {
+        self.inner.list(scope, cursor, now)
+    }
+
+    fn tombstone<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        request: &'a PrivateMemoryTombstoneRequest,
+    ) -> MemoryFuture<'a, AgentPrivateMemory> {
+        self.inner.tombstone(scope, request)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        request: &'a PrivateMemoryDeleteRequest,
+    ) -> MemoryFuture<'a, ()> {
+        self.inner.delete(scope, request)
+    }
+
+    fn purge_expired<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        now: AgentTimestampMillis,
+        limit: usize,
+    ) -> MemoryFuture<'a, u64> {
+        self.inner.purge_expired(scope, now, limit)
+    }
+}
+
+/// The same world as [`hostile_world`], over an authority a test can meter.
+fn metered_world(
+    ranking: MemoryRetrievalOutcome,
+    authority: Arc<MeteredAuthority>,
+) -> (Fixture, Arc<InMemoryContextSnapshotStore>) {
+    let snapshots = Arc::new(InMemoryContextSnapshotStore::new());
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, text_turn("checking the ticket history"))
+            .with_turn_for(2, proposing_turn("resolved")),
+    );
+    let fx = Fixture::new(dispatcher).with_memory(
+        AgentRunMemory::new(
+            Arc::new(InMemorySessionMemoryStore::new()),
+            snapshots.clone(),
+        )
+        .with_retrieval(AgentMemoryRetrieval::new(
+            Arc::new(ScriptedPrivateMemoryRetriever::new().with_outcome(ranking)),
+            authority,
+            AgentGuardrailChain::new(AgentRevisionNumber::INITIAL),
+        )),
+    );
+    (fx, snapshots)
+}
+
+/// A flat ranking of `count` identities that exist in no store, all at one
+/// relevance — the shape a drifted or hostile index returns.
+fn long_ranking(count: usize) -> MemoryRetrievalOutcome {
+    MemoryRetrievalOutcome {
+        memories: (0..count)
+            .map(|index| RetrievedPrivateMemory {
+                memory: private_memory(&agent_scope(), &format!("ghost-{index}"), "nothing"),
+                relevance_bps: 5_000,
+                embedding: None,
+            })
+            .collect(),
+        index_watermark: None,
+    }
+}
+
+/// The embedding reference the snapshot carries comes from the authoritative
+/// record, not from the ranking payload.
+///
+/// It was the one field lifted verbatim from the retriever's answer into
+/// durable, digest-covered state. `AgentPrivateMemory::validate` bounds the
+/// model name and rejects an empty model or zero dimensions; nothing bounded
+/// it on this path, and `max_bytes` counts only content, so a ranking could
+/// put an arbitrarily large string into an immutable snapshot.
+#[tokio::test]
+async fn the_snapshot_embeds_the_stores_embedding_not_the_rankings() {
+    let scope = agent_scope();
+    let authority = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    let stored = private_memory(&scope, "ours", "our own renewal terms")
+        .with_embedding(MemoryEmbeddingRef {
+            model: "trusted-embedder".to_string(),
+            dimensions: 8,
+            version: AgentRevisionNumber::INITIAL,
+        })
+        .expect("the stored embedding is bounded");
+    authority
+        .upsert(&scope, &stored, PrivateMemoryExpectation::Absent)
+        .await
+        .expect("seed upsert");
+
+    // The ranking names the same identity but claims a different vector.
+    let mut ranked = ranking(vec![stored.clone()]);
+    ranked.memories[0].embedding = Some(MemoryEmbeddingRef {
+        model: "FORGED-EMBEDDER".to_string(),
+        dimensions: 4_096,
+        version: AgentRevisionNumber::INITIAL,
+    });
+
+    let (fx, snapshots) = hostile_world(ranked, authority);
+    let snapshot = first_snapshot(&fx, &snapshots).await;
+
+    let selected = snapshot
+        .private_memory
+        .first()
+        .expect("the stored memory was selected");
+    assert_eq!(
+        selected
+            .embedding
+            .as_ref()
+            .map(|reference| &reference.model),
+        Some(&"trusted-embedder".to_string()),
+        "the ranking's embedding reference reached the snapshot"
+    );
+    let encoded = serde_json::to_string(&snapshot).expect("the snapshot serializes");
+    assert!(
+        !encoded.contains("FORGED-EMBEDDER"),
+        "the ranking's own words are in the durable snapshot: {encoded}"
+    );
+}
+
+/// A ranking's *length* cannot decide how much I/O the settle pass performs.
+///
+/// The walk stops only at a selection bound, and an identity the store does
+/// not hold never grows the selection — so before the resolution ceiling a
+/// retriever could hand the owning shard as many sequential point reads as it
+/// liked, none of which produced anything.
+#[tokio::test]
+async fn a_long_ranking_cannot_buy_unbounded_authoritative_reads() {
+    let inner = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    seed(&inner, &agent_scope(), "ours", "our own renewal terms").await;
+    let authority = Arc::new(MeteredAuthority::over(inner));
+
+    let (fx, snapshots) = metered_world(long_ranking(500), authority.clone());
+    let snapshot = first_snapshot(&fx, &snapshots).await;
+
+    assert!(
+        authority.gets() <= AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS,
+        "a 500-entry ranking bought {} store reads, ceiling {}",
+        authority.gets(),
+        AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS
+    );
+    assert!(
+        snapshot.private_memory.is_empty(),
+        "no ranked identity was held in scope, so nothing may be embedded"
+    );
+}
+
+/// A store fault part-way through the walk keeps what is already verified.
+///
+/// The snapshot is immutable and persisted first-writer-wins, so discarding
+/// the verified prefix would not degrade *this* assembly — it would blank the
+/// run's long-term memory for the rest of its life, on every retry of every
+/// later turn.
+#[tokio::test]
+async fn a_store_fault_mid_walk_keeps_the_verified_prefix() {
+    let scope = agent_scope();
+    let inner = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    seed(&inner, &scope, "first", "the renewal terms").await;
+    seed(&inner, &scope, "second", "the escalation path").await;
+    seed(&inner, &scope, "third", "the refund policy").await;
+    let authority = Arc::new(MeteredAuthority::over(inner).failing_after(2));
+
+    let ranked = ranking(vec![
+        private_memory(&scope, "first", "the renewal terms"),
+        private_memory(&scope, "second", "the escalation path"),
+        private_memory(&scope, "third", "the refund policy"),
+    ]);
+    let (fx, snapshots) = metered_world(ranked, authority.clone());
+    let snapshot = first_snapshot(&fx, &snapshots).await;
+
+    assert_eq!(
+        snapshot.private_memory.len(),
+        2,
+        "the two records the store answered for were discarded by the third's \
+         failure: {:?}",
+        snapshot.private_memory
+    );
+    assert_eq!(
+        snapshot.budget.private_memories, 2,
+        "the budget must describe what the snapshot carries"
+    );
+    assert!(
+        snapshot.budget.private_memory_bytes > 0,
+        "a snapshot carrying selections carries their bytes"
+    );
+    assert!(
+        snapshot.ingress_revision.is_some(),
+        "a chain evaluated every embedded record, so the snapshot must name it"
+    );
+    assert_eq!(authority.gets(), 3, "the walk stopped at the failing read");
+}
+
+// ---------------------------------------------------------------------------
+// One declaration of the store this agent's long-term memory lives in.
+// ---------------------------------------------------------------------------
+
+/// The bundle's authority *is* the run's private store, whatever order the
+/// builders ran in, and the promotion executor derives from the same place.
+///
+/// Naming the two separately is a pairing nothing can check — an
+/// `Arc<dyn AgentPrivateMemoryStore>` carries no identity a wiring check could
+/// compare — and getting it wrong writes every promoted memory where nothing
+/// reads it, signalled only by a counter a hostile retriever also moves.
+#[test]
+fn the_retrieval_bundles_authority_is_the_runs_private_store() {
+    let authority: Arc<dyn AgentPrivateMemoryStore> =
+        Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    let decoy: Arc<dyn AgentPrivateMemoryStore> = Arc::new(MeteredAuthority::over(Arc::new(
+        InMemoryAgentPrivateMemoryStore::new(),
+    )));
+    let bundle = AgentMemoryRetrieval::new(
+        Arc::new(ScriptedPrivateMemoryRetriever::new()),
+        authority.clone(),
+        AgentGuardrailChain::new(AgentRevisionNumber::INITIAL),
+    );
+
+    for (label, memory) in [
+        (
+            "private store first",
+            AgentRunMemory::new(
+                Arc::new(InMemorySessionMemoryStore::new()),
+                Arc::new(InMemoryContextSnapshotStore::new()),
+            )
+            .with_private_store(decoy.clone())
+            .with_retrieval(bundle.clone()),
+        ),
+        (
+            "retrieval first",
+            AgentRunMemory::new(
+                Arc::new(InMemorySessionMemoryStore::new()),
+                Arc::new(InMemoryContextSnapshotStore::new()),
+            )
+            .with_retrieval(bundle.clone())
+            .with_private_store(decoy.clone()),
+        ),
+    ] {
+        let private = memory.private().expect("a private store is wired");
+        assert!(
+            Arc::ptr_eq(private, &authority),
+            "{label}: the run answered the store nothing resolves through"
+        );
+        let executor = SessionMemoryPromotionExecutor::for_memory(&memory)
+            .expect("the bundle names a private store");
+        assert!(
+            Arc::ptr_eq(executor.private_store(), &authority),
+            "{label}: promotions would write a store retrieval never reads"
+        );
+    }
+}
+
+/// With no bundle wired, the explicitly named store is still the answer.
+#[test]
+fn without_a_bundle_the_named_private_store_is_the_runs_private_store() {
+    let named: Arc<dyn AgentPrivateMemoryStore> = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    let memory = AgentRunMemory::new(
+        Arc::new(InMemorySessionMemoryStore::new()),
+        Arc::new(InMemoryContextSnapshotStore::new()),
+    )
+    .with_private_store(named.clone());
+
+    assert!(Arc::ptr_eq(
+        memory.private().expect("a private store is wired"),
+        &named
+    ));
+    assert!(SessionMemoryPromotionExecutor::for_memory(&memory).is_some());
+
+    let bare = AgentRunMemory::new(
+        Arc::new(InMemorySessionMemoryStore::new()),
+        Arc::new(InMemoryContextSnapshotStore::new()),
+    );
+    assert!(bare.private().is_none());
+    assert!(
+        SessionMemoryPromotionExecutor::for_memory(&bare).is_none(),
+        "a deployment that names no private store does not promote"
     );
 }

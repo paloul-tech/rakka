@@ -7059,6 +7059,12 @@ where
                     // more alarming — condition than a record the query
                     // simply does not admit.
                     ("unverified", report.unverified),
+                    // Not a failure and not a disagreement about one record:
+                    // the ranking was longer than this deployment resolves,
+                    // so its tail was never read. Emitted here because a
+                    // persistently capped walk is index drift or a retriever
+                    // ignoring the limit its query names.
+                    ("resolution-capped", usize::from(report.resolution_capped)),
                 ] {
                     if count > 0 {
                         record_agent_domain_counter(

@@ -98,6 +98,27 @@ pub const AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH: usize = 128;
 /// unbounded read. A vector backend ranks in its index and never needs this.
 pub const AGENT_MEMORY_RETRIEVAL_SCAN_MAX_ENTRIES: usize = 1024;
 
+/// The most ranked identities one assembly resolves through the authoritative
+/// store, however long a ranking the retriever returns.
+///
+/// The resolution walk performs one point read per ranked identity, inside
+/// the run's settle pass. Without a ceiling the *length of an adapter's
+/// answer* would decide how much I/O the owning shard performs, so a drifted
+/// or compromised retriever could stall a run by returning a very long list of
+/// identities the store does not hold — none of which grows the selection and
+/// none of which the walk would otherwise stop at.
+pub const AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS: usize = 64;
+
+/// How much slack the resolution ceiling allows above
+/// [`MemoryRetrievalPolicy::max_results`].
+///
+/// A ceiling equal to `max_results` would be correct but brittle: one stale
+/// index entry — a memory tombstoned after it was indexed — would cost a
+/// selection slot. The multiple absorbs a benign drifted tail while keeping
+/// the bound a function of *this* deployment's configuration rather than of
+/// the adapter's answer.
+pub const AGENT_MEMORY_RETRIEVAL_RESOLUTION_FACTOR: usize = 4;
+
 // ===========================================================================
 // The retrieval seam ([specification 13.3, 13.6]).
 // ===========================================================================
@@ -248,6 +269,11 @@ pub struct RetrievedPrivateMemory {
     pub relevance_bps: u16,
     /// Metadata of the derived vector that ranked this memory, when the
     /// backend has one.
+    ///
+    /// Advisory, exactly as [`Self::memory`] is: the snapshot embeds the
+    /// embedding reference the *authoritative record* carries, which
+    /// [`AgentPrivateMemory::validate`] bounds. This field is a ranking
+    /// detail a backend may report and nothing durable is derived from it.
     pub embedding: Option<MemoryEmbeddingRef>,
 }
 
@@ -444,6 +470,27 @@ impl MemoryRetrievalPolicy {
         self.max_results
     }
 
+    /// The most ranked identities one assembly resolves through the
+    /// authoritative store: [`Self::max_results`] times
+    /// [`AGENT_MEMORY_RETRIEVAL_RESOLUTION_FACTOR`], capped at
+    /// [`AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS`].
+    ///
+    /// Derived rather than stored, so it cannot disagree with
+    /// [`Self::max_results`] whatever order the builders are called in, and it
+    /// is always at least `max_results` — a bound below that could not fill a
+    /// selection even from a perfectly healthy index.
+    #[must_use]
+    pub const fn max_resolutions(&self) -> usize {
+        let allowance = self
+            .max_results
+            .saturating_mul(AGENT_MEMORY_RETRIEVAL_RESOLUTION_FACTOR);
+        if allowance > AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS {
+            AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS
+        } else {
+            allowance
+        }
+    }
+
     /// The selection's content byte budget.
     #[must_use]
     pub const fn max_bytes(&self) -> usize {
@@ -546,8 +593,16 @@ pub fn derive_retrieval_query(
 /// The **authoritative store**, because [`assemble_context`] resolves every
 /// ranked identity through it and embeds the record *it* holds. A bundle
 /// without one would be a retriever whose payload nothing checks, which is
-/// the same fail-open wearing different clothes. A deployment normally passes
-/// the same `Arc` it gives [`AgentRunMemory::with_private_store`].
+/// the same fail-open wearing different clothes.
+///
+/// This store *is* the run's private store: [`AgentRunMemory::private`]
+/// answers from the bundle whenever one is wired, and
+/// [`crate::dispatch::SessionMemoryPromotionExecutor::for_memory`] builds the
+/// promotion executor from it. Naming a second store beside it would be
+/// uncheckable — an `Arc<dyn AgentPrivateMemoryStore>` carries no identity a
+/// wiring check could compare, and two handles to one database are as
+/// legitimate as two handles to two — so there is one declaration instead of
+/// a comparison.
 #[derive(Clone)]
 pub struct AgentMemoryRetrieval {
     retriever: Arc<dyn AgentPrivateMemoryRetriever>,
@@ -578,6 +633,18 @@ impl AgentMemoryRetrieval {
     #[must_use]
     pub fn authority(&self) -> &dyn AgentPrivateMemoryStore {
         self.authority.as_ref()
+    }
+
+    /// The authoritative store as a shared handle, for a collaborator that
+    /// must hold *this* store rather than one named separately beside it.
+    ///
+    /// [`AgentRunMemory::private`] and
+    /// [`crate::dispatch::SessionMemoryPromotionExecutor::for_memory`] both
+    /// answer from here, which is what keeps the store promotions write and
+    /// the store retrieval resolves through one declaration.
+    #[must_use]
+    pub const fn authority_handle(&self) -> &Arc<dyn AgentPrivateMemoryStore> {
+        &self.authority
     }
 
     /// Uses an explicit retrieval policy.
@@ -887,8 +954,13 @@ fn cosine_relevance_bps(a: &[f32], b: &[f32]) -> u16 {
 pub struct RetrievalReport {
     /// Whether a retrieval ran (a bundle was wired and a query derived).
     pub attempted: bool,
-    /// Whether the retriever failed and the turn degraded to an empty
-    /// selection.
+    /// Whether the retrieval was cut short by a backend failure.
+    ///
+    /// A retriever failure degrades to an *empty* selection — nothing was
+    /// ranked, so there is nothing to keep. An authoritative-store failure
+    /// part-way through the walk degrades to the prefix already verified,
+    /// which is why this is a separate fact from [`Self::selected`] being
+    /// zero.
     pub degraded: bool,
     /// How many memories the snapshot selected.
     pub selected: usize,
@@ -913,6 +985,16 @@ pub struct RetrievalReport {
     pub reported: usize,
     /// How many records a `require-checkpoint` outcome dropped fail-closed.
     pub checkpoint_refused: usize,
+    /// Whether the walk stopped at
+    /// [`MemoryRetrievalPolicy::max_resolutions`] with ranked identities left
+    /// unresolved.
+    ///
+    /// Distinct from [`Self::degraded`]: nothing failed. It means the
+    /// retriever returned a ranking longer than this deployment will resolve,
+    /// which for a healthy backend should not happen — the query names its
+    /// limit — so a persistently set flag is index drift or a retriever
+    /// ignoring the bound it was given.
+    pub resolution_capped: bool,
 }
 
 impl RetrievalReport {
@@ -959,11 +1041,23 @@ pub struct AssembledContext {
 /// [`RetrievalReport::unverified`], so scope is checked here rather than
 /// delegated — see [`AgentPrivateMemoryRetriever`].
 ///
+/// The rule holds for every field the snapshot carries. The only value taken
+/// from the ranking payload is
+/// [`RetrievedPrivateMemory::relevance_bps`] — the one thing the retriever
+/// legitimately owns — and it is clamped; identity, revision, kind, content,
+/// digest, classification, confidence, and the embedding reference all come
+/// from the authoritative record. The walk resolves at most
+/// [`MemoryRetrievalPolicy::max_resolutions`] identities, so the length of the
+/// retriever's answer cannot decide how much I/O the settle pass performs.
+///
 /// A retriever error degrades the turn — empty selection, attempted retrieval
 /// still recorded — instead of failing the assembly
-/// ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)); an
-/// authoritative-store error degrades it the same way, for the same reason; a
-/// session-store error propagates, as it always has.
+/// ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)). An
+/// authoritative-store error degrades it for the same reason but not to the
+/// same place: the walk stops and keeps the prefix it has already verified,
+/// because a retriever outage has nothing to keep while a store outage
+/// part-way through does, and this snapshot is immutable. A session-store
+/// error propagates, as it always has.
 ///
 /// # The selection is always a rank prefix
 ///
@@ -1042,6 +1136,7 @@ pub async fn assemble_context(
     let mut selections: Vec<SnapshotPrivateMemory> = Vec::new();
     let mut selected_bytes = 0usize;
     let mut seen: BTreeSet<AgentPrivateMemoryId> = BTreeSet::new();
+    let mut resolved = 0usize;
 
     for retrieved in outcome.memories {
         if selections.len() >= policy.max_results() {
@@ -1071,6 +1166,17 @@ pub async fn assemble_context(
             report.rejected += 1;
             continue;
         }
+        // The resolution ceiling, checked immediately before the read it
+        // bounds. Only a *selection* stops this walk otherwise, and an
+        // identity the store does not hold never grows the selection — so
+        // without this the length of the retriever's answer, which is
+        // adapter-controlled, would decide how many sequential point reads
+        // the owning shard performs inside its settle pass.
+        if resolved >= policy.max_resolutions() {
+            report.resolution_capped = true;
+            break;
+        }
+        resolved += 1;
         let memory_record = match retrieval
             .authority()
             .get(&agent_scope, &ranked_id, now)
@@ -1085,28 +1191,27 @@ pub async fn assemble_context(
                 continue;
             }
             Err(_) => {
-                // The authoritative store is unreachable. Degrade the whole
-                // retrieval exactly as a retriever outage does — memory is
+                // The authoritative store is unreachable part-way through the
+                // walk. Stop, and keep what is already verified — memory is
                 // never the correctness source, and a store fault must not
                 // stall the settle pass ([specification 13.1]).
+                //
+                // Not the same as a *retriever* outage, which happens before
+                // anything is ranked and so has nothing to keep. Every
+                // selection held at this point is a record this same store
+                // answered for this same scope, so discarding them would
+                // volunteer a worse outcome than the fault requires: the
+                // snapshot is immutable and persisted first-writer-wins, so a
+                // momentary blip would cost the run its long-term memory for
+                // the rest of its life, on every retry of every later turn.
+                // Stopping keeps the selection a prefix of the ranking, which
+                // is the property this whole walk maintains, and lets the
+                // common tail below write one self-consistent report — the
+                // arm used to zero `selected`/`transformed`/`reported` while
+                // leaving `unverified` at its partial-walk value, publishing
+                // the cross-scope-leakage alarm on a store outage.
                 report.degraded = true;
-                report.selected = 0;
-                report.transformed = 0;
-                report.reported = 0;
-                snapshot.private_memory.clear();
-                snapshot.budget.private_memories = 0;
-                snapshot.budget.private_memory_bytes = 0;
-                snapshot.retrievals.push(SnapshotRetrieval {
-                    query: query.text().to_string(),
-                    retriever: retriever.backend_name().to_string(),
-                    retriever_version: retriever.retriever_version(),
-                    index_watermark: None,
-                });
-                snapshot.content_digest = snapshot.compute_digest();
-                return Ok(AssembledContext {
-                    snapshot,
-                    retrieval: report,
-                });
+                break;
             }
         };
 
@@ -1191,7 +1296,14 @@ pub async fn assemble_context(
             classification: memory_record.classification,
             confidence_bps: memory_record.confidence_bps,
             relevance_bps: retrieved.relevance_bps.min(10_000),
-            embedding: retrieved.embedding,
+            // From the authoritative record, not the ranking payload. This is
+            // the one field that used to be lifted verbatim from the
+            // retriever's answer into durable, digest-covered state: it is
+            // unbounded there, while `AgentPrivateMemory::validate` bounds the
+            // model name and requires a non-empty model and non-zero
+            // dimensions. `relevance_bps` above is the only value the
+            // retriever legitimately owns, and it is clamped.
+            embedding: memory_record.embedding.clone(),
             transforms: decision
                 .transforms
                 .iter()

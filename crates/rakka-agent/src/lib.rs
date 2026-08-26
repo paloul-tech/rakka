@@ -279,8 +279,9 @@ pub use retrieval::{
     AgentMemoryEmbedder, AgentMemoryRetrieval, AgentPrivateMemoryRetriever, AssembledContext,
     InMemoryPrivateMemoryRetriever, MemoryRetrievalOutcome, MemoryRetrievalPolicy,
     MemoryRetrievalQuery, RetrievalReport, RetrievedPrivateMemory,
-    AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH, AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES,
-    AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES, AGENT_MEMORY_RETRIEVAL_SCAN_MAX_ENTRIES,
+    AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH, AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS,
+    AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES, AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES,
+    AGENT_MEMORY_RETRIEVAL_RESOLUTION_FACTOR, AGENT_MEMORY_RETRIEVAL_SCAN_MAX_ENTRIES,
 };
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,

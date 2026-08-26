@@ -892,12 +892,50 @@ pub struct SessionMemoryPromotionExecutor {
 
 impl SessionMemoryPromotionExecutor {
     /// Wires the executor over the two stores it bridges.
+    ///
+    /// Prefer [`Self::for_memory`] wherever an
+    /// [`crate::memory::AgentRunMemory`] exists: the
+    /// store named here must be the same one retrieval resolves through, and
+    /// naming it twice is a pairing nothing can check.
     #[must_use]
     pub fn new(
         session: Arc<dyn SessionMemoryStore>,
         private: Arc<dyn AgentPrivateMemoryStore>,
     ) -> Self {
         Self { session, private }
+    }
+
+    /// Wires the executor from one run-memory bundle, so promotions write the
+    /// store retrieval resolves through.
+    ///
+    /// This is the pairing that matters and the one nothing can verify after
+    /// the fact. An `Arc<dyn AgentPrivateMemoryStore>` carries no identity a
+    /// wiring check could compare, so a deployment that hands promotion one
+    /// store and retrieval another gets an agent whose every promoted memory
+    /// is written where nothing reads it: each ranked identity resolves to
+    /// `None`, the snapshot is byte-identical to one assembled from an empty
+    /// ranking, and the only signal is `RetrievalReport::unverified` — the
+    /// same counter a hostile retriever moves. Deriving both from one
+    /// declaration removes the question instead of answering it.
+    ///
+    /// Answers `None` when the bundle names no private store at all, which is
+    /// a deployment that does not promote.
+    #[must_use]
+    pub fn for_memory(memory: &crate::memory::AgentRunMemory) -> Option<Self> {
+        Some(Self {
+            session: Arc::clone(memory.session_handle()),
+            private: Arc::clone(memory.private()?),
+        })
+    }
+
+    /// The private store promotions are written to.
+    ///
+    /// The store retrieval resolves through must be this one; see
+    /// [`Self::for_memory`], which is how a deployment guarantees it rather
+    /// than asserting it.
+    #[must_use]
+    pub const fn private_store(&self) -> &Arc<dyn AgentPrivateMemoryStore> {
+        &self.private
     }
 
     /// Reads the selected session entries in one bounded page.
