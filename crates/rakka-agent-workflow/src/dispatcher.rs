@@ -48,6 +48,51 @@ pub const METRIC_AGENT_DISPATCHER_IN_FLIGHT: &str = "rakka.agent_workflow.dispat
 /// Gauge for due dispatcher work that could not be claimed in one pass.
 pub const METRIC_AGENT_DISPATCHER_BACKLOG: &str = "rakka.agent_workflow.dispatcher.backlog";
 
+/// The most bytes of failure detail one fleet index entry keeps in
+/// [`AgentDispatchEntry::last_error_code`].
+///
+/// The fleet index is a *single* durable record that every worker loads and
+/// re-persists on every claim pass, and the string that reaches this field is
+/// supplied by an application dispatcher or an application dispatch
+/// authority. An unbounded one becomes unbounded growth on the hottest shared
+/// record in the system — and on a retry path, which repeats every backoff
+/// interval.
+///
+/// The bound lives here, at the record, rather than at each writer: a bound
+/// applied by callers holds only for the callers that remember it, and this
+/// field has writers in this crate, in `rakka-agent`, and in any deployment
+/// that drives a fleet of its own.
+pub const AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH: usize = 512;
+
+/// Bounds one persisted failure detail: newlines folded to spaces, truncated
+/// on a character boundary at [`AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH`].
+///
+/// This is *bounding*, not sanitizing. It cannot remove secret material a
+/// collaborator chose to put in its error text — that stays the
+/// collaborator's own contract — but it keeps an unbounded body out of a
+/// durable record.
+#[must_use]
+pub fn bounded_dispatch_detail(detail: &str) -> String {
+    let single_line: String = detail
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\r' {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if single_line.len() <= AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH {
+        return single_line;
+    }
+    let mut end = AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH;
+    while end > 0 && !single_line.is_char_boundary(end) {
+        end -= 1;
+    }
+    single_line[..end].to_string()
+}
+
 /// Creates the default dispatcher fleet persistence id.
 #[must_use]
 pub fn agent_dispatcher_fleet_persistence_id() -> PersistenceId {
@@ -714,7 +759,11 @@ impl AgentDispatchEntry {
         self.lease = None;
         self.due_at = next_retry_at;
         self.attempts = attempts;
-        self.last_error_code = Some(message);
+        // Bounded here, where the field is written, so no writer can bypass
+        // it — see [`AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH`]. This is the
+        // retry path, so an unbounded string would be re-persisted on every
+        // backoff interval for as long as the condition lasts.
+        self.last_error_code = Some(bounded_dispatch_detail(&message));
         self.updated_at = now;
         self
     }
@@ -723,7 +772,7 @@ impl AgentDispatchEntry {
         self.status = AgentDispatchStatus::Exhausted;
         self.lease = None;
         self.attempts = attempts;
-        self.last_error_code = Some(message);
+        self.last_error_code = Some(bounded_dispatch_detail(&message));
         self.updated_at = now;
         self.exhausted_at = Some(now);
         self
@@ -1165,8 +1214,24 @@ where
     /// caller.
     #[must_use]
     pub fn with_claim_filter(mut self, filter: AgentDispatchClaimFilter) -> Self {
-        self.claim_filter = filter;
+        self.set_claim_filter(filter);
         self
+    }
+
+    /// Restricts what this worker's handle may claim, in place.
+    ///
+    /// The `&mut` form exists because a consuming builder is unreachable from
+    /// behind a `&mut self` accessor — which is how
+    /// [`AgentDispatcherWorker::fleet_mut`] hands out this handle, and why
+    /// that worker could not install a filter at all.
+    pub fn set_claim_filter(&mut self, filter: AgentDispatchClaimFilter) {
+        self.claim_filter = filter;
+    }
+
+    /// The filter this handle claims under.
+    #[must_use]
+    pub const fn claim_filter(&self) -> &AgentDispatchClaimFilter {
+        &self.claim_filter
     }
 
     /// Creates a dispatcher fleet with explicit dependencies.
@@ -1978,6 +2043,33 @@ where
         &mut self.fleet
     }
 
+    /// Restricts what this worker may claim.
+    ///
+    /// Without this the worker served everything, with no way to say
+    /// otherwise: it builds its fleet handle privately and hands it out only
+    /// behind `&mut`, which a consuming builder cannot reach. A deployment
+    /// mixing this worker with class-restricted ones over the same fleet
+    /// index therefore kept the race the claim filter exists to remove — the
+    /// unfiltered worker claims a ticket it cannot run, and its dispatcher
+    /// fails the effect permanently while a worker that serves the class
+    /// stands by.
+    ///
+    /// The filter is per *worker*, not per fleet, which is the whole point:
+    /// several workers share one index and accept different classes. Build one
+    /// with [`AgentDispatchClaimFilter::by_target_attribute`] over whatever
+    /// attribute the effects carry — `rakka-agent` routes on
+    /// `agent_effect_execution_policy`.
+    #[must_use]
+    pub fn with_claim_filter(mut self, filter: AgentDispatchClaimFilter) -> Self {
+        self.fleet.set_claim_filter(filter);
+        self
+    }
+
+    /// Restricts what this worker may claim, in place.
+    pub fn set_claim_filter(&mut self, filter: AgentDispatchClaimFilter) {
+        self.fleet.set_claim_filter(filter);
+    }
+
     /// Recovers the fleet state.
     pub async fn recover(&mut self) -> AgentDispatcherResult<&AgentDispatcherFleetState> {
         self.fleet.recover().await
@@ -2139,16 +2231,20 @@ where
             OutboxDispatchResult::Success => {
                 inbox.inner_mut().record_outbox_success(&message_id).await?
             }
+            // The dispatcher is application-implemented and its message is
+            // unbounded. It reaches the durable outbox row and, through the
+            // telemetry event, the fleet index — so it is bounded before the
+            // write, exactly as `AgentDispatchEntry` bounds what it keeps.
             OutboxDispatchResult::Failure { message } => {
                 inbox
                     .inner_mut()
-                    .record_outbox_failure(&message_id, message.clone(), false)
+                    .record_outbox_failure(&message_id, bounded_dispatch_detail(message), false)
                     .await?
             }
             OutboxDispatchResult::Timeout { message } => {
                 inbox
                     .inner_mut()
-                    .record_outbox_failure(&message_id, message.clone(), true)
+                    .record_outbox_failure(&message_id, bounded_dispatch_detail(message), true)
                     .await?
             }
         };

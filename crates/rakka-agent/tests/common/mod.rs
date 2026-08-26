@@ -29,26 +29,26 @@ use rakka_agent::testkit::{
 };
 use rakka_agent::{
     delegation_result_operation_id, AgentA2aSendExecutor, AgentA2aSendFinding,
-    AgentAuthorityEnvelope, AgentBudgetAllocation, AgentBudgetCeilings, AgentBudgetDimension,
-    AgentContinuousGoalSpec, AgentDefinition, AgentDefinitionId, AgentDelegationId,
-    AgentDelegationRecord, AgentDelegationReport, AgentDelegationStatus, AgentDispatchAuthority,
-    AgentDispatchDecision, AgentDispatchFuture, AgentDispatchPass, AgentEffectPolicies,
-    AgentEffectSpec, AgentEntityAddress, AgentEntityAuthority, AgentEntityClass,
-    AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentEpochSpec, AgentExchangeEnvelope,
-    AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter, AgentFanInPolicy, AgentGoalId,
-    AgentGoalMode, AgentId, AgentModelAdapter, AgentModelTurn, AgentOperationId,
-    AgentOperationKind, AgentPolicyRef, AgentRevisionNumber, AgentRevisionProvenance,
-    AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectSink, AgentRunEffectStatus,
-    AgentRunEntityStore, AgentRunMemory, AgentRunScope, AgentRunSnapshot, AgentRunState,
-    AgentRunStatus, AgentRunTerminalReason, AgentSchemaId, AgentSchemaRef, AgentScope,
-    AgentSettings, AgentSettingsChange, AgentSetupRevision, AgentTaskContent, AgentTaskCreation,
-    AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand, AgentTaskEntityStore,
-    AgentTaskId, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope,
-    AgentTaskSnapshot, AgentTaskState, AgentTaskStatus, AgentToolAuthority, AgentToolBinding,
-    AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration, AgentToolDescriptor,
-    AgentToolKind, AgentToolRegistry, AgentWakeBinding, AgentWakeOccurrence, AgentWakePolicy,
-    AgentWakePolicyRevision, AgentWakeScanner, AgentWakeScannerSettings, AgentWakeTimerEntry,
-    AgentWakeTimerStore, AgentWakeTimerStoreState, AgentWakeTriggerKind,
+    AgentAuthorityEnvelope, AgentAuthorityRefusal, AgentBudgetAllocation, AgentBudgetCeilings,
+    AgentBudgetDimension, AgentContinuousGoalSpec, AgentDefinition, AgentDefinitionId,
+    AgentDelegationId, AgentDelegationRecord, AgentDelegationReport, AgentDelegationStatus,
+    AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentDispatchPass,
+    AgentEffectPolicies, AgentEffectSpec, AgentEntityAddress, AgentEntityAuthority,
+    AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentEpochSpec,
+    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter,
+    AgentFanInPolicy, AgentGoalId, AgentGoalMode, AgentId, AgentModelAdapter, AgentModelTurn,
+    AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentRevisionNumber,
+    AgentRevisionProvenance, AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectSink,
+    AgentRunEffectStatus, AgentRunEntityStore, AgentRunMemory, AgentRunScope, AgentRunSnapshot,
+    AgentRunState, AgentRunStatus, AgentRunTerminalReason, AgentSchemaId, AgentSchemaRef,
+    AgentScope, AgentSettings, AgentSettingsChange, AgentSetupRevision, AgentTaskContent,
+    AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand,
+    AgentTaskEntityStore, AgentTaskId, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId,
+    AgentTaskScope, AgentTaskSnapshot, AgentTaskState, AgentTaskStatus, AgentToolAuthority,
+    AgentToolBinding, AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration,
+    AgentToolDescriptor, AgentToolKind, AgentToolRegistry, AgentWakeBinding, AgentWakeOccurrence,
+    AgentWakePolicy, AgentWakePolicyRevision, AgentWakeScanner, AgentWakeScannerSettings,
+    AgentWakeTimerEntry, AgentWakeTimerStore, AgentWakeTimerStoreState, AgentWakeTriggerKind,
     InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore, ScheduleRevision, TenantId,
     WorkflowAgentRunEffectSink, AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
@@ -2478,6 +2478,28 @@ impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAutho
     }
 }
 
+/// A gate that answers one fixed refusal for every intent.
+///
+/// The refusal's code and message are *application*-authored on the real
+/// trait, so this is how a test drives the refusal-settlement paths with
+/// strings of its own choosing — which is the only way to see what those paths
+/// persist.
+pub struct FixedRefusalAuthority(pub AgentAuthorityRefusal);
+
+impl AgentDispatchAuthority for FixedRefusalAuthority {
+    fn authorize<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _run: &'a AgentRunState,
+        _intent: &'a AgentRunEffect,
+        _attempt: u32,
+        _now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        let refusal = self.0.clone();
+        Box::pin(async move { Ok(AgentDispatchDecision::Refused(refusal)) })
+    }
+}
+
 /// The authority fixture: the common task-and-run fixture over the durable
 /// workflow-outbox sink, plus the fleet, the executor, the kill-switch probe,
 /// and a configurable [`AgentToolAuthority`] behind the pipeline's required
@@ -2496,6 +2518,7 @@ pub struct AuthorityFixture {
     pub probe: KillSwitchProbe,
     pub credentials: Option<Arc<ScriptedCredentialResolver>>,
     pub expire_grants: bool,
+    pub fixed_refusal: Option<AgentAuthorityRefusal>,
 }
 
 impl AuthorityFixture {
@@ -2543,6 +2566,7 @@ impl AuthorityFixture {
             probe: KillSwitchProbe::new(),
             credentials: None,
             expire_grants: false,
+            fixed_refusal: None,
         }
     }
 
@@ -2579,6 +2603,13 @@ impl AuthorityFixture {
     /// successfully cannot see the surface it exists to check.
     pub fn with_failing_credential_resolver(mut self, code: &str, message: &str) -> Self {
         self.credentials = Some(Arc::new(ScriptedCredentialResolver::failing(code, message)));
+        self
+    }
+
+    /// Refuses every intent with the given refusal, so a test can choose the
+    /// application-authored code and message the settlement paths persist.
+    pub fn with_fixed_refusal(mut self, refusal: AgentAuthorityRefusal) -> Self {
+        self.fixed_refusal = Some(refusal);
         self
     }
 
@@ -2646,10 +2677,10 @@ impl AuthorityFixture {
         if let Some(setup) = &self.setup {
             gate = gate.with_setup_for_run(run_scope(), setup.clone());
         }
-        let gate: Arc<dyn AgentDispatchAuthority> = if self.expire_grants {
-            Arc::new(ExpiredGrantAuthority(gate))
-        } else {
-            Arc::new(gate)
+        let gate: Arc<dyn AgentDispatchAuthority> = match &self.fixed_refusal {
+            Some(refusal) => Arc::new(FixedRefusalAuthority(refusal.clone())),
+            None if self.expire_grants => Arc::new(ExpiredGrantAuthority(gate)),
+            None => Arc::new(gate),
         };
         let mut delivery = InProcessRunResultDelivery::new(
             self.fx.runs.clone(),

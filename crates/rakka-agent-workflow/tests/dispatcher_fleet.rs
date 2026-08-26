@@ -7,22 +7,23 @@ use rakka_agent_workflow::{
     AgentCausationId, AgentCompiledExecutionPlan, AgentCompiledNodeKind, AgentCompiledNodeTarget,
     AgentCompiledPlanEdge, AgentCompiledPlanFingerprint, AgentCompiledPlanId,
     AgentCompiledPlanNode, AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCorrelationId,
-    AgentDeduplicationKey, AgentDispatchConcurrencyLimits, AgentDispatchIndexEntry,
-    AgentDispatchQuery, AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherError,
-    AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorker,
-    AgentDispatcherWorkerId, AgentDurabilityMetadata, AgentEffect, AgentEffectDispatchFuture,
-    AgentEffectDispatcher, AgentEffectDispatcherRegistry, AgentEffectId, AgentEffectKind,
-    AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget, AgentGraphEffectBridge,
-    AgentGraphEffectScheduleRequest, AgentGraphNodeState, AgentGraphRunState, AgentGraphScheduler,
-    AgentGraphWaitReason, AgentIdempotencyKey, AgentRunId, AgentRunInbox, AgentTimestampMillis,
-    AgentWorkflowId, AgentWorkflowQueryIndex, InMemoryAgentWorkflowQueryIndex,
-    WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    AgentDeduplicationKey, AgentDispatchClaimFilter, AgentDispatchConcurrencyLimits,
+    AgentDispatchIndexEntry, AgentDispatchQuery, AgentDispatchStatus, AgentDispatchTargetClass,
+    AgentDispatcherError, AgentDispatcherFleetSettings, AgentDispatcherFleetState,
+    AgentDispatcherWorker, AgentDispatcherWorkerId, AgentDurabilityMetadata, AgentEffect,
+    AgentEffectDispatchFuture, AgentEffectDispatcher, AgentEffectDispatcherRegistry, AgentEffectId,
+    AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget,
+    AgentGraphEffectBridge, AgentGraphEffectScheduleRequest, AgentGraphNodeState,
+    AgentGraphRunState, AgentGraphScheduler, AgentGraphWaitReason, AgentIdempotencyKey, AgentRunId,
+    AgentRunInbox, AgentTimestampMillis, AgentWorkflowId, AgentWorkflowQueryIndex,
+    InMemoryAgentWorkflowQueryIndex, WorkflowDefinitionVersion,
+    AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 use rakka_core::InMemoryMetricsRecorder;
 use rakka_persistence::InMemoryDurableStateStore;
 use rakka_workflow::{
     ManualWorkflowClock, OutboxDispatchResult, OutboxMessageId, OutboxStatus, WorkflowState,
-    WorkflowTimestamp,
+    WorkflowTelemetryEvent, WorkflowTimestamp,
 };
 
 type WorkflowStore = InMemoryDurableStateStore<WorkflowState>;
@@ -1185,4 +1186,273 @@ impl AgentEffectDispatcher for ExpiringDispatcher {
         self.clock.advance_millis(self.advance_ms);
         Box::pin(async { OutboxDispatchResult::Success })
     }
+}
+
+// ---------------------------------------------------------------------------
+// This crate's own worker: it may decline a class, and it may not grow the
+// shared index without limit.
+// ---------------------------------------------------------------------------
+
+const CLASS_ATTRIBUTE: &str = "execution_class";
+
+/// An effect whose target names an execution class, the way `rakka-agent`
+/// tags one from the intent's execution-policy reference.
+fn classified_effect(effect_id: &str, class: &str) -> AgentEffect {
+    let durability = AgentDurabilityMetadata::new(
+        AgentDeduplicationKey::new(format!("dedupe-{effect_id}")),
+        AgentCausationId::new(format!("cause-{effect_id}")),
+        AgentCorrelationId::new(format!("correlation-{effect_id}")),
+    );
+    let metadata = AgentEffectMetadata::new(
+        AgentEffectId::new(effect_id),
+        durability,
+        AgentIdempotencyKey::new(format!("idempotency-{effect_id}")),
+        AgentTimestampMillis::new(100),
+    )
+    .expect("effect metadata should be valid")
+    .due_at(AgentTimestampMillis::new(100));
+
+    let target = AgentEffectTarget {
+        target_type: "tool".to_string(),
+        name: "classified-tool".to_string(),
+        address: Some("tool://classified-tool".to_string()),
+        attributes: BTreeMap::from([(CLASS_ATTRIBUTE.to_string(), class.to_string())]),
+    };
+
+    AgentEffectSchedule::new(AgentEffectKind::ToolCall, target, metadata)
+        .expect("effect schedule should be valid")
+        .expected_result_type("dispatch.result")
+        .expect("expected result type should be valid")
+        .into_effect()
+        .expect("effect should validate")
+}
+
+/// This crate's own worker can decline a class it does not serve.
+///
+/// It builds its fleet handle privately and hands it out only behind `&mut`,
+/// which a consuming builder cannot reach — so before `with_claim_filter` it
+/// served everything with no way to say otherwise, and a deployment mixing it
+/// with class-restricted workers over this same shared index kept exactly the
+/// race the filter exists to remove.
+#[tokio::test]
+async fn a_worker_may_decline_a_class_it_does_not_serve() {
+    let workflow_store = WorkflowStore::new();
+    let fleet_store = FleetStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let run_id = AgentRunId::new("run-classified");
+
+    schedule_effect(
+        &workflow_store,
+        &clock,
+        run_id.clone(),
+        classified_effect("effect-classified", "sandboxed"),
+    )
+    .await;
+
+    let settings = AgentDispatcherFleetSettings::new(8, 1_000);
+    let mut general = worker(
+        "worker-general",
+        fleet_store.clone(),
+        workflow_store.clone(),
+        clock.clone(),
+        metrics.clone(),
+        settings.clone(),
+    )
+    .with_claim_filter(AgentDispatchClaimFilter::by_target_attribute(
+        CLASS_ATTRIBUTE,
+        ["general"],
+    ));
+    general.recover().await.expect("fleet should recover");
+    general
+        .refresh_run(run_id.clone(), None)
+        .await
+        .expect("the effect should index");
+    let refused = general.claim_due().await.expect("the pass completes");
+    assert_eq!(
+        refused.claims.len(),
+        0,
+        "the worker took a lease on a class it does not serve"
+    );
+    assert_eq!(
+        refused.class_filtered, 1,
+        "the skip must be counted, or a stalled fleet looks like an idle one"
+    );
+
+    // And the ticket is still there for the worker that does serve it.
+    let mut sandboxed = worker(
+        "worker-sandboxed",
+        fleet_store,
+        workflow_store,
+        clock,
+        metrics,
+        settings,
+    )
+    .with_claim_filter(AgentDispatchClaimFilter::by_target_attribute(
+        CLASS_ATTRIBUTE,
+        ["sandboxed"],
+    ));
+    sandboxed.recover().await.expect("fleet should recover");
+    let served = sandboxed.claim_due().await.expect("the pass completes");
+    assert_eq!(
+        served.claims.len(),
+        1,
+        "the serving worker did not get the ticket the other one left alone"
+    );
+    assert_eq!(served.class_filtered, 0);
+}
+
+/// An application dispatcher's failure text cannot grow the shared fleet index
+/// without limit.
+///
+/// `last_error_code` is one field on a *single* durable record that every
+/// worker loads and re-persists on every claim pass, and the string reaching
+/// it is authored by the application.
+#[tokio::test]
+async fn an_application_dispatch_failure_is_bounded_before_it_reaches_durable_state() {
+    let workflow_store = WorkflowStore::new();
+    let fleet_store = FleetStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let run_id = AgentRunId::new("run-unbounded-failure");
+    let effect_id = "effect-unbounded-failure";
+
+    schedule_effect(
+        &workflow_store,
+        &clock,
+        run_id.clone(),
+        effect(
+            effect_id,
+            AgentEffectKind::ToolCall,
+            "tool",
+            "research-tool",
+            100,
+        ),
+    )
+    .await;
+
+    let mut worker = worker(
+        "worker-bounded",
+        fleet_store,
+        workflow_store.clone(),
+        clock.clone(),
+        metrics,
+        AgentDispatcherFleetSettings::new(8, 1_000),
+    );
+    worker.recover().await.expect("fleet should recover");
+    worker
+        .refresh_run(run_id.clone(), None)
+        .await
+        .expect("the effect should index");
+    let batch = worker.claim_due().await.expect("the pass completes");
+    let claim = batch.claims[0].clone();
+
+    let long = "z".repeat(AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH * 4);
+    let mut dispatcher = RecordingDispatcher::new([OutboxDispatchResult::Failure {
+        message: long.clone(),
+    }]);
+    let completion = worker
+        .dispatch_claim(claim, &mut dispatcher)
+        .await
+        .expect("the claim dispatches");
+
+    let recorded = completion
+        .entry
+        .last_error_code
+        .as_ref()
+        .expect("a failed dispatch records its detail");
+    assert!(
+        recorded.len() <= AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH,
+        "the fleet index kept {} bytes of application failure text, bound {}",
+        recorded.len(),
+        AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH
+    );
+
+    // The durable outbox row the same message reaches, too.
+    let mut inbox = AgentRunInbox::with_clock(run_id, workflow_store, clock);
+    inbox.recover().await.expect("the inbox recovers");
+    let encoded = serde_json::to_string(
+        inbox
+            .inner()
+            .state()
+            .expect("the workflow state is recovered"),
+    )
+    .expect("the state serializes");
+    assert!(
+        !encoded.contains(&"z".repeat(AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH + 1)),
+        "the durable outbox row kept more than the bound of application text"
+    );
+}
+
+/// The fleet index bounds its own field, whatever a writer hands it.
+///
+/// `record_claim_failure` is public and takes a telemetry event the *caller*
+/// built. `rakka-agent`'s deferral path builds one by hand and never passes
+/// through the outbox writer at all, so a bound applied only where the events
+/// are made holds only for the makers that remembered it — and this field
+/// lives on a single record every worker in the fleet loads and re-persists.
+#[tokio::test]
+async fn the_fleet_index_bounds_what_a_hand_built_event_hands_it() {
+    let workflow_store = WorkflowStore::new();
+    let fleet_store = FleetStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let run_id = AgentRunId::new("run-hand-built-event");
+    let effect_id = "effect-hand-built-event";
+
+    schedule_effect(
+        &workflow_store,
+        &clock,
+        run_id.clone(),
+        effect(
+            effect_id,
+            AgentEffectKind::ToolCall,
+            "tool",
+            "research-tool",
+            100,
+        ),
+    )
+    .await;
+
+    let mut worker = worker(
+        "worker-hand-built",
+        fleet_store,
+        workflow_store,
+        clock,
+        metrics,
+        AgentDispatcherFleetSettings::new(8, 1_000),
+    );
+    worker.recover().await.expect("fleet should recover");
+    worker
+        .refresh_run(run_id, None)
+        .await
+        .expect("the effect should index");
+    let batch = worker.claim_due().await.expect("the pass completes");
+    let claim = batch.claims[0].clone();
+
+    let long = "y".repeat(AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH * 4);
+    let entry = worker
+        .fleet_mut()
+        .record_claim_failure(
+            &claim,
+            &WorkflowTelemetryEvent::OutboxDispatchRetried {
+                message_id: OutboxMessageId::new(claim.effect_id.as_str()),
+                attempt: 1,
+                next_retry_at: WorkflowTimestamp::from_millis(2_000),
+                message: long,
+            },
+        )
+        .await
+        .expect("the failure records");
+
+    let recorded = entry
+        .last_error_code
+        .as_ref()
+        .expect("a failed claim records its detail");
+    assert!(
+        recorded.len() <= AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH,
+        "the index kept {} bytes from a hand-built event, bound {}",
+        recorded.len(),
+        AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH
+    );
 }

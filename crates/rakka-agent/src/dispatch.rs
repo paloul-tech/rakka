@@ -145,11 +145,30 @@ const INDETERMINATE_OUTCOME_MESSAGE: &str =
 
 /// The most bytes of failure detail one dispatch attempt persists.
 ///
-/// A failed attempt's detail is written to the run's durable outbox row and
-/// echoed onto the dispatcher fleet's index entry, neither of which bounds it
-/// on its own. A collaborator that returns a multi-kilobyte error body would
-/// otherwise become durable state readable by every worker in the fleet.
-pub const AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH: usize = 512;
+/// A failed attempt's detail is written to the run's durable outbox row, to
+/// the generation-final outcome the run entity keeps, and — through the
+/// telemetry event — to the dispatcher fleet's index entry. A collaborator
+/// that returns a multi-kilobyte error body would otherwise become durable
+/// state readable by every worker in the fleet.
+///
+/// One bound, declared once: the fleet index is owned by the substrate, which
+/// bounds the field it keeps, so this is that same bound rather than a second
+/// number that could drift from it.
+pub const AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH: usize =
+    rakka_agent_workflow::AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH;
+
+/// The most bytes of a stable *code* one dispatch attempt persists.
+///
+/// Rakka's own codes are far under this, but an application-implemented
+/// [`AgentDispatchAuthority`] supplies its own on every refusal, and a refusal
+/// code reaches the fleet index, the outbox row, and the run's durable
+/// outcome. Bounded separately from the detail, and tighter, so a verbose code
+/// cannot crowd the detail out of a record they share.
+///
+/// A code longer than this is truncated, which by construction leaves a string
+/// equal to no registered code — the honest outcome for something that was
+/// never a stable identifier.
+pub const AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH: usize = 128;
 
 /// Bounds one persisted attempt detail: single line, truncated on a character
 /// boundary at [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`].
@@ -157,27 +176,38 @@ pub const AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH: usize = 512;
 /// This is *bounding*, not sanitizing. It cannot remove secret material a
 /// collaborator chose to put in its error text — that is the collaborator's
 /// own contract, documented on every executor trait in this module — but it
-/// does keep an unbounded body out of two durable records
+/// does keep an unbounded body out of three durable records
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
 fn bounded_failure_detail(detail: &str) -> String {
-    let single_line: String = detail
-        .chars()
-        .map(|character| {
-            if character == '\n' || character == '\r' {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect();
-    if single_line.len() <= AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH {
-        return single_line;
+    rakka_agent_workflow::bounded_dispatch_detail(detail)
+}
+
+/// Bounds one persisted stable code at
+/// [`AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH`], on a character boundary.
+fn bounded_failure_code(code: &str) -> String {
+    let bounded = bounded_failure_detail(code);
+    if bounded.len() <= AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH {
+        return bounded;
     }
-    let mut end = AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH;
-    while end > 0 && !single_line.is_char_boundary(end) {
+    let mut end = AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH;
+    while end > 0 && !bounded.is_char_boundary(end) {
         end -= 1;
     }
-    single_line[..end].to_string()
+    bounded[..end].to_string()
+}
+
+/// Composes one persisted `code: detail` line and bounds the whole of it.
+///
+/// The code is bounded first so a verbose one cannot crowd out the detail
+/// beside it, and the composition is bounded again so the *record* — not each
+/// half of it — is what
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] describes.
+fn bounded_failure_line(prefix: &str, code: &str, detail: &str) -> String {
+    bounded_failure_detail(&format!(
+        "{prefix}{}: {}",
+        bounded_failure_code(code),
+        bounded_failure_detail(detail)
+    ))
 }
 
 /// The collaborator's own stable code, when the failure came from one.
@@ -2755,9 +2785,12 @@ where
             intent,
             attempt,
             claim.fencing_token,
+            // Bounded here rather than at the callers: one of them composes
+            // this message from an application refusal, and a bound that
+            // depends on every caller remembering it is not a bound.
             AgentRunEffectOutcome::Indeterminate {
-                code: code.to_string(),
-                message: message.to_string(),
+                code: bounded_failure_code(code),
+                message: bounded_failure_detail(message),
             },
             pass,
         )
@@ -2824,7 +2857,7 @@ where
             let message = format!(
                 "a prior attempt may have invoked the target, and the recovery retry was \
                  refused ({}); an explicit reconciliation decision is owed",
-                refusal.message
+                bounded_failure_detail(&refusal.message)
             );
             return self
                 .park_indeterminate(
@@ -2860,7 +2893,11 @@ where
             message_id: OutboxMessageId::new(claim.effect_id.as_str()),
             attempt: attempt.saturating_sub(1),
             next_retry_at: self.clock.now().add_millis(self.retry_backoff_ms),
-            message: format!("deferred: {code}: {}", bounded_failure_detail(message)),
+            // Both halves are application-supplied — an `AgentDispatchAuthority`
+            // authors the refusal this carries — and deferral is the *retry*
+            // path, so whatever lands here is re-persisted onto the shared
+            // fleet index every backoff interval until the condition clears.
+            message: bounded_failure_line("deferred: ", code, message),
         };
         self.fleet.record_claim_failure(claim, &event).await?;
         pass.deferred += 1;
@@ -2882,13 +2919,17 @@ where
     ) -> AgentDispatchResult<ClaimConclusion> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
         // Bounded once, here, so the outbox row, the fleet index entry, and
-        // the `Exhausted` word all carry the same bounded detail.
+        // the `Exhausted` word all carry the same bounded code and detail —
+        // and so does the line composed from them, which is the record the
+        // documented bound actually describes.
+        let code = bounded_failure_code(code);
         let detail = bounded_failure_detail(message);
+        let line = bounded_failure_line("", &code, &detail);
         let mut inbox = self.inbox(scope);
         inbox.recover().await?;
         let event = inbox
             .inner_mut()
-            .record_outbox_failure(&message_id, format!("{code}: {detail}"), false)
+            .record_outbox_failure(&message_id, line, false)
             .await
             .map_err(AgentInboxError::from)?;
         pass.failed_attempts += 1;
@@ -3315,9 +3356,12 @@ where
             intent,
             attempt,
             claim.fencing_token,
+            // The refusal is authored by an application-implemented
+            // [`AgentDispatchAuthority`], and this outcome is durable run
+            // state.
             AgentRunEffectOutcome::Failed {
-                code: refusal.code.clone(),
-                message: refusal.message.clone(),
+                code: bounded_failure_code(&refusal.code),
+                message: bounded_failure_detail(&refusal.message),
             },
             pass,
         )
@@ -3382,17 +3426,21 @@ where
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<()> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
+        // One caller passes an application refusal's code straight through,
+        // and this reason is written to the durable outbox row and echoed on
+        // the fleet index.
+        let reason = bounded_failure_code(reason);
         let mut inbox = self.inbox(scope);
         inbox.recover().await?;
         let event = inbox
             .inner_mut()
-            .record_outbox_cancelled(&message_id, reason)
+            .record_outbox_cancelled(&message_id, reason.clone())
             .await
             .map_err(AgentInboxError::from)?
             .unwrap_or_else(|| WorkflowTelemetryEvent::OutboxDispatchCancelled {
                 message_id: message_id.clone(),
                 at: self.clock.now(),
-                message: reason.to_string(),
+                message: reason,
             });
         self.fleet.record_claim_failure(claim, &event).await?;
         pass.cancelled += 1;

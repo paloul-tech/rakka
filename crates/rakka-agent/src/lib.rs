@@ -156,7 +156,8 @@ pub use dispatch::{
     AgentReconciliationFinding, AgentRunEffectDispatcher, AgentRunResultDelivery,
     AgentRunSetupResolver, AgentWorkflowCancelExecutor, AgentWorkflowCancelFinding,
     AgentWorkflowStartExecutor, AgentWorkflowStartFinding, SessionMemoryPromotionExecutor,
-    WorkflowAgentRunEffectSink, AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH,
+    WorkflowAgentRunEffectSink, AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH,
+    AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH,
 };
 pub use effect::{
     compensation_call_id, effect_id_for, external_idempotency_key_for, AgentClaimAppendProvenance,

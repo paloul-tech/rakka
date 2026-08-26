@@ -632,3 +632,104 @@ async fn the_metric_series_of_a_credentialed_run_carry_no_identifier_or_secret()
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 7. A dispatch authority's own words are bounded too — code as well as
+//    detail.
+// ---------------------------------------------------------------------------
+
+/// The filler an over-long refusal code carries, so a surface holding more
+/// than the bound is visible as a single run of one character.
+const CODE_FILLER: char = 'c';
+
+/// The filler an over-long refusal message carries.
+const DETAIL_FILLER: char = 'm';
+
+fn oversized_refusal(retryable: bool) -> rakka_agent::AgentAuthorityRefusal {
+    let code = format!(
+        "authority-refused-{}",
+        CODE_FILLER
+            .to_string()
+            .repeat(rakka_agent::dispatch::AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH * 4)
+    );
+    let message = format!(
+        "RAKKA-LONG-REFUSAL-DETAIL{}",
+        DETAIL_FILLER
+            .to_string()
+            .repeat(rakka_agent::dispatch::AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH * 4)
+    );
+    if retryable {
+        rakka_agent::AgentAuthorityRefusal::transient(code, message)
+    } else {
+        rakka_agent::AgentAuthorityRefusal::of(code, message)
+    }
+}
+
+/// Asserts no durable surface kept more than the bound of either filler.
+///
+/// A single run of one character is the precise probe: finding `bound + 1` of
+/// them proves a field kept more than the bound, and finding none proves every
+/// field that carries the filler was truncated at or below it.
+async fn assert_refusal_words_are_bounded(fx: &AuthorityFixture) {
+    let over_code = CODE_FILLER
+        .to_string()
+        .repeat(rakka_agent::dispatch::AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH + 1);
+    let over_detail = DETAIL_FILLER
+        .to_string()
+        .repeat(rakka_agent::dispatch::AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH + 1);
+    for (label, encoded) in fx.durable_surfaces().await {
+        assert!(
+            !encoded.contains(&over_code),
+            "durable surface {label:?} kept more than the code bound of the \
+             authority's own refusal code"
+        );
+        assert!(
+            !encoded.contains(&over_detail),
+            "durable surface {label:?} kept more than the detail bound of the \
+             authority's own refusal message"
+        );
+    }
+}
+
+/// A *transient* refusal is the worst case, and it was unbounded.
+///
+/// Deferral is the retry path: the composed line is written onto the single
+/// shared fleet index record every worker re-persists on every claim pass, and
+/// it repeats every backoff interval for as long as the condition lasts. Only
+/// the message half was bounded; the code went in verbatim.
+#[tokio::test]
+async fn a_transient_authority_refusal_is_bounded_on_the_shared_fleet_index() {
+    // The gate refuses every intent, so the run's own turn-1 model effect is
+    // the ticket under test — a refusal reaches this path long before any
+    // tool call does.
+    let fx = credentialed_fixture().with_fixed_refusal(oversized_refusal(true));
+    fx.start().await;
+
+    // Several passes, because this is the path that repeats.
+    for _round in 0..3 {
+        let pass = fx.one_pass().await;
+        assert_eq!(
+            pass.deferred, 1,
+            "the transient refusal did not defer, so nothing exercised the bound"
+        );
+        assert_eq!(pass.failed_attempts, 0, "a deferral spends no attempt");
+    }
+
+    assert_refusal_words_are_bounded(&fx).await;
+}
+
+/// A *definitive* refusal reaches durable run state, the outbox row, and the
+/// fleet index — all three under the authority's own code.
+#[tokio::test]
+async fn a_definitive_authority_refusal_is_bounded_on_every_durable_surface() {
+    let fx = credentialed_fixture().with_fixed_refusal(oversized_refusal(false));
+    fx.start().await;
+    let pass = fx.one_pass().await;
+    assert_eq!(
+        pass.cancelled, 1,
+        "the definitive refusal did not settle the ticket, so nothing \
+         exercised the bound"
+    );
+
+    assert_refusal_words_are_bounded(&fx).await;
+}
