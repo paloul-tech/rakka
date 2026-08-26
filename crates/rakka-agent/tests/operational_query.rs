@@ -200,6 +200,31 @@ async fn the_snapshot_answers_from_durable_state_with_telemetry_unavailable() {
         !decoded.has_accepted_result,
         "a pre-field snapshot loads with the fact unset"
     );
+
+    // The rule reaches the *nested* run projection too: `AgentRunSnapshot` is
+    // embedded here, so an operational answer serialized by an older peer is
+    // what a reader deserializes. `terminal_at` gets there by being an
+    // `Option`, which serde already loads as `None` when the field is absent
+    // — this pins that, so narrowing the field later fails here rather than
+    // in a rolling update.
+    let mut before_terminal_at = serde_json::to_value(&snapshot).expect("the snapshot serializes");
+    before_terminal_at
+        .get_mut("run")
+        .expect("the operational answer carries a run projection")
+        .as_object_mut()
+        .expect("the run projection serializes as an object")
+        .remove("terminal_at")
+        .expect("the field is present on a current run projection");
+    let decoded: rakka_agent::AgentOperationalSnapshot = serde_json::from_value(before_terminal_at)
+        .expect("a pre-field operational snapshot still deserializes");
+    assert!(
+        decoded
+            .run
+            .expect("the run projection loads")
+            .terminal_at
+            .is_none(),
+        "a pre-field run projection loads with the stamp unset"
+    );
 }
 
 /// A run parked behind an approval checkpoint reports the wait, the gated

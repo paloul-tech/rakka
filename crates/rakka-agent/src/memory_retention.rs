@@ -104,19 +104,22 @@ impl AgentRunRetentionOutcome {
         }
     }
 
-    /// Whether anything was actually deleted.
+    /// Whether either tier actually removed a record.
+    ///
+    /// A discharge that ran but deleted nothing is `false` — including the
+    /// replay of an already discharged run, which both tiers answer
+    /// `Purged { entries: 0 }`. That distinction is the whole point of the
+    /// predicate: a caller that gates a deletion audit entry, an erasure
+    /// notification, or a deleted-record count on it must not be told a
+    /// deletion happened on every idempotent re-drive.
     #[must_use]
     pub const fn deleted_anything(self) -> bool {
-        matches!(
-            self,
-            Self::Discharged {
-                snapshots: SessionPurgeOutcome::Purged { .. },
-                ..
-            } | Self::Discharged {
-                session: SessionPurgeOutcome::Purged { .. },
-                ..
+        match self {
+            Self::Discharged { snapshots, session } => {
+                snapshots.entries_deleted() > 0 || session.entries_deleted() > 0
             }
-        )
+            Self::NotTerminal { .. } | Self::TerminalTimeUnknown | Self::RunAbsent => false,
+        }
     }
 }
 
@@ -188,9 +191,13 @@ pub struct AgentMemoryRetentionReport {
     pub terminal_time_unknown: usize,
     /// Scopes with no durable run record.
     pub absent: usize,
-    /// Runs held by a legal hold on either tier.
+    /// Runs held by a legal hold on either tier, counted once per *run* —
+    /// never once per tier, or a fleet of ten held runs would report twenty
+    /// against ten discharged.
     pub held: usize,
-    /// Runs whose retention window has not elapsed.
+    /// Runs whose retention window has not elapsed on either tier, counted
+    /// once per run. This and [`Self::held`] may both count the same run: one
+    /// tier can be under a hold while the other is simply not yet due.
     pub not_yet_due: usize,
     /// Records deleted across both tiers.
     pub records_deleted: u64,
@@ -275,15 +282,26 @@ where
             match outcome {
                 AgentRunRetentionOutcome::Discharged { snapshots, session } => {
                     report.discharged += 1;
+                    // Records are a per-tier quantity and sum across both.
                     for tier in [snapshots, session] {
-                        match tier {
-                            SessionPurgeOutcome::Purged { entries } => {
-                                report.records_deleted =
-                                    report.records_deleted.saturating_add(entries);
-                            }
-                            SessionPurgeOutcome::Held => report.held += 1,
-                            SessionPurgeOutcome::NotYetDue => report.not_yet_due += 1,
-                        }
+                        report.records_deleted = report
+                            .records_deleted
+                            .saturating_add(tier.entries_deleted());
+                    }
+                    // The two refusal counters are per-*run*, as their docs
+                    // say, so they are tested once each rather than summed
+                    // over the tiers. They are independent tests, not an
+                    // else: one tier may be held while the other is merely
+                    // not yet due, and both facts are true of that run.
+                    if matches!(snapshots, SessionPurgeOutcome::Held)
+                        || matches!(session, SessionPurgeOutcome::Held)
+                    {
+                        report.held += 1;
+                    }
+                    if matches!(snapshots, SessionPurgeOutcome::NotYetDue)
+                        || matches!(session, SessionPurgeOutcome::NotYetDue)
+                    {
+                        report.not_yet_due += 1;
                     }
                 }
                 AgentRunRetentionOutcome::NotTerminal { .. } => report.not_terminal += 1,

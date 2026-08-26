@@ -869,6 +869,45 @@ impl AgentEffectPolicies {
         self
     }
 
+    /// Stamps the trust class every effect *Rakka itself* commits runs under:
+    /// the model call, a compensation, a memory promotion, a goal evaluation,
+    /// an A2A send, a workflow start or cancel, and a claim append
+    /// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// These are the effects no application declaration names, and without
+    /// this they can carry no class at all — which is what makes
+    /// [`crate::tools::AgentToolAuthority::with_required_execution_policy`]
+    /// enforceable rather than a switch that refuses every run's first model
+    /// call.
+    ///
+    /// Registered tools are deliberately untouched: a tool's class comes from
+    /// its [`crate::tools::AgentToolBinding`] declaration, and the dispatch
+    /// gate refuses an intent whose class disagrees with that binding. So is
+    /// the unclassified-tool default, which must stay refusable — a tool the
+    /// deployment never classified is exactly what a required execution
+    /// policy exists to catch.
+    ///
+    /// Prefer deriving policies through
+    /// [`crate::tools::AgentToolAuthority::effect_policies`], which applies
+    /// this stamp from the class the authority requires, so the gate and the
+    /// specs that satisfy it cannot drift.
+    #[must_use]
+    pub fn with_substrate_execution_policy(mut self, policy: AgentExecutionPolicyRef) -> Self {
+        for spec in [
+            &mut self.model,
+            &mut self.compensation,
+            &mut self.memory_promotion,
+            &mut self.goal_evaluation,
+            &mut self.a2a_send,
+            &mut self.workflow_start,
+            &mut self.workflow_cancel,
+            &mut self.claim_append,
+        ] {
+            spec.execution_policy = Some(policy.clone());
+        }
+        self
+    }
+
     /// The spec one request dispatches under.
     #[must_use]
     pub fn spec_for(&self, request: &AgentRunEffectRequest) -> &AgentEffectSpec {

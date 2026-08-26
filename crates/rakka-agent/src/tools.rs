@@ -1033,7 +1033,11 @@ pub struct AgentToolAuthority {
     /// memory-ingress boundary under this authority's own declared chain.
     memory_ingress_attested: bool,
     execution_router: Option<Arc<dyn AgentExecutionPolicyRouter>>,
-    require_execution_policy: bool,
+    /// The trust class every effect Rakka itself commits runs under, when the
+    /// deployment requires each intent to name one. `Some` *is* strict mode:
+    /// one declaration drives both the gate and the specs that satisfy it, so
+    /// the two cannot drift apart.
+    substrate_execution_policy: Option<AgentExecutionPolicyRef>,
     grant_ttl_ms: u64,
 }
 
@@ -1047,7 +1051,7 @@ impl AgentToolAuthority {
             guardrails: None,
             memory_ingress_attested: false,
             execution_router: None,
-            require_execution_policy: false,
+            substrate_execution_policy: None,
             grant_ttl_ms: AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
         }
     }
@@ -1129,7 +1133,8 @@ impl AgentToolAuthority {
         self
     }
 
-    /// Refuses any intent that carries no execution-policy reference.
+    /// Refuses any intent that carries no execution-policy reference, and
+    /// names the class the substrate's own effects carry.
     ///
     /// Off by default, because
     /// [specification 11.8](../../../docs/plans/rakka-agent/spec.md) says an
@@ -1142,9 +1147,26 @@ impl AgentToolAuthority {
     /// [specification 16](../../../docs/plans/rakka-agent/spec.md) forbids
     /// claiming isolation from. This is the switch that makes the claim
     /// checkable rather than asserted.
+    ///
+    /// The requirement is deliberately universal. A model call, a
+    /// compensation, an A2A send and a workflow start all reach a worker
+    /// exactly as a tool call does, so exempting them would relocate the hole
+    /// rather than close it — but only a *tool* intent carries a class of its
+    /// own, projected from its [`AgentToolBinding`] declaration. `substrate`
+    /// is therefore mandatory: it is the class stamped on every effect Rakka
+    /// itself commits, and [`Self::effect_policies`] applies it, so the gate
+    /// and the specs that satisfy it derive from this one declaration.
+    ///
+    /// A deployment that assembles [`crate::effect::AgentEffectPolicies`] by
+    /// hand must apply
+    /// [`crate::effect::AgentEffectPolicies::with_substrate_execution_policy`]
+    /// itself, or its very first model call is refused
+    /// `execution-policy-required` — the refusal names the knob. The
+    /// configured router must accept `substrate`, and some worker must serve
+    /// it, or the substrate has been classified onto a class nothing runs.
     #[must_use]
-    pub const fn with_required_execution_policy(mut self) -> Self {
-        self.require_execution_policy = true;
+    pub fn with_required_execution_policy(mut self, substrate: AgentExecutionPolicyRef) -> Self {
+        self.substrate_execution_policy = Some(substrate);
         self
     }
 
@@ -1163,18 +1185,25 @@ impl AgentToolAuthority {
 
     /// The commit-time effect policies this authority's configuration
     /// projects: the registry's bindings, pinned to the configured guardrail
-    /// chain's revision.
+    /// chain's revision, and — under
+    /// [`Self::with_required_execution_policy`] — stamped with the trust
+    /// class the substrate's own effects run under.
     ///
     /// Wire the run entity with *this* projection rather than
-    /// [`AgentToolRegistry::effect_policies`] whenever a chain is configured:
-    /// the pin it stamps on every committed intent is what the dispatch
-    /// pipeline holds guardrail transforms deterministic against, so one
-    /// external idempotency key can never carry two differently transformed
-    /// payloads across a chain change.
+    /// [`AgentToolRegistry::effect_policies`] whenever a chain or a required
+    /// execution policy is configured. The guardrail pin it stamps on every
+    /// committed intent is what the dispatch pipeline holds guardrail
+    /// transforms deterministic against, so one external idempotency key can
+    /// never carry two differently transformed payloads across a chain
+    /// change; and the substrate class is what makes the requirement this
+    /// same authority enforces satisfiable at all.
     pub fn effect_policies(&self) -> AgentEffectResult<crate::effect::AgentEffectPolicies> {
         let mut policies = self.registry.effect_policies()?;
         if let Some(chain) = &self.guardrails {
             policies = policies.with_guardrail_revision(chain.revision());
+        }
+        if let Some(substrate) = &self.substrate_execution_policy {
+            policies = policies.with_substrate_execution_policy(substrate.clone());
         }
         Ok(policies)
     }
@@ -2412,14 +2441,18 @@ impl AgentToolAuthority {
         policy: Option<&AgentExecutionPolicyRef>,
     ) -> Result<(), AgentAuthorityRefusal> {
         let Some(policy) = policy else {
-            if self.require_execution_policy {
+            if self.substrate_execution_policy.is_some() {
                 // Definitive, not transient: no worker will ever accept a
                 // class that does not exist, and clearing the condition means
                 // re-declaring the tool.
                 return Err(AgentAuthorityRefusal::of(
                     "execution-policy-required",
                     "this deployment routes every effect by trust class and the intent names \
-                     none; it stays undispatchable rather than running with ambient authority",
+                     none; it stays undispatchable rather than running with ambient authority. \
+                     A tool takes its class from its registered binding's declaration; every \
+                     effect Rakka itself commits takes it from \
+                     AgentEffectPolicies::with_substrate_execution_policy, which \
+                     AgentToolAuthority::effect_policies applies",
                 ));
             }
             return Ok(());

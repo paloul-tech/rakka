@@ -660,6 +660,21 @@ pub enum SessionPurgeOutcome {
     NotYetDue,
 }
 
+impl SessionPurgeOutcome {
+    /// How many records this call actually removed.
+    ///
+    /// Zero for a hold, for a window that has not elapsed, *and* for the
+    /// replay of an already purged run — [`Self::Purged`] reports what this
+    /// call removed, not what the run once held.
+    #[must_use]
+    pub const fn entries_deleted(self) -> u64 {
+        match self {
+            Self::Purged { entries } => entries,
+            Self::Held | Self::NotYetDue => 0,
+        }
+    }
+}
+
 /// The future a [`SessionMemoryStore`] or [`ContextSnapshotStore`] operation
 /// returns.
 pub type MemoryFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MemoryError>> + Send + 'a>>;

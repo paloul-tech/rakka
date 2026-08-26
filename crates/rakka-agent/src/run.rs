@@ -974,6 +974,14 @@ pub struct AgentRunSnapshot {
     pub accepted_at: AgentTimestampMillis,
     /// When it first reached a terminal status, and the clock its short-term
     /// retention is measured from. `None` while it is live.
+    ///
+    /// Snapshots serialized before this field load with it unset. Serde
+    /// already loads a missing `Option` as `None`; the attribute states the
+    /// intent explicitly, so narrowing the field to a non-`Option` type later
+    /// cannot silently make every older answer unreadable — this projection
+    /// is embedded in [`crate::query::AgentOperationalSnapshot`], which an
+    /// older peer deserializes.
+    #[serde(default)]
     pub terminal_at: Option<AgentTimestampMillis>,
     /// The time of its last accepted transition.
     pub updated_at: AgentTimestampMillis,
@@ -1155,6 +1163,13 @@ fn terminate(
     // clock must not move when a re-driven wind-down re-enters this transition
     // ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
     run.terminal_at = Some(now);
+    // The record now carries a field only a binary that knows schema version 2
+    // can round-trip, so a version-1 record earns its upgrade at exactly the
+    // transition that gives it one. Without this a run *created* before the
+    // bump would keep saying version 1 — readable, and therefore erasable, by
+    // a peer that would drop the stamp on the next settlement it applies, and
+    // the already-terminal guard above means nothing could ever restore it.
+    state.schema_version = CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION;
     state.updated_at = now;
     Ok(())
 }

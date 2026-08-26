@@ -21,14 +21,17 @@ use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     discharge_run_memory_retention, AgentContextSnapshotRef, AgentMemoryRetentionSweep,
     AgentModelTurn, AgentPrivateMemory, AgentPrivateMemoryId, AgentPrivateMemoryKind,
-    AgentPrivateMemoryStore, AgentRunMemory, AgentRunRetentionOutcome, AgentRunScope,
-    AgentRunStatus, AgentSchemaPolicy, AgentScope, AgentTaskContent, ContextSnapshotStore,
-    InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
-    MemoryClassification, MemoryOperationId, MemoryTombstoneReason, PrivateMemoryExpectation,
+    AgentPrivateMemoryStore, AgentRecordKind, AgentRunMemory, AgentRunRetentionOutcome,
+    AgentRunScope, AgentRunStatus, AgentSchemaCompatibility, AgentSchemaPolicy, AgentScope,
+    AgentTaskContent, ContextSnapshotStore, InMemoryAgentPrivateMemoryStore,
+    InMemoryContextSnapshotStore, InMemorySessionMemoryStore, MemoryClassification,
+    MemoryOperationId, MemoryTombstoneReason, PrivateMemoryExpectation,
     PrivateMemoryTombstoneRequest, SessionMemoryCursor, SessionMemoryStore, SessionPurgeOutcome,
     SessionRetentionPolicy, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION,
 };
-use rakka_agent_workflow::AgentTimestampMillis;
+use rakka_agent_workflow::{AgentTimestampMillis, StateSchemaVersion};
+use rakka_persistence::DurableStateStore;
 
 mod common;
 
@@ -122,6 +125,44 @@ impl World {
             .await
             .expect("the snapshot store reads")
             .is_some()
+    }
+
+    /// The schema version the run's persisted record carries, read from the
+    /// serialized record rather than from a constant, so a stamp the code
+    /// never wrote cannot be asserted into existence.
+    async fn run_schema_version(&self) -> u64 {
+        let state = rakka_agent::load_agent_run_state(
+            &self.fx.runs,
+            &run_scope(),
+            &AgentSchemaPolicy::default(),
+        )
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+        serde_json::to_value(&state).expect("the run state serializes")["schema_version"]
+            .as_u64()
+            .expect("the record carries a numeric schema version")
+    }
+
+    /// Rewrites the persisted run record's schema version, the way a peer
+    /// binary from before a bump would have written it.
+    async fn rewrite_run_schema_version(&self, version: u64) {
+        let id = run_scope().persistence_id();
+        let record = self
+            .fx
+            .runs
+            .load(&id)
+            .await
+            .expect("the run record loads")
+            .expect("the run record exists");
+        let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+        value["schema_version"] = serde_json::json!(version);
+        let downgraded = serde_json::from_value(value).expect("the tampered record deserializes");
+        self.fx
+            .runs
+            .compare_and_set(&id, record.revision, downgraded)
+            .await
+            .expect("the tampered record persists");
     }
 
     async fn terminal_at(&self) -> Option<AgentTimestampMillis> {
@@ -248,6 +289,7 @@ async fn a_due_terminal_run_purges_both_tiers_and_a_replay_purges_zero() {
     };
     assert!(matches!(snapshots, SessionPurgeOutcome::Purged { entries } if entries > 0));
     assert!(matches!(session, SessionPurgeOutcome::Purged { entries } if entries > 0));
+    assert!(first.deleted_anything(), "records were removed: {first:?}");
 
     let replay = world.discharge(&window(0), 1_000_001).await;
     assert_eq!(
@@ -257,6 +299,13 @@ async fn a_due_terminal_run_purges_both_tiers_and_a_replay_purges_zero() {
             session: SessionPurgeOutcome::Purged { entries: 0 },
         },
         "a replayed discharge must delete nothing and say so"
+    );
+    // The predicate must agree with the payload it summarizes. A caller that
+    // gates a deletion audit entry or an erasure notification on it would
+    // otherwise record one on every idempotent re-drive of the same run.
+    assert!(
+        !replay.deleted_anything(),
+        "a replay that deleted nothing must not report a deletion: {replay:?}"
     );
 }
 
@@ -483,4 +532,108 @@ async fn a_sweep_over_many_runs_reports_what_it_skipped_without_aborting() {
         "an absent scope is reported, not an error that stops the pass"
     );
     assert!(report.records_deleted > 0);
+}
+
+// ---------------------------------------------------------------------------
+// The sweep's refusal counters are per run, and the schema version fences the
+// stamp against a peer that would erase it.
+// ---------------------------------------------------------------------------
+
+/// `held` and `not_yet_due` count runs, as their documentation says.
+///
+/// Counting them once per *tier* doubled every refusal: ten held scopes would
+/// report twenty held against ten discharged, which reads as a report of
+/// twenty runs the operator does not have.
+#[tokio::test]
+async fn a_sweep_counts_its_refusals_per_run_not_per_tier() {
+    let world = world();
+    world.run_to_completion().await;
+    let terminal_at = world
+        .terminal_at()
+        .await
+        .expect("a completed run stamps its terminal time")
+        .as_millis();
+    let sweep = AgentMemoryRetentionSweep::new(world.fx.runs.clone(), world.memory.clone());
+
+    let held = sweep
+        .discharge(
+            [run_scope()],
+            &window(0).with_legal_hold(true),
+            AgentTimestampMillis::new(1_000_000),
+        )
+        .await
+        .expect("the sweep completes");
+    assert_eq!(held.discharged, 1);
+    assert_eq!(
+        held.held, 1,
+        "one run held on both of its tiers is one held run, not two"
+    );
+    assert_eq!(held.records_deleted, 0);
+
+    let early = sweep
+        .discharge(
+            [run_scope()],
+            &window(WINDOW_MS),
+            AgentTimestampMillis::new(terminal_at + WINDOW_MS - 1),
+        )
+        .await
+        .expect("the sweep completes");
+    assert_eq!(early.discharged, 1);
+    assert_eq!(
+        early.not_yet_due, 1,
+        "one run short of its window on both tiers is one not-yet-due run"
+    );
+    assert_eq!(early.held, 0);
+}
+
+/// A run created before `terminal_at` existed upgrades its schema version at
+/// the transition that gives it the field.
+///
+/// Without the upgrade the bump protects nothing that matters: a record
+/// *created* by the older binary keeps saying version 1, so that binary keeps
+/// reading it — and serde drops the field it does not know, on the next
+/// settlement or return command it applies to the already-terminal run. The
+/// stamp is written once under an already-terminal guard, so nothing could
+/// ever put it back, and the run's session rows and snapshots would never be
+/// purged.
+#[tokio::test]
+async fn a_pre_bump_run_record_upgrades_its_schema_when_it_terminalizes() {
+    let world = world();
+    world.fx.instantiate_agent().await;
+    world.fx.create_task().await;
+
+    // The record as the older binary wrote it: version 1, no stamp to carry.
+    world.rewrite_run_schema_version(1).await;
+    assert_eq!(world.run_schema_version().await, 1);
+    assert_eq!(
+        world.terminal_at().await,
+        None,
+        "the run is still live, so there is nothing to erase yet"
+    );
+
+    world.fx.pump().await.expect("the loop runs to completion");
+
+    assert!(
+        world.terminal_at().await.is_some(),
+        "the completed run stamped its terminal time"
+    );
+    assert_eq!(
+        world.run_schema_version().await,
+        u64::from(CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION.get()),
+        "the record carries a field only the current version knows, and still \
+         claims the version that does not"
+    );
+
+    // And that is what a peer from before the bump now meets on the load path.
+    let older_binary = AgentSchemaPolicy::default().with_compatibility(
+        AgentRecordKind::RunState,
+        AgentSchemaCompatibility::n_plus_one(StateSchemaVersion::new(1)),
+    );
+    assert!(
+        rakka_agent::load_agent_run_state(&world.fx.runs, &run_scope(), &older_binary)
+            .await
+            .is_err(),
+        "a binary that cannot round-trip the stamp must fail closed, not load \
+         the record and drop it"
+    );
 }
