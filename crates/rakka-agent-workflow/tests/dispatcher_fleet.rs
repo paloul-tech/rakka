@@ -1197,7 +1197,7 @@ const CLASS_ATTRIBUTE: &str = "execution_class";
 
 /// An effect whose target names an execution class, the way `rakka-agent`
 /// tags one from the intent's execution-policy reference.
-fn classified_effect(effect_id: &str, class: &str) -> AgentEffect {
+fn classified_effect(effect_id: &str, class: &str, due_at: u64) -> AgentEffect {
     let durability = AgentDurabilityMetadata::new(
         AgentDeduplicationKey::new(format!("dedupe-{effect_id}")),
         AgentCausationId::new(format!("cause-{effect_id}")),
@@ -1210,7 +1210,7 @@ fn classified_effect(effect_id: &str, class: &str) -> AgentEffect {
         AgentTimestampMillis::new(100),
     )
     .expect("effect metadata should be valid")
-    .due_at(AgentTimestampMillis::new(100));
+    .due_at(AgentTimestampMillis::new(due_at));
 
     let target = AgentEffectTarget {
         target_type: "tool".to_string(),
@@ -1246,7 +1246,7 @@ async fn a_worker_may_decline_a_class_it_does_not_serve() {
         &workflow_store,
         &clock,
         run_id.clone(),
-        classified_effect("effect-classified", "sandboxed"),
+        classified_effect("effect-classified", "sandboxed", 100),
     )
     .await;
 
@@ -1454,5 +1454,140 @@ async fn the_fleet_index_bounds_what_a_hand_built_event_hands_it() {
         "the index kept {} bytes from a hand-built event, bound {}",
         recorded.len(),
         AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH
+    );
+}
+
+/// A busy pass reports the class it cannot serve, not zero.
+///
+/// The batch-size break used to sit above the filter check, so a fleet with
+/// plentiful servable work filled its batch from the earlier entries and
+/// returned before ever reaching the unservable one. Every pass then reported
+/// `class_filtered: 0` while a ticket no worker serves sat `Ready` forever —
+/// which is the silent stall the counter exists to prevent, and it appeared
+/// exactly when a fleet was busiest.
+///
+/// The unservable entry is ordered *last* by `due_at` deliberately: that is
+/// the arrangement a single-ticket test cannot distinguish, and the one a real
+/// backlog produces, since the stalled ticket is the one nobody ever claims
+/// and so keeps being overtaken.
+#[tokio::test]
+async fn a_busy_pass_still_reports_the_class_it_cannot_serve() {
+    let workflow_store = WorkflowStore::new();
+    let fleet_store = FleetStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(1_000));
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let run_id = AgentRunId::new("run-busy-filter");
+
+    for (index, due_at) in [100_u64, 101, 102].into_iter().enumerate() {
+        schedule_effect(
+            &workflow_store,
+            &clock,
+            run_id.clone(),
+            classified_effect(&format!("effect-servable-{index}"), "sandboxed", due_at),
+        )
+        .await;
+    }
+    // Latest due, so it sorts behind every servable entry.
+    schedule_effect(
+        &workflow_store,
+        &clock,
+        run_id.clone(),
+        classified_effect("effect-unservable", "gpu", 200),
+    )
+    .await;
+
+    let mut worker = worker(
+        "worker-sandboxed",
+        fleet_store,
+        workflow_store,
+        clock,
+        metrics,
+        // Two at a time, and three servable entries: the batch fills before
+        // the walk would ever have reached the unservable one.
+        AgentDispatcherFleetSettings::new(2, 1_000),
+    )
+    .with_claim_filter(AgentDispatchClaimFilter::by_target_attribute(
+        CLASS_ATTRIBUTE,
+        ["sandboxed"],
+    ));
+    worker.recover().await.expect("fleet should recover");
+    worker
+        .refresh_run(run_id, None)
+        .await
+        .expect("the effects should index");
+
+    let batch = worker.claim_due().await.expect("the pass completes");
+    assert_eq!(batch.claims.len(), 2, "the batch limit still bounds claims");
+    assert_eq!(
+        batch.class_filtered, 1,
+        "the unservable entry sat behind a full batch and went unreported"
+    );
+    assert_eq!(
+        batch.due_dispatch_count, 4,
+        "the fleet-wide backlog counts every claimable entry"
+    );
+    assert!(
+        batch.backpressure_limited,
+        "a third servable entry was left unclaimed"
+    );
+}
+
+/// A class-restricted worker that claimed everything it serves is not under
+/// backpressure.
+///
+/// `backpressure_limited` compared a *fleet-wide* due count against this
+/// worker's post-filter claims, so any worker declaring a class reported
+/// backpressure permanently — for work that was never its to do.
+#[tokio::test]
+async fn a_worker_that_claimed_all_it_serves_reports_no_backpressure() {
+    let workflow_store = WorkflowStore::new();
+    let fleet_store = FleetStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(1_000));
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let run_id = AgentRunId::new("run-no-backpressure");
+
+    schedule_effect(
+        &workflow_store,
+        &clock,
+        run_id.clone(),
+        classified_effect("effect-mine", "sandboxed", 100),
+    )
+    .await;
+    for (index, due_at) in [101_u64, 102].into_iter().enumerate() {
+        schedule_effect(
+            &workflow_store,
+            &clock,
+            run_id.clone(),
+            classified_effect(&format!("effect-theirs-{index}"), "gpu", due_at),
+        )
+        .await;
+    }
+
+    let mut worker = worker(
+        "worker-sandboxed",
+        fleet_store,
+        workflow_store,
+        clock,
+        metrics,
+        AgentDispatcherFleetSettings::new(8, 1_000),
+    )
+    .with_claim_filter(AgentDispatchClaimFilter::by_target_attribute(
+        CLASS_ATTRIBUTE,
+        ["sandboxed"],
+    ));
+    worker.recover().await.expect("fleet should recover");
+    worker
+        .refresh_run(run_id, None)
+        .await
+        .expect("the effects should index");
+
+    let batch = worker.claim_due().await.expect("the pass completes");
+    assert_eq!(batch.claims.len(), 1, "the one servable entry was claimed");
+    assert_eq!(batch.class_filtered, 2);
+    assert_eq!(batch.due_dispatch_count, 3);
+    assert!(
+        !batch.backpressure_limited,
+        "this worker claimed everything it serves; the rest is another \
+         worker's backlog, not this one's backpressure"
     );
 }

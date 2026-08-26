@@ -1643,6 +1643,11 @@ pub struct AgentDispatchPass {
     /// Never a failure: the ticket stays claimable for a worker that serves
     /// the class. A value that stays non-zero across passes while work is due
     /// is the signal that *no* worker serves it.
+    ///
+    /// Complete over the due tickets rather than over the ones a pass had room
+    /// to consider, so a busy fleet reports the same number an idle one would
+    /// — which matters because a busy fleet is when an unservable class is
+    /// most likely to be sitting behind work that keeps getting claimed.
     pub class_filtered: usize,
     /// True when the probe killed the worker mid-pass.
     pub died: bool,

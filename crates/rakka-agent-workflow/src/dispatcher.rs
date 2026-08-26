@@ -1061,9 +1061,19 @@ pub struct AgentDispatchClaimBatch {
     pub worker_id: AgentDispatcherWorkerId,
     /// Timestamp used for the claim pass.
     pub claimed_at: AgentTimestampMillis,
-    /// Claimable entries before concurrency and batch limits.
+    /// Claimable entries before concurrency and batch limits, across the
+    /// whole fleet index and regardless of this worker's claim filter.
+    ///
+    /// This is the fleet's backlog, not this worker's: [`Self::class_filtered`]
+    /// is the part of it this worker does not serve.
     pub due_dispatch_count: usize,
-    /// True when more work was due than this pass could claim.
+    /// True when more work this worker *can serve* was due than this pass
+    /// claimed.
+    ///
+    /// Deliberately not measured against [`Self::due_dispatch_count`]: an
+    /// entry whose class another worker serves is that worker's backlog, and
+    /// counting it here would make every class-restricted worker report
+    /// backpressure forever.
     pub backpressure_limited: bool,
     /// Entries skipped because target concurrency was exhausted.
     pub concurrency_limited: usize,
@@ -1074,6 +1084,12 @@ pub struct AgentDispatchClaimBatch {
     /// is what distinguishes "waiting for the worker that serves this class"
     /// from "no worker in the fleet serves it" — the anti-stall signal a
     /// heterogeneous fleet needs, and one that costs no durable write.
+    ///
+    /// Complete over the claimable entries, not over the ones this pass had
+    /// room to consider: the walk keeps counting after the batch fills, so a
+    /// busy fleet reports the same number an idle one would. That matters
+    /// because a busy fleet is precisely when an unservable class is most
+    /// likely to be sitting behind work that keeps getting claimed.
     pub class_filtered: usize,
     /// Claims issued to the worker.
     pub claims: Vec<AgentDispatchClaim>,
@@ -1378,14 +1394,31 @@ where
         let mut claims = Vec::new();
         let mut concurrency_limited = 0;
         let mut class_filtered = 0;
+        let mut servable = 0usize;
         for entry in claimable {
-            if claims.len() >= self.settings.max_batch_size {
-                break;
-            }
-            // Before the lease, not after it: a worker that cannot run this
-            // entry must not hold it away from one that can.
+            // The filter is consulted first, and the scan runs to the end of
+            // the claimable list instead of stopping once the batch is full.
+            // `class_filtered` and `servable` describe *this worker against
+            // this index* — how much of the due work it cannot serve, and how
+            // much it can — and neither may depend on how much of that work
+            // one pass happened to have room for. With the batch-size break
+            // above this check, a busy fleet filled its batch from the earlier
+            // entries and returned before reaching the unservable ones, so
+            // every pass reported `class_filtered: 0` exactly when a class
+            // nobody serves was stalling: the one condition the counter
+            // exists to make visible.
+            //
+            // Before the lease, too: a worker that cannot run this entry must
+            // not hold it away from one that can.
             if !self.claim_filter.accepts(&entry) {
                 class_filtered += 1;
+                continue;
+            }
+            servable += 1;
+            if claims.len() >= self.settings.max_batch_size {
+                // No room in this batch. Keep scanning rather than breaking:
+                // the list is already materialized and the remaining work is
+                // a filter check per entry, with no I/O and no durable write.
                 continue;
             }
             let class_count = in_flight_by_class
@@ -1413,7 +1446,14 @@ where
             claims.push(claim);
         }
 
-        let backpressure_limited = due_dispatch_count > claims.len();
+        // Servable work this pass left behind — never fleet-wide due work.
+        // An entry whose class another worker serves is *that* worker's
+        // backlog, so counting it here made every class-restricted worker
+        // report permanent backpressure. Accumulated in the walk rather than
+        // derived as `due_dispatch_count - class_filtered`: the two are equal
+        // only while both use the same claimable predicate, and a bound that
+        // depends on two things agreeing is one nothing checks.
+        let backpressure_limited = servable > claims.len();
         if !claims.is_empty() {
             self.persist(record.revision, next).await?;
         }
