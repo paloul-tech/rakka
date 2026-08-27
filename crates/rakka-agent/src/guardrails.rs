@@ -500,24 +500,6 @@ impl AgentGuardrailChain {
         &self.stages
     }
 
-    /// Accepts that every required stage is present *and* actually runs, or
-    /// fails closed.
-    ///
-    /// This is the dispatch-time half of the mandatory-guardrail rule: an
-    /// envelope that requires a stage the deployment's chain cannot run must
-    /// not dispatch, because the alternative is silently running without a
-    /// guardrail the definition promised.
-    ///
-    /// `evaluated` is the set of boundaries the caller has evaluation points
-    /// for. Presence alone is not coverage: a stage bound only to boundaries
-    /// nothing evaluates would satisfy the envelope's mandatory set while
-    /// never running, which is the same fail-open as a stage bound to no
-    /// boundary at all — that one is refused at registration
-    /// ([`Self::with_stage`]), and this one can only be caught here, because
-    /// whether a boundary has an evaluation point is a property of the caller,
-    /// not of the chain. A required stage that runs at none of them is refused
-    /// (`guardrail-stage-unevaluated`).
-    ///
     /// A content-free fingerprint of what this chain *declares*: its
     /// revision, its policy reference, and each stage's id, revision,
     /// boundary set, and mandatory flag, in evaluation order.
@@ -557,10 +539,34 @@ impl AgentGuardrailChain {
         AgentContentDigest::of_json(&declaration)
     }
 
+    /// Accepts that every required stage is present *and* actually runs, or
+    /// fails closed.
+    ///
+    /// This is the dispatch-time half of the mandatory-guardrail rule: an
+    /// envelope that requires a stage the deployment's chain cannot run must
+    /// not dispatch, because the alternative is silently running without a
+    /// guardrail the definition promised.
+    ///
+    /// `evaluated` is the set of boundaries the caller has evaluation points
+    /// for. Presence alone is not coverage: a stage bound only to boundaries
+    /// nothing evaluates would satisfy the envelope's mandatory set while
+    /// never running, which is the same fail-open as a stage bound to no
+    /// boundary at all — that one is refused at registration
+    /// ([`Self::with_stage`]), and this one can only be caught here, because
+    /// whether a boundary has an evaluation point is a property of the caller,
+    /// not of the chain.
+    ///
     /// A stage that runs at *some* evaluated boundary satisfies coverage even
     /// when the evaluation in hand is at a different one: a stage bound to
     /// [`AgentGuardrailBoundary::ToolRequest`] is doing its job, and a model
     /// call that does not trigger it is not an escape.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentGuardrailError::MissingRequiredStage`] (`guardrail-stage-missing`)
+    /// when the chain does not hold a required stage, and
+    /// [`AgentGuardrailError::StageNotEvaluated`] (`guardrail-stage-unevaluated`)
+    /// when it holds one that runs at none of the evaluated boundaries.
     pub fn validate_covers(
         &self,
         required: &BTreeSet<AgentGuardrailStageId>,
