@@ -223,8 +223,9 @@ pub use memory::{
     AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_ENTRIES,
 };
 pub use memory_retention::{
-    discharge_run_memory_retention, AgentMemoryRetentionReport, AgentMemoryRetentionSweep,
-    AgentRunRetentionOutcome,
+    backfill_run_terminal_stamp, discharge_run_memory_retention, AgentMemoryRetentionReport,
+    AgentMemoryRetentionSweep, AgentRunRetentionOutcome, AgentRunTerminalStampBackfill,
+    AgentRunTerminalStampOutcome, AgentRunTerminalStampReport,
 };
 pub use model::{
     AgentModelAdapter, AgentModelError, AgentModelFuture, AgentModelRequest, AgentModelResult,

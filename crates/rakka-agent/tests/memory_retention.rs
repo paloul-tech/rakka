@@ -19,10 +19,11 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    discharge_run_memory_retention, AgentContextSnapshotRef, AgentMemoryRetentionSweep,
-    AgentModelTurn, AgentPrivateMemory, AgentPrivateMemoryId, AgentPrivateMemoryKind,
-    AgentPrivateMemoryStore, AgentRecordKind, AgentRunMemory, AgentRunRetentionOutcome,
-    AgentRunScope, AgentRunStatus, AgentSchemaCompatibility, AgentSchemaPolicy, AgentScope,
+    backfill_run_terminal_stamp, discharge_run_memory_retention, AgentContextSnapshotRef,
+    AgentMemoryRetentionSweep, AgentModelTurn, AgentPrivateMemory, AgentPrivateMemoryId,
+    AgentPrivateMemoryKind, AgentPrivateMemoryStore, AgentRecordKind, AgentRunMemory,
+    AgentRunRetentionOutcome, AgentRunScope, AgentRunStatus, AgentRunTerminalStampBackfill,
+    AgentRunTerminalStampOutcome, AgentSchemaCompatibility, AgentSchemaPolicy, AgentScope,
     AgentTaskContent, ContextSnapshotStore, InMemoryAgentPrivateMemoryStore,
     InMemoryContextSnapshotStore, InMemorySessionMemoryStore, MemoryClassification,
     MemoryOperationId, MemoryTombstoneReason, PrivateMemoryExpectation,
@@ -636,4 +637,355 @@ async fn a_pre_bump_run_record_upgrades_its_schema_when_it_terminalizes() {
         "a binary that cannot round-trip the stamp must fail closed, not load \
          the record and drop it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The one-time repair: a run that was already terminal when the stamp shipped.
+// ---------------------------------------------------------------------------
+
+impl World {
+    /// Rewrites the persisted record into the exact shape a binary from before
+    /// the stamp existed would have left behind: terminal, no `terminal_at`,
+    /// and claiming schema version 1.
+    ///
+    /// Tampering the serialized record rather than constructing one is what
+    /// makes this the real backlog: the record still carries every other field
+    /// a completed run wrote, so a repair that depended on something else
+    /// being absent would not pass here.
+    async fn strip_terminal_stamp(&self) {
+        let id = run_scope().persistence_id();
+        let record = self
+            .fx
+            .runs
+            .load(&id)
+            .await
+            .expect("the run record loads")
+            .expect("the run record exists");
+        let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+        value["schema_version"] = serde_json::json!(1);
+        value["run"]
+            .as_object_mut()
+            .expect("a completed run has a materialized record")
+            .remove("terminal_at")
+            .expect("the completed run had stamped one");
+        let older = serde_json::from_value(value).expect("the tampered record deserializes");
+        self.fx
+            .runs
+            .compare_and_set(&id, record.revision, older)
+            .await
+            .expect("the tampered record persists");
+    }
+
+    async fn updated_at(&self) -> AgentTimestampMillis {
+        rakka_agent::load_agent_run_state(
+            &self.fx.runs,
+            &run_scope(),
+            &AgentSchemaPolicy::default(),
+        )
+        .await
+        .expect("the run state loads")
+        .expect("the run exists")
+        .updated_at()
+    }
+
+    async fn backfill(&self) -> AgentRunTerminalStampOutcome {
+        backfill_run_terminal_stamp(&self.fx.runs, &run_scope(), &AgentSchemaPolicy::default())
+            .await
+            .expect("the backfill completes")
+    }
+}
+
+/// The whole point: a record the discharge refuses forever becomes one it can
+/// discharge, and the repair is what closes the gap.
+#[tokio::test]
+async fn a_pre_upgrade_terminal_record_is_refused_then_repaired_then_discharged() {
+    let world = world();
+    world.run_to_completion().await;
+    world.strip_terminal_stamp().await;
+
+    let policy = window(WINDOW_MS);
+    assert_eq!(
+        world.discharge(&policy, 10_000).await,
+        AgentRunRetentionOutcome::TerminalTimeUnknown,
+        "the backlog is refused before the repair, however long its window has \
+         been elapsed"
+    );
+    assert!(
+        world.session_entries().await > 0,
+        "and nothing was purged, which is the defect"
+    );
+
+    let updated_at = world.updated_at().await;
+    assert_eq!(
+        world.backfill().await,
+        AgentRunTerminalStampOutcome::Stamped {
+            terminal_at: updated_at
+        },
+        "the repair stamps the record from the only durable clock it still has"
+    );
+
+    let outcome = world.discharge(&policy, 10_000).await;
+    assert!(
+        outcome.deleted_anything(),
+        "the repaired record discharges: {outcome:?}"
+    );
+    assert_eq!(
+        world.session_entries().await,
+        0,
+        "the session rows the backlog was holding are gone"
+    );
+    assert!(
+        !world.snapshot_exists(1).await,
+        "and so are the snapshots that embedded their content"
+    );
+}
+
+/// The stamp comes from `updated_at`, and the repair does not move it.
+///
+/// Both halves matter. A repair that stamped `now` would restart the retention
+/// window at whenever the migration happened to run, and one that moved
+/// `updated_at` would push the very clock a second pass would read.
+#[tokio::test]
+async fn the_repair_stamps_from_updated_at_without_moving_it() {
+    let world = world();
+    world.run_to_completion().await;
+    world.strip_terminal_stamp().await;
+
+    let before = world.updated_at().await;
+    let outcome = world.backfill().await;
+
+    assert_eq!(
+        outcome,
+        AgentRunTerminalStampOutcome::Stamped {
+            terminal_at: before
+        },
+    );
+    assert_eq!(
+        world.terminal_at().await,
+        Some(before),
+        "the persisted stamp is the record's own last-transition time"
+    );
+    assert_eq!(
+        world.updated_at().await,
+        before,
+        "a repair is not an accepted transition, so it does not move the clock \
+         that means one"
+    );
+}
+
+/// A completed migration is safe to re-drive: the second pass repairs nothing.
+#[tokio::test]
+async fn a_repaired_record_is_never_restamped_by_a_re_drive() {
+    let world = world();
+    world.run_to_completion().await;
+    world.strip_terminal_stamp().await;
+
+    let AgentRunTerminalStampOutcome::Stamped { terminal_at } = world.backfill().await else {
+        panic!("the first pass repairs the record");
+    };
+
+    assert_eq!(
+        world.backfill().await,
+        AgentRunTerminalStampOutcome::AlreadyStamped,
+        "the second pass finds nothing to repair"
+    );
+    assert_eq!(
+        world.terminal_at().await,
+        Some(terminal_at),
+        "and the stamp it already carried did not move"
+    );
+}
+
+/// A run that stamped itself normally is not part of the backlog either — the
+/// same `AlreadyStamped` answer, reached without any tampering.
+#[tokio::test]
+async fn a_normally_stamped_run_is_not_part_of_the_backlog() {
+    let world = world();
+    world.run_to_completion().await;
+
+    let stamped = world.terminal_at().await.expect("the run stamped itself");
+    assert_eq!(
+        world.backfill().await,
+        AgentRunTerminalStampOutcome::AlreadyStamped
+    );
+    assert_eq!(world.terminal_at().await, Some(stamped));
+}
+
+/// A live run is left alone: it will stamp itself at its own terminal
+/// transition, and re-dating it from `updated_at` now would be a fabrication.
+#[tokio::test]
+async fn a_live_run_is_not_part_of_the_backlog() {
+    let world = world();
+    world.fx.instantiate_agent().await;
+    world.fx.create_task().await;
+
+    let outcome = world.backfill().await;
+    assert!(
+        matches!(
+            outcome,
+            AgentRunTerminalStampOutcome::NotTerminal { status } if !status.is_terminal()
+        ),
+        "a live run is refused, not stamped: {outcome:?}"
+    );
+    assert_eq!(
+        world.terminal_at().await,
+        None,
+        "and nothing was written to it"
+    );
+}
+
+/// The repair carries the same schema upgrade the terminal transition does, so
+/// a peer from before the bump fails closed on the record instead of loading it
+/// and dropping the stamp again.
+#[tokio::test]
+async fn a_repaired_record_fails_closed_on_a_peer_from_before_the_bump() {
+    let world = world();
+    world.run_to_completion().await;
+    world.strip_terminal_stamp().await;
+    assert_eq!(
+        world.run_schema_version().await,
+        1,
+        "the backlog record claims the version that cannot round-trip a stamp"
+    );
+
+    world.backfill().await;
+
+    assert_eq!(
+        world.run_schema_version().await,
+        u64::from(CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION.get()),
+        "the repaired record claims the version that can carry what it now holds"
+    );
+    let older_binary = AgentSchemaPolicy::default().with_compatibility(
+        AgentRecordKind::RunState,
+        AgentSchemaCompatibility::n_plus_one(StateSchemaVersion::new(1)),
+    );
+    assert!(
+        rakka_agent::load_agent_run_state(&world.fx.runs, &run_scope(), &older_binary)
+            .await
+            .is_err(),
+        "a binary that would drop the repaired stamp must fail closed on it"
+    );
+}
+
+/// A pass over mixed scopes counts each outcome and never aborts on a refusal.
+#[tokio::test]
+async fn a_backfill_pass_reports_each_outcome_and_settles() {
+    let world = world();
+    world.run_to_completion().await;
+    world.strip_terminal_stamp().await;
+
+    let absent = AgentRunScope::new(
+        run_scope().tenant().clone(),
+        run_scope().agent().clone(),
+        rakka_agent::AgentRunId::new("run-absent").expect("run id"),
+    )
+    .expect("the absent scope is well formed");
+
+    let report = AgentRunTerminalStampBackfill::new(world.fx.runs.clone())
+        .stamp([run_scope(), absent, run_scope()])
+        .await
+        .expect("the pass completes");
+
+    // The repaired scope is counted once as repaired and, on its second visit
+    // in the same pass, once as already carrying a stamp.
+    assert_eq!(report.stamped, 1, "{report:?}");
+    assert_eq!(report.already_stamped, 1, "{report:?}");
+    assert_eq!(report.not_terminal, 0, "{report:?}");
+    assert_eq!(report.absent, 1, "{report:?}");
+    assert_eq!(report.conflicted, 0, "{report:?}");
+    assert!(
+        report.is_settled(),
+        "nothing was raced, so the migration is complete for these scopes"
+    );
+}
+
+/// A writer that moves the record between the read and the write wins, and the
+/// repair reports a conflict rather than clobbering it.
+///
+/// The race is made deterministic rather than reached by repetition: the store
+/// wrapper advances the revision on every read, so the compare-and-set is
+/// always against a revision that no longer exists.
+#[tokio::test]
+async fn a_racing_writer_wins_and_the_repair_reports_a_conflict() {
+    let world = world();
+    world.run_to_completion().await;
+    world.strip_terminal_stamp().await;
+
+    let racing = RacingRunStore {
+        inner: world.fx.runs.clone(),
+    };
+    let outcome = backfill_run_terminal_stamp(&racing, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("a lost race is a value, not an error");
+
+    assert_eq!(outcome, AgentRunTerminalStampOutcome::Conflicted);
+    assert!(
+        outcome.should_retry(),
+        "a conflict is the one retryable arm"
+    );
+    assert_eq!(
+        world.terminal_at().await,
+        None,
+        "the racing writer's record survived un-stamped: the repair wrote nothing"
+    );
+
+    // And the same scope repairs cleanly once nothing is racing it.
+    assert!(matches!(
+        world.backfill().await,
+        AgentRunTerminalStampOutcome::Stamped { .. }
+    ));
+}
+
+/// A run store that commits an unrelated write on every read, so any
+/// compare-and-set built from what it returned is guaranteed to be stale.
+#[derive(Clone)]
+struct RacingRunStore {
+    inner: RunStore,
+}
+
+impl DurableStateStore<rakka_agent::AgentRunState> for RacingRunStore {
+    fn backend_name(&self) -> &'static str {
+        "racing-in-memory"
+    }
+
+    fn load<'a>(
+        &'a self,
+        persistence_id: &'a rakka_persistence::PersistenceId,
+    ) -> rakka_persistence::StoreFuture<
+        'a,
+        Option<rakka_persistence::StateRecord<rakka_agent::AgentRunState>>,
+    > {
+        Box::pin(async move {
+            let Some(record) = self.inner.load(persistence_id).await? else {
+                return Ok(None);
+            };
+            // The concurrent writer: re-persisting the same state is enough,
+            // because it is the revision the reader will compare against.
+            self.inner
+                .compare_and_set(persistence_id, record.revision, record.state.clone())
+                .await?;
+            Ok(Some(record))
+        })
+    }
+
+    fn compare_and_set<'a>(
+        &'a self,
+        persistence_id: &'a rakka_persistence::PersistenceId,
+        expected_revision: rakka_persistence::Revision,
+        state: rakka_agent::AgentRunState,
+    ) -> rakka_persistence::StoreFuture<
+        'a,
+        rakka_persistence::StateRecord<rakka_agent::AgentRunState>,
+    > {
+        self.inner
+            .compare_and_set(persistence_id, expected_revision, state)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        persistence_id: &'a rakka_persistence::PersistenceId,
+        expected_revision: rakka_persistence::Revision,
+    ) -> rakka_persistence::StoreFuture<'a, rakka_persistence::Revision> {
+        self.inner.delete(persistence_id, expected_revision)
+    }
 }

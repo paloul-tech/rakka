@@ -36,6 +36,70 @@ The fifth was softer: retention had no production caller anywhere, so
 `terminal_at` stamp to measure from — `updated_at` could not serve, because a
 terminal run keeps accepting settlement commands and the deadline would recede.
 
+### The pre-upgrade backlog, and the one-time repair
+
+The stamp is written at the single terminal transition, under the
+already-terminal guard that makes it once-only. That guard also puts an entire
+population out of reach: **a run that was already terminal when the field
+shipped never re-enters the one place that could stamp it.** Nothing in normal
+operation can, so `discharge_run_memory_retention` answers
+`TerminalTimeUnknown` for that run *for the life of the deployment*, and its
+session rows and context snapshots — the tier that embeds model-visible
+content — are never purged. The only signal was `terminal_time_unknown`, a
+counter climbing beside a healthy `discharged`, with no documented remediation.
+Refusing silently forever is the one option that leaves content past its
+window, so it is not the option taken.
+
+`backfill_run_terminal_stamp` repairs one scope and
+`AgentRunTerminalStampBackfill` is the bounded, deployment-invoked pass over
+many — the same shape as the retention sweep, and for the same reason: Rakka
+keeps no index of runs by terminal state, so enumeration belongs to the
+application. Four properties are what make it safe to run against a live
+fleet, and each is asserted:
+
+- **The clock is `updated_at`, and it is sound in one direction only.** It is
+  the time of the last accepted transition, so for a terminal run it is never
+  *earlier* than the true terminal time: the terminal transition sets both to
+  the same instant, and only transitions landing afterwards move it on. A
+  backfilled deadline therefore falls at or after the real one — the run is
+  retained at least as long as policy requires and never purged early. That
+  asymmetry is the argument for repairing at all: erring late is recoverable by
+  running the sweep again, erring early destroys a record no replay can
+  rebuild. It is an approximation, and it is written down rather than implied.
+- **It is opt-in, not something the discharge does on its own.** Re-dating a
+  retention clock is a decision a deployment makes; a sweep that did it
+  silently would turn "this run's window has elapsed" into "this run's window
+  elapsed relative to whenever the migration happened to run", with nothing in
+  the record saying so.
+- **It never moves a stamp that exists.** The guard is re-checked inside
+  `AgentRunState::backfill_terminal_at`, not trusted from the caller, so a
+  completed migration is safe to re-drive and a normally-stamped run is
+  untouched. `updated_at` itself is deliberately not moved either — a repair is
+  not an accepted transition, and moving it would push the clock the next pass
+  would read.
+- **It loses every race.** The write is a compare-and-set against the revision
+  it read, so a resident entity that wrote in between wins and the pass reports
+  `Conflicted` — the only retryable outcome — rather than clobbering it. In the
+  other direction the entity's own persist drops its cached record on a
+  revision conflict and recovers the authoritative one, so a backfill racing a
+  live terminal run costs that run one re-driven command, not a wedge.
+
+**Operational ordering: run it once the fleet is fully upgraded, never during
+the rolling update.** A repaired record carries run-state schema version 2,
+which a binary from before the bump fails closed on — correctly, since that
+binary would otherwise load it and drop the stamp again on the next settlement
+it applied. Repairing early therefore makes those records unreadable to peers
+still running, and nothing is gained by hurrying: an unstamped record is
+refused by the discharge, not deleted. A migration is complete when a pass over
+the same scopes reports `conflicted: 0` and `stamped: 0`.
+
+Proven in `tests/memory_retention.rs` (8 clauses), each falsified: removing
+both once-only guards, dropping the schema upgrade, taking the stamp from
+`accepted_at` instead of `updated_at`, propagating a revision conflict as an
+error, and reporting a stamp without writing one each fail their own test.
+Removing only the *caller's* guard does not — which is the point of re-checking
+inside the mutator, and is what that arrangement was verified for.
+
 ## Specification 16, clause by clause
 
 | Clause | Enforced where | Proof | Status |

@@ -893,6 +893,55 @@ impl AgentRunState {
         })
     }
 
+    /// Stamps [`AgentRun::terminal_at`] on a terminal record written before
+    /// that field existed, and upgrades the record to the schema version that
+    /// carries it. Returns the stamp it wrote, or `None` when there was
+    /// nothing to repair.
+    ///
+    /// This is the one-time repair for the backlog the stamp's own once-only
+    /// guard puts out of reach. `terminate` stamps at the single terminal
+    /// transition and early-returns on an already-terminal run, so a run that
+    /// was *already* terminal when the field shipped never re-enters the one
+    /// place that could give it a stamp. Nothing else can, and without one
+    /// [`crate::memory_retention::discharge_run_memory_retention`] answers
+    /// [`crate::memory_retention::AgentRunRetentionOutcome::TerminalTimeUnknown`]
+    /// for that run forever — so its session rows and context snapshots, the
+    /// tier that embeds model-visible content, are never purged.
+    ///
+    /// [`Self::updated_at`] is the fallback clock, and it is a *sound* one in
+    /// exactly one direction. It is the time of the last accepted transition,
+    /// so for a terminal run it is never earlier than the true terminal time:
+    /// the terminal transition sets both to the same instant, and only
+    /// transitions that land afterwards move it on. A backfilled deadline therefore falls at or
+    /// after the real one — the run is retained at least as long as policy
+    /// requires and never purged early. That asymmetry is the whole argument
+    /// for doing this as an opt-in repair: erring late is recoverable by
+    /// running the sweep again, and erring early destroys a record no replay
+    /// can rebuild.
+    ///
+    /// The guard is re-checked here rather than trusted from the caller, so
+    /// this can never move a stamp that already exists, whatever raced it
+    /// between a caller's classification and this call.
+    ///
+    /// [`Self::updated_at`] itself is deliberately not moved. It means the
+    /// last accepted *transition*, and a repair is not one; moving it would
+    /// also push the very clock the next backfill would read.
+    pub fn backfill_terminal_at(&mut self) -> Option<AgentTimestampMillis> {
+        let updated_at = self.updated_at;
+        let run = self.run.as_mut()?;
+        if !run.status.is_terminal() || run.terminal_at.is_some() {
+            return None;
+        }
+        run.terminal_at = Some(updated_at);
+        // The same upgrade `terminate` performs, and for the same reason: the
+        // record now carries a field only a binary that knows schema version 2
+        // can round-trip, so a peer that still writes version 1 must fail
+        // closed on it rather than load it and drop the stamp on the next
+        // settlement it applies.
+        self.schema_version = CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION;
+        Some(updated_at)
+    }
+
     fn run_mut(&mut self) -> AgentRunResult<&mut AgentRun> {
         self.run.as_mut().ok_or_else(|| AgentRunError::NotAccepted {
             scope: self.scope.clone(),
