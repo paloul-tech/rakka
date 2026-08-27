@@ -55,10 +55,10 @@ use crate::identity::{AgentId, AgentRunId, AgentRunScope, AgentScope, TenantId};
 use crate::memory::{
     AgentContextSnapshotRef, AgentPrivateMemory, AgentPrivateMemoryId, AgentPrivateMemoryKind,
     AgentPrivateMemoryStore, ContextSnapshotStore, MemoryClassification, MemoryEntryId,
-    MemoryEntryRole, MemoryFuture, MemoryOperationId, MemorySequence, MemoryTombstoneReason,
-    PrivateMemoryCursor, PrivateMemoryDeleteRequest, PrivateMemoryExpectation,
-    PrivateMemoryTombstoneRequest, SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
-    SessionPurgeOutcome, SessionRetentionPolicy,
+    MemoryEntryRole, MemoryError, MemoryFuture, MemoryOperationId, MemorySequence,
+    MemoryTombstoneReason, PrivateMemoryCursor, PrivateMemoryDeleteRequest,
+    PrivateMemoryExpectation, PrivateMemoryTombstoneRequest, SessionMemoryCursor,
+    SessionMemoryEntry, SessionMemoryStore, SessionPurgeOutcome, SessionRetentionPolicy,
 };
 use crate::retrieval::{AgentPrivateMemoryRetriever, MemoryRetrievalQuery};
 use crate::task::{AgentContentDigest, AgentTaskContent};
@@ -304,6 +304,33 @@ pub fn conformance_private_memory(
         AgentTimestampMillis::new(1),
     )
     .expect("the memory is bounded")
+}
+
+/// Attempts one withdrawal from `scope` and answers the refusal, or `None`
+/// when the store allowed it.
+///
+/// Returns the whole [`MemoryError`] rather than its code: the isolation
+/// clauses compare answers by whole value, and a code comparison would admit
+/// a backend that distinguished deny from absent in any other field.
+async fn outsider_tombstone(
+    store: &dyn AgentPrivateMemoryStore,
+    scope: &AgentScope,
+    memory_id: &AgentPrivateMemoryId,
+    discriminator: &str,
+) -> Option<MemoryError> {
+    store
+        .tombstone(
+            scope,
+            &PrivateMemoryTombstoneRequest {
+                memory_id: memory_id.clone(),
+                operation_id: MemoryOperationId::derive_for_agent(scope, discriminator)
+                    .expect("the op id derives"),
+                reason: MemoryTombstoneReason::Retracted,
+                tombstoned_at: AgentTimestampMillis::new(2),
+            },
+        )
+        .await
+        .err()
 }
 
 /// How a conformance run makes one memory *rankable*.
@@ -868,6 +895,18 @@ pub async fn private_scope_isolation(store: &dyn AgentPrivateMemoryStore) {
         .await
         .expect("the create lands");
 
+    // A second primary-owned record, under an id the twin-identity clause
+    // never creates anywhere else. The withdrawal clause below needs one: by
+    // the time it runs, `PrivateMemoryOperation::ALL` has already put every
+    // outsider's own `mem-owned` in its own scope, so withdrawing *that* id
+    // from an outsider would be an outsider withdrawing its own memory and
+    // would prove nothing about isolation.
+    let witness = conformance_private_memory(&scopes.primary, "witness", "escalation path");
+    store
+        .upsert(&scopes.primary, &witness, PrivateMemoryExpectation::Absent)
+        .await
+        .expect("the create lands");
+
     let empty_get = store
         .get(&scopes.empty, &memory.memory_id, now())
         .await
@@ -876,6 +915,15 @@ pub async fn private_scope_isolation(store: &dyn AgentPrivateMemoryStore) {
         .list(&scopes.empty, PrivateMemoryCursor::start(), now())
         .await
         .expect("the empty list succeeds");
+    // The reference answer for a *withdrawal* of an id the scope does not
+    // hold. Taken here, against the same id the outsiders will aim at, because
+    // the comparison the clause needs is "the outsider's answer for this id"
+    // against "an uninvolved scope's answer for this id" — not against the
+    // answer for some other id, which differs by the caller's own input
+    // (`MemoryError::NotFound` echoes the id asked for) and so could never
+    // compare equal.
+    let empty_tombstone =
+        outsider_tombstone(store, &scopes.empty, &witness.memory_id, "withdraw-empty").await;
 
     // Reads first, for every outsider, before any of them has written: the
     // twin-identity clause below deliberately populates the outsider scopes,
@@ -923,28 +971,41 @@ pub async fn private_scope_isolation(store: &dyn AgentPrivateMemoryStore) {
                     );
                 }
                 PrivateMemoryOperation::Tombstone => {
-                    let refusal = store
-                        .tombstone(
-                            outsider,
-                            &PrivateMemoryTombstoneRequest {
-                                memory_id: AgentPrivateMemoryId::new("mem-never")
-                                    .expect("the id is valid"),
-                                operation_id: MemoryOperationId::derive_for_agent(
-                                    outsider,
-                                    "withdraw-absent",
-                                )
-                                .expect("the op id derives"),
-                                reason: MemoryTombstoneReason::Retracted,
-                                tombstoned_at: AgentTimestampMillis::new(2),
-                            },
-                        )
-                        .await
-                        .err()
-                        .map(|error| error.code());
+                    // The *primary's* record, from the outsider's scope —
+                    // the shape every sibling arm uses, and the only one that
+                    // can be got wrong. Aimed at an id that exists nowhere,
+                    // this clause proved a not-found path exists and nothing
+                    // about isolation: a backend that let a foreign scope
+                    // withdraw the primary's memory passed it.
+                    let foreign =
+                        outsider_tombstone(store, outsider, &witness.memory_id, "withdraw-witness")
+                            .await;
+                    // By whole value against the empty scope's answer for the
+                    // same id, as every clause in this module does: deny must
+                    // be indistinguishable from absent, which "both are
+                    // errors" would not establish.
                     assert_eq!(
-                        refusal,
+                        foreign, empty_tombstone,
+                        "an outsider's withdrawal of the primary's memory is \
+                         distinguishable from an uninvolved scope's"
+                    );
+                    assert_eq!(
+                        foreign.as_ref().map(MemoryError::code),
                         Some("memory-not-found"),
-                        "an outsider's tombstone of an absent id answered something else"
+                        "an outsider's tombstone of the primary's memory was not refused"
+                    );
+                    let held = store
+                        .get(&scopes.primary, &witness.memory_id, now())
+                        .await
+                        .expect("the primary read succeeds")
+                        .expect("the primary's memory is still there");
+                    assert!(
+                        !held.is_tombstoned(),
+                        "an outsider withdrew the primary's memory"
+                    );
+                    assert_eq!(
+                        held.content_digest, witness.content_digest,
+                        "an outsider's withdrawal reached the primary's record"
                     );
                 }
                 PrivateMemoryOperation::Delete => {
@@ -1040,19 +1101,25 @@ pub async fn retriever_scope_isolation(
         .retrieve(&scopes.empty, &query, now())
         .await
         .expect("the empty retrieval succeeds");
+    assert!(
+        empty.memories.is_empty(),
+        "the empty scope's retrieval answered records, so the comparison below \
+         would be satisfied by a retriever that ignores scope altogether — it \
+         would answer the primary's corpus to every scope, including this one"
+    );
     for outsider in scopes.outsiders() {
         let foreign = retriever
             .retrieve(outsider, &query, now())
             .await
             .expect("the outsider retrieval succeeds");
+        // By whole value, which is what this module's own rule requires and
+        // what a length comparison does not give: a backend answering a
+        // foreign scope with a distinguishable-but-same-length outcome — a
+        // different record, a different relevance, a different watermark —
+        // still tells an unauthorized caller that something is there.
         assert_eq!(
-            foreign.memories.len(),
-            empty.memories.len(),
+            foreign, empty,
             "an outsider's retrieval differs from an empty scope's"
-        );
-        assert_eq!(
-            foreign.index_watermark, empty.index_watermark,
-            "the index watermark differs across scopes, which reveals corpus state"
         );
     }
 }

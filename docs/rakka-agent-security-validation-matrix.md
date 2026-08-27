@@ -135,9 +135,19 @@ drift. The isolation clauses compare a foreign scope's answer to a *third
 genuinely-empty* scope's by **whole value**: `is_empty()` and `is_none()`,
 which the previous copies used, are satisfied by a backend that answers
 "empty" differently from how it answers an unknown scope, and that difference
-is the disclosure. Exhaustiveness is a compiler matter — one operation enum
-per trait, matched with no wildcard — so a method added to a trait fails to
-build until its isolation arm exists.
+is the disclosure. Two clauses did not honour that rule and now do: the
+withdrawal arm aimed at an id that exists in no scope, which proved a
+not-found path exists and nothing about isolation, and the retriever clause
+compared answers by length. The withdrawal arm now targets a primary-owned
+record no outsider twins — comparing the outsider's refusal to an uninvolved
+scope's refusal for the *same* id, since `MemoryError::NotFound` echoes the id
+asked for and two different ids could never compare equal — and re-reads the
+record to prove it survives un-withdrawn. The retriever clause compares whole
+outcomes, and asserts the empty scope's own answer is empty, without which a
+retriever ignoring scope altogether would answer the primary's corpus to every
+scope, empty included, and match itself. Exhaustiveness is a compiler matter —
+one operation enum per trait, matched with no wildcard — so a method added to
+a trait fails to build until its isolation arm exists.
 
 | Clause | What a non-conformant backend does | Runners |
 | --- | --- | --- |
