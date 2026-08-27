@@ -4493,14 +4493,191 @@ Spec: [16](spec.md#16-security-and-authorization),
   two-connection compare-and-set, migration idempotence, the doctored-row
   fail-closed, and the vector-encoding round trip.
 
-### Slice 6.3 — Telemetry and Collector validation
+### Slice 6.3a — GenAI adapter, metric catalogue, and export redaction
 
-Spec: [17.14-17.17](spec.md#1714-content-capture-and-redaction),
+Spec: [17.2](spec.md#172-instrumentation-scope-and-resource),
+[17.6](spec.md#176-required-span-model), [17.12](spec.md#1712-metrics),
+[17.14](spec.md#1714-content-capture-and-redaction),
+[17.15](spec.md#1715-baggage),
 [17.20](spec.md#1720-semantic-convention-compatibility).
 
-- Native OTLP wiring at an application binary, pinned GenAI convention
-  review, redaction/allowlist processors, tail-sampling retention rules,
-  Collector loss visibility, exporter failure behavior.
+Slice 6.3 was split on 2026-08-27 after a survey of what it would have to
+touch. The single entry read as validation work — wire the exporter, review
+the pinning, add Collector rules — but four of its six items are blocked on
+emission that does not exist: a tail-sampling policy selects on attributes no
+mapping function writes, a redaction allowlist has nothing to allow until the
+adapter names its keys, and both GenAI client metrics are histograms in a
+crate that records none. 6.3a is that emission work; 6.3b is the deployment
+validation that can only be honest once 6.3a has landed. The ordering is a
+dependency, not a preference.
+
+Two scope decisions are user-approved (2026-08-27): the **full metric
+catalogue** of [17.12](spec.md#1712-metrics) is in scope rather than a named
+subset, and 6.3b wires a **real OpenTelemetry SDK** rather than a fourth
+serializable bridge record.
+
+- **The `otel` module has no production consumer.** `AgentGenAiOperation`,
+  `agent_instrumentation_scope`, `decision_span_event`, `usage_attributes`,
+  and `AgentGenAiIdentity` are reached only from their own `#[cfg(test)]`
+  block and the `lib.rs` re-export, and nothing in the workspace constructs an
+  `AgentOtlpBridgeExport` outside tests. This is the shape slice 6.1 found in
+  the five `init_agent_*_entity_remote_sharding` registrations, and the same
+  corrective applies: the module needs a call site on the path a run actually
+  takes, not more unit tests.
+- **The convention pin is a string, not a review.**
+  [17.20](spec.md#1720-semantic-convention-compatibility) requires an upgrade
+  to review span names and kinds, metric names, units, and buckets, required
+  attributes, operation values, content-capture guidance, and Collector rules.
+  Span names and kinds are mapped; the rest are not.
+  `ATTR_GEN_AI_OPERATION_NAME`, `ATTR_GEN_AI_PROVIDER_NAME`,
+  `ATTR_GEN_AI_TOOL_NAME`, and `ATTR_GEN_AI_TOOL_TYPE` are declared and
+  re-exported but written by no mapping function; `ATTR_ERROR_TYPE`,
+  `ATTR_RAKKA_ERROR_CODE`, and `ATTR_RAKKA_AGENT_EFFECT_STATUS` are declared,
+  unexported, and unused; `AgentGenAiOperation::span` leaves every status
+  `Unset`. Status and error mapping is load-bearing for 6.3b, whose retention
+  policies select on exactly those attributes.
+- **The full 17.12 catalogue, into a crate that records no histogram.** Every
+  duration the section lists — decision, goal evaluation, delegation,
+  workflow-tool, assignment/handoff/result-validation/dependency, wake and
+  epoch, autonomy admission and budget, team and moderation, active turn,
+  wait, effect queue and dispatch, model and tool, memory and retrieval,
+  recovery — is unrecorded, and both GenAI client metrics (operation
+  duration, token usage) are histograms. The section's gauges join them:
+  logically active and waiting by bounded status class, resident entities and
+  activation/passivation rate, trigger/timer/outbox backlog and oldest age,
+  shard ownership distribution. Every new label key joins
+  `AGENT_METRIC_FIELDS` and passes `validate_agent_domain_metric_attributes`,
+  and the catalogue is written down — 17.12 requires labels to be bounded
+  *and documented*, and no document lists them today.
+- **Units, buckets, and exemplars are structurally unrepresentable.**
+  `rakka_core::OpenTelemetryMetric` carries name, kind, temporality, and data
+  points and no unit; `OpenTelemetryDataPoint` carries attributes, value,
+  count, and sum and no bucket boundaries or exemplars.
+  [17.17](spec.md#1717-otlp-and-collector-boundary) permits extending the
+  bridge additively or mapping directly into the application SDK, and forbids
+  dropping the field silently while claiming semantic-convention compliance.
+  `rakka-core` is in the publishable set and
+  `docs/rakka-v1-observability-exporters.md` currently documents count/sum
+  only as a deliberate choice, so whichever way this resolves it is a recorded
+  decision with a doc change, not an implementation detail.
+- **Redaction owes an allowlist before export, not only at the Collector.**
+  `AgentOtelSpanExport::from_telemetry_context` copies
+  `telemetry_context.baggage` straight into span attributes, and `validate()`
+  checks only the trace context: there is a bounded-label validator for
+  metrics and no counterpart for spans or logs. The agent domain clears
+  baggage on persist through `sanitize_agent_telemetry_context`, which does
+  nothing for a caller that builds a span from a context it was handed.
+  [17.14](spec.md#1714-content-capture-and-redaction) puts minimization at the
+  application and the Collector second, as defense in depth, and
+  [17.15](spec.md#1715-baggage) makes received baggage untrusted.
+- **Two `otel` features gate nothing.** `rakka-agent-workflow` and
+  `rakka-a2a` each declare `otel = []`; the only `#[cfg(feature = "otel")]` in
+  the workspace is `rakka-agent`'s. The A2A one is documented as gating
+  trace-context propagation and attribute helpers, which is also why the A2A
+  ingress `SERVER` span that `otel.rs` defers to the protocol adapter is built
+  by nobody, leaving scenario 21's ingress row without its span half. Each
+  feature is implemented or removed; a declared-inert feature is the finding,
+  not the fix.
+
+Done when: every span row, metric, and attribute the reviewed revision
+requires for the shipped milestones is emitted by a mapping function with a
+production call site; the 17.12 catalogue is recorded, its labels documented
+and validated; unit, bucket, and exemplar semantics are either represented in
+the bridge or documented as mapped in the application; and an attribute
+outside the allowlist cannot reach a span or log export record. Scenario 25 is
+re-proven at the export boundary rather than only at durable state.
+
+### Slice 6.3b — Application binary, Collector, sampling, and exporter failure
+
+Spec: [17.14](spec.md#1714-content-capture-and-redaction),
+[17.16](spec.md#1716-sampling),
+[17.17](spec.md#1717-otlp-and-collector-boundary).
+
+The deployment half of the split described in 6.3a, and it depends on 6.3a
+whole: a Collector rule can only allowlist keys the adapter emits, and a
+tail-sampling policy can only retain traces whose spans carry a status and an
+error code. Wiring it first would produce configuration that passes its own
+string-matching tests and drops everything in production.
+
+- **A real SDK at a real binary** (user-approved 2026-08-27). The workspace
+  depends on neither `opentelemetry` nor `tracing-subscriber` today —
+  `rakka-agent`'s testkit hand-rolls `CapturingSubscriber` to avoid the
+  latter. [17.17](spec.md#1717-otlp-and-collector-boundary) puts the SDK, the
+  `tracing` subscriber and layer, the OTLP exporter, exporter credentials, and
+  shutdown/flush at the application boundary, so this lands in a new
+  `publish = false` example that owns all five and drives a real agent run
+  through them. The workspace's pinned tonic 0.12 / prost 0.13 generation
+  constrains the SDK version; that pin is reviewed and recorded like the Rig
+  and A2A pins. Core crates stay SDK-neutral, and `scripts/package-check.sh`
+  stays offline and green.
+- **Spans come from the live loop, not from durable state** (resolved in
+  planning). `AgentGenAiOperation::span` needs a start and an end per bounded
+  segment, and durable records carry only `occurred_at`. Stamping segment
+  boundaries into persisted schema would make a telemetry change a durable
+  migration, which [17.20](spec.md#1720-semantic-convention-compatibility)
+  forbids absent an independent domain change. The loop emits its own bounded
+  segments and the persisted context supplies links and resume — the model
+  [17.4](spec.md#174-bounded-trace-segments) already describes.
+- **An agent-domain Collector configuration.** The shipped topology under
+  `docs/plans/agentic-workflow/` is the workflow domain's: its
+  `transform/redact` is a denylist of six keys (`prompt_text`,
+  `completion_text`, `tool_arguments`, `tool_output`, `artifact_uri`,
+  `authorization`), none of which the GenAI vocabulary uses, and its metric
+  rules drop workflow identifiers. The agent domain needs its own, keyed on
+  `gen_ai.*` and `rakka.agent.*` and expressed as the allowlist
+  [17.14](spec.md#1714-content-capture-and-redaction) asks for. Contract tests
+  mirror `crates/rakka-k8s/tests/agent_workflow_otel_collector_topology.rs`,
+  including its gated `kubectl` validation. The Collector distribution and
+  component versions are pinned with a stated revalidation procedure; the
+  present manifests pin `otel/opentelemetry-collector-contrib:0.107.0` against
+  a convention revision of 1.36.0, which the review either reconciles or
+  records.
+- **Tail sampling, with the routing it requires.** The gateway runs
+  `probabilistic_sampler` and no `tail_sampling`, and the agent-to-gateway hop
+  is a plain `otlp/gateway` exporter, so nothing guarantees
+  [17.16](spec.md#1716-sampling)'s requirement that every span of one trace
+  reach the same decision instance. A `loadbalancing` exporter with
+  trace-ID-aware routing and a `tail_sampling` policy expressing all eight
+  retention classes — error status or stable failure code, indeterminate
+  effect or reconciliation, security denial, policy override, or revocation,
+  checkpoint escalation or timeout, recovery failure or stale-owner conflict,
+  configured high latency, excessive retry, and a newly deployed version under
+  investigation — replaces it, sized together with decision wait, trace
+  buffers, memory limiter, queues, and exporter retry as the section requires.
+- **Loss visibility on the export path, not on one sink.**
+  `METRIC_AGENT_TELEMETRY_FLUSH_FAILURES` has a single recording site — the
+  decision sink's refusal in `run.rs` — with `METRIC_AGENT_DECISION_DROPS` as
+  a gauge beside it, and scenario 26 is proven against that sink alone.
+  [17.12](spec.md#1712-metrics) asks for export queue, drops, failures, and
+  Collector/exporter health, and neither Collector configuration enables
+  `service.telemetry`, which is where the refusal, queue, drop, processing,
+  and export-failure counters
+  [17.17](spec.md#1717-otlp-and-collector-boundary) lists come from.
+- **Exporter failure proven by behavior, not by grep.** The gateway config
+  carries `sending_queue` and `retry_on_failure`, and the existing test
+  asserts those strings are present. 6.3b drives an unreachable endpoint and a
+  saturated queue against the real exporter and asserts the run still
+  converges from durable state, that the loss is counted, and that drain still
+  flushes. A live-Collector arm is gated in the established idiom (an endpoint
+  environment variable, as `RAKKA_POSTGRES_TEST_DSN` gates the PostgreSQL
+  suites); a deterministic in-process arm always runs, so the claim is never
+  gate-only.
+- **Falsification, per the standing lesson of 6.1 and 6.2.** Every fix across
+  6.3a and 6.3b is reverted, the suite confirmed failing, and restored, with
+  the falsification recorded. A green suite over a silent path proves nothing,
+  which is exactly how the adapter arrived at this slice fully unit-tested and
+  entirely unreachable.
+
+Done when: an example binary exports agent traces, metrics, and logs to a
+Collector over OTLP through a pinned SDK it owns; the agent Collector
+configuration allowlists, tail-samples with trace-ID-aware routing, and
+reports its own health; an unavailable exporter changes no durable outcome and
+is visible in bounded counters; and
+`docs/rakka-agent-telemetry-validation-matrix.md` records the reviewed
+convention revision, the pinned distribution and component versions, and which
+telemetry claims are enforced, which are delegated to the deployment, and
+which remain inferred — the third companion to the fault-injection and
+security matrices.
 
 ### Slice 6.4 — Documentation and compatibility
 

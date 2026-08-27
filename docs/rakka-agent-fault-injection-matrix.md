@@ -174,4 +174,5 @@ table names. It does not remove the need for:
 - membership and downing policy tuned for the deployment, since the harness
   announces departure rather than detecting it;
 - Kubernetes-level pod eviction, rollout, and drain testing;
-- security validation (slice 6.2) and telemetry/Collector validation (slice 6.3).
+- security validation (slice 6.2) and telemetry/Collector validation
+  (slices 6.3a and 6.3b).

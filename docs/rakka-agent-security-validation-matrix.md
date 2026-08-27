@@ -262,4 +262,4 @@ Passing these means each claim in the tables above is test-backed at the
 fidelity its row names. It does not remove the need for an authenticating
 ingress, a real worker-pool and sandbox implementation behind the execution
 classes, a credential issuer that does not echo secrets in its errors, or the
-telemetry and Collector validation slice 6.3 owns.
+telemetry and Collector validation slices 6.3a and 6.3b own.
