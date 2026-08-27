@@ -87,6 +87,7 @@ use crate::guardrails::{
     AgentGuardrailError, AgentGuardrailReport, AgentGuardrailTransform,
 };
 use crate::identity::{AgentGoalId, AgentRunScope, AgentTaskId};
+use crate::memory::AgentRunMemory;
 use crate::model::{AgentToolCallRequest, AGENT_TOOL_ARGUMENTS_MAX_BYTES};
 use crate::task::{AgentContentDigest, AgentSchemaRef};
 
@@ -1068,17 +1069,35 @@ impl AgentToolAuthority {
         self
     }
 
-    /// Attests that this deployment's retrieval bundle evaluates the
-    /// memory-ingress boundary under the *same declared chain* this authority
-    /// carries.
+    /// Attests that the run memory this deployment assembles through
+    /// evaluates the memory-ingress boundary under the *same declared chain*
+    /// this authority carries.
     ///
     /// The two enforcement points are structurally separate — the authority
-    /// evaluates model and tool requests before dispatch, the retrieval bundle
-    /// evaluates retrieved memory during snapshot assembly — and neither can
-    /// see the other's chain. So the deployment that wires both says so here,
-    /// and the claim is *checked* rather than taken: the two
-    /// [`AgentGuardrailChain::declaration_digest`]s must agree, which catches a
-    /// drifted revision and an empty bundle chain alike.
+    /// evaluates model and tool requests before dispatch, the run memory's
+    /// retrieval bundle evaluates retrieved memory during snapshot assembly —
+    /// and neither can see the other's chain at dispatch. So the deployment
+    /// that wires both says so here, and the claim is *checked* rather than
+    /// taken: the two [`AgentGuardrailChain::declaration_digest`]s must agree,
+    /// which catches a drifted revision and an empty bundle chain alike.
+    ///
+    /// It takes the [`AgentRunMemory`] rather than a bare
+    /// [`crate::retrieval::AgentMemoryRetrieval`], and that is the whole
+    /// point: the object attested must be the object the run assembles
+    /// through. Checking a bundle handed in for the occasion proves a
+    /// deployment *owns* a matching chain somewhere, not that the run will
+    /// ever evaluate it — a bundle attested and then not installed, or
+    /// installed alongside a different one, satisfied the check and ran no
+    /// ingress stage at all. Passing the memory narrows the mistake to one a
+    /// deployment has to work at: building a second `AgentRunMemory` for the
+    /// run entity. Since the type is `Clone` and cheap, the natural shape is
+    /// one value, attested here and handed to the run.
+    ///
+    /// A memory carrying no retrieval bundle is refused rather than treated as
+    /// an empty chain: nothing would evaluate the boundary, which is the
+    /// condition this attestation exists to rule out.
+    ///
+    /// Use [`Self::attests`] to re-check a memory assembled separately.
     ///
     /// Without this attestation the authority does not count `MemoryIngress`
     /// among the boundaries it evaluates, so an envelope requiring a
@@ -1090,26 +1109,59 @@ impl AgentToolAuthority {
     /// # Errors
     ///
     /// [`AgentGuardrailError::ChainMismatch`] (`guardrail-chain-mismatch`)
-    /// when the two declarations differ, or when this authority carries no
-    /// chain at all. The refusal lands at wiring time, so a misconfigured
-    /// deployment fails at startup rather than at its first tool call.
+    /// when the two declarations differ, when this authority carries no chain
+    /// at all, or when the memory carries no retrieval bundle. The refusal
+    /// lands at wiring time, so a misconfigured deployment fails at startup
+    /// rather than at its first tool call.
     pub fn with_memory_ingress(
         mut self,
-        retrieval: &crate::retrieval::AgentMemoryRetrieval,
+        memory: &AgentRunMemory,
     ) -> Result<Self, AgentGuardrailError> {
-        let bundle = retrieval.guardrails().declaration_digest();
-        let mine = self
-            .guardrails
-            .as_ref()
-            .map(AgentGuardrailChain::declaration_digest);
-        if mine.as_ref() != Some(&bundle) {
+        let installed = self.declared_by(memory);
+        let mine = self.declared_chain();
+        if installed.is_none() || installed != mine {
             return Err(AgentGuardrailError::ChainMismatch {
                 authority: mine,
-                retrieval: bundle,
+                retrieval: installed,
             });
         }
         self.memory_ingress_attested = true;
         Ok(self)
+    }
+
+    /// Whether this authority's attestation holds for the given run memory.
+    ///
+    /// The attestation is checked once, at wiring time, against the memory it
+    /// was shown. A deployment that assembles its run memory somewhere else —
+    /// a second construction, a reload, a refactor — can re-check it here
+    /// rather than assume, and an assertion in a deployment's own startup
+    /// path is the cheapest place to catch a bundle that drifted from the
+    /// chain the dispatch gate enforces.
+    ///
+    /// `false` when this authority never attested, when it carries no chain,
+    /// when the memory carries no bundle, or when the two declarations differ.
+    #[must_use]
+    pub fn attests(&self, memory: &AgentRunMemory) -> bool {
+        if !self.memory_ingress_attested {
+            return false;
+        }
+        let installed = self.declared_by(memory);
+        installed.is_some() && installed == self.declared_chain()
+    }
+
+    /// This authority's own chain declaration, when it carries a chain.
+    fn declared_chain(&self) -> Option<AgentContentDigest> {
+        self.guardrails
+            .as_ref()
+            .map(AgentGuardrailChain::declaration_digest)
+    }
+
+    /// The chain declaration the run memory's retrieval bundle carries, when
+    /// it carries one.
+    fn declared_by(&self, memory: &AgentRunMemory) -> Option<AgentContentDigest> {
+        memory
+            .retrieval()
+            .map(|retrieval| retrieval.guardrails().declaration_digest())
     }
 
     /// The boundaries this authority's coverage check treats as evaluated.

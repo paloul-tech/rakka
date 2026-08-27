@@ -23,18 +23,23 @@
 //! authority checks, and that test moved here to require one.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use rakka_agent::testkit::DeterministicModelAdapter;
+use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedPrivateMemoryRetriever};
 use rakka_agent::{
     AgentEffectSpec, AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain,
     AgentGuardrailContext, AgentGuardrailOutcome, AgentGuardrailStage, AgentGuardrailStageId,
-    AgentMemoryRetrieval, AgentModelTurn, AgentRevisionNumber, AgentTaskContent,
-    AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    InMemoryAgentPrivateMemoryStore, InMemoryPrivateMemoryRetriever,
+    AgentMemoryRetrieval, AgentModelTurn, AgentPrivateMemory, AgentPrivateMemoryId,
+    AgentPrivateMemoryKind, AgentPrivateMemoryStore, AgentRevisionNumber, AgentRunMemory,
+    AgentTaskContent, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore, InMemoryPrivateMemoryRetriever,
+    InMemorySessionMemoryStore, MemoryClassification, MemoryOperationId, MemoryRetrievalOutcome,
+    PrivateMemoryExpectation, RetrievedPrivateMemory,
     AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
+use rakka_agent_workflow::AgentTimestampMillis;
 
 mod common;
 
@@ -74,12 +79,38 @@ fn deployment_chain(revision: u64) -> AgentGuardrailChain {
         .expect("the stage registers")
 }
 
-fn bundle(chain: AgentGuardrailChain) -> AgentMemoryRetrieval {
-    let store = Arc::new(InMemoryAgentPrivateMemoryStore::new());
-    AgentMemoryRetrieval::new(
+/// A run memory whose retrieval bundle carries the given chain.
+///
+/// The helper yields the *memory*, not a bare bundle, because that is what an
+/// authority now attests: a bundle handed in for the occasion proves only that
+/// a matching chain exists somewhere, never that the run will evaluate it.
+fn memory_with(chain: AgentGuardrailChain) -> AgentRunMemory {
+    memory_over(Arc::new(InMemoryAgentPrivateMemoryStore::new()), chain)
+}
+
+/// The same, over a caller-supplied private store, so a test can seed a
+/// memory the ingress chain will actually be handed.
+fn memory_over(
+    store: Arc<InMemoryAgentPrivateMemoryStore>,
+    chain: AgentGuardrailChain,
+) -> AgentRunMemory {
+    AgentRunMemory::new(
+        Arc::new(InMemorySessionMemoryStore::new()),
+        Arc::new(InMemoryContextSnapshotStore::new()),
+    )
+    .with_retrieval(AgentMemoryRetrieval::new(
         Arc::new(InMemoryPrivateMemoryRetriever::new(store.clone())),
         store,
         chain,
+    ))
+}
+
+/// A run memory with no retrieval bundle at all — the deployment that wires
+/// session memory and nothing else.
+fn memory_without_retrieval() -> AgentRunMemory {
+    AgentRunMemory::new(
+        Arc::new(InMemorySessionMemoryStore::new()),
+        Arc::new(InMemoryContextSnapshotStore::new()),
     )
 }
 
@@ -123,7 +154,7 @@ fn an_attested_bundle_carrying_the_same_chain_satisfies_memory_ingress_coverage(
         &AgentEffectSpec::non_idempotent(),
     ))
     .with_guardrails(chain.clone())
-    .with_memory_ingress(&bundle(chain))
+    .with_memory_ingress(&memory_with(chain))
     .expect("the bundle carries the same declared chain");
 
     assert!(
@@ -166,7 +197,7 @@ fn a_bundle_at_a_different_revision_is_refused_at_wiring() {
         &AgentEffectSpec::non_idempotent(),
     ))
     .with_guardrails(deployment_chain(7))
-    .with_memory_ingress(&bundle(deployment_chain(8)))
+    .with_memory_ingress(&memory_with(deployment_chain(8)))
     .expect_err("a drifted revision is a different declared evaluation");
 
     assert_eq!(error.code(), "guardrail-chain-mismatch");
@@ -193,7 +224,7 @@ fn an_empty_bundle_chain_at_the_same_revision_is_refused_at_wiring() {
         &AgentEffectSpec::non_idempotent(),
     ))
     .with_guardrails(deployment_chain(7))
-    .with_memory_ingress(&bundle(empty))
+    .with_memory_ingress(&memory_with(empty))
     .expect_err("an empty bundle chain runs no stage, whatever it calls itself");
 
     assert_eq!(error.code(), "guardrail-chain-mismatch");
@@ -206,7 +237,7 @@ fn an_authority_with_no_chain_cannot_attest() {
         TOOL,
         &AgentEffectSpec::non_idempotent(),
     ))
-    .with_memory_ingress(&bundle(deployment_chain(7)))
+    .with_memory_ingress(&memory_with(deployment_chain(7)))
     .expect_err("an authority with no chain has nothing to attest about");
 
     assert_eq!(error.code(), "guardrail-chain-mismatch");
@@ -224,7 +255,7 @@ fn replacing_the_authority_chain_after_attestation_revokes_it() {
         &AgentEffectSpec::non_idempotent(),
     ))
     .with_guardrails(chain.clone())
-    .with_memory_ingress(&bundle(chain))
+    .with_memory_ingress(&memory_with(chain))
     .expect("the attestation holds")
     .with_guardrails(deployment_chain(9));
 
@@ -247,7 +278,7 @@ fn two_independently_built_chains_with_the_same_declaration_attest() {
         &AgentEffectSpec::non_idempotent(),
     ))
     .with_guardrails(deployment_chain(7))
-    .with_memory_ingress(&bundle(deployment_chain(7)))
+    .with_memory_ingress(&memory_with(deployment_chain(7)))
     .expect("two equal declarations are one declared evaluation");
 }
 
@@ -297,7 +328,7 @@ async fn the_same_deployment_attested_dispatches() {
     let chain = deployment_chain(7);
     let authority = AgentToolAuthority::new(registry)
         .with_guardrails(chain.clone())
-        .with_memory_ingress(&bundle(chain))
+        .with_memory_ingress(&memory_with(chain))
         .expect("the attestation holds");
 
     let adapter = DeterministicModelAdapter::new()
@@ -333,4 +364,217 @@ fn the_unattested_boundary_set_is_strictly_smaller() {
     deployment_chain(7)
         .validate_covers(&required, &AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES)
         .expect_err("a memory-ingress-only stage covers nothing an authority evaluates alone");
+}
+
+// ---------------------------------------------------------------------------
+// The attested object is the object the run assembles through.
+// ---------------------------------------------------------------------------
+
+/// A stage that counts the memory-ingress evaluations it performs, so a test
+/// can assert the chain *ran* rather than that a constant named it.
+struct CountingIngress(Arc<AtomicUsize>);
+
+impl AgentGuardrail for CountingIngress {
+    fn evaluate(
+        &self,
+        context: &AgentGuardrailContext<'_>,
+        _content: &serde_json::Value,
+    ) -> AgentGuardrailOutcome {
+        if context.boundary == AgentGuardrailBoundary::MemoryIngress {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        AgentGuardrailOutcome::Allow
+    }
+}
+
+/// [`deployment_chain`], with a stage that records that it ran.
+fn counting_chain(revision: u64, seen: Arc<AtomicUsize>) -> AgentGuardrailChain {
+    AgentGuardrailChain::new(AgentRevisionNumber::new(revision))
+        .with_stage(
+            AgentGuardrailStage::new(
+                stage_id(STAGE),
+                AgentRevisionNumber::INITIAL,
+                Arc::new(CountingIngress(seen)),
+            )
+            .at_boundary(AgentGuardrailBoundary::MemoryIngress)
+            .mandatory(),
+        )
+        .expect("the stage registers")
+}
+
+fn private_memory(name: &str, text: &str) -> AgentPrivateMemory {
+    AgentPrivateMemory::new(
+        AgentPrivateMemoryId::new(format!("mem-{name}")).expect("memory id"),
+        MemoryOperationId::derive_for_agent(&agent_scope(), format!("create-{name}"))
+            .expect("op id"),
+        AgentPrivateMemoryKind::Semantic,
+        AgentTaskContent::inline(serde_json::json!(text)).expect("content"),
+        9_000,
+        MemoryClassification::Unclassified,
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the memory is bounded")
+}
+
+/// A run memory whose retriever deterministically ranks one seeded record, so
+/// the ingress chain is handed something to evaluate.
+///
+/// A scripted retriever rather than the in-memory one: the ranking must not
+/// depend on token overlap between the fixture's task input and the seed, and
+/// the record still has to survive the authoritative-store resolution, which
+/// is what the seeding is for.
+fn memory_ranking(
+    store: Arc<InMemoryAgentPrivateMemoryStore>,
+    chain: AgentGuardrailChain,
+    ranked: AgentPrivateMemory,
+) -> AgentRunMemory {
+    let outcome = MemoryRetrievalOutcome {
+        memories: vec![RetrievedPrivateMemory {
+            memory: ranked,
+            relevance_bps: 9_000,
+            embedding: None,
+        }],
+        index_watermark: None,
+    };
+    AgentRunMemory::new(
+        Arc::new(InMemorySessionMemoryStore::new()),
+        Arc::new(InMemoryContextSnapshotStore::new()),
+    )
+    .with_retrieval(AgentMemoryRetrieval::new(
+        Arc::new(ScriptedPrivateMemoryRetriever::new().with_outcome(outcome)),
+        store,
+        chain,
+    ))
+}
+
+/// The positive control, wired the way a deployment actually runs: the
+/// attested memory is the memory the run assembles through, and the stage the
+/// envelope requires is observed running.
+///
+/// The previous version of this test attested a bundle built for the occasion
+/// and then handed the fixture no memory at all. It passed — dispatch
+/// succeeded with `MemoryIngress` counted as evaluated — while no ingress
+/// stage existed anywhere in the run. That is precisely the fail-open the
+/// attestation was added to close, reproduced inside its own positive control.
+#[tokio::test]
+async fn the_attested_memory_is_the_one_the_run_assembles_through() {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let chain = counting_chain(7, seen.clone());
+
+    let store = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    let record = private_memory("ours", "the renewal terms");
+    store
+        .upsert(&agent_scope(), &record, PrivateMemoryExpectation::Absent)
+        .await
+        .expect("the seed upserts");
+    let memory = memory_ranking(store, chain.clone(), record);
+
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let mut envelope = envelope_for_registry(&registry);
+    envelope.mandatory_guardrails.insert(stage_id(STAGE));
+
+    let authority = AgentToolAuthority::new(registry)
+        .with_guardrails(chain)
+        .with_memory_ingress(&memory)
+        .expect("the attestation holds");
+    assert!(
+        authority.attests(&memory),
+        "the attestation must hold for the memory it was shown"
+    );
+
+    let adapter = DeterministicModelAdapter::new()
+        .with_turn_for(1, tool_calling_turn())
+        .with_turn_for(2, proposing_turn());
+    let fx = AuthorityFixture::new(adapter, authority, None)
+        .with_envelope(envelope)
+        .with_memory(memory);
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "an attested deployment dispatches normally"
+    );
+    assert!(
+        seen.load(Ordering::SeqCst) >= 1,
+        "dispatch was admitted on a memory-ingress stage that never ran"
+    );
+}
+
+/// A memory carrying no retrieval bundle cannot be attested.
+///
+/// This is the shape the old positive control silently had: nothing evaluates
+/// the boundary, so there is no chain to be the same as.
+#[test]
+fn a_memory_with_no_retrieval_bundle_cannot_be_attested() {
+    let error = AgentToolAuthority::new(tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::non_idempotent(),
+    ))
+    .with_guardrails(deployment_chain(7))
+    .with_memory_ingress(&memory_without_retrieval())
+    .expect_err("a memory with no bundle evaluates the boundary nowhere");
+
+    assert_eq!(error.code(), "guardrail-chain-mismatch");
+}
+
+/// Two absences are not an agreement.
+///
+/// An authority with no chain and a memory with no bundle both declare
+/// nothing, so a bare declaration comparison finds them equal — and would
+/// attest that a boundary nobody evaluates is evaluated. The emptiest possible
+/// deployment is exactly the one that must not pass.
+#[test]
+fn an_authority_with_no_chain_cannot_attest_a_memory_with_no_bundle() {
+    let error = AgentToolAuthority::new(tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::non_idempotent(),
+    ))
+    .with_memory_ingress(&memory_without_retrieval())
+    .expect_err("neither side evaluates the boundary, so neither can vouch for it");
+
+    assert_eq!(error.code(), "guardrail-chain-mismatch");
+}
+
+/// The attestation can be re-checked against a memory assembled elsewhere.
+///
+/// The check runs once, at wiring time. A deployment that builds its run
+/// memory in a second place — a reload, a refactor, a per-shard construction —
+/// has an assertion available rather than an assumption.
+#[test]
+fn attests_re_checks_a_separately_assembled_memory() {
+    let chain = deployment_chain(7);
+    let authority = AgentToolAuthority::new(tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::non_idempotent(),
+    ))
+    .with_guardrails(chain.clone())
+    .with_memory_ingress(&memory_with(chain))
+    .expect("the attestation holds");
+
+    assert!(
+        authority.attests(&memory_with(deployment_chain(7))),
+        "an equal declaration is the same declared evaluation, however it was built"
+    );
+    assert!(
+        !authority.attests(&memory_with(AgentGuardrailChain::new(
+            AgentRevisionNumber::new(7)
+        ))),
+        "an empty chain at the same revision runs no stage"
+    );
+    assert!(
+        !authority.attests(&memory_without_retrieval()),
+        "a memory with no bundle evaluates the boundary nowhere"
+    );
+
+    let unattested = AgentToolAuthority::new(tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::non_idempotent(),
+    ))
+    .with_guardrails(deployment_chain(7));
+    assert!(
+        !unattested.attests(&memory_with(deployment_chain(7))),
+        "an authority that never attested vouches for nothing, matching chain or not"
+    );
 }

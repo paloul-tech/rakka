@@ -820,11 +820,17 @@ pub enum AgentGuardrailError {
     },
     /// Two enforcement points were wired with differently declared chains, so
     /// a stage required at one would not run at the other.
+    ///
+    /// Either side may be absent, and absence is the more common
+    /// misconfiguration: an authority with no chain cannot attest anything,
+    /// and a run memory with no retrieval bundle evaluates the memory-ingress
+    /// boundary nowhere at all.
     ChainMismatch {
         /// The attesting authority's chain declaration, when it has a chain.
         authority: Option<AgentContentDigest>,
-        /// The retrieval bundle's chain declaration.
-        retrieval: AgentContentDigest,
+        /// The run memory's retrieval-bundle chain declaration, when it
+        /// carries a bundle.
+        retrieval: Option<AgentContentDigest>,
     },
 }
 
@@ -880,17 +886,22 @@ impl Display for AgentGuardrailError {
             Self::ChainMismatch {
                 authority,
                 retrieval,
-            } => match authority {
-                Some(authority) => write!(
+            } => match (authority, retrieval) {
+                (Some(authority), Some(retrieval)) => write!(
                     f,
                     "the dispatch authority's guardrail chain ({authority}) and the retrieval \
                      bundle's ({retrieval}) declare different evaluations, so a stage required at \
                      one would not run at the other"
                 ),
-                None => write!(
+                (None, Some(retrieval)) => write!(
                     f,
                     "the dispatch authority carries no guardrail chain, so it cannot attest that \
                      the retrieval bundle's ({retrieval}) is the same one"
+                ),
+                (_, None) => write!(
+                    f,
+                    "the run memory carries no retrieval bundle, so nothing evaluates the \
+                     memory-ingress boundary and there is no chain to attest"
                 ),
             },
         }

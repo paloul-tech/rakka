@@ -2620,6 +2620,18 @@ impl AuthorityFixture {
         self
     }
 
+    /// Wires the run entity with a memory bundle, so the loop assembles real
+    /// context snapshots — and, with a retrieval bundle installed, evaluates
+    /// the memory-ingress boundary while it does.
+    ///
+    /// A test that attests a bundle to the dispatch authority must pass the
+    /// *same* `AgentRunMemory` here, or it proves only that the deployment
+    /// owns a matching chain somewhere.
+    pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
+        self.fx = self.fx.with_memory(memory);
+        self
+    }
+
     /// Replaces the envelope the agent is instantiated under.
     pub fn with_envelope(mut self, envelope: AgentAuthorityEnvelope) -> Self {
         self.envelope = envelope;
