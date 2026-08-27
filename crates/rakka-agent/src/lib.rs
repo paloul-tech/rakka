@@ -72,6 +72,8 @@ pub mod guardrails;
 pub mod identity;
 pub mod loop_runtime;
 pub mod memory;
+pub mod memory_conformance;
+pub mod memory_retention;
 pub mod model;
 pub mod observability;
 #[cfg(feature = "otel")]
@@ -154,7 +156,8 @@ pub use dispatch::{
     AgentReconciliationFinding, AgentRunEffectDispatcher, AgentRunResultDelivery,
     AgentRunSetupResolver, AgentWorkflowCancelExecutor, AgentWorkflowCancelFinding,
     AgentWorkflowStartExecutor, AgentWorkflowStartFinding, SessionMemoryPromotionExecutor,
-    WorkflowAgentRunEffectSink,
+    WorkflowAgentRunEffectSink, AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH,
+    AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH,
 };
 pub use effect::{
     compensation_call_id, effect_id_for, external_idempotency_key_for, AgentClaimAppendProvenance,
@@ -219,6 +222,11 @@ pub use memory::{
     AGENT_SESSION_WINDOW_MAX_ENTRIES, AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES,
     AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_ENTRIES,
 };
+pub use memory_retention::{
+    backfill_run_terminal_stamp, discharge_run_memory_retention, AgentMemoryRetentionReport,
+    AgentMemoryRetentionSweep, AgentRunRetentionOutcome, AgentRunTerminalStampBackfill,
+    AgentRunTerminalStampOutcome, AgentRunTerminalStampReport,
+};
 pub use model::{
     AgentModelAdapter, AgentModelError, AgentModelFuture, AgentModelRequest, AgentModelResult,
     AgentModelRetryPolicy, AgentModelTurn, AgentModelUsage, AgentToolCallId, AgentToolCallRequest,
@@ -273,8 +281,9 @@ pub use retrieval::{
     AgentMemoryEmbedder, AgentMemoryRetrieval, AgentPrivateMemoryRetriever, AssembledContext,
     InMemoryPrivateMemoryRetriever, MemoryRetrievalOutcome, MemoryRetrievalPolicy,
     MemoryRetrievalQuery, RetrievalReport, RetrievedPrivateMemory,
-    AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH, AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES,
-    AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES, AGENT_MEMORY_RETRIEVAL_SCAN_MAX_ENTRIES,
+    AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH, AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS,
+    AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES, AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES,
+    AGENT_MEMORY_RETRIEVAL_RESOLUTION_FACTOR, AGENT_MEMORY_RETRIEVAL_SCAN_MAX_ENTRIES,
 };
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,
@@ -514,9 +523,9 @@ pub use tools::{
     AgentEnvironmentConcurrencyProtocol, AgentExecutionPolicyRouter, AgentGrantDescriptor,
     AgentGrantedDispatch, AgentToolAuthority, AgentToolBinding, AgentToolDescriptor,
     AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResultBehavior,
-    AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
-    AGENT_TOOL_DESCRIPTION_MAX_LENGTH, AGENT_TOOL_PARAMETERS_MAX_BYTES,
-    AGENT_TOOL_REGISTRY_MAX_TOOLS,
+    AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
+    AGENT_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_TOOL_DESCRIPTION_MAX_LENGTH,
+    AGENT_TOOL_PARAMETERS_MAX_BYTES, AGENT_TOOL_REGISTRY_MAX_TOOLS,
 };
 pub use workflow_tool::{
     child_workflow_run_id, workflow_cancel_command, workflow_cancel_command_id,

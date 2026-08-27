@@ -4,7 +4,7 @@
 //! module adds a fleet-level index for cross-run discovery, leases, fencing,
 //! target concurrency limits, and bounded health snapshots.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
@@ -47,6 +47,51 @@ pub const METRIC_AGENT_DISPATCHER_IN_FLIGHT: &str = "rakka.agent_workflow.dispat
 
 /// Gauge for due dispatcher work that could not be claimed in one pass.
 pub const METRIC_AGENT_DISPATCHER_BACKLOG: &str = "rakka.agent_workflow.dispatcher.backlog";
+
+/// The most bytes of failure detail one fleet index entry keeps in
+/// [`AgentDispatchEntry::last_error_code`].
+///
+/// The fleet index is a *single* durable record that every worker loads and
+/// re-persists on every claim pass, and the string that reaches this field is
+/// supplied by an application dispatcher or an application dispatch
+/// authority. An unbounded one becomes unbounded growth on the hottest shared
+/// record in the system — and on a retry path, which repeats every backoff
+/// interval.
+///
+/// The bound lives here, at the record, rather than at each writer: a bound
+/// applied by callers holds only for the callers that remember it, and this
+/// field has writers in this crate, in `rakka-agent`, and in any deployment
+/// that drives a fleet of its own.
+pub const AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH: usize = 512;
+
+/// Bounds one persisted failure detail: newlines folded to spaces, truncated
+/// on a character boundary at [`AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH`].
+///
+/// This is *bounding*, not sanitizing. It cannot remove secret material a
+/// collaborator chose to put in its error text — that stays the
+/// collaborator's own contract — but it keeps an unbounded body out of a
+/// durable record.
+#[must_use]
+pub fn bounded_dispatch_detail(detail: &str) -> String {
+    let single_line: String = detail
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\r' {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if single_line.len() <= AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH {
+        return single_line;
+    }
+    let mut end = AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH;
+    while end > 0 && !single_line.is_char_boundary(end) {
+        end -= 1;
+    }
+    single_line[..end].to_string()
+}
 
 /// Creates the default dispatcher fleet persistence id.
 #[must_use]
@@ -714,7 +759,11 @@ impl AgentDispatchEntry {
         self.lease = None;
         self.due_at = next_retry_at;
         self.attempts = attempts;
-        self.last_error_code = Some(message);
+        // Bounded here, where the field is written, so no writer can bypass
+        // it — see [`AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH`]. This is the
+        // retry path, so an unbounded string would be re-persisted on every
+        // backoff interval for as long as the condition lasts.
+        self.last_error_code = Some(bounded_dispatch_detail(&message));
         self.updated_at = now;
         self
     }
@@ -723,7 +772,7 @@ impl AgentDispatchEntry {
         self.status = AgentDispatchStatus::Exhausted;
         self.lease = None;
         self.attempts = attempts;
-        self.last_error_code = Some(message);
+        self.last_error_code = Some(bounded_dispatch_detail(&message));
         self.updated_at = now;
         self.exhausted_at = Some(now);
         self
@@ -1012,14 +1061,120 @@ pub struct AgentDispatchClaimBatch {
     pub worker_id: AgentDispatcherWorkerId,
     /// Timestamp used for the claim pass.
     pub claimed_at: AgentTimestampMillis,
-    /// Claimable entries before concurrency and batch limits.
+    /// Claimable entries before concurrency and batch limits, across the
+    /// whole fleet index and regardless of this worker's claim filter.
+    ///
+    /// This is the fleet's backlog, not this worker's: [`Self::class_filtered`]
+    /// is the part of it this worker does not serve.
     pub due_dispatch_count: usize,
-    /// True when more work was due than this pass could claim.
+    /// True when more work this worker *can serve* was due than this pass
+    /// claimed.
+    ///
+    /// Deliberately not measured against [`Self::due_dispatch_count`]: an
+    /// entry whose class another worker serves is that worker's backlog, and
+    /// counting it here would make every class-restricted worker report
+    /// backpressure forever.
     pub backpressure_limited: bool,
     /// Entries skipped because target concurrency was exhausted.
     pub concurrency_limited: usize,
+    /// Entries this worker's claim filter refused, because they name an
+    /// execution class it does not serve.
+    ///
+    /// A persistently non-zero value beside a non-zero `due_dispatch_count`
+    /// is what distinguishes "waiting for the worker that serves this class"
+    /// from "no worker in the fleet serves it" — the anti-stall signal a
+    /// heterogeneous fleet needs, and one that costs no durable write.
+    ///
+    /// Complete over the claimable entries, not over the ones this pass had
+    /// room to consider: the walk keeps counting after the batch fills, so a
+    /// busy fleet reports the same number an idle one would. That matters
+    /// because a busy fleet is precisely when an unservable class is most
+    /// likely to be sitting behind work that keeps getting claimed.
+    pub class_filtered: usize,
     /// Claims issued to the worker.
     pub claims: Vec<AgentDispatchClaim>,
+}
+
+/// Which dispatch work one worker may claim, by a bounded target attribute.
+///
+/// The fleet index is one shared record: every worker registers into it and
+/// every worker reads it, which is what makes the durable backlog recoverable
+/// on any pod. Isolation is therefore enforced where the work is *taken* —
+/// here — and again where it is *authorized*, by the agent domain's dispatch
+/// authority. It is never enforced by hiding the index, which carries only
+/// bounded routing metadata and no secret material
+/// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md),
+/// [16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Filtering at claim time rather than refusing after the claim is what makes
+/// a heterogeneous fleet work at all. A worker that refused *after* claiming
+/// would hold the entry's lease while it did so, starving the worker that can
+/// actually run it; and a refusal is a durable write, so every worker would
+/// pay one per class it does not serve.
+///
+/// The attribute is matched against [`AgentEffectTarget::attributes`]. An
+/// entry that does not carry the attribute at all is accepted by default:
+/// unclassified work routes anywhere, and refusing it is a policy decision
+/// belonging to the authorization layer, not to the fleet. A deployment that
+/// wants the stricter rule at this layer too says so with
+/// [`Self::without_unclassified`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentDispatchClaimFilter {
+    attribute: Option<String>,
+    accepted: BTreeSet<String>,
+    accept_unclassified: bool,
+}
+
+impl AgentDispatchClaimFilter {
+    /// A filter that accepts every entry.
+    ///
+    /// The default, and the behaviour of every worker built before this filter
+    /// existed: a homogeneous fleet needs no routing, and one that has not
+    /// declared its classes must not silently stop claiming work.
+    #[must_use]
+    pub fn any() -> Self {
+        Self {
+            attribute: None,
+            accepted: BTreeSet::new(),
+            accept_unclassified: true,
+        }
+    }
+
+    /// Accepts only entries whose `attribute` names one of `accepted`.
+    ///
+    /// An empty `accepted` set means this worker serves no classified work at
+    /// all — which is a coherent thing to configure for a worker that exists
+    /// only to run unclassified effects.
+    #[must_use]
+    pub fn by_target_attribute(
+        attribute: impl Into<String>,
+        accepted: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            attribute: Some(attribute.into()),
+            accepted: accepted.into_iter().map(Into::into).collect(),
+            accept_unclassified: true,
+        }
+    }
+
+    /// Refuses an entry that does not carry the attribute.
+    #[must_use]
+    pub fn without_unclassified(mut self) -> Self {
+        self.accept_unclassified = false;
+        self
+    }
+
+    /// Whether this worker may claim the entry.
+    #[must_use]
+    pub fn accepts(&self, entry: &AgentDispatchEntry) -> bool {
+        let Some(attribute) = self.attribute.as_ref() else {
+            return true;
+        };
+        match entry.target.attributes.get(attribute) {
+            Some(value) => self.accepted.contains(value),
+            None => self.accept_unclassified,
+        }
+    }
 }
 
 /// Durable dispatcher fleet facade.
@@ -1032,6 +1187,7 @@ where
     store: Store,
     clock: Clock,
     settings: AgentDispatcherFleetSettings,
+    claim_filter: AgentDispatchClaimFilter,
     metrics: Arc<dyn MetricsRecorder>,
     record: Option<StateRecord<AgentDispatcherFleetState>>,
 }
@@ -1065,6 +1221,35 @@ where
     Store: DurableStateStore<AgentDispatcherFleetState>,
     Clock: WorkflowClock,
 {
+    /// Restricts what this worker's handle may claim.
+    ///
+    /// Per *worker*, not per fleet: two workers over one shared index have
+    /// different filters, which is the entire point. It deliberately does not
+    /// live on [`AgentDispatcherFleetSettings`], which is serialized as part
+    /// of the fleet's configuration and describes the fleet rather than the
+    /// caller.
+    #[must_use]
+    pub fn with_claim_filter(mut self, filter: AgentDispatchClaimFilter) -> Self {
+        self.set_claim_filter(filter);
+        self
+    }
+
+    /// Restricts what this worker's handle may claim, in place.
+    ///
+    /// The `&mut` form exists because a consuming builder is unreachable from
+    /// behind a `&mut self` accessor — which is how
+    /// [`AgentDispatcherWorker::fleet_mut`] hands out this handle, and why
+    /// that worker could not install a filter at all.
+    pub fn set_claim_filter(&mut self, filter: AgentDispatchClaimFilter) {
+        self.claim_filter = filter;
+    }
+
+    /// The filter this handle claims under.
+    #[must_use]
+    pub const fn claim_filter(&self) -> &AgentDispatchClaimFilter {
+        &self.claim_filter
+    }
+
     /// Creates a dispatcher fleet with explicit dependencies.
     #[must_use]
     pub const fn with_clock_and_metrics(
@@ -1079,6 +1264,11 @@ where
             store,
             clock,
             settings,
+            claim_filter: AgentDispatchClaimFilter {
+                attribute: None,
+                accepted: BTreeSet::new(),
+                accept_unclassified: true,
+            },
             metrics,
             record: None,
         }
@@ -1203,9 +1393,33 @@ where
 
         let mut claims = Vec::new();
         let mut concurrency_limited = 0;
+        let mut class_filtered = 0;
+        let mut servable = 0usize;
         for entry in claimable {
+            // The filter is consulted first, and the scan runs to the end of
+            // the claimable list instead of stopping once the batch is full.
+            // `class_filtered` and `servable` describe *this worker against
+            // this index* — how much of the due work it cannot serve, and how
+            // much it can — and neither may depend on how much of that work
+            // one pass happened to have room for. With the batch-size break
+            // above this check, a busy fleet filled its batch from the earlier
+            // entries and returned before reaching the unservable ones, so
+            // every pass reported `class_filtered: 0` exactly when a class
+            // nobody serves was stalling: the one condition the counter
+            // exists to make visible.
+            //
+            // Before the lease, too: a worker that cannot run this entry must
+            // not hold it away from one that can.
+            if !self.claim_filter.accepts(&entry) {
+                class_filtered += 1;
+                continue;
+            }
+            servable += 1;
             if claims.len() >= self.settings.max_batch_size {
-                break;
+                // No room in this batch. Keep scanning rather than breaking:
+                // the list is already materialized and the remaining work is
+                // a filter check per entry, with no I/O and no durable write.
+                continue;
             }
             let class_count = in_flight_by_class
                 .get(&entry.target_class)
@@ -1232,11 +1446,21 @@ where
             claims.push(claim);
         }
 
-        let backpressure_limited = due_dispatch_count > claims.len();
+        // Servable work this pass left behind — never fleet-wide due work.
+        // An entry whose class another worker serves is *that* worker's
+        // backlog, so counting it here made every class-restricted worker
+        // report permanent backpressure. Accumulated in the walk rather than
+        // derived as `due_dispatch_count - class_filtered`: the two are equal
+        // only while both use the same claimable predicate, and a bound that
+        // depends on two things agreeing is one nothing checks.
+        let backpressure_limited = servable > claims.len();
         if !claims.is_empty() {
             self.persist(record.revision, next).await?;
         }
         self.record_metric("claim", "claimed", "none", claims.len() as u64);
+        if class_filtered > 0 {
+            self.record_metric("claim", "class-filtered", "none", class_filtered as u64);
+        }
         self.record_gauges(now);
         Ok(AgentDispatchClaimBatch {
             worker_id,
@@ -1244,6 +1468,7 @@ where
             due_dispatch_count,
             backpressure_limited,
             concurrency_limited,
+            class_filtered,
             claims,
         })
     }
@@ -1858,6 +2083,33 @@ where
         &mut self.fleet
     }
 
+    /// Restricts what this worker may claim.
+    ///
+    /// Without this the worker served everything, with no way to say
+    /// otherwise: it builds its fleet handle privately and hands it out only
+    /// behind `&mut`, which a consuming builder cannot reach. A deployment
+    /// mixing this worker with class-restricted ones over the same fleet
+    /// index therefore kept the race the claim filter exists to remove — the
+    /// unfiltered worker claims a ticket it cannot run, and its dispatcher
+    /// fails the effect permanently while a worker that serves the class
+    /// stands by.
+    ///
+    /// The filter is per *worker*, not per fleet, which is the whole point:
+    /// several workers share one index and accept different classes. Build one
+    /// with [`AgentDispatchClaimFilter::by_target_attribute`] over whatever
+    /// attribute the effects carry — `rakka-agent` routes on
+    /// `agent_effect_execution_policy`.
+    #[must_use]
+    pub fn with_claim_filter(mut self, filter: AgentDispatchClaimFilter) -> Self {
+        self.fleet.set_claim_filter(filter);
+        self
+    }
+
+    /// Restricts what this worker may claim, in place.
+    pub fn set_claim_filter(&mut self, filter: AgentDispatchClaimFilter) {
+        self.fleet.set_claim_filter(filter);
+    }
+
     /// Recovers the fleet state.
     pub async fn recover(&mut self) -> AgentDispatcherResult<&AgentDispatcherFleetState> {
         self.fleet.recover().await
@@ -2019,16 +2271,20 @@ where
             OutboxDispatchResult::Success => {
                 inbox.inner_mut().record_outbox_success(&message_id).await?
             }
+            // The dispatcher is application-implemented and its message is
+            // unbounded. It reaches the durable outbox row and, through the
+            // telemetry event, the fleet index — so it is bounded before the
+            // write, exactly as `AgentDispatchEntry` bounds what it keeps.
             OutboxDispatchResult::Failure { message } => {
                 inbox
                     .inner_mut()
-                    .record_outbox_failure(&message_id, message.clone(), false)
+                    .record_outbox_failure(&message_id, bounded_dispatch_detail(message), false)
                     .await?
             }
             OutboxDispatchResult::Timeout { message } => {
                 inbox
                     .inner_mut()
-                    .record_outbox_failure(&message_id, message.clone(), true)
+                    .record_outbox_failure(&message_id, bounded_dispatch_detail(message), true)
                     .await?
             }
         };

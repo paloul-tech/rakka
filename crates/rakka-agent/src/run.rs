@@ -619,6 +619,24 @@ pub struct AgentRun {
     /// When the run durably accepted its assignment, stamped by the owner that
     /// wrote it.
     pub accepted_at: AgentTimestampMillis,
+    /// When the run first reached a terminal status, stamped by the owner that
+    /// wrote the terminal transition.
+    ///
+    /// This is the clock short-term retention is measured from
+    /// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md), open
+    /// decision 7), and it is deliberately not
+    /// [`AgentRunState::updated_at`]: that is the time of the *last accepted*
+    /// transition, which for a terminal run keeps moving as settlement and
+    /// return commands land, so a deadline measured from it could recede
+    /// indefinitely. It is stamped exactly once — the single terminal
+    /// transition's already-terminal guard is what keeps a replayed or
+    /// re-driven wind-down from moving it.
+    ///
+    /// `None` on a live run, and on a terminal record written before this
+    /// field existed; a retention discharge refuses such a record rather than
+    /// guessing a due time from a field that means something else.
+    #[serde(default)]
+    pub terminal_at: Option<AgentTimestampMillis>,
 }
 
 impl AgentRun {
@@ -870,8 +888,58 @@ impl AgentRunState {
             settlement: run.settlement,
             pending_top_up: run.loop_state.pending_top_up().copied(),
             accepted_at: run.accepted_at,
+            terminal_at: run.terminal_at,
             updated_at: self.updated_at,
         })
+    }
+
+    /// Stamps [`AgentRun::terminal_at`] on a terminal record written before
+    /// that field existed, and upgrades the record to the schema version that
+    /// carries it. Returns the stamp it wrote, or `None` when there was
+    /// nothing to repair.
+    ///
+    /// This is the one-time repair for the backlog the stamp's own once-only
+    /// guard puts out of reach. `terminate` stamps at the single terminal
+    /// transition and early-returns on an already-terminal run, so a run that
+    /// was *already* terminal when the field shipped never re-enters the one
+    /// place that could give it a stamp. Nothing else can, and without one
+    /// [`crate::memory_retention::discharge_run_memory_retention`] answers
+    /// [`crate::memory_retention::AgentRunRetentionOutcome::TerminalTimeUnknown`]
+    /// for that run forever — so its session rows and context snapshots, the
+    /// tier that embeds model-visible content, are never purged.
+    ///
+    /// [`Self::updated_at`] is the fallback clock, and it is a *sound* one in
+    /// exactly one direction. It is the time of the last accepted transition,
+    /// so for a terminal run it is never earlier than the true terminal time:
+    /// the terminal transition sets both to the same instant, and only
+    /// transitions that land afterwards move it on. A backfilled deadline therefore falls at or
+    /// after the real one — the run is retained at least as long as policy
+    /// requires and never purged early. That asymmetry is the whole argument
+    /// for doing this as an opt-in repair: erring late is recoverable by
+    /// running the sweep again, and erring early destroys a record no replay
+    /// can rebuild.
+    ///
+    /// The guard is re-checked here rather than trusted from the caller, so
+    /// this can never move a stamp that already exists, whatever raced it
+    /// between a caller's classification and this call.
+    ///
+    /// [`Self::updated_at`] itself is deliberately not moved. It means the
+    /// last accepted *transition*, and a repair is not one; moving it would
+    /// also push the very clock the next backfill would read.
+    pub fn backfill_terminal_at(&mut self) -> Option<AgentTimestampMillis> {
+        let updated_at = self.updated_at;
+        let run = self.run.as_mut()?;
+        if !run.status.is_terminal() || run.terminal_at.is_some() {
+            return None;
+        }
+        run.terminal_at = Some(updated_at);
+        // The same upgrade `terminate` performs, and for the same reason: the
+        // record now carries a field only a binary that knows schema version 2
+        // can round-trip, so a peer that still writes version 1 must fail
+        // closed on it rather than load it and drop the stamp on the next
+        // settlement it applies.
+        self.schema_version = CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION;
+        Some(updated_at)
     }
 
     fn run_mut(&mut self) -> AgentRunResult<&mut AgentRun> {
@@ -953,6 +1021,17 @@ pub struct AgentRunSnapshot {
     pub pending_top_up: Option<AgentPendingTopUp>,
     /// When it durably accepted its assignment.
     pub accepted_at: AgentTimestampMillis,
+    /// When it first reached a terminal status, and the clock its short-term
+    /// retention is measured from. `None` while it is live.
+    ///
+    /// Snapshots serialized before this field load with it unset. Serde
+    /// already loads a missing `Option` as `None`; the attribute states the
+    /// intent explicitly, so narrowing the field to a non-`Option` type later
+    /// cannot silently make every older answer unreadable — this projection
+    /// is embedded in [`crate::query::AgentOperationalSnapshot`], which an
+    /// older peer deserializes.
+    #[serde(default)]
+    pub terminal_at: Option<AgentTimestampMillis>,
     /// The time of its last accepted transition.
     pub updated_at: AgentTimestampMillis,
 }
@@ -1129,6 +1208,17 @@ fn terminate(
     // means a run cancelled while waiting on a grant stops asking and settles.
     run.loop_state.clear_pending_top_up();
     run.terminal_reason = Some(reason);
+    // Stamped once, under the already-terminal guard above: the retention
+    // clock must not move when a re-driven wind-down re-enters this transition
+    // ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+    run.terminal_at = Some(now);
+    // The record now carries a field only a binary that knows schema version 2
+    // can round-trip, so a version-1 record earns its upgrade at exactly the
+    // transition that gives it one. Without this a run *created* before the
+    // bump would keep saying version 1 — readable, and therefore erasable, by
+    // a peer that would drop the stamp on the next settlement it applies, and
+    // the already-terminal guard above means nothing could ever restore it.
+    state.schema_version = CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION;
     state.updated_at = now;
     Ok(())
 }
@@ -1266,6 +1356,7 @@ fn accept_assignment(
         terminal_reason: None,
         settlement: AgentRunSettlementStatus::Owed,
         accepted_at: now,
+        terminal_at: None,
     };
     // Acceptance reserves growth headroom: a run admitted here must still be able
     // to hold the turn it was created to take.
@@ -7010,6 +7101,19 @@ where
                     ("reported", report.reported),
                     ("checkpoint-refused", report.checkpoint_refused),
                     ("rejected", report.rejected),
+                    // A ranked identity the authoritative store does not hold
+                    // in this scope. Counted separately from `rejected`
+                    // because it means the retriever and the store disagree
+                    // about what this agent has, which is a different — and
+                    // more alarming — condition than a record the query
+                    // simply does not admit.
+                    ("unverified", report.unverified),
+                    // Not a failure and not a disagreement about one record:
+                    // the ranking was longer than this deployment resolves,
+                    // so its tail was never read. Emitted here because a
+                    // persistently capped walk is index drift or a retriever
+                    // ignoring the limit its query names.
+                    ("resolution-capped", usize::from(report.resolution_capped)),
                 ] {
                     if count > 0 {
                         record_agent_domain_counter(
@@ -8897,6 +9001,7 @@ mod tests {
             terminal_reason: None,
             settlement: AgentRunSettlementStatus::Owed,
             accepted_at: now,
+            terminal_at: None,
         };
         let baseline = run.materialized_size_bytes();
 
@@ -9317,6 +9422,7 @@ mod tests {
                     .expect("the input is inline-bounded"),
                 status,
                 loop_state,
+                terminal_at: terminal_reason.as_ref().map(|_| now),
                 terminal_reason,
                 settlement: AgentRunSettlementStatus::Owed,
                 accepted_at: now,

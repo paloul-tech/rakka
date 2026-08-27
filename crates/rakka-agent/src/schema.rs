@@ -44,7 +44,22 @@ pub const CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 
 /// Current schema version of the durable [`crate::run::AgentRunState`].
-pub const CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+///
+/// Version 2 adds [`crate::run::AgentRun::terminal_at`], the clock short-term
+/// retention is measured from. The bump is what stops a rolling update from
+/// *erasing* it. Serde drops a field it does not know; a terminal run keeps
+/// accepting settlement and return commands, so an older peer would apply one
+/// and re-persist the record without the stamp; and the stamp is written
+/// exactly once, under an already-terminal guard, so nothing could ever put it
+/// back. Under the N/N+1 policy a version-1 binary fails closed on a version-2
+/// record instead, which is the whole point of versioning a durable shape.
+///
+/// A record created before the bump keeps saying version 1 until the run
+/// terminalizes, which is the transition that gives it the version-2 field;
+/// [`crate::run::AgentRunState`] upgrades its own stamp there. Until then both
+/// generations round-trip it losslessly, so a live run is never stalled by the
+/// bump.
+pub const CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(2);
 
 /// Current schema version of the durable [`crate::team::AgentTeamState`].
 pub const CURRENT_AGENT_TEAM_STATE_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);

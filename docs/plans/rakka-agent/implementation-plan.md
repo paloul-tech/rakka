@@ -4359,6 +4359,140 @@ Spec: [16](spec.md#16-security-and-authorization),
   cross-tenant existence-leak tests, executor trust-class routing, secret
   exclusion sweeps over state/events/telemetry.
 
+**Amended as implemented (2026-08-25):**
+
+- **Four of the five items were fail-opens, not missing tests.** Like 6.1, the
+  gap was wider than the line item suggested: in each case the code was wrong
+  and no test would have noticed. Each fix is verified by *falsification* —
+  reverted, the suite confirmed failing, restored — which is the standing
+  lesson from the 6.1 review that a fix proven only by a green suite is not
+  proven.
+- **The retriever was trusted for content and for scope, and the trait doc
+  said that was unavoidable.** `assemble_context` re-checked every property a
+  retrieved record carried except the one deciding whose memory it is, and
+  `AgentPrivateMemoryRetriever`'s doc called scope "the one contract clause no
+  downstream layer can catch a violation of" — because an `AgentPrivateMemory`
+  carries no tenant or agent. That reasoning was wrong: the assembly holds the
+  authoritative `AgentScope`, the store is scope-addressed, and the crate's own
+  boundary already says the index is a rebuildable projection while the store
+  holds the authoritative record. **The retriever now supplies a ranking and
+  the store supplies the record.** Resolving each ranked identity through
+  `AgentPrivateMemoryStore::get` closes four things at once, three of which
+  nobody had named: cross-scope leakage, content forgery, metadata forgery (a
+  fabricated classification or confidence no longer passes `admits`), and index
+  drift — including a memory tombstoned *after* it was indexed, which the old
+  path embedded because it checked the retriever's pre-tombstone copy. A
+  ranked identity the store does not hold is dropped and counted on
+  `RetrievalReport::unverified`; the resulting snapshot is byte-identical to
+  one assembled from an empty ranking, so the drop is not an existence oracle.
+  `AgentMemoryRetrieval::new` takes the store as a required argument, on the
+  same argument that already made the chain required.
+- **The two-chain wiring was documented and unverifiable.**
+  `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` unconditionally claimed memory-ingress
+  was evaluated, so `validate_covers` admitted a mandatory ingress-only stage
+  at an authority that had never seen a bundle. Now the deployment attests
+  (`AgentToolAuthority::with_memory_ingress`) and the attestation is *checked*
+  against `AgentGuardrailChain::declaration_digest`, which compares stage
+  declarations rather than revisions — the shape a deployment actually lands
+  in is an empty bundle chain carrying the *same* revision number, which a
+  revision comparison waves through. Unattested, the authority counts only
+  `AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES` and fails closed on the
+  existing `guardrail-stage-unevaluated`. Two alternatives were rejected:
+  `Arc::ptr_eq` (unforgeable, but refuses a deployment that legitimately
+  rebuilds an identical chain from one config) and a factory minting both
+  consumers (convention, not enforcement — the plain constructors would
+  remain, and omission would not fail closed).
+- **A credential resolver's failure text was reaching durable state, and the
+  substrate already knew better.** The leak was not in run state — `run.rs`
+  persists `bounded_detail(code)` — but in the workflow outbox row's
+  `last_error` and the fleet index's `last_error_code`, both unbounded and
+  fleet-readable, neither enumerated by `AgentRecordKind`. Two facts that
+  reinforce each other, and the reason the sweep scans the substrate beside the
+  catalogue. `AgentCredentialError::to_outbox_dispatch_result` already emitted
+  its code alone, so this was bringing `rakka-agent` into line with its own
+  substrate rather than inventing policy. Every persisted attempt detail is now
+  bounded at 512 bytes, and the bounding-is-not-sanitizing distinction is
+  stated on all nine executor traits.
+- **There was no trust-class routing, and the fix is not the obvious one.**
+  Making `execution-policy-unroutable` *retryable* was the first instinct and
+  is wrong three ways: it turns a shipped definitive failure into an unbounded
+  spin for a single-worker deployment; it is a claim-then-release race, so the
+  non-accepting worker holds the lease while the serving one cannot claim; and
+  `defer_dispatch` writes to the durable fleet index on every refusal, giving
+  write amplification proportional to workers × classes. The refusal is
+  downstream of the mistake. Filtering happens **at the claim**, and needs no
+  durable schema change because `ATTR_AGENT_EFFECT_EXECUTION_POLICY` already
+  rides the ticket into the fleet index. Partitioning the fleet persistence id
+  by class was also rejected: `pump_run` registers a run's whole due-effect
+  batch in one write and a run's effects span classes, so every worker would
+  still need write access to every class's index — no isolation gained, and a
+  retag strands tickets with no migration path. The cost accepted: a class no
+  worker serves now waits rather than failing fast, which is why
+  `class_filtered` exists beside `due_dispatch_count`.
+- **Retention had no production caller, and `updated_at` could not have been
+  the clock.** A terminal run keeps accepting settlement and return commands,
+  each advancing `updated_at`, so a deadline measured from it recedes
+  indefinitely. `AgentRun::terminal_at` stamps the single terminal transition
+  under its existing once-only guard. `discharge_run_memory_retention` purges
+  snapshots *before* session rows, so a kill between them leaves the copy
+  something else can still sweep rather than stranding content in the immutable
+  tier. Private memory is untouched by design.
+- **Two things documented rather than fixed, with the reasons recorded.**
+  `SessionPurgeOutcome::Purged { entries }` is a cardinality oracle — a
+  nonexistent scope answers zero — and stays one: the count is what makes a
+  fleet sweep observable and a purge auditable, no memory surface is reachable
+  from A2A or `query.rs`, and a conformance clause asserting otherwise would
+  freeze the leak into the contract. And a private `delete` does not discharge
+  an erasure request on its own, because a snapshot that embedded the memory
+  keeps its copy until the run's snapshot purge — required by scenario 17's
+  retry determinism, bounded by the retention window, and now proven as a fact
+  with its bound rather than left a footnote.
+- **One memory contract, run by both backends.** Four traits with two
+  implementations each, and the semantics were asserted *twice by hand* — once
+  in `memory.rs`'s unit tests and once, copied, in the PostgreSQL adapter's.
+  `rakka_agent::memory_conformance` is now the single suite, following the
+  knowledge graph's `conformance.rs` idiom rather than the testkit's
+  `assert_*_store_contract` shape for two structural reasons: the subject is
+  inherently *three*-scoped (a primary, a foreign, and a third
+  genuinely-empty scope to compare against), and a live-DSN runner needs
+  per-run namespacing once rather than at every call site. The isolation
+  clauses compare by **whole value** against the empty scope: `is_empty()` and
+  `is_none()`, which both hand-written copies used, are satisfied by a backend
+  that answers "empty" *differently* from how it answers an unknown scope —
+  a distinguishable `Ok` versus error, a different page shape — which is
+  exactly the disclosure the clause forbids. Exhaustiveness is a compiler
+  matter: one `…Operation` enum per trait, matched without a wildcard, so a
+  new method fails to compile until its isolation arm is written. Writing the
+  suite found two things about *the clauses*, both instructive: an isolation
+  clause must do all its reads before any of its writes, and a "duplicate
+  create" that reuses the original's derived operation id is answered from the
+  ledger as a replay — the idempotence contract working, not a violation.
+- Proof roster: `tests/memory_store_contract.rs` (14),
+  `crates/rakka-agent-postgres/tests/memory_conformance.rs` (12, DSN-gated),
+  `tests/memory_scope_fence.rs` (7), `tests/memory_guardrail_chain_consistency.rs`
+  (10), `tests/memory_retention.rs` (8), `tests/secret_exclusion.rs` (9),
+  `tests/executor_isolation.rs` (6), `tests/tenant_isolation.rs` (5).
+  Documentation: `docs/rakka-agent-security-validation-matrix.md`, plus the new
+  stable codes in `docs/rakka-compatibility.md`.
+- Owed onward, and recorded in the matrix: guardrail evaluation points for
+  `ModelResponse`, `ToolResponse`, `A2aIngress`, and `A2aEgress` — 4 of 7
+  declared boundaries, with `ToolResponse` the poisoning-relevant one, since a
+  tool result enters session memory and every later model context without
+  crossing a boundary; communal retrieval and `SnapshotCommunalClaim` (slice
+  4.6's deferral stands, and until it exists there is no communal poisoning
+  surface); the knowledge graph's absent retention/tombstone/deletion, an
+  absolute spec-13.1 requirement; the unwired model-visible descriptor rung;
+  descriptor revision pinning across recovery; tenant-scoped mandatory
+  guardrails; the non-atomic revocation re-check; the exhaustive
+  `A2AOperation::ALL` deny-is-absent sweep at the A2A surface, whose two doors
+  that fail open on tenancy by design (`A2AHeaderTenantResolver`'s
+  request-supplied tenant and the `default_tenant` fallback) are named in the
+  matrix but not yet driven under a denying authorizer; and the PostgreSQL
+  adapter's hand-written store assertions, which the shared suite now
+  duplicates and which should be reduced to backend-only proofs — the
+  two-connection compare-and-set, migration idempotence, the doctored-row
+  fail-closed, and the vector-encoding round trip.
+
 ### Slice 6.3 — Telemetry and Collector validation
 
 Spec: [17.14-17.17](spec.md#1714-content-capture-and-redaction),

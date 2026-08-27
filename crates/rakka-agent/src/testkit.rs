@@ -3278,6 +3278,7 @@ impl AgentEffectReconciler for ScriptedReconciler {
 #[derive(Clone)]
 pub struct ScriptedCredentialResolver {
     token: String,
+    failure: Option<(String, String)>,
     resolutions: Arc<AtomicUsize>,
 }
 
@@ -3287,11 +3288,29 @@ impl ScriptedCredentialResolver {
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
+            failure: None,
             resolutions: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// How many bindings have been resolved.
+    /// A resolver that always fails with `code` and `message`.
+    ///
+    /// The message stands in for what a real resolver quotes back from a
+    /// secret store, which is why it exists: the failure path — not the happy
+    /// path — is where an application-supplied string reaches a durable
+    /// record, so proving the runtime does not persist it needs a resolver
+    /// that fails.
+    #[must_use]
+    pub fn failing(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            token: String::new(),
+            failure: Some((code.into(), message.into())),
+            resolutions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// How many bindings have been resolved — attempted, whether the
+    /// resolution succeeded or failed.
     #[must_use]
     pub fn resolutions(&self) -> usize {
         self.resolutions.load(Ordering::SeqCst)
@@ -3316,9 +3335,145 @@ impl AgentEffectCredentialResolver for ScriptedCredentialResolver {
     ) -> AgentDispatchFuture<'a, AgentEphemeralCredential> {
         Box::pin(async move {
             self.resolutions.fetch_add(1, Ordering::SeqCst);
+            if let Some((code, message)) = self.failure.as_ref() {
+                return Err(crate::dispatch::AgentDispatchError::collaborator(
+                    code.clone(),
+                    message.clone(),
+                ));
+            }
             Ok(AgentEphemeralCredential::bearer_token(self.token.clone()))
         })
     }
+}
+
+/// Captures every `tracing` event this process emits, so a test can assert
+/// what a structured log carries.
+///
+/// Structured logs are the one observability surface with no in-process reader
+/// of its own: metrics have a recorder, decision events have a sink, and spans
+/// are persisted context — but a `tracing::warn!` goes nowhere a test can see.
+/// A secret-exclusion sweep that skipped them would be asserting about every
+/// surface except the one a developer reaches for first.
+///
+/// Implemented directly against the `tracing` facade rather than through
+/// `tracing-subscriber`, which the workspace does not depend on: `tracing`
+/// re-exports [`tracing::Subscriber`], [`tracing::Event`],
+/// [`tracing::Metadata`], and [`tracing::field::Visit`], which is everything a
+/// capture needs. Adding a dependency for a two-line log surface would not pay
+/// for itself.
+///
+/// The subscriber installs *globally* and once per process
+/// ([`Self::install_global`]). A thread-local default would be tidier, but its
+/// guard is `!Send` and would have to be held across `.await` points inside a
+/// `#[tokio::test]` — which happens to work on the current-thread runtime and
+/// is a trap for whoever changes the runtime next. One global buffer shared by
+/// the binary's tests is the honest trade: each test drains what it needs.
+#[derive(Clone, Default)]
+pub struct CapturingSubscriber {
+    events: Arc<Mutex<Vec<String>>>,
+    next_span: Arc<AtomicU64>,
+}
+
+impl CapturingSubscriber {
+    /// Installs the capture as this process's global subscriber, returning a
+    /// handle onto its buffer.
+    ///
+    /// Idempotent: a second call returns a handle onto the buffer the first
+    /// installed, because a process may set a global default only once.
+    #[must_use]
+    pub fn install_global() -> Self {
+        static INSTALLED: std::sync::OnceLock<CapturingSubscriber> = std::sync::OnceLock::new();
+        INSTALLED
+            .get_or_init(|| {
+                let subscriber = Self::default();
+                // A prior global default is not an error here: it means
+                // something else in this binary already installed one, and
+                // the buffer simply stays empty rather than the test aborting.
+                let _ = tracing::subscriber::set_global_default(subscriber.clone());
+                subscriber
+            })
+            .clone()
+    }
+
+    /// Every event captured so far, rendered as
+    /// `target|level|message|field=value,...`.
+    #[must_use]
+    pub fn events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .expect("the capture buffer should not be poisoned")
+            .clone()
+    }
+
+    /// Drops everything captured so far.
+    pub fn clear(&self) {
+        self.events
+            .lock()
+            .expect("the capture buffer should not be poisoned")
+            .clear();
+    }
+}
+
+impl Debug for CapturingSubscriber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapturingSubscriber")
+            .field("events", &self.events().len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Renders one event's fields into `key=value` pairs.
+#[derive(Default)]
+struct CapturedFields {
+    message: String,
+    fields: Vec<String>,
+}
+
+impl tracing::field::Visit for CapturedFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+    }
+}
+
+impl tracing::Subscriber for CapturingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        // Ids are opaque and must be non-zero; the capture holds no span
+        // state, so a monotonic counter is the whole implementation.
+        tracing::span::Id::from_u64(self.next_span.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = CapturedFields::default();
+        event.record(&mut visitor);
+        let metadata = event.metadata();
+        let rendered = format!(
+            "{}|{}|{}|{}",
+            metadata.target(),
+            metadata.level(),
+            visitor.message,
+            visitor.fields.join(",")
+        );
+        self.events
+            .lock()
+            .expect("the capture buffer should not be poisoned")
+            .push(rendered);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 /// A workflow clock over a shared atomic counter, so a test can advance time

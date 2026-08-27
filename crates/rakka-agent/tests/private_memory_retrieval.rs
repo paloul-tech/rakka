@@ -99,6 +99,7 @@ fn retrieving_world(stores: &Stores) -> Fixture {
     );
     let retrieval = AgentMemoryRetrieval::new(
         Arc::new(InMemoryPrivateMemoryRetriever::new(stores.private.clone())),
+        stores.private.clone(),
         AgentGuardrailChain::new(AgentRevisionNumber::INITIAL),
     );
     Fixture::new(dispatcher).with_memory(
@@ -328,6 +329,7 @@ async fn a_model_effect_retry_is_immune_to_index_and_store_drift() {
             InMemoryPrivateMemoryRetriever::new(stores.private.clone())
                 .with_version(AgentRevisionNumber::new(9)),
         ),
+        stores.private.clone(),
         AgentGuardrailChain::new(AgentRevisionNumber::INITIAL),
     );
     let mut run = rakka_agent::testkit::run_entity(&scope, &fx.runs, &fx.effects)
@@ -403,6 +405,7 @@ async fn a_retriever_outage_degrades_to_an_empty_selection_without_stalling() {
             .with_private_store(stores.private.clone())
             .with_retrieval(AgentMemoryRetrieval::new(
                 Arc::new(scripted.clone()),
+                stores.private.clone(),
                 AgentGuardrailChain::new(AgentRevisionNumber::INITIAL),
             )),
     );

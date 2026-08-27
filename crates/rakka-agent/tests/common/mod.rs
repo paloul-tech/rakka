@@ -29,26 +29,26 @@ use rakka_agent::testkit::{
 };
 use rakka_agent::{
     delegation_result_operation_id, AgentA2aSendExecutor, AgentA2aSendFinding,
-    AgentAuthorityEnvelope, AgentBudgetAllocation, AgentBudgetCeilings, AgentBudgetDimension,
-    AgentContinuousGoalSpec, AgentDefinition, AgentDefinitionId, AgentDelegationId,
-    AgentDelegationRecord, AgentDelegationReport, AgentDelegationStatus, AgentDispatchAuthority,
-    AgentDispatchDecision, AgentDispatchFuture, AgentDispatchPass, AgentEffectPolicies,
-    AgentEffectSpec, AgentEntityAddress, AgentEntityAuthority, AgentEntityClass,
-    AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentEpochSpec, AgentExchangeEnvelope,
-    AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter, AgentFanInPolicy, AgentGoalId,
-    AgentGoalMode, AgentId, AgentModelAdapter, AgentModelTurn, AgentOperationId,
-    AgentOperationKind, AgentPolicyRef, AgentRevisionNumber, AgentRevisionProvenance,
-    AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectSink, AgentRunEffectStatus,
-    AgentRunEntityStore, AgentRunMemory, AgentRunScope, AgentRunSnapshot, AgentRunState,
-    AgentRunStatus, AgentRunTerminalReason, AgentSchemaId, AgentSchemaRef, AgentScope,
-    AgentSettings, AgentSettingsChange, AgentSetupRevision, AgentTaskContent, AgentTaskCreation,
-    AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand, AgentTaskEntityStore,
-    AgentTaskId, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope,
-    AgentTaskSnapshot, AgentTaskState, AgentTaskStatus, AgentToolAuthority, AgentToolBinding,
-    AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration, AgentToolDescriptor,
-    AgentToolKind, AgentToolRegistry, AgentWakeBinding, AgentWakeOccurrence, AgentWakePolicy,
-    AgentWakePolicyRevision, AgentWakeScanner, AgentWakeScannerSettings, AgentWakeTimerEntry,
-    AgentWakeTimerStore, AgentWakeTimerStoreState, AgentWakeTriggerKind,
+    AgentAuthorityEnvelope, AgentAuthorityRefusal, AgentBudgetAllocation, AgentBudgetCeilings,
+    AgentBudgetDimension, AgentContinuousGoalSpec, AgentDefinition, AgentDefinitionId,
+    AgentDelegationId, AgentDelegationRecord, AgentDelegationReport, AgentDelegationStatus,
+    AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentDispatchPass,
+    AgentEffectPolicies, AgentEffectSpec, AgentEntityAddress, AgentEntityAuthority,
+    AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentEpochSpec,
+    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter,
+    AgentFanInPolicy, AgentGoalId, AgentGoalMode, AgentId, AgentModelAdapter, AgentModelTurn,
+    AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentRevisionNumber,
+    AgentRevisionProvenance, AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectSink,
+    AgentRunEffectStatus, AgentRunEntityStore, AgentRunMemory, AgentRunScope, AgentRunSnapshot,
+    AgentRunState, AgentRunStatus, AgentRunTerminalReason, AgentSchemaId, AgentSchemaRef,
+    AgentScope, AgentSettings, AgentSettingsChange, AgentSetupRevision, AgentTaskContent,
+    AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand,
+    AgentTaskEntityStore, AgentTaskId, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId,
+    AgentTaskScope, AgentTaskSnapshot, AgentTaskState, AgentTaskStatus, AgentToolAuthority,
+    AgentToolBinding, AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration,
+    AgentToolDescriptor, AgentToolKind, AgentToolRegistry, AgentWakeBinding, AgentWakeOccurrence,
+    AgentWakePolicy, AgentWakePolicyRevision, AgentWakeScanner, AgentWakeScannerSettings,
+    AgentWakeTimerEntry, AgentWakeTimerStore, AgentWakeTimerStoreState, AgentWakeTriggerKind,
     InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore, ScheduleRevision, TenantId,
     WorkflowAgentRunEffectSink, AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
@@ -59,7 +59,6 @@ use rakka_agent_workflow::{
     AgentDispatcherFleetState, AgentDispatcherWorkerId, AgentEphemeralCredential,
     AgentTimestampMillis, PrincipalRef,
 };
-use rakka_persistence::InMemoryDurableStateStore;
 
 /// Durable store for the task entity class; a pass-through until a crash
 /// point is armed.
@@ -2438,8 +2437,13 @@ pub async fn create_real_child(
         .expect("the child task creates");
 }
 
-pub type WorkflowStore = InMemoryDurableStateStore<WorkflowState>;
-pub type FleetStore = InMemoryDurableStateStore<AgentDispatcherFleetState>;
+// Crash-armable, like every other store the fixture owns: the durable
+// workflow substrate is where a dispatch attempt's failure detail actually
+// lands, so a sweep that cannot kill a worker mid-write to it is not sweeping
+// the surface it claims to. `effect_dispatch.rs` already declared these two
+// aliases locally; this is the one copy.
+pub type WorkflowStore = CrashingStateStore<WorkflowState>;
+pub type FleetStore = CrashingStateStore<AgentDispatcherFleetState>;
 pub type WorkflowSink = WorkflowAgentRunEffectSink<WorkflowStore, SharedAtomicWorkflowClock>;
 pub type Pipeline =
     AgentRunEffectDispatcher<WorkflowStore, FleetStore, RunStore, SharedAtomicWorkflowClock>;
@@ -2474,6 +2478,28 @@ impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAutho
     }
 }
 
+/// A gate that answers one fixed refusal for every intent.
+///
+/// The refusal's code and message are *application*-authored on the real
+/// trait, so this is how a test drives the refusal-settlement paths with
+/// strings of its own choosing — which is the only way to see what those paths
+/// persist.
+pub struct FixedRefusalAuthority(pub AgentAuthorityRefusal);
+
+impl AgentDispatchAuthority for FixedRefusalAuthority {
+    fn authorize<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _run: &'a AgentRunState,
+        _intent: &'a AgentRunEffect,
+        _attempt: u32,
+        _now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        let refusal = self.0.clone();
+        Box::pin(async move { Ok(AgentDispatchDecision::Refused(refusal)) })
+    }
+}
+
 /// The authority fixture: the common task-and-run fixture over the durable
 /// workflow-outbox sink, plus the fleet, the executor, the kill-switch probe,
 /// and a configurable [`AgentToolAuthority`] behind the pipeline's required
@@ -2492,6 +2518,7 @@ pub struct AuthorityFixture {
     pub probe: KillSwitchProbe,
     pub credentials: Option<Arc<ScriptedCredentialResolver>>,
     pub expire_grants: bool,
+    pub fixed_refusal: Option<AgentAuthorityRefusal>,
 }
 
 impl AuthorityFixture {
@@ -2539,6 +2566,7 @@ impl AuthorityFixture {
             probe: KillSwitchProbe::new(),
             credentials: None,
             expire_grants: false,
+            fixed_refusal: None,
         }
     }
 
@@ -2568,10 +2596,39 @@ impl AuthorityFixture {
         self
     }
 
+    /// Wires a credential resolver that always fails.
+    ///
+    /// The failure path — not the happy path — is where an application-supplied
+    /// string reaches a durable record, so a sweep that only ever resolves
+    /// successfully cannot see the surface it exists to check.
+    pub fn with_failing_credential_resolver(mut self, code: &str, message: &str) -> Self {
+        self.credentials = Some(Arc::new(ScriptedCredentialResolver::failing(code, message)));
+        self
+    }
+
+    /// Refuses every intent with the given refusal, so a test can choose the
+    /// application-authored code and message the settlement paths persist.
+    pub fn with_fixed_refusal(mut self, refusal: AgentAuthorityRefusal) -> Self {
+        self.fixed_refusal = Some(refusal);
+        self
+    }
+
     /// Backdates every issued grant's expiry, so the dispatcher's
     /// pre-attempt revalidation refuses it.
     pub fn with_expired_grants(mut self) -> Self {
         self.expire_grants = true;
+        self
+    }
+
+    /// Wires the run entity with a memory bundle, so the loop assembles real
+    /// context snapshots — and, with a retrieval bundle installed, evaluates
+    /// the memory-ingress boundary while it does.
+    ///
+    /// A test that attests a bundle to the dispatch authority must pass the
+    /// *same* `AgentRunMemory` here, or it proves only that the deployment
+    /// owns a matching chain somewhere.
+    pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
+        self.fx = self.fx.with_memory(memory);
         self
     }
 
@@ -2601,16 +2658,41 @@ impl AuthorityFixture {
         self.fx.create_task().await;
     }
 
+    /// A fresh dispatch worker over the shared durable stores, named, with its
+    /// own tool executor and an optional set of execution classes it serves.
+    ///
+    /// `pipeline()` is this with the fixture's own executor, the shared
+    /// worker id, and no class restriction. A routing proof needs two workers
+    /// with *separate* executors so it can name which one invoked.
+    pub fn worker(
+        &self,
+        worker_id: &str,
+        tools: RecordingToolExecutor,
+        classes: Option<&[&str]>,
+    ) -> Pipeline {
+        let mut pipeline = self.build_pipeline(worker_id, tools);
+        if let Some(classes) = classes {
+            pipeline = pipeline.with_execution_classes(classes.iter().map(|class| {
+                rakka_agent::AgentExecutionPolicyRef::new(*class).expect("the class ref is valid")
+            }));
+        }
+        pipeline
+    }
+
     /// A fresh dispatch worker over the shared durable stores.
     pub fn pipeline(&self) -> Pipeline {
+        self.build_pipeline("worker-1", self.tools.clone())
+    }
+
+    fn build_pipeline(&self, worker_id: &str, tools: RecordingToolExecutor) -> Pipeline {
         let mut gate = AgentEntityAuthority::new(self.fx.agents.clone(), self.authority.clone());
         if let Some(setup) = &self.setup {
             gate = gate.with_setup_for_run(run_scope(), setup.clone());
         }
-        let gate: Arc<dyn AgentDispatchAuthority> = if self.expire_grants {
-            Arc::new(ExpiredGrantAuthority(gate))
-        } else {
-            Arc::new(gate)
+        let gate: Arc<dyn AgentDispatchAuthority> = match &self.fixed_refusal {
+            Some(refusal) => Arc::new(FixedRefusalAuthority(refusal.clone())),
+            None if self.expire_grants => Arc::new(ExpiredGrantAuthority(gate)),
+            None => Arc::new(gate),
         };
         let mut delivery = InProcessRunResultDelivery::new(
             self.fx.runs.clone(),
@@ -2623,13 +2705,13 @@ impl AuthorityFixture {
             delivery = delivery.with_workflow_tools(config.clone());
         }
         let mut pipeline = AgentRunEffectDispatcher::new(
-            AgentDispatcherWorkerId::new("worker-1"),
+            AgentDispatcherWorkerId::new(worker_id),
             self.workflow_store.clone(),
             self.fleet_store.clone(),
             self.fx.runs.clone(),
             self.wf_clock.clone(),
             Arc::new(self.adapter.clone()),
-            Arc::new(self.tools.clone()),
+            Arc::new(tools),
             gate,
             Arc::new(delivery),
         )
@@ -2639,6 +2721,99 @@ impl AuthorityFixture {
             pipeline = pipeline.with_credential_resolver(credentials.clone());
         }
         pipeline
+    }
+
+    /// Every durable surface this fixture owns, as `(label, serialized json)`.
+    ///
+    /// The list is the sweep's whole reach, so it lives here rather than in
+    /// any one test: a store added to the fixture is scanned by every test
+    /// that scans, instead of by whichever ones remembered to.
+    ///
+    /// It deliberately includes the two workflow-substrate records — the run's
+    /// inbox/outbox `WorkflowState` and the dispatcher fleet index — which
+    /// carry no `AgentRecordKind` and are therefore invisible to a sweep that
+    /// enumerates the agent record catalogue alone. They are also exactly
+    /// where a failed dispatch attempt's detail is persisted.
+    pub async fn durable_surfaces(&self) -> Vec<(&'static str, String)> {
+        async fn dump<S>(
+            store: &CrashingStateStore<S>,
+            id: &rakka_persistence::PersistenceId,
+        ) -> String
+        where
+            S: rakka_persistence::DurableState + serde::Serialize,
+        {
+            use rakka_persistence::DurableStateStore;
+            let record = store.load(id).await.expect("the store loads");
+            match record {
+                Some(record) => {
+                    serde_json::to_string(&record.state).expect("the record serializes")
+                }
+                None => String::new(),
+            }
+        }
+
+        let run = run_scope();
+        let task = task_scope();
+        let agent = agent_scope();
+        let workflow_id = rakka_persistence::PersistenceId::new(
+            rakka_agent::workflow_run_id(&run).as_str().to_string(),
+        );
+        let fleet_id = rakka_persistence::PersistenceId::new(
+            rakka_agent_workflow::agent_dispatcher_fleet_persistence_id()
+                .as_str()
+                .to_string(),
+        );
+        vec![
+            (
+                "agents",
+                dump(&self.fx.agents, &agent.persistence_id()).await,
+            ),
+            ("tasks", dump(&self.fx.tasks, &task.persistence_id()).await),
+            ("runs", dump(&self.fx.runs, &run.persistence_id()).await),
+            ("workflow", dump(&self.workflow_store, &workflow_id).await),
+            ("fleet", dump(&self.fleet_store, &fleet_id).await),
+            ("task-history", self.task_history_dump(&task).await),
+        ]
+    }
+
+    /// The task history log, paged whole and serialized.
+    async fn task_history_dump(&self, scope: &AgentTaskScope) -> String {
+        use rakka_agent::AgentTaskHistoryStore;
+        let mut cursor = rakka_agent::AgentTaskHistoryCursor::start();
+        let mut entries = Vec::new();
+        // Bounded: a fixture's log is short, and a runaway page loop would
+        // hang the sweep rather than fail it.
+        for _page in 0..64 {
+            let Ok(page) = self.fx.history.read(scope, cursor).await else {
+                break;
+            };
+            entries.extend(page.entries);
+            match page.next {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        serde_json::to_string(&entries).expect("the history entries serialize")
+    }
+
+    /// Every telemetry surface this fixture can render, as
+    /// `(label, rendered)`.
+    ///
+    /// Rendered, not serialized: a metric observation set has no wire form,
+    /// and what matters for a content sweep is the text a reader would see.
+    /// Rendered, not serialized: a metric observation set has no wire form,
+    /// and what matters for a content sweep is the text a reader would see.
+    /// The recorder arrives as an argument because the fixture holds only an
+    /// `Arc<dyn MetricsRecorder>`, which cannot be rendered — the caller owns
+    /// the concrete handle it installed.
+    pub fn telemetry_surfaces(
+        &self,
+        metrics: &rakka_core::InMemoryMetricsRecorder,
+    ) -> Vec<(&'static str, String)> {
+        vec![(
+            "metrics",
+            format!("{:?}", metrics.snapshot().observations()),
+        )]
     }
 
     /// Advances the shared clock past the fleet lease.
