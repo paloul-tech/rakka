@@ -24,7 +24,7 @@ use rakka_agent_workflow::{
     validate_agent_span_link, validate_agent_telemetry_context, AgentCausationId,
     AgentCorrelationId, AgentTelemetryContext, AgentTimestampMillis, StateSchemaVersion,
 };
-use rakka_core::{MetricAttributes, MetricsRecorder};
+use rakka_core::{MetricAttributes, MetricKind, MetricsRecorder, OpenTelemetryInstrumentView};
 use serde::{Deserialize, Serialize};
 
 use crate::definition::{AgentEffectSafetyClass, AgentRevisionNumber, AgentToolId};
@@ -917,6 +917,355 @@ pub fn record_agent_domain_gauge(
     Ok(())
 }
 
+/// Records an agent-domain histogram observation after validating its labels.
+pub fn record_agent_domain_histogram(
+    metrics: &dyn MetricsRecorder,
+    name: &str,
+    value: f64,
+    attributes: MetricAttributes<'_>,
+) -> AgentObservabilityResult<()> {
+    validate_agent_domain_metric_attributes(attributes)?;
+    metrics.record_histogram(name, value, attributes);
+    Ok(())
+}
+
+/// Records the millisecond distance between two timestamps as a histogram
+/// observation.
+///
+/// Both endpoints come from the caller's injected clock — the same
+/// `AgentTimestampMillis` every transition and every dispatch attempt already
+/// carries — rather than from a wall-clock `Instant`. That keeps a duration
+/// deterministic under the frozen clocks the test suite drives, and it is the
+/// only way a duration spanning a durable boundary (a queued effect, a parked
+/// wait, an epoch) can be measured at all, since those endpoints are persisted
+/// timestamps and not moments this process lived through.
+///
+/// A non-monotonic pair records nothing rather than a negative duration: a
+/// clock that went backwards is a deployment fault, and a negative sample
+/// would corrupt every aggregate that reads the series.
+pub fn record_agent_domain_duration(
+    metrics: &dyn MetricsRecorder,
+    name: &str,
+    start: AgentTimestampMillis,
+    end: AgentTimestampMillis,
+    attributes: MetricAttributes<'_>,
+) -> AgentObservabilityResult<()> {
+    let Some(elapsed) = end.as_millis().checked_sub(start.as_millis()) else {
+        return Ok(());
+    };
+    record_agent_domain_histogram(metrics, name, elapsed as f64, attributes)
+}
+
+/// Latency bucket boundaries, in milliseconds, shared by every agent-domain
+/// duration instrument.
+///
+/// One ladder rather than a bespoke set per instrument: the agent domain's
+/// durations span the same range for the same reason — a bounded in-process
+/// segment at the bottom, a durable round trip in the middle, a human or an
+/// external system at the top — and a single ladder is what lets a dashboard
+/// compare a model call against the wait it caused without re-bucketing.
+pub const AGENT_LATENCY_BUCKETS_MS: &[f64] = &[
+    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+    60_000.0, 300_000.0, 900_000.0,
+];
+
+/// Count bucket boundaries shared by agent-domain distribution instruments
+/// that measure a quantity rather than a duration — token counts, record
+/// counts.
+pub const AGENT_COUNT_BUCKETS: &[f64] = &[
+    1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0,
+    100_000.0,
+];
+
+/// One agent-domain metric instrument: its stable name, kind, unit, bounded
+/// label keys, and — for a distribution — its bucket boundaries.
+///
+/// [Specification 17.12](../../../docs/plans/rakka-agent/spec.md) requires
+/// metric labels to be bounded **and documented**. A prose table alone drifts
+/// from the code the moment a call site changes, so the catalogue is data:
+/// [`AGENT_DOMAIN_METRIC_INSTRUMENTS`] is walked by the test that puts every
+/// label key through [`validate_agent_domain_metric_attributes`], and it is
+/// what supplies unit and bucket semantics to the OTLP bridge, which sees only
+/// raw observations and could not otherwise know them.
+///
+/// This mirrors the substrate's `AgentMetricInstrument`, extended with the two
+/// things the agent domain needs and the substrate's shape lacks: the bounded
+/// label keys, and the bucket boundaries.
+// `Eq` is deliberately absent: the bucket boundaries are `f64`, which has no
+// total equality. `PartialEq` is what the catalogue tests need.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AgentDomainMetricInstrument {
+    /// Stable metric name.
+    pub name: &'static str,
+    /// Instrument kind.
+    pub kind: MetricKind,
+    /// UCUM-compatible unit label where one exists, otherwise an annotation
+    /// in the `{thing}` form the conventions use for dimensionless counts.
+    pub unit: &'static str,
+    /// The bounded label keys this instrument records, every one of which is
+    /// in [`AGENT_METRIC_FIELDS`] or the substrate's bounded vocabulary.
+    pub labels: &'static [&'static str],
+    /// Explicit bucket boundaries for a distribution; empty for counters and
+    /// gauges.
+    pub buckets: &'static [f64],
+    /// Human-readable description.
+    pub description: &'static str,
+}
+
+impl AgentDomainMetricInstrument {
+    /// Defines one agent-domain instrument.
+    #[must_use]
+    pub const fn new(
+        name: &'static str,
+        kind: MetricKind,
+        unit: &'static str,
+        labels: &'static [&'static str],
+        buckets: &'static [f64],
+        description: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            kind,
+            unit,
+            labels,
+            buckets,
+            description,
+        }
+    }
+
+    /// The borrowed view the OTLP bridge needs to carry this instrument's unit
+    /// and buckets into an export.
+    #[must_use]
+    pub const fn as_export_view(&self) -> OpenTelemetryInstrumentView<'static> {
+        OpenTelemetryInstrumentView {
+            name: self.name,
+            unit: self.unit,
+            bucket_boundaries: self.buckets,
+        }
+    }
+}
+
+/// Every metric the agent domain records, with its unit, bounded labels, and
+/// buckets.
+///
+/// This is the documented catalogue
+/// [specification 17.12](../../../docs/plans/rakka-agent/spec.md) requires,
+/// kept as data so it cannot drift from the call sites: `tests/metric_catalogue.rs`
+/// asserts that every name recorded anywhere in the crate appears here and
+/// that every entry's labels pass the bounded-label guard.
+///
+/// The gauges 17.12 asks for that measure the *substrate* rather than the agent
+/// domain — resident entities, inbox and outbox backlog, mailbox and stream
+/// pressure, shard-ownership distribution — are deliberately absent: they are
+/// published by `rakka.agent_workflow.*` and `rakka.*` instruments already, and
+/// a second name for one number is two catalogues that drift. The prose
+/// catalogue in `docs/rakka-agent-observability-catalogue.md` names the
+/// providing instrument for each of those rows.
+pub const AGENT_DOMAIN_METRIC_INSTRUMENTS: &[AgentDomainMetricInstrument] = &[
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_DECISIONS,
+        MetricKind::Counter,
+        "{decision}",
+        &["decision_kind", "decision_source"],
+        &[],
+        "Agent-loop decisions durably retained by a decision sink.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_RUN_TRANSITIONS,
+        MetricKind::Counter,
+        "{transition}",
+        &["phase"],
+        &[],
+        "Committed loop transitions, by the phase they advanced from.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_EFFECT_OUTCOMES,
+        MetricKind::Counter,
+        "{effect}",
+        &["effect_kind", "safety_class", "outcome"],
+        &[],
+        "Resolved effect generations, including indeterminate outcomes.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_RECOVERY_EVENTS,
+        MetricKind::Counter,
+        "{recovery}",
+        &["outcome"],
+        &[],
+        "Run recoveries after restart, passivation, or shard movement.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_DECISION_DROPS,
+        MetricKind::Gauge,
+        "{decision}",
+        &[],
+        &[],
+        "Decision events a run's bounded outbox ring dropped.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+        MetricKind::Counter,
+        "{failure}",
+        &["signal"],
+        &[],
+        "Telemetry flush attempts a sink refused, by signal.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_MEMORY_RETRIEVALS,
+        MetricKind::Counter,
+        "{retrieval}",
+        &["backend", "outcome"],
+        &[],
+        "Private-memory retrievals run by context-snapshot assembly.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+        MetricKind::Counter,
+        "{record}",
+        &["outcome"],
+        &[],
+        "Memory-ingress guardrail outcomes on retrieved records.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_WAKE_DISPOSITIONS,
+        MetricKind::Counter,
+        "{wake}",
+        &["outcome", "trigger"],
+        &[],
+        "Wake dispositions the continuous controller durably recorded.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_EPOCHS,
+        MetricKind::Counter,
+        "{epoch}",
+        &["outcome"],
+        &[],
+        "Continuous-goal epoch admissions and results.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_GOAL_LIFECYCLE,
+        MetricKind::Counter,
+        "{transition}",
+        &["transition"],
+        &[],
+        "Continuous-goal lifecycle transitions at the admission gate.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_GOAL_STATUS,
+        MetricKind::Counter,
+        "{transition}",
+        &["transition"],
+        &[],
+        "Goal-contract status transitions, by the status arrived at.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_GOAL_STAGNATION,
+        MetricKind::Counter,
+        "{trip}",
+        &["trigger"],
+        &[],
+        "Stagnation-threshold trips the wake controller detected.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_DELEGATION_RESULTS,
+        MetricKind::Counter,
+        "{result}",
+        &["outcome"],
+        &[],
+        "Delegated children's terminal results decided at the parent's door.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_HANDOFF_RESULTS,
+        MetricKind::Counter,
+        "{result}",
+        &["outcome"],
+        &[],
+        "Handoff resolutions decided at the source run's door.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_FAN_IN_RESOLUTIONS,
+        MetricKind::Counter,
+        "{group}",
+        &["outcome"],
+        &[],
+        "Fan-in groups resolved, by bounded resolution code.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_WORKFLOW_RESULTS,
+        MetricKind::Counter,
+        "{result}",
+        &["outcome"],
+        &[],
+        "Child workflow runs' terminal results accepted at the parent's door.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_TEAM_OPERATIONS,
+        MetricKind::Counter,
+        "{operation}",
+        &["operation", "outcome"],
+        &[],
+        "Team board and lifecycle operations committed at the team entity.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_MODERATION_TURNS,
+        MetricKind::Counter,
+        "{operation}",
+        &["operation", "outcome"],
+        &[],
+        "Moderated-conversation turn and lifecycle operations.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_HUMAN_RESULTS,
+        MetricKind::Counter,
+        "{result}",
+        &["outcome"],
+        &[],
+        "Authenticated human-result submissions decided at the task entity.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_DEPENDENCY_OUTCOMES,
+        MetricKind::Counter,
+        "{edge}",
+        &["outcome"],
+        &[],
+        "Dependency outcomes durably applied at the dependent task.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_EXCHANGE_UNSETTLEABLE,
+        MetricKind::Counter,
+        "{refusal}",
+        &["operation", "error_code"],
+        &[],
+        "Exchange replies a settle pass could not settle, per pass.",
+    ),
+    AgentDomainMetricInstrument::new(
+        crate::wake_scanner::METRIC_AGENT_WAKES,
+        MetricKind::Counter,
+        "{wake}",
+        &["outcome", "trigger"],
+        &[],
+        "Wake delivery attempts made by the shared scanner.",
+    ),
+];
+
+/// Returns the agent-domain instrument definition for a metric name.
+#[must_use]
+pub fn agent_domain_metric_instrument(name: &str) -> Option<&'static AgentDomainMetricInstrument> {
+    AGENT_DOMAIN_METRIC_INSTRUMENTS
+        .iter()
+        .find(|instrument| instrument.name == name)
+}
+
+/// The whole catalogue as OTLP bridge instrument views, so an export carries
+/// every agent-domain unit and bucket boundary.
+#[must_use]
+pub fn agent_domain_instrument_views() -> Vec<OpenTelemetryInstrumentView<'static>> {
+    AGENT_DOMAIN_METRIC_INSTRUMENTS
+        .iter()
+        .map(AgentDomainMetricInstrument::as_export_view)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use rakka_agent_workflow::{AgentAttributes, AgentSpanLink};
@@ -1019,24 +1368,114 @@ mod tests {
 
     #[test]
     fn every_instrument_label_key_passes_the_bounded_guard() {
-        // The closed set of label keys every rakka.agent.* instrument records.
-        // A key added to an instrument must be added here, and it must pass.
-        let recorded: &[&str] = &[
-            "decision_kind",
-            "decision_source",
-            "phase",
-            "effect_kind",
-            "safety_class",
-            "operation",
-            "outcome",
-            "signal",
-        ];
-        for key in recorded {
-            assert!(
-                validate_agent_domain_metric_attributes(&[(key, "value")]).is_ok(),
-                "{key} must be accepted"
-            );
+        // Walked from the catalogue, not from a hand-maintained copy of it.
+        // The copy this replaced had gone stale in exactly the way a copy
+        // does: it listed eight keys while `backend`, `transition`, `trigger`,
+        // and `error_code` were being recorded, so it asserted nothing about
+        // four of the twelve keys in use. Reading the catalogue makes the
+        // omission impossible — a new label key is only recordable once the
+        // instrument declares it, and the instrument's declaration is what
+        // this walks.
+        assert!(!AGENT_DOMAIN_METRIC_INSTRUMENTS.is_empty());
+        for instrument in AGENT_DOMAIN_METRIC_INSTRUMENTS {
+            for key in instrument.labels {
+                assert!(
+                    validate_agent_domain_metric_attributes(&[(key, "value")]).is_ok(),
+                    "{key} on {} must be accepted",
+                    instrument.name
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_catalogue_is_well_formed() {
+        let mut names = std::collections::BTreeSet::new();
+        for instrument in AGENT_DOMAIN_METRIC_INSTRUMENTS {
+            assert!(
+                instrument.name.starts_with("rakka.agent."),
+                "unexpected metric namespace: {}",
+                instrument.name
+            );
+            assert!(
+                names.insert(instrument.name),
+                "duplicate metric instrument: {}",
+                instrument.name
+            );
+            assert!(
+                !instrument.unit.trim().is_empty(),
+                "{} declares no unit",
+                instrument.name
+            );
+            assert!(
+                !instrument.description.trim().is_empty(),
+                "{} declares no description",
+                instrument.name
+            );
+            // Buckets are a distribution's property; a counter or gauge that
+            // declared them would export a data point nothing can read.
+            if instrument.kind == MetricKind::Histogram {
+                assert!(
+                    !instrument.buckets.is_empty(),
+                    "{} is a histogram with no buckets",
+                    instrument.name
+                );
+                assert!(
+                    instrument.buckets.windows(2).all(|pair| pair[0] < pair[1]),
+                    "{}'s buckets must ascend",
+                    instrument.name
+                );
+            } else {
+                assert!(
+                    instrument.buckets.is_empty(),
+                    "{} is not a distribution and must declare no buckets",
+                    instrument.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_export_view_carries_the_unit_and_the_buckets() {
+        let views = agent_domain_instrument_views();
+        assert_eq!(views.len(), AGENT_DOMAIN_METRIC_INSTRUMENTS.len());
+        let decisions = agent_domain_metric_instrument(METRIC_AGENT_DECISIONS)
+            .expect("the decision counter is catalogued");
+        let view = decisions.as_export_view();
+        assert_eq!(view.name, METRIC_AGENT_DECISIONS);
+        assert_eq!(view.unit, decisions.unit);
+        assert!(view.bucket_boundaries.is_empty());
+    }
+
+    #[test]
+    fn a_duration_records_the_distance_and_a_backwards_clock_records_nothing() {
+        let metrics = rakka_core::InMemoryMetricsRecorder::new();
+        record_agent_domain_duration(
+            &metrics,
+            METRIC_AGENT_DECISIONS,
+            AgentTimestampMillis::new(10),
+            AgentTimestampMillis::new(35),
+            &[],
+        )
+        .expect("the labels are bounded");
+        record_agent_domain_duration(
+            &metrics,
+            METRIC_AGENT_DECISIONS,
+            AgentTimestampMillis::new(35),
+            AgentTimestampMillis::new(10),
+            &[],
+        )
+        .expect("a backwards pair is not an error");
+
+        let snapshot = metrics.snapshot();
+        let observations = snapshot.observations_named(METRIC_AGENT_DECISIONS);
+        assert_eq!(
+            observations.len(),
+            1,
+            "a backwards clock records nothing rather than a negative sample"
+        );
+        assert_eq!(observations[0].value(), 25.0);
+        assert_eq!(observations[0].kind(), MetricKind::Histogram);
     }
 
     #[test]
