@@ -11,7 +11,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use rakka_core::{
-    export_open_telemetry_metrics, MetricAttribute, MetricsSnapshot, OpenTelemetryMetricsExport,
+    export_open_telemetry_metrics_with_instruments, MetricAttribute, MetricsSnapshot,
+    OpenTelemetryInstrumentView, OpenTelemetryMetricsExport,
 };
 use serde::{Deserialize, Serialize};
 
@@ -808,10 +809,35 @@ pub struct AgentOtlpBridgeExport {
 
 impl AgentOtlpBridgeExport {
     /// Builds an OTLP bridge export from a metrics snapshot, spans, and logs.
+    ///
+    /// The exported metrics carry no unit and no bucket boundaries, because a
+    /// snapshot alone does not know them. A caller holding an instrument
+    /// catalogue should use [`Self::from_signals_with_instruments`], which is
+    /// what preserves the unit and bucket semantics
+    /// ([specification 17.17](../../docs/plans/rakka-agent/spec.md)).
     pub fn from_signals(
         exporter: AgentOtlpExporterConfig,
         resource: AgentOtelResource,
         metrics_snapshot: &MetricsSnapshot,
+        spans: Vec<AgentOtelSpanExport>,
+        logs: Vec<AgentLogEvent>,
+    ) -> AgentOtlpResult<Self> {
+        Self::from_signals_with_instruments(exporter, resource, metrics_snapshot, &[], spans, logs)
+    }
+
+    /// Builds an OTLP bridge export whose metrics carry the units and bucket
+    /// boundaries the caller's instrument catalogue declares.
+    ///
+    /// The bridge cannot invent them: the recorder stores raw observations and
+    /// knows nothing about instruments, so the domain that declared the
+    /// instrument supplies the view. Dropping the fields instead is what
+    /// [17.17](../../docs/plans/rakka-agent/spec.md) forbids while claiming
+    /// semantic-convention compliance.
+    pub fn from_signals_with_instruments(
+        exporter: AgentOtlpExporterConfig,
+        resource: AgentOtelResource,
+        metrics_snapshot: &MetricsSnapshot,
+        instruments: &[OpenTelemetryInstrumentView<'_>],
         spans: Vec<AgentOtelSpanExport>,
         logs: Vec<AgentLogEvent>,
     ) -> AgentOtlpResult<Self> {
@@ -829,7 +855,11 @@ impl AgentOtlpBridgeExport {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect::<Vec<_>>();
-        let metrics = export_open_telemetry_metrics(metrics_snapshot, &resource_pairs);
+        let metrics = export_open_telemetry_metrics_with_instruments(
+            metrics_snapshot,
+            &resource_pairs,
+            instruments,
+        );
         Ok(Self {
             exporter,
             resource,
