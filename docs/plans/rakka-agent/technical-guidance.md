@@ -1091,7 +1091,18 @@ when values are known from the provider:
 - workflow duration for multi-agent orchestration; and
 - tool execution duration.
 
-Add Rakka metrics for durable/runtime concerns not covered upstream:
+Add Rakka metrics for durable/runtime concerns not covered upstream.
+
+**Amended by slice 6.3a.** This table is the design intent and is no longer a
+description of what ships. Fifteen of its eighteen rows name metrics that were
+never implemented, and the three that match by name did not match by label —
+`rakka.agent.decisions` carries `decision_kind` and `decision_source`, not
+`outcome`. The shipped catalogue, with units, buckets, and the bounded label
+keys as data, is `AGENT_DOMAIN_METRIC_INSTRUMENTS` and its rendering in
+[`docs/rakka-agent-observability-catalogue.md`](../../rakka-agent-observability-catalogue.md);
+a test scans the crate's own sources so the two cannot drift again. Where a row
+below shipped under a different name the mapping is noted inline; the rest
+remain owed, and the catalogue page lists them as such.
 
 | Metric | Instrument | Bounded labels |
 | --- | --- | --- |
@@ -1103,15 +1114,15 @@ Add Rakka metrics for durable/runtime concerns not covered upstream:
 | `rakka.agent.moderation.turns` | Counter | operation, outcome (amended by slice 5.3: labeled like the team counter from the closed key set; the `mode` label is owed with the model-visible moderation tool) |
 | `rakka.agent.goal.evaluations` | Counter | goal mode, evaluator class, outcome |
 | `rakka.agent.delegations` | Counter | peer/skill class, outcome |
-| `rakka.agent.decision.duration` | Histogram, seconds | decision kind/source |
-| `rakka.agent.turn.duration` | Histogram, seconds | outcome, model profile, bounded agent class/version |
+| `rakka.agent.decision.duration` | Histogram, seconds | decision kind/source (owed; the loop transition is measured today as part of `rakka.agent.turn.duration`) |
+| `rakka.agent.turn.duration` | Histogram, seconds | outcome, model profile, bounded agent class/version (shipped in **milliseconds** with `outcome` only, measured between the turn's durable timestamps) |
 | `rakka.agent.run.active` | Gauge | status class, tenant tier |
 | `rakka.agent.wait.duration` | Histogram, seconds | wait/checkpoint kind, outcome |
-| `rakka.agent.effect.indeterminate` | Counter | effect/tool class, safety class |
+| `rakka.agent.effect.indeterminate` | Counter | effect/tool class, safety class (shipped as an `outcome=indeterminate` row of `rakka.agent.effect.outcomes`, so an indeterminate transition is counted beside its siblings rather than in a separate series) |
 | `rakka.agent.memory.operation.duration` | Histogram, seconds | memory tier, operation, backend class |
 | `rakka.agent.memory.records` | Histogram | memory tier, operation |
-| `rakka.agent.recovery.duration` | Histogram, seconds | recovery reason, outcome |
-| `rakka.agent.telemetry.export.failures` | Counter | signal, exporter class, error code |
+| `rakka.agent.recovery.duration` | Histogram, seconds | recovery reason, outcome (shipped in **milliseconds** with `outcome` only) |
+| `rakka.agent.telemetry.export.failures` | Counter | signal, exporter class, error code (shipped as `rakka.agent.telemetry.flush.failures`, labelled by `signal`) |
 
 Use metric histograms and gauges for fleet health rather than querying sampled
 traces for totals. Do not label metrics with goal/task/agent/run/delegation/

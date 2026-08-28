@@ -4587,6 +4587,72 @@ the bridge or documented as mapped in the application; and an attribute
 outside the allowlist cannot reach a span or log export record. Scenario 25 is
 re-proven at the export boundary rather than only at durable state.
 
+**Landed.** Four decisions were taken, each because the obvious alternative was
+wrong in a specific way rather than merely less tidy.
+
+- **Emission is a neutral vocabulary, and only the mapping is gated.** The
+  loop, the entities, and the dispatcher close `AgentTelemetrySegment` values
+  named by `AgentSegmentOperation` with no feature gate, and `otel` owns the
+  translation to `invoke_agent`, `execute_tool`, and the rest. Emitting the
+  convention records directly under `#[cfg(feature = "otel")]` was rejected:
+  it puts the GenAI vocabulary on the durable execution path, and it makes the
+  emission absent from every default build — including the
+  `cargo test -p rakka-agent --no-default-features` run that `validate.sh`
+  performs, which is exactly where an unreachable adapter would hide again.
+  `AgentGenAiSpanExporter` is the segment sink that closes the loop, and
+  `genai_operation` is total over the Rakka vocabulary and matched without a
+  wildcard, so adding a class fails to compile until its convention row exists.
+- **Durations have two rules, because they have two kinds of endpoint.** A
+  duration spanning a durable boundary — an outstanding effect, a turn — is the
+  difference of two persisted timestamps, so a run that passivated or moved
+  shard mid-effect reports what a resident one would. A duration inside one
+  process has exactly one injected `now` available and measures its own
+  monotonic width, anchored at that timestamp. Using the injected clock for
+  both would have reported every live operation as instantaneous; using
+  `Instant` for both would have made a figure that survives passivation
+  impossible to compute. The effect pair was deliberately *not* split into
+  queue and dispatch: `dispatched_at` is stamped when the run hands the effect
+  to the outbox, not when a worker begins an attempt, so the split would report
+  the run's hand-off latency under a name promising queue delay.
+- **The catalogue is data, and a source scan holds it to the code.** 17.12
+  requires labels to be bounded *and documented*, and the two prose tables that
+  existed were both wrong — the technical guidance named fifteen metrics that
+  did not exist, and the in-crate label list had gone stale on four keys in
+  use. A third prose copy would have gone the same way, so
+  `AGENT_DOMAIN_METRIC_INSTRUMENTS` carries name, kind, unit, labels, and
+  buckets, and `tests/metric_catalogue.rs` scans the crate's own sources in
+  both directions. The 17.12 gauges the substrate already publishes are
+  deliberately absent rather than mirrored, with the providing instrument named
+  in the catalogue page: two names for one number is two catalogues that drift.
+- **Redaction is two layers, because bounding is not sanitizing.** The bridge
+  stopped copying the durable context's baggage into span attributes — baggage
+  is a propagation context, externally received baggage is untrusted, and the
+  agent domain's own sanitizer runs on the persist path and so never saw a span
+  built from a handed-in context — and gained the generic attribute, count, and
+  ordering bounds the metric vocabulary always had. On top of that the adapter
+  applies a closed allowlist before a record is built, because which keys may
+  be exported is a domain decision and a denylist is a guess about what content
+  will be called next time. Both were falsified: restoring the baggage copy
+  fails the bridge test, removing the allowlist filter leaks `tool_arguments`.
+
+Of the two inert features, `rakka-agent-workflow`'s was removed and
+`rakka-a2a`'s was implemented — the ingress `SERVER` span, which closes
+scenario 21's ingress half and is the only `AgentOtelSpanKind::Server` the
+workspace constructs. Propagation stayed unconditional; gating it would have
+removed trace continuity from a default build, which is the opposite of what
+the feature claimed.
+
+Owed onward, and named in
+`docs/rakka-agent-observability-catalogue.md` rather than left silent: the
+17.12 clauses with no instrument yet — logically active and waiting goals and
+runs by status class, activation/passivation rate and cold-activation latency,
+trigger and timer backlog with oldest age, wait duration by kind, the
+delegation, workflow-tool, task-operation, wake, epoch, autonomy, budget, team,
+and moderation *durations* whose counters exist, memory and retrieval latency,
+and context snapshot size — several of which need the bounded,
+deployment-invoked sweep shape of `AgentMemoryRetentionSweep`, because Rakka
+keeps no index to enumerate them from. Exemplars are 6.3b's, by decision.
+
 ### Slice 6.3b — Application binary, Collector, sampling, and exporter failure
 
 Spec: [17.14](spec.md#1714-content-capture-and-redaction),

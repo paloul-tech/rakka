@@ -122,6 +122,12 @@ Compatibility failures must be observable through multiple surfaces:
 - Metrics: `rakka.k8s.compatibility` records `state=accepted|rejected`, and `rakka.k8s.readiness` records `outcome=ready|not-ready`.
 - Remote delivery: unsupported schemas fail through the serialization registry before delivery.
 
+Agent-domain telemetry names are a compatibility surface of their own, because a deployment's dashboards, alerts, and Collector rules are written against them:
+
+- Every `rakka.agent.*` metric name, its instrument kind, its unit, and its bounded label keys are enumerated in [`rakka-agent-observability-catalogue.md`](rakka-agent-observability-catalogue.md) and held as data in `AGENT_DOMAIN_METRIC_INSTRUMENTS`. Renaming a metric, changing its kind or unit, or adding a label key is a compatibility change; adding a new metric is not. A metric declared in the crate but missing from the catalogue fails `cargo test -p rakka-agent --test metric_catalogue`.
+- Every bounded operation class of `AgentSegmentOperation` and the span name and kind it maps to under the `otel` feature are likewise enumerated there. The OpenTelemetry GenAI semantic-convention revision the mapping targets is pinned at `AGENT_GENAI_CONVENTION_REVISION` and stamped into every exported batch's instrumentation scope, so a consumer can tell which revision produced a record. Upgrading it is the specification 17.20 review, never a side effect, and never a durable-state migration.
+- Span and log export records carry only the keys in `AGENT_SPAN_ATTRIBUTE_KEYS`. A key outside it is dropped before export rather than renamed, so a consumer may rely on the absence of prompt, completion, tool-payload, memory-content, and credential keys — not merely on a Collector rule removing them.
+
 ## Tests
 
 Run the default compatibility matrix:

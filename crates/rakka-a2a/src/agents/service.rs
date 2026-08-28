@@ -143,6 +143,7 @@ pub struct RakkaAgentA2AService<
     default_tenant: Option<String>,
     metrics: Arc<dyn MetricsRecorder>,
     decision_events: Option<Arc<dyn AgentDecisionEventSink>>,
+    segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
     goal_claims: Option<Arc<dyn AgentGoalClaimSource>>,
 }
 
@@ -205,6 +206,7 @@ where
             default_tenant: None,
             metrics: Arc::new(NoopMetricsRecorder),
             decision_events: None,
+            segments: None,
             goal_claims: None,
         }
     }
@@ -291,6 +293,46 @@ where
     pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
         self.decision_events = Some(sink);
         self
+    }
+
+    /// Closes the protocol ingress segment into `sink`
+    /// ([specification 17.6](../../../docs/plans/rakka-agent/spec.md)'s first
+    /// row).
+    ///
+    /// The ingress `SERVER` span is the protocol adapter's — `rakka-agent`'s
+    /// convention mapping explicitly defers to it and does not build one —
+    /// and until this it was built by nobody, leaving scenario 21's ingress
+    /// row with a durable half and no span half. The segment brackets context
+    /// extraction and durable acceptance, which is the ordering
+    /// [17.5](../../../docs/plans/rakka-agent/spec.md) requires: the context
+    /// is extracted *before* the command is accepted, so the accepted command
+    /// belongs to the caller's trace rather than to one invented afterwards.
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
+        self.segments = Some(sink);
+        self
+    }
+
+    /// Closes one ingress segment, naming the bounded A2A operation class.
+    fn close_ingress_segment(
+        &self,
+        operation: &'static str,
+        timer: rakka_agent::AgentSegmentTimer,
+        telemetry: &rakka_agent_workflow::AgentTelemetryContext,
+        outcome: Result<(), &str>,
+    ) {
+        let Some(sink) = self.segments.as_ref() else {
+            return;
+        };
+        let segment = timer
+            .close(rakka_agent::AgentSegmentOperation::A2aIngress {
+                operation: operation.to_string(),
+            })
+            .telemetry(telemetry.clone());
+        sink.record(&match outcome {
+            Ok(()) => segment.ok(),
+            Err(code) => segment.failed("rakka.a2a.ingress", code),
+        });
     }
 
     /// Joins shared-knowledge claims into [`Self::agent_goal_view`].
@@ -779,8 +821,39 @@ where
         params: &ServiceParams,
         request: &SendMessageRequest,
     ) -> RakkaAgentA2AResult<Task> {
-        let normalized = self.normalized_send(params, request)?;
-        self.send_message_normalized(request, &normalized).await
+        // The segment begins before normalization, because extraction is part
+        // of ingress: a context that fails to parse is dropped whole there,
+        // and the segment must cover the window in which that happened.
+        let timer = rakka_agent::AgentSegmentTimer::start(self.clock.now());
+        let normalized = match self.normalized_send(params, request) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                self.close_ingress_segment(
+                    A2AOperation::SendMessage.as_label(),
+                    timer,
+                    &rakka_agent_workflow::AgentTelemetryContext::default(),
+                    Err(error.code()),
+                );
+                return Err(error);
+            }
+        };
+        // The wire method is the ingress class. The finer authorization
+        // class — a handoff, a team command, a result submission — is decided
+        // downstream from the collaboration cluster, and naming it here would
+        // claim the door knew something it does not know yet.
+        let operation = A2AOperation::SendMessage.as_label();
+        let telemetry = normalized.telemetry.clone();
+        let sent = self.send_message_normalized(request, &normalized).await;
+        self.close_ingress_segment(
+            operation,
+            timer,
+            &telemetry,
+            match &sent {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error.code()),
+            },
+        );
+        sent
     }
 
     /// The normalized half of [`Self::send_message`], shared with
