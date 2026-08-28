@@ -104,7 +104,8 @@ pub const ATTR_RAKKA_AGENT_TASK_ID: &str = "rakka.agent.task.id";
 /// Restricted Rakka attribute: `AgentDelegationId`.
 pub const ATTR_RAKKA_AGENT_DELEGATION_ID: &str = "rakka.agent.delegation.id";
 /// Rakka attribute: the settings revision in force.
-pub const ATTR_RAKKA_AGENT_SETTINGS_REVISION: &str = "rakka.agent.settings_revision";
+pub const ATTR_RAKKA_AGENT_SETTINGS_REVISION: &str =
+    crate::observability::SEGMENT_ATTR_SETTINGS_REVISION;
 /// Rakka attribute: the turn index.
 pub const ATTR_RAKKA_AGENT_TURN_INDEX: &str = "rakka.agent.turn.index";
 /// Rakka attribute: the loop phase label.
@@ -116,7 +117,13 @@ pub const ATTR_RAKKA_AGENT_DECISION_SOURCE: &str = "rakka.agent.decision.source"
 /// Rakka attribute: the effect safety-class label.
 pub const ATTR_RAKKA_AGENT_EFFECT_SAFETY: &str = "rakka.agent.effect.safety";
 /// Rakka attribute: the effect status label.
-pub const ATTR_RAKKA_AGENT_EFFECT_STATUS: &str = "rakka.agent.effect.status";
+///
+/// Aliased to the ungated segment key rather than repeating the string. The
+/// emitting path is not feature-gated and the convention mapping is, so the
+/// two would otherwise be separate literals for one key, able to drift
+/// without anything noticing — which is how an attribute ends up declared on
+/// one side and written on the other under a different name.
+pub const ATTR_RAKKA_AGENT_EFFECT_STATUS: &str = crate::observability::SEGMENT_ATTR_EFFECT_STATUS;
 /// Rakka attribute: the stable decision reason code.
 pub const ATTR_RAKKA_AGENT_DECISION_REASON: &str = "rakka.agent.decision.reason";
 /// Standard error attribute: the stable low-cardinality error type.
@@ -126,12 +133,18 @@ pub const ATTR_RAKKA_ERROR_CODE: &str = "rakka.error.code";
 
 /// Rakka attribute: the bounded effect kind a dispatch segment names.
 pub const ATTR_RAKKA_AGENT_EFFECT_KIND: &str = "rakka.agent.effect.kind";
+/// Rakka attribute: which dispatch attempt a segment describes.
+pub const ATTR_RAKKA_AGENT_EFFECT_ATTEMPT: &str = crate::observability::SEGMENT_ATTR_EFFECT_ATTEMPT;
+/// Rakka attribute: the bounded checkpoint kind a park opened.
+pub const ATTR_RAKKA_AGENT_CHECKPOINT_KIND: &str =
+    crate::observability::SEGMENT_ATTR_CHECKPOINT_KIND;
 /// Rakka attribute: the bounded A2A operation class of an ingress segment.
 pub const ATTR_RAKKA_AGENT_A2A_OPERATION: &str = "rakka.agent.a2a.operation";
 /// Rakka attribute: the bounded memory tier of a memory segment.
 pub const ATTR_RAKKA_AGENT_MEMORY_TIER: &str = "rakka.agent.memory.tier";
 /// Rakka attribute: how many loop transitions one resident slice advanced.
-pub const ATTR_RAKKA_AGENT_LOOP_TRANSITIONS: &str = "rakka.agent.loop.transitions";
+pub const ATTR_RAKKA_AGENT_LOOP_TRANSITIONS: &str =
+    crate::observability::SEGMENT_ATTR_LOOP_TRANSITIONS;
 
 /// The span event name a mapped loop decision is emitted under.
 pub const AGENT_DECISION_SPAN_EVENT: &str = "rakka.agent.decide";
@@ -164,10 +177,12 @@ pub const AGENT_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     ATTR_GEN_AI_USAGE_INPUT_TOKENS,
     ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
     ATTR_RAKKA_AGENT_A2A_OPERATION,
+    ATTR_RAKKA_AGENT_CHECKPOINT_KIND,
     ATTR_RAKKA_AGENT_DECISION_KIND,
     ATTR_RAKKA_AGENT_DECISION_REASON,
     ATTR_RAKKA_AGENT_DECISION_SOURCE,
     ATTR_RAKKA_AGENT_DELEGATION_ID,
+    ATTR_RAKKA_AGENT_EFFECT_ATTEMPT,
     ATTR_RAKKA_AGENT_EFFECT_KIND,
     ATTR_RAKKA_AGENT_EFFECT_SAFETY,
     ATTR_RAKKA_AGENT_EFFECT_STATUS,
@@ -189,10 +204,73 @@ pub const AGENT_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
 /// under a name the allowlist trusts.
 pub const AGENT_SPAN_ATTRIBUTE_VALUE_MAX_BYTES: usize = 256;
 
-/// Whether a key is one this adapter may export.
+/// Every attribute key this adapter may put on an exported **log** record.
+///
+/// A superset of [`AGENT_SPAN_ATTRIBUTE_KEYS`] rather than the same list. A
+/// log record legitimately carries the substrate's durable correlation
+/// vocabulary — the identities specification 17.13 asks a structured log to
+/// carry, which are exactly the identities 17.12 forbids on a *metric* — so
+/// applying the span list to logs would strip the audit trail while claiming
+/// to redact it.
+///
+/// The identities here are the ones that belong on an access-controlled log
+/// under 17.3; content, credentials, prompts, completions, tool payloads, and
+/// memory records appear on neither list and reach neither surface.
+pub const AGENT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
+    rakka_agent_workflow::AGENT_LOG_ATTR_AUDIT_EVENT_ID,
+    rakka_agent_workflow::AGENT_LOG_ATTR_AUDIT_KIND,
+    rakka_agent_workflow::AGENT_LOG_ATTR_CAUSATION_ID,
+    rakka_agent_workflow::AGENT_LOG_ATTR_CHECKPOINT_ID,
+    rakka_agent_workflow::AGENT_LOG_ATTR_COMMAND_ID,
+    rakka_agent_workflow::AGENT_LOG_ATTR_CORRELATION_ID,
+    rakka_agent_workflow::AGENT_LOG_ATTR_DEFINITION_VERSION,
+    rakka_agent_workflow::AGENT_LOG_ATTR_EFFECT_ID,
+    rakka_agent_workflow::AGENT_LOG_ATTR_REDACTION,
+    rakka_agent_workflow::AGENT_LOG_ATTR_RUN_ID,
+    rakka_agent_workflow::AGENT_LOG_ATTR_STEP_ID,
+    rakka_agent_workflow::AGENT_LOG_ATTR_TENANT_ID,
+    rakka_agent_workflow::AGENT_LOG_ATTR_WORKFLOW_ID,
+    rakka_agent_workflow::AGENT_LOG_ATTR_WORKFLOW_TYPE,
+];
+
+/// Whether a key is one this adapter may export on a span.
 #[must_use]
 pub fn is_agent_span_attribute(key: &str) -> bool {
     AGENT_SPAN_ATTRIBUTE_KEYS.contains(&key)
+}
+
+/// Whether a key is one this adapter may export on a log record.
+#[must_use]
+pub fn is_agent_log_attribute(key: &str) -> bool {
+    is_agent_span_attribute(key) || AGENT_LOG_ATTRIBUTE_KEYS.contains(&key)
+}
+
+/// Keeps only what a log record may carry.
+#[must_use]
+fn allowlisted_log(attributes: AgentAttributes) -> AgentAttributes {
+    attributes
+        .into_iter()
+        .filter(|(key, value)| {
+            is_agent_log_attribute(key)
+                && !value.is_empty()
+                && value.len() <= AGENT_SPAN_ATTRIBUTE_VALUE_MAX_BYTES
+                && !value.contains('\n')
+                && !value.contains('\r')
+        })
+        .collect()
+}
+
+/// Applies the log allowlist to one record, in place.
+///
+/// Filtering rather than refusing, for the same reason the span path filters:
+/// a record carrying an unknown key is still worth exporting without it, and
+/// dropping the whole record would turn a telemetry mistake into a lost audit
+/// correlation.
+#[must_use]
+pub fn allowlist_agent_log(mut log: AgentLogEvent) -> AgentLogEvent {
+    log.attributes = allowlisted_log(log.attributes);
+    log.resource = allowlisted_log(log.resource);
+    log
 }
 
 /// Accepts an exported span or log attribute set, or names the first key it
@@ -605,9 +683,26 @@ pub fn segment_span(segment: &AgentTelemetrySegment) -> AgentOtlpResult<AgentOte
         AgentSegmentOutcome::Unset => span.status = AgentOtelSpanStatus::Unset,
     }
 
+    // Provider-reported usage, when the segment carried it. `usage_attributes`
+    // maps only what the provider actually reported, which is why the segment
+    // holds an `Option` rather than a zeroed struct.
+    if let Some(usage) = &segment.usage {
+        attributes.extend(usage_attributes(usage));
+    }
+
     // The bridge copies nothing into attributes on its own any more, so this
     // set is exactly what the adapter decided to export.
     span.attributes = allowlisted(attributes);
+
+    // Every durable decision the operation committed becomes a bounded span
+    // event ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)
+    // allows a decision span *or* span event; an event on the transition that
+    // made the decision is the one that needs no correlation to be useful).
+    for decision in &segment.decisions {
+        let mut event = decision_span_event(decision);
+        event.attributes = allowlisted(event.attributes);
+        span = span.event(event);
+    }
     Ok(span)
 }
 
@@ -846,6 +941,10 @@ impl AgentGenAiSpanExporter {
         logs: Vec<AgentLogEvent>,
     ) -> AgentOtlpResult<AgentOtlpBridgeExport> {
         let instruments = crate::observability::agent_domain_instrument_views();
+        // Logs pass the allowlist here rather than at their emitter, because
+        // this is the boundary they leave Rakka at and a caller may hand in
+        // records this crate did not build.
+        let logs = logs.into_iter().map(allowlist_agent_log).collect();
         Ok(AgentOtlpBridgeExport::from_signals_with_instruments(
             exporter,
             resource,

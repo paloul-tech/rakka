@@ -2651,6 +2651,17 @@ impl AuthorityFixture {
         self
     }
 
+    /// Wires the run entity with a bounded-segment sink.
+    ///
+    /// The dispatch pipeline takes its own through `pipeline().with_segments`:
+    /// the two are separate wirings because they are separate processes in a
+    /// real deployment, and a test that wires only one is asserting about only
+    /// one.
+    pub fn with_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
+        self.fx = self.fx.with_segments(sink);
+        self
+    }
+
     /// Replaces the envelope the agent is instantiated under.
     pub fn with_envelope(mut self, envelope: AgentAuthorityEnvelope) -> Self {
         self.envelope = envelope;
@@ -2722,6 +2733,9 @@ impl AuthorityFixture {
         .with_effect_policies(self.fx.policies.clone());
         if let Some(config) = &self.fx.workflow_tools {
             delivery = delivery.with_workflow_tools(config.clone());
+        }
+        if let Some(segments) = &self.fx.segments {
+            delivery = delivery.with_segments(segments.clone());
         }
         let mut pipeline = AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new(worker_id),

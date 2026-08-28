@@ -29,8 +29,8 @@ use rakka_agent::{
     ATTR_GEN_AI_TOOL_TYPE, ATTR_RAKKA_ERROR_CODE, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{
-    AgentAttributes, AgentOtelResource, AgentOtelSpanKind, AgentOtelSpanStatus,
-    AgentOtlpExporterConfig, AgentTelemetryContext, AgentTimestampMillis,
+    AgentAttributes, AgentLogEvent, AgentLogSeverity, AgentOtelResource, AgentOtelSpanKind,
+    AgentOtelSpanStatus, AgentOtlpExporterConfig, AgentTelemetryContext, AgentTimestampMillis,
 };
 use rakka_core::InMemoryMetricsRecorder;
 
@@ -486,4 +486,245 @@ async fn the_dispatcher_closes_the_model_and_tool_rows() {
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].kind, AgentOtelSpanKind::Client);
     assert!(spans[0].name.starts_with("chat "));
+}
+
+/// The eight retention classes of specification 17.16 are only expressible if
+/// a span carries something to select on. These are the four that had nothing
+/// before the follow-up, driven through the mapping rather than asserted at
+/// the constants.
+#[test]
+fn the_retention_classes_have_attributes_to_select_on() {
+    // Indeterminate effect: the outcome 17.9 requires to be retainable.
+    let indeterminate = AgentTelemetrySegment::new(
+        AgentSegmentOperation::EffectDispatch {
+            effect_kind: "tool-call",
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(9),
+    )
+    .telemetry(traced())
+    .attribute(
+        rakka_agent::SEGMENT_ATTR_EFFECT_STATUS,
+        rakka_agent::AgentRunEffectStatus::Indeterminate.as_label(),
+    )
+    .attribute(rakka_agent::SEGMENT_ATTR_EFFECT_ATTEMPT, "3")
+    .failed("rakka.agent.effect", "dispatch-ambiguous");
+    let span = segment_span(&indeterminate).expect("the span maps");
+    assert_eq!(span.status, AgentOtelSpanStatus::Error);
+    assert_eq!(
+        span.attributes
+            .get(rakka_agent::ATTR_RAKKA_AGENT_EFFECT_STATUS)
+            .map(String::as_str),
+        Some("indeterminate"),
+        "an indeterminate outcome must be selectable"
+    );
+    // Excessive retry.
+    assert_eq!(
+        span.attributes
+            .get(rakka_agent::ATTR_RAKKA_AGENT_EFFECT_ATTEMPT)
+            .map(String::as_str),
+        Some("3")
+    );
+
+    // Checkpoint escalation or timeout: the park names its kind.
+    let checkpoint = AgentTelemetrySegment::new(
+        AgentSegmentOperation::CheckpointOpen,
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .attribute(rakka_agent::SEGMENT_ATTR_CHECKPOINT_KIND, "approval")
+    .ok();
+    let span = segment_span(&checkpoint).expect("the span maps");
+    assert_eq!(
+        span.attributes
+            .get(rakka_agent::ATTR_RAKKA_AGENT_CHECKPOINT_KIND)
+            .map(String::as_str),
+        Some("approval")
+    );
+
+    // A newly deployed version under investigation.
+    let decide = AgentTelemetrySegment::new(
+        AgentSegmentOperation::Decide {
+            phase: "deciding-continuation",
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .attribute(rakka_agent::SEGMENT_ATTR_SETTINGS_REVISION, "7")
+    .ok();
+    let span = segment_span(&decide).expect("the span maps");
+    assert_eq!(
+        span.attributes
+            .get(rakka_agent::ATTR_RAKKA_AGENT_SETTINGS_REVISION)
+            .map(String::as_str),
+        Some("7")
+    );
+}
+
+/// The ungated segment keys and the gated convention constants are the same
+/// strings, because the convention constants alias them. Two literals for one
+/// key across a feature boundary is how an attribute ends up declared on one
+/// side and written on the other under a different name.
+#[test]
+fn the_segment_keys_and_the_convention_keys_are_one_set_of_strings() {
+    for (segment_key, convention_key) in [
+        (
+            rakka_agent::SEGMENT_ATTR_EFFECT_STATUS,
+            rakka_agent::ATTR_RAKKA_AGENT_EFFECT_STATUS,
+        ),
+        (
+            rakka_agent::SEGMENT_ATTR_EFFECT_ATTEMPT,
+            rakka_agent::ATTR_RAKKA_AGENT_EFFECT_ATTEMPT,
+        ),
+        (
+            rakka_agent::SEGMENT_ATTR_CHECKPOINT_KIND,
+            rakka_agent::ATTR_RAKKA_AGENT_CHECKPOINT_KIND,
+        ),
+        (
+            rakka_agent::SEGMENT_ATTR_SETTINGS_REVISION,
+            rakka_agent::ATTR_RAKKA_AGENT_SETTINGS_REVISION,
+        ),
+        (
+            rakka_agent::SEGMENT_ATTR_LOOP_TRANSITIONS,
+            rakka_agent::ATTR_RAKKA_AGENT_LOOP_TRANSITIONS,
+        ),
+    ] {
+        assert_eq!(segment_key, convention_key);
+        assert!(is_agent_span_attribute(segment_key));
+    }
+}
+
+/// A segment carrying durable decisions maps them to bounded span events, and
+/// provider-reported usage to the convention's usage attributes. These are the
+/// two mapping functions that still had no caller after the first pass.
+///
+/// The decision comes from a real run rather than a constructed one, which is
+/// the part worth proving: the run entity attaching its committed decisions to
+/// the segment is what gives `decision_span_event` a caller at all.
+#[tokio::test]
+async fn decisions_and_usage_reach_the_span_through_their_mappers() {
+    let sink = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup", "argument"))
+            .with_turn_for(2, proposing_turn("resolved")),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    );
+    // Both sinks, and the coupling is deliberate: a decision is a *durable*
+    // record, so the loop writes one only when a decision sink is wired.
+    // Letting a span sink switch that on would make a telemetry choice change
+    // durable state, which is precisely backwards. Segments carry the
+    // decisions a run was already recording.
+    let fx = Fixture::new(dispatcher)
+        .with_segments(sink.clone())
+        .with_decision_events(Arc::new(rakka_agent::InMemoryAgentDecisionEventSink::new()));
+    fx.instantiate_agent().await;
+    fx.create_task_traced(traced()).await;
+    fx.pump().await.expect("the run completes");
+
+    let deciding = sink
+        .segments()
+        .into_iter()
+        .find(|segment| !segment.decisions.is_empty())
+        .expect("a committed transition carried its decisions onto the segment");
+    let span = segment_span(&deciding).expect("the span maps");
+    assert_eq!(span.events.len(), deciding.decisions.len());
+    assert!(span
+        .events
+        .iter()
+        .all(|event| event.name == rakka_agent::AGENT_DECISION_SPAN_EVENT));
+    assert!(span.events[0]
+        .attributes
+        .contains_key("rakka.agent.decision.kind"));
+    // A decision event names no identifier, on the span as in durable state.
+    for event in &span.events {
+        for key in event.attributes.keys() {
+            assert!(is_agent_span_attribute(key), "{key} escaped the allowlist");
+            assert!(!key.ends_with(".id"));
+        }
+    }
+
+    // Usage that reports nothing is dropped rather than exported as a zero.
+    let empty = AgentTelemetrySegment::new(
+        AgentSegmentOperation::ModelInference {
+            model_profile: "fast".to_string(),
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .usage(rakka_agent::AgentModelUsage::default())
+    .ok();
+    let span = segment_span(&empty).expect("the span maps");
+    assert!(!span
+        .attributes
+        .contains_key(rakka_agent::ATTR_GEN_AI_USAGE_INPUT_TOKENS));
+
+    let reported = AgentTelemetrySegment::new(
+        AgentSegmentOperation::ModelInference {
+            model_profile: "fast".to_string(),
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .usage(rakka_agent::AgentModelUsage {
+        input_tokens: 120,
+        output_tokens: 45,
+        cost_micros: 900,
+    })
+    .ok();
+    let span = segment_span(&reported).expect("the span maps");
+    assert_eq!(
+        span.attributes
+            .get(rakka_agent::ATTR_GEN_AI_USAGE_INPUT_TOKENS)
+            .map(String::as_str),
+        Some("120")
+    );
+    // Cost is provider-reported too, and deliberately never exported.
+    assert!(!serde_json::to_string(&span)
+        .expect("the record serializes")
+        .contains("900"));
+}
+
+/// A log record's allowlist is a superset of the span one, and for a reason:
+/// a structured log carries the durable correlation identities 17.13 asks for,
+/// which are exactly the identities 17.12 forbids on a metric. Applying the
+/// span list to logs would strip the audit trail while claiming to redact it.
+#[test]
+fn a_log_keeps_its_correlation_vocabulary_and_loses_everything_else() {
+    let mut attributes = AgentAttributes::new();
+    attributes.insert("run_id".to_string(), "run-1".to_string());
+    attributes.insert("audit_event_id".to_string(), "audit-1".to_string());
+    attributes.insert("correlation_id".to_string(), "corr-1".to_string());
+    attributes.insert("prompt_text".to_string(), "SENSITIVE".to_string());
+    attributes.insert("authorization".to_string(), "Bearer SECRET".to_string());
+
+    let log = AgentLogEvent::new(
+        "rakka.agent.run.started",
+        AgentLogSeverity::Info,
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(1),
+    );
+    let log = AgentLogEvent { attributes, ..log };
+
+    let filtered = rakka_agent::allowlist_agent_log(log);
+    assert!(filtered.attributes.contains_key("run_id"));
+    assert!(filtered.attributes.contains_key("audit_event_id"));
+    assert!(filtered.attributes.contains_key("correlation_id"));
+    assert!(!filtered.attributes.contains_key("prompt_text"));
+    assert!(!filtered.attributes.contains_key("authorization"));
+    for key in filtered.attributes.keys() {
+        assert!(rakka_agent::is_agent_log_attribute(key), "{key} escaped");
+    }
+
+    // A run id belongs on a log and not on a span: the two lists differ on
+    // purpose, and the span list is the stricter one.
+    assert!(!is_agent_span_attribute("run_id"));
 }

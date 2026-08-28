@@ -4635,6 +4635,23 @@ wrong in a specific way rather than merely less tidy.
   will be called next time. Both were falsified: restoring the baggage copy
   fails the bridge test, removing the allowlist filter leaks `tool_arguments`.
 
+A follow-up pass closed what the first left open, and the gap is worth
+recording because it was the slice's own defect class recurring: three
+attributes had been *declared and allowlisted* while nothing wrote them, which
+is exactly the shape — a vocabulary that reads complete and emits nothing —
+that made the adapter unreachable in the first place. Four of
+[17.16](spec.md#1716-sampling)'s eight retention classes had nothing to select
+on, so a Collector rule expressing them would have matched nothing in
+production while passing its own tests. `rakka.agent.effect.status`,
+`rakka.agent.effect.attempt`, `rakka.agent.checkpoint.kind`, and
+`rakka.agent.settings_revision` now ride the segments that know them; the
+`checkpoint-open` and `run-resume` rows are wired; the two remaining orphaned
+mapping functions (`decision_span_event`, `usage_attributes`) have callers
+through segment fields; and the log allowlist joins the span one — wider by
+design, since a structured log carries the durable identities a metric may not.
+The convention constants alias the ungated segment keys, so one key can never
+again be two literals across a feature boundary.
+
 Of the two inert features, `rakka-agent-workflow`'s was removed and
 `rakka-a2a`'s was implemented — the ingress `SERVER` span, which closes
 scenario 21's ingress half and is the only `AgentOtelSpanKind::Server` the

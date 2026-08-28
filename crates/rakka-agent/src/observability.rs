@@ -1580,7 +1580,9 @@ impl AgentSegmentIdentity {
 /// [17.20](../../../docs/plans/rakka-agent/spec.md) forbids. What *is*
 /// persisted is the trace context the segment carries, which is what lets a
 /// resume link back to the operation that parked.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` is absent because [`AgentDecisionEvent`] derives only `PartialEq`, as
+// does [`AgentDecisionEventPage`]; a segment carrying one follows.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentTelemetrySegment {
     /// The bounded operation class.
     pub operation: AgentSegmentOperation,
@@ -1599,6 +1601,29 @@ pub struct AgentTelemetrySegment {
     /// Bounded attributes from closed vocabularies. Never content, never a
     /// credential, never an unbounded message.
     pub attributes: AgentAttributes,
+    /// The durable decisions the operation committed, when it committed any.
+    ///
+    /// Carried as the domain's own [`AgentDecisionEvent`] rather than as a
+    /// convention span event, so the ungated path stays free of the GenAI
+    /// vocabulary and the mapping stays in one place
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md): a
+    /// durable decision produces a correlated decision span *or span event*).
+    ///
+    /// A run populates this only when it is already recording decisions —
+    /// that is, when a decision sink is wired. The coupling is deliberate: a
+    /// decision is a durable record, and letting a *telemetry* sink switch on
+    /// a durable write would invert
+    /// [17.1](../../../docs/plans/rakka-agent/spec.md), which makes telemetry
+    /// never a correctness input. Segments carry the decisions a run was
+    /// already committing, and none it was not.
+    pub decisions: Vec<AgentDecisionEvent>,
+    /// Provider-reported token usage, when the operation was a model call
+    /// that reported some.
+    ///
+    /// Only what the provider actually reported
+    /// ([17.8](../../../docs/plans/rakka-agent/spec.md): never invent token
+    /// usage), and absent rather than zeroed when it reported none.
+    pub usage: Option<crate::model::AgentModelUsage>,
     /// The durable trace context the operation belongs to.
     pub telemetry: AgentTelemetryContext,
 }
@@ -1620,6 +1645,8 @@ impl AgentTelemetrySegment {
             error_code: None,
             identity: AgentSegmentIdentity::default(),
             attributes: AgentAttributes::new(),
+            decisions: Vec::new(),
+            usage: None,
             telemetry: AgentTelemetryContext::default(),
         }
     }
@@ -1676,6 +1703,23 @@ impl AgentTelemetrySegment {
         self
     }
 
+    /// Attaches the durable decisions the operation committed.
+    #[must_use]
+    pub fn decisions(mut self, decisions: Vec<AgentDecisionEvent>) -> Self {
+        self.decisions = decisions;
+        self
+    }
+
+    /// Attaches provider-reported token usage.
+    ///
+    /// Usage that reports no tokens at all is dropped rather than attached: a
+    /// zero is a claim about the provider there is no evidence for.
+    #[must_use]
+    pub fn usage(mut self, usage: crate::model::AgentModelUsage) -> Self {
+        self.usage = (usage.total_tokens() > 0).then_some(usage);
+        self
+    }
+
     /// The operation's duration in milliseconds, or `None` when the clock ran
     /// backwards between the endpoints.
     #[must_use]
@@ -1686,6 +1730,28 @@ impl AgentTelemetrySegment {
 
 /// The longest stable error code a segment carries.
 pub const AGENT_SEGMENT_ERROR_CODE_MAX_LENGTH: usize = 96;
+
+/// Segment attribute: the resolved status of the effect an operation settled.
+///
+/// This is the key a retention policy selects `indeterminate` on
+/// ([specification 17.9](../../../docs/plans/rakka-agent/spec.md): an
+/// indeterminate transition must be an important event suitable for
+/// tail-sampling retention).
+pub const SEGMENT_ATTR_EFFECT_STATUS: &str = "rakka.agent.effect.status";
+
+/// Segment attribute: which dispatch attempt this was, so a retention policy
+/// can select excessive retry.
+pub const SEGMENT_ATTR_EFFECT_ATTEMPT: &str = "rakka.agent.effect.attempt";
+
+/// Segment attribute: the settings revision in force, so a retention policy
+/// can select a newly deployed version under investigation.
+pub const SEGMENT_ATTR_SETTINGS_REVISION: &str = "rakka.agent.settings_revision";
+
+/// Segment attribute: how many loop transitions one resident slice advanced.
+pub const SEGMENT_ATTR_LOOP_TRANSITIONS: &str = "rakka.agent.loop.transitions";
+
+/// Segment attribute: the bounded checkpoint kind a park opened.
+pub const SEGMENT_ATTR_CHECKPOINT_KIND: &str = "rakka.agent.checkpoint.kind";
 
 /// Measures one *live* bounded operation — a transition, a dispatch attempt,
 /// a provider call — and closes it into a segment.

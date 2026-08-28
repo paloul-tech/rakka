@@ -179,21 +179,55 @@ milestones; the emission is not, and this is the list rather than a silence.
 
 | Closed by | Classes |
 | --- | --- |
-| The run entity | `decide`, `invoke-agent`, `effect-schedule`, `run-recover` |
+| The run entity | `decide`, `invoke-agent`, `effect-schedule`, `checkpoint-open`, `run-resume`, `run-recover` |
 | The dispatcher | `tool-authorize`, `effect-dispatch`, `model-inference`, `execute-tool` |
 | The A2A service | `a2a-ingress` |
 
 The remaining classes — `wake-admit`, `autonomy-admit`, `budget-reserve`,
 `budget-settle`, `validate-task-result`, `handoff`, `team-operation`,
 `moderation-turn`, `workflow-invoke`, `goal-evaluate`, `delegate-to-peer`,
-`memory-operation`, `retrieval`, `checkpoint-open`, and `run-resume` — map to
-spans today but are closed by nobody. Wiring them means threading the sink
+`memory-operation`, and `retrieval` — map to spans today but are closed by
+nobody. Wiring them means threading the sink
 through the task, team, and conversation entities, which is the same shape as
 the run entity's and is owed rather than blocked. `delegate-to-peer`,
 `workflow-invoke`, and `goal-evaluate` are additionally *covered in interval*
 by `effect-dispatch`, whose `effect_kind` label distinguishes an A2A send from
 a workflow start from a goal evaluation — what they lack is the convention's
 own name and kind, not a measurement.
+
+### What a retention policy can select on
+
+[Specification 17.16](plans/rakka-agent/spec.md) asks a sampling policy to
+retain eight classes of trace. A policy can only express a class if a span
+carries something to match, so the mapping is recorded here rather than left
+for the deployment slice to discover:
+
+| 17.16 retention class | Selectable on |
+| --- | --- |
+| `ERROR` status or stable failure code | span status, `error.type`, `rakka.error.code` |
+| Indeterminate effect or reconciliation | `rakka.agent.effect.status` = `indeterminate`, on an error-status dispatch span closed at the park |
+| Security denial, policy override, revocation | the refusal code on a failed `rakka.agent.tool.authorize` span |
+| Checkpoint escalation or timeout | `rakka.agent.checkpoint.kind` on `rakka.agent.checkpoint.open` |
+| Recovery failure | error status on `rakka.agent.run.recover` |
+| Configured high latency | the span's own duration |
+| Excessive retry | `rakka.agent.effect.attempt` |
+| Newly deployed version under investigation | `rakka.agent.settings_revision` |
+
+Stale-owner conflict is the one 17.16 case with no dedicated attribute: it
+surfaces today as a failed transition's stable error code rather than as a
+class of its own.
+
+### Two vocabularies, and why the log one is wider
+
+`AGENT_SPAN_ATTRIBUTE_KEYS` is the closed set a span may carry.
+`AGENT_LOG_ATTRIBUTE_KEYS` is a **superset**, adding the substrate's durable
+correlation identities — `run_id`, `correlation_id`, `causation_id`,
+`audit_event_id`, and the rest. That is not a weaker rule, it is a different
+one: [17.13](plans/rakka-agent/spec.md) asks a structured log to carry exactly
+the identities [17.12](plans/rakka-agent/spec.md) forbids on a *metric*, so
+applying the span list to logs would strip the audit trail while claiming to
+redact it. Content, credentials, prompts, completions, tool payloads, and
+memory records are on neither list and reach neither surface.
 
 A class with no call site is not a silent gap in the suite:
 `tests/telemetry_segments.rs` asserts the classes above against a real run and

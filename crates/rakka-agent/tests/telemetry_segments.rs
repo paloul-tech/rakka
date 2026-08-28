@@ -96,6 +96,16 @@ async fn a_run_closes_a_segment_for_every_committed_transition() {
         .filter(|segment| matches!(segment.operation, AgentSegmentOperation::InvokeAgent { .. }))
         .count();
     assert!(decides > 0, "committed transitions close decide segments");
+    // A resume is a durable wait being discharged — here, the model result
+    // arriving at a run parked in `AwaitingModel`. It is closed only when the
+    // wait actually ended, so a duplicate or a refusal closes none.
+    assert!(
+        segments
+            .iter()
+            .any(|segment| matches!(segment.operation, AgentSegmentOperation::RunResume)),
+        "discharging a durable wait closes a resume segment: {:?}",
+        sink.operations()
+    );
     // The schedule row ends after durable acceptance into the outbox, not
     // after the transition that marked the effect ready — `Ready` does not
     // prove the sink write landed.
@@ -260,6 +270,34 @@ async fn the_real_dispatch_pipeline_closes_its_own_segments() {
         }
     }
 
+    // The attributes specification 17.16's retention classes select on ride
+    // the attempt that produced them, so a tail-sampling policy has something
+    // to match rather than a rule that silently keeps nothing.
+    let dispatch = sink
+        .segments()
+        .into_iter()
+        .find(|segment| {
+            matches!(
+                segment.operation,
+                AgentSegmentOperation::EffectDispatch { .. }
+            )
+        })
+        .expect("a dispatch segment was closed");
+    assert_eq!(
+        dispatch
+            .attributes
+            .get(rakka_agent::SEGMENT_ATTR_EFFECT_STATUS)
+            .map(String::as_str),
+        Some("succeeded"),
+        "the resolved effect status must be selectable"
+    );
+    assert!(dispatch
+        .attributes
+        .contains_key(rakka_agent::SEGMENT_ATTR_EFFECT_ATTEMPT));
+    assert!(dispatch
+        .attributes
+        .contains_key(rakka_agent::SEGMENT_ATTR_SETTINGS_REVISION));
+
     let operations = sink.operations();
     for expected in ["tool-authorize", "effect-dispatch", "model-inference"] {
         assert!(
@@ -289,4 +327,80 @@ async fn the_real_dispatch_pipeline_closes_its_own_segments() {
         assert_eq!(segment.outcome, AgentSegmentOutcome::Ok);
         assert!(segment.telemetry.trace_parent.is_some() || segment.identity.run.is_some());
     }
+}
+
+/// A checkpoint park closes its segment after the durable park, and names the
+/// bounded checkpoint kind a retention policy selects escalation and timeout
+/// on.
+///
+/// Specification 17.11 requires the opening span to end once the wait and its
+/// notification are accepted, and forbids holding a span object across the
+/// wait — so this asserts the segment exists *and* that the run is parked when
+/// it does, which is the pair that makes the claim meaningful.
+#[tokio::test]
+async fn a_checkpoint_park_closes_its_segment_and_holds_none_open() {
+    const TOOL: &str = "charge-card";
+
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let registry = AgentToolRegistry::new()
+        .register(
+            tool_binding_for_spec(TOOL, &AgentEffectSpec::non_idempotent())
+                .with_checkpoint_required(),
+        )
+        .expect("the tool registers");
+    let adapter = DeterministicModelAdapter::new()
+        .with_turn_for(1, tool_calling_turn(TOOL))
+        .with_turn_for(2, proposing_turn("charged"));
+    // The checkpoint park is a *run entity* transition, so the sink has to
+    // reach the entity as well as the dispatch pipeline. They are separate
+    // wirings because in a deployment they are separate processes.
+    let fx = AuthorityFixture::over(adapter, registry, None).with_segments(sink.clone());
+    fx.start().await;
+
+    let mut pipeline = fx.pipeline().with_segments(sink.clone());
+    for _round in 0..16 {
+        fx.settle().await;
+        let pass = pipeline
+            .pump_run(&run_scope())
+            .await
+            .expect("the dispatch pass runs");
+        let parked = fx
+            .fx
+            .run_snapshot()
+            .await
+            .is_some_and(|run| run.status == rakka_agent::AgentRunStatus::WaitingForApproval);
+        if parked {
+            break;
+        }
+        if pass.registered == 0 && pass.claimed == 0 && pass.delivered == 0 {
+            break;
+        }
+    }
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(
+        run.status,
+        rakka_agent::AgentRunStatus::WaitingForApproval,
+        "the fixture must reach the checkpoint wait, or this proves nothing"
+    );
+
+    let checkpoints: Vec<_> = sink
+        .segments()
+        .into_iter()
+        .filter(|segment| matches!(segment.operation, AgentSegmentOperation::CheckpointOpen))
+        .collect();
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "the park closes exactly one checkpoint segment: {:?}",
+        sink.operations()
+    );
+    assert!(checkpoints[0]
+        .attributes
+        .contains_key(rakka_agent::SEGMENT_ATTR_CHECKPOINT_KIND));
+    // Ended, not held: the segment has both endpoints while the run is still
+    // parked, which is what "no span object is held during passive wait"
+    // means in a system that never holds one at all.
+    assert!(checkpoints[0].duration_ms().is_some());
+    assert_eq!(checkpoints[0].outcome, AgentSegmentOutcome::Ok);
 }

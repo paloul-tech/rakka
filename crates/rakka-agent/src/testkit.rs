@@ -3002,6 +3002,7 @@ where
     policies: AgentEffectPolicies,
     workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
+    segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -3025,6 +3026,7 @@ where
             policies: AgentEffectPolicies::default(),
             workflow_tools: None,
             delegation: None,
+            segments: None,
         }
     }
 
@@ -3044,6 +3046,20 @@ where
         config: crate::workflow_tool::AgentRunWorkflowConfig,
     ) -> Self {
         self.workflow_tools = Some(config);
+        self
+    }
+
+    /// Wires the entity this delivery drives with a bounded-segment sink.
+    ///
+    /// Delivering a durable result *advances the loop* — it is what discharges
+    /// a wait, folds a turn, and opens the next checkpoint — so this driver
+    /// closes segments as much as the entity a caller drives directly. Every
+    /// driver of a run must share one wiring, the same rule session memory and
+    /// decision events already follow: an unwired driver silently closes
+    /// nothing for every transition it commits.
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn crate::observability::AgentSegmentSink>) -> Self {
+        self.segments = Some(sink);
         self
     }
 
@@ -3077,6 +3093,9 @@ where
             }
             if let Some(config) = &self.delegation {
                 entity = entity.with_delegation(config.clone());
+            }
+            if let Some(segments) = &self.segments {
+                entity = entity.with_segments(segments.clone());
             }
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity

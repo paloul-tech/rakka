@@ -116,7 +116,7 @@ use crate::definition::{AgentCredentialBindingRef, AgentEffectSafetyClass, Agent
 use crate::effect::{
     compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentMemoryPromotionRequest,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
-    AgentRunEffectSink, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
+    AgentRunEffectSink, AgentRunEffectStatus, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
 };
 use crate::identity::{AgentIdentityError, AgentRunScope, AgentScope};
 use crate::memory::{
@@ -125,7 +125,10 @@ use crate::memory::{
     PrivateMemoryExpectation, SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
 };
 use crate::model::{AgentModelAdapter, AgentModelRequest, AgentToolCallRequest};
-use crate::observability::{AgentSegmentOperation, AgentSegmentTimer};
+use crate::observability::{
+    AgentSegmentOperation, AgentSegmentTimer, SEGMENT_ATTR_EFFECT_ATTEMPT,
+    SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_SETTINGS_REVISION,
+};
 use crate::run::{
     load_agent_run_state, AgentRun, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError,
     AgentRunState,
@@ -2531,17 +2534,36 @@ where
             .invoke(scope, intent, &granted, credential.as_ref())
             .await;
         drop(credential);
-        let attempt_segment = attempt_timer.close(AgentSegmentOperation::EffectDispatch {
-            effect_kind: intent.kind().as_label(),
-        });
-        self.close_segment(
-            scope,
-            &intent.telemetry,
-            match &invoked {
-                Ok(_) => attempt_segment.ok(),
-                Err(error) => attempt_segment.failed("rakka.agent.dispatch", error.code()),
-            },
-        );
+        // The three attributes a retention policy selects on, and the reason
+        // each is here: the resolved status carries `indeterminate`, which
+        // specification 17.9 requires to be retainable; the attempt number is
+        // what "excessive retry" means; and the settings revision is what
+        // "a newly deployed version under investigation" means.
+        let attempt_segment = attempt_timer
+            .close(AgentSegmentOperation::EffectDispatch {
+                effect_kind: intent.kind().as_label(),
+            })
+            .attribute(SEGMENT_ATTR_EFFECT_ATTEMPT, attempt.to_string())
+            .attribute(
+                SEGMENT_ATTR_SETTINGS_REVISION,
+                granted.grant.settings_revision.get().to_string(),
+            );
+        let attempt_segment = match &invoked {
+            Ok(outcome) => attempt_segment
+                .attribute(
+                    SEGMENT_ATTR_EFFECT_STATUS,
+                    outcome.resolved_status().as_label(),
+                )
+                .ok(),
+            Err(error) => attempt_segment.failed("rakka.agent.dispatch", error.code()),
+        };
+        // Provider-reported usage rides the attempt that produced it, so a
+        // token count and the latency that produced it are one record.
+        let attempt_segment = match &invoked {
+            Ok(AgentRunEffectOutcome::Model { turn }) => attempt_segment.usage(turn.usage),
+            _ => attempt_segment,
+        };
+        self.close_segment(scope, &intent.telemetry, attempt_segment);
 
         if !self.survives(AgentDispatchWindow::AfterInvocation) {
             return Ok(ClaimConclusion::Died);
@@ -2864,6 +2886,7 @@ where
         message: &str,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
+        let timer = AgentSegmentTimer::start(self.now());
         self.deliver_outcome(
             scope,
             intent,
@@ -2879,6 +2902,25 @@ where
             pass,
         )
         .await?;
+        // An indeterminate outcome is an error event a retention policy must
+        // be able to keep ([specification 17.9]) — and it is the one outcome
+        // the dispatch attempt's own segment cannot describe, because the
+        // attempt did not conclude: this is the *decision* that its outcome is
+        // unknowable, taken after the fact and often on a different worker.
+        self.close_segment(
+            scope,
+            &intent.telemetry,
+            timer
+                .close(AgentSegmentOperation::EffectDispatch {
+                    effect_kind: intent.kind().as_label(),
+                })
+                .attribute(
+                    SEGMENT_ATTR_EFFECT_STATUS,
+                    AgentRunEffectStatus::Indeterminate.as_label(),
+                )
+                .attribute(SEGMENT_ATTR_EFFECT_ATTEMPT, attempt.to_string())
+                .failed("rakka.agent.effect", bounded_failure_code(code)),
+        );
         pass.parked_indeterminate += 1;
         self.settle_ticket_cancelled(scope, &claim, "indeterminate", pass)
             .await?;

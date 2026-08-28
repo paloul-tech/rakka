@@ -117,7 +117,8 @@ use crate::observability::{
     METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
     METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION, METRIC_AGENT_RECOVERY_EVENTS,
     METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
-    METRIC_AGENT_TURN_DURATION, METRIC_AGENT_WORKFLOW_RESULTS,
+    METRIC_AGENT_TURN_DURATION, METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND,
+    SEGMENT_ATTR_LOOP_TRANSITIONS, SEGMENT_ATTR_SETTINGS_REVISION,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -6464,6 +6465,17 @@ where
         // transition commits before the settle pass, so a resolution can be
         // durable even when the call fails.
         let resolution_before = self.fan_in_resolution();
+        // A resume is a durable wait being discharged, which is exactly a
+        // command arriving at a run whose phase does not advance on its own
+        // ([specification 17.11]: the resume segment links the parked
+        // operation to the request that triggered it, and no span object was
+        // held across the wait in between).
+        let resume_timer = self
+            .state()
+            .ok()
+            .and_then(|state| state.loop_state().map(AgentLoopState::phase))
+            .filter(|phase| phase.is_waiting())
+            .map(|_| AgentSegmentTimer::start(now));
         let reverify = command.clone();
         let reply = match self.apply_command(command, router, now).await {
             // A command that *commits* is fenced by its own compare-and-set:
@@ -6488,6 +6500,20 @@ where
             other => other,
         };
         self.record_fan_in_resolution(resolution_before);
+        // Closed only when the wait actually ended. A command that arrives at
+        // a waiting run and leaves it waiting — a duplicate, a refusal, a
+        // partial fan-in — discharged nothing, and a resume segment for it
+        // would claim a transition that did not happen.
+        if let Some(timer) = resume_timer {
+            let resumed = self
+                .state()
+                .ok()
+                .and_then(|state| state.loop_state().map(AgentLoopState::phase))
+                .is_some_and(|phase| !phase.is_waiting());
+            if resumed {
+                self.close_segment(timer.close(AgentSegmentOperation::RunResume).ok());
+            }
+        }
         reply
     }
 
@@ -7250,6 +7276,23 @@ where
                     })
                 })
                 .flatten();
+            // Read before the transition so the segment can name exactly what
+            // *this* transition added: the decisions it committed, and whether
+            // it opened a checkpoint. A post-hoc read alone could not tell a
+            // decision this transition made from one an earlier pass owed.
+            let (decisions_before, checkpoints_before, settings_revision) = self
+                .state()
+                .ok()
+                .and_then(|state| {
+                    state.loop_state().map(|loop_state| {
+                        (
+                            loop_state.decision_outbox().len(),
+                            loop_state.open_checkpoints().len(),
+                            loop_state.agent_settings_revision(),
+                        )
+                    })
+                })
+                .unwrap_or((0, 0, AgentRevisionNumber::INITIAL));
             let transition_segment = AgentSegmentTimer::start(now);
             let committed = self
                 .host
@@ -7285,15 +7328,54 @@ where
                 &[("phase", phase)],
             )
             .ok();
-            // The transition committed, so the decision it carried is durable;
-            // the segment describes work that actually happened. The persisted
-            // context is what links it to the operation that scheduled the
-            // effect this transition acted on.
+            // The transition committed, so the decisions it carried are
+            // durable; the segment describes work that actually happened. The
+            // persisted context is what links it to the operation that
+            // scheduled the effect this transition acted on.
+            let (decisions, opened) = self
+                .state()
+                .ok()
+                .and_then(|state| {
+                    state.loop_state().map(|loop_state| {
+                        (
+                            loop_state
+                                .decision_outbox()
+                                .iter()
+                                .skip(decisions_before)
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                            loop_state
+                                .open_checkpoints()
+                                .iter()
+                                .skip(checkpoints_before)
+                                .map(|checkpoint| checkpoint.kind.as_label())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                })
+                .unwrap_or_default();
             self.close_segment(
                 transition_segment
                     .close(AgentSegmentOperation::Decide { phase })
+                    .attribute(
+                        SEGMENT_ATTR_SETTINGS_REVISION,
+                        settings_revision.get().to_string(),
+                    )
+                    .decisions(decisions)
                     .ok(),
             );
+            // The checkpoint segment ends after the durable park, which is
+            // this same commit: specification 17.11 requires the opening span
+            // to end once the wait and its notification are accepted, and
+            // forbids holding a span object across the wait itself.
+            for kind in opened {
+                self.close_segment(
+                    AgentSegmentTimer::start(now)
+                        .close(AgentSegmentOperation::CheckpointOpen)
+                        .attribute(SEGMENT_ATTR_CHECKPOINT_KIND, kind)
+                        .ok(),
+                );
+            }
             if let Some((usage, started_at)) = turn_measurements {
                 if let Some(started_at) = started_at {
                     record_agent_domain_duration(
@@ -7330,7 +7412,7 @@ where
                     invocation
                         .close(AgentSegmentOperation::InvokeAgent { agent_name: None })
                         .ok()
-                        .attribute("rakka.agent.loop.transitions", transitions.to_string()),
+                        .attribute(SEGMENT_ATTR_LOOP_TRANSITIONS, transitions.to_string()),
                 );
             }
         }
