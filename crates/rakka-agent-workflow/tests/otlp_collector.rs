@@ -382,3 +382,85 @@ fn a_pre_extension_span_record_decodes_with_default_kind_status_and_events() {
             .expect("the record round-trips");
     assert_eq!(round_tripped, stamped);
 }
+
+/// A span record built from a durable context carries the trace identity and
+/// the links, and **no attributes at all**.
+///
+/// It used to copy the context's baggage verbatim into span attributes, past
+/// a `validate` that inspected attributes not at all. Baggage is a
+/// propagation context rather than a span attribute set, and baggage received
+/// from an external caller is untrusted (specification 17.15), so a caller
+/// that wants an attribute now sets it explicitly — which is what makes an
+/// exported set exactly what its emitter decided to export.
+#[test]
+fn a_span_built_from_a_context_copies_no_baggage_into_its_attributes() {
+    let context = telemetry_context();
+    assert!(
+        !context.baggage.is_empty(),
+        "the fixture must carry baggage, or this proves nothing"
+    );
+
+    let span = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds");
+
+    assert!(
+        span.attributes.is_empty(),
+        "baggage reached the span attributes: {:?}",
+        span.attributes
+    );
+    // The trace identity and the links are what a context does supply.
+    assert_eq!(span.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(span.links.len(), context.span_links.len());
+    span.validate().expect("the record is valid");
+
+    // An explicitly-set attribute is kept, so the change removes a copy and
+    // not the ability to carry attributes.
+    let span = span.attribute("step.kind", "tool");
+    assert_eq!(
+        span.attributes.get("step.kind").map(String::as_str),
+        Some("tool")
+    );
+}
+
+/// The export records now carry the generic bounds the metric vocabulary
+/// always had and this side never did: a blank key, an unbounded value, a
+/// multi-line value, and an inverted time range are each refused.
+#[test]
+fn an_unbounded_or_malformed_span_attribute_is_refused() {
+    let base = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(10),
+        AgentTimestampMillis::new(20),
+        &telemetry_context(),
+    )
+    .expect("the span builds");
+
+    base.clone().validate().expect("the base record is valid");
+
+    let blank_key = base.clone().attribute("   ", "value");
+    assert!(blank_key.validate().is_err(), "a blank key is refused");
+
+    let overlong = base.clone().attribute("step.kind", "x".repeat(4096));
+    assert!(
+        overlong.validate().is_err(),
+        "an unbounded value is refused"
+    );
+
+    let multiline = base.clone().attribute("step.kind", "tool\nmore");
+    assert!(
+        multiline.validate().is_err(),
+        "a multi-line value is refused"
+    );
+
+    let mut inverted = base;
+    inverted.start_time = AgentTimestampMillis::new(30);
+    assert!(
+        inverted.validate().is_err(),
+        "an end before its start is refused"
+    );
+}

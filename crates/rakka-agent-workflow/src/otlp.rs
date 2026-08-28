@@ -17,9 +17,9 @@ use rakka_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    validate_agent_log_event, AgentAttributes, AgentAuditError, AgentLogEvent,
-    AgentRedactionPolicy, AgentSpanLink, AgentTelemetryContext, AgentTimestampMillis,
-    AgentTraceContext, AgentTraceError,
+    validate_agent_log_event, validate_agent_span_link, AgentAttributes, AgentAuditError,
+    AgentLogEvent, AgentRedactionPolicy, AgentSpanLink, AgentTelemetryContext,
+    AgentTimestampMillis, AgentTraceContext, AgentTraceError,
 };
 
 /// OTLP gRPC default endpoint.
@@ -654,6 +654,57 @@ impl AgentOtelInstrumentationScope {
     }
 }
 
+/// The most bytes one exported span, event, or log attribute value may carry.
+pub const AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES: usize = 1024;
+
+/// The most attributes one exported span, event, link, or log record may
+/// carry.
+pub const AGENT_EXPORT_MAX_ATTRIBUTES: usize = 64;
+
+/// The most events one exported span may carry.
+pub const AGENT_EXPORT_MAX_SPAN_EVENTS: usize = 32;
+
+/// The most links one exported span may carry.
+pub const AGENT_EXPORT_MAX_SPAN_LINKS: usize = 32;
+
+/// Generic bounds every exported attribute set must satisfy.
+///
+/// Not a redaction policy: this refuses a malformed or unbounded attribute,
+/// never an inappropriate one. Deciding which keys may be exported at all is
+/// the emitting domain's job, and it happens before a record is built.
+pub(crate) fn validate_export_attributes(
+    field: &'static str,
+    attributes: &AgentAttributes,
+) -> AgentOtlpResult<()> {
+    if attributes.len() > AGENT_EXPORT_MAX_ATTRIBUTES {
+        return Err(AgentOtlpError::InvalidExporter {
+            field,
+            reason: "exceeds the bounded attribute count",
+        });
+    }
+    for (key, value) in attributes {
+        if is_blank(key) {
+            return Err(AgentOtlpError::InvalidExporter {
+                field,
+                reason: "attribute keys are required",
+            });
+        }
+        if value.len() > AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES {
+            return Err(AgentOtlpError::InvalidExporter {
+                field,
+                reason: "attribute value exceeds its bound",
+            });
+        }
+        if value.contains('\n') || value.contains('\r') {
+            return Err(AgentOtlpError::InvalidExporter {
+                field,
+                reason: "attribute values must be single-line",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// OpenTelemetry-oriented span bridge record for agent workflow traces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentOtelSpanExport {
@@ -692,6 +743,21 @@ pub struct AgentOtelSpanExport {
 
 impl AgentOtelSpanExport {
     /// Builds a span bridge record from a durable telemetry context.
+    ///
+    /// The context supplies the trace identity and the span links, and
+    /// **nothing else**. It deliberately does not supply attributes: baggage
+    /// is a propagation context, not a span attribute set, and baggage
+    /// received from an external caller is untrusted
+    /// ([specification 17.15](../../docs/plans/rakka-agent/spec.md)). Copying
+    /// it verbatim — which this used to do — meant any key a caller's context
+    /// happened to carry reached the export record intact, past a `validate`
+    /// that inspected attributes not at all, and past the agent domain's own
+    /// baggage-clearing sanitizer, which runs on the *persist* path and so
+    /// never saw a span built from a context a caller was handed.
+    ///
+    /// A caller that wants an attribute sets it explicitly through
+    /// [`Self::attribute`], which is what makes the exported set exactly what
+    /// the adapter decided to export.
     pub fn from_telemetry_context(
         name: impl Into<String>,
         start_time: AgentTimestampMillis,
@@ -719,7 +785,7 @@ impl AgentOtelSpanExport {
             start_time,
             end_time,
             links: telemetry_context.span_links.clone(),
-            attributes: telemetry_context.baggage.clone(),
+            attributes: AgentAttributes::new(),
             kind: AgentOtelSpanKind::default(),
             status: AgentOtelSpanStatus::default(),
             events: Vec::new(),
@@ -762,11 +828,33 @@ impl AgentOtelSpanExport {
     }
 
     /// Validates the span export record.
+    ///
+    /// The attribute, event, and link guards are the counterpart of the metric
+    /// vocabulary's bounded-label validator, which had no equivalent on this
+    /// side: a span record used to be checked for its name and its trace
+    /// context and for nothing that rides on it. These are *generic* bounds —
+    /// non-blank keys, single-line values, and counts — and they are not a
+    /// redaction policy: which keys are allowed is a domain decision, made by
+    /// the adapter's allowlist before a record is built. Bounding is not
+    /// sanitizing, and neither substitutes for the other.
     pub fn validate(&self) -> AgentOtlpResult<()> {
         if is_blank(&self.name) {
             return Err(AgentOtlpError::InvalidExporter {
                 field: "span.name",
                 reason: "required",
+            });
+        }
+        if self.end_time.as_millis() < self.start_time.as_millis() {
+            return Err(AgentOtlpError::InvalidExporter {
+                field: "span.end_time",
+                reason: "must not precede the start time",
+            });
+        }
+        validate_export_attributes("span.attributes", &self.attributes)?;
+        if self.events.len() > AGENT_EXPORT_MAX_SPAN_EVENTS {
+            return Err(AgentOtlpError::InvalidExporter {
+                field: "span.events",
+                reason: "exceeds the bounded event count",
             });
         }
         for event in &self.events {
@@ -776,6 +864,17 @@ impl AgentOtelSpanExport {
                     reason: "required",
                 });
             }
+            validate_export_attributes("span.event.attributes", &event.attributes)?;
+        }
+        if self.links.len() > AGENT_EXPORT_MAX_SPAN_LINKS {
+            return Err(AgentOtlpError::InvalidExporter {
+                field: "span.links",
+                reason: "exceeds the bounded link count",
+            });
+        }
+        for link in &self.links {
+            validate_agent_span_link(link)?;
+            validate_export_attributes("span.link.attributes", &link.attributes)?;
         }
         AgentTraceContext::new(
             self.trace_id.clone(),

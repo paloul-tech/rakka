@@ -728,6 +728,23 @@ pub fn validate_agent_log_event(
     }
     validate_log_trace_fields(event)?;
     validate_log_redaction(event, redaction_policy)?;
+    // The log record's attribute set had no guard at all, which made it the
+    // one export surface where an unbounded or multi-line value could ride
+    // out under a well-formed record. These are generic bounds, not a
+    // redaction policy: which keys a log may carry is the emitting domain's
+    // decision, made before the record is built.
+    crate::otlp::validate_export_attributes("log.attributes", &event.attributes).map_err(|_| {
+        AgentAuditError::InvalidLogEvent {
+            field: "attributes",
+            reason: "must be bounded, single-line, and non-blank keyed",
+        }
+    })?;
+    crate::otlp::validate_export_attributes("log.resource", &event.resource).map_err(|_| {
+        AgentAuditError::InvalidLogEvent {
+            field: "resource",
+            reason: "must be bounded, single-line, and non-blank keyed",
+        }
+    })?;
     Ok(())
 }
 

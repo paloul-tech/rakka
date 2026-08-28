@@ -30,13 +30,23 @@
 //! and the reversible mapping stays outside the telemetry backend
 //! ([specification 17.3](../../../docs/plans/rakka-agent/spec.md)).
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
 use rakka_agent_workflow::{
-    AgentAttributes, AgentOtelInstrumentationScope, AgentOtelSpanEvent, AgentOtelSpanExport,
-    AgentOtelSpanKind, AgentOtlpResult, AgentTelemetryContext, AgentTimestampMillis,
+    AgentAttributes, AgentLogEvent, AgentOtelInstrumentationScope, AgentOtelResource,
+    AgentOtelSpanEvent, AgentOtelSpanExport, AgentOtelSpanKind, AgentOtelSpanStatus,
+    AgentOtlpBridgeExport, AgentOtlpExporterConfig, AgentOtlpResult, AgentTelemetryContext,
+    AgentTimestampMillis,
 };
+use rakka_core::MetricsSnapshot;
 
 use crate::model::AgentModelUsage;
-use crate::observability::AgentDecisionEvent;
+use crate::observability::{
+    AgentDecisionEvent, AgentSegmentOperation, AgentSegmentOutcome, AgentSegmentSink,
+    AgentTelemetrySegment,
+};
 
 /// The single source of the pinned revision literal, so the bare revision
 /// ([`AGENT_GENAI_CONVENTION_REVISION`]) and the schema URL
@@ -114,8 +124,115 @@ pub const ATTR_ERROR_TYPE: &str = "error.type";
 /// Rakka attribute: the stable Rakka error code.
 pub const ATTR_RAKKA_ERROR_CODE: &str = "rakka.error.code";
 
+/// Rakka attribute: the bounded effect kind a dispatch segment names.
+pub const ATTR_RAKKA_AGENT_EFFECT_KIND: &str = "rakka.agent.effect.kind";
+/// Rakka attribute: the bounded A2A operation class of an ingress segment.
+pub const ATTR_RAKKA_AGENT_A2A_OPERATION: &str = "rakka.agent.a2a.operation";
+/// Rakka attribute: the bounded memory tier of a memory segment.
+pub const ATTR_RAKKA_AGENT_MEMORY_TIER: &str = "rakka.agent.memory.tier";
+/// Rakka attribute: how many loop transitions one resident slice advanced.
+pub const ATTR_RAKKA_AGENT_LOOP_TRANSITIONS: &str = "rakka.agent.loop.transitions";
+
 /// The span event name a mapped loop decision is emitted under.
 pub const AGENT_DECISION_SPAN_EVENT: &str = "rakka.agent.decide";
+
+/// Every attribute key this adapter may put on an exported span or log
+/// record.
+///
+/// [Specification 17.14](../../../docs/plans/rakka-agent/spec.md) asks the
+/// application to minimize before export and treats Collector processors as
+/// defence in depth, not as the first line — and
+/// [17.15](../../../docs/plans/rakka-agent/spec.md) makes received baggage
+/// untrusted. There is a bounded-label validator for metrics
+/// ([`crate::observability::validate_agent_domain_metric_attributes`]) and,
+/// before this, none for spans, so anything a caller's context happened to
+/// carry reached a span record intact.
+///
+/// This is that counterpart: a closed allowlist rather than a denylist,
+/// because a denylist is a guess about what content will be called next time,
+/// and the adapter knows exactly which keys it writes.
+pub const AGENT_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
+    ATTR_ERROR_TYPE,
+    ATTR_GEN_AI_AGENT_ID,
+    ATTR_GEN_AI_AGENT_NAME,
+    ATTR_GEN_AI_AGENT_VERSION,
+    ATTR_GEN_AI_CONVERSATION_ID,
+    ATTR_GEN_AI_OPERATION_NAME,
+    ATTR_GEN_AI_PROVIDER_NAME,
+    ATTR_GEN_AI_TOOL_NAME,
+    ATTR_GEN_AI_TOOL_TYPE,
+    ATTR_GEN_AI_USAGE_INPUT_TOKENS,
+    ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
+    ATTR_RAKKA_AGENT_A2A_OPERATION,
+    ATTR_RAKKA_AGENT_DECISION_KIND,
+    ATTR_RAKKA_AGENT_DECISION_REASON,
+    ATTR_RAKKA_AGENT_DECISION_SOURCE,
+    ATTR_RAKKA_AGENT_DELEGATION_ID,
+    ATTR_RAKKA_AGENT_EFFECT_KIND,
+    ATTR_RAKKA_AGENT_EFFECT_SAFETY,
+    ATTR_RAKKA_AGENT_EFFECT_STATUS,
+    ATTR_RAKKA_AGENT_GOAL_ID,
+    ATTR_RAKKA_AGENT_LOOP_PHASE,
+    ATTR_RAKKA_AGENT_LOOP_TRANSITIONS,
+    ATTR_RAKKA_AGENT_MEMORY_TIER,
+    ATTR_RAKKA_AGENT_SETTINGS_REVISION,
+    ATTR_RAKKA_AGENT_TASK_ID,
+    ATTR_RAKKA_AGENT_TURN_INDEX,
+    ATTR_RAKKA_ERROR_CODE,
+];
+
+/// The most bytes one exported span attribute value may carry.
+///
+/// Bounding is not sanitizing: a key outside
+/// [`AGENT_SPAN_ATTRIBUTE_KEYS`] is refused however short its value, and this
+/// bound exists so an allowlisted key cannot smuggle an unbounded payload
+/// under a name the allowlist trusts.
+pub const AGENT_SPAN_ATTRIBUTE_VALUE_MAX_BYTES: usize = 256;
+
+/// Whether a key is one this adapter may export.
+#[must_use]
+pub fn is_agent_span_attribute(key: &str) -> bool {
+    AGENT_SPAN_ATTRIBUTE_KEYS.contains(&key)
+}
+
+/// Accepts an exported span or log attribute set, or names the first key it
+/// refuses.
+///
+/// A value is refused when it is empty, exceeds
+/// [`AGENT_SPAN_ATTRIBUTE_VALUE_MAX_BYTES`], or carries a line break — the
+/// same value rules the metric guard applies, for the same reason.
+pub fn validate_agent_span_attributes(attributes: &AgentAttributes) -> Result<(), String> {
+    for (key, value) in attributes {
+        if !is_agent_span_attribute(key) {
+            return Err(key.clone());
+        }
+        if value.is_empty()
+            || value.len() > AGENT_SPAN_ATTRIBUTE_VALUE_MAX_BYTES
+            || value.contains('\n')
+            || value.contains('\r')
+        {
+            return Err(key.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Keeps only what [`validate_agent_span_attributes`] accepts.
+///
+/// The exporter filters rather than fails: a segment carrying an unknown key
+/// is still worth exporting without it, and refusing the whole span would
+/// make a telemetry mistake into a loss of the operation's record.
+#[must_use]
+fn allowlisted(attributes: AgentAttributes) -> AgentAttributes {
+    attributes
+        .into_iter()
+        .filter(|(key, value)| {
+            let mut single = AgentAttributes::new();
+            single.insert(key.clone(), value.clone());
+            validate_agent_span_attributes(&single).is_ok()
+        })
+        .collect()
+}
 
 /// The instrumentation scope every agent export batch is stamped with.
 #[must_use]
@@ -141,10 +258,50 @@ pub fn agent_instrumentation_scope() -> AgentOtelInstrumentationScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AgentGenAiOperation {
-    /// One bounded active turn of a named agent.
+    /// One bounded active invocation of an agent.
     InvokeAgent {
-        /// The bounded configured agent telemetry name.
-        agent_name: String,
+        /// The bounded configured agent telemetry name, when one exists.
+        ///
+        /// Absent is the normal case: an `AgentId` is an identifier however
+        /// bounded it is, and [17.6](../../../docs/plans/rakka-agent/spec.md)
+        /// forbids one in a span name. The identity rides
+        /// [`ATTR_GEN_AI_AGENT_ID`] instead.
+        agent_name: Option<String>,
+    },
+    /// Protocol ingress for one A2A operation, extracting context before
+    /// durable acceptance.
+    A2aIngress {
+        /// The bounded A2A operation class.
+        operation: String,
+    },
+    /// Continuous wake and epoch admission.
+    WakeAdmit,
+    /// An outbound A2A call to a peer agent.
+    DelegateToPeer {
+        /// The bounded peer or skill class.
+        peer_class: String,
+    },
+    /// Task result validation against its bounded rule set.
+    ValidateTaskResult,
+    /// A same-task transfer of responsibility.
+    Handoff,
+    /// A team board claim or message operation.
+    TeamOperation {
+        /// The bounded team operation label.
+        operation: String,
+    },
+    /// One moderated-conversation turn transition.
+    ModerationTurn,
+    /// A durable workflow-tool invocation.
+    WorkflowInvoke,
+    /// Goal progress and evidence evaluation.
+    GoalEvaluate,
+    /// A short-term, private, or communal memory operation.
+    MemoryOperation,
+    /// A retrieval against an authorized knowledge space.
+    Retrieval {
+        /// The bounded data-source or backend class.
+        data_source: String,
     },
     /// A general loop decision.
     Decide,
@@ -185,7 +342,21 @@ impl AgentGenAiOperation {
     #[must_use]
     pub fn span_name(&self) -> String {
         match self {
-            Self::InvokeAgent { agent_name } => format!("invoke_agent {agent_name}"),
+            Self::InvokeAgent { agent_name } => match agent_name {
+                Some(agent_name) => format!("invoke_agent {agent_name}"),
+                None => "invoke_agent".to_string(),
+            },
+            Self::A2aIngress { .. } => "rakka.agent.a2a.ingress".to_string(),
+            Self::WakeAdmit => "rakka.agent.wake.admit".to_string(),
+            Self::DelegateToPeer { peer_class } => format!("invoke_agent {peer_class}"),
+            Self::ValidateTaskResult => "rakka.agent.task.validate_result".to_string(),
+            Self::Handoff => "rakka.agent.handoff".to_string(),
+            Self::TeamOperation { operation } => format!("rakka.agent.team.{operation}"),
+            Self::ModerationTurn => "rakka.agent.moderation.turn".to_string(),
+            Self::WorkflowInvoke => "rakka.agent.workflow.invoke".to_string(),
+            Self::GoalEvaluate => "rakka.agent.goal.evaluate".to_string(),
+            Self::MemoryOperation => "rakka.agent.memory.operation".to_string(),
+            Self::Retrieval { data_source } => format!("retrieval {data_source}"),
             Self::Decide => "rakka.agent.decide".to_string(),
             Self::ModelInference { operation, model } => format!("{operation} {model}"),
             Self::EffectSchedule => "rakka.agent.effect.schedule".to_string(),
@@ -201,6 +372,24 @@ impl AgentGenAiOperation {
         }
     }
 
+    /// The value this operation contributes to `gen_ai.operation.name`.
+    ///
+    /// Where the reviewed convention defines a well-known value it is used;
+    /// where it does not — every durable Rakka operation — the stable
+    /// `rakka.agent.*` class is used instead, because inventing a
+    /// convention value would make an upgrade's compatibility review
+    /// impossible to perform honestly.
+    #[must_use]
+    pub fn operation_name(&self) -> String {
+        match self {
+            Self::InvokeAgent { .. } | Self::DelegateToPeer { .. } => "invoke_agent".to_string(),
+            Self::ModelInference { operation, .. } => operation.clone(),
+            Self::ExecuteTool { .. } => "execute_tool".to_string(),
+            Self::Retrieval { .. } => "retrieval".to_string(),
+            other => other.span_name(),
+        }
+    }
+
     /// The span kind of the operation.
     ///
     /// The schedule/dispatch pair is `PRODUCER`/`CONSUMER` because the durable
@@ -209,8 +398,9 @@ impl AgentGenAiOperation {
     #[must_use]
     pub const fn span_kind(&self) -> AgentOtelSpanKind {
         match self {
-            Self::ModelInference { .. } => AgentOtelSpanKind::Client,
-            Self::EffectSchedule => AgentOtelSpanKind::Producer,
+            Self::A2aIngress { .. } => AgentOtelSpanKind::Server,
+            Self::ModelInference { .. } | Self::DelegateToPeer { .. } => AgentOtelSpanKind::Client,
+            Self::EffectSchedule | Self::Handoff => AgentOtelSpanKind::Producer,
             Self::EffectDispatch => AgentOtelSpanKind::Consumer,
             Self::InvokeAgent { .. }
             | Self::Decide
@@ -221,7 +411,15 @@ impl AgentGenAiOperation {
             | Self::RunRecover
             | Self::AutonomyAdmit
             | Self::BudgetReserve
-            | Self::BudgetSettle => AgentOtelSpanKind::Internal,
+            | Self::BudgetSettle
+            | Self::WakeAdmit
+            | Self::ValidateTaskResult
+            | Self::TeamOperation { .. }
+            | Self::ModerationTurn
+            | Self::WorkflowInvoke
+            | Self::GoalEvaluate
+            | Self::MemoryOperation
+            | Self::Retrieval { .. } => AgentOtelSpanKind::Internal,
         }
     }
 
@@ -241,6 +439,188 @@ impl AgentGenAiOperation {
             telemetry,
         )?
         .kind(self.span_kind()))
+    }
+}
+
+/// Maps one Rakka bounded operation class to its convention row.
+///
+/// This is the whole point of the module and, before slice 6.3a, the thing it
+/// had no caller for: the operations above were reachable only from the
+/// module's own tests. The mapping is total over
+/// [`AgentSegmentOperation`], matched without a wildcard, so a class added to
+/// the Rakka vocabulary fails to compile until its convention row is decided
+/// — which is the [17.20](../../../docs/plans/rakka-agent/spec.md) review
+/// happening at the compiler rather than in a checklist.
+#[must_use]
+pub fn genai_operation(operation: &AgentSegmentOperation) -> AgentGenAiOperation {
+    match operation {
+        AgentSegmentOperation::A2aIngress { operation } => AgentGenAiOperation::A2aIngress {
+            operation: operation.clone(),
+        },
+        AgentSegmentOperation::Decide { .. } => AgentGenAiOperation::Decide,
+        AgentSegmentOperation::InvokeAgent { agent_name } => AgentGenAiOperation::InvokeAgent {
+            agent_name: agent_name.clone(),
+        },
+        AgentSegmentOperation::ModelInference { model_profile } => {
+            AgentGenAiOperation::ModelInference {
+                // The well-known GenAI operation name for a completion; Rakka's
+                // model adapter contract is a single bounded turn, which is
+                // what `chat` describes.
+                operation: GEN_AI_OPERATION_CHAT.to_string(),
+                model: model_profile.clone(),
+            }
+        }
+        AgentSegmentOperation::EffectSchedule { .. } => AgentGenAiOperation::EffectSchedule,
+        AgentSegmentOperation::EffectDispatch { .. } => AgentGenAiOperation::EffectDispatch,
+        AgentSegmentOperation::ToolAuthorize { .. } => AgentGenAiOperation::ToolAuthorize,
+        AgentSegmentOperation::ExecuteTool { tool_name } => AgentGenAiOperation::ExecuteTool {
+            tool_name: tool_name.clone(),
+        },
+        AgentSegmentOperation::DelegateToPeer { peer_class } => {
+            AgentGenAiOperation::DelegateToPeer {
+                peer_class: peer_class.clone(),
+            }
+        }
+        AgentSegmentOperation::WorkflowInvoke { .. } => AgentGenAiOperation::WorkflowInvoke,
+        AgentSegmentOperation::GoalEvaluate => AgentGenAiOperation::GoalEvaluate,
+        AgentSegmentOperation::ValidateTaskResult => AgentGenAiOperation::ValidateTaskResult,
+        AgentSegmentOperation::Handoff => AgentGenAiOperation::Handoff,
+        AgentSegmentOperation::TeamOperation { operation } => AgentGenAiOperation::TeamOperation {
+            operation: operation.clone(),
+        },
+        AgentSegmentOperation::ModerationTurn { .. } => AgentGenAiOperation::ModerationTurn,
+        AgentSegmentOperation::WakeAdmit => AgentGenAiOperation::WakeAdmit,
+        AgentSegmentOperation::AutonomyAdmit => AgentGenAiOperation::AutonomyAdmit,
+        AgentSegmentOperation::BudgetReserve => AgentGenAiOperation::BudgetReserve,
+        AgentSegmentOperation::BudgetSettle => AgentGenAiOperation::BudgetSettle,
+        AgentSegmentOperation::MemoryOperation { .. } => AgentGenAiOperation::MemoryOperation,
+        AgentSegmentOperation::Retrieval { backend } => AgentGenAiOperation::Retrieval {
+            data_source: backend.clone(),
+        },
+        AgentSegmentOperation::CheckpointOpen => AgentGenAiOperation::CheckpointOpen,
+        AgentSegmentOperation::RunResume => AgentGenAiOperation::RunResume,
+        AgentSegmentOperation::RunRecover => AgentGenAiOperation::RunRecover,
+    }
+}
+
+/// The well-known GenAI operation name a Rakka model call maps to.
+pub const GEN_AI_OPERATION_CHAT: &str = "chat";
+
+/// The provider class Rakka reports when the deployment named none.
+///
+/// [17.8](../../../docs/plans/rakka-agent/spec.md) asks for the provider when
+/// it is "supplied by the provider or safely known". Rakka's model adapter
+/// contract is provider-neutral by design — the deploying application supplies
+/// the concrete client — so the honest value is the adapter boundary itself,
+/// never a guess at whoever is behind it.
+pub const GEN_AI_PROVIDER_RAKKA_ADAPTER: &str = "rakka.model_adapter";
+
+/// The attributes one segment's bounded class contributes.
+fn operation_attributes(segment: &AgentTelemetrySegment) -> AgentAttributes {
+    let mut attributes = AgentAttributes::new();
+    let genai = genai_operation(&segment.operation);
+    attributes.insert(
+        ATTR_GEN_AI_OPERATION_NAME.to_string(),
+        genai.operation_name().to_string(),
+    );
+    match &segment.operation {
+        AgentSegmentOperation::ModelInference { model_profile } => {
+            attributes.insert(
+                ATTR_GEN_AI_PROVIDER_NAME.to_string(),
+                GEN_AI_PROVIDER_RAKKA_ADAPTER.to_string(),
+            );
+            if !model_profile.is_empty() {
+                attributes.insert(ATTR_GEN_AI_AGENT_VERSION.to_string(), model_profile.clone());
+            }
+        }
+        AgentSegmentOperation::ExecuteTool { tool_name } => {
+            attributes.insert(ATTR_GEN_AI_TOOL_NAME.to_string(), tool_name.clone());
+            attributes.insert(
+                ATTR_GEN_AI_TOOL_TYPE.to_string(),
+                GEN_AI_TOOL_TYPE_FUNCTION.to_string(),
+            );
+        }
+        AgentSegmentOperation::EffectSchedule { effect_kind }
+        | AgentSegmentOperation::EffectDispatch { effect_kind }
+        | AgentSegmentOperation::ToolAuthorize { effect_kind } => {
+            attributes.insert(
+                ATTR_RAKKA_AGENT_EFFECT_KIND.to_string(),
+                (*effect_kind).to_string(),
+            );
+        }
+        AgentSegmentOperation::A2aIngress { operation } => {
+            attributes.insert(
+                ATTR_RAKKA_AGENT_A2A_OPERATION.to_string(),
+                operation.clone(),
+            );
+        }
+        AgentSegmentOperation::Decide { phase } => {
+            attributes.insert(
+                ATTR_RAKKA_AGENT_LOOP_PHASE.to_string(),
+                (*phase).to_string(),
+            );
+        }
+        AgentSegmentOperation::MemoryOperation { tier } => {
+            attributes.insert(
+                ATTR_RAKKA_AGENT_MEMORY_TIER.to_string(),
+                (*tier).to_string(),
+            );
+        }
+        _ => {}
+    }
+    attributes
+}
+
+/// The tool type Rakka reports for a dispatched tool call.
+pub const GEN_AI_TOOL_TYPE_FUNCTION: &str = "function";
+
+/// Builds the convention span record for one ended segment.
+///
+/// Status and error mapping happen here and nowhere else: the segment's
+/// outcome becomes the span status, and a failure's stable type and Rakka code
+/// become [`ATTR_ERROR_TYPE`] and [`ATTR_RAKKA_ERROR_CODE`] rather than an
+/// unbounded message, as [17.6](../../../docs/plans/rakka-agent/spec.md)
+/// requires. Every attribute passes the allowlist before it reaches the
+/// record, so an attribute outside
+/// [`AGENT_SPAN_ATTRIBUTE_KEYS`] cannot be exported however it got onto the
+/// segment or into the context the segment carries.
+pub fn segment_span(segment: &AgentTelemetrySegment) -> AgentOtlpResult<AgentOtelSpanExport> {
+    let genai = genai_operation(&segment.operation);
+    let mut span = genai.span(segment.start, segment.end, &segment.telemetry)?;
+
+    let mut attributes = operation_attributes(segment);
+    attributes.extend(segment.attributes.clone());
+    attributes.extend(identity_of(&segment.identity).attributes());
+    match segment.outcome {
+        AgentSegmentOutcome::Ok => span.status = AgentOtelSpanStatus::Ok,
+        AgentSegmentOutcome::Error => {
+            span.status = AgentOtelSpanStatus::Error;
+            if let Some(error_type) = segment.error_type {
+                attributes.insert(ATTR_ERROR_TYPE.to_string(), error_type.to_string());
+            }
+            if let Some(code) = &segment.error_code {
+                attributes.insert(ATTR_RAKKA_ERROR_CODE.to_string(), code.clone());
+            }
+        }
+        AgentSegmentOutcome::Unset => span.status = AgentOtelSpanStatus::Unset,
+    }
+
+    // The bridge copies nothing into attributes on its own any more, so this
+    // set is exactly what the adapter decided to export.
+    span.attributes = allowlisted(attributes);
+    Ok(span)
+}
+
+/// The convention identity of one segment's durable identities.
+fn identity_of(identity: &crate::observability::AgentSegmentIdentity) -> AgentGenAiIdentity {
+    AgentGenAiIdentity {
+        agent_id: identity.agent.clone(),
+        agent_name: None,
+        agent_version: None,
+        conversation_id: identity.run.clone(),
+        goal_id: identity.goal.clone(),
+        task_id: identity.task.clone(),
+        delegation_id: identity.delegation.clone(),
     }
 }
 
@@ -357,6 +737,149 @@ pub fn usage_attributes(usage: &AgentModelUsage) -> AgentAttributes {
     attributes
 }
 
+/// How many mapped spans an exporter buffers before it starts dropping.
+pub const DEFAULT_AGENT_SPAN_BUFFER_CAPACITY: usize = 512;
+
+/// The production call site of this module: a segment sink that maps every
+/// ended operation into a convention span record and buffers it for export.
+///
+/// The `otel` module used to have none. Its operations, its identity mapping,
+/// and its decision event were reachable only from its own test block, and
+/// nothing in the workspace built an [`AgentOtlpBridgeExport`] outside tests —
+/// the same shape slice 6.1 found in the five sharding registrations, with the
+/// same corrective: a call site on the path a run actually takes.
+///
+/// Wire it with `with_segments` on a run entity, its sharding settings, or the
+/// dispatcher, and the loop, the entities, and the dispatch attempts all flow
+/// through here.
+///
+/// **Bounded, lossy, and never blocking.** [17.1](../../../docs/plans/rakka-agent/spec.md)
+/// requires export to be bounded and forbids unbounded in-process queues, and
+/// [`AgentSegmentSink::record`] may neither block nor fail. So the buffer is a
+/// ring: at capacity the *oldest* span is dropped and counted, the way a run's
+/// decision outbox drops its oldest owed event. Dropping the oldest rather
+/// than the newest keeps the most recent operations — the ones an incident is
+/// usually about — and the drop count is what makes the loss visible.
+///
+/// The exporter owns no OTLP transport, no credentials, and no SDK: it
+/// produces the serializable bridge record and the application boundary sends
+/// it ([17.17](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug)]
+pub struct AgentGenAiSpanExporter {
+    spans: Mutex<VecDeque<AgentOtelSpanExport>>,
+    capacity: usize,
+    dropped: AtomicU64,
+    unmappable: AtomicU64,
+}
+
+impl Default for AgentGenAiSpanExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgentGenAiSpanExporter {
+    /// An exporter buffering [`DEFAULT_AGENT_SPAN_BUFFER_CAPACITY`] spans.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_AGENT_SPAN_BUFFER_CAPACITY)
+    }
+
+    /// An exporter with an explicit buffer bound.
+    ///
+    /// A capacity of zero is raised to one: a ring that can hold nothing would
+    /// drop every span while reporting a healthy pipeline.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            spans: Mutex::new(VecDeque::new()),
+            capacity: capacity.max(1),
+            dropped: AtomicU64::new(0),
+            unmappable: AtomicU64::new(0),
+        }
+    }
+
+    /// How many mapped spans are waiting to be exported.
+    #[must_use]
+    pub fn buffered(&self) -> usize {
+        self.spans.lock().map(|spans| spans.len()).unwrap_or(0)
+    }
+
+    /// How many mapped spans the bounded buffer dropped.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::SeqCst)
+    }
+
+    /// How many segments could not be mapped to a span at all.
+    ///
+    /// A segment whose durable context carries no `traceparent` has no trace
+    /// to belong to, and inventing one would fabricate a causal claim. Those
+    /// segments are counted here rather than exported under a made-up trace.
+    #[must_use]
+    pub fn unmappable(&self) -> u64 {
+        self.unmappable.load(Ordering::SeqCst)
+    }
+
+    /// Takes every buffered span, leaving the buffer empty.
+    #[must_use]
+    pub fn drain(&self) -> Vec<AgentOtelSpanExport> {
+        self.spans
+            .lock()
+            .map(|mut spans| spans.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Builds one OTLP bridge export from the buffered spans, the given
+    /// metrics snapshot, and the given logs.
+    ///
+    /// The batch is stamped with [`agent_instrumentation_scope`], so the
+    /// pinned convention revision travels with the data
+    /// ([17.2](../../../docs/plans/rakka-agent/spec.md)), and the metrics
+    /// carry the agent catalogue's units and buckets rather than being
+    /// exported unitless.
+    pub fn bridge_export(
+        &self,
+        exporter: AgentOtlpExporterConfig,
+        resource: AgentOtelResource,
+        metrics: &MetricsSnapshot,
+        logs: Vec<AgentLogEvent>,
+    ) -> AgentOtlpResult<AgentOtlpBridgeExport> {
+        let instruments = crate::observability::agent_domain_instrument_views();
+        Ok(AgentOtlpBridgeExport::from_signals_with_instruments(
+            exporter,
+            resource,
+            metrics,
+            &instruments,
+            self.drain(),
+            logs,
+        )?
+        .with_scope(agent_instrumentation_scope()))
+    }
+}
+
+impl AgentSegmentSink for AgentGenAiSpanExporter {
+    fn backend_name(&self) -> &'static str {
+        "otlp-bridge"
+    }
+
+    fn record(&self, segment: &AgentTelemetrySegment) {
+        let Ok(span) = segment_span(segment) else {
+            self.unmappable.fetch_add(1, Ordering::SeqCst);
+            return;
+        };
+        let Ok(mut spans) = self.spans.lock() else {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+            return;
+        };
+        while spans.len() >= self.capacity {
+            spans.pop_front();
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+        spans.push_back(span);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rakka_agent_workflow::AgentOtelSpanStatus;
@@ -381,9 +904,17 @@ mod tests {
         let rows: &[(AgentGenAiOperation, &str, AgentOtelSpanKind)] = &[
             (
                 AgentGenAiOperation::InvokeAgent {
-                    agent_name: "support".to_string(),
+                    agent_name: Some("support".to_string()),
                 },
                 "invoke_agent support",
+                AgentOtelSpanKind::Internal,
+            ),
+            // Rakka itself supplies no name — an `AgentId` is an identifier
+            // however bounded it is, and 17.6 forbids one in a span name — so
+            // the nameless form is the one a run actually produces.
+            (
+                AgentGenAiOperation::InvokeAgent { agent_name: None },
+                "invoke_agent",
                 AgentOtelSpanKind::Internal,
             ),
             (
