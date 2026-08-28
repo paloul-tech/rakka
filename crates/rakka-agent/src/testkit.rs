@@ -1542,6 +1542,7 @@ where
     policies: AgentEffectPolicies,
     memory: Arc<Mutex<Option<AgentRunMemory>>>,
     decisions: Arc<Mutex<Option<Arc<dyn AgentDecisionEventSink>>>>,
+    segments: Arc<Mutex<Option<Arc<dyn crate::observability::AgentSegmentSink>>>>,
     metrics: Arc<Mutex<Option<Arc<dyn MetricsRecorder>>>>,
     delegation: Arc<Mutex<Option<crate::delegation::AgentRunDelegationConfig>>>,
     workflow_tools: Arc<Mutex<Option<crate::workflow_tool::AgentRunWorkflowConfig>>>,
@@ -1564,6 +1565,7 @@ where
             policies: self.policies.clone(),
             memory: self.memory.clone(),
             decisions: self.decisions.clone(),
+            segments: self.segments.clone(),
             metrics: self.metrics.clone(),
             delegation: self.delegation.clone(),
             workflow_tools: self.workflow_tools.clone(),
@@ -1595,6 +1597,7 @@ where
             policies: AgentEffectPolicies::default(),
             memory: Arc::new(Mutex::new(None)),
             decisions: Arc::new(Mutex::new(None)),
+            segments: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(None)),
             delegation: Arc::new(Mutex::new(None)),
             workflow_tools: Arc::new(Mutex::new(None)),
@@ -1640,6 +1643,15 @@ where
             .decisions
             .lock()
             .expect("the decision slot should not be poisoned") = Some(sink);
+    }
+
+    /// Wires every run entity this transport builds with a bounded-segment
+    /// sink, under the same shared-slot rule as [`Self::install_memory`].
+    pub fn install_segments(&self, sink: Arc<dyn crate::observability::AgentSegmentSink>) {
+        *self
+            .segments
+            .lock()
+            .expect("the segment slot should not be poisoned") = Some(sink);
     }
 
     /// Wires every run entity this transport builds with a metrics recorder,
@@ -1756,6 +1768,14 @@ where
                 .clone();
             if let Some(decisions) = decisions {
                 entity = entity.with_decision_events(decisions);
+            }
+            let segments = self
+                .segments
+                .lock()
+                .expect("the segment slot should not be poisoned")
+                .clone();
+            if let Some(segments) = segments {
+                entity = entity.with_segments(segments);
             }
             let metrics = self
                 .metrics

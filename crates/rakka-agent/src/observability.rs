@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use rakka_agent_workflow::{
-    validate_agent_span_link, validate_agent_telemetry_context, AgentCausationId,
+    validate_agent_span_link, validate_agent_telemetry_context, AgentAttributes, AgentCausationId,
     AgentCorrelationId, AgentTelemetryContext, AgentTimestampMillis, StateSchemaVersion,
 };
 use rakka_core::{MetricAttributes, MetricKind, MetricsRecorder, OpenTelemetryInstrumentView};
@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::definition::{AgentEffectSafetyClass, AgentRevisionNumber, AgentToolId};
 use crate::identity::{
-    AgentGoalId, AgentOperationId, AgentOperationKind, AgentRunScope, AgentTaskId,
+    AgentGoalId, AgentOperationId, AgentOperationKind, AgentRunScope, AgentTaskId, AgentTaskScope,
 };
 use crate::loop_runtime::AgentLoopPhase;
 use crate::memory::AgentContextSnapshotRef;
@@ -659,8 +659,63 @@ pub const METRIC_AGENT_RUN_TRANSITIONS: &str = "rakka.agent.run.transitions";
 /// requires.
 pub const METRIC_AGENT_EFFECT_OUTCOMES: &str = "rakka.agent.effect.outcomes";
 
+/// Histogram, milliseconds: how long a committed effect stayed outstanding,
+/// from its durable acceptance to its durable result, labeled by effect kind
+/// and terminal outcome
+/// ([specification 17.9](../../../docs/plans/rakka-agent/spec.md),
+/// [17.12](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// This is the latency the *run* observed: queue wait, dispatch, and the
+/// external call together, measured between the effect's own durable
+/// timestamps, so the value is the same whichever worker resolved it and
+/// whatever clock this process happens to hold. `effect_kind` is what
+/// separates a model call from a tool call from an A2A send.
+///
+/// It is deliberately one instrument rather than a queue/dispatch pair. The
+/// effect's `dispatched_at` is stamped when the run hands the effect to the
+/// outbox, not when a worker begins an attempt on it, so a pair split there
+/// would report the run's own hand-off latency under a name promising queue
+/// delay. The dispatcher measures its own attempt separately, from the clock
+/// it actually holds.
+pub const METRIC_AGENT_EFFECT_OUTSTANDING_DURATION: &str =
+    "rakka.agent.effect.outstanding.duration";
+
+/// Histogram, milliseconds: one bounded active turn, from the durable
+/// acceptance of the turn's model effect to the transition that folded the
+/// turn into the session, labeled by outcome
+/// ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)'s active
+/// turn duration).
+///
+/// A turn spans a durable wait — the run is not resident while its model
+/// effect is outstanding — so this is deliberately measured between two
+/// persisted timestamps rather than across a live segment, which is also why
+/// it survives the passivation, recovery, and shard movement the turn may
+/// cross.
+pub const METRIC_AGENT_TURN_DURATION: &str = "rakka.agent.turn.duration";
+
+/// Histogram, tokens: provider-reported token usage per recorded turn, labeled
+/// by `direction` (`input` / `output`)
+/// ([specification 17.8](../../../docs/plans/rakka-agent/spec.md),
+/// [17.12](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Only what the provider actually reported is recorded; a turn carrying no
+/// usage records nothing rather than a zero, because a zero is a claim about
+/// the provider that Rakka has no evidence for. Cost is deliberately absent:
+/// it is a tenant-specific figure and never a metric label or value here.
+pub const METRIC_AGENT_MODEL_TOKENS: &str = "rakka.agent.model.tokens";
+
 /// Counter: run recoveries, labeled by outcome.
 pub const METRIC_AGENT_RECOVERY_EVENTS: &str = "rakka.agent.recovery.events";
+
+/// Histogram, milliseconds: how long one run recovery took, labeled by outcome
+/// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md),
+/// [17.12](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// This one is genuinely in-process — a durable load, in this process, now —
+/// so it is measured by the recovery segment's own monotonic width rather than
+/// between persisted timestamps, and it is the cold-activation latency an
+/// operator watches after a shard moves.
+pub const METRIC_AGENT_RECOVERY_DURATION: &str = "rakka.agent.recovery.duration";
 
 /// Gauge: the run's durable count of decision events its bounded ring
 /// dropped — the visibility
@@ -846,6 +901,7 @@ pub const AGENT_METRIC_FIELDS: &[&str] = &[
     "backend",
     "decision_kind",
     "decision_source",
+    "direction",
     "operation",
     "outcome",
     "phase",
@@ -1087,12 +1143,44 @@ pub const AGENT_DOMAIN_METRIC_INSTRUMENTS: &[AgentDomainMetricInstrument] = &[
         "Resolved effect generations, including indeterminate outcomes.",
     ),
     AgentDomainMetricInstrument::new(
+        METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
+        MetricKind::Histogram,
+        "ms",
+        &["effect_kind", "outcome"],
+        AGENT_LATENCY_BUCKETS_MS,
+        "Durable acceptance to durable result, as the run observed it.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_TURN_DURATION,
+        MetricKind::Histogram,
+        "ms",
+        &["outcome"],
+        AGENT_LATENCY_BUCKETS_MS,
+        "One bounded active turn, across its durable model round trip.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_MODEL_TOKENS,
+        MetricKind::Histogram,
+        "{token}",
+        &["direction"],
+        AGENT_COUNT_BUCKETS,
+        "Provider-reported token usage per recorded turn, by direction.",
+    ),
+    AgentDomainMetricInstrument::new(
         METRIC_AGENT_RECOVERY_EVENTS,
         MetricKind::Counter,
         "{recovery}",
         &["outcome"],
         &[],
         "Run recoveries after restart, passivation, or shard movement.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_RECOVERY_DURATION,
+        MetricKind::Histogram,
+        "ms",
+        &["outcome"],
+        AGENT_LATENCY_BUCKETS_MS,
+        "One run recovery, measured in the process that performed it.",
     ),
     AgentDomainMetricInstrument::new(
         METRIC_AGENT_DECISION_DROPS,
@@ -1247,6 +1335,468 @@ pub const AGENT_DOMAIN_METRIC_INSTRUMENTS: &[AgentDomainMetricInstrument] = &[
         "Wake delivery attempts made by the shared scanner.",
     ),
 ];
+
+/// One bounded operation the runtime observed, named by a closed class.
+///
+/// This is Rakka's own stable vocabulary for the span rows of
+/// [specification 17.6](../../../docs/plans/rakka-agent/spec.md), and it is
+/// deliberately *not* the OpenTelemetry GenAI vocabulary:
+/// [17.20](../../../docs/plans/rakka-agent/spec.md) requires the agent domain
+/// to keep an internal vocabulary of its own and to put the convention mapping
+/// behind the `otel` feature. So the loop, the entities, and the dispatcher
+/// emit these unconditionally — a `--no-default-features` build measures the
+/// same operations — and [`crate::otel`] is the only place they become
+/// `invoke_agent`, `execute_tool`, and the rest.
+///
+/// Every payload is a bounded class from a configured registry — a telemetry
+/// name, a tool name, a model profile — never a raw identifier, user input, or
+/// argument text ([17.6](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentSegmentOperation {
+    /// A2A protocol ingress, bracketing context extraction and durable
+    /// acceptance. The class is the bounded A2A operation label.
+    A2aIngress {
+        /// The bounded A2A operation class.
+        operation: String,
+    },
+    /// One bounded loop transition that produced a decision.
+    Decide {
+        /// The loop phase the transition advanced from.
+        phase: &'static str,
+    },
+    /// One bounded active invocation of an agent.
+    InvokeAgent {
+        /// The bounded configured agent telemetry or template name, when the
+        /// deployment configured one.
+        ///
+        /// Absent is the normal case inside Rakka, and deliberately so:
+        /// [17.6](../../../docs/plans/rakka-agent/spec.md) forbids a span name
+        /// to embed an agent identifier, and `AgentId` is an identifier however
+        /// bounded it is. The agent's identity rides the segment's
+        /// [`AgentSegmentIdentity`] instead, which is where
+        /// [17.3](../../../docs/plans/rakka-agent/spec.md) puts it — an
+        /// access-controlled attribute, never a name.
+        agent_name: Option<String>,
+    },
+    /// Durable acceptance of an effect into the outbox.
+    EffectSchedule {
+        /// The bounded effect kind.
+        effect_kind: &'static str,
+    },
+    /// One dispatcher attempt on a scheduled effect.
+    EffectDispatch {
+        /// The bounded effect kind.
+        effect_kind: &'static str,
+    },
+    /// The dispatch-time authority decision for an effect.
+    ToolAuthorize {
+        /// The bounded effect kind the grant was sought for.
+        effect_kind: &'static str,
+    },
+    /// A model/provider call executed through the model adapter.
+    ModelInference {
+        /// The bounded model profile or requested model class.
+        model_profile: String,
+    },
+    /// Application-level execution of a named tool.
+    ExecuteTool {
+        /// The tool name from the bounded registry.
+        tool_name: String,
+    },
+    /// An outbound A2A call to a peer agent.
+    DelegateToPeer {
+        /// The bounded peer or skill class.
+        peer_class: String,
+    },
+    /// A durable workflow-tool invocation.
+    WorkflowInvoke {
+        /// The bounded workflow class.
+        workflow_class: String,
+    },
+    /// Goal progress/evidence evaluation.
+    GoalEvaluate,
+    /// Task result validation against its bounded rule set.
+    ValidateTaskResult,
+    /// A same-task transfer of responsibility.
+    Handoff,
+    /// A team board claim or message operation.
+    TeamOperation {
+        /// The bounded team operation label.
+        operation: String,
+    },
+    /// One moderated-conversation turn transition.
+    ModerationTurn {
+        /// The bounded conversation operation label.
+        operation: String,
+    },
+    /// Continuous wake/epoch admission.
+    WakeAdmit,
+    /// A fail-closed autonomy admission check.
+    AutonomyAdmit,
+    /// A dispatch-time budget reservation.
+    BudgetReserve,
+    /// A terminal budget settlement.
+    BudgetSettle,
+    /// A short-term, private, or communal memory operation.
+    MemoryOperation {
+        /// The bounded memory tier.
+        tier: &'static str,
+    },
+    /// A retrieval against an authorized knowledge space.
+    Retrieval {
+        /// The bounded backend class.
+        backend: String,
+    },
+    /// Opening a durable checkpoint; the segment ends at the durable park.
+    CheckpointOpen,
+    /// Resuming a run after a durable wait.
+    RunResume,
+    /// Recovering a run after restart, passivation, or shard movement.
+    RunRecover,
+}
+
+impl AgentSegmentOperation {
+    /// Stable kebab-case class label, for logs and bounded metric labels.
+    ///
+    /// The label names the *class*, never its payload: an operation's bounded
+    /// class is low-cardinality and a tool or model name is not, so a label
+    /// built from this can ride a metric while the payload rides a span.
+    #[must_use]
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::A2aIngress { .. } => "a2a-ingress",
+            Self::Decide { .. } => "decide",
+            Self::InvokeAgent { .. } => "invoke-agent",
+            Self::EffectSchedule { .. } => "effect-schedule",
+            Self::EffectDispatch { .. } => "effect-dispatch",
+            Self::ToolAuthorize { .. } => "tool-authorize",
+            Self::ModelInference { .. } => "model-inference",
+            Self::ExecuteTool { .. } => "execute-tool",
+            Self::DelegateToPeer { .. } => "delegate-to-peer",
+            Self::WorkflowInvoke { .. } => "workflow-invoke",
+            Self::GoalEvaluate => "goal-evaluate",
+            Self::ValidateTaskResult => "validate-task-result",
+            Self::Handoff => "handoff",
+            Self::TeamOperation { .. } => "team-operation",
+            Self::ModerationTurn { .. } => "moderation-turn",
+            Self::WakeAdmit => "wake-admit",
+            Self::AutonomyAdmit => "autonomy-admit",
+            Self::BudgetReserve => "budget-reserve",
+            Self::BudgetSettle => "budget-settle",
+            Self::MemoryOperation { .. } => "memory-operation",
+            Self::Retrieval { .. } => "retrieval",
+            Self::CheckpointOpen => "checkpoint-open",
+            Self::RunResume => "run-resume",
+            Self::RunRecover => "run-recover",
+        }
+    }
+}
+
+/// How a bounded operation ended.
+///
+/// `Unset` is not "unknown so far": a segment is only ever recorded once it
+/// has ended, so `Unset` means the operation carries no success or failure
+/// judgement at all — the OpenTelemetry default for a span whose instrument
+/// does not classify the outcome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentSegmentOutcome {
+    /// The operation ended without a success or failure judgement.
+    #[default]
+    Unset,
+    /// The operation succeeded.
+    Ok,
+    /// The operation failed.
+    Error,
+}
+
+impl AgentSegmentOutcome {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// The durable identities a segment may carry, under the caller's telemetry
+/// access policy ([specification 17.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Identifiers may appear in access-controlled traces and logs and must never
+/// label a metric or ride baggage. Where a tenant's policy requires a
+/// pseudonym instead of a raw identifier, the substitution belongs to the sink
+/// that exports the segment, and the reversible mapping stays outside the
+/// telemetry backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentSegmentIdentity {
+    /// The agent this operation belongs to.
+    pub agent: Option<String>,
+    /// The run — the durable session identity.
+    pub run: Option<String>,
+    /// The task.
+    pub task: Option<String>,
+    /// The goal.
+    pub goal: Option<String>,
+    /// The delegation.
+    pub delegation: Option<String>,
+}
+
+impl AgentSegmentIdentity {
+    /// The identity of one run scope.
+    #[must_use]
+    pub fn of_run(scope: &AgentRunScope) -> Self {
+        Self {
+            agent: Some(scope.agent().as_str().to_string()),
+            run: Some(scope.run().as_str().to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// The identity of one task scope.
+    ///
+    /// A task is tenant-scoped rather than agent-scoped — a task outlives the
+    /// agent assigned to it, and may be reassigned — so the agent is absent
+    /// here rather than guessed from the caller.
+    #[must_use]
+    pub fn of_task(scope: &AgentTaskScope) -> Self {
+        Self {
+            task: Some(scope.task().as_str().to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// One ended bounded operation: what it was, when it ran, how it ended, and
+/// the durable trace context it belongs to.
+///
+/// A segment is *closed*, never open. The runtime never holds a span object
+/// across a durable wait
+/// ([17.4](../../../docs/plans/rakka-agent/spec.md)), and the boundaries are
+/// never persisted: stamping them into a durable record would make a telemetry
+/// change a state migration, which
+/// [17.20](../../../docs/plans/rakka-agent/spec.md) forbids. What *is*
+/// persisted is the trace context the segment carries, which is what lets a
+/// resume link back to the operation that parked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTelemetrySegment {
+    /// The bounded operation class.
+    pub operation: AgentSegmentOperation,
+    /// When the operation began.
+    pub start: AgentTimestampMillis,
+    /// When the operation ended.
+    pub end: AgentTimestampMillis,
+    /// How it ended.
+    pub outcome: AgentSegmentOutcome,
+    /// The stable low-cardinality error type, on an error outcome.
+    pub error_type: Option<&'static str>,
+    /// The stable Rakka error code, on an error outcome.
+    pub error_code: Option<String>,
+    /// The durable identities, under the caller's access policy.
+    pub identity: AgentSegmentIdentity,
+    /// Bounded attributes from closed vocabularies. Never content, never a
+    /// credential, never an unbounded message.
+    pub attributes: AgentAttributes,
+    /// The durable trace context the operation belongs to.
+    pub telemetry: AgentTelemetryContext,
+}
+
+impl AgentTelemetrySegment {
+    /// A segment that ended without a success or failure judgement.
+    #[must_use]
+    pub fn new(
+        operation: AgentSegmentOperation,
+        start: AgentTimestampMillis,
+        end: AgentTimestampMillis,
+    ) -> Self {
+        Self {
+            operation,
+            start,
+            end,
+            outcome: AgentSegmentOutcome::Unset,
+            error_type: None,
+            error_code: None,
+            identity: AgentSegmentIdentity::default(),
+            attributes: AgentAttributes::new(),
+            telemetry: AgentTelemetryContext::default(),
+        }
+    }
+
+    /// Marks the operation successful.
+    #[must_use]
+    pub fn ok(mut self) -> Self {
+        self.outcome = AgentSegmentOutcome::Ok;
+        self
+    }
+
+    /// Marks the operation failed, with a stable low-cardinality type and the
+    /// stable Rakka code.
+    ///
+    /// The code is bounded on the way in, because an error code is a stable
+    /// short string and an unbounded one here would be an error *message*
+    /// wearing a code's name — the exact substitution
+    /// [17.6](../../../docs/plans/rakka-agent/spec.md) forbids as a grouping
+    /// attribute.
+    #[must_use]
+    pub fn failed(mut self, error_type: &'static str, code: impl AsRef<str>) -> Self {
+        self.outcome = AgentSegmentOutcome::Error;
+        self.error_type = Some(error_type);
+        let code = code.as_ref();
+        let bounded = code
+            .char_indices()
+            .take_while(|(index, character)| {
+                index + character.len_utf8() <= AGENT_SEGMENT_ERROR_CODE_MAX_LENGTH
+            })
+            .map(|(_, character)| character)
+            .collect::<String>();
+        self.error_code = Some(bounded);
+        self
+    }
+
+    /// Attaches the durable identities.
+    #[must_use]
+    pub fn identity(mut self, identity: AgentSegmentIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// Attaches the durable trace context.
+    #[must_use]
+    pub fn telemetry(mut self, telemetry: AgentTelemetryContext) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    /// Adds one bounded attribute.
+    #[must_use]
+    pub fn attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.attributes.insert(key.into(), value.into());
+        self
+    }
+
+    /// The operation's duration in milliseconds, or `None` when the clock ran
+    /// backwards between the endpoints.
+    #[must_use]
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.end.as_millis().checked_sub(self.start.as_millis())
+    }
+}
+
+/// The longest stable error code a segment carries.
+pub const AGENT_SEGMENT_ERROR_CODE_MAX_LENGTH: usize = 96;
+
+/// Measures one *live* bounded operation — a transition, a dispatch attempt,
+/// a provider call — and closes it into a segment.
+///
+/// Two clocks, on purpose. The segment is *anchored* to the caller's injected
+/// `AgentTimestampMillis`, so a segment's position in time agrees with the
+/// durable records around it and stays deterministic under the frozen clocks
+/// the suite drives. Its *width* comes from a monotonic [`Instant`], because a
+/// live operation has exactly one injected timestamp — a transition receives
+/// one `now` and commits under it — and deriving a width from a single value
+/// would report every live operation as instantaneous.
+///
+/// This is the opposite trade from
+/// [`record_agent_domain_duration`], and deliberately so: a duration spanning a
+/// durable boundary has two persisted endpoints and must use them, while a
+/// duration inside one process has none and must measure itself.
+#[derive(Debug)]
+pub struct AgentSegmentTimer {
+    anchor: AgentTimestampMillis,
+    started: std::time::Instant,
+}
+
+impl AgentSegmentTimer {
+    /// Starts measuring, anchored at the caller's current timestamp.
+    #[must_use]
+    pub fn start(anchor: AgentTimestampMillis) -> Self {
+        Self {
+            anchor,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Closes the measurement into a segment for the given operation.
+    #[must_use]
+    pub fn close(self, operation: AgentSegmentOperation) -> AgentTelemetrySegment {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        AgentTelemetrySegment::new(
+            operation,
+            self.anchor,
+            AgentTimestampMillis::new(self.anchor.as_millis().saturating_add(elapsed)),
+        )
+    }
+}
+
+/// Receives bounded operation segments as they end.
+///
+/// Deliberately synchronous and infallible, unlike
+/// [`AgentDecisionEventSink`]. A segment is closed inside the dispatch
+/// attempt and at entity command boundaries, where there is no place to await
+/// and nothing that may fail the operation: telemetry is never a correctness
+/// input ([17.1](../../../docs/plans/rakka-agent/spec.md)), so a sink that
+/// cannot keep up must drop and count, never block or error. Buffering,
+/// batching, and export belong to the implementation — see
+/// [`crate::otel::AgentGenAiSpanExporter`], which is the one that turns these
+/// into OTLP span records.
+pub trait AgentSegmentSink: Send + Sync {
+    /// The bounded backend class, for the flush-failure metric's `signal`.
+    fn backend_name(&self) -> &'static str;
+
+    /// Records one ended segment.
+    fn record(&self, segment: &AgentTelemetrySegment);
+}
+
+/// In-memory segment sink for deterministic tests.
+#[derive(Debug, Default)]
+pub struct InMemoryAgentSegmentSink {
+    segments: Mutex<Vec<AgentTelemetrySegment>>,
+}
+
+impl InMemoryAgentSegmentSink {
+    /// Creates an empty sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every segment recorded so far, in the order they ended.
+    #[must_use]
+    pub fn segments(&self) -> Vec<AgentTelemetrySegment> {
+        self.segments
+            .lock()
+            .map(|segments| segments.clone())
+            .unwrap_or_default()
+    }
+
+    /// The bounded operation labels recorded so far, in order.
+    #[must_use]
+    pub fn operations(&self) -> Vec<&'static str> {
+        self.segments
+            .lock()
+            .map(|segments| {
+                segments
+                    .iter()
+                    .map(|segment| segment.operation.as_label())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl AgentSegmentSink for InMemoryAgentSegmentSink {
+    fn backend_name(&self) -> &'static str {
+        "in-memory"
+    }
+
+    fn record(&self, segment: &AgentTelemetrySegment) {
+        if let Ok(mut segments) = self.segments.lock() {
+            segments.push(segment.clone());
+        }
+    }
+}
 
 /// Returns the agent-domain instrument definition for a metric name.
 #[must_use]

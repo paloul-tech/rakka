@@ -107,7 +107,7 @@ use rakka_agent_workflow::{
     agent_effect_to_outbox_command, AgentDispatchClaim, AgentDispatcherError, AgentDispatcherFleet,
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorkerId, AgentEffect,
     AgentEphemeralCredential, AgentInboxError, AgentOutboxError, AgentRunId as WorkflowRunId,
-    AgentRunInbox, AgentTimestampMillis, PrincipalRef,
+    AgentRunInbox, AgentTelemetryContext, AgentTimestampMillis, PrincipalRef,
 };
 use rakka_persistence::DurableStateStore;
 
@@ -125,6 +125,7 @@ use crate::memory::{
     PrivateMemoryExpectation, SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
 };
 use crate::model::{AgentModelAdapter, AgentModelRequest, AgentToolCallRequest};
+use crate::observability::{AgentSegmentOperation, AgentSegmentTimer};
 use crate::run::{
     load_agent_run_state, AgentRun, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError,
     AgentRunState,
@@ -1704,6 +1705,7 @@ where
     claim_appends: Option<Arc<dyn AgentClaimAppendExecutor>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
+    segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
 }
 
 impl<Flow, Fleet, Runs, Clock> AgentRunEffectDispatcher<Flow, Fleet, Runs, Clock>
@@ -1770,6 +1772,7 @@ where
             claim_appends: None,
             delivery,
             probe: None,
+            segments: None,
         }
     }
 
@@ -1975,6 +1978,42 @@ where
         self
     }
 
+    /// Closes the dispatcher's bounded operation segments into `sink`
+    /// ([specification 17.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The dispatcher is where the external world is actually touched — the
+    /// provider call, the tool call, the peer send — and it is the only
+    /// vantage point from which those latencies are visible. A run entity
+    /// sees the effect's durable acceptance and its durable result and
+    /// nothing in between, so a segment for the attempt itself can only be
+    /// closed here.
+    ///
+    /// Segments are closed on the worker holding the lease, after the durable
+    /// write that makes the attempt real, and never block or fail it.
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn crate::observability::AgentSegmentSink>) -> Self {
+        self.segments = Some(sink);
+        self
+    }
+
+    /// Closes one segment into the wired sink, attaching the run's identity
+    /// and the trace context the effect carried across the durable boundary.
+    fn close_segment(
+        &self,
+        scope: &AgentRunScope,
+        telemetry: &AgentTelemetryContext,
+        segment: crate::observability::AgentTelemetrySegment,
+    ) {
+        let Some(sink) = self.segments.as_ref() else {
+            return;
+        };
+        sink.record(
+            &segment
+                .identity(crate::observability::AgentSegmentIdentity::of_run(scope))
+                .telemetry(telemetry.clone()),
+        );
+    }
+
     /// The sink runs served by this pipeline should flush through.
     #[must_use]
     pub fn sink(&self) -> WorkflowAgentRunEffectSink<Flow, Clock> {
@@ -1988,6 +2027,11 @@ where
             self.workflow_store.clone(),
             self.clock.clone(),
         )
+    }
+
+    /// The dispatcher's own clock, as an agent-domain timestamp.
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.now().as_millis())
     }
 
     fn survives(&self, window: AgentDispatchWindow) -> bool {
@@ -2254,10 +2298,29 @@ where
         // an unroutable execution policy, a blocked guardrail — settles the
         // generation (scenario 54).
         let now = rakka_agent_workflow::AgentTimestampMillis::new(self.clock.now().as_millis());
-        let decision = self
+        // A distinct segment from the attempt below, because it is a distinct
+        // interval with a distinct meaning: it ends before the durable
+        // `Started` write, so a refusal here provably invoked nothing.
+        let authorize_timer = AgentSegmentTimer::start(now);
+        let authorized = self
             .authority
             .authorize(scope, state, intent, attempt, now)
-            .await?;
+            .await;
+        let authorize_segment = authorize_timer.close(AgentSegmentOperation::ToolAuthorize {
+            effect_kind: intent.kind().as_label(),
+        });
+        self.close_segment(
+            scope,
+            &intent.telemetry,
+            match &authorized {
+                Ok(AgentDispatchDecision::Granted(_)) => authorize_segment.ok(),
+                Ok(AgentDispatchDecision::Refused(refusal)) => {
+                    authorize_segment.failed("rakka.agent.authority", &refusal.code)
+                }
+                Err(error) => authorize_segment.failed("rakka.agent.authority", error.code()),
+            },
+        );
+        let decision = authorized?;
         let granted = match decision {
             AgentDispatchDecision::Granted(granted) => {
                 if let Err(refusal) = granted.grant.validate_for(scope, intent, attempt, now) {
@@ -2459,10 +2522,26 @@ where
         }
 
         pass.invoked += 1;
+        // The attempt segment brackets the external call only. It begins after
+        // the durable `Started` write, so a segment exists exactly when an
+        // invocation may have happened — which is the window that decides
+        // whether an outcome is indeterminate.
+        let attempt_timer = AgentSegmentTimer::start(self.now());
         let invoked = self
             .invoke(scope, intent, &granted, credential.as_ref())
             .await;
         drop(credential);
+        let attempt_segment = attempt_timer.close(AgentSegmentOperation::EffectDispatch {
+            effect_kind: intent.kind().as_label(),
+        });
+        self.close_segment(
+            scope,
+            &intent.telemetry,
+            match &invoked {
+                Ok(_) => attempt_segment.ok(),
+                Err(error) => attempt_segment.failed("rakka.agent.dispatch", error.code()),
+            },
+        );
 
         if !self.survives(AgentDispatchWindow::AfterInvocation) {
             return Ok(ClaimConclusion::Died);
@@ -2989,11 +3068,25 @@ where
                 if let Some(profile) = profile {
                     request = request.with_profile(profile);
                 }
-                let turn = self.model.call(&request).await.map_err(|error| {
-                    AgentDispatchError::Invocation {
-                        code: error.code(),
-                        message: error.to_string(),
-                    }
+                let model_profile = request
+                    .profile
+                    .as_ref()
+                    .map(|profile| profile.as_str().to_string())
+                    .unwrap_or_default();
+                let timer = AgentSegmentTimer::start(self.now());
+                let called = self.model.call(&request).await;
+                let segment = timer.close(AgentSegmentOperation::ModelInference { model_profile });
+                self.close_segment(
+                    scope,
+                    &intent.telemetry,
+                    match &called {
+                        Ok(_) => segment.ok(),
+                        Err(error) => segment.failed("rakka.agent.model", error.code()),
+                    },
+                );
+                let turn = called.map_err(|error| AgentDispatchError::Invocation {
+                    code: error.code(),
+                    message: error.to_string(),
                 })?;
                 turn.validate()
                     .map_err(|error| AgentDispatchError::Invocation {
@@ -3006,7 +3099,23 @@ where
             }
             AgentRunEffectRequest::Tool { call } => {
                 let call: &AgentToolCallRequest = granted.tool_call.as_deref().unwrap_or(call);
-                let content = self.tools.execute(scope, intent, call, credential).await?;
+                // The tool name is a bounded class from the configured
+                // registry, which 17.6 permits in a span name; the call's
+                // arguments are not, and never leave the dispatch path.
+                let timer = AgentSegmentTimer::start(self.now());
+                let executed = self.tools.execute(scope, intent, call, credential).await;
+                let segment = timer.close(AgentSegmentOperation::ExecuteTool {
+                    tool_name: call.tool.as_str().to_string(),
+                });
+                self.close_segment(
+                    scope,
+                    &intent.telemetry,
+                    match &executed {
+                        Ok(_) => segment.ok(),
+                        Err(error) => segment.failed("rakka.agent.tool", error.code()),
+                    },
+                );
+                let content = executed?;
                 Ok(AgentRunEffectOutcome::Tool {
                     call_id: call.call_id.clone(),
                     content,

@@ -21,8 +21,9 @@ use rakka_agent::{
     AgentTaskEntityCommand, AgentTaskScope, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest,
     AgentToolId, AgentWakeBackoffPolicy, AgentWakeLifecyclePolicy, InMemoryAgentDecisionEventSink,
     ScheduleRevision, AGENT_EPOCH_RESULT_PAYLOAD_TYPE, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
-    METRIC_AGENT_DECISIONS, METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EPOCHS,
-    METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_WAKE_DISPOSITIONS,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
+    METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_MODEL_TOKENS,
+    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TURN_DURATION, METRIC_AGENT_WAKE_DISPOSITIONS,
 };
 use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
 use rakka_core::{InMemoryMetricsRecorder, MetricKind};
@@ -962,4 +963,116 @@ async fn moderation_turns_count_once_under_bounded_labels() {
         ],
         "one observation per durable decision, none for the replays"
     );
+}
+
+/// The duration instruments record from durable timestamps, so a run that
+/// crossed a passivation reports the same figures a resident one would, and a
+/// replayed result adds no second sample.
+#[tokio::test]
+async fn a_run_records_its_durations_from_durable_timestamps() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, proposing_turn("resolved")),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    );
+
+    let fx = Fixture::new(dispatcher).with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the loop should run to completion");
+
+    let snapshot = metrics.snapshot();
+
+    // Every effect the run resolved is measured once, by kind and outcome.
+    let outstanding = snapshot.observations_named(METRIC_AGENT_EFFECT_OUTSTANDING_DURATION);
+    assert_eq!(
+        outstanding.len(),
+        snapshot
+            .observations_named(METRIC_AGENT_EFFECT_OUTCOMES)
+            .len(),
+        "an effect that resolves is measured exactly as often as it is counted"
+    );
+    assert!(outstanding
+        .iter()
+        .all(|observation| observation.kind() == MetricKind::Histogram));
+    assert_eq!(
+        labels_of(&snapshot, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION),
+        vec![
+            vec![
+                ("effect_kind".to_string(), "model-call".to_string()),
+                ("outcome".to_string(), "succeeded".to_string()),
+            ],
+            vec![
+                ("effect_kind".to_string(), "tool-call".to_string()),
+                ("outcome".to_string(), "succeeded".to_string()),
+            ],
+            vec![
+                ("effect_kind".to_string(), "model-call".to_string()),
+                ("outcome".to_string(), "succeeded".to_string()),
+            ],
+        ],
+        "the model call, the tool call, and the second model call, in order"
+    );
+
+    // Two turns were folded into the session, so two turns were measured.
+    let turns = snapshot.observations_named(METRIC_AGENT_TURN_DURATION);
+    assert_eq!(turns.len(), 2, "one sample per recorded turn");
+    assert!(turns
+        .iter()
+        .all(|observation| observation.kind() == MetricKind::Histogram));
+    assert_eq!(
+        labels_of(&snapshot, METRIC_AGENT_TURN_DURATION),
+        vec![
+            vec![("outcome".to_string(), "recorded".to_string())],
+            vec![("outcome".to_string(), "recorded".to_string())],
+        ]
+    );
+
+    // Only the proposing turn reported usage, so only it contributes tokens —
+    // one sample per direction, and nothing at all for the turn that reported
+    // none.
+    let tokens = snapshot.observations_named(METRIC_AGENT_MODEL_TOKENS);
+    assert_eq!(
+        labels_of(&snapshot, METRIC_AGENT_MODEL_TOKENS),
+        vec![
+            vec![("direction".to_string(), "input".to_string())],
+            vec![("direction".to_string(), "output".to_string())],
+        ],
+        "a turn carrying no provider usage records nothing rather than a zero"
+    );
+    assert_eq!(tokens[0].value(), 10.0);
+    assert_eq!(tokens[1].value(), 5.0);
+
+    // A re-driven pass answers every command from the operation log, so no
+    // duration is sampled twice.
+    fx.pump().await.expect("the re-driven pass is idempotent");
+    let redriven = metrics.snapshot();
+    for name in [
+        METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
+        METRIC_AGENT_TURN_DURATION,
+        METRIC_AGENT_MODEL_TOKENS,
+    ] {
+        assert_eq!(
+            redriven.observations_named(name).len(),
+            snapshot.observations_named(name).len(),
+            "{name} gained a sample on a replay"
+        );
+    }
+
+    for observation in redriven.observations() {
+        let attributes: Vec<(&str, &str)> = observation
+            .attributes()
+            .iter()
+            .map(|attribute| (attribute.key(), attribute.value()))
+            .collect();
+        validate_agent_domain_metric_attributes(&attributes).unwrap_or_else(|error| {
+            panic!("{}: {error}", observation.name());
+        });
+    }
 }

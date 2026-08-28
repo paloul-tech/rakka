@@ -32,7 +32,7 @@ ok  5/18 budgets settled durably: 2 loop iterations, 2 model calls, 3 effect att
 ok  6/18 fully passivated (0 resident entities) and still addressable: the describe ask re-materialized the owner
 ok  7/18 both model turns executed through dispatcher worker-1
 ok  8/18 the session view assembled 1 correlated trace segments by run id
-ok  9/18 bounded metrics observed: rakka.agent.recovery.events, rakka.agent.run.transitions, rakka.agent.telemetry.flush.failures
+ok  9/18 bounded metrics observed: rakka.agent.recovery.duration, rakka.agent.recovery.events, rakka.agent.run.transitions, rakka.agent.telemetry.flush.failures, rakka.agent.turn.duration
 ok 10/18 short-term session context persisted: 3 entries, 2 immutable snapshots
 ok 11/18 each effectful call is its own durable effect: model and tool ticketed separately
 ok 12/18 the checkpoint-required tool parked the run WaitingForApproval, passivated
