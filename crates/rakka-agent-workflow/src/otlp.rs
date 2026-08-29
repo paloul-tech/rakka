@@ -17,8 +17,8 @@ use rakka_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    validate_agent_log_event, validate_agent_span_link, AgentAttributes, AgentAuditError,
-    AgentLogEvent, AgentRedactionPolicy, AgentSpanLink, AgentTelemetryContext,
+    agent_derived_span_id, validate_agent_log_event, validate_agent_span_link, AgentAttributes,
+    AgentAuditError, AgentLogEvent, AgentRedactionPolicy, AgentSpanLink, AgentTelemetryContext,
     AgentTimestampMillis, AgentTraceContext, AgentTraceError,
 };
 
@@ -742,7 +742,19 @@ pub struct AgentOtelSpanExport {
 }
 
 impl AgentOtelSpanExport {
-    /// Builds a span bridge record from a durable telemetry context.
+    /// Builds a span bridge record for a span that runs *inside* a durable
+    /// telemetry context.
+    ///
+    /// The context's span id is the record's **parent**, never its own id.
+    /// A `traceparent` names the span it was propagated from, so writing it
+    /// back as this record's id made every span a run closed collide on one
+    /// id — and on the *caller's* id, since that is where an ingress context
+    /// comes from. The child id is derived by [`agent_derived_span_id`] from
+    /// the little this constructor holds: the name and the time window. A
+    /// caller that goes on to populate the record calls
+    /// [`Self::with_derived_span_id`] afterwards, which re-derives over
+    /// everything that actually distinguishes one operation from its
+    /// siblings.
     ///
     /// The context supplies the trace identity and the span links, and
     /// **nothing else**. It deliberately does not supply attributes: baggage
@@ -775,11 +787,19 @@ impl AgentOtelSpanExport {
             trace_parent,
             telemetry_context.trace_state.as_deref(),
         )?;
+        let name = name.into();
+        let start = start_time.as_millis().to_string();
+        let end = end_time.as_millis().to_string();
+        let span_id = agent_derived_span_id(
+            &trace_context.trace_id,
+            &trace_context.span_id,
+            &[name.as_str(), start.as_str(), end.as_str()],
+        );
         Ok(Self {
-            name: name.into(),
+            name,
             trace_id: trace_context.trace_id,
-            span_id: trace_context.span_id,
-            parent_span_id: None,
+            span_id,
+            parent_span_id: Some(trace_context.span_id),
             trace_flags: trace_context.trace_flags,
             trace_state: trace_context.trace_state,
             start_time,
@@ -796,6 +816,59 @@ impl AgentOtelSpanExport {
     #[must_use]
     pub fn parent_span_id(mut self, parent_span_id: impl Into<String>) -> Self {
         self.parent_span_id = Some(parent_span_id.into());
+        self
+    }
+
+    /// Re-derives the span id over everything the record now carries, plus
+    /// whatever `distinguishing` material the caller holds and the record
+    /// does not.
+    ///
+    /// [`Self::from_telemetry_context`] derives from the name and the time
+    /// window, which separates two spans of different operations and does not
+    /// separate two spans of the *same* operation in the same millisecond. A
+    /// caller that has finished populating a record calls this, and the id
+    /// then covers the attributes, events, and links that tell the record
+    /// apart from its siblings — its attempt, its effect kind, its decisions.
+    ///
+    /// Content still does not always separate two records. A run closes two
+    /// `rakka.agent.effect.schedule` operations for two different effects with
+    /// the same name, the same attributes and the same millisecond, and
+    /// nothing on either record differs — the effect's identity is not a span
+    /// attribute, by [17.3](../../docs/plans/rakka-agent/spec.md). Merging
+    /// them would lose one, so an emitter that can produce such a pair passes
+    /// something that separates them: `AgentGenAiSpanExporter` passes its own
+    /// emission ordinal. Pass an empty slice when the record is all there is.
+    ///
+    /// The parent, the trace, and the derivation rule are unchanged; only the
+    /// material grows.
+    #[must_use]
+    pub fn with_derived_span_id(mut self, distinguishing: &[&str]) -> Self {
+        let mut material = vec![
+            self.name.clone(),
+            self.start_time.as_millis().to_string(),
+            self.end_time.as_millis().to_string(),
+            self.kind.as_label().to_string(),
+            self.status.as_label().to_string(),
+        ];
+        for (key, value) in &self.attributes {
+            material.push(format!("{key}={value}"));
+        }
+        for event in &self.events {
+            material.push(format!("{}@{}", event.name, event.time.as_millis()));
+            for (key, value) in &event.attributes {
+                material.push(format!("{key}={value}"));
+            }
+        }
+        for link in &self.links {
+            material.push(format!("{}-{}", link.trace_id, link.span_id));
+        }
+        let mut material = material.iter().map(String::as_str).collect::<Vec<_>>();
+        material.extend_from_slice(distinguishing);
+        self.span_id = agent_derived_span_id(
+            &self.trace_id,
+            self.parent_span_id.as_deref().unwrap_or_default(),
+            &material,
+        );
         self
     }
 

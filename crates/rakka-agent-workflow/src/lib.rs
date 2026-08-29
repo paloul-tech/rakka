@@ -232,7 +232,8 @@ pub use otlp::{
     AgentOtelInstrumentationScope, AgentOtelResource, AgentOtelSpanEvent, AgentOtelSpanExport,
     AgentOtelSpanKind, AgentOtelSpanStatus, AgentOtlpBridgeExport, AgentOtlpBridgeReceiver,
     AgentOtlpError, AgentOtlpExporterConfig, AgentOtlpProtocol, AgentOtlpReceiverFuture,
-    AgentOtlpResult, AgentOtlpSignal, InMemoryAgentOtlpReceiver, DEFAULT_AGENT_OTLP_GRPC_ENDPOINT,
+    AgentOtlpResult, AgentOtlpSignal, InMemoryAgentOtlpReceiver,
+    AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES, DEFAULT_AGENT_OTLP_GRPC_ENDPOINT,
     DEFAULT_AGENT_OTLP_HTTP_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS,
     OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
     OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_TIMEOUT, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
@@ -315,7 +316,7 @@ pub use timers::{
     AGENT_TIMER_PERSISTENCE_PREFIX, DEFAULT_AGENT_TIMER_STORE_ID, METRIC_AGENT_TIMERS,
 };
 pub use trace_context::{
-    agent_child_telemetry_context, agent_durable_resume_telemetry_context,
+    agent_child_telemetry_context, agent_derived_span_id, agent_durable_resume_telemetry_context,
     extract_agent_trace_context, inject_agent_trace_context, parse_agent_trace_context,
     require_agent_trace_context, validate_agent_span_link, validate_agent_telemetry_context,
     AgentTraceContext, AgentTraceError, AgentTraceResult, TRACEPARENT_HEADER, TRACESTATE_HEADER,

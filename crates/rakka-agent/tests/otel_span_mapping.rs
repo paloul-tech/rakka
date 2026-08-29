@@ -16,6 +16,7 @@
 
 #![cfg(feature = "otel")]
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
@@ -31,6 +32,7 @@ use rakka_agent::{
 use rakka_agent_workflow::{
     AgentAttributes, AgentLogEvent, AgentLogSeverity, AgentOtelResource, AgentOtelSpanKind,
     AgentOtelSpanStatus, AgentOtlpExporterConfig, AgentTelemetryContext, AgentTimestampMillis,
+    OTEL_RESOURCE_SERVICE_INSTANCE_ID, OTEL_RESOURCE_SERVICE_NAME, OTEL_RESOURCE_SERVICE_VERSION,
 };
 use rakka_core::InMemoryMetricsRecorder;
 
@@ -39,6 +41,10 @@ mod common;
 use common::*;
 
 const TRACE_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+/// The trace the caller propagated, and the caller's own span inside it.
+const TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
+const CALLER_SPAN_ID: &str = "b7ad6b7169203331";
 
 fn traced() -> AgentTelemetryContext {
     AgentTelemetryContext {
@@ -727,4 +733,222 @@ fn a_log_keeps_its_correlation_vocabulary_and_loses_everything_else() {
     // A run id belongs on a log and not on a span: the two lists differ on
     // purpose, and the span list is the stricter one.
     assert!(!is_agent_span_attribute("run_id"));
+}
+
+/// Every span a real run closes gets its own id, under the caller's span.
+///
+/// The durable telemetry context is one context for the whole run, and its
+/// `traceparent` names the *caller's* span. Building each record with that id
+/// meant a run exported eight or twenty-five records that were, to a backend,
+/// one span — and one that already belonged to the client. No hierarchy, no
+/// per-operation latency, no way to tell a tool call from the decide that
+/// scheduled it. The mapping now parents to the context and derives an id per
+/// record.
+#[tokio::test]
+async fn every_span_a_run_closes_gets_its_own_id_under_the_callers_span() {
+    let exporter = Arc::new(AgentGenAiSpanExporter::new());
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup", "argument"))
+            .with_turn_for(2, proposing_turn("answer")),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(serde_json::json!({ "found": "result" }))
+            .expect("the tool result is inline-bounded"),
+    );
+
+    let fx = Fixture::new(dispatcher).with_segments(exporter.clone());
+    fx.instantiate_agent().await;
+    fx.create_task_traced(traced()).await;
+    fx.pump().await.expect("the run completes");
+
+    let spans = exporter.drain();
+    assert!(
+        spans.len() > 1,
+        "a run closes more than one operation, or this proves nothing"
+    );
+
+    let ids: HashSet<&str> = spans.iter().map(|span| span.span_id.as_str()).collect();
+    assert_eq!(
+        ids.len(),
+        spans.len(),
+        "every span needs its own id; {} records collapsed to {} ids",
+        spans.len(),
+        ids.len()
+    );
+
+    for span in &spans {
+        assert_eq!(
+            span.trace_id, TRACE_ID,
+            "the run stays in the caller's trace"
+        );
+        assert_ne!(
+            span.span_id, CALLER_SPAN_ID,
+            "span `{}` is impersonating the caller's span",
+            span.name
+        );
+        assert_eq!(
+            span.parent_span_id.as_deref(),
+            Some(CALLER_SPAN_ID),
+            "span `{}` must hang under the caller's span",
+            span.name
+        );
+        span.validate()
+            .unwrap_or_else(|error| panic!("span `{}` is invalid: {error}", span.name));
+    }
+}
+
+/// A flush that cannot be built leaves the buffer where it was.
+///
+/// `bridge_export` used to pass `self.drain()` as an argument, so the ring was
+/// emptied before the callee validated anything. A blank endpoint — or one
+/// caller-supplied log that failed its bounds — then destroyed up to a full
+/// buffer of already-mapped spans, unrecoverably, while `buffered()` and
+/// `dropped()` both reported a clean pipeline.
+#[test]
+fn a_flush_that_fails_keeps_the_spans_it_could_not_export() {
+    let exporter = AgentGenAiSpanExporter::new();
+    let metrics = InMemoryMetricsRecorder::new();
+
+    for phase in ["deciding-continuation", "deciding-completion"] {
+        exporter.record(
+            &AgentTelemetrySegment::new(
+                AgentSegmentOperation::Decide { phase },
+                AgentTimestampMillis::new(1),
+                AgentTimestampMillis::new(2),
+            )
+            .telemetry(traced())
+            .ok(),
+        );
+    }
+    assert_eq!(exporter.buffered(), 2);
+
+    let refused = exporter.bridge_export(
+        AgentOtlpExporterConfig::grpc(""),
+        AgentOtelResource::new("rakka-agent"),
+        &metrics.snapshot(),
+        Vec::new(),
+    );
+    assert!(refused.is_err(), "a blank endpoint is refused");
+    assert_eq!(
+        exporter.buffered(),
+        2,
+        "a refused flush must not empty the buffer"
+    );
+    assert_eq!(exporter.dropped(), 0);
+
+    let batch = exporter
+        .bridge_export(
+            AgentOtlpExporterConfig::grpc("http://collector:4317"),
+            AgentOtelResource::new("rakka-agent"),
+            &metrics.snapshot(),
+            Vec::new(),
+        )
+        .expect("the next flush builds");
+    assert_eq!(
+        batch.spans.len(),
+        2,
+        "the spans the failed flush held survive to the one that works"
+    );
+    assert_eq!(exporter.buffered(), 0, "a successful flush empties it");
+}
+
+/// A record that could never be exported never enters the ring.
+///
+/// The buffer is cleared only on a successful flush, so one unexportable span
+/// admitted to it would fail every later flush and strand every span queued
+/// behind it. It is counted as unmappable at the door instead.
+#[test]
+fn a_span_that_cannot_pass_export_validation_is_never_buffered() {
+    let exporter = AgentGenAiSpanExporter::new();
+
+    // An inverted window: mappable, and refused by the export bounds.
+    exporter.record(
+        &AgentTelemetrySegment::new(
+            AgentSegmentOperation::Decide {
+                phase: "deciding-continuation",
+            },
+            AgentTimestampMillis::new(9),
+            AgentTimestampMillis::new(1),
+        )
+        .telemetry(traced())
+        .ok(),
+    );
+
+    assert_eq!(exporter.buffered(), 0, "it must not reach the buffer");
+    assert_eq!(exporter.unmappable(), 1, "and the loss must be counted");
+    assert_eq!(exporter.dropped(), 0);
+}
+
+/// A log record keeps the identity of the service that emitted it.
+///
+/// `service.name` and its siblings are on neither the span nor the log
+/// attribute vocabulary — neither vocabulary is about resources — so running a
+/// log's `resource` through the attribute allowlist deleted every key in it.
+/// Records reached the Collector with an empty resource and nothing to
+/// attribute them to, while the batch-level resource beside them travelled
+/// unfiltered.
+#[test]
+fn a_logs_service_identity_survives_the_export_boundary() {
+    let exporter = AgentGenAiSpanExporter::new();
+    let metrics = InMemoryMetricsRecorder::new();
+
+    let mut resource = AgentAttributes::new();
+    resource.insert(
+        OTEL_RESOURCE_SERVICE_NAME.to_string(),
+        "checkout".to_string(),
+    );
+    resource.insert(
+        OTEL_RESOURCE_SERVICE_VERSION.to_string(),
+        "1.4.2".to_string(),
+    );
+    resource.insert(
+        OTEL_RESOURCE_SERVICE_INSTANCE_ID.to_string(),
+        "pod-7".to_string(),
+    );
+    // The generic value bounds still apply: a multi-line value is dropped
+    // here rather than failing the whole batch at validation.
+    resource.insert("deployment.note".to_string(), "two\nlines".to_string());
+
+    let log = AgentLogEvent::new(
+        "rakka.agent.run.started",
+        AgentLogSeverity::Info,
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(1),
+    )
+    .resource(resource);
+
+    let batch = exporter
+        .bridge_export(
+            AgentOtlpExporterConfig::grpc("http://collector:4317"),
+            AgentOtelResource::new("rakka-agent"),
+            &metrics.snapshot(),
+            vec![log],
+        )
+        .expect("the bridge export builds");
+    batch.validate().expect("the batch is valid");
+
+    let exported = &batch.logs[0].resource;
+    assert_eq!(
+        exported.get(OTEL_RESOURCE_SERVICE_NAME).map(String::as_str),
+        Some("checkout"),
+        "the emitting service must survive: {exported:?}"
+    );
+    assert_eq!(
+        exported
+            .get(OTEL_RESOURCE_SERVICE_VERSION)
+            .map(String::as_str),
+        Some("1.4.2")
+    );
+    assert_eq!(
+        exported
+            .get(OTEL_RESOURCE_SERVICE_INSTANCE_ID)
+            .map(String::as_str),
+        Some("pod-7")
+    );
+    assert!(
+        !exported.contains_key("deployment.note"),
+        "a multi-line resource value is still dropped"
+    );
 }

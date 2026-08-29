@@ -38,7 +38,7 @@ use rakka_agent_workflow::{
     AgentAttributes, AgentLogEvent, AgentOtelInstrumentationScope, AgentOtelResource,
     AgentOtelSpanEvent, AgentOtelSpanExport, AgentOtelSpanKind, AgentOtelSpanStatus,
     AgentOtlpBridgeExport, AgentOtlpExporterConfig, AgentOtlpResult, AgentTelemetryContext,
-    AgentTimestampMillis,
+    AgentTimestampMillis, AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES,
 };
 use rakka_core::MetricsSnapshot;
 
@@ -260,16 +260,52 @@ fn allowlisted_log(attributes: AgentAttributes) -> AgentAttributes {
         .collect()
 }
 
+/// Keeps what a log record's **resource** may carry.
+///
+/// The attribute allowlist deliberately does not run here. A resource is not
+/// the record's attribute set: it is the identity of the service that emitted
+/// it, and the OpenTelemetry keys that carry that identity —
+/// [`OTEL_RESOURCE_SERVICE_NAME`](rakka_agent_workflow::OTEL_RESOURCE_SERVICE_NAME)
+/// and its siblings — are on neither the span nor the log vocabulary, because
+/// neither vocabulary is about resources. Filtering a resource through them
+/// deleted **every** key, so records reached the Collector with an empty
+/// resource and nothing to attribute them to, while the batch-level
+/// [`AgentOtelResource`] beside them travelled unfiltered. Two policies for
+/// one kind of data, and the stricter of them applied to the copy that
+/// carries the emitter's name.
+///
+/// What still applies are the generic value bounds, at the width the export
+/// validator itself enforces: an oversized or multi-line value is dropped
+/// here rather than failing the whole batch there. Bounding is not
+/// sanitizing, and a resource needs the first and not the second.
+#[must_use]
+fn bounded_resource(resource: AgentAttributes) -> AgentAttributes {
+    resource
+        .into_iter()
+        .filter(|(key, value)| {
+            !key.trim().is_empty()
+                && !value.is_empty()
+                && value.len() <= AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES
+                && !value.contains('\n')
+                && !value.contains('\r')
+        })
+        .collect()
+}
+
 /// Applies the log allowlist to one record, in place.
 ///
 /// Filtering rather than refusing, for the same reason the span path filters:
 /// a record carrying an unknown key is still worth exporting without it, and
 /// dropping the whole record would turn a telemetry mistake into a lost audit
 /// correlation.
+///
+/// The record's attributes pass the allowlist; its resource passes
+/// [`bounded_resource`], which is a different question with a different
+/// answer.
 #[must_use]
 pub fn allowlist_agent_log(mut log: AgentLogEvent) -> AgentLogEvent {
     log.attributes = allowlisted_log(log.attributes);
-    log.resource = allowlisted_log(log.resource);
+    log.resource = bounded_resource(log.resource);
     log
 }
 
@@ -703,7 +739,13 @@ pub fn segment_span(segment: &AgentTelemetrySegment) -> AgentOtlpResult<AgentOte
         event.attributes = allowlisted(event.attributes);
         span = span.event(event);
     }
-    Ok(span)
+
+    // The record is complete, so its span id is re-derived over everything it
+    // carries rather than over the name and time window alone. Without this a
+    // run's `decide` spans — same name, same operation, same millisecond —
+    // would be one span to a backend. Two records that are *still* identical
+    // are separated by the emitting sink, which knows they are two.
+    Ok(span.with_derived_span_id(&[]))
 }
 
 /// The convention identity of one segment's durable identities.
@@ -865,6 +907,7 @@ pub struct AgentGenAiSpanExporter {
     capacity: usize,
     dropped: AtomicU64,
     unmappable: AtomicU64,
+    emitted: AtomicU64,
 }
 
 impl Default for AgentGenAiSpanExporter {
@@ -891,6 +934,7 @@ impl AgentGenAiSpanExporter {
             capacity: capacity.max(1),
             dropped: AtomicU64::new(0),
             unmappable: AtomicU64::new(0),
+            emitted: AtomicU64::new(0),
         }
     }
 
@@ -906,11 +950,15 @@ impl AgentGenAiSpanExporter {
         self.dropped.load(Ordering::SeqCst)
     }
 
-    /// How many segments could not be mapped to a span at all.
+    /// How many segments produced no exportable span.
     ///
     /// A segment whose durable context carries no `traceparent` has no trace
     /// to belong to, and inventing one would fabricate a causal claim. Those
-    /// segments are counted here rather than exported under a made-up trace.
+    /// segments are counted here rather than exported under a made-up trace,
+    /// and so are the records that map but cannot pass
+    /// [`AgentOtelSpanExport::validate`] — they are refused at the door
+    /// rather than admitted to a buffer that is only cleared on a successful
+    /// flush, where one of them would strand every span queued behind it.
     #[must_use]
     pub fn unmappable(&self) -> u64 {
         self.unmappable.load(Ordering::SeqCst)
@@ -945,15 +993,33 @@ impl AgentGenAiSpanExporter {
         // this is the boundary they leave Rakka at and a caller may hand in
         // records this crate did not build.
         let logs = logs.into_iter().map(allowlist_agent_log).collect();
-        Ok(AgentOtlpBridgeExport::from_signals_with_instruments(
+
+        // The buffer is read under its lock and emptied only once the batch
+        // has been built. Passing `self.drain()` as an argument emptied it
+        // *before* the callee's validation ran, so a blank endpoint or one
+        // caller-supplied log that failed its bounds destroyed up to a full
+        // buffer of already-mapped spans — unrecoverably, and while
+        // `buffered()` and `dropped()` both reported a clean pipeline. Now a
+        // failed flush leaves the spans where they were, and the next flush
+        // with a working configuration ships them.
+        let mut buffered = self.spans.lock().ok();
+        let staged = buffered
+            .as_ref()
+            .map(|spans| spans.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let export = AgentOtlpBridgeExport::from_signals_with_instruments(
             exporter,
             resource,
             metrics,
             &instruments,
-            self.drain(),
+            staged,
             logs,
         )?
-        .with_scope(agent_instrumentation_scope()))
+        .with_scope(agent_instrumentation_scope());
+        if let Some(spans) = buffered.as_mut() {
+            spans.clear();
+        }
+        Ok(export)
     }
 }
 
@@ -967,6 +1033,22 @@ impl AgentSegmentSink for AgentGenAiSpanExporter {
             self.unmappable.fetch_add(1, Ordering::SeqCst);
             return;
         };
+        // Two closed operations can be identical in every mapped field: a run
+        // schedules two different effects, of the same kind, in the same
+        // millisecond, and the effect's identity is not a span attribute. The
+        // sink is the one thing that knows they are two records rather than
+        // one, so its emission ordinal is what separates their ids.
+        let emission = self.emitted.fetch_add(1, Ordering::SeqCst).to_string();
+        let span = span.with_derived_span_id(&[emission.as_str()]);
+        // A record that cannot pass export validation must not enter the ring
+        // at all. The buffer is now cleared only on a *successful* flush, so
+        // admitting one would fail every later flush and strand every span
+        // queued behind it — the mapping half of the same failure the drain
+        // ordering used to cause.
+        if span.validate().is_err() {
+            self.unmappable.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
         let Ok(mut spans) = self.spans.lock() else {
             self.dropped.fetch_add(1, Ordering::SeqCst);
             return;

@@ -464,3 +464,107 @@ fn an_unbounded_or_malformed_span_attribute_is_refused() {
         "an end before its start is refused"
     );
 }
+
+/// A span built from a durable context is that context's **child**, not a
+/// second record claiming to be it.
+///
+/// The `traceparent` a context carries names the span it was propagated from
+/// — an ingress caller's, or the run's own parked span. Writing it back as
+/// the new record's span id made every span built from one context collide on
+/// a single id, and on an id that already belonged to somebody else's span.
+#[test]
+fn a_span_built_from_a_context_is_its_child_rather_than_a_copy_of_it() {
+    let context = telemetry_context();
+    let span = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds");
+
+    assert_eq!(
+        span.parent_span_id.as_deref(),
+        Some("00f067aa0ba902b7"),
+        "the context's span id is the parent"
+    );
+    assert_ne!(
+        span.span_id, "00f067aa0ba902b7",
+        "and never the record's own id"
+    );
+    span.validate().expect("the derived id is a valid span id");
+
+    // Same context, different operation: two records, two ids.
+    let sibling = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.checkpoint",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the sibling builds");
+    assert_ne!(span.span_id, sibling.span_id);
+    assert_eq!(span.parent_span_id, sibling.parent_span_id);
+
+    // The derivation is a function of its inputs, so it is reproducible
+    // rather than drawn from a random source there is none of on this path.
+    let again = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds again");
+    assert_eq!(span.span_id, again.span_id);
+}
+
+/// The name and the time window do not separate two spans of the *same*
+/// operation, so a populated record re-derives over what does.
+#[test]
+fn a_populated_record_re_derives_its_id_over_what_distinguishes_it() {
+    let context = telemetry_context();
+    let base = AgentOtelSpanExport::from_telemetry_context(
+        "rakka.agent.effect.dispatch",
+        AgentTimestampMillis::new(10),
+        AgentTimestampMillis::new(20),
+        &context,
+    )
+    .expect("the span builds");
+
+    let first = base
+        .clone()
+        .attribute("rakka.agent.effect.attempt", "1")
+        .with_derived_span_id(&[]);
+    let second = base
+        .clone()
+        .attribute("rakka.agent.effect.attempt", "2")
+        .with_derived_span_id(&[]);
+
+    assert_ne!(
+        first.span_id, second.span_id,
+        "two attempts of one effect are two spans"
+    );
+    assert_ne!(
+        first.span_id, base.span_id,
+        "re-deriving over the attributes moves the id"
+    );
+    assert_eq!(
+        first.parent_span_id, base.parent_span_id,
+        "and leaves the parent alone"
+    );
+    first.validate().expect("the re-derived id is valid");
+    second.validate().expect("the re-derived id is valid");
+
+    // Two records that content cannot separate — same operation, same
+    // attributes, same millisecond — are separated by the material their
+    // emitter holds and they do not.
+    let twin = first.clone().with_derived_span_id(&[]);
+    assert_eq!(twin.span_id, first.span_id, "content alone merges them");
+    let distinguished = first.clone().with_derived_span_id(&["7"]);
+    assert_ne!(
+        distinguished.span_id, first.span_id,
+        "an emitter that knows they are two says so"
+    );
+    distinguished
+        .validate()
+        .expect("the distinguished id is valid");
+}
