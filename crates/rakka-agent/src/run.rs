@@ -57,7 +57,7 @@
 //! calling it after a transition, after recovery, or from a sweep are the same
 //! operation.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
@@ -110,15 +110,16 @@ use crate::model::AgentModelError;
 use crate::observability::{
     record_agent_domain_counter, record_agent_domain_duration, record_agent_domain_gauge,
     record_agent_domain_histogram, record_unsettleable_exchanges, AgentDecisionDraft,
-    AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource, AgentSegmentIdentity,
-    AgentSegmentOperation, AgentSegmentSink, AgentSegmentTimer, METRIC_AGENT_DECISIONS,
-    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_FAN_IN_RESOLUTIONS,
-    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
-    METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION, METRIC_AGENT_RECOVERY_EVENTS,
-    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
-    METRIC_AGENT_TURN_DURATION, METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND,
-    SEGMENT_ATTR_LOOP_TRANSITIONS, SEGMENT_ATTR_SETTINGS_REVISION,
+    AgentDecisionEvent, AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource,
+    AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink, AgentSegmentTimer,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
+    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
+    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION,
+    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_TURN_DURATION,
+    METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND, SEGMENT_ATTR_LOOP_TRANSITIONS,
+    SEGMENT_ATTR_SETTINGS_REVISION,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -7280,19 +7281,20 @@ where
             // *this* transition added: the decisions it committed, and whether
             // it opened a checkpoint. A post-hoc read alone could not tell a
             // decision this transition made from one an earlier pass owed.
-            let (decisions_before, checkpoints_before, settings_revision) = self
+            // The mark is a set of *identities*, not a pair of lengths — see
+            // [`segment_marks`].
+            let (marks, settings_revision) = self
                 .state()
                 .ok()
                 .and_then(|state| {
                     state.loop_state().map(|loop_state| {
                         (
-                            loop_state.decision_outbox().len(),
-                            loop_state.open_checkpoints().len(),
+                            segment_marks(loop_state),
                             loop_state.agent_settings_revision(),
                         )
                     })
                 })
-                .unwrap_or((0, 0, AgentRevisionNumber::INITIAL));
+                .unwrap_or_else(|| (AgentSegmentMarks::default(), AgentRevisionNumber::INITIAL));
             let transition_segment = AgentSegmentTimer::start(now);
             let committed = self
                 .host
@@ -7336,22 +7338,9 @@ where
                 .state()
                 .ok()
                 .and_then(|state| {
-                    state.loop_state().map(|loop_state| {
-                        (
-                            loop_state
-                                .decision_outbox()
-                                .iter()
-                                .skip(decisions_before)
-                                .cloned()
-                                .collect::<Vec<_>>(),
-                            loop_state
-                                .open_checkpoints()
-                                .iter()
-                                .skip(checkpoints_before)
-                                .map(|checkpoint| checkpoint.kind.as_label())
-                                .collect::<Vec<_>>(),
-                        )
-                    })
+                    state
+                        .loop_state()
+                        .map(|loop_state| segment_additions(loop_state, &marks))
                 })
                 .unwrap_or_default();
             self.close_segment(
@@ -8712,6 +8701,79 @@ where
 /// would answer it `Duplicate` from the operation log and swallow the fault
 /// the caller must see. Only a domain refusal — a verdict derived from the
 /// record's own fences, which by construction wrote nothing — is re-answered.
+/// What the run had already recorded when a transition began.
+///
+/// Read before the transition so the segment it closes can name exactly what
+/// *this* transition added — a post-hoc read alone cannot tell a decision this
+/// transition made from one an earlier pass owed.
+///
+/// The mark is a set of **identities**, never a pair of lengths, and
+/// [`segment_additions`] is its only reader so the two cannot drift. Neither
+/// collection this marks is append-only. The decision outbox is a ring that
+/// evicts from the front at
+/// [`AGENT_RUN_DECISION_OUTBOX_CAPACITY`](crate::AGENT_RUN_DECISION_OUTBOX_CAPACITY),
+/// and `open_checkpoints` is pruned with `retain` when a checkpoint is dropped
+/// or a turn is cleared. A length captured before and skipped after therefore
+/// reads the wrong suffix the moment either collection shrinks:
+///
+/// - On a saturated outbox — a wired decision sink whose backend is down, so
+///   `flush_decision_events` breaks on its first error and drains nothing —
+///   every later transition evicts one and pushes one, the length never moves,
+///   and the skip yields *nothing*. Every `rakka.agent.decide` span silently
+///   stops carrying its decision events, exactly when they matter most.
+/// - When an evict and a push do not cancel out exactly, the skip yields the
+///   wrong events: decisions an earlier transition made, attributed to this
+///   one.
+/// - When a transition both retires a checkpoint and opens another, the length
+///   is flat and no `CheckpointOpen` segment is closed — and that span carries
+///   `rakka.agent.checkpoint.kind`, the catalogue's only selector for
+///   specification 17.16's checkpoint retention class.
+///
+/// The decision sequence is monotonic per run and consumed even by a dropped
+/// event, and a checkpoint id is stable for the checkpoint's life, so both
+/// marks survive a prune.
+#[derive(Debug, Default, Clone)]
+struct AgentSegmentMarks {
+    /// The highest decision sequence the run had assigned.
+    decision_sequence: u64,
+    /// The checkpoints already open.
+    checkpoints: BTreeSet<HumanCheckpointId>,
+}
+
+/// Reads the marks a transition is measured against.
+fn segment_marks(loop_state: &AgentLoopState) -> AgentSegmentMarks {
+    AgentSegmentMarks {
+        decision_sequence: loop_state.decision_sequence(),
+        checkpoints: loop_state
+            .open_checkpoints()
+            .iter()
+            .map(|checkpoint| checkpoint.checkpoint_id.clone())
+            .collect(),
+    }
+}
+
+/// The decisions a transition committed and the checkpoint kinds it opened,
+/// diffed against [`segment_marks`] by identity.
+fn segment_additions(
+    loop_state: &AgentLoopState,
+    marks: &AgentSegmentMarks,
+) -> (Vec<AgentDecisionEvent>, Vec<&'static str>) {
+    (
+        loop_state
+            .decision_outbox()
+            .iter()
+            .filter(|event| event.sequence > marks.decision_sequence)
+            .cloned()
+            .collect(),
+        loop_state
+            .open_checkpoints()
+            .iter()
+            .filter(|checkpoint| !marks.checkpoints.contains(&checkpoint.checkpoint_id))
+            .map(|checkpoint| checkpoint.kind.as_label())
+            .collect(),
+    )
+}
+
 fn run_refusal_may_be_stale(error: &AgentRunError) -> bool {
     !matches!(
         error,
@@ -9240,6 +9302,192 @@ mod tests {
         AgentAcceptedResult, AgentSchemaId, AgentSchemaRef, AgentTaskContent, AgentTaskDefinition,
     };
     use crate::AgentToolId;
+
+    /// A fixture loop state with nothing recorded on it yet.
+    fn segment_mark_fixture() -> (AgentRunScope, AgentLoopState) {
+        let scope = AgentRunScope::new(
+            TenantId::new("tenant"),
+            AgentId::new("agent").expect("the agent id is valid"),
+            AgentRunId::new("run").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let schema = AgentSchemaRef::new(
+            AgentSchemaId::new("result").expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        );
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("definition").expect("the definition id is valid"),
+            "The segment-mark fixture.",
+            schema.clone(),
+            schema,
+        )
+        .expect("the definition is valid");
+        let budget = AgentRunBudget::allocate(
+            crate::budget::AgentBudgetGrant::from_ceilings(&definition.budgets),
+            AgentTimestampMillis::new(1),
+        );
+        let loop_state = AgentLoopState::started(
+            AgentTaskId::new("task").expect("the task id is valid"),
+            None,
+            AgentRevisionNumber::INITIAL,
+            AgentRevisionNumber::INITIAL,
+            definition.version,
+            budget,
+        );
+        (scope, loop_state)
+    }
+
+    /// A saturated decision outbox must not silence the decide span.
+    ///
+    /// The outbox is a ring, and it saturates exactly when a wired decision
+    /// sink cannot be drained — its backend is down, so `flush_decision_events`
+    /// breaks on the first error and clears nothing. From then on every
+    /// transition evicts one entry and pushes one, so the *length* never moves
+    /// and the prefix-length diff this replaced reported that the transition
+    /// had committed no decisions at all.
+    #[test]
+    fn a_saturated_decision_outbox_still_reports_what_a_transition_added() {
+        let now = AgentTimestampMillis::new(1);
+        let (scope, mut loop_state) = segment_mark_fixture();
+
+        for slot in 0..crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY {
+            assert!(loop_state.record_decision(
+                &scope,
+                AgentDecisionDraft::new(
+                    AgentDecisionKind::Continue,
+                    AgentDecisionSource::DeterministicPolicy,
+                    format!("fill-{slot}"),
+                ),
+                now,
+            ));
+        }
+        let saturated = loop_state.decision_outbox().len();
+        assert_eq!(
+            saturated,
+            crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY,
+            "the ring must be full, or this proves nothing"
+        );
+
+        // The transition under measurement: it commits two decisions.
+        let marks = segment_marks(&loop_state);
+        for slot in ["committed-a", "committed-b"] {
+            assert!(loop_state.record_decision(
+                &scope,
+                AgentDecisionDraft::new(
+                    AgentDecisionKind::CallTools,
+                    AgentDecisionSource::Model,
+                    slot,
+                ),
+                now,
+            ));
+        }
+
+        assert_eq!(
+            loop_state.decision_outbox().len(),
+            saturated,
+            "the ring evicted as it pushed, which is the whole point"
+        );
+        let (decisions, _) = segment_additions(&loop_state, &marks);
+        assert_eq!(
+            decisions.len(),
+            2,
+            "the segment must carry the decisions this transition committed"
+        );
+        assert!(decisions
+            .iter()
+            .all(|event| event.sequence > marks.decision_sequence));
+
+        // The rule this replaced, spelled out: a length captured before and
+        // skipped after finds nothing on a ring that evicts as it pushes.
+        assert_eq!(
+            loop_state.decision_outbox().iter().skip(saturated).count(),
+            0,
+            "a prefix-length diff reports an empty transition here"
+        );
+    }
+
+    /// A transition that retires one checkpoint and opens another must still
+    /// close a `CheckpointOpen` segment.
+    ///
+    /// `open_checkpoints` is pruned with `retain`, so the length is flat across
+    /// such a transition and the prefix-length diff closed no segment — and
+    /// that span carries `rakka.agent.checkpoint.kind`, the only selector
+    /// specification 17.16's checkpoint retention class has.
+    #[test]
+    fn retiring_and_opening_a_checkpoint_in_one_transition_still_names_the_opened_one() {
+        let now = AgentTimestampMillis::new(1);
+        let (scope, mut loop_state) = segment_mark_fixture();
+
+        let context =
+            AgentContextSnapshotRef::for_turn(&scope, loop_state.turn()).expect("the ref derives");
+        let effect = AgentRunEffect::new(
+            &scope,
+            loop_state.turn(),
+            0,
+            AgentRunEffectRequest::Model {
+                context,
+                profile: None,
+            },
+            &AgentEffectSpec::read_only(),
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the effect derives");
+
+        let checkpoint = |id: &str, kind| {
+            crate::checkpoints::AgentCheckpoint::open(
+                HumanCheckpointId::new(id),
+                kind,
+                scope.clone(),
+                &effect,
+                "summary",
+                PrincipalRef {
+                    principal_type: "service".to_string(),
+                    principal_id: "operator".to_string(),
+                    display_name: None,
+                },
+                now,
+            )
+            .expect("the checkpoint opens")
+        };
+
+        loop_state
+            .record_checkpoint(checkpoint(
+                "retired",
+                crate::checkpoints::AgentCheckpointKind::Approval,
+            ))
+            .expect("the first checkpoint records");
+
+        // The transition under measurement: it retires one and opens one.
+        let marks = segment_marks(&loop_state);
+        let held = loop_state.open_checkpoints().len();
+        loop_state.drop_checkpoint(&HumanCheckpointId::new("retired"));
+        loop_state
+            .record_checkpoint(checkpoint(
+                "opened",
+                crate::checkpoints::AgentCheckpointKind::SecurityAuthorization,
+            ))
+            .expect("the second checkpoint records");
+
+        assert_eq!(
+            loop_state.open_checkpoints().len(),
+            held,
+            "the retire and the open cancel out in the length, which is the point"
+        );
+        let (_, opened) = segment_additions(&loop_state, &marks);
+        assert_eq!(
+            opened,
+            vec!["security-authorization"],
+            "the newly opened checkpoint must reach a segment"
+        );
+
+        // The rule this replaced, spelled out.
+        assert_eq!(
+            loop_state.open_checkpoints().iter().skip(held).count(),
+            0,
+            "a prefix-length diff closes no checkpoint segment here"
+        );
+    }
 
     /// A superset of every working set one turn can hold, under maximal
     /// identifiers, must fit the growth reserve.

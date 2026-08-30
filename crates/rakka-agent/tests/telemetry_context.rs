@@ -230,8 +230,21 @@ fn the_dispatch_ticket_forwards_the_scheduling_segments_context() {
     );
 }
 
+/// A reconciled re-dispatch stays in the run's trace, as a sibling of the
+/// attempt it supersedes.
+///
+/// It used to start from `default()` — no `traceparent` at all — to express
+/// that the re-invocation is caused by the reconciliation decision rather than
+/// by the segment that scheduled the attempt an operator proved never ran.
+/// That expressed it by *leaving the trace*, and once a context's span id
+/// became a span's parent rather than its identity, a context with no
+/// `traceparent` belongs to nothing: every span of the re-invocation was
+/// refused by the mapper and counted `unmappable`, silently, for exactly the
+/// re-invocation an incident is about. Keeping the propagated parent says the
+/// same thing correctly — sibling, not child — and the link says which attempt
+/// it supersedes.
 #[test]
-fn a_new_generation_links_the_superseded_one_and_starts_parentless() {
+fn a_new_generation_stays_in_the_trace_and_links_the_superseded_one() {
     let mut effect = tool_effect();
     effect.telemetry = stamped_context();
 
@@ -239,9 +252,15 @@ fn a_new_generation_links_the_superseded_one_and_starts_parentless() {
         .begin_next_generation(&scope(), AgentTimestampMillis::new(2))
         .expect("the next generation begins");
 
-    assert!(
-        effect.telemetry.trace_parent.is_none(),
-        "a reconciled re-dispatch is caused by the decision, not the superseded segment"
+    assert_eq!(
+        effect.telemetry.trace_parent.as_deref(),
+        Some(TRACE_PARENT),
+        "a re-dispatch that leaves the trace exports no spans at all"
+    );
+    assert_eq!(
+        effect.telemetry.trace_state.as_deref(),
+        Some("vendor=value"),
+        "and it stays under the same vendor state"
     );
     assert_eq!(effect.telemetry.span_links.len(), 1);
     let link = &effect.telemetry.span_links[0];

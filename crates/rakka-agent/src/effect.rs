@@ -2022,11 +2022,23 @@ pub const LINK_KIND_SUPERSEDED_GENERATION: &str = "superseded-generation";
 /// superseded generation's segment must not parent the reconciled re-dispatch —
 /// and a span link back to it, so the causal chain across generations stays
 /// walkable ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
-/// The new generation starts parent-less on purpose: its dispatch is caused by
-/// a reconciliation decision, not by the segment that scheduled the attempt an
-/// operator just proved never executed.
+///
+/// The new generation keeps the run's trace and its propagated parent, so its
+/// spans are *siblings* of the superseded attempt's rather than children of
+/// them: the re-dispatch is caused by a reconciliation decision, not by the
+/// segment that scheduled the attempt an operator just proved never executed.
+/// This context used to be built from `default()` to express that, which
+/// dropped the `traceparent` along with the parentage — and once a context's
+/// span id became a span's *parent* rather than its identity, a context with
+/// no `traceparent` belongs to no trace at all. Every span of the
+/// re-invocation was then refused by the mapper and counted `unmappable`:
+/// `tool-authorize`, `effect-dispatch`, `model-inference`, and `execute-tool`
+/// all vanished for exactly the re-invocation an incident is about, and
+/// silently, because `unmappable` labels no `rakka.agent.*` instrument.
 fn superseded_generation_telemetry(prior: &AgentTelemetryContext) -> AgentTelemetryContext {
     let mut next = AgentTelemetryContext {
+        trace_parent: prior.trace_parent.clone(),
+        trace_state: prior.trace_state.clone(),
         span_links: prior.span_links.clone(),
         ..AgentTelemetryContext::default()
     };

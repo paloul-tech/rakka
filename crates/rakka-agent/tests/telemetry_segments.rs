@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    AgentEffectSpec, AgentModelTurn, AgentSegmentOperation, AgentSegmentOutcome, AgentTaskContent,
-    AgentToolCallId, AgentToolCallRequest, AgentToolId, AgentToolRegistry,
+    AgentEffectSpec, AgentModelTurn, AgentSegmentOperation, AgentSegmentOutcome, AgentSegmentSink,
+    AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId, AgentToolRegistry,
     InMemoryAgentSegmentSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentTelemetryContext;
@@ -403,4 +403,66 @@ async fn a_checkpoint_park_closes_its_segment_and_holds_none_open() {
     // means in a system that never holds one at all.
     assert!(checkpoints[0].duration_ms().is_some());
     assert_eq!(checkpoints[0].outcome, AgentSegmentOutcome::Ok);
+}
+
+/// The in-memory sink is bounded, like the trait says every sink must be.
+///
+/// It pushed into an unbounded `Vec`, six lines below the paragraph stating
+/// that [17.1] forbids unbounded in-process queues and that a sink which
+/// cannot keep up must drop and count. That was not merely an inconsistent
+/// test helper: the only other implementation in the workspace is behind the
+/// `otel` feature, so under `--no-default-features` this was the only thing a
+/// deployment could pass to `with_segments`, and nothing drained it.
+#[test]
+fn the_in_memory_sink_is_bounded_and_counts_what_it_drops() {
+    let sink = InMemoryAgentSegmentSink::with_capacity(3);
+    let phases = [
+        "preparing-context",
+        "deciding-continuation",
+        "awaiting-effects",
+        "recording-results",
+        "deciding-completion",
+    ];
+    for (index, phase) in phases.iter().enumerate() {
+        let at = rakka_agent_workflow::AgentTimestampMillis::new(index as u64 + 1);
+        sink.record(
+            &rakka_agent::AgentTelemetrySegment::new(
+                AgentSegmentOperation::Decide { phase },
+                at,
+                at,
+            )
+            .telemetry(ingress_context())
+            .ok(),
+        );
+    }
+
+    let retained = sink.segments();
+    assert_eq!(retained.len(), 3, "the bound holds");
+    assert_eq!(sink.dropped(), 2, "and the loss is counted, not silent");
+    // The oldest went, so the most recent operations — the ones an incident is
+    // usually about — are the ones kept, as in the exporter's ring.
+    assert_eq!(
+        retained
+            .iter()
+            .map(|segment| segment.start.as_millis())
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+
+    // A capacity of zero would otherwise drop everything while reporting a
+    // healthy sink.
+    let degenerate = InMemoryAgentSegmentSink::with_capacity(0);
+    degenerate.record(
+        &rakka_agent::AgentTelemetrySegment::new(
+            AgentSegmentOperation::Decide {
+                phase: "preparing-context",
+            },
+            rakka_agent_workflow::AgentTimestampMillis::new(1),
+            rakka_agent_workflow::AgentTimestampMillis::new(1),
+        )
+        .telemetry(ingress_context())
+        .ok(),
+    );
+    assert_eq!(degenerate.segments().len(), 1);
+    assert_eq!(degenerate.dropped(), 0);
 }

@@ -299,9 +299,9 @@ fn bounded_resource(resource: AgentAttributes) -> AgentAttributes {
 /// dropping the whole record would turn a telemetry mistake into a lost audit
 /// correlation.
 ///
-/// The record's attributes pass the allowlist; its resource passes
-/// [`bounded_resource`], which is a different question with a different
-/// answer.
+/// The record's attributes pass the allowlist; its resource passes the
+/// generic value bounds instead, which is a different question with a
+/// different answer — see `bounded_resource`.
 #[must_use]
 pub fn allowlist_agent_log(mut log: AgentLogEvent) -> AgentLogEvent {
     log.attributes = allowlisted_log(log.attributes);

@@ -13,11 +13,12 @@
 //! Specification: section 17. Filled by slice 1.13, reusing the existing
 //! `rakka-agent-workflow` trace-context and OTLP substrate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use rakka_agent_workflow::{
@@ -1815,29 +1816,74 @@ pub trait AgentSegmentSink: Send + Sync {
     fn record(&self, segment: &AgentTelemetrySegment);
 }
 
+/// The most segments an [`InMemoryAgentSegmentSink`] retains before it starts
+/// dropping the oldest.
+///
+/// Twice the span exporter's buffer, because a segment is retained until a
+/// test reads it rather than until the next flush, and a whole run's worth
+/// should fit without the bound ever being reached.
+pub const DEFAULT_AGENT_SEGMENT_SINK_CAPACITY: usize = 1024;
+
 /// In-memory segment sink for deterministic tests.
-#[derive(Debug, Default)]
+///
+/// **Bounded, like every sink.** The trait above states that
+/// [17.1](../../../docs/plans/rakka-agent/spec.md) forbids unbounded
+/// in-process queues and that a sink which cannot keep up must drop and
+/// count; this one used to push into an unbounded `Vec`, six lines below the
+/// paragraph saying it must not. That was not merely an inconsistent test
+/// helper: the only *other* implementation in the workspace is
+/// [`crate::otel::AgentGenAiSpanExporter`], which is behind the `otel`
+/// feature, so under `--no-default-features` this was the only thing a
+/// deployment could pass to `with_segments` — and every loop transition,
+/// dispatch attempt, model call, tool call and A2A ingress appended a cloned
+/// segment, with nothing draining it, until the node ran out of memory.
+///
+/// It is a ring: at capacity the oldest segment is dropped and counted, the
+/// same rule and the same direction as the exporter's buffer.
+#[derive(Debug)]
 pub struct InMemoryAgentSegmentSink {
-    segments: Mutex<Vec<AgentTelemetrySegment>>,
+    segments: Mutex<VecDeque<AgentTelemetrySegment>>,
+    capacity: usize,
+    dropped: AtomicU64,
+}
+
+impl Default for InMemoryAgentSegmentSink {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemoryAgentSegmentSink {
-    /// Creates an empty sink.
+    /// Creates an empty sink retaining
+    /// [`DEFAULT_AGENT_SEGMENT_SINK_CAPACITY`] segments.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_capacity(DEFAULT_AGENT_SEGMENT_SINK_CAPACITY)
     }
 
-    /// Every segment recorded so far, in the order they ended.
+    /// Creates an empty sink with an explicit bound.
+    ///
+    /// A capacity of zero is raised to one: a ring that can hold nothing
+    /// would drop every segment while reporting a healthy sink.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            segments: Mutex::new(VecDeque::new()),
+            capacity: capacity.max(1),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Every segment retained, in the order they ended.
     #[must_use]
     pub fn segments(&self) -> Vec<AgentTelemetrySegment> {
         self.segments
             .lock()
-            .map(|segments| segments.clone())
+            .map(|segments| segments.iter().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// The bounded operation labels recorded so far, in order.
+    /// The bounded operation labels retained, in order.
     #[must_use]
     pub fn operations(&self) -> Vec<&'static str> {
         self.segments
@@ -1850,6 +1896,15 @@ impl InMemoryAgentSegmentSink {
             })
             .unwrap_or_default()
     }
+
+    /// How many segments the bound dropped.
+    ///
+    /// A non-zero count is what makes the loss visible rather than silent —
+    /// and, in a test, what says an assertion is reading a truncated history.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::SeqCst)
+    }
 }
 
 impl AgentSegmentSink for InMemoryAgentSegmentSink {
@@ -1858,9 +1913,15 @@ impl AgentSegmentSink for InMemoryAgentSegmentSink {
     }
 
     fn record(&self, segment: &AgentTelemetrySegment) {
-        if let Ok(mut segments) = self.segments.lock() {
-            segments.push(segment.clone());
+        let Ok(mut segments) = self.segments.lock() else {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+            return;
+        };
+        while segments.len() >= self.capacity {
+            segments.pop_front();
+            self.dropped.fetch_add(1, Ordering::SeqCst);
         }
+        segments.push_back(segment.clone());
     }
 }
 

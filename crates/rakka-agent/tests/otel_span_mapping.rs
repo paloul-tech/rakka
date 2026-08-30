@@ -22,8 +22,9 @@ use std::sync::Arc;
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     genai_operation, is_agent_span_attribute, segment_span, validate_agent_span_attributes,
-    AgentGenAiSpanExporter, AgentModelTurn, AgentSegmentIdentity, AgentSegmentOperation,
-    AgentSegmentSink, AgentSegmentTimer, AgentTaskContent, AgentTelemetrySegment, AgentToolCallId,
+    AgentEffectSpec, AgentGenAiSpanExporter, AgentModelTurn, AgentRevisionNumber, AgentRunEffect,
+    AgentRunEffectRequest, AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink,
+    AgentSegmentTimer, AgentTaskContent, AgentTelemetrySegment, AgentToolCallId,
     AgentToolCallRequest, AgentToolId, AGENT_GENAI_CONVENTION_REVISION, AGENT_OTEL_SCOPE_NAME,
     AGENT_SPAN_ATTRIBUTE_KEYS, ATTR_ERROR_TYPE, ATTR_GEN_AI_AGENT_ID, ATTR_GEN_AI_CONVERSATION_ID,
     ATTR_GEN_AI_OPERATION_NAME, ATTR_GEN_AI_PROVIDER_NAME, ATTR_GEN_AI_TOOL_NAME,
@@ -951,4 +952,90 @@ fn a_logs_service_identity_survives_the_export_boundary() {
         !exported.contains_key("deployment.note"),
         "a multi-line resource value is still dropped"
     );
+}
+
+/// A reconciled re-invocation still exports spans.
+///
+/// `begin_next_generation` used to reset the effect's telemetry to `default()`
+/// to say the re-dispatch is caused by the reconciliation decision rather than
+/// by the segment that scheduled the superseded attempt. It said that by
+/// leaving the trace: with no `traceparent`, `from_telemetry_context` refuses
+/// the record and the exporter counts it `unmappable`, so `tool-authorize`,
+/// `effect-dispatch`, `model-inference` and `execute-tool` all vanished for
+/// exactly the re-invocation an incident is about — and silently, because
+/// `unmappable` labels no `rakka.agent.*` instrument.
+#[test]
+fn the_spans_of_a_reconciled_re_invocation_reach_the_exporter() {
+    let call = AgentToolCallRequest::new(
+        AgentToolCallId::new("call-1").expect("the call id is valid"),
+        AgentToolId::new("charge-card").expect("the tool id is valid"),
+        serde_json::json!({ "amount": 42 }),
+    )
+    .expect("the call is bounded");
+    let mut effect = AgentRunEffect::new(
+        &run_scope(),
+        1,
+        0,
+        AgentRunEffectRequest::Tool {
+            call: Box::new(call),
+        },
+        &AgentEffectSpec::non_idempotent(),
+        AgentRevisionNumber::INITIAL,
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the effect derives");
+    effect.telemetry = traced();
+
+    effect
+        .begin_next_generation(&run_scope(), AgentTimestampMillis::new(2))
+        .expect("the operator-reconciled generation begins");
+
+    let exporter = AgentGenAiSpanExporter::new();
+    for operation in [
+        AgentSegmentOperation::ToolAuthorize {
+            effect_kind: "tool-call",
+        },
+        AgentSegmentOperation::EffectDispatch {
+            effect_kind: "tool-call",
+        },
+        AgentSegmentOperation::ExecuteTool {
+            tool_name: "charge-card".to_string(),
+        },
+    ] {
+        exporter.record(
+            &AgentTelemetrySegment::new(
+                operation,
+                AgentTimestampMillis::new(3),
+                AgentTimestampMillis::new(4),
+            )
+            .telemetry(effect.telemetry.clone())
+            .attribute(rakka_agent::SEGMENT_ATTR_EFFECT_ATTEMPT, "1")
+            .ok(),
+        );
+    }
+
+    assert_eq!(
+        exporter.unmappable(),
+        0,
+        "the re-invocation's segments must map, not vanish"
+    );
+    let spans = exporter.drain();
+    assert_eq!(spans.len(), 3);
+    for span in &spans {
+        assert_eq!(
+            span.trace_id, TRACE_ID,
+            "the re-invocation stays in the run's trace"
+        );
+        assert_eq!(
+            span.parent_span_id.as_deref(),
+            Some(CALLER_SPAN_ID),
+            "a sibling of the superseded attempt, not a child of it"
+        );
+        assert_eq!(
+            span.links.len(),
+            1,
+            "and the link says which attempt it supersedes"
+        );
+        span.validate().expect("the record is valid");
+    }
 }
