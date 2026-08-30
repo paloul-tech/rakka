@@ -147,6 +147,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(dispatcher: ScriptedDispatcher) -> Self {
+        Self::with_segments(dispatcher, None)
+    }
+
+    fn with_segments(
+        dispatcher: ScriptedDispatcher,
+        segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
+    ) -> Self {
         let tasks = TaskStore::new();
         let agents = AgentStore::new();
         let runs = RunStore::new();
@@ -194,6 +201,14 @@ impl Fixture {
             .with_clock(Arc::new(TestClock(clock.clone())))
             .with_default_tenant(TENANT),
         );
+        let service = match segments {
+            Some(sink) => Arc::new(
+                Arc::try_unwrap(service)
+                    .unwrap_or_else(|_| unreachable!("the service is not yet shared"))
+                    .with_segments(sink),
+            ),
+            None => service,
+        };
 
         Self {
             tasks,
@@ -1018,4 +1033,117 @@ async fn duplicate_sends_survive_any_owner_loss_with_one_task_one_run_one_turn()
 
     sweep("run", run_writes).await;
     sweep("task", task_writes).await;
+}
+
+/// The ingress `SERVER` span is closed on the path applications actually wire.
+///
+/// The segment was added to `send_message` only. But `send` is the routing
+/// entry point — routing `message/send` through it is mandatory, since
+/// `send_message` would misclassify a team or conversation envelope, and this
+/// repo's own coordination example calls it at six sites — and it dispatched
+/// straight to the normalized halves, closing nothing. So the span the slice
+/// exists to add was absent from the primary path, `AgentOtelSpanKind::Server`
+/// was constructed on no real request, and every run and dispatch span had no
+/// request span to root it.
+#[tokio::test]
+async fn every_ingress_entry_point_closes_its_server_segment() {
+    const TRACE_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fixture = Fixture::with_segments(
+        ScriptedDispatcher::new().with_turn(valid_turn("resolved")),
+        Some(segments.clone()),
+    );
+    fixture.instantiate_agent().await;
+
+    // A send carrying the caller's context in its message metadata.
+    let mut message = task_message("msg-trace-1");
+    message.metadata = Some(
+        [("traceparent".to_string(), json!(TRACE_PARENT))]
+            .into_iter()
+            .collect(),
+    );
+    let task = fixture
+        .service
+        .send(&params(), &send_request(&message))
+        .await
+        .expect("the routed send is accepted");
+    let task_id = match task {
+        a2a::SendMessageResponse::Task(task) => task.id,
+        a2a::SendMessageResponse::Message(_) => panic!("a typed task send answers with a task"),
+    };
+
+    let ingress: Vec<_> = segments
+        .segments()
+        .into_iter()
+        .filter(|segment| {
+            matches!(
+                segment.operation,
+                rakka_agent::AgentSegmentOperation::A2aIngress { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        ingress.len(),
+        1,
+        "the routing entry point closes exactly one ingress segment"
+    );
+    assert_eq!(
+        ingress[0].telemetry.trace_parent.as_deref(),
+        Some(TRACE_PARENT),
+        "and it belongs to the caller's trace"
+    );
+
+    // A read carries no message metadata at all, so its context comes from the
+    // W3C header map — which is where it travels for a method with no payload.
+    let mut headers = params();
+    headers.insert("traceparent".to_string(), vec![TRACE_PARENT.to_string()]);
+    fixture
+        .service
+        .get_task(&headers, None, &task_id, None, None)
+        .await
+        .expect("the read answers");
+
+    let reads: Vec<_> = segments
+        .segments()
+        .into_iter()
+        .filter(|segment| {
+            matches!(
+                &segment.operation,
+                rakka_agent::AgentSegmentOperation::A2aIngress { operation }
+                    if operation == "get-task"
+            )
+        })
+        .collect();
+    assert_eq!(reads.len(), 1, "a read closes its ingress segment too");
+    assert_eq!(
+        reads[0].telemetry.trace_parent.as_deref(),
+        Some(TRACE_PARENT),
+        "from the header carrier"
+    );
+
+    // A request refused before normalization still carried a context, and the
+    // span of a rejected call is the one an operator is looking for.
+    let refused = fixture
+        .service
+        .send(&headers, &send_request(&task_message("")))
+        .await;
+    assert!(refused.is_err(), "a blank message id is refused");
+    let rejected: Vec<_> = segments
+        .segments()
+        .into_iter()
+        .filter(|segment| {
+            matches!(
+                &segment.operation,
+                rakka_agent::AgentSegmentOperation::A2aIngress { operation }
+                    if operation == "send-message"
+            ) && segment.outcome == rakka_agent::AgentSegmentOutcome::Error
+        })
+        .collect();
+    assert_eq!(rejected.len(), 1, "the refusal closes a failed segment");
+    assert_eq!(
+        rejected[0].telemetry.trace_parent.as_deref(),
+        Some(TRACE_PARENT),
+        "answering the empty context here mapped every refusal to no span"
+    );
 }

@@ -2660,24 +2660,24 @@ where
                 // deduplicated on the derived result operation id and fenced
                 // by the run's effect record, so a second recovery pass
                 // resolves to the same single outcome.
-                self.deliver_outcome(
+                //
+                // Through `park_indeterminate` rather than beside it. This arm
+                // used to hand-roll the same delivery, counter, and ticket
+                // settlement without the segment, so the *canonical* indeterminate
+                // — a non-idempotent effect whose worker died after the durable
+                // `Started` write — was the one case a retention policy keyed on
+                // `rakka.agent.effect.status = indeterminate` retained nothing
+                // for. One outcome, one code path.
+                self.park_indeterminate(
                     scope,
+                    claim,
                     intent,
                     attempt,
-                    claim.fencing_token,
-                    AgentRunEffectOutcome::Indeterminate {
-                        code: "dispatcher-lost-after-started".to_string(),
-                        message: "the attempt may have invoked the target; its outcome must be \
-                                  reconciled"
-                            .to_string(),
-                    },
+                    "dispatcher-lost-after-started",
+                    "the attempt may have invoked the target; its outcome must be reconciled",
                     pass,
                 )
-                .await?;
-                pass.parked_indeterminate += 1;
-                self.settle_ticket_cancelled(scope, &claim, "indeterminate", pass)
-                    .await?;
-                Ok(ClaimConclusion::Settled)
+                .await
             }
         }
     }
@@ -2692,6 +2692,7 @@ where
         intent: &AgentRunEffect,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
+        let timer = AgentSegmentTimer::start(self.now());
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
         let mut inbox = self.inbox(scope);
         inbox.recover().await?;
@@ -2705,18 +2706,29 @@ where
         if let WorkflowTelemetryEvent::OutboxDispatchExhausted { attempts, .. } = &event {
             let attempts = *attempts;
             self.fleet.record_claim_failure(&claim, &event).await?;
-            self.deliver_outcome(
+            let outcome = AgentRunEffectOutcome::Exhausted {
+                code: "dispatcher-lost-after-started".to_string(),
+                message: "the retry budget was spent recovering ambiguous attempts".to_string(),
+            };
+            let status = outcome.resolved_status();
+            self.deliver_outcome(scope, intent, attempts, claim.fencing_token, outcome, pass)
+                .await?;
+            // Spending the last of a generation's budget on ambiguous losses
+            // is a terminal decision the attempt segments cannot describe:
+            // every attempt that reached this arm was lost before it could
+            // close one, and the invocation that would have closed the last
+            // never ran. Without this the generation ends with no span at all.
+            self.close_segment(
                 scope,
-                intent,
-                attempts,
-                claim.fencing_token,
-                AgentRunEffectOutcome::Exhausted {
-                    code: "dispatcher-lost-after-started".to_string(),
-                    message: "the retry budget was spent recovering ambiguous attempts".to_string(),
-                },
-                pass,
-            )
-            .await?;
+                &intent.telemetry,
+                timer
+                    .close(AgentSegmentOperation::EffectDispatch {
+                        effect_kind: intent.kind().as_label(),
+                    })
+                    .attribute(SEGMENT_ATTR_EFFECT_STATUS, status.as_label())
+                    .attribute(SEGMENT_ATTR_EFFECT_ATTEMPT, attempts.to_string())
+                    .failed("rakka.agent.effect", "dispatcher-lost-after-started"),
+            );
             return Ok(ClaimConclusion::Settled);
         }
 

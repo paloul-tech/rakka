@@ -46,8 +46,9 @@ use super::error::{RakkaAgentA2AError, RakkaAgentA2AResult};
 use super::ingress::{
     agent_conversation_command, agent_task_cancel_command, agent_task_create_command,
     agent_task_handoff_command, agent_task_input, agent_task_result_command, agent_team_command,
-    normalize_agent_cancel, normalize_agent_send, resolve_agent_target, resolve_agent_tenant,
-    resolve_handoff_target, NormalizedAgentCommand,
+    extract_header_telemetry, extract_ingress_telemetry, normalize_agent_cancel,
+    normalize_agent_send, resolve_agent_target, resolve_agent_tenant, resolve_handoff_target,
+    NormalizedAgentCommand,
 };
 use super::management::{
     is_management_message, management_provenance, management_response_message,
@@ -313,6 +314,14 @@ where
         self
     }
 
+    /// The ingress class of every `message/send`-shaped entry point.
+    ///
+    /// The *wire method* is the ingress class. The finer authorization class —
+    /// a handoff, a team command, a result submission, a management command —
+    /// is decided downstream from the collaboration cluster, and naming it at
+    /// the door would claim the door knew something it does not know yet.
+    const INGRESS_MESSAGE_SEND: &'static str = A2AOperation::SendMessage.as_label();
+
     /// Closes one ingress segment, naming the bounded A2A operation class.
     fn close_ingress_segment(
         &self,
@@ -333,6 +342,51 @@ where
             Ok(()) => segment.ok(),
             Err(code) => segment.failed("rakka.a2a.ingress", code),
         });
+    }
+
+    /// Closes one ingress segment from the answer the entry point produced.
+    fn close_ingress<T>(
+        &self,
+        operation: &'static str,
+        timer: rakka_agent::AgentSegmentTimer,
+        telemetry: &rakka_agent_workflow::AgentTelemetryContext,
+        answered: &RakkaAgentA2AResult<T>,
+    ) {
+        self.close_ingress_segment(
+            operation,
+            timer,
+            telemetry,
+            match answered {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error.code()),
+            },
+        );
+    }
+
+    /// The trace context a send-shaped request carried at the door.
+    ///
+    /// The message metadata is the carrier the agent domain propagates into
+    /// durable state, so a path that has already normalized uses the context it
+    /// computed and this is not called. This is for the paths that have not:
+    /// the management command, which normalizes nothing, and any send refused
+    /// before its metadata could be merged. It falls back to the W3C header
+    /// map, which is where trace context canonically travels for a caller that
+    /// set nothing in the payload — so a rejected request still maps to a span,
+    /// which is the span an operator debugging a refusal is looking for.
+    fn door_telemetry(
+        &self,
+        params: &ServiceParams,
+        request: &SendMessageRequest,
+    ) -> rakka_agent_workflow::AgentTelemetryContext {
+        let from_metadata =
+            merged_metadata(request.metadata.as_ref(), request.message.metadata.as_ref())
+                .map(|metadata| extract_ingress_telemetry(&metadata))
+                .unwrap_or_default();
+        if from_metadata.trace_parent.is_some() {
+            from_metadata
+        } else {
+            extract_header_telemetry(params)
+        }
     }
 
     /// Joins shared-knowledge claims into [`Self::agent_goal_view`].
@@ -360,11 +414,25 @@ where
         params: &ServiceParams,
         request: &SendMessageRequest,
     ) -> RakkaAgentA2AResult<a2a::SendMessageResponse> {
+        // The ingress `SERVER` span is closed here, at the routing entry
+        // point, and not only in `send_message`. This is the method an
+        // application wires for `message/send` — routing through it is
+        // mandatory, since `send_message` would misclassify a team or
+        // conversation envelope — so a segment closed only in `send_message`
+        // was a segment the primary path never closed.
+        //
+        // It begins before normalization, because extraction is part of
+        // ingress: a context that fails to parse is dropped whole there, and
+        // the segment must cover the window in which that happened.
+        let timer = rakka_agent::AgentSegmentTimer::start(self.clock.now());
         if is_management_message(&request.message) {
-            return self
-                .manage_agent(params, request)
+            let telemetry = self.door_telemetry(params, request);
+            let answered = self
+                .manage_agent_inner(params, request)
                 .await
                 .map(a2a::SendMessageResponse::Message);
+            self.close_ingress(Self::INGRESS_MESSAGE_SEND, timer, &telemetry, &answered);
+            return answered;
         }
         // A team command answers with an immediate message, exactly as a
         // management command does — it drives a board decision, never a
@@ -372,31 +440,45 @@ where
         // either parses whole or fails the send closed, and the one merge
         // and normalization here serves the dispatch and the chosen branch
         // alike — the hot path never re-merges or re-parses.
-        let normalized = self.normalized_send(params, request)?;
-        if matches!(
+        let normalized = match self.normalized_send(params, request) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                self.close_ingress_segment(
+                    Self::INGRESS_MESSAGE_SEND,
+                    timer,
+                    &extract_header_telemetry(params),
+                    Err(error.code()),
+                );
+                return Err(error);
+            }
+        };
+        // The context the normalization computed is the one durable state
+        // records, so the span and the durable record agree by construction.
+        let telemetry = normalized.telemetry.clone();
+        let answered = if matches!(
             normalized.collaboration.as_ref(),
             Some(super::collaboration::AgentCollaborationEnvelope::Team(_))
         ) {
-            return self
-                .team_command_normalized(request, &normalized)
+            self.team_command_normalized(request, &normalized)
                 .await
-                .map(a2a::SendMessageResponse::Message);
-        }
-        // A conversation command likewise answers with an immediate message:
-        // it drives a turn-protocol decision, never a task creation
-        // (specification 8.11).
-        if matches!(
+                .map(a2a::SendMessageResponse::Message)
+        } else if matches!(
+            // A conversation command likewise answers with an immediate
+            // message: it drives a turn-protocol decision, never a task
+            // creation (specification 8.11).
             normalized.collaboration.as_ref(),
             Some(super::collaboration::AgentCollaborationEnvelope::Conversation(_))
         ) {
-            return self
-                .conversation_command_normalized(request, &normalized)
+            self.conversation_command_normalized(request, &normalized)
                 .await
-                .map(a2a::SendMessageResponse::Message);
-        }
-        self.send_message_normalized(request, &normalized)
-            .await
-            .map(a2a::SendMessageResponse::Task)
+                .map(a2a::SendMessageResponse::Message)
+        } else {
+            self.send_message_normalized(request, &normalized)
+                .await
+                .map(a2a::SendMessageResponse::Task)
+        };
+        self.close_ingress(Self::INGRESS_MESSAGE_SEND, timer, &telemetry, &answered);
+        answered
     }
 
     /// Merges the request- and message-level metadata and normalizes the
@@ -439,8 +521,23 @@ where
         params: &ServiceParams,
         request: &SendMessageRequest,
     ) -> RakkaAgentA2AResult<Message> {
-        let normalized = self.normalized_send(params, request)?;
-        self.team_command_normalized(request, &normalized).await
+        let timer = rakka_agent::AgentSegmentTimer::start(self.clock.now());
+        let normalized = match self.normalized_send(params, request) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                self.close_ingress_segment(
+                    Self::INGRESS_MESSAGE_SEND,
+                    timer,
+                    &extract_header_telemetry(params),
+                    Err(error.code()),
+                );
+                return Err(error);
+            }
+        };
+        let telemetry = normalized.telemetry.clone();
+        let answered = self.team_command_normalized(request, &normalized).await;
+        self.close_ingress(Self::INGRESS_MESSAGE_SEND, timer, &telemetry, &answered);
+        answered
     }
 
     /// The normalized half of [`Self::team_command`], shared with
@@ -533,9 +630,25 @@ where
         params: &ServiceParams,
         request: &SendMessageRequest,
     ) -> RakkaAgentA2AResult<Message> {
-        let normalized = self.normalized_send(params, request)?;
-        self.conversation_command_normalized(request, &normalized)
-            .await
+        let timer = rakka_agent::AgentSegmentTimer::start(self.clock.now());
+        let normalized = match self.normalized_send(params, request) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                self.close_ingress_segment(
+                    Self::INGRESS_MESSAGE_SEND,
+                    timer,
+                    &extract_header_telemetry(params),
+                    Err(error.code()),
+                );
+                return Err(error);
+            }
+        };
+        let telemetry = normalized.telemetry.clone();
+        let answered = self
+            .conversation_command_normalized(request, &normalized)
+            .await;
+        self.close_ingress(Self::INGRESS_MESSAGE_SEND, timer, &telemetry, &answered);
+        answered
     }
 
     /// The normalized half of [`Self::conversation_command`], shared with
@@ -612,6 +725,22 @@ where
     /// stale-revision conflict — is not an error: it answers as
     /// [`AgentManagementResponse::Refused`] so the caller can rebase.
     pub async fn manage_agent(
+        &self,
+        params: &ServiceParams,
+        request: &SendMessageRequest,
+    ) -> RakkaAgentA2AResult<Message> {
+        let timer = rakka_agent::AgentSegmentTimer::start(self.clock.now());
+        let telemetry = self.door_telemetry(params, request);
+        let answered = self.manage_agent_inner(params, request).await;
+        self.close_ingress(Self::INGRESS_MESSAGE_SEND, timer, &telemetry, &answered);
+        answered
+    }
+
+    /// The body of [`Self::manage_agent`], run inside its ingress segment.
+    ///
+    /// `send`'s management branch calls this directly, so exactly one segment
+    /// is closed however the command arrived.
+    async fn manage_agent_inner(
         &self,
         params: &ServiceParams,
         request: &SendMessageRequest,
@@ -828,31 +957,23 @@ where
         let normalized = match self.normalized_send(params, request) {
             Ok(normalized) => normalized,
             Err(error) => {
+                // A request refused before normalization still carried a
+                // context, in the header map if not in its payload. Answering
+                // the empty context here mapped every rejected request to no
+                // span at all — which is the span an operator debugging a
+                // refusal is looking for.
                 self.close_ingress_segment(
-                    A2AOperation::SendMessage.as_label(),
+                    Self::INGRESS_MESSAGE_SEND,
                     timer,
-                    &rakka_agent_workflow::AgentTelemetryContext::default(),
+                    &extract_header_telemetry(params),
                     Err(error.code()),
                 );
                 return Err(error);
             }
         };
-        // The wire method is the ingress class. The finer authorization
-        // class — a handoff, a team command, a result submission — is decided
-        // downstream from the collaboration cluster, and naming it here would
-        // claim the door knew something it does not know yet.
-        let operation = A2AOperation::SendMessage.as_label();
         let telemetry = normalized.telemetry.clone();
         let sent = self.send_message_normalized(request, &normalized).await;
-        self.close_ingress_segment(
-            operation,
-            timer,
-            &telemetry,
-            match &sent {
-                Ok(_) => Ok(()),
-                Err(error) => Err(error.code()),
-            },
-        );
+        self.close_ingress(Self::INGRESS_MESSAGE_SEND, timer, &telemetry, &sent);
         sent
     }
 
@@ -1034,6 +1155,33 @@ where
         principal: Option<&PrincipalRef>,
         history_length: Option<i32>,
     ) -> RakkaAgentA2AResult<Task> {
+        let timer = rakka_agent::AgentSegmentTimer::start(self.clock.now());
+        let telemetry = extract_header_telemetry(params);
+        let answered = self
+            .get_task_inner(params, request_tenant, task_id, principal, history_length)
+            .await;
+        self.close_ingress(
+            A2AOperation::GetTask.as_label(),
+            timer,
+            &telemetry,
+            &answered,
+        );
+        answered
+    }
+
+    /// The body of [`Self::get_task`], run inside its ingress segment.
+    ///
+    /// A read takes no message metadata, so the W3C header map is its only
+    /// carrier — and it writes nothing durable, so reading it here cannot change
+    /// what any record carries.
+    async fn get_task_inner(
+        &self,
+        params: &ServiceParams,
+        request_tenant: Option<&str>,
+        task_id: &str,
+        principal: Option<&PrincipalRef>,
+        history_length: Option<i32>,
+    ) -> RakkaAgentA2AResult<Task> {
         let now = self.clock.now();
         let mut normalized = normalize_agent_cancel(
             self.tenant_resolver.as_ref(),
@@ -1082,6 +1230,34 @@ where
         params: &ServiceParams,
         request: &CancelTaskRequest,
     ) -> RakkaAgentA2AResult<Task> {
+        let timer = rakka_agent::AgentSegmentTimer::start(self.clock.now());
+        let telemetry = {
+            let carried = extract_ingress_telemetry(&request.metadata.clone().unwrap_or_default());
+            if carried.trace_parent.is_some() {
+                carried
+            } else {
+                extract_header_telemetry(params)
+            }
+        };
+        let answered = self.cancel_task_inner(params, request).await;
+        self.close_ingress(
+            A2AOperation::CancelTask.as_label(),
+            timer,
+            &telemetry,
+            &answered,
+        );
+        answered
+    }
+
+    /// The body of [`Self::cancel_task`], run inside its ingress segment.
+    ///
+    /// A cancel carries its own metadata, so that carrier wins and the span
+    /// agrees with the context the normalization records.
+    async fn cancel_task_inner(
+        &self,
+        params: &ServiceParams,
+        request: &CancelTaskRequest,
+    ) -> RakkaAgentA2AResult<Task> {
         let now = self.clock.now();
         let metadata = request.metadata.clone().unwrap_or_default();
         let normalized = normalize_agent_cancel(
@@ -1121,6 +1297,29 @@ where
     /// surfaces [`crate::task::TaskProjectionError::ReplayWindowExpired`]
     /// through [`RakkaAgentA2AError::Projection`] so a caller resyncs.
     pub async fn replay_task_events(
+        &self,
+        params: &ServiceParams,
+        request_tenant: Option<&str>,
+        task_id: &str,
+        principal: Option<&PrincipalRef>,
+        after_cursor: Option<&str>,
+    ) -> RakkaAgentA2AResult<Vec<crate::task::A2ATaskEvent>> {
+        let timer = rakka_agent::AgentSegmentTimer::start(self.clock.now());
+        let telemetry = extract_header_telemetry(params);
+        let answered = self
+            .replay_task_events_inner(params, request_tenant, task_id, principal, after_cursor)
+            .await;
+        self.close_ingress(
+            A2AOperation::SubscribeToTask.as_label(),
+            timer,
+            &telemetry,
+            &answered,
+        );
+        answered
+    }
+
+    /// The body of [`Self::replay_task_events`], run inside its ingress segment.
+    async fn replay_task_events_inner(
         &self,
         params: &ServiceParams,
         request_tenant: Option<&str>,
@@ -1175,6 +1374,37 @@ where
     /// empty page would read as "this entity recorded nothing"), or a backing
     /// log faults.
     pub async fn replay_coordination_events(
+        &self,
+        params: &ServiceParams,
+        request_tenant: Option<&str>,
+        scope: &str,
+        principal: Option<&PrincipalRef>,
+        after_cursor: Option<&str>,
+        limit: usize,
+    ) -> RakkaAgentA2AResult<AgentCoordinationReplay> {
+        let timer = rakka_agent::AgentSegmentTimer::start(self.clock.now());
+        let telemetry = extract_header_telemetry(params);
+        let answered = self
+            .replay_coordination_events_inner(
+                params,
+                request_tenant,
+                scope,
+                principal,
+                after_cursor,
+                limit,
+            )
+            .await;
+        self.close_ingress(
+            A2AOperation::CoordinationEventRead.as_label(),
+            timer,
+            &telemetry,
+            &answered,
+        );
+        answered
+    }
+
+    /// The body of [`Self::replay_coordination_events`], run inside its ingress segment.
+    async fn replay_coordination_events_inner(
         &self,
         params: &ServiceParams,
         request_tenant: Option<&str>,
@@ -1320,6 +1550,29 @@ where
     /// traversal reached is unreadable under the schema policy. Neither absence
     /// nor denial is a failure.
     pub async fn agent_goal_view(
+        &self,
+        params: &ServiceParams,
+        request_tenant: Option<&str>,
+        goal: &str,
+        principal: Option<&PrincipalRef>,
+        max_tasks: Option<usize>,
+    ) -> RakkaAgentA2AResult<Option<AgentGoalView>> {
+        let timer = rakka_agent::AgentSegmentTimer::start(self.clock.now());
+        let telemetry = extract_header_telemetry(params);
+        let answered = self
+            .agent_goal_view_inner(params, request_tenant, goal, principal, max_tasks)
+            .await;
+        self.close_ingress(
+            A2AOperation::GoalViewRead.as_label(),
+            timer,
+            &telemetry,
+            &answered,
+        );
+        answered
+    }
+
+    /// The body of [`Self::agent_goal_view`], run inside its ingress segment.
+    async fn agent_goal_view_inner(
         &self,
         params: &ServiceParams,
         request_tenant: Option<&str>,

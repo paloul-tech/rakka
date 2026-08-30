@@ -18,8 +18,8 @@ use rakka_agent::{
     ATTR_AGENT_TELEMETRY_LINK_KIND, LINK_KIND_SUPERSEDED_GENERATION,
 };
 use rakka_agent_workflow::{
-    AgentCorrelationId, AgentTelemetryContext, AgentTimestampMillis, HumanCheckpointId,
-    PrincipalRef, StateSchemaVersion,
+    AgentAttributes, AgentCorrelationId, AgentSpanLink, AgentTelemetryContext,
+    AgentTimestampMillis, HumanCheckpointId, PrincipalRef, StateSchemaVersion,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -300,4 +300,56 @@ fn the_write_gate_is_strict_where_the_read_is_permissive() {
 
     let checkpoint = checkpoint().with_telemetry(malformed);
     assert_eq!(checkpoint.telemetry, AgentTelemetryContext::default());
+}
+
+/// The durable write gate bounds a link's *attributes*, not only its ids.
+///
+/// The gate is strict on write so the read side never has to fail closed over
+/// telemetry — but it inspected only trace and span ids, so a link carrying an
+/// over-long or multi-line attribute was persisted, and then every span closed
+/// under that context copied it onto an export record that
+/// `AgentOtelSpanExport::validate` refuses. A durable write poisoning a
+/// telemetry read, for the life of the run, which is the inversion 17.1
+/// forbids.
+#[test]
+fn the_write_gate_bounds_a_span_links_attributes_too() {
+    let context = rakka_agent::sanitize_agent_telemetry_context(AgentTelemetryContext {
+        trace_parent: Some(TRACE_PARENT.to_string()),
+        span_links: vec![AgentSpanLink {
+            trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+            span_id: "c7ad6b7169203332".to_string(),
+            trace_state: None,
+            attributes: AgentAttributes::from([
+                ("link_kind".to_string(), "superseded-generation".to_string()),
+                ("multiline".to_string(), "two\nlines".to_string()),
+                (
+                    "oversized".to_string(),
+                    "x".repeat(rakka_agent_workflow::AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES + 1),
+                ),
+            ]),
+        }],
+        ..AgentTelemetryContext::default()
+    });
+
+    let link = &context.span_links[0];
+    assert_eq!(
+        link.attributes.get("link_kind").map(String::as_str),
+        Some("superseded-generation"),
+        "the causality the link carries survives"
+    );
+    assert!(
+        !link.attributes.contains_key("multiline") && !link.attributes.contains_key("oversized"),
+        "what an export could not carry is dropped at the write: {:?}",
+        link.attributes
+    );
+
+    rakka_agent_workflow::AgentOtelSpanExport::from_telemetry_context(
+        "rakka.agent.effect.dispatch",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds")
+    .validate()
+    .expect("a persisted link must never make a record unexportable");
 }

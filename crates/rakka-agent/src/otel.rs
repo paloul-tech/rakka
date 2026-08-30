@@ -35,10 +35,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use rakka_agent_workflow::{
-    AgentAttributes, AgentLogEvent, AgentOtelInstrumentationScope, AgentOtelResource,
-    AgentOtelSpanEvent, AgentOtelSpanExport, AgentOtelSpanKind, AgentOtelSpanStatus,
-    AgentOtlpBridgeExport, AgentOtlpExporterConfig, AgentOtlpResult, AgentTelemetryContext,
-    AgentTimestampMillis, AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES,
+    bounded_export_attributes, AgentAttributes, AgentLogEvent, AgentOtelInstrumentationScope,
+    AgentOtelResource, AgentOtelSpanEvent, AgentOtelSpanExport, AgentOtelSpanKind,
+    AgentOtelSpanStatus, AgentOtlpBridgeExport, AgentOtlpExporterConfig, AgentOtlpResult,
+    AgentTelemetryContext, AgentTimestampMillis, AGENT_EXPORT_MAX_ATTRIBUTES,
 };
 use rakka_core::MetricsSnapshot;
 
@@ -280,16 +280,7 @@ fn allowlisted_log(attributes: AgentAttributes) -> AgentAttributes {
 /// sanitizing, and a resource needs the first and not the second.
 #[must_use]
 fn bounded_resource(resource: AgentAttributes) -> AgentAttributes {
-    resource
-        .into_iter()
-        .filter(|(key, value)| {
-            !key.trim().is_empty()
-                && !value.is_empty()
-                && value.len() <= AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES
-                && !value.contains('\n')
-                && !value.contains('\r')
-        })
-        .collect()
+    bounded_export_attributes(resource, AGENT_EXPORT_MAX_ATTRIBUTES)
 }
 
 /// Applies the log allowlist to one record, in place.

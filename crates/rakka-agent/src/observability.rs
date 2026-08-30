@@ -86,10 +86,22 @@ pub fn sanitize_agent_telemetry_context(context: AgentTelemetryContext) -> Agent
         sanitized.trace_state = trace_candidate.trace_state;
     }
 
+    // A link's *attributes* are bounded here too, not only its ids. The export
+    // record copies the persisted links verbatim, and one over-long or
+    // multi-line link attribute makes every span closed under this context
+    // unexportable for the life of the run — a durable write poisoning a
+    // telemetry read, which is the inversion 17.1 forbids.
     let mut links: Vec<_> = context
         .span_links
         .into_iter()
         .filter(|link| validate_agent_span_link(link).is_ok())
+        .map(|mut link| {
+            link.attributes = rakka_agent_workflow::bounded_export_attributes(
+                link.attributes,
+                rakka_agent_workflow::AGENT_EXPORT_MAX_ATTRIBUTES,
+            );
+            link
+        })
         .collect();
     if links.len() > AGENT_TELEMETRY_MAX_SPAN_LINKS {
         links.drain(..links.len() - AGENT_TELEMETRY_MAX_SPAN_LINKS);

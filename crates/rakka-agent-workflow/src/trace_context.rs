@@ -317,9 +317,17 @@ pub fn agent_durable_resume_telemetry_context(
     let parked = require_agent_trace_context(context)?;
     let mut resumed = parked.child(resume_span_id)?.to_telemetry_context();
     resumed.baggage = context.baggage.clone();
+    // Bounded here, at the write. The returned context is persisted, and every
+    // span later built under it copies these links onto its export record —
+    // where one over-long or multi-line attribute makes the record fail
+    // validation for the life of the run. A caller cannot be relied on to know
+    // the export bound, so the boundary that accepts its attributes applies it.
     resumed
         .span_links
-        .push(parked.to_span_link(link_attributes));
+        .push(parked.to_span_link(crate::bounded_export_attributes(
+            link_attributes,
+            crate::AGENT_EXPORT_MAX_ATTRIBUTES,
+        )));
     Ok(resumed)
 }
 

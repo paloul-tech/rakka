@@ -667,6 +667,37 @@ pub const AGENT_EXPORT_MAX_SPAN_EVENTS: usize = 32;
 /// The most links one exported span may carry.
 pub const AGENT_EXPORT_MAX_SPAN_LINKS: usize = 32;
 
+/// Keeps only the attributes an exported record may carry, at most `max` of
+/// them.
+///
+/// The *filtering* counterpart of `validate_export_attributes`, and the
+/// reason both exist. Validation is the right answer for a record a caller
+/// hand-builds: it names what is wrong. It is the wrong answer for a record
+/// Rakka derives from something already durable — an audit event's attributes,
+/// a persisted context's span links — because the durable record cannot be
+/// changed after the fact, so refusing its projection makes an old write
+/// permanently unexportable, and telemetry becomes a thing that can fail.
+///
+/// So a writer that derives an export record from durable state bounds it here
+/// instead: what cannot be exported is dropped, the durable record keeps it,
+/// and the rest of the batch ships. Attributes are ordered, so which ones a
+/// `max` keeps is deterministic rather than whichever the iterator reached
+/// first.
+#[must_use]
+pub fn bounded_export_attributes(attributes: AgentAttributes, max: usize) -> AgentAttributes {
+    attributes
+        .into_iter()
+        .filter(|(key, value)| {
+            !is_blank(key)
+                && !value.is_empty()
+                && value.len() <= AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES
+                && !value.contains('\n')
+                && !value.contains('\r')
+        })
+        .take(max)
+        .collect()
+}
+
 /// Generic bounds every exported attribute set must satisfy.
 ///
 /// Not a redaction policy: this refuses a malformed or unbounded attribute,
