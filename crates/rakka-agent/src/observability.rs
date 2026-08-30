@@ -711,10 +711,20 @@ pub const METRIC_AGENT_TURN_DURATION: &str = "rakka.agent.turn.duration";
 /// ([specification 17.8](../../../docs/plans/rakka-agent/spec.md),
 /// [17.12](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// Only what the provider actually reported is recorded; a turn carrying no
-/// usage records nothing rather than a zero, because a zero is a claim about
-/// the provider that Rakka has no evidence for. Cost is deliberately absent:
-/// it is a tenant-specific figure and never a metric label or value here.
+/// Only what the provider actually reported is recorded, **per direction**: a
+/// direction reporting zero records nothing rather than a zero, because a zero
+/// is a claim about the provider that Rakka has no evidence for.
+/// [`crate::model::AgentModelUsage`] carries plain counts and documents an
+/// unreported dimension as zero, so at this boundary "the provider said
+/// nothing" and "the provider said none" are the same value and neither is
+/// evidence. The cost is stated rather than hidden: a turn that genuinely
+/// emitted zero completion tokens — a refusal with an empty completion —
+/// contributes no `output` sample. Distinguishing the two would take an
+/// adapter contract that carries the difference, which the provider adapter in
+/// this crate does not have to give.
+///
+/// Cost is deliberately absent: it is a tenant-specific figure and never a
+/// metric label or value here.
 pub const METRIC_AGENT_MODEL_TOKENS: &str = "rakka.agent.model.tokens";
 
 /// Counter: run recoveries, labeled by outcome.

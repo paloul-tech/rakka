@@ -1076,3 +1076,50 @@ async fn a_run_records_its_durations_from_durable_timestamps() {
         });
     }
 }
+
+/// A provider that reports one direction contributes one sample, not two.
+///
+/// The guard used to sit on the *total* while the recording under it was
+/// unconditional, so a streaming adapter returning only completion tokens
+/// passed it and then wrote a fabricated `input = 0` on every turn. The first
+/// boundary of `AGENT_COUNT_BUCKETS` is 1, so those zeros land beside genuine
+/// one-token prompts and drag every input percentile toward zero — against the
+/// instrument's own promise that a zero is a claim about the provider Rakka has
+/// no evidence for.
+///
+/// The cost of reading it this way is real and deliberate: a turn that
+/// genuinely emitted zero completion tokens contributes no `output` sample,
+/// because `AgentModelUsage` carries plain counts and cannot tell that apart
+/// from silence.
+#[tokio::test]
+async fn a_direction_the_provider_did_not_report_records_no_sample() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let dispatcher = ScriptedDispatcher::new().with_turn(
+        AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+            .with_text("I have an answer.")
+            .with_proposal(
+                AgentTaskContent::inline(serde_json::json!({ "answer": "resolved" }))
+                    .expect("the proposal is inline-bounded"),
+            )
+            // The shape a streaming adapter returns: completion tokens only.
+            .with_usage(AgentModelUsage {
+                input_tokens: 0,
+                output_tokens: 120,
+                cost_micros: 0,
+            }),
+    );
+    let fx = Fixture::new(dispatcher).with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the run completes");
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        labels_of(&snapshot, METRIC_AGENT_MODEL_TOKENS),
+        vec![vec![("direction".to_string(), "output".to_string())]],
+        "the unreported direction must contribute nothing"
+    );
+    let tokens = snapshot.observations_named(METRIC_AGENT_MODEL_TOKENS);
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].value(), 120.0);
+}

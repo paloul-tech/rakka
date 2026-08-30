@@ -7376,14 +7376,29 @@ where
                     )
                     .ok();
                 }
-                // Only what the provider reported: a turn that carried no
-                // usage records nothing rather than a zero, which would be a
-                // claim about the provider there is no evidence for.
-                if let Some(usage) = usage.filter(|usage| usage.total_tokens() > 0) {
+                // Only what the provider reported, and *per direction* rather
+                // than in aggregate. The guard used to be on the total, and the
+                // recording under it unconditional, so a provider reporting only
+                // completion tokens — a streaming adapter, typically — passed it
+                // and then wrote a fabricated `input = 0` on every turn. The
+                // first bucket of `AGENT_COUNT_BUCKETS` starts at 1, so those
+                // zeros land beside genuine one-token prompts and drag every
+                // input percentile toward zero.
+                //
+                // A zero here is not evidence of a zero. `AgentModelUsage`
+                // carries plain counts and documents an unreported dimension as
+                // zero, so at this boundary "the provider said nothing" and "the
+                // provider said none" are the same value. Recording neither is
+                // the honest reading, and it is the one the instrument's own
+                // doc promises.
+                if let Some(usage) = usage {
                     for (direction, tokens) in [
                         ("input", usage.input_tokens),
                         ("output", usage.output_tokens),
                     ] {
+                        if tokens == 0 {
+                            continue;
+                        }
                         record_agent_domain_histogram(
                             self.metrics.as_ref(),
                             METRIC_AGENT_MODEL_TOKENS,

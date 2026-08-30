@@ -91,6 +91,16 @@ validated_id! {
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)). A provider
 /// that reports nothing leaves them zero; a budget is still charged for the call
 /// itself.
+///
+/// Because the counts are plain, **zero is not evidence of zero**: an
+/// unreported dimension and a genuinely empty one are the same value here, and
+/// nothing downstream can tell them apart. The budget charges the total either
+/// way — the work was done and billed — while telemetry treats a zero as
+/// silence and records nothing for it
+/// ([`METRIC_AGENT_MODEL_TOKENS`](crate::METRIC_AGENT_MODEL_TOKENS), and
+/// `usage_attributes` behind the `otel` feature). Those two readings are
+/// deliberate and different: a ledger must not under-charge, and an instrument
+/// must not invent a sample.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentModelUsage {
     /// Prompt tokens the provider billed.

@@ -851,17 +851,24 @@ pub fn decision_span_event(decision: &AgentDecisionEvent) -> AgentOtelSpanEvent 
 /// ([specification 17.8](../../../docs/plans/rakka-agent/spec.md): never
 /// invent token usage); cost stays out of standard attributes and out of
 /// metric labels.
+///
+/// A direction reporting zero is *omitted* rather than written as `"0"`, for
+/// the reason the token histogram skips it: [`AgentModelUsage`] carries plain
+/// counts, so at this boundary "the provider said nothing" and "the provider
+/// said none" are the same value, and writing one of them as a figure claims
+/// evidence there is none. Both convention attributes are optional, so an
+/// absent one is the convention-correct way to say so.
 #[must_use]
 pub fn usage_attributes(usage: &AgentModelUsage) -> AgentAttributes {
     let mut attributes = AgentAttributes::new();
-    attributes.insert(
-        ATTR_GEN_AI_USAGE_INPUT_TOKENS.to_string(),
-        usage.input_tokens.to_string(),
-    );
-    attributes.insert(
-        ATTR_GEN_AI_USAGE_OUTPUT_TOKENS.to_string(),
-        usage.output_tokens.to_string(),
-    );
+    for (key, tokens) in [
+        (ATTR_GEN_AI_USAGE_INPUT_TOKENS, usage.input_tokens),
+        (ATTR_GEN_AI_USAGE_OUTPUT_TOKENS, usage.output_tokens),
+    ] {
+        if tokens > 0 {
+            attributes.insert(key.to_string(), tokens.to_string());
+        }
+    }
     attributes
 }
 

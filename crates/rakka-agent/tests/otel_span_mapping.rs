@@ -21,14 +21,15 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    genai_operation, is_agent_span_attribute, segment_span, validate_agent_span_attributes,
-    AgentEffectSpec, AgentGenAiSpanExporter, AgentModelTurn, AgentRevisionNumber, AgentRunEffect,
-    AgentRunEffectRequest, AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink,
-    AgentSegmentTimer, AgentTaskContent, AgentTelemetrySegment, AgentToolCallId,
-    AgentToolCallRequest, AgentToolId, AGENT_GENAI_CONVENTION_REVISION, AGENT_OTEL_SCOPE_NAME,
-    AGENT_SPAN_ATTRIBUTE_KEYS, ATTR_ERROR_TYPE, ATTR_GEN_AI_AGENT_ID, ATTR_GEN_AI_CONVERSATION_ID,
-    ATTR_GEN_AI_OPERATION_NAME, ATTR_GEN_AI_PROVIDER_NAME, ATTR_GEN_AI_TOOL_NAME,
-    ATTR_GEN_AI_TOOL_TYPE, ATTR_RAKKA_ERROR_CODE, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    genai_operation, is_agent_span_attribute, segment_span, usage_attributes,
+    validate_agent_span_attributes, AgentEffectSpec, AgentGenAiSpanExporter, AgentModelTurn,
+    AgentRevisionNumber, AgentRunEffect, AgentRunEffectRequest, AgentSegmentIdentity,
+    AgentSegmentOperation, AgentSegmentSink, AgentSegmentTimer, AgentTaskContent,
+    AgentTelemetrySegment, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    AGENT_GENAI_CONVENTION_REVISION, AGENT_OTEL_SCOPE_NAME, AGENT_SPAN_ATTRIBUTE_KEYS,
+    ATTR_ERROR_TYPE, ATTR_GEN_AI_AGENT_ID, ATTR_GEN_AI_CONVERSATION_ID, ATTR_GEN_AI_OPERATION_NAME,
+    ATTR_GEN_AI_PROVIDER_NAME, ATTR_GEN_AI_TOOL_NAME, ATTR_GEN_AI_TOOL_TYPE, ATTR_RAKKA_ERROR_CODE,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{
     AgentAttributes, AgentLogEvent, AgentLogSeverity, AgentOtelResource, AgentOtelSpanKind,
@@ -1038,4 +1039,45 @@ fn the_spans_of_a_reconciled_re_invocation_reach_the_exporter() {
         );
         span.validate().expect("the record is valid");
     }
+}
+
+/// The span attributes follow the same rule as the histogram.
+///
+/// `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens` are optional
+/// convention attributes, so an absent one is how the convention says "not
+/// reported". Writing `"0"` instead claimed a figure Rakka has no evidence for
+/// on every span of every turn a one-directional provider produced.
+#[test]
+fn a_usage_direction_with_no_evidence_is_omitted_rather_than_written_as_zero() {
+    let reported = usage_attributes(&rakka_agent::AgentModelUsage {
+        input_tokens: 120,
+        output_tokens: 45,
+        cost_micros: 7,
+    });
+    assert_eq!(
+        reported.get(rakka_agent::ATTR_GEN_AI_USAGE_INPUT_TOKENS),
+        Some(&"120".to_string())
+    );
+    assert_eq!(
+        reported.get(rakka_agent::ATTR_GEN_AI_USAGE_OUTPUT_TOKENS),
+        Some(&"45".to_string())
+    );
+
+    let one_sided = usage_attributes(&rakka_agent::AgentModelUsage {
+        input_tokens: 0,
+        output_tokens: 120,
+        cost_micros: 0,
+    });
+    assert_eq!(
+        one_sided.get(rakka_agent::ATTR_GEN_AI_USAGE_OUTPUT_TOKENS),
+        Some(&"120".to_string()),
+        "what the provider reported is written"
+    );
+    assert!(
+        !one_sided.contains_key(rakka_agent::ATTR_GEN_AI_USAGE_INPUT_TOKENS),
+        "and what it did not is absent, not zero: {one_sided:?}"
+    );
+
+    // Cost is on neither surface.
+    assert_eq!(one_sided.len(), 1);
 }
