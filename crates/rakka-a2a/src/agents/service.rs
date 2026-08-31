@@ -320,12 +320,16 @@ where
     /// a handoff, a team command, a result submission, a management command —
     /// is decided downstream from the collaboration cluster, and naming it at
     /// the door would claim the door knew something it does not know yet.
-    const INGRESS_MESSAGE_SEND: &'static str = A2AOperation::SendMessage.as_label();
+    const INGRESS_MESSAGE_SEND: A2AOperation = A2AOperation::SendMessage;
 
     /// Closes one ingress segment, naming the bounded A2A operation class.
+    ///
+    /// The class is the typed [`A2AOperation`], not a label a caller passes:
+    /// the label is derived here, at the single construction site, so the
+    /// bounded class and the string on the span cannot drift apart.
     fn close_ingress_segment(
         &self,
-        operation: &'static str,
+        operation: A2AOperation,
         timer: rakka_agent::AgentSegmentTimer,
         telemetry: &rakka_agent_workflow::AgentTelemetryContext,
         outcome: Result<(), &str>,
@@ -335,19 +339,19 @@ where
         };
         let segment = timer
             .close(rakka_agent::AgentSegmentOperation::A2aIngress {
-                operation: operation.to_string(),
+                operation: operation.as_label().to_string(),
             })
             .telemetry(telemetry.clone());
         sink.record(&match outcome {
             Ok(()) => segment.ok(),
-            Err(code) => segment.failed("rakka.a2a.ingress", code),
+            Err(code) => segment.failed(super::A2A_INGRESS_ERROR_TYPE, code),
         });
     }
 
     /// Closes one ingress segment from the answer the entry point produced.
     fn close_ingress<T>(
         &self,
-        operation: &'static str,
+        operation: A2AOperation,
         timer: rakka_agent::AgentSegmentTimer,
         telemetry: &rakka_agent_workflow::AgentTelemetryContext,
         answered: &RakkaAgentA2AResult<T>,
@@ -1160,12 +1164,7 @@ where
         let answered = self
             .get_task_inner(params, request_tenant, task_id, principal, history_length)
             .await;
-        self.close_ingress(
-            A2AOperation::GetTask.as_label(),
-            timer,
-            &telemetry,
-            &answered,
-        );
+        self.close_ingress(A2AOperation::GetTask, timer, &telemetry, &answered);
         answered
     }
 
@@ -1240,12 +1239,7 @@ where
             }
         };
         let answered = self.cancel_task_inner(params, request).await;
-        self.close_ingress(
-            A2AOperation::CancelTask.as_label(),
-            timer,
-            &telemetry,
-            &answered,
-        );
+        self.close_ingress(A2AOperation::CancelTask, timer, &telemetry, &answered);
         answered
     }
 
@@ -1309,12 +1303,7 @@ where
         let answered = self
             .replay_task_events_inner(params, request_tenant, task_id, principal, after_cursor)
             .await;
-        self.close_ingress(
-            A2AOperation::SubscribeToTask.as_label(),
-            timer,
-            &telemetry,
-            &answered,
-        );
+        self.close_ingress(A2AOperation::SubscribeToTask, timer, &telemetry, &answered);
         answered
     }
 
@@ -1395,7 +1384,7 @@ where
             )
             .await;
         self.close_ingress(
-            A2AOperation::CoordinationEventRead.as_label(),
+            A2AOperation::CoordinationEventRead,
             timer,
             &telemetry,
             &answered,
@@ -1562,12 +1551,7 @@ where
         let answered = self
             .agent_goal_view_inner(params, request_tenant, goal, principal, max_tasks)
             .await;
-        self.close_ingress(
-            A2AOperation::GoalViewRead.as_label(),
-            timer,
-            &telemetry,
-            &answered,
-        );
+        self.close_ingress(A2AOperation::GoalViewRead, timer, &telemetry, &answered);
         answered
     }
 

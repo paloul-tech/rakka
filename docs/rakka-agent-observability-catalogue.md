@@ -217,6 +217,30 @@ Stale-owner conflict is the one 17.16 case with no dedicated attribute: it
 surfaces today as a failed transition's stable error code rather than as a
 class of its own.
 
+`error.type` is a bounded vocabulary, held as data in
+`AGENT_SEGMENT_ERROR_TYPES` and checked against the call sites in both
+directions by `cargo test -p rakka-agent --test metric_catalogue`, because
+`AgentTelemetrySegment::failed` takes a `&'static str` and the compiler can
+check nothing about it:
+
+| `error.type` | Written by |
+| --- | --- |
+| `rakka.agent.authority` | the dispatch authority's refusals |
+| `rakka.agent.dispatch` | the dispatcher's own attempt failures |
+| `rakka.agent.effect` | effect outcomes, including the indeterminate park |
+| `rakka.agent.model` | the model adapter call |
+| `rakka.agent.outbox` | durable effect acceptance |
+| `rakka.agent.recovery` | run recovery |
+| `rakka.agent.tool` | tool execution |
+| `rakka.a2a.ingress` | the A2A edge (`rakka_a2a::agents::A2A_INGRESS_ERROR_TYPE`) |
+
+The last is the protocol adapter's, not the agent domain's, and is deliberately
+outside `AGENT_SEGMENT_ERROR_TYPES`: `rakka-agent` does not write it and could
+not keep the entry honest. `rakka.error.code` beside it is the subsystem's own
+stable code, bounded at `AGENT_SEGMENT_ERROR_CODE_MAX_LENGTH` — a *code* is a
+short stable string, and an unbounded one would be an error message wearing a
+code's name.
+
 ### Two vocabularies, and why the log one is wider
 
 `AGENT_SPAN_ATTRIBUTE_KEYS` is the closed set a span may carry.

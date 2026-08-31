@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use rakka_agent::{
     agent_domain_instrument_views, agent_domain_metric_instrument,
     validate_agent_domain_metric_attributes, AGENT_DOMAIN_METRIC_INSTRUMENTS,
+    AGENT_SEGMENT_ERROR_TYPES,
 };
 
 fn crate_src() -> PathBuf {
@@ -132,4 +133,59 @@ fn the_lookup_and_the_export_views_agree_with_the_table() {
         assert_eq!(found, instrument);
     }
     assert!(agent_domain_metric_instrument("rakka.agent.not.a.metric").is_none());
+}
+
+/// Every stable `error.type` the crate writes is catalogued, and every
+/// catalogued one is written.
+///
+/// `AgentTelemetrySegment::failed` takes a `&'static str`, so the compiler
+/// checks nothing about it — and [17.6](../../../docs/plans/rakka-agent/spec.md)
+/// makes `error.type` a grouping attribute while 17.16 asks a retention policy
+/// to select on it, so these strings are a compatibility surface an operator
+/// writes Collector rules against. That is exactly the shape the metric
+/// catalogue exists for, so it gets the same bijection: a new type nobody
+/// documented fails here rather than shipping, and a documented type nothing
+/// writes fails here rather than sitting in a doc as a promise.
+#[test]
+fn every_segment_error_type_the_crate_writes_is_catalogued() {
+    const MARKER: &str = ".failed(";
+    let mut written = BTreeSet::new();
+    let entries = fs::read_dir(crate_src()).expect("the crate's src directory is readable");
+    for entry in entries {
+        let path = entry.expect("a directory entry is readable").path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("a source file is readable");
+        for chunk in source.split(MARKER).skip(1) {
+            // The first argument is the error type, and every call site in
+            // this crate passes it as a literal.
+            let Some((_, rest)) = chunk.split_once('"') else {
+                continue;
+            };
+            let Some((value, _)) = rest.split_once('"') else {
+                continue;
+            };
+            written.insert(value.to_string());
+        }
+    }
+    assert!(
+        !written.is_empty(),
+        "the scan found no failed segments at all, so it is proving nothing"
+    );
+
+    let catalogued: BTreeSet<&str> = AGENT_SEGMENT_ERROR_TYPES.iter().copied().collect();
+    for value in &written {
+        assert!(
+            catalogued.contains(value.as_str()),
+            "`{value}` is written onto a failed segment but is not in \
+             AGENT_SEGMENT_ERROR_TYPES, so no operator was told it exists"
+        );
+    }
+    for value in &catalogued {
+        assert!(
+            written.contains(*value),
+            "`{value}` is catalogued but this crate writes it nowhere"
+        );
+    }
 }

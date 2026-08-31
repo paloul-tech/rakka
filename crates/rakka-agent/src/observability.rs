@@ -1762,6 +1762,32 @@ impl AgentTelemetrySegment {
 /// The longest stable error code a segment carries.
 pub const AGENT_SEGMENT_ERROR_CODE_MAX_LENGTH: usize = 96;
 
+/// Every stable `error.type` the **agent domain** writes onto a failed
+/// segment.
+///
+/// [Specification 17.6](../../../docs/plans/rakka-agent/spec.md) makes
+/// `error.type` a grouping attribute, and 17.16 asks a retention policy to
+/// select on it — so operators write Collector rules against these strings and
+/// they are a compatibility surface, not a diagnostic detail. `failed` takes a
+/// `&'static str`, which gives the compiler nothing to check, so the
+/// vocabulary is data here and `tests/metric_catalogue.rs` holds the call
+/// sites to it in both directions: a new type that is not listed fails the
+/// suite, and a listed type nothing writes fails it too.
+///
+/// The A2A edge writes one more of its own,
+/// `rakka_a2a::agents::A2A_INGRESS_ERROR_TYPE`, because the protocol adapter
+/// owns the ingress span the agent domain defers to it. It is not in this list
+/// because this crate does not write it and could not keep it honest.
+pub const AGENT_SEGMENT_ERROR_TYPES: &[&str] = &[
+    "rakka.agent.authority",
+    "rakka.agent.dispatch",
+    "rakka.agent.effect",
+    "rakka.agent.model",
+    "rakka.agent.outbox",
+    "rakka.agent.recovery",
+    "rakka.agent.tool",
+];
+
 /// Segment attribute: the resolved status of the effect an operation settled.
 ///
 /// This is the key a retention policy selects `indeterminate` on
@@ -1790,7 +1816,8 @@ pub const SEGMENT_ATTR_CHECKPOINT_KIND: &str = "rakka.agent.checkpoint.kind";
 /// Two clocks, on purpose. The segment is *anchored* to the caller's injected
 /// `AgentTimestampMillis`, so a segment's position in time agrees with the
 /// durable records around it and stays deterministic under the frozen clocks
-/// the suite drives. Its *width* comes from a monotonic [`Instant`], because a
+/// the suite drives. Its *width* comes from a monotonic [`std::time::Instant`],
+/// because a
 /// live operation has exactly one injected timestamp — a transition receives
 /// one `now` and commits under it — and deriving a width from a single value
 /// would report every live operation as instantaneous.

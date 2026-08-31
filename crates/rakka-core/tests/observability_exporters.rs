@@ -286,3 +286,100 @@ fn a_pre_extension_metric_record_decodes_without_unit_or_buckets() {
     assert!(metric.data_points()[0].bucket_counts().is_empty());
     assert_eq!(metric.data_points()[0].count(), Some(1));
 }
+
+/// A bucket declaration that cannot be bucketed against is ignored, not
+/// trusted.
+///
+/// `histogram_bucket_index` takes the first boundary an observation does not
+/// exceed, which is right only for a strictly ascending set. The boundaries
+/// are caller-supplied at a public entry point that validated nothing — the
+/// one consistency check anywhere near them was that `bucket_counts` is one
+/// longer than `bucket_boundaries`, which an unsorted or duplicated set
+/// satisfies — so `[10.0, 5.0, 50.0]` produced a non-monotonic cumulative
+/// histogram that a Collector rejects or renders as nonsense quantiles, while
+/// the unit and the bucket vector made it look authoritative.
+#[test]
+fn an_unusable_bucket_declaration_degrades_to_count_and_sum() {
+    let unusable: &[(&str, &[f64])] = &[
+        ("descending", &[10.0, 5.0, 50.0]),
+        ("duplicated", &[1.0, 1.0, 10.0]),
+        ("nan", &[1.0, f64::NAN, 10.0]),
+        ("infinite", &[1.0, f64::INFINITY]),
+        ("empty", &[]),
+    ];
+
+    for (label, boundaries) in unusable {
+        let recorder = InMemoryMetricsRecorder::new();
+        for value in [0.5_f64, 4.0, 25.0] {
+            recorder.record_histogram(METRIC_HTTP_REQUEST_LATENCY_MS, value, &[]);
+        }
+        let export = export_open_telemetry_metrics_with_instruments(
+            &recorder.snapshot(),
+            &[],
+            &[OpenTelemetryInstrumentView {
+                name: METRIC_HTTP_REQUEST_LATENCY_MS,
+                unit: "ms",
+                bucket_boundaries: boundaries,
+            }],
+        );
+        let point = &export.metrics()[0].data_points()[0];
+        assert!(
+            point.bucket_boundaries().is_empty() && point.bucket_counts().is_empty(),
+            "{label} boundaries must not be bucketed against"
+        );
+        // The series still exports: an absent distribution, never a dropped one.
+        assert_eq!(point.count(), Some(3), "{label}");
+        assert_eq!(point.sum(), Some(29.5), "{label}");
+        assert_eq!(export.metrics()[0].unit(), Some("ms"), "{label}");
+    }
+
+    // The ascending set beside them still buckets, or the assertions above
+    // would pass on an exporter that had simply stopped bucketing.
+    let recorder = InMemoryMetricsRecorder::new();
+    for value in [0.5_f64, 4.0, 25.0] {
+        recorder.record_histogram(METRIC_HTTP_REQUEST_LATENCY_MS, value, &[]);
+    }
+    let export = export_open_telemetry_metrics_with_instruments(
+        &recorder.snapshot(),
+        &[],
+        &[OpenTelemetryInstrumentView {
+            name: METRIC_HTTP_REQUEST_LATENCY_MS,
+            unit: "ms",
+            bucket_boundaries: &[1.0, 5.0, 50.0],
+        }],
+    );
+    assert_eq!(
+        export.metrics()[0].data_points()[0].bucket_counts(),
+        &[1, 1, 1, 0]
+    );
+}
+
+/// One non-finite observation must not poison the whole series.
+///
+/// `summary.sum += value` makes the exported sum NaN for every attribute set
+/// that shares the metric, and `value <= boundary` is false for every
+/// boundary, so the sample also lands in `+Inf` while claiming to be one.
+#[test]
+fn a_non_finite_observation_is_dropped_rather_than_summed() {
+    let recorder = InMemoryMetricsRecorder::new();
+    for value in [2.0_f64, f64::NAN, 4.0, f64::INFINITY] {
+        recorder.record_histogram(METRIC_HTTP_REQUEST_LATENCY_MS, value, &[]);
+    }
+    let export = export_open_telemetry_metrics_with_instruments(
+        &recorder.snapshot(),
+        &[],
+        &[OpenTelemetryInstrumentView {
+            name: METRIC_HTTP_REQUEST_LATENCY_MS,
+            unit: "ms",
+            bucket_boundaries: &[1.0, 5.0],
+        }],
+    );
+    let point = &export.metrics()[0].data_points()[0];
+    assert_eq!(
+        point.count(),
+        Some(2),
+        "only the finite samples are counted"
+    );
+    assert_eq!(point.sum(), Some(6.0), "and the sum stays a number");
+    assert_eq!(point.bucket_counts(), &[0, 2, 0]);
+}

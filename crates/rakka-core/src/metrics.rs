@@ -611,7 +611,44 @@ pub struct OpenTelemetryInstrumentView<'a> {
     pub unit: &'a str,
     /// Explicit histogram bucket upper bounds, ascending. Empty for counters,
     /// gauges, and histograms whose distribution the caller does not bucket.
+    ///
+    /// A set that is not strictly ascending, or that carries a NaN or an
+    /// infinity, is *ignored* rather than trusted — see
+    /// [`Self::has_usable_buckets`].
     pub bucket_boundaries: &'a [f64],
+}
+
+impl OpenTelemetryInstrumentView<'_> {
+    /// Whether [`Self::bucket_boundaries`] can be bucketed against.
+    ///
+    /// The bucketing walk takes the first boundary an observation does not
+    /// exceed, which is the right answer only for a strictly ascending set. A
+    /// declaration is caller-supplied — this is a public entry point, and the
+    /// only consistency check anywhere near it was that `bucket_counts` is one
+    /// longer than `bucket_boundaries`, which an unsorted or duplicated set
+    /// satisfies — so boundaries such as `[10.0, 5.0, 50.0]` placed every
+    /// observation in the first bound it did not exceed and produced a
+    /// non-monotonic cumulative histogram: a Collector rejects it, or renders
+    /// nonsense quantiles, while the unit and the bucket vector make it look
+    /// authoritative. A NaN boundary is never `>=` anything, so it silently
+    /// swallowed the ordering too.
+    ///
+    /// An unusable declaration degrades to the count/sum form, exactly as a
+    /// metric the catalogue does not name does, on the principle this module
+    /// already states for a mismatched bucket pair: a wrong distribution is
+    /// worse than an absent one.
+    #[must_use]
+    pub fn has_usable_buckets(&self) -> bool {
+        !self.bucket_boundaries.is_empty()
+            && self
+                .bucket_boundaries
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && self
+                .bucket_boundaries
+                .iter()
+                .all(|boundary| boundary.is_finite())
+    }
 }
 
 /// Converts a Rakka metrics snapshot into a serializable OpenTelemetry-oriented bridge model.
@@ -832,6 +869,7 @@ fn aggregate_metrics_with_instruments(
                     .filter(|unit| !unit.is_empty())
                     .map(ToOwned::to_owned),
                 bucket_boundaries: instrument
+                    .filter(|instrument| instrument.has_usable_buckets())
                     .map(|instrument| instrument.bucket_boundaries.to_vec())
                     .unwrap_or_default(),
                 counters: BTreeMap::new(),
@@ -848,6 +886,14 @@ fn aggregate_metrics_with_instruments(
                 metric.gauges.insert(attributes, observation.value());
             }
             MetricKind::Histogram => {
+                // A non-finite observation is dropped rather than summed: one
+                // NaN makes the exported `sum` of the whole series NaN, and
+                // `value <= boundary` is false for every boundary, so it also
+                // lands in the `+Inf` bucket while claiming to be a sample.
+                // Losing one bad observation is the recoverable direction.
+                if !observation.value().is_finite() {
+                    continue;
+                }
                 let boundaries = metric.bucket_boundaries.clone();
                 let summary = metric.histograms.entry(attributes).or_default();
                 summary.count = summary.count.saturating_add(1);
