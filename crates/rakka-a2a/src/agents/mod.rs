@@ -15,6 +15,15 @@
 //! siblings — nothing here changes the existing workflow handler — and the
 //! dependency is one-directional: `rakka-agent` never depends on this crate.
 
+/// The stable `error.type` the A2A edge writes onto a failed ingress segment.
+///
+/// The protocol adapter owns the ingress `SERVER` span the agent domain's
+/// convention mapping defers to it, so it owns this value too. It sits beside
+/// `rakka_agent::AGENT_SEGMENT_ERROR_TYPES` in the compatibility surface an
+/// operator writes retention rules against, and is declared rather than
+/// spelled at the call site so the two cannot drift.
+pub const A2A_INGRESS_ERROR_TYPE: &str = "rakka.a2a.ingress";
+
 pub mod catalog;
 pub mod client;
 pub mod collaboration;

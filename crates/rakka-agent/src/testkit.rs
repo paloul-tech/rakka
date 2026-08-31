@@ -1542,6 +1542,7 @@ where
     policies: AgentEffectPolicies,
     memory: Arc<Mutex<Option<AgentRunMemory>>>,
     decisions: Arc<Mutex<Option<Arc<dyn AgentDecisionEventSink>>>>,
+    segments: Arc<Mutex<Option<Arc<dyn crate::observability::AgentSegmentSink>>>>,
     metrics: Arc<Mutex<Option<Arc<dyn MetricsRecorder>>>>,
     delegation: Arc<Mutex<Option<crate::delegation::AgentRunDelegationConfig>>>,
     workflow_tools: Arc<Mutex<Option<crate::workflow_tool::AgentRunWorkflowConfig>>>,
@@ -1564,6 +1565,7 @@ where
             policies: self.policies.clone(),
             memory: self.memory.clone(),
             decisions: self.decisions.clone(),
+            segments: self.segments.clone(),
             metrics: self.metrics.clone(),
             delegation: self.delegation.clone(),
             workflow_tools: self.workflow_tools.clone(),
@@ -1595,6 +1597,7 @@ where
             policies: AgentEffectPolicies::default(),
             memory: Arc::new(Mutex::new(None)),
             decisions: Arc::new(Mutex::new(None)),
+            segments: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(None)),
             delegation: Arc::new(Mutex::new(None)),
             workflow_tools: Arc::new(Mutex::new(None)),
@@ -1640,6 +1643,15 @@ where
             .decisions
             .lock()
             .expect("the decision slot should not be poisoned") = Some(sink);
+    }
+
+    /// Wires every run entity this transport builds with a bounded-segment
+    /// sink, under the same shared-slot rule as [`Self::install_memory`].
+    pub fn install_segments(&self, sink: Arc<dyn crate::observability::AgentSegmentSink>) {
+        *self
+            .segments
+            .lock()
+            .expect("the segment slot should not be poisoned") = Some(sink);
     }
 
     /// Wires every run entity this transport builds with a metrics recorder,
@@ -1756,6 +1768,14 @@ where
                 .clone();
             if let Some(decisions) = decisions {
                 entity = entity.with_decision_events(decisions);
+            }
+            let segments = self
+                .segments
+                .lock()
+                .expect("the segment slot should not be poisoned")
+                .clone();
+            if let Some(segments) = segments {
+                entity = entity.with_segments(segments);
             }
             let metrics = self
                 .metrics
@@ -2982,6 +3002,7 @@ where
     policies: AgentEffectPolicies,
     workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
+    segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -3005,6 +3026,7 @@ where
             policies: AgentEffectPolicies::default(),
             workflow_tools: None,
             delegation: None,
+            segments: None,
         }
     }
 
@@ -3024,6 +3046,20 @@ where
         config: crate::workflow_tool::AgentRunWorkflowConfig,
     ) -> Self {
         self.workflow_tools = Some(config);
+        self
+    }
+
+    /// Wires the entity this delivery drives with a bounded-segment sink.
+    ///
+    /// Delivering a durable result *advances the loop* — it is what discharges
+    /// a wait, folds a turn, and opens the next checkpoint — so this driver
+    /// closes segments as much as the entity a caller drives directly. Every
+    /// driver of a run must share one wiring, the same rule session memory and
+    /// decision events already follow: an unwired driver silently closes
+    /// nothing for every transition it commits.
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn crate::observability::AgentSegmentSink>) -> Self {
+        self.segments = Some(sink);
         self
     }
 
@@ -3057,6 +3093,9 @@ where
             }
             if let Some(config) = &self.delegation {
                 entity = entity.with_delegation(config.clone());
+            }
+            if let Some(segments) = &self.segments {
+                entity = entity.with_segments(segments.clone());
             }
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity

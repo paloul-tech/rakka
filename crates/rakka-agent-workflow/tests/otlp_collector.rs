@@ -382,3 +382,217 @@ fn a_pre_extension_span_record_decodes_with_default_kind_status_and_events() {
             .expect("the record round-trips");
     assert_eq!(round_tripped, stamped);
 }
+
+/// A span record built from a durable context carries the trace identity and
+/// the links, and **no attributes at all**.
+///
+/// It used to copy the context's baggage verbatim into span attributes, past
+/// a `validate` that inspected attributes not at all. Baggage is a
+/// propagation context rather than a span attribute set, and baggage received
+/// from an external caller is untrusted (specification 17.15), so a caller
+/// that wants an attribute now sets it explicitly — which is what makes an
+/// exported set exactly what its emitter decided to export.
+#[test]
+fn a_span_built_from_a_context_copies_no_baggage_into_its_attributes() {
+    let context = telemetry_context();
+    assert!(
+        !context.baggage.is_empty(),
+        "the fixture must carry baggage, or this proves nothing"
+    );
+
+    let span = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds");
+
+    assert!(
+        span.attributes.is_empty(),
+        "baggage reached the span attributes: {:?}",
+        span.attributes
+    );
+    // The trace identity and the links are what a context does supply.
+    assert_eq!(span.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(span.links.len(), context.span_links.len());
+    span.validate().expect("the record is valid");
+
+    // An explicitly-set attribute is kept, so the change removes a copy and
+    // not the ability to carry attributes.
+    let span = span.attribute("step.kind", "tool");
+    assert_eq!(
+        span.attributes.get("step.kind").map(String::as_str),
+        Some("tool")
+    );
+}
+
+/// The export records now carry the generic bounds the metric vocabulary
+/// always had and this side never did: a blank key, an unbounded value, a
+/// multi-line value, and an inverted time range are each refused.
+#[test]
+fn an_unbounded_or_malformed_span_attribute_is_refused() {
+    let base = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(10),
+        AgentTimestampMillis::new(20),
+        &telemetry_context(),
+    )
+    .expect("the span builds");
+
+    base.clone().validate().expect("the base record is valid");
+
+    let blank_key = base.clone().attribute("   ", "value");
+    assert!(blank_key.validate().is_err(), "a blank key is refused");
+
+    let overlong = base.clone().attribute("step.kind", "x".repeat(4096));
+    assert!(
+        overlong.validate().is_err(),
+        "an unbounded value is refused"
+    );
+
+    let multiline = base.clone().attribute("step.kind", "tool\nmore");
+    assert!(
+        multiline.validate().is_err(),
+        "a multi-line value is refused"
+    );
+
+    let mut inverted = base;
+    inverted.start_time = AgentTimestampMillis::new(30);
+    assert!(
+        inverted.validate().is_err(),
+        "an end before its start is refused"
+    );
+}
+
+/// A span built from a durable context is that context's **child**, not a
+/// second record claiming to be it.
+///
+/// The `traceparent` a context carries names the span it was propagated from
+/// — an ingress caller's, or the run's own parked span. Writing it back as
+/// the new record's span id made every span built from one context collide on
+/// a single id, and on an id that already belonged to somebody else's span.
+#[test]
+fn a_span_built_from_a_context_is_its_child_rather_than_a_copy_of_it() {
+    let context = telemetry_context();
+    let span = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds");
+
+    assert_eq!(
+        span.parent_span_id.as_deref(),
+        Some("00f067aa0ba902b7"),
+        "the context's span id is the parent"
+    );
+    assert_ne!(
+        span.span_id, "00f067aa0ba902b7",
+        "and never the record's own id"
+    );
+    span.validate().expect("the derived id is a valid span id");
+
+    // Same context, different operation: two records, two ids.
+    let sibling = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.checkpoint",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the sibling builds");
+    assert_ne!(span.span_id, sibling.span_id);
+    assert_eq!(span.parent_span_id, sibling.parent_span_id);
+
+    // The derivation is a function of its inputs, so it is reproducible
+    // rather than drawn from a random source there is none of on this path.
+    let again = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds again");
+    assert_eq!(span.span_id, again.span_id);
+}
+
+/// The name and the time window do not separate two spans of the *same*
+/// operation, so a populated record re-derives over what does.
+#[test]
+fn a_populated_record_re_derives_its_id_over_what_distinguishes_it() {
+    let context = telemetry_context();
+    let base = AgentOtelSpanExport::from_telemetry_context(
+        "rakka.agent.effect.dispatch",
+        AgentTimestampMillis::new(10),
+        AgentTimestampMillis::new(20),
+        &context,
+    )
+    .expect("the span builds");
+
+    let first = base
+        .clone()
+        .attribute("rakka.agent.effect.attempt", "1")
+        .with_derived_span_id(&[]);
+    let second = base
+        .clone()
+        .attribute("rakka.agent.effect.attempt", "2")
+        .with_derived_span_id(&[]);
+
+    assert_ne!(
+        first.span_id, second.span_id,
+        "two attempts of one effect are two spans"
+    );
+    assert_ne!(
+        first.span_id, base.span_id,
+        "re-deriving over the attributes moves the id"
+    );
+    assert_eq!(
+        first.parent_span_id, base.parent_span_id,
+        "and leaves the parent alone"
+    );
+    first.validate().expect("the re-derived id is valid");
+    second.validate().expect("the re-derived id is valid");
+
+    // Two records that content cannot separate — same operation, same
+    // attributes, same millisecond — are separated by the material their
+    // emitter holds and they do not.
+    let twin = first.clone().with_derived_span_id(&[]);
+    assert_eq!(twin.span_id, first.span_id, "content alone merges them");
+    let distinguished = first.clone().with_derived_span_id(&["7"]);
+    assert_ne!(
+        distinguished.span_id, first.span_id,
+        "an emitter that knows they are two says so"
+    );
+    distinguished
+        .validate()
+        .expect("the distinguished id is valid");
+}
+
+/// A span name is refused for surrounding whitespace, not only for being blank.
+///
+/// The convention builds several names by joining an operation to an embedded
+/// class — `{operation} {model}`, `retrieval {data_source}` — and an emitter
+/// with no value to join produced a name differing from the bare operation by
+/// an invisible character. `is_blank` let every one of those through, and
+/// backends group by span name, so it was a silent second class.
+#[test]
+fn a_span_name_with_surrounding_whitespace_is_refused() {
+    let base = AgentOtelSpanExport::from_telemetry_context(
+        "chat",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &telemetry_context(),
+    )
+    .expect("the span builds");
+    base.clone().validate().expect("the bare name is valid");
+
+    for name in ["chat ", " chat", "chat\t"] {
+        let mut span = base.clone();
+        span.name = name.to_string();
+        assert!(
+            span.validate().is_err(),
+            "`{name:?}` must not export as a second span class"
+        );
+    }
+}

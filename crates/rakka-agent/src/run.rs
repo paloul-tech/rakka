@@ -57,7 +57,7 @@
 //! calling it after a transition, after recovery, or from a sweep are the same
 //! operation.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
@@ -108,13 +108,18 @@ use crate::memory::{
 };
 use crate::model::AgentModelError;
 use crate::observability::{
-    record_agent_domain_counter, record_agent_domain_gauge, record_unsettleable_exchanges,
-    AgentDecisionDraft, AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource,
+    record_agent_domain_counter, record_agent_domain_duration, record_agent_domain_gauge,
+    record_agent_domain_histogram, record_unsettleable_exchanges, AgentDecisionDraft,
+    AgentDecisionEvent, AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource,
+    AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink, AgentSegmentTimer,
     METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
-    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_FAN_IN_RESOLUTIONS,
-    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
+    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
+    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION,
     METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WORKFLOW_RESULTS,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_TURN_DURATION,
+    METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND, SEGMENT_ATTR_LOOP_TRANSITIONS,
+    SEGMENT_ATTR_SETTINGS_REVISION,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -6180,6 +6185,7 @@ where
     policies: AgentEffectPolicies,
     memory: Option<AgentRunMemory>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    segments: Option<Arc<dyn AgentSegmentSink>>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
     workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
     metrics: Arc<dyn MetricsRecorder>,
@@ -6227,6 +6233,7 @@ where
             policies: AgentEffectPolicies::default(),
             memory: None,
             decisions: None,
+            segments: None,
             delegation: None,
             workflow_tools: None,
             metrics: Arc::new(NoopMetricsRecorder),
@@ -6273,6 +6280,22 @@ where
     #[must_use]
     pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
         self.decisions = Some(sink);
+        self
+    }
+
+    /// Closes bounded operation segments into `sink`
+    /// ([specification 17.4](../../../docs/plans/rakka-agent/spec.md),
+    /// [17.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A segment is closed when its operation ends and never held open across
+    /// a durable wait, so a passivating run leaves nothing in flight. The sink
+    /// is called synchronously after the transition it describes has already
+    /// committed, and it may neither block nor fail: telemetry is not a
+    /// correctness input, so a sink that cannot keep up must drop and count.
+    /// An unwired store closes nothing.
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn AgentSegmentSink>) -> Self {
+        self.segments = Some(sink);
         self
     }
 
@@ -6353,8 +6376,12 @@ where
     /// Loads the run's durable state, failing closed on an unsupported schema
     /// version.
     pub async fn recover(&mut self, now: AgentTimestampMillis) -> AgentRunResult<&AgentRunState> {
-        let result = self.host.recover(now).await;
-        let outcome = if result.is_ok() {
+        let timer = AgentSegmentTimer::start(now);
+        // The recovered state's borrow is dropped immediately: the telemetry
+        // below needs `&self`, and the reference this method returns is read
+        // back from `state()` once the failure has been decided.
+        let failure = self.host.recover(now).await.err();
+        let outcome = if failure.is_none() {
             "recovered"
         } else {
             "failed"
@@ -6366,9 +6393,31 @@ where
             &[("outcome", outcome)],
         )
         .ok();
-        let state = result?;
+        // Closed before the load's error is propagated, so a failed recovery
+        // is a segment with an error status rather than a segment that never
+        // existed — which is the case an operator most needs to see. The
+        // duration metric reads the segment's own width rather than measuring
+        // twice.
+        let segment = match &failure {
+            None => timer.close(AgentSegmentOperation::RunRecover).ok(),
+            Some(error) => timer
+                .close(AgentSegmentOperation::RunRecover)
+                .failed("rakka.agent.recovery", error.code()),
+        };
+        record_agent_domain_duration(
+            self.metrics.as_ref(),
+            METRIC_AGENT_RECOVERY_DURATION,
+            segment.start,
+            segment.end,
+            &[("outcome", outcome)],
+        )
+        .ok();
+        self.close_segment(segment);
+        if let Some(failure) = failure {
+            return Err(failure.into());
+        }
         self.recovered = true;
-        Ok(state)
+        self.state()
     }
 
     /// Re-reads the durable record unconditionally, without the public
@@ -6417,6 +6466,17 @@ where
         // transition commits before the settle pass, so a resolution can be
         // durable even when the call fails.
         let resolution_before = self.fan_in_resolution();
+        // A resume is a durable wait being discharged, which is exactly a
+        // command arriving at a run whose phase does not advance on its own
+        // ([specification 17.11]: the resume segment links the parked
+        // operation to the request that triggered it, and no span object was
+        // held across the wait in between).
+        let resume_timer = self
+            .state()
+            .ok()
+            .and_then(|state| state.loop_state().map(AgentLoopState::phase))
+            .filter(|phase| phase.is_waiting())
+            .map(|_| AgentSegmentTimer::start(now));
         let reverify = command.clone();
         let reply = match self.apply_command(command, router, now).await {
             // A command that *commits* is fenced by its own compare-and-set:
@@ -6441,6 +6501,20 @@ where
             other => other,
         };
         self.record_fan_in_resolution(resolution_before);
+        // Closed only when the wait actually ended. A command that arrives at
+        // a waiting run and leaves it waiting — a duplicate, a refusal, a
+        // partial fan-in — discharged nothing, and a resume segment for it
+        // would claim a transition that did not happen.
+        if let Some(timer) = resume_timer {
+            let resumed = self
+                .state()
+                .ok()
+                .and_then(|state| state.loop_state().map(AgentLoopState::phase))
+                .is_some_and(|phase| !phase.is_waiting());
+            if resumed {
+                self.close_segment(timer.close(AgentSegmentOperation::RunResume).ok());
+            }
+        }
         reply
     }
 
@@ -6486,12 +6560,23 @@ where
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
                 let outcome_label = outcome.resolved_status().as_label();
+                // Read before the transition, because the resolution may
+                // retire the generation: the timestamps are the effect's own
+                // durable ones, so the durations below are the same figures
+                // whichever worker dispatched it and whatever clock this
+                // process holds.
                 let effect_labels = self.state()?.loop_state().and_then(|loop_state| {
                     loop_state
                         .effects()
                         .iter()
                         .find(|effect| effect.effect_id == effect_id)
-                        .map(|effect| (effect.kind().as_label(), effect.safety.class().as_label()))
+                        .map(|effect| {
+                            (
+                                effect.kind().as_label(),
+                                effect.safety.class().as_label(),
+                                effect.created_at,
+                            )
+                        })
                 });
                 let reply = self
                     .transition(now, move |state| {
@@ -6506,7 +6591,7 @@ where
                 // result answers from the operation log above and never
                 // reaches this arm, so a generation resolves in the metric at
                 // most once.
-                if let Some((effect_kind, safety_class)) = effect_labels {
+                if let Some((effect_kind, safety_class, created_at)) = effect_labels {
                     record_agent_domain_counter(
                         self.metrics.as_ref(),
                         METRIC_AGENT_EFFECT_OUTCOMES,
@@ -6516,6 +6601,18 @@ where
                             ("safety_class", safety_class),
                             ("outcome", outcome_label),
                         ],
+                    )
+                    .ok();
+                    // Measured between the effect's own durable timestamps,
+                    // so a run that passivated, recovered, or moved shard
+                    // while the effect was outstanding reports the same
+                    // figure a resident one would.
+                    record_agent_domain_duration(
+                        self.metrics.as_ref(),
+                        METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
+                        created_at,
+                        now,
+                        &[("effect_kind", effect_kind), ("outcome", outcome_label)],
                     )
                     .ok();
                 }
@@ -7134,6 +7231,15 @@ where
     /// durable wait.
     async fn advance_loop(&mut self, now: AgentTimestampMillis) -> AgentRunResult<usize> {
         let mut transitions = 0;
+        // The resident execution slice: everything this activation advances
+        // before it returns the run to a durable wait. It is the bounded
+        // active invocation of specification 17.4 — a *turn* spans a durable
+        // model round trip and cannot be one live span without holding one
+        // open across passivation, which 17.4 forbids.
+        let invocation = self
+            .segments
+            .is_some()
+            .then(|| AgentSegmentTimer::start(now));
         for _step in 0..AGENT_RUN_MAX_LOOP_STEPS_PER_PASS {
             let can_advance = self.state()?.run().is_some_and(AgentRun::can_advance);
             if !can_advance {
@@ -7150,6 +7256,46 @@ where
                 .state()?
                 .loop_state()
                 .map_or("none", |loop_state| loop_state.phase().as_label());
+            // The turn's measurements are read before the fold, because the
+            // fold consumes the pending turn. The turn's start is the durable
+            // acceptance of the model effect it waited on, so the duration
+            // spans the passivation, recovery, and shard movement a turn may
+            // cross — which a live segment could not.
+            let turn_measurements = (phase == AgentLoopPhase::RecordingTurn.as_label())
+                .then(|| {
+                    self.state().ok().and_then(|state| {
+                        state.loop_state().map(|loop_state| {
+                            let turn = loop_state.turn();
+                            let started_at = loop_state
+                                .effects()
+                                .iter()
+                                .filter(|effect| effect.turn == turn)
+                                .map(|effect| effect.created_at)
+                                .min();
+                            (loop_state.pending_turn().map(|turn| turn.usage), started_at)
+                        })
+                    })
+                })
+                .flatten();
+            // Read before the transition so the segment can name exactly what
+            // *this* transition added: the decisions it committed, and whether
+            // it opened a checkpoint. A post-hoc read alone could not tell a
+            // decision this transition made from one an earlier pass owed.
+            // The mark is a set of *identities*, not a pair of lengths — see
+            // [`segment_marks`].
+            let (marks, settings_revision) = self
+                .state()
+                .ok()
+                .and_then(|state| {
+                    state.loop_state().map(|loop_state| {
+                        (
+                            segment_marks(loop_state),
+                            loop_state.agent_settings_revision(),
+                        )
+                    })
+                })
+                .unwrap_or_else(|| (AgentSegmentMarks::default(), AgentRevisionNumber::INITIAL));
+            let transition_segment = AgentSegmentTimer::start(now);
             let committed = self
                 .host
                 .initiate(now, |state| {
@@ -7184,8 +7330,125 @@ where
                 &[("phase", phase)],
             )
             .ok();
+            // The transition committed, so the decisions it carried are
+            // durable; the segment describes work that actually happened. The
+            // persisted context is what links it to the operation that
+            // scheduled the effect this transition acted on.
+            let (decisions, opened) = self
+                .state()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .loop_state()
+                        .map(|loop_state| segment_additions(loop_state, &marks))
+                })
+                .unwrap_or_default();
+            self.close_segment(
+                transition_segment
+                    .close(AgentSegmentOperation::Decide { phase })
+                    .attribute(
+                        SEGMENT_ATTR_SETTINGS_REVISION,
+                        settings_revision.get().to_string(),
+                    )
+                    .decisions(decisions)
+                    .ok(),
+            );
+            // The checkpoint segment ends after the durable park, which is
+            // this same commit: specification 17.11 requires the opening span
+            // to end once the wait and its notification are accepted, and
+            // forbids holding a span object across the wait itself.
+            for kind in opened {
+                self.close_segment(
+                    AgentSegmentTimer::start(now)
+                        .close(AgentSegmentOperation::CheckpointOpen)
+                        .attribute(SEGMENT_ATTR_CHECKPOINT_KIND, kind)
+                        .ok(),
+                );
+            }
+            if let Some((usage, started_at)) = turn_measurements {
+                if let Some(started_at) = started_at {
+                    record_agent_domain_duration(
+                        self.metrics.as_ref(),
+                        METRIC_AGENT_TURN_DURATION,
+                        started_at,
+                        now,
+                        &[("outcome", "recorded")],
+                    )
+                    .ok();
+                }
+                // Only what the provider reported, and *per direction* rather
+                // than in aggregate. The guard used to be on the total, and the
+                // recording under it unconditional, so a provider reporting only
+                // completion tokens — a streaming adapter, typically — passed it
+                // and then wrote a fabricated `input = 0` on every turn. The
+                // first bucket of `AGENT_COUNT_BUCKETS` starts at 1, so those
+                // zeros land beside genuine one-token prompts and drag every
+                // input percentile toward zero.
+                //
+                // A zero here is not evidence of a zero. `AgentModelUsage`
+                // carries plain counts and documents an unreported dimension as
+                // zero, so at this boundary "the provider said nothing" and "the
+                // provider said none" are the same value. Recording neither is
+                // the honest reading, and it is the one the instrument's own
+                // doc promises.
+                if let Some(usage) = usage {
+                    for (direction, tokens) in [
+                        ("input", usage.input_tokens),
+                        ("output", usage.output_tokens),
+                    ] {
+                        if tokens == 0 {
+                            continue;
+                        }
+                        record_agent_domain_histogram(
+                            self.metrics.as_ref(),
+                            METRIC_AGENT_MODEL_TOKENS,
+                            tokens as f64,
+                            &[("direction", direction)],
+                        )
+                        .ok();
+                    }
+                }
+            }
+        }
+        if let Some(invocation) = invocation {
+            if transitions > 0 {
+                self.close_segment(
+                    invocation
+                        .close(AgentSegmentOperation::InvokeAgent { agent_name: None })
+                        .ok()
+                        .attribute(SEGMENT_ATTR_LOOP_TRANSITIONS, transitions.to_string()),
+                );
+            }
         }
         Ok(transitions)
+    }
+
+    /// Closes one segment into the wired sink, attaching the run's identity
+    /// and the trace context its durable state carries.
+    ///
+    /// Identity is attached here rather than at each call site so no segment
+    /// can be emitted without it, and the trace context comes from the loop
+    /// state — the context the command that activated this run carried — so a
+    /// segment links to the operation that caused it across every passivation
+    /// and shard movement in between.
+    fn close_segment(&self, segment: crate::observability::AgentTelemetrySegment) {
+        let Some(sink) = self.segments.as_ref() else {
+            return;
+        };
+        let telemetry = self
+            .state()
+            .ok()
+            .and_then(|state| {
+                state
+                    .loop_state()
+                    .map(|loop_state| loop_state.telemetry().clone())
+            })
+            .unwrap_or_default();
+        sink.record(
+            &segment
+                .identity(AgentSegmentIdentity::of_run(&self.scope))
+                .telemetry(telemetry),
+        );
     }
 
     /// Commits the workflow-cancel decisions a wind-down or straggler chase
@@ -7448,7 +7711,20 @@ where
                 continue;
             }
             let record = effect.to_workflow_effect(&self.scope);
-            self.effects.dispatch(&self.scope, &record).await?;
+            // The schedule segment ends after durable acceptance into the
+            // outbox, which is what specification 17.6 asks of the producer
+            // row — not after the transition that marked the effect ready,
+            // because `Ready` does not prove the sink write landed.
+            let timer = AgentSegmentTimer::start(now);
+            let dispatched = self.effects.dispatch(&self.scope, &record).await;
+            let segment = timer.close(AgentSegmentOperation::EffectSchedule {
+                effect_kind: effect.kind().as_label(),
+            });
+            self.close_segment(match &dispatched {
+                Ok(()) => segment.ok(),
+                Err(error) => segment.failed("rakka.agent.outbox", error.code()),
+            });
+            dispatched?;
         }
 
         Ok(dispatchable.len())
@@ -7947,6 +8223,15 @@ where
         self
     }
 
+    /// Closes bounded operation segments into `sink`, delegating to the
+    /// wrapped store so a sharded entity closes the same segments a
+    /// directly-driven one does.
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn AgentSegmentSink>) -> Self {
+        self.entity = self.entity.map(|entity| entity.with_segments(sink));
+        self
+    }
+
     /// Wires the hosted run with a session-memory backend
     /// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)),
     /// delegating to the wrapped store so a sharded entity persists session
@@ -8066,6 +8351,7 @@ pub struct AgentRunEntityShardingSettings {
     clock: AgentRunClock,
     metrics: Arc<dyn MetricsRecorder>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    segments: Option<Arc<dyn AgentSegmentSink>>,
     memory: Option<AgentRunMemory>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
     workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
@@ -8097,6 +8383,7 @@ impl AgentRunEntityShardingSettings {
             clock: system_run_clock(),
             metrics: Arc::new(NoopMetricsRecorder),
             decisions: None,
+            segments: None,
             memory: None,
             delegation: None,
             workflow_tools: None,
@@ -8198,6 +8485,20 @@ impl AgentRunEntityShardingSettings {
     #[must_use]
     pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
         self.decisions = Some(sink);
+        self
+    }
+
+    /// Wires every hosted run with a bounded-segment sink
+    /// ([specification 17.4](../../../docs/plans/rakka-agent/spec.md),
+    /// [17.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Absent by default, so an unwired deployment closes no segments. A
+    /// segment is closed after the transition it describes has committed and
+    /// is never held open across a durable wait, so a passivating or moving
+    /// run leaves nothing in flight.
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn AgentSegmentSink>) -> Self {
+        self.segments = Some(sink);
         self
     }
 
@@ -8346,6 +8647,9 @@ where
     if let Some(decisions) = settings.decisions.clone() {
         entity = entity.with_decision_events(decisions);
     }
+    if let Some(segments) = settings.segments.clone() {
+        entity = entity.with_segments(segments);
+    }
     if let Some(memory) = settings.memory.clone() {
         entity = entity.with_memory(memory);
     }
@@ -8412,6 +8716,79 @@ where
 /// would answer it `Duplicate` from the operation log and swallow the fault
 /// the caller must see. Only a domain refusal — a verdict derived from the
 /// record's own fences, which by construction wrote nothing — is re-answered.
+/// What the run had already recorded when a transition began.
+///
+/// Read before the transition so the segment it closes can name exactly what
+/// *this* transition added — a post-hoc read alone cannot tell a decision this
+/// transition made from one an earlier pass owed.
+///
+/// The mark is a set of **identities**, never a pair of lengths, and
+/// [`segment_additions`] is its only reader so the two cannot drift. Neither
+/// collection this marks is append-only. The decision outbox is a ring that
+/// evicts from the front at
+/// [`AGENT_RUN_DECISION_OUTBOX_CAPACITY`](crate::AGENT_RUN_DECISION_OUTBOX_CAPACITY),
+/// and `open_checkpoints` is pruned with `retain` when a checkpoint is dropped
+/// or a turn is cleared. A length captured before and skipped after therefore
+/// reads the wrong suffix the moment either collection shrinks:
+///
+/// - On a saturated outbox — a wired decision sink whose backend is down, so
+///   `flush_decision_events` breaks on its first error and drains nothing —
+///   every later transition evicts one and pushes one, the length never moves,
+///   and the skip yields *nothing*. Every `rakka.agent.decide` span silently
+///   stops carrying its decision events, exactly when they matter most.
+/// - When an evict and a push do not cancel out exactly, the skip yields the
+///   wrong events: decisions an earlier transition made, attributed to this
+///   one.
+/// - When a transition both retires a checkpoint and opens another, the length
+///   is flat and no `CheckpointOpen` segment is closed — and that span carries
+///   `rakka.agent.checkpoint.kind`, the catalogue's only selector for
+///   specification 17.16's checkpoint retention class.
+///
+/// The decision sequence is monotonic per run and consumed even by a dropped
+/// event, and a checkpoint id is stable for the checkpoint's life, so both
+/// marks survive a prune.
+#[derive(Debug, Default, Clone)]
+struct AgentSegmentMarks {
+    /// The highest decision sequence the run had assigned.
+    decision_sequence: u64,
+    /// The checkpoints already open.
+    checkpoints: BTreeSet<HumanCheckpointId>,
+}
+
+/// Reads the marks a transition is measured against.
+fn segment_marks(loop_state: &AgentLoopState) -> AgentSegmentMarks {
+    AgentSegmentMarks {
+        decision_sequence: loop_state.decision_sequence(),
+        checkpoints: loop_state
+            .open_checkpoints()
+            .iter()
+            .map(|checkpoint| checkpoint.checkpoint_id.clone())
+            .collect(),
+    }
+}
+
+/// The decisions a transition committed and the checkpoint kinds it opened,
+/// diffed against [`segment_marks`] by identity.
+fn segment_additions(
+    loop_state: &AgentLoopState,
+    marks: &AgentSegmentMarks,
+) -> (Vec<AgentDecisionEvent>, Vec<&'static str>) {
+    (
+        loop_state
+            .decision_outbox()
+            .iter()
+            .filter(|event| event.sequence > marks.decision_sequence)
+            .cloned()
+            .collect(),
+        loop_state
+            .open_checkpoints()
+            .iter()
+            .filter(|checkpoint| !marks.checkpoints.contains(&checkpoint.checkpoint_id))
+            .map(|checkpoint| checkpoint.kind.as_label())
+            .collect(),
+    )
+}
+
 fn run_refusal_may_be_stale(error: &AgentRunError) -> bool {
     !matches!(
         error,
@@ -8940,6 +9317,192 @@ mod tests {
         AgentAcceptedResult, AgentSchemaId, AgentSchemaRef, AgentTaskContent, AgentTaskDefinition,
     };
     use crate::AgentToolId;
+
+    /// A fixture loop state with nothing recorded on it yet.
+    fn segment_mark_fixture() -> (AgentRunScope, AgentLoopState) {
+        let scope = AgentRunScope::new(
+            TenantId::new("tenant"),
+            AgentId::new("agent").expect("the agent id is valid"),
+            AgentRunId::new("run").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let schema = AgentSchemaRef::new(
+            AgentSchemaId::new("result").expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        );
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("definition").expect("the definition id is valid"),
+            "The segment-mark fixture.",
+            schema.clone(),
+            schema,
+        )
+        .expect("the definition is valid");
+        let budget = AgentRunBudget::allocate(
+            crate::budget::AgentBudgetGrant::from_ceilings(&definition.budgets),
+            AgentTimestampMillis::new(1),
+        );
+        let loop_state = AgentLoopState::started(
+            AgentTaskId::new("task").expect("the task id is valid"),
+            None,
+            AgentRevisionNumber::INITIAL,
+            AgentRevisionNumber::INITIAL,
+            definition.version,
+            budget,
+        );
+        (scope, loop_state)
+    }
+
+    /// A saturated decision outbox must not silence the decide span.
+    ///
+    /// The outbox is a ring, and it saturates exactly when a wired decision
+    /// sink cannot be drained — its backend is down, so `flush_decision_events`
+    /// breaks on the first error and clears nothing. From then on every
+    /// transition evicts one entry and pushes one, so the *length* never moves
+    /// and the prefix-length diff this replaced reported that the transition
+    /// had committed no decisions at all.
+    #[test]
+    fn a_saturated_decision_outbox_still_reports_what_a_transition_added() {
+        let now = AgentTimestampMillis::new(1);
+        let (scope, mut loop_state) = segment_mark_fixture();
+
+        for slot in 0..crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY {
+            assert!(loop_state.record_decision(
+                &scope,
+                AgentDecisionDraft::new(
+                    AgentDecisionKind::Continue,
+                    AgentDecisionSource::DeterministicPolicy,
+                    format!("fill-{slot}"),
+                ),
+                now,
+            ));
+        }
+        let saturated = loop_state.decision_outbox().len();
+        assert_eq!(
+            saturated,
+            crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY,
+            "the ring must be full, or this proves nothing"
+        );
+
+        // The transition under measurement: it commits two decisions.
+        let marks = segment_marks(&loop_state);
+        for slot in ["committed-a", "committed-b"] {
+            assert!(loop_state.record_decision(
+                &scope,
+                AgentDecisionDraft::new(
+                    AgentDecisionKind::CallTools,
+                    AgentDecisionSource::Model,
+                    slot,
+                ),
+                now,
+            ));
+        }
+
+        assert_eq!(
+            loop_state.decision_outbox().len(),
+            saturated,
+            "the ring evicted as it pushed, which is the whole point"
+        );
+        let (decisions, _) = segment_additions(&loop_state, &marks);
+        assert_eq!(
+            decisions.len(),
+            2,
+            "the segment must carry the decisions this transition committed"
+        );
+        assert!(decisions
+            .iter()
+            .all(|event| event.sequence > marks.decision_sequence));
+
+        // The rule this replaced, spelled out: a length captured before and
+        // skipped after finds nothing on a ring that evicts as it pushes.
+        assert_eq!(
+            loop_state.decision_outbox().iter().skip(saturated).count(),
+            0,
+            "a prefix-length diff reports an empty transition here"
+        );
+    }
+
+    /// A transition that retires one checkpoint and opens another must still
+    /// close a `CheckpointOpen` segment.
+    ///
+    /// `open_checkpoints` is pruned with `retain`, so the length is flat across
+    /// such a transition and the prefix-length diff closed no segment — and
+    /// that span carries `rakka.agent.checkpoint.kind`, the only selector
+    /// specification 17.16's checkpoint retention class has.
+    #[test]
+    fn retiring_and_opening_a_checkpoint_in_one_transition_still_names_the_opened_one() {
+        let now = AgentTimestampMillis::new(1);
+        let (scope, mut loop_state) = segment_mark_fixture();
+
+        let context =
+            AgentContextSnapshotRef::for_turn(&scope, loop_state.turn()).expect("the ref derives");
+        let effect = AgentRunEffect::new(
+            &scope,
+            loop_state.turn(),
+            0,
+            AgentRunEffectRequest::Model {
+                context,
+                profile: None,
+            },
+            &AgentEffectSpec::read_only(),
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the effect derives");
+
+        let checkpoint = |id: &str, kind| {
+            crate::checkpoints::AgentCheckpoint::open(
+                HumanCheckpointId::new(id),
+                kind,
+                scope.clone(),
+                &effect,
+                "summary",
+                PrincipalRef {
+                    principal_type: "service".to_string(),
+                    principal_id: "operator".to_string(),
+                    display_name: None,
+                },
+                now,
+            )
+            .expect("the checkpoint opens")
+        };
+
+        loop_state
+            .record_checkpoint(checkpoint(
+                "retired",
+                crate::checkpoints::AgentCheckpointKind::Approval,
+            ))
+            .expect("the first checkpoint records");
+
+        // The transition under measurement: it retires one and opens one.
+        let marks = segment_marks(&loop_state);
+        let held = loop_state.open_checkpoints().len();
+        loop_state.drop_checkpoint(&HumanCheckpointId::new("retired"));
+        loop_state
+            .record_checkpoint(checkpoint(
+                "opened",
+                crate::checkpoints::AgentCheckpointKind::SecurityAuthorization,
+            ))
+            .expect("the second checkpoint records");
+
+        assert_eq!(
+            loop_state.open_checkpoints().len(),
+            held,
+            "the retire and the open cancel out in the length, which is the point"
+        );
+        let (_, opened) = segment_additions(&loop_state, &marks);
+        assert_eq!(
+            opened,
+            vec!["security-authorization"],
+            "the newly opened checkpoint must reach a segment"
+        );
+
+        // The rule this replaced, spelled out.
+        assert_eq!(
+            loop_state.open_checkpoints().iter().skip(held).count(),
+            0,
+            "a prefix-length diff closes no checkpoint segment here"
+        );
+    }
 
     /// A superset of every working set one turn can hold, under maximal
     /// identifiers, must fit the growth reserve.

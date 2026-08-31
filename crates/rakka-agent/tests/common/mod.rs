@@ -827,6 +827,9 @@ pub struct Fixture<
     /// enables it. Absent by default, so the run records no decision events —
     /// the pre-slice-1.13 behavior.
     pub decisions: Option<Arc<dyn rakka_agent::AgentDecisionEventSink>>,
+    /// The bounded-segment sink the run entity is wired with, when a test
+    /// enables it. Absent by default, so the run closes no segments.
+    pub segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
     /// The metrics recorder the run entity is wired with, when a test enables
     /// it. Absent by default, so the run records no metrics.
     pub metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
@@ -943,6 +946,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             clock,
             memory: None,
             decisions: None,
+            segments: None,
             metrics: None,
             delegation: None,
             workflow_tools: None,
@@ -990,6 +994,15 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     ) -> Self {
         self.run_transport.install_decisions(sink.clone());
         self.decisions = Some(sink);
+        self
+    }
+
+    /// Wires the run entity with a bounded-segment sink, under the same
+    /// every-driver rule as [`Self::with_memory`].
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
+        self.run_transport.install_segments(sink.clone());
+        self.segments = Some(sink);
         self
     }
 
@@ -1297,6 +1310,9 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         if let Some(decisions) = &self.decisions {
             entity = entity.with_decision_events(decisions.clone());
         }
+        if let Some(segments) = &self.segments {
+            entity = entity.with_segments(segments.clone());
+        }
         if let Some(metrics) = &self.metrics {
             entity = entity.with_metrics(metrics.clone());
         }
@@ -1571,6 +1587,9 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         }
         if let Some(decisions) = &self.decisions {
             entity = entity.with_decision_events(decisions.clone());
+        }
+        if let Some(segments) = &self.segments {
+            entity = entity.with_segments(segments.clone());
         }
         if let Some(metrics) = &self.metrics {
             entity = entity.with_metrics(metrics.clone());
@@ -2632,6 +2651,17 @@ impl AuthorityFixture {
         self
     }
 
+    /// Wires the run entity with a bounded-segment sink.
+    ///
+    /// The dispatch pipeline takes its own through `pipeline().with_segments`:
+    /// the two are separate wirings because they are separate processes in a
+    /// real deployment, and a test that wires only one is asserting about only
+    /// one.
+    pub fn with_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
+        self.fx = self.fx.with_segments(sink);
+        self
+    }
+
     /// Replaces the envelope the agent is instantiated under.
     pub fn with_envelope(mut self, envelope: AgentAuthorityEnvelope) -> Self {
         self.envelope = envelope;
@@ -2703,6 +2733,9 @@ impl AuthorityFixture {
         .with_effect_policies(self.fx.policies.clone());
         if let Some(config) = &self.fx.workflow_tools {
             delivery = delivery.with_workflow_tools(config.clone());
+        }
+        if let Some(segments) = &self.fx.segments {
+            delivery = delivery.with_segments(segments.clone());
         }
         let mut pipeline = AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new(worker_id),

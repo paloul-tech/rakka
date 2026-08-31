@@ -39,7 +39,7 @@ rakka.http.request.latency_ms -> rakka_http_request_latency_ms
 rakka.remote.failures -> rakka_remote_failures
 ```
 
-Counters are summed by metric name and label set. Gauges export the latest value by metric name and label set. Histograms currently export summary-compatible `_count` and `_sum` series because Rakka's backend-neutral recorder stores raw observations without fixed buckets.
+Counters are summed by metric name and label set. Gauges export the latest value by metric name and label set. Histograms export summary-compatible `_count` and `_sum` series. This is unchanged by the OpenTelemetry bridge's bucket support below: the Prometheus text format's histogram type needs bucket boundaries at scrape time for every series, and the recorder is deliberately backend-neutral, so the summary form remains what a scrape sees.
 
 ## OpenTelemetry Bridge
 
@@ -52,6 +52,19 @@ Counters are summed by metric name and label set. Gauges export the latest value
 - data points with attributes and either scalar values or histogram count/sum.
 
 This deliberately avoids depending on one OpenTelemetry SDK version inside Rakka v1. Applications can map the bridge into their chosen OpenTelemetry SDK, collector, or OTLP exporter.
+
+### Units and histogram buckets
+
+A `MetricsSnapshot` records observations, not instruments: it holds a name, a kind, a value, and attributes, and nothing that could say what unit a value is in or where a distribution's buckets fall. Those facts belong to the domain that declared the instrument.
+
+`export_open_telemetry_metrics_with_instruments` takes that declaration as a borrowed `OpenTelemetryInstrumentView { name, unit, bucket_boundaries }` per metric and, for the metrics it names:
+
+- stamps the UCUM-compatible unit onto `OpenTelemetryMetric::unit`; and
+- buckets each histogram observation against the declared boundaries, emitting `bucket_boundaries` alongside a `bucket_counts` vector one entry longer — the trailing entry is the OTLP `+Inf` overflow bucket.
+
+Both fields are additive and `#[serde(default)]`, so a bridge record produced before they existed still decodes. A metric the catalogue does not name exports exactly as `export_open_telemetry_metrics` exports it — count and sum, no unit — so a partial catalogue degrades a series rather than dropping it. `export_open_telemetry_metrics` is now that call with an empty catalogue, and its output is unchanged.
+
+**Exemplars are not represented in the bridge, by decision.** An exemplar links a retained raw measurement to the trace and span active when it was recorded, and an OpenTelemetry SDK collects them by reading an ambient span from the current context. Rakka has no ambient span context — trace context is passed explicitly as a value through durable records — so `MetricsRecorder::record_histogram` has no trace identity to read, and giving it one would put trace identifiers into a core metrics trait that has deliberately stayed free of them. Exemplars are therefore attached by the application-owned OpenTelemetry SDK at the binary boundary, which is where the semantic conventions place them ("when supported by the application SDK and backend"). This is a recorded mapping, not a silent drop.
 
 Tracing remains based on the `tracing` crate. HTTP and gRPC adapters create request-boundary spans, stream helpers create stream pipeline spans, and remoting emits connection/failure events under `rakka.*` targets. Applications that want OpenTelemetry traces should install a `tracing` subscriber with an OpenTelemetry layer at the binary boundary.
 

@@ -53,7 +53,12 @@ cargo check -p rakka-a2a --no-default-features
 `server`, `sharding`, `postgres`, `http`, `k8s`, `otel`, and `testkit` features,
 exposed through the gated `rakka` facade features `a2a`, `a2a-server`,
 `a2a-sharding`, `a2a-postgres`, `a2a-http`, `a2a-k8s`, `a2a-otel`, and
-`a2a-testkit`.
+`a2a-testkit`. `otel` gates the OpenTelemetry GenAI convention mapping for the
+A2A edge — the ingress `SERVER` span the agent domain's adapter defers to the
+protocol adapter — and activates `rakka-agent/otel`. It deliberately does not
+gate trace-context propagation: extraction on ingress and injection on egress
+are unconditional on every path, because gating them would remove trace
+continuity from a default build.
 
 ## Error Codes
 

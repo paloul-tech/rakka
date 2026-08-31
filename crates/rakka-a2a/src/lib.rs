@@ -41,8 +41,13 @@
 //!   scheduler watermarks, and crate-owned idempotent migrations.
 //! - `http`: route composition with Rakka HTTP observability helpers.
 //! - `k8s`: Kubernetes drain/readiness integration helpers.
-//! - `otel`: trace-context propagation and OpenTelemetry-compatible
-//!   attribute helpers.
+//! - `otel`: the OpenTelemetry GenAI convention mapping for the A2A edge —
+//!   the ingress `SERVER` span the agent domain's adapter defers to the
+//!   protocol adapter, and the attribute helpers that go with it. It activates
+//!   `rakka-agent/otel`. Trace-context propagation is deliberately *not*
+//!   gated: extraction on ingress and injection on egress are unconditional on
+//!   every path, because gating them would remove trace continuity from a
+//!   default build.
 //! - `testkit`: in-memory stores, fixtures, and compatibility probes.
 //! - `agents`: typed Rakka Agent surface over `rakka-agent` entities —
 //!   `AgentTaskId` task identity, durable deduplicated ingress, the
@@ -68,6 +73,9 @@ pub mod dispatch;
 pub mod error;
 pub mod mapping;
 pub mod observability;
+/// The OpenTelemetry GenAI convention mapping for the A2A edge.
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod projection;
 pub mod protocol;
 pub mod push;
