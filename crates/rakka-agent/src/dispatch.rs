@@ -3122,11 +3122,12 @@ where
                 if let Some(profile) = profile {
                     request = request.with_profile(profile);
                 }
+                // No `unwrap_or_default`: an unprofiled deployment has no
+                // model profile, and an empty string is not the name of one.
                 let model_profile = request
                     .profile
                     .as_ref()
-                    .map(|profile| profile.as_str().to_string())
-                    .unwrap_or_default();
+                    .map(|profile| profile.as_str().to_string());
                 let timer = AgentSegmentTimer::start(self.now());
                 let called = self.model.call(&request).await;
                 let segment = timer.close(AgentSegmentOperation::ModelInference { model_profile });

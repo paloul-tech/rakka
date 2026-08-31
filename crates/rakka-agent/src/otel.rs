@@ -87,6 +87,16 @@ pub const ATTR_GEN_AI_CONVERSATION_ID: &str = "gen_ai.conversation.id";
 pub const ATTR_GEN_AI_OPERATION_NAME: &str = "gen_ai.operation.name";
 /// GenAI attribute: the provider name.
 pub const ATTR_GEN_AI_PROVIDER_NAME: &str = "gen_ai.provider.name";
+/// GenAI attribute: the model the request asked for.
+///
+/// Rakka's model adapter contract is provider-neutral, so the value is the
+/// deployment's bounded *model profile* — the name it configured and the run
+/// pinned — never a provider's internal model string, which Rakka does not
+/// see. The convention's span name for a chat span is
+/// `{gen_ai.operation.name} {gen_ai.request.model}`, so a mapping that
+/// produced that name without this attribute named a dimension no query could
+/// group by.
+pub const ATTR_GEN_AI_REQUEST_MODEL: &str = "gen_ai.request.model";
 /// GenAI attribute: the tool name from the bounded registry.
 pub const ATTR_GEN_AI_TOOL_NAME: &str = "gen_ai.tool.name";
 /// GenAI attribute: the tool type from the bounded registry.
@@ -172,6 +182,7 @@ pub const AGENT_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     ATTR_GEN_AI_CONVERSATION_ID,
     ATTR_GEN_AI_OPERATION_NAME,
     ATTR_GEN_AI_PROVIDER_NAME,
+    ATTR_GEN_AI_REQUEST_MODEL,
     ATTR_GEN_AI_TOOL_NAME,
     ATTR_GEN_AI_TOOL_TYPE,
     ATTR_GEN_AI_USAGE_INPUT_TOKENS,
@@ -414,8 +425,16 @@ pub enum AgentGenAiOperation {
     ModelInference {
         /// The well-known GenAI operation name (usually `chat`).
         operation: String,
-        /// The bounded requested model name.
-        model: String,
+        /// The bounded requested model profile, when the deployment configured
+        /// one.
+        ///
+        /// Absent is a normal case, and the *default* one: a deployment that
+        /// names no profile leaves the adapter to its own default. The
+        /// convention's span name is `{operation} {model}`, so an absent model
+        /// makes the name the bare operation — as
+        /// [`Self::InvokeAgent`] already does for an absent agent name —
+        /// rather than the operation followed by a space.
+        model: Option<String>,
     },
     /// Durable acceptance of an effect into the outbox.
     EffectSchedule,
@@ -463,7 +482,10 @@ impl AgentGenAiOperation {
             Self::MemoryOperation => "rakka.agent.memory.operation".to_string(),
             Self::Retrieval { data_source } => format!("retrieval {data_source}"),
             Self::Decide => "rakka.agent.decide".to_string(),
-            Self::ModelInference { operation, model } => format!("{operation} {model}"),
+            Self::ModelInference { operation, model } => match model {
+                Some(model) => format!("{operation} {model}"),
+                None => operation.clone(),
+            },
             Self::EffectSchedule => "rakka.agent.effect.schedule".to_string(),
             Self::EffectDispatch => "rakka.agent.effect.dispatch".to_string(),
             Self::ToolAuthorize => "rakka.agent.tool.authorize".to_string(),
@@ -634,8 +656,15 @@ fn operation_attributes(segment: &AgentTelemetrySegment) -> AgentAttributes {
                 ATTR_GEN_AI_PROVIDER_NAME.to_string(),
                 GEN_AI_PROVIDER_RAKKA_ADAPTER.to_string(),
             );
-            if !model_profile.is_empty() {
-                attributes.insert(ATTR_GEN_AI_AGENT_VERSION.to_string(), model_profile.clone());
+            // The model profile belongs to `gen_ai.request.model`, which is
+            // the key the convention's own span name for a chat span is built
+            // from. It used to be written to `gen_ai.agent.version` — the key
+            // documented as the *agent definition revision*, and the key
+            // `AgentGenAiIdentity` writes that revision to — so one dimension
+            // held two unrelated vocabularies and a dashboard grouping by it
+            // mixed model profiles with agent revisions.
+            if let Some(model_profile) = model_profile {
+                attributes.insert(ATTR_GEN_AI_REQUEST_MODEL.to_string(), model_profile.clone());
             }
         }
         AgentSegmentOperation::ExecuteTool { tool_name } => {
@@ -1104,7 +1133,7 @@ mod tests {
             (
                 AgentGenAiOperation::ModelInference {
                     operation: "chat".to_string(),
-                    model: "gpt-x".to_string(),
+                    model: Some("gpt-x".to_string()),
                 },
                 "chat gpt-x",
                 AgentOtelSpanKind::Client,

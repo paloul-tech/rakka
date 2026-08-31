@@ -1419,8 +1419,16 @@ pub enum AgentSegmentOperation {
     },
     /// A model/provider call executed through the model adapter.
     ModelInference {
-        /// The bounded model profile or requested model class.
-        model_profile: String,
+        /// The bounded model profile the request pinned, when the deployment
+        /// configured one.
+        ///
+        /// `None` is the default configuration, not an error: a deployment
+        /// that names no profile leaves the adapter to its own default. It was
+        /// a `String` filled with `""` by an `unwrap_or_default`, which is how
+        /// the convention span name came out as `"chat "` — a class differing
+        /// from `chat` by an invisible character, which backends group
+        /// separately.
+        model_profile: Option<String>,
     },
     /// Application-level execution of a named tool.
     ExecuteTool {

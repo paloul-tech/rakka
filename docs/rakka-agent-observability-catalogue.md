@@ -234,6 +234,22 @@ A class with no call site is not a silent gap in the suite:
 a real dispatch pipeline, and `tests/otel_span_mapping.rs` maps every class,
 so a row added to the emission is already covered by the mapping proof.
 
+### The model in a span name, and the key it must match
+
+The convention names a chat span `{gen_ai.operation.name} {gen_ai.request.model}`,
+so the name embeds a dimension that must exist as an attribute for a query to
+group by it. `gen_ai.request.model` carries the deployment's bounded model
+profile — Rakka's adapter contract is provider-neutral, so it never sees a
+provider's internal model string. `gen_ai.agent.version` carries the agent
+definition revision and nothing else.
+
+A deployment that configures no profile is the *default* configuration, not an
+error: the span is named `chat`, and no model attribute is written, because
+Rakka has nothing to name. It is emphatically not named `chat ` — a class
+differing from `chat` by an invisible character, which every backend groups
+separately — and `AgentOtelSpanExport::validate` now refuses a name with
+surrounding whitespace so no other joined name can reintroduce the same class.
+
 ### Why the agent's name is not in the span name
 
 `invoke_agent` carries no name. 17.6 forbids a span name to embed an agent

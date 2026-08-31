@@ -948,6 +948,19 @@ impl AgentOtelSpanExport {
                 reason: "required",
             });
         }
+        // A name is refused for surrounding whitespace as well as for being
+        // blank. The convention builds several span names by joining an
+        // operation to an embedded class — `{operation} {model}`,
+        // `retrieval {data_source}` — and an emitter that had no value to join
+        // produced a name differing from the bare operation by an invisible
+        // character. Backends group by span name, so that is a silent second
+        // class, and `is_blank` alone let every one of them through.
+        if self.name.trim() != self.name {
+            return Err(AgentOtlpError::InvalidExporter {
+                field: "span.name",
+                reason: "must not begin or end with whitespace",
+            });
+        }
         if self.end_time.as_millis() < self.start_time.as_millis() {
             return Err(AgentOtlpError::InvalidExporter {
                 field: "span.end_time",

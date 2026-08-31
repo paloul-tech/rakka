@@ -75,7 +75,7 @@ fn every_operation() -> Vec<AgentSegmentOperation> {
             effect_kind: "tool-call",
         },
         AgentSegmentOperation::ModelInference {
-            model_profile: "fast".to_string(),
+            model_profile: Some("fast".to_string()),
         },
         AgentSegmentOperation::ExecuteTool {
             tool_name: "lookup".to_string(),
@@ -154,7 +154,7 @@ fn the_non_internal_rows_carry_the_kinds_the_convention_requires() {
         ),
         (
             AgentSegmentOperation::ModelInference {
-                model_profile: "fast".to_string(),
+                model_profile: Some("fast".to_string()),
             },
             AgentOtelSpanKind::Client,
         ),
@@ -196,7 +196,7 @@ fn the_non_internal_rows_carry_the_kinds_the_convention_requires() {
 fn a_failed_segment_maps_to_an_error_status_with_a_bounded_code() {
     let failed = AgentTelemetrySegment::new(
         AgentSegmentOperation::ModelInference {
-            model_profile: "fast".to_string(),
+            model_profile: Some("fast".to_string()),
         },
         AgentTimestampMillis::new(1),
         AgentTimestampMillis::new(9),
@@ -266,7 +266,7 @@ fn the_genai_attributes_are_written_by_the_mapping() {
     );
 
     let model = segment(AgentSegmentOperation::ModelInference {
-        model_profile: "fast".to_string(),
+        model_profile: Some("fast".to_string()),
     });
     let span = segment_span(&model).expect("the span maps");
     assert_eq!(span.name, "chat fast");
@@ -485,7 +485,7 @@ async fn the_dispatcher_closes_the_model_and_tool_rows() {
     exporter.record(
         &timer
             .close(AgentSegmentOperation::ModelInference {
-                model_profile: "fast".to_string(),
+                model_profile: Some("fast".to_string()),
             })
             .telemetry(traced())
             .ok(),
@@ -661,7 +661,7 @@ async fn decisions_and_usage_reach_the_span_through_their_mappers() {
     // Usage that reports nothing is dropped rather than exported as a zero.
     let empty = AgentTelemetrySegment::new(
         AgentSegmentOperation::ModelInference {
-            model_profile: "fast".to_string(),
+            model_profile: Some("fast".to_string()),
         },
         AgentTimestampMillis::new(1),
         AgentTimestampMillis::new(2),
@@ -676,7 +676,7 @@ async fn decisions_and_usage_reach_the_span_through_their_mappers() {
 
     let reported = AgentTelemetrySegment::new(
         AgentSegmentOperation::ModelInference {
-            model_profile: "fast".to_string(),
+            model_profile: Some("fast".to_string()),
         },
         AgentTimestampMillis::new(1),
         AgentTimestampMillis::new(2),
@@ -1080,4 +1080,92 @@ fn a_usage_direction_with_no_evidence_is_omitted_rather_than_written_as_zero() {
 
     // Cost is on neither surface.
     assert_eq!(one_sided.len(), 1);
+}
+
+/// The model belongs to `gen_ai.request.model`, and the agent revision keeps
+/// `gen_ai.agent.version` to itself.
+///
+/// The mapping wrote the model profile to `gen_ai.agent.version` — the key its
+/// own doc calls "the agent definition revision", and the key
+/// `AgentGenAiIdentity` writes that revision to — so one dimension carried two
+/// unrelated vocabularies and a dashboard grouping by it mixed model profiles
+/// with agent revisions. Meanwhile the convention's span name for a chat span
+/// is `{gen_ai.operation.name} {gen_ai.request.model}` and the mapping produced
+/// exactly that name with no such attribute to match it.
+#[test]
+fn the_model_profile_lands_on_the_request_model_key() {
+    let model = AgentTelemetrySegment::new(
+        AgentSegmentOperation::ModelInference {
+            model_profile: Some("fast".to_string()),
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .identity(AgentSegmentIdentity {
+        agent: Some("support-agent".to_string()),
+        ..AgentSegmentIdentity::default()
+    })
+    .ok();
+    let span = segment_span(&model).expect("the span maps");
+
+    assert_eq!(span.name, "chat fast");
+    assert_eq!(
+        span.attributes
+            .get(rakka_agent::ATTR_GEN_AI_REQUEST_MODEL)
+            .map(String::as_str),
+        Some("fast"),
+        "the name's own dimension must exist as an attribute"
+    );
+    assert!(
+        !span
+            .attributes
+            .contains_key(rakka_agent::ATTR_GEN_AI_AGENT_VERSION),
+        "the agent revision key must not carry a model profile: {:?}",
+        span.attributes
+    );
+    // And the key is exportable: a new attribute the allowlist does not know
+    // would be filtered straight back out.
+    assert!(is_agent_span_attribute(
+        rakka_agent::ATTR_GEN_AI_REQUEST_MODEL
+    ));
+    validate_agent_span_attributes(&span.attributes).expect("every key is allowlisted");
+}
+
+/// An unprofiled deployment — the default configuration — names the bare
+/// operation.
+///
+/// `Option<profile>` was flattened to `""` by an `unwrap_or_default`, so the
+/// span name came out `"chat "`: not blank, so it exported, and different from
+/// `chat` by an invisible trailing character, which backends group separately.
+/// The model attribute was skipped at the same time, so nothing on the span
+/// identified the model either.
+#[test]
+fn an_unprofiled_model_call_names_the_bare_operation() {
+    let unprofiled = AgentTelemetrySegment::new(
+        AgentSegmentOperation::ModelInference {
+            model_profile: None,
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .ok();
+    let span = segment_span(&unprofiled).expect("the span maps");
+
+    assert_eq!(span.name, "chat", "no trailing space, no second class");
+    assert!(
+        !span
+            .attributes
+            .contains_key(rakka_agent::ATTR_GEN_AI_REQUEST_MODEL),
+        "and no model is claimed where none was configured"
+    );
+    assert_eq!(
+        span.attributes
+            .get(ATTR_GEN_AI_OPERATION_NAME)
+            .map(String::as_str),
+        Some("chat"),
+        "the operation is still named"
+    );
+    span.validate().expect("the record is valid");
 }

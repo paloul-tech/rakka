@@ -568,3 +568,31 @@ fn a_populated_record_re_derives_its_id_over_what_distinguishes_it() {
         .validate()
         .expect("the distinguished id is valid");
 }
+
+/// A span name is refused for surrounding whitespace, not only for being blank.
+///
+/// The convention builds several names by joining an operation to an embedded
+/// class — `{operation} {model}`, `retrieval {data_source}` — and an emitter
+/// with no value to join produced a name differing from the bare operation by
+/// an invisible character. `is_blank` let every one of those through, and
+/// backends group by span name, so it was a silent second class.
+#[test]
+fn a_span_name_with_surrounding_whitespace_is_refused() {
+    let base = AgentOtelSpanExport::from_telemetry_context(
+        "chat",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &telemetry_context(),
+    )
+    .expect("the span builds");
+    base.clone().validate().expect("the bare name is valid");
+
+    for name in ["chat ", " chat", "chat\t"] {
+        let mut span = base.clone();
+        span.name = name.to_string();
+        assert!(
+            span.validate().is_err(),
+            "`{name:?}` must not export as a second span class"
+        );
+    }
+}
