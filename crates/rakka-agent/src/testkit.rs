@@ -3003,6 +3003,7 @@ where
     workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
     segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
+    metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -3027,6 +3028,7 @@ where
             workflow_tools: None,
             delegation: None,
             segments: None,
+            metrics: None,
         }
     }
 
@@ -3063,6 +3065,24 @@ where
         self
     }
 
+    /// Wires the entity this delivery drives with a metrics recorder.
+    ///
+    /// The same rule as [`Self::with_segments`], one field over, and it was
+    /// missed: delivering a durable result folds the turn and settles the
+    /// effect, so this driver is where `rakka.agent.turn.duration`,
+    /// `rakka.agent.model.tokens`, `rakka.agent.effect.outcomes`, and
+    /// `rakka.agent.effect.outstanding.duration` are recorded. An unwired
+    /// delivery records **none** of them while the sharded entity beside it
+    /// reports a healthy metric surface — which is exactly how a 17.12 clause
+    /// can read "implemented" and publish nothing. Found by the telemetry
+    /// export walk, whose exported metric set was missing every instrument
+    /// this path owns.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn rakka_core::MetricsRecorder>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Wires the entities this delivery builds to serve delegation — the
     /// delivered model result is where a fan-out turn is intercepted, so an
     /// unwired delivery would refuse the coordination and await verbs the
@@ -3096,6 +3116,9 @@ where
             }
             if let Some(segments) = &self.segments {
                 entity = entity.with_segments(segments.clone());
+            }
+            if let Some(metrics) = &self.metrics {
+                entity = entity.with_metrics(metrics.clone());
             }
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity
