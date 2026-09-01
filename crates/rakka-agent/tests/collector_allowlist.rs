@@ -20,8 +20,10 @@
 
 use std::collections::BTreeSet;
 
-use rakka_agent::otel::{AGENT_LOG_ATTRIBUTE_KEYS, AGENT_SPAN_ATTRIBUTE_KEYS};
-use rakka_agent::AGENT_METRIC_FIELDS;
+use rakka_agent::otel::{
+    AGENT_LOG_ATTRIBUTE_KEYS, AGENT_OTEL_SCOPE_NAME, AGENT_SPAN_ATTRIBUTE_KEYS,
+};
+use rakka_agent::{AGENT_DOMAIN_METRIC_INSTRUMENTS, AGENT_METRIC_FIELDS};
 
 const TOPOLOGY: &str =
     include_str!("../../../docs/plans/rakka-agent/kubernetes-agent-otel-collector-topology.yaml");
@@ -240,57 +242,119 @@ fn no_retention_policy_selects_on_a_key_the_allowlist_strips() {
     }
 }
 
-/// The metric allowlist is conditioned on agent-domain metrics; spans and logs
-/// are not.
+/// Each allowlist rule is conditioned on what it was written for — and the log
+/// rule's *absence* of a condition is as deliberate as the other two.
 ///
 /// A `keep_keys` with no `where` deletes every key it does not name from
-/// **every** datapoint in the pipeline, and this list is the *agent* label
-/// vocabulary. The application's bridge exports the whole `MetricsSnapshot`,
-/// so the unconditioned rule was stripping `state` off `rakka.cluster.members`
-/// and `actor` off `rakka.actor.mailbox.depth` — collapsing each into one
-/// attribute-less last-write-wins series, which is destruction rather than
-/// redaction.
+/// **every** record in the pipeline, and these lists are the *agent*
+/// vocabularies, while the gateway's receiver is a general OTLP listener fed
+/// by a DaemonSet that collects from every pod in the cluster.
 ///
-/// The other two are asserted **unconditioned**, because that is equally
-/// deliberate: the log list is the last guard over `tracing` records whose
-/// fields are arbitrary, and those reach the Collector under a scope named for
-/// their target rather than the pinned one, so any scope condition would
-/// exempt precisely the records that most need filtering.
+/// Metrics condition on the instrument name. The application's bridge exports
+/// the whole `MetricsSnapshot`, so the unconditioned rule was stripping
+/// `state` off `rakka.cluster.members` and `actor` off
+/// `rakka.actor.mailbox.depth` — collapsing each into one attribute-less
+/// last-write-wins series, which is destruction rather than redaction. The
+/// prefix stops at `rakka.agent` with **no trailing dot**: the label list it
+/// guards is the union of the agent domain's and the workflow kernel's
+/// vocabularies, and every workflow instrument is `rakka.agent_workflow.<x>`,
+/// which `^rakka\.agent\.` cannot match — so with the dot, most of the list
+/// was inert and the workflow half had no Collector-side bound at all.
+///
+/// Spans condition on the emitting scope, for that same reason one context
+/// over: `rakka-http`'s `http.request`, `rakka-grpc`'s `grpc.request` and
+/// `rakka-stream`'s `stream.pipeline` carry none of the keys in the span list,
+/// so the unconditioned rule delivered every substrate span stripped of every
+/// attribute it had — kept and unreadable, with nothing reporting the loss.
+/// The adapter stamps the pinned scope on its own batch, so it is available
+/// here as exactly the discriminator the metric rule takes from the name.
+///
+/// Logs stay **unconditioned**, and that one is deliberate: the log rule is
+/// the last guard over `tracing` records whose fields are arbitrary, and those
+/// reach the Collector under a scope named for their target rather than the
+/// pinned one, so any scope condition would exempt precisely the records that
+/// most need filtering.
 #[test]
-fn the_metric_allowlist_applies_only_to_agent_metrics() {
-    let statement = statement_for("metric_statements");
+fn each_allowlist_rule_is_conditioned_on_what_it_was_written_for() {
+    // Read out of the configuration, never restated. A loop asserting that
+    // catalogued names start with a *literal* `"rakka.agent"` is a fact about
+    // the catalogue that holds whatever the YAML says — which is the same
+    // shape of assertion as an allowlist key that no rule can reach.
+    let prefix = metric_condition_prefix();
+    // Both directions, because only the pair is a guarantee. Widening until
+    // every agent instrument matches is trivially satisfied by `^rakka`, which
+    // strips the substrate; narrowing until no substrate matches is trivially
+    // satisfied by the `^rakka\.agent\.` this replaces, which reached no
+    // workflow instrument at all.
+    for instrument in AGENT_DOMAIN_METRIC_INSTRUMENTS {
+        assert!(
+            instrument.name.starts_with(&prefix),
+            "`{}` is a catalogued agent instrument the condition's `{prefix}` \
+             prefix excludes",
+            instrument.name
+        );
+    }
+    for name in AGENT_FAMILY_WITNESSES {
+        assert!(
+            name.starts_with(&prefix),
+            "`{name}` names a family whose labels this list bounds, but whose \
+             datapoints the condition's `{prefix}` prefix never reaches"
+        );
+    }
+    for name in SUBSTRATE_METRIC_FAMILIES {
+        assert!(
+            !name.starts_with(&prefix),
+            "`{name}` is a substrate instrument whose labels the condition's \
+             `{prefix}` prefix would now strip"
+        );
+    }
+
+    let spans = statement_for("trace_statements");
     assert!(
-        statement.contains("where IsMatch(metric.name,"),
-        "the metric keep_keys runs unconditioned, so it deletes the labels of \
-         every non-agent instrument the bridge exports: {statement}"
+        spans.contains(&format!(
+            "where instrumentation_scope.name == \"{AGENT_OTEL_SCOPE_NAME}\""
+        )),
+        "the span keep_keys runs unconditioned, so every `http.request`, \
+         `grpc.request` and `stream.pipeline` span sharing this pipeline is \
+         delivered with no attributes at all: {spans}"
     );
-    for name in AGENT_DOMAIN_METRIC_NAMES {
-        assert!(
-            name.starts_with("rakka.agent."),
-            "`{name}` is a catalogued agent instrument the condition's \
-             `^rakka\\.agent\\.` prefix would exclude"
-        );
-    }
-    for context in ["trace_statements", "log_statements"] {
-        assert!(
-            !statement_for(context).contains(" where "),
-            "`{context}` is conditioned; the span and log vocabularies are \
-             closed sets the adapter writes, and the log rule is the last guard \
-             over `tracing` records that do not carry the pinned scope"
-        );
-    }
+
+    assert!(
+        !statement_for("log_statements").contains(" where "),
+        "the log rule is conditioned, and it must not be: it is the last guard \
+         over `tracing` records, which reach the Collector under a scope named \
+         for their target rather than the pinned one, so a scope condition \
+         exempts precisely the records that most need filtering"
+    );
 }
 
-/// Every catalogued agent-domain instrument name.
-const AGENT_DOMAIN_METRIC_NAMES: &[&str] = &[
-    "rakka.agent.decisions",
-    "rakka.agent.effect.outcomes",
-    "rakka.agent.effect.outstanding.duration",
-    "rakka.agent.model.tokens",
-    "rakka.agent.recovery.duration",
-    "rakka.agent.run.transitions",
-    "rakka.agent.telemetry.export.queue",
-    "rakka.agent.turn.duration",
+/// One real instrument from each family whose labels the metric allowlist
+/// bounds, named by the constant rather than a copy of its value so a rename
+/// fails to compile instead of drifting.
+///
+/// The agent domain is walked in full through [`AGENT_DOMAIN_METRIC_INSTRUMENTS`];
+/// the workflow kernel publishes no equivalent name catalogue — its 28 metric
+/// constants are declared across seven modules — so this is a witness for that
+/// family, not a bijection over it. Building that catalogue is the way to make
+/// it one.
+const AGENT_FAMILY_WITNESSES: &[&str] = &[
+    rakka_agent::METRIC_AGENT_DECISIONS,
+    rakka_agent_workflow::METRIC_AGENT_DISPATCHER_BACKLOG,
+];
+
+/// Substrate families the condition must continue to leave alone.
+///
+/// These are the instruments the unconditioned rule was destroying, and they
+/// are what stops the prefix being widened any further: every one of them
+/// shares `rakka.` with the agent families and must not share `rakka.agent`.
+const SUBSTRATE_METRIC_FAMILIES: &[&str] = &[
+    "rakka.cluster.members",
+    "rakka.actor.mailbox.depth",
+    "rakka.stream.pressure",
+    "rakka.remote.envelopes",
+    "rakka.http.requests",
+    "rakka.grpc.requests",
+    "rakka.sharding.shards",
 ];
 
 /// The pinned convention revision the manifests document is the one the
@@ -375,6 +439,43 @@ fn keep_keys(context: &str) -> BTreeSet<String> {
         .map(|(body, _)| body)
         .unwrap_or_else(|| panic!("`{context}`'s keep_keys is unterminated"));
     quoted(body)
+}
+
+/// The literal name prefix the metric condition selects on.
+///
+/// Read out of the YAML rather than restated in Rust, because a test that
+/// restates the prefix asserts nothing about the file it is guarding: the two
+/// direction assertions in
+/// [`each_allowlist_rule_is_conditioned_on_what_it_was_written_for`] only bind
+/// the configuration if they run against the configured pattern. The condition
+/// is an anchored `IsMatch` whose pattern is a plain escaped-dot literal, and
+/// this refuses anything richer rather than reading a real regex as a prefix
+/// and quietly asserting something weaker than it says.
+fn metric_condition_prefix() -> String {
+    let statement = statement_for("metric_statements");
+    let pattern = statement
+        .split_once("IsMatch(metric.name, \"")
+        .map(|(_, rest)| rest)
+        .expect("the metric statement conditions on the instrument name")
+        .split_once("\")")
+        .map(|(pattern, _)| pattern)
+        .expect("the metric condition's pattern is terminated");
+    let anchored = pattern.strip_prefix('^').unwrap_or_else(|| {
+        panic!(
+            "the metric condition `{pattern}` is not anchored, so it matches a \
+             name anywhere and reading it as a prefix would be wrong"
+        )
+    });
+    // The YAML escapes the backslash, so an OTTL `\.` reaches this file as `\\.`.
+    let literal = anchored.replace("\\\\.", ".");
+    assert!(
+        literal
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_'),
+        "the metric condition `{pattern}` is not a plain anchored prefix, so \
+         reading it as one asserts something weaker than it says"
+    );
+    literal
 }
 
 /// One transform statement, from its `keep_keys(` to the end of its block.

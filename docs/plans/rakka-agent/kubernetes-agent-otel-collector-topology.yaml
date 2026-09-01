@@ -262,23 +262,58 @@ data:
       # `AGENT_LOG_ATTRIBUTE_KEYS`, and the bounded metric label vocabulary —
       # held to the code by `crates/rakka-agent/tests/collector_allowlist.rs`.
       #
-      # **The metric rule is conditioned; the span and log rules are not, and
-      # the asymmetry is the point.** A `keep_keys` with no `where` deletes
-      # every key it does not name from every datapoint in the pipeline, and
-      # the metric list is the *agent* label vocabulary. The application's
-      # bridge exports the whole `MetricsSnapshot`, substrate instruments
-      # included, so the unconditioned rule was deleting `state` from
+      # **Two of the three rules are conditioned and one is not, and each of
+      # the three answers is deliberate.** A `keep_keys` with no `where`
+      # deletes every key it does not name from every record in the pipeline,
+      # and these lists are the *agent* vocabularies — while this gateway's
+      # receiver is a general OTLP listener fed by a DaemonSet that collects
+      # from every pod in the cluster, not an agent-only door.
+      #
+      # Metrics condition on the instrument name. The application's bridge
+      # exports the whole `MetricsSnapshot`, substrate instruments included,
+      # so the unconditioned rule was deleting `state` from
       # `rakka.cluster.members`, `actor` from `rakka.actor.mailbox.depth`,
       # `stream` from `rakka.stream.pressure` and so on — collapsing each into
       # one attribute-less last-write-wins series. That is not redaction; it
       # is silent destruction of a metric this list was never written for.
       #
-      # Spans and logs stay unconditioned deliberately. Their vocabularies are
-      # closed sets the adapter writes, the log list is the last guard over
-      # `tracing` records whose fields are arbitrary, and those records reach
-      # the Collector under a scope named for their target rather than the
-      # pinned one — so conditioning on scope there would exempt exactly the
-      # records that most need the filter.
+      # **The prefix ends at `rakka\.agent` with no trailing dot, and that is
+      # deliberate — do not "correct" it.** The label list below is the union
+      # of the agent domain's `AGENT_METRIC_FIELDS` and the workflow kernel's
+      # `AGENT_WORKFLOW_BOUNDED_METRIC_ATTRIBUTES`, and every workflow
+      # instrument is named `rakka.agent_workflow.<x>`, which `^rakka\.agent\.`
+      # cannot match. With the dot, roughly two dozen of the keys below were
+      # inert: they sat in the allowlist proving nothing while the workflow
+      # half of the surface had no Collector-side bound at all, so a datapoint
+      # stamped `run_id` or `workflow_id` reached the backend untouched and
+      # became an unbounded hot label — while the validation matrix recorded
+      # 17.14 defence-in-depth as met. No substrate family begins `rakka.agent`
+      # (`rakka.cluster`, `rakka.actor`, `rakka.stream`, `rakka.remote`,
+      # `rakka.http`, `rakka.grpc`, `rakka.sharding`, …), so dropping the dot
+      # widens the rule to exactly the two agent families and nothing else.
+      # `collector_allowlist.rs` asserts both directions: every catalogued
+      # agent instrument matches, and no substrate family does.
+      #
+      # Spans condition on the emitting scope, for the same reason one context
+      # over. `rakka-http` writes `http.request` spans carrying `method` and
+      # `route`, `rakka-grpc` writes `grpc.request` carrying `service` and
+      # `rpc_kind`, `rakka-stream` writes `stream.pipeline` — none of those
+      # keys is in the list below, so the unconditioned rule delivered every
+      # substrate span stripped of every attribute it had: kept, and
+      # unreadable, with nothing anywhere reporting the loss. The agent
+      # adapter stamps `agent_instrumentation_scope()` on its own batch, so
+      # `rakka.agent` is a fact about the emitter that a substrate span does
+      # not carry — which is exactly the discriminator the metric rule gets
+      # from the instrument name.
+      #
+      # Logs stay unconditioned, and that is not the same oversight left
+      # standing. The log rule is the last guard over bridged `tracing`
+      # records, whose fields are arbitrary — and those records reach the
+      # Collector under a scope named for their *target* (`rakka_agent`,
+      # `rakka_http`) rather than the pinned one. A scope condition here would
+      # exempt precisely the records that most need the filter, so the rule's
+      # cost is paid deliberately: a `tracing` field this list does not name
+      # is dropped.
       transform/allowlist:
         error_mode: ignore
         trace_statements:
@@ -296,6 +331,7 @@ data:
                   "rakka.agent.loop.phase", "rakka.agent.loop.transitions",
                   "rakka.agent.memory.tier", "rakka.agent.settings_revision",
                   "rakka.agent.task.id", "rakka.agent.turn.index", "rakka.error.code"])
+                where instrumentation_scope.name == "rakka.agent"
         log_statements:
           - context: log
             statements:
@@ -324,7 +360,7 @@ data:
                   "queue", "redaction", "retry_attempt_bucket", "safety_class", "signal",
                   "state_schema_version", "status", "step_kind", "target_class", "tenant_tier",
                   "timer_status", "transition", "trigger", "trigger_kind", "workflow_type"])
-                where IsMatch(metric.name, "^rakka\\.agent\\.")
+                where IsMatch(metric.name, "^rakka\\.agent")
       # All eight retention classes of specification 17.16, each selecting on
       # an attribute a mapping function actually writes. Every policy below is
       # a `string_attribute` or a `status_code`/`latency` policy and never a
