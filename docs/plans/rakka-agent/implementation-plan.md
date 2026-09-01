@@ -4762,6 +4762,93 @@ telemetry claims are enforced, which are delegated to the deployment, and
 which remain inferred — the third companion to the fault-injection and
 security matrices.
 
+**Landed.** Five decisions, and three defects that only a real SDK, a real
+socket, and a real Collector could have found.
+
+- **The SDK pin is decided by an API boundary, not by recency.** `opentelemetry`
+  0.29 is both the highest release on the workspace's `tonic 0.12` / `prost
+  0.13` generation *and* the last one whose `metrics::data` types an
+  application can construct — 0.30 sealed `ResourceMetrics`, `Histogram`, and
+  `HistogramDataPoint`. That second constraint is the load-bearing one: Rakka
+  arrives at the boundary with metrics **already aggregated**, carrying the
+  catalogue's declared units and bucket boundaries, and 0.29 is the last
+  generation that can accept them as they are. On 0.30 or later the only path
+  is re-recording every measurement through the `Meter` API and re-declaring
+  the buckets in the binary, which makes the catalogue advisory and
+  [17.17](spec.md#1717-otlp-and-collector-boundary)'s "MUST NOT silently drop
+  the field" hard to keep. Recorded as a design change rather than a version
+  bump.
+- **The receiver is in-process, so the wire claim is never gate-only.** The
+  export walk stands up a real gRPC server speaking the generated OTLP service
+  definitions on an ephemeral port and asserts on the **decoded protobuf** it
+  was handed. Asserting on the batch the mapping built would have proven the
+  mapping and nothing about the export — a serialization OTLP rejects, a signal
+  wired to the wrong service, a unit dropped in translation would all have
+  passed. A live-Collector arm exists and is gated; it is not what the claim
+  rests on.
+- **Exemplars are declared, not inferred.** 6.3a recorded them as owed to this
+  boundary because `MetricsRecorder` has no trace identity to read — trace
+  context here is an explicit value on a durable record, never an ambient one.
+  A closed `AgentTelemetrySegment` is the one value carrying a measurement's
+  operation *and* its trace and span ids, so a bounded reservoir fed by the
+  segment sink fills `HistogramDataPoint.exemplars`, and `EXEMPLAR_SOURCES`
+  names which segment class supplies which histogram. A representative link is
+  what an exemplar is; that it is not a per-measurement one is recorded rather
+  than implied.
+- **The allowlist is checked against the code, in the crate that has it.** The
+  Kubernetes shape is contract-tested in `rakka-k8s` and the allowlist in
+  `rakka-agent`, because `rakka-k8s` sits below it in the DAG and can only
+  compare a list of strings to a copy of itself. That is the failure this entry
+  warned about — configuration that passes its own string-matching tests and
+  drops everything in production — and a same-crate test would have been
+  precisely it. The retention selectors are checked the same way, in both
+  directions: a policy key no mapping function writes fails, and so does a key
+  the allowlist strips before the sampler runs.
+- **A gated arm runs the pinned distribution's own `validate`.** `kubectl`
+  validates Kubernetes objects and knows nothing about a ConfigMap's contents;
+  a string assertion knows only that a word appears. This arm found two of the
+  three defects below within a minute of first running.
+
+The three defects, each with the falsification that keeps its test honest:
+
+- **`InProcessRunResultDelivery` recorded no metrics.** It threaded a segment
+  sink and no `MetricsRecorder`, so `turn.duration`, `model.tokens`,
+  `effect.outcomes`, and `effect.outstanding.duration` were recorded by
+  **nobody** on the delivery path while the sharded entity beside it reported a
+  healthy surface. This is the "every driver of a run must share one wiring"
+  rule the segment sink states, one field over and unnoticed. Found because the
+  export walk's exported metric set was missing exactly the instruments that
+  path owns — four metrics where seven were expected.
+- **`container.name` is not a `k8sattributes` field** at a current
+  distribution. The metadata list was inherited from the workflow topology,
+  which pins a 2024 build; the Collector refuses to start on it. This is what
+  the 0.107.0-against-1.36.0 spread looks like in practice, and it is why the
+  agent topology took a current pin while the workflow one's stays where its
+  own plan put it.
+- **`loadbalancing` refuses `routing_key: traceID` for metrics.** Wiring the
+  metrics pipeline to the exporter traces need produces a Collector that fails
+  at startup — and a string assertion for `loadbalancing` calls it correct. The
+  metrics pipeline has its own `otlp/gateway` exporter; traces and logs keep
+  the trace-id router, over a **headless** service, because a `ClusterIP` there
+  would spread one trace's spans across gateway replicas and each would sample
+  a partial trace with nothing failing.
+
+Two things are recorded as inferred rather than claimed, in
+`docs/rakka-agent-telemetry-validation-matrix.md`: tail sampling is contract-
+tested and distribution-validated as configuration but is not exercised against
+a running two-replica gateway, and **an agent trace can outlive its own
+sampling decision** — a run parked on a human approval resumes long after
+`decision_wait`, and the segments it closes then are governed by a decision
+taken without them. That is inherent to tail sampling, and it is why the
+retention classes select on attributes that appear early in a trace wherever
+they can.
+
+Owed onward and named rather than left silent: 13 of the 24 segment classes
+still have no production call site, and `AgentSegmentIdentity::of_task` has no
+caller at all — so `rakka.agent.task.id`, `.goal.id`, and `.delegation.id` are
+allowlisted at both layers and written by nothing, which is 6.3a's own defect
+class still open for three attributes.
+
 ### Slice 6.4 — Documentation and compatibility
 
 Spec: [20](spec.md#20-compatibility-and-migration).

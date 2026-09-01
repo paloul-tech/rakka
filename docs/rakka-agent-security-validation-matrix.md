@@ -11,7 +11,9 @@ demonstrated.
 
 The companion documents are
 [`rakka-agent-fault-injection-matrix.md`](rakka-agent-fault-injection-matrix.md),
-whose closing section named this validation as still owed, and
+whose closing section named this validation as still owed,
+[`rakka-agent-telemetry-validation-matrix.md`](rakka-agent-telemetry-validation-matrix.md),
+which does the same for the telemetry claims, and
 [`rakka-v1-security-operational-defaults.md`](rakka-v1-security-operational-defaults.md),
 which states the framework-versus-operator split for the substrate.
 
