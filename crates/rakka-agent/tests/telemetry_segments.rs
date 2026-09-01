@@ -466,3 +466,63 @@ fn the_in_memory_sink_is_bounded_and_counts_what_it_drops() {
     assert_eq!(degenerate.segments().len(), 1);
     assert_eq!(degenerate.dropped(), 0);
 }
+
+/// A bounded sink's loss is published, and published as a **diff**.
+///
+/// [17.12](../../../docs/plans/rakka-agent/spec.md) asks for telemetry export
+/// queue and drops, and before slice 6.3b the only recording site in the crate
+/// was the durable decision sink's refusal — a segment sink dropped in total
+/// silence. Both halves are asserted here because both can fail
+/// independently: a sink that publishes nothing reports a healthy pipeline
+/// while losing spans, and a sink that publishes its *cumulative* counter into
+/// an adding counter reports the triangular sum of its loss instead of the
+/// loss. The second is the reason `AgentSegmentSinkHealth` holds state at all.
+#[test]
+fn a_bounded_sink_publishes_its_loss_once_per_drop() {
+    let metrics = Arc::new(rakka_core::InMemoryMetricsRecorder::new());
+    let sink = InMemoryAgentSegmentSink::with_capacity(1).with_metrics(metrics.clone());
+
+    let segment = |at: u64| {
+        rakka_agent::AgentTelemetrySegment::new(
+            AgentSegmentOperation::Decide { phase: "propose" },
+            rakka_agent_workflow::AgentTimestampMillis::new(at),
+            rakka_agent_workflow::AgentTimestampMillis::new(at + 1),
+        )
+        .ok()
+    };
+
+    // The first fills the ring; the next three each evict one.
+    for at in 0..4 {
+        sink.record(&segment(at));
+    }
+    assert_eq!(sink.dropped(), 3, "capacity 1 evicts three of four");
+
+    let snapshot = metrics.snapshot();
+    let queue = snapshot.observations_named(rakka_agent::METRIC_AGENT_TELEMETRY_EXPORT_QUEUE);
+    assert!(
+        !queue.is_empty(),
+        "the queue depth is published, so a drop is not the first an operator hears of it"
+    );
+    let drops: f64 = snapshot
+        .observations_named(rakka_agent::METRIC_AGENT_TELEMETRY_EXPORT_DROPS)
+        .iter()
+        .map(|observation| observation.value())
+        .sum();
+    assert!(
+        (drops - 3.0).abs() < f64::EPSILON,
+        "three evictions must total three, not the cumulative sum of a growing counter; saw {drops}"
+    );
+
+    // One more eviction adds exactly one, not another whole history.
+    sink.record(&segment(9));
+    let drops: f64 = metrics
+        .snapshot()
+        .observations_named(rakka_agent::METRIC_AGENT_TELEMETRY_EXPORT_DROPS)
+        .iter()
+        .map(|observation| observation.value())
+        .sum();
+    assert!(
+        (drops - 4.0).abs() < f64::EPSILON,
+        "a fourth eviction adds one; saw {drops}"
+    );
+}

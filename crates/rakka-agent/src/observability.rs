@@ -19,7 +19,7 @@ use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rakka_agent_workflow::{
     validate_agent_span_link, validate_agent_telemetry_context, AgentAttributes, AgentCausationId,
@@ -749,6 +749,48 @@ pub const METRIC_AGENT_DECISION_DROPS: &str = "rakka.agent.decision.drops";
 /// Counter: telemetry flush attempts a sink refused, labeled by signal.
 pub const METRIC_AGENT_TELEMETRY_FLUSH_FAILURES: &str = "rakka.agent.telemetry.flush.failures";
 
+/// Gauge: records a bounded telemetry sink is holding, awaiting export.
+///
+/// The export-path half of the loss visibility
+/// [17.12](../../../docs/plans/rakka-agent/spec.md) asks for. A sink that must
+/// drop rather than block ([`AgentSegmentSink`]) makes queue depth the leading
+/// indicator and the drop counter the lagging one, so both are published, and
+/// both are labeled by the sink's own [`AgentSegmentSink::backend_name`] so a
+/// deployment running more than one can tell them apart.
+pub const METRIC_AGENT_TELEMETRY_EXPORT_QUEUE: &str = "rakka.agent.telemetry.export.queue";
+
+/// Counter: records a bounded telemetry sink dropped at capacity.
+///
+/// Distinct from [`METRIC_AGENT_TELEMETRY_EXPORT_UNMAPPABLE`] on purpose: this
+/// one says the pipeline is behind, that one says a record could never have
+/// been sent. An operator's response to them is not the same.
+pub const METRIC_AGENT_TELEMETRY_EXPORT_DROPS: &str = "rakka.agent.telemetry.export.drops";
+
+/// Counter: records a telemetry sink refused because they could not be mapped.
+///
+/// A record that fails its convention mapping or its export validation never
+/// enters the buffer, so it is neither queued nor dropped — and without its
+/// own counter it would leave no trace at all.
+pub const METRIC_AGENT_TELEMETRY_EXPORT_UNMAPPABLE: &str =
+    "rakka.agent.telemetry.export.unmappable";
+
+/// The `signal` label values **this crate** writes onto
+/// [`METRIC_AGENT_TELEMETRY_FLUSH_FAILURES`] and the export instruments above.
+///
+/// Bounded and enumerated because 17.12 requires labels to be bounded *and*
+/// documented, and because a free-form signal name is how a bounded label
+/// becomes an unbounded one. `decision-events` is the durable decision sink's
+/// refusal; `spans` is a bounded segment sink's buffer.
+///
+/// Deliberately **not** a union with the application boundary's signals. The
+/// OTLP exporter lives in the deploying binary
+/// ([17.17](../../../docs/plans/rakka-agent/spec.md)), so its per-signal
+/// values are its own to declare and its own to hold to a bijection — the same
+/// separation `rakka_a2a::agents::A2A_INGRESS_ERROR_TYPE` keeps from
+/// [`AGENT_SEGMENT_ERROR_TYPES`], and for the same reason: a vocabulary this
+/// crate lists but never writes is a promise nothing keeps.
+pub const AGENT_TELEMETRY_SIGNALS: &[&str] = &["decision-events", "spans"];
+
 /// Counter: private-memory retrievals run by snapshot assembly, labeled by
 /// bounded backend name and outcome (`retrieved` / `degraded` / `skipped`)
 /// ([specification 17.10](../../../docs/plans/rakka-agent/spec.md)).
@@ -1220,6 +1262,30 @@ pub const AGENT_DOMAIN_METRIC_INSTRUMENTS: &[AgentDomainMetricInstrument] = &[
         &["signal"],
         &[],
         "Telemetry flush attempts a sink refused, by signal.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_TELEMETRY_EXPORT_QUEUE,
+        MetricKind::Gauge,
+        "{record}",
+        &["backend", "signal"],
+        &[],
+        "Records a bounded telemetry sink is holding, awaiting export.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_TELEMETRY_EXPORT_DROPS,
+        MetricKind::Counter,
+        "{record}",
+        &["backend", "signal"],
+        &[],
+        "Records a bounded telemetry sink dropped at capacity.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_TELEMETRY_EXPORT_UNMAPPABLE,
+        MetricKind::Counter,
+        "{record}",
+        &["backend"],
+        &[],
+        "Records a telemetry sink refused as unmappable.",
     ),
     AgentDomainMetricInstrument::new(
         METRIC_AGENT_MEMORY_RETRIEVALS,
@@ -1897,11 +1963,32 @@ pub const DEFAULT_AGENT_SEGMENT_SINK_CAPACITY: usize = 1024;
 ///
 /// It is a ring: at capacity the oldest segment is dropped and counted, the
 /// same rule and the same direction as the exporter's buffer.
-#[derive(Debug)]
 pub struct InMemoryAgentSegmentSink {
     segments: Mutex<VecDeque<AgentTelemetrySegment>>,
     capacity: usize,
     dropped: AtomicU64,
+    metrics: Option<Arc<dyn MetricsRecorder>>,
+    health: AgentSegmentSinkHealth,
+}
+
+impl fmt::Debug for InMemoryAgentSegmentSink {
+    /// Hand-written because a `MetricsRecorder` is a caller-supplied trait
+    /// object with no `Debug` bound, and adding one to the substrate's
+    /// recorder trait to satisfy a test helper would be the tail wagging the
+    /// dog. Prints what a reader of a sink actually wants: how much it holds
+    /// and how much it lost.
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InMemoryAgentSegmentSink")
+            .field(
+                "retained",
+                &self.segments.lock().map(|segments| segments.len()).ok(),
+            )
+            .field("capacity", &self.capacity)
+            .field("dropped", &self.dropped())
+            .field("metrics", &self.metrics.is_some())
+            .finish()
+    }
 }
 
 impl Default for InMemoryAgentSegmentSink {
@@ -1928,7 +2015,23 @@ impl InMemoryAgentSegmentSink {
             segments: Mutex::new(VecDeque::new()),
             capacity: capacity.max(1),
             dropped: AtomicU64::new(0),
+            metrics: None,
+            health: AgentSegmentSinkHealth::new(),
         }
+    }
+
+    /// Publishes this sink's export health to `metrics`.
+    ///
+    /// Publication happens **only when the ring actually drops**, plus the
+    /// queue gauge at that moment. A sink has no flush point of its own, and
+    /// publishing on every `record` would put three metric writes on the path
+    /// of every loop transition, dispatch attempt, model call, and A2A
+    /// request — for a number that does not change. The event worth seeing is
+    /// the drop.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Every segment retained, in the order they ended.
@@ -1962,6 +2065,24 @@ impl InMemoryAgentSegmentSink {
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::SeqCst)
     }
+
+    /// Publishes queue depth and the drop diff, when a recorder is wired.
+    ///
+    /// Called with the sink's lock already released: a metrics recorder is a
+    /// caller-supplied trait object, and holding a telemetry lock across one
+    /// is how a telemetry sink becomes a correctness input.
+    fn publish_health(&self, queued: usize) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        self.health.publish(
+            metrics.as_ref(),
+            self.backend_name(),
+            queued,
+            self.dropped(),
+            0,
+        );
+    }
 }
 
 impl AgentSegmentSink for InMemoryAgentSegmentSink {
@@ -1972,13 +2093,99 @@ impl AgentSegmentSink for InMemoryAgentSegmentSink {
     fn record(&self, segment: &AgentTelemetrySegment) {
         let Ok(mut segments) = self.segments.lock() else {
             self.dropped.fetch_add(1, Ordering::SeqCst);
+            self.publish_health(0);
             return;
         };
+        let mut lost = false;
         while segments.len() >= self.capacity {
             segments.pop_front();
             self.dropped.fetch_add(1, Ordering::SeqCst);
+            lost = true;
         }
         segments.push_back(segment.clone());
+        let queued = segments.len();
+        drop(segments);
+        if lost {
+            self.publish_health(queued);
+        }
+    }
+}
+
+/// Publishes one bounded telemetry sink's export health.
+///
+/// [17.12](../../../docs/plans/rakka-agent/spec.md) asks for telemetry export
+/// queue, drops, and failures, and until this slice the only recording site in
+/// the crate was the durable decision sink's refusal. A segment sink drops
+/// rather than blocks — that is the rule [`AgentSegmentSink`] states — so the
+/// loss it takes is invisible unless something publishes it.
+///
+/// **Counters are published as diffs, and that is the whole reason this is a
+/// type rather than a function.** A sink's own `dropped()` / `unmappable()`
+/// counters are cumulative, and `MetricsRecorder::increment_counter` *adds*,
+/// so handing it the cumulative value on every publish would report the
+/// triangular sum of the loss instead of the loss. This holds the last
+/// published value and increments by the difference — the same rule
+/// `advance_loop` follows for segment additions, and for the same reason: what
+/// a periodic reader owes a counter is what changed, not what stands.
+#[derive(Debug, Default)]
+pub struct AgentSegmentSinkHealth {
+    published_drops: AtomicU64,
+    published_unmappable: AtomicU64,
+}
+
+impl AgentSegmentSinkHealth {
+    /// Creates a publisher that has published nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publishes queue depth as a gauge and the two loss counters as diffs.
+    ///
+    /// The `signal` label is written here as the literal `"spans"` rather than
+    /// taken as a parameter. A segment sink has exactly one signal, so a
+    /// parameter would have been speculative generality — and it would have
+    /// put the value somewhere no bijection scan could pair it with its key,
+    /// which is how a bounded label vocabulary quietly stops being bounded.
+    /// The application boundary's per-signal values are its own
+    /// ([`AGENT_TELEMETRY_SIGNALS`]).
+    pub fn publish(
+        &self,
+        metrics: &dyn MetricsRecorder,
+        backend: &'static str,
+        queued: usize,
+        dropped: u64,
+        unmappable: u64,
+    ) {
+        record_agent_domain_gauge(
+            metrics,
+            METRIC_AGENT_TELEMETRY_EXPORT_QUEUE,
+            queued as f64,
+            &[("backend", backend), ("signal", "spans")],
+        )
+        .ok();
+        let new_drops =
+            dropped.saturating_sub(self.published_drops.swap(dropped, Ordering::SeqCst));
+        if new_drops > 0 {
+            record_agent_domain_counter(
+                metrics,
+                METRIC_AGENT_TELEMETRY_EXPORT_DROPS,
+                new_drops,
+                &[("backend", backend), ("signal", "spans")],
+            )
+            .ok();
+        }
+        let new_unmappable =
+            unmappable.saturating_sub(self.published_unmappable.swap(unmappable, Ordering::SeqCst));
+        if new_unmappable > 0 {
+            record_agent_domain_counter(
+                metrics,
+                METRIC_AGENT_TELEMETRY_EXPORT_UNMAPPABLE,
+                new_unmappable,
+                &[("backend", backend)],
+            )
+            .ok();
+        }
     }
 }
 

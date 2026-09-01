@@ -31,8 +31,9 @@
 //! ([specification 17.3](../../../docs/plans/rakka-agent/spec.md)).
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rakka_agent_workflow::{
     bounded_export_attributes, AgentAttributes, AgentLogEvent, AgentOtelInstrumentationScope,
@@ -40,12 +41,12 @@ use rakka_agent_workflow::{
     AgentOtelSpanStatus, AgentOtlpBridgeExport, AgentOtlpExporterConfig, AgentOtlpResult,
     AgentTelemetryContext, AgentTimestampMillis, AGENT_EXPORT_MAX_ATTRIBUTES,
 };
-use rakka_core::MetricsSnapshot;
+use rakka_core::{MetricsRecorder, MetricsSnapshot};
 
 use crate::model::AgentModelUsage;
 use crate::observability::{
     AgentDecisionEvent, AgentSegmentOperation, AgentSegmentOutcome, AgentSegmentSink,
-    AgentTelemetrySegment,
+    AgentSegmentSinkHealth, AgentTelemetrySegment,
 };
 
 /// The single source of the pinned revision literal, so the bare revision
@@ -928,13 +929,31 @@ pub const DEFAULT_AGENT_SPAN_BUFFER_CAPACITY: usize = 512;
 /// The exporter owns no OTLP transport, no credentials, and no SDK: it
 /// produces the serializable bridge record and the application boundary sends
 /// it ([17.17](../../../docs/plans/rakka-agent/spec.md)).
-#[derive(Debug)]
 pub struct AgentGenAiSpanExporter {
     spans: Mutex<VecDeque<AgentOtelSpanExport>>,
     capacity: usize,
     dropped: AtomicU64,
     unmappable: AtomicU64,
     emitted: AtomicU64,
+    metrics: Option<Arc<dyn MetricsRecorder>>,
+    health: AgentSegmentSinkHealth,
+}
+
+impl fmt::Debug for AgentGenAiSpanExporter {
+    /// Hand-written for the same reason
+    /// [`crate::observability::InMemoryAgentSegmentSink`]'s is: a
+    /// `MetricsRecorder` is a caller-supplied trait object with no `Debug`
+    /// bound.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentGenAiSpanExporter")
+            .field("buffered", &self.buffered())
+            .field("capacity", &self.capacity)
+            .field("dropped", &self.dropped())
+            .field("unmappable", &self.unmappable())
+            .field("metrics", &self.metrics.is_some())
+            .finish()
+    }
 }
 
 impl Default for AgentGenAiSpanExporter {
@@ -962,7 +981,22 @@ impl AgentGenAiSpanExporter {
             dropped: AtomicU64::new(0),
             unmappable: AtomicU64::new(0),
             emitted: AtomicU64::new(0),
+            metrics: None,
+            health: AgentSegmentSinkHealth::new(),
         }
+    }
+
+    /// Publishes this exporter's buffer depth and loss to `metrics`.
+    ///
+    /// Publication happens on [`Self::bridge_export`] — the exporter's one
+    /// natural periodic point — rather than on `record`, so the three metric
+    /// writes ride the flush and not every closed segment. That also makes the
+    /// gauge read the depth the flush is about to clear, which is the number
+    /// an operator sizing a buffer wants.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// How many mapped spans are waiting to be exported.
@@ -1015,6 +1049,15 @@ impl AgentGenAiSpanExporter {
         metrics: &MetricsSnapshot,
         logs: Vec<AgentLogEvent>,
     ) -> AgentOtlpResult<AgentOtlpBridgeExport> {
+        if let Some(metrics) = self.metrics.as_ref() {
+            self.health.publish(
+                metrics.as_ref(),
+                self.backend_name(),
+                self.buffered(),
+                self.dropped(),
+                self.unmappable(),
+            );
+        }
         let instruments = crate::observability::agent_domain_instrument_views();
         // Logs pass the allowlist here rather than at their emitter, because
         // this is the boundary they leave Rakka at and a caller may hand in
