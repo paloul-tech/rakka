@@ -2022,12 +2022,17 @@ impl InMemoryAgentSegmentSink {
 
     /// Publishes this sink's export health to `metrics`.
     ///
-    /// Publication happens **only when the ring actually drops**, plus the
-    /// queue gauge at that moment. A sink has no flush point of its own, and
-    /// publishing on every `record` would put three metric writes on the path
-    /// of every loop transition, dispatch attempt, model call, and A2A
-    /// request — for a number that does not change. The event worth seeing is
-    /// the drop.
+    /// **What each signal costs, and why the gauge is not the leading
+    /// indicator here.** A sink has no flush point of its own, so `record` is
+    /// the only place publication can happen. The queue gauge is written only
+    /// when the depth *changes*: it traces the ring filling and then goes
+    /// quiet, because a ring that evicts rather than blocks sits at exactly
+    /// `capacity` from its first eviction onward. Publishing it only on a drop
+    /// — which is what this did — meant it was only ever observed at that one
+    /// constant, and could never show a sink filling up. The **drop counter**
+    /// is the leading indicator, and its write is not avoidable: on a
+    /// saturated ring every record evicts one, and each eviction is a distinct
+    /// loss that a sampled counter would under-report.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
         self.metrics = Some(metrics);
@@ -2071,7 +2076,7 @@ impl InMemoryAgentSegmentSink {
     /// Called with the sink's lock already released: a metrics recorder is a
     /// caller-supplied trait object, and holding a telemetry lock across one
     /// is how a telemetry sink becomes a correctness input.
-    fn publish_health(&self, queued: usize) {
+    fn publish_health(&self, queued: Option<usize>) {
         let Some(metrics) = self.metrics.as_ref() else {
             return;
         };
@@ -2093,21 +2098,23 @@ impl AgentSegmentSink for InMemoryAgentSegmentSink {
     fn record(&self, segment: &AgentTelemetrySegment) {
         let Ok(mut segments) = self.segments.lock() else {
             self.dropped.fetch_add(1, Ordering::SeqCst);
-            self.publish_health(0);
+            // No depth, rather than a depth of zero. Poisoning is sticky, so
+            // this sink will now drop every record it is handed for the life
+            // of the process — and `0` is the one reading that would have an
+            // operator see a drained, healthy queue while that happened. The
+            // drop still counts; the gauge keeps the last depth it could
+            // actually observe.
+            self.publish_health(None);
             return;
         };
-        let mut lost = false;
         while segments.len() >= self.capacity {
             segments.pop_front();
             self.dropped.fetch_add(1, Ordering::SeqCst);
-            lost = true;
         }
         segments.push_back(segment.clone());
         let queued = segments.len();
         drop(segments);
-        if lost {
-            self.publish_health(queued);
-        }
+        self.publish_health(Some(queued));
     }
 }
 
@@ -2127,10 +2134,25 @@ impl AgentSegmentSink for InMemoryAgentSegmentSink {
 /// published value and increments by the difference — the same rule
 /// `advance_loop` follows for segment additions, and for the same reason: what
 /// a periodic reader owes a counter is what changed, not what stands.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AgentSegmentSinkHealth {
+    published_queue: AtomicU64,
     published_drops: AtomicU64,
     published_unmappable: AtomicU64,
+}
+
+impl Default for AgentSegmentSinkHealth {
+    fn default() -> Self {
+        Self {
+            // `0` is a legal queue depth, so "nothing published yet" needs a
+            // value no ring can hold. Without it a sink whose first observed
+            // depth is zero would be indistinguishable from one that had
+            // already published zero, and would skip the write.
+            published_queue: AtomicU64::new(u64::MAX),
+            published_drops: AtomicU64::new(0),
+            published_unmappable: AtomicU64::new(0),
+        }
+    }
 }
 
 impl AgentSegmentSinkHealth {
@@ -2141,6 +2163,11 @@ impl AgentSegmentSinkHealth {
     }
 
     /// Publishes queue depth as a gauge and the two loss counters as diffs.
+    ///
+    /// `queued` is `None` when the caller cannot observe its own depth — a
+    /// poisoned lock, and nothing else. It is not the same as `Some(0)`, and
+    /// reporting the two alike is how a sink that is dropping every record
+    /// comes to read as an empty, healthy queue.
     ///
     /// The `signal` label is written here as the literal `"spans"` rather than
     /// taken as a parameter. A segment sink has exactly one signal, so a
@@ -2153,19 +2180,37 @@ impl AgentSegmentSinkHealth {
         &self,
         metrics: &dyn MetricsRecorder,
         backend: &'static str,
-        queued: usize,
+        queued: Option<usize>,
         dropped: u64,
         unmappable: u64,
     ) {
-        record_agent_domain_gauge(
-            metrics,
-            METRIC_AGENT_TELEMETRY_EXPORT_QUEUE,
-            queued as f64,
-            &[("backend", backend), ("signal", "spans")],
-        )
-        .ok();
-        let new_drops =
-            dropped.saturating_sub(self.published_drops.swap(dropped, Ordering::SeqCst));
+        if let Some(queued) = queued {
+            // Only when the depth moved. A ring that evicts rather than blocks
+            // sits at exactly `capacity` from its first eviction onward, so
+            // re-writing it per record buys an operator nothing and puts a
+            // gauge write with label validation on the hot path of every loop
+            // transition, dispatch attempt, model call and A2A request.
+            //
+            // `swap`, not the `fetch_max` the counters use, because a depth
+            // legitimately falls and a gauge is last-write-wins. The two
+            // differ in what a race costs: a rewound *counter* watermark
+            // republishes an interval and is wrong forever after, while two
+            // publishers racing here can at worst leave the gauge one step
+            // behind until the depth next changes. In the steady state they
+            // cannot even do that — every publisher on a saturated ring
+            // observes `capacity` and agrees.
+            let queued = queued as u64;
+            if self.published_queue.swap(queued, Ordering::SeqCst) != queued {
+                record_agent_domain_gauge(
+                    metrics,
+                    METRIC_AGENT_TELEMETRY_EXPORT_QUEUE,
+                    queued as f64,
+                    &[("backend", backend), ("signal", "spans")],
+                )
+                .ok();
+            }
+        }
+        let new_drops = Self::advance(&self.published_drops, dropped);
         if new_drops > 0 {
             record_agent_domain_counter(
                 metrics,
@@ -2175,8 +2220,7 @@ impl AgentSegmentSinkHealth {
             )
             .ok();
         }
-        let new_unmappable =
-            unmappable.saturating_sub(self.published_unmappable.swap(unmappable, Ordering::SeqCst));
+        let new_unmappable = Self::advance(&self.published_unmappable, unmappable);
         if new_unmappable > 0 {
             record_agent_domain_counter(
                 metrics,
@@ -2186,6 +2230,32 @@ impl AgentSegmentSinkHealth {
             )
             .ok();
         }
+    }
+
+    /// Advances one cumulative watermark, returning how far it advanced.
+    ///
+    /// **Advance-only, and that is a correctness property rather than a
+    /// micro-optimisation.** A `swap` is atomic by itself, but the pair
+    /// *(read the sink's counter, swap the watermark)* is not, and every
+    /// driver of a run shares one `Arc<dyn AgentSegmentSink>` across threads.
+    /// Two publishers can therefore swap out of order: the one that observed
+    /// the higher count lands first and reports it, then the one that observed
+    /// the lower count **rewinds** the watermark to a value already published.
+    /// The next publish diffs against that rewound value and counts the
+    /// interval a second time — ten increments for eight real drops, which is
+    /// exactly the over-report the diff exists to prevent. With `fetch_max` a
+    /// late, lower observation owes nothing and moves nothing, and the total
+    /// published can never exceed the highest count observed.
+    ///
+    /// The `load` in front is a fast path, not a second opinion: it can only
+    /// skip when this observation is already covered, which is precisely when
+    /// there is nothing to publish. Every eviction on a saturated ring takes
+    /// it for `unmappable`, which a segment sink never raises above zero.
+    fn advance(watermark: &AtomicU64, observed: u64) -> u64 {
+        if observed <= watermark.load(Ordering::SeqCst) {
+            return 0;
+        }
+        observed.saturating_sub(watermark.fetch_max(observed, Ordering::SeqCst))
     }
 }
 
@@ -2447,6 +2517,62 @@ mod tests {
         // The same key with a short single-line value is accepted.
         validate_agent_domain_metric_attributes(&[("phase", "deciding-continuation")])
             .expect("a bounded key with a bounded value is accepted");
+    }
+
+    /// A poisoned sink reports no depth, rather than an empty queue.
+    ///
+    /// Poisoning is sticky: once a panic has been taken while the ring's lock
+    /// was held, this sink drops every record it is ever handed again. The arm
+    /// used to publish a depth of `0` on that path, so the one metric an
+    /// operator would consult to see a backing-up pipeline reported a drained,
+    /// healthy queue for a sink that had stopped working entirely — the exact
+    /// opposite reading. Nothing outside this crate can reach the private lock
+    /// to poison it, which is why this lives beside the code rather than in
+    /// `tests/telemetry_segments.rs`.
+    #[test]
+    fn a_poisoned_sink_publishes_no_queue_depth() {
+        let metrics = Arc::new(rakka_core::InMemoryMetricsRecorder::new());
+        let sink =
+            Arc::new(InMemoryAgentSegmentSink::with_capacity(4).with_metrics(metrics.clone()));
+        let segment = |at: u64| {
+            AgentTelemetrySegment::new(
+                AgentSegmentOperation::Decide { phase: "propose" },
+                rakka_agent_workflow::AgentTimestampMillis::new(at),
+                rakka_agent_workflow::AgentTimestampMillis::new(at + 1),
+            )
+            .ok()
+        };
+
+        // One healthy record, so there is a real depth on record to contrast
+        // the poisoned publish against.
+        sink.record(&segment(1));
+
+        let poisoner = Arc::clone(&sink);
+        let _panicked = std::thread::spawn(move || {
+            let _held = poisoner
+                .segments
+                .lock()
+                .expect("the lock is not yet poisoned");
+            panic!("poisoning the ring");
+        })
+        .join();
+        assert!(sink.segments.lock().is_err(), "the lock is poisoned");
+
+        sink.record(&segment(2));
+        assert_eq!(sink.dropped(), 1, "the record was dropped, and counted");
+
+        let snapshot = metrics.snapshot();
+        let depths: Vec<u64> = snapshot
+            .observations_named(METRIC_AGENT_TELEMETRY_EXPORT_QUEUE)
+            .iter()
+            .map(|observation| observation.value() as u64)
+            .collect();
+        assert_eq!(
+            depths,
+            vec![1],
+            "the poisoned publish adds no depth of its own; the gauge holds the \
+             last one this sink could actually observe"
+        );
     }
 
     #[test]

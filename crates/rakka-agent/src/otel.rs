@@ -1053,7 +1053,7 @@ impl AgentGenAiSpanExporter {
             self.health.publish(
                 metrics.as_ref(),
                 self.backend_name(),
-                self.buffered(),
+                Some(self.buffered()),
                 self.dropped(),
                 self.unmappable(),
             );

@@ -526,3 +526,84 @@ fn a_bounded_sink_publishes_its_loss_once_per_drop() {
         "a fourth eviction adds one; saw {drops}"
     );
 }
+
+/// A health watermark that can rewind reports more loss than the sink took.
+///
+/// `AgentSegmentSinkHealth` diffs a cumulative counter, and the watermark it
+/// diffs against was advanced with `swap`. That is atomic on its own, but the
+/// pair *(read the sink's counter, swap the watermark)* is not — and every
+/// driver of a run shares one `Arc<dyn AgentSegmentSink>` across threads, so
+/// two publishers can land out of order. The publisher that saw the higher
+/// count reports it, then the one that saw the lower count rewinds the
+/// watermark to a value already published, and the next publish counts that
+/// interval a second time.
+///
+/// The interleaving is reproduced here directly rather than raced for: the
+/// three calls below are exactly what those two threads plus the next publish
+/// hand the type, in the order they would arrive. Under `swap` the total is
+/// ten for eight real drops; under an advance-only watermark a late lower
+/// observation owes nothing and moves nothing.
+#[test]
+fn a_health_watermark_never_rewinds() {
+    let metrics = rakka_core::InMemoryMetricsRecorder::new();
+    let health = rakka_agent::AgentSegmentSinkHealth::new();
+
+    // The thread that observed 7 publishes first, then the one that observed
+    // 5, then a later publish at 8.
+    health.publish(&metrics, "in-memory", None, 7, 0);
+    health.publish(&metrics, "in-memory", None, 5, 0);
+    health.publish(&metrics, "in-memory", None, 8, 0);
+
+    let drops: f64 = metrics
+        .snapshot()
+        .observations_named(rakka_agent::METRIC_AGENT_TELEMETRY_EXPORT_DROPS)
+        .iter()
+        .map(|observation| observation.value())
+        .sum();
+    assert!(
+        (drops - 8.0).abs() < f64::EPSILON,
+        "the published total is the highest count observed, not the sum of a \
+         rewound interval counted twice; saw {drops}"
+    );
+}
+
+/// The queue gauge traces the ring filling, then stops writing.
+///
+/// It was published only inside the drop branch, where `segments.len()` is
+/// always exactly `capacity` — the eviction loop exits one below the bound and
+/// the push restores it. So the "leading indicator" was a constant an operator
+/// could read only at saturation, and once the ring was full it was rewritten
+/// on the path of every loop transition, dispatch attempt, model call and A2A
+/// request, for a number that could not change.
+///
+/// Both halves are asserted: the depths that reach the recorder are the fill
+/// curve, and eight records produce four writes rather than eight.
+#[test]
+fn a_bounded_sink_publishes_a_queue_depth_that_moves() {
+    let metrics = Arc::new(rakka_core::InMemoryMetricsRecorder::new());
+    let sink = InMemoryAgentSegmentSink::with_capacity(4).with_metrics(metrics.clone());
+    for at in 0..8 {
+        sink.record(
+            &rakka_agent::AgentTelemetrySegment::new(
+                AgentSegmentOperation::Decide { phase: "propose" },
+                rakka_agent_workflow::AgentTimestampMillis::new(at),
+                rakka_agent_workflow::AgentTimestampMillis::new(at + 1),
+            )
+            .ok(),
+        );
+    }
+    assert_eq!(sink.dropped(), 4, "capacity 4 evicts four of eight");
+
+    let snapshot = metrics.snapshot();
+    let depths: Vec<u64> = snapshot
+        .observations_named(rakka_agent::METRIC_AGENT_TELEMETRY_EXPORT_QUEUE)
+        .iter()
+        .map(|observation| observation.value() as u64)
+        .collect();
+    assert_eq!(
+        depths,
+        vec![1, 2, 3, 4],
+        "the gauge is the fill curve, written once per change and never again \
+         once the ring saturates"
+    );
+}
