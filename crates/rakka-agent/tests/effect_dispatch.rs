@@ -179,15 +179,19 @@ impl DispatchFixture {
                 self.fx.agents.clone(),
                 AgentToolAuthority::new(self.registry.clone()),
             )),
-            Arc::new(
-                InProcessRunResultDelivery::new(
+            Arc::new({
+                let mut delivery = InProcessRunResultDelivery::new(
                     self.fx.runs.clone(),
                     self.fx.effects.clone(),
                     self.fx.router.clone(),
                     self.fx.clock.clone(),
                 )
-                .with_effect_policies(self.fx.policies.clone()),
-            ),
+                .with_effect_policies(self.fx.policies.clone());
+                if let Some(metrics) = &self.fx.metrics {
+                    delivery = delivery.with_metrics(metrics.clone());
+                }
+                delivery
+            }),
         )
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
         .with_probe(Arc::new(self.probe.clone()))

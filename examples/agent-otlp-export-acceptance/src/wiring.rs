@@ -1,5 +1,16 @@
-//! The sharded world: all three real entity types on one node, the
-//! in-process A2A service core, and the production effect dispatcher.
+//! The sharded world the export walk drives: all three real entity types on
+//! one node, the in-process A2A service core, and the production effect
+//! dispatcher — with one segment sink threaded through every driver of a run.
+//!
+//! **Four wirings, not one.** A run is advanced by the entity a caller drives,
+//! by the dispatch pipeline, by `InProcessRunResultDelivery` (delivering a
+//! durable result commits loop transitions, which is where `decide` and
+//! `checkpoint-open` segments close), and — for the ingress `SERVER` span —
+//! by the A2A service. A sink wired to fewer than four sees a partial trace,
+//! and the walk fails rather than reporting a smaller number: dropping the
+//! delivery's sink alone takes the export from 38 spans and 11 convention span
+//! names to 21 and 9. The metrics recorder follows the same rule and was
+//! missing from that driver entirely — see `InProcessRunResultDelivery`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,25 +22,24 @@ use rakka_a2a::agents::{
 use rakka_a2a::auth::AllowAllAuthorizer;
 use rakka_a2a::mapping::A2AHeaderTenantResolver;
 use rakka_a2a::projection::InMemoryA2ATaskProjectionStore;
+use rakka_agent::otel::AgentGenAiSpanExporter;
 use rakka_agent::testkit::{
-    CrashingStateStore, DeferredExchangeRouter, DeterministicModelAdapter,
-    InProcessRunResultDelivery, KillSwitchProbe, LocalShardedExchangeRoute, RecordingToolExecutor,
-    ScriptedReconciler, SharedAtomicWorkflowClock,
+    DeferredExchangeRouter, DeterministicModelAdapter, InProcessRunResultDelivery, KillSwitchProbe,
+    LocalShardedExchangeRoute, RecordingToolExecutor, ScriptedReconciler,
+    SharedAtomicWorkflowClock,
 };
 use rakka_agent::AgentRevisionNumber;
 use rakka_agent::{
     agent_entity_type_key, agent_run_entity_type_key, agent_task_entity_type_key,
     init_agent_entity_sharding, init_agent_run_entity_sharding, init_agent_task_entity_sharding,
-    AgentDecisionEvent, AgentDecisionEventPage, AgentDecisionEventSink, AgentDecisionWriteStatus,
     AgentEffectSpec, AgentEntityAuthority, AgentEntityClass, AgentEntityRegistration,
-    AgentEntityShardingSettings, AgentEntityState, AgentExchangeRouter, AgentObservabilityError,
-    AgentObservabilityFuture, AgentRunEntityMessage, AgentRunEntityRegistration,
-    AgentRunEntityShardingSettings, AgentRunMemory, AgentRunScope, AgentRunState, AgentSchemaId,
-    AgentSchemaRef, AgentTaskEntityMessage, AgentTaskEntityRegistration,
+    AgentEntityShardingSettings, AgentEntityState, AgentExchangeRouter, AgentRunEntityMessage,
+    AgentRunEntityRegistration, AgentRunEntityShardingSettings, AgentRunMemory, AgentRunState,
+    AgentSchemaId, AgentSchemaRef, AgentTaskEntityMessage, AgentTaskEntityRegistration,
     AgentTaskEntityShardingSettings, AgentTaskState, AgentToolAuthority, AgentToolBinding,
     AgentToolDeclaration, AgentToolDescriptor, AgentToolId, AgentToolKind, AgentToolRegistry,
-    InMemoryAgentTaskHistoryStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
-    WorkflowAgentRunEffectSink,
+    InMemoryAgentDecisionEventSink, InMemoryAgentTaskHistoryStore, InMemoryContextSnapshotStore,
+    InMemorySessionMemoryStore, WorkflowAgentRunEffectSink,
 };
 use rakka_agent_workflow::substrate::WorkflowState;
 use rakka_agent_workflow::{
@@ -38,6 +48,8 @@ use rakka_agent_workflow::{
 };
 use rakka_core::{ActorSystem, InMemoryMetricsRecorder};
 use rakka_persistence::InMemoryDurableStateStore;
+
+use crate::sdk::{ExemplarReservoir, ExemplarSegmentSink};
 use rakka_sharding::ClusterSharding;
 
 /// The single tool of the walk: non-idempotent, checkpoint-required.
@@ -52,7 +64,7 @@ pub type Service = RakkaAgentA2AService<
     InMemoryDurableStateStore<AgentTaskState>,
     InMemoryDurableStateStore<AgentEntityState>,
     InMemoryAgentTaskHistoryStore,
-    CrashingStateStore<AgentRunState>,
+    InMemoryDurableStateStore<AgentRunState>,
     InMemoryDurableStateStore<rakka_agent::AgentTeamState>,
     rakka_agent::InMemoryAgentTeamHistoryStore,
     InMemoryDurableStateStore<rakka_agent::AgentConversationState>,
@@ -63,47 +75,9 @@ pub type Service = RakkaAgentA2AService<
 pub type Pipeline = rakka_agent::AgentRunEffectDispatcher<
     InMemoryDurableStateStore<WorkflowState>,
     InMemoryDurableStateStore<AgentDispatcherFleetState>,
-    CrashingStateStore<AgentRunState>,
+    InMemoryDurableStateStore<AgentRunState>,
     SharedAtomicWorkflowClock,
 >;
-
-/// A decision sink that is always down — the unavailable telemetry backend
-/// of the statement's last bullet.
-#[derive(Debug)]
-pub struct UnavailableDecisionSink;
-
-impl AgentDecisionEventSink for UnavailableDecisionSink {
-    fn backend_name(&self) -> &'static str {
-        "unavailable"
-    }
-
-    fn append<'a>(
-        &'a self,
-        _scope: &'a AgentRunScope,
-        _event: &'a AgentDecisionEvent,
-    ) -> AgentObservabilityFuture<'a, AgentDecisionWriteStatus> {
-        Box::pin(async {
-            Err(AgentObservabilityError::Sink {
-                code: "unavailable".to_string(),
-                message: "the backend is down".to_string(),
-            })
-        })
-    }
-
-    fn read<'a>(
-        &'a self,
-        _scope: &'a AgentRunScope,
-        _after: u64,
-        _limit: usize,
-    ) -> AgentObservabilityFuture<'a, AgentDecisionEventPage> {
-        Box::pin(async {
-            Err(AgentObservabilityError::Sink {
-                code: "unavailable".to_string(),
-                message: "the backend is down".to_string(),
-            })
-        })
-    }
-}
 
 /// A deterministic service clock over the shared tick counter.
 struct TickClock(Arc<AtomicU64>);
@@ -153,8 +127,8 @@ pub struct World {
     pub tasks: InMemoryDurableStateStore<AgentTaskState>,
     /// Durable agent records.
     pub agents: InMemoryDurableStateStore<AgentEntityState>,
-    /// Durable run records; crash-armable for the owner-loss bullet.
-    pub runs: CrashingStateStore<AgentRunState>,
+    /// Durable run records.
+    pub runs: InMemoryDurableStateStore<AgentRunState>,
     /// Append-only task history.
     pub history: InMemoryAgentTaskHistoryStore,
     /// The workflow outbox the run's effects ticket through.
@@ -190,6 +164,14 @@ pub struct World {
     pub task_registration: AgentTaskEntityRegistration,
     /// The run entity type registration.
     pub run_registration: AgentRunEntityRegistration,
+    /// The bounded ring every closed segment maps into.
+    pub spans: Arc<AgentGenAiSpanExporter>,
+    /// The application-owned exemplar reservoir, fed by the same segments.
+    pub exemplars: Arc<ExemplarReservoir>,
+    /// The one sink all four drivers of a run share.
+    pub segments: Arc<ExemplarSegmentSink>,
+    /// The durable decision sink, so `decide` spans carry their events.
+    pub decisions: Arc<InMemoryAgentDecisionEventSink>,
 }
 
 impl World {
@@ -198,11 +180,11 @@ impl World {
     /// `adapter` scripts the model; the walk passes one scripted for its
     /// two-turn flow.
     pub fn new(adapter: DeterministicModelAdapter, catalog_target: A2AAgentTarget) -> Self {
-        let system = ActorSystem::new("DurableAgentAcceptance");
+        let system = ActorSystem::new("AgentOtlpExportAcceptance");
         let sharding = ClusterSharding::get(&system);
         let tasks = InMemoryDurableStateStore::<AgentTaskState>::new();
         let agents = InMemoryDurableStateStore::<AgentEntityState>::new();
-        let runs = CrashingStateStore::<AgentRunState>::new();
+        let runs = InMemoryDurableStateStore::<AgentRunState>::new();
         let history = InMemoryAgentTaskHistoryStore::new();
         let workflow_store = InMemoryDurableStateStore::<WorkflowState>::new();
         let fleet_store = InMemoryDurableStateStore::<AgentDispatcherFleetState>::new();
@@ -217,6 +199,13 @@ impl World {
         let metrics = Arc::new(InMemoryMetricsRecorder::new());
         let session = Arc::new(InMemorySessionMemoryStore::new());
         let snapshots = Arc::new(InMemoryContextSnapshotStore::new());
+        let decisions = Arc::new(InMemoryAgentDecisionEventSink::new());
+        // The exporter publishes its own queue depth and loss into the same
+        // recorder the run entity records into, so the walk's loss assertions
+        // read one snapshot rather than two surfaces.
+        let spans = Arc::new(AgentGenAiSpanExporter::new().with_metrics(metrics.clone()));
+        let exemplars = Arc::new(ExemplarReservoir::new());
+        let segments = Arc::new(ExemplarSegmentSink::new(spans.clone(), exemplars.clone()));
 
         let policies = registry
             .effect_policies()
@@ -241,7 +230,14 @@ impl World {
             history.clone(),
             deferred.as_router(),
             AgentTaskEntityShardingSettings::new(agent_task_entity_type_key())
-                .with_clock(entity_clock.clone()),
+                .with_clock(entity_clock.clone())
+                // The task entity is the sole recording site for the wake,
+                // epoch, human-result, dependency, stagnation, goal-status and
+                // goal-lifecycle counters. Without this they are recorded into
+                // the default `NoopMetricsRecorder` and cannot reach the
+                // snapshot, the bridge export, or the receiver — in the one
+                // walk built to prove the metric surface exports.
+                .with_metrics(metrics.clone()),
         )
         .expect("task entity sharding initializes");
         let run_registration = init_agent_run_entity_sharding(
@@ -253,7 +249,8 @@ impl World {
                 .with_clock(entity_clock)
                 .with_effect_policies(policies)
                 .with_metrics(metrics.clone())
-                .with_decision_events(Arc::new(UnavailableDecisionSink))
+                .with_segments(segments.clone())
+                .with_decision_events(decisions.clone())
                 .with_memory(AgentRunMemory::new(session.clone(), snapshots.clone())),
         )
         .expect("run entity sharding initializes");
@@ -302,6 +299,8 @@ impl World {
                 Arc::new(AllowAllAuthorizer),
             )
             .with_clock(Arc::new(TickClock(clock.clone())))
+            .with_segments(segments.clone())
+            .with_metrics(metrics.clone())
             .with_default_tenant("acme"),
         );
 
@@ -328,6 +327,10 @@ impl World {
             agent_registration,
             task_registration,
             run_registration,
+            spans,
+            exemplars,
+            segments,
+            decisions,
         }
     }
 
@@ -362,9 +365,12 @@ impl World {
                         .effect_policies()
                         .expect("the registry projects valid policies"),
                 )
-                .with_metrics(self.metrics.clone()),
+                .with_segments(self.segments.clone())
+                .with_metrics(self.metrics.clone())
+                .with_decision_events(self.decisions.clone()),
             ),
         )
+        .with_segments(self.segments.clone())
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
         .with_probe(Arc::new(self.probe.clone()))
         .with_reconciler(Arc::new(ScriptedReconciler::new()))

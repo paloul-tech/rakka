@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use rakka_agent::{
     agent_domain_instrument_views, agent_domain_metric_instrument,
     validate_agent_domain_metric_attributes, AGENT_DOMAIN_METRIC_INSTRUMENTS,
-    AGENT_SEGMENT_ERROR_TYPES,
+    AGENT_SEGMENT_ERROR_TYPES, AGENT_TELEMETRY_SIGNALS,
 };
 
 fn crate_src() -> PathBuf {
@@ -186,6 +186,60 @@ fn every_segment_error_type_the_crate_writes_is_catalogued() {
         assert!(
             written.contains(*value),
             "`{value}` is catalogued but this crate writes it nowhere"
+        );
+    }
+}
+
+/// Every `signal` label value this crate writes is in
+/// [`AGENT_TELEMETRY_SIGNALS`], and every catalogued value is written.
+///
+/// The same bijection the error types get, and owed for the same reason: a
+/// `signal` value is a `&'static str` the compiler checks nothing about, and
+/// it is what an operator's dashboard groups telemetry loss by. Three of the
+/// four instruments carrying the key were added by slice 6.3b, so without this
+/// the label vocabulary would have been documentation only — which is the
+/// defect class that slice was fixing.
+#[test]
+fn every_telemetry_signal_the_crate_writes_is_catalogued() {
+    const MARKER: &str = "\"signal\", ";
+    let mut written = BTreeSet::new();
+    let entries = fs::read_dir(crate_src()).expect("the crate's src directory is readable");
+    for entry in entries {
+        let path = entry.expect("a directory entry is readable").path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("a source file is readable");
+        for chunk in source.split(MARKER).skip(1) {
+            // Every `("signal", …)` pair in this crate passes a literal or a
+            // parameter; only the literals are this scan's business, and a
+            // parameter is covered by its own caller's literal.
+            let Some(rest) = chunk.strip_prefix('"') else {
+                continue;
+            };
+            let Some((value, _)) = rest.split_once('"') else {
+                continue;
+            };
+            written.insert(value.to_string());
+        }
+    }
+    assert!(
+        !written.is_empty(),
+        "the scan found no signal labels at all, so it is proving nothing"
+    );
+
+    let catalogued: BTreeSet<&str> = AGENT_TELEMETRY_SIGNALS.iter().copied().collect();
+    for value in &written {
+        assert!(
+            catalogued.contains(value.as_str()),
+            "`{value}` is written as a `signal` label but is not in \
+             AGENT_TELEMETRY_SIGNALS, so no operator was told it exists"
+        );
+    }
+    for value in &catalogued {
+        assert!(
+            written.contains(*value),
+            "`{value}` is catalogued as a signal but this crate writes it nowhere"
         );
     }
 }

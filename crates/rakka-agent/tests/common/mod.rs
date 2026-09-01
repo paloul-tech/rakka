@@ -2737,6 +2737,23 @@ impl AuthorityFixture {
         if let Some(segments) = &self.fx.segments {
             delivery = delivery.with_segments(segments.clone());
         }
+        // The recorder too. `Fixture::with_metrics` wires thirteen entity
+        // sites and this one was not among them, so a suite driving
+        // `pipeline()` with metrics enabled saw zero `rakka.agent.turn.
+        // duration`, `.model.tokens`, `.effect.outcomes` and
+        // `.effect.outstanding.duration` — the delivery is their only
+        // recording site — while the sharded entity beside it looked healthy.
+        if let Some(metrics) = &self.fx.metrics {
+            delivery = delivery.with_metrics(metrics.clone());
+        }
+        // And the decision sink, for the same reason a field over: the
+        // delivered model result *is* the deciding transition of a model turn,
+        // so `run_at` wiring the sink while this driver did not left every
+        // pipeline-driven turn with no 17.7 record and no
+        // `rakka.agent.decisions` count.
+        if let Some(decisions) = &self.fx.decisions {
+            delivery = delivery.with_decision_events(decisions.clone());
+        }
         let mut pipeline = AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new(worker_id),
             self.workflow_store.clone(),

@@ -534,7 +534,8 @@ impl World {
                         .effect_policies()
                         .expect("the registry projects valid policies"),
                 )
-                .with_delegation(handoff_config()),
+                .with_delegation(handoff_config())
+                .with_metrics(self.metrics.clone()),
             ),
         )
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))

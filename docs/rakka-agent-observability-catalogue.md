@@ -21,8 +21,10 @@ constant binds fails it too. What follows is that data, rendered.
 The companion documents are
 [`rakka-agent-security-validation-matrix.md`](rakka-agent-security-validation-matrix.md)
 and [`rakka-agent-fault-injection-matrix.md`](rakka-agent-fault-injection-matrix.md).
-The telemetry validation matrix that records which telemetry claims are
-enforced, delegated, or inferred belongs to slice 6.3b and will cite this page.
+[`rakka-agent-telemetry-validation-matrix.md`](rakka-agent-telemetry-validation-matrix.md)
+records which telemetry claims are enforced, which are delegated to the
+deployment, and which remain inferred; it cites this page rather than
+repeating it.
 
 ## Metrics
 
@@ -46,6 +48,9 @@ without re-bucketing.
 | `rakka.agent.recovery.duration` | Histogram | `ms` | `outcome` | latency | One run recovery, measured in the process that performed it. |
 | `rakka.agent.decision.drops` | Gauge | `{decision}` | — | — | Decision events a run's bounded outbox ring dropped. |
 | `rakka.agent.telemetry.flush.failures` | Counter | `{failure}` | `signal` | — | Telemetry flush attempts a sink refused, by signal. |
+| `rakka.agent.telemetry.export.queue` | Gauge | `{record}` | `backend`, `signal` | — | Records a bounded telemetry sink is holding, awaiting export. |
+| `rakka.agent.telemetry.export.drops` | Counter | `{record}` | `backend`, `signal` | — | Records a bounded telemetry sink dropped at capacity. |
+| `rakka.agent.telemetry.export.unmappable` | Counter | `{record}` | `backend` | — | Records a telemetry sink refused as unmappable. |
 | `rakka.agent.memory.retrievals` | Counter | `{retrieval}` | `backend`, `outcome` | — | Private-memory retrievals run by context-snapshot assembly. |
 | `rakka.agent.memory.ingress.outcomes` | Counter | `{record}` | `outcome` | — | Memory-ingress guardrail outcomes on retrieved records. |
 | `rakka.agent.wake.dispositions` | Counter | `{wake}` | `outcome`, `trigger` | — | Wake dispositions the continuous controller durably recorded. |
@@ -108,6 +113,23 @@ correct.
 | Mailbox and stream pressure | `rakka.agent_workflow.runtime.mailbox_depth`, `rakka.agent_workflow.stream.pressure`, `rakka.actor.mailbox.depth`, `rakka.stream.pressure` |
 | Human checkpoint wait latency and waiting runs | `rakka.agent_workflow.human.wait.latency_ms`, `rakka.agent_workflow.human.waiting_runs` |
 
+### The `signal` label, and where its values are declared
+
+The four instruments carrying `signal` take their values from two closed
+vocabularies, in two places, deliberately. `AGENT_TELEMETRY_SIGNALS` in
+`crates/rakka-agent/src/observability.rs` holds what **this crate** writes —
+`decision-events` for the durable decision sink's refusal, `spans` for a
+bounded segment sink's buffer — and `tests/metric_catalogue.rs` holds it to a
+bijection with the call sites. `AGENT_OTLP_EXPORT_SIGNALS` in
+`examples/agent-otlp-export-acceptance/src/sdk.rs` holds the application
+boundary's — `otlp-traces`, `otlp-metrics`, `otlp-logs` — because the OTLP
+exporter lives in the deploying binary
+([17.17](plans/rakka-agent/spec.md#1717-otlp-and-collector-boundary)), and
+`tests/exporter_failure.rs` holds *those* to a bijection against a real failing
+export. A vocabulary a crate lists but never writes is a promise nothing keeps,
+which is the same reason `rakka_a2a::agents::A2A_INGRESS_ERROR_TYPE` is not in
+`AGENT_SEGMENT_ERROR_TYPES`.
+
 ### Owed, and named here so it is not assumed covered
 
 17.12's remaining clauses have no instrument yet, and this is the list rather
@@ -117,9 +139,16 @@ trigger and timer backlog with oldest age; wait duration and current age by
 wait or checkpoint kind; delegation, workflow-tool, task-operation, wake
 admission, epoch, autonomy admission, budget, team, and moderation *durations*
 (their counters exist); memory operation and retrieval latency and returned
-record count; context snapshot size and count; and the telemetry export queue
-depth and Collector/exporter health, which belong to the deployment-owned
-exporter that slice 6.3b wires.
+record count; and context snapshot size and count.
+
+The telemetry export queue and its loss are **no longer on that list**: slice
+6.3b added `rakka.agent.telemetry.export.{queue,drops,unmappable}` above,
+published by every bounded segment sink. Collector and exporter *health* stays
+delegated, because it is the Collector's own — both tiers of
+[`plans/rakka-agent/kubernetes-agent-otel-collector-topology.yaml`](plans/rakka-agent/kubernetes-agent-otel-collector-topology.yaml)
+now enable `service.telemetry` and publish it, and
+[`rakka-agent-telemetry-validation-matrix.md`](rakka-agent-telemetry-validation-matrix.md)
+records that nothing here consumes it.
 
 The fleet-scoped gauges among these need enumeration Rakka does not index —
 the same constraint slice 6.2 hit with `terminal_at` — so they will arrive as a

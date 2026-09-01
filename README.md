@@ -400,6 +400,18 @@ Validate the manifest with `kubectl` against your active context:
 RAKKA_K8S_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s optional_kubectl_manifest_validation_is_gated -- --nocapture
 ```
 
+Validate the agent-domain OpenTelemetry Collector topology — the Kubernetes
+objects with `kubectl`, and both Collector configurations against the pinned
+distribution itself, which is the only check that knows what a Collector
+configuration means:
+
+```sh
+RAKKA_AGENT_OTEL_VALIDATE_MANIFESTS=1 \
+  cargo test -p rakka-k8s --test agent_otel_collector_topology -- --nocapture
+RAKKA_AGENT_OTEL_VALIDATE_COLLECTOR_CONFIG=1 \
+  cargo test -p rakka-k8s --test agent_otel_collector_topology -- --nocapture
+```
+
 Run the optional local-cluster scenario against your active kind/minikube context:
 
 ```sh

@@ -174,5 +174,7 @@ table names. It does not remove the need for:
 - membership and downing policy tuned for the deployment, since the harness
   announces departure rather than detecting it;
 - Kubernetes-level pod eviction, rollout, and drain testing;
-- security validation (slice 6.2) and telemetry/Collector validation
-  (slices 6.3a and 6.3b).
+- security validation, recorded in
+  [`rakka-agent-security-validation-matrix.md`](rakka-agent-security-validation-matrix.md),
+  and telemetry/Collector validation, recorded in
+  [`rakka-agent-telemetry-validation-matrix.md`](rakka-agent-telemetry-validation-matrix.md).
