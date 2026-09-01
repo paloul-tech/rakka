@@ -230,7 +230,14 @@ impl World {
             history.clone(),
             deferred.as_router(),
             AgentTaskEntityShardingSettings::new(agent_task_entity_type_key())
-                .with_clock(entity_clock.clone()),
+                .with_clock(entity_clock.clone())
+                // The task entity is the sole recording site for the wake,
+                // epoch, human-result, dependency, stagnation, goal-status and
+                // goal-lifecycle counters. Without this they are recorded into
+                // the default `NoopMetricsRecorder` and cannot reach the
+                // snapshot, the bridge export, or the receiver — in the one
+                // walk built to prove the metric surface exports.
+                .with_metrics(metrics.clone()),
         )
         .expect("task entity sharding initializes");
         let run_registration = init_agent_run_entity_sharding(
@@ -293,6 +300,7 @@ impl World {
             )
             .with_clock(Arc::new(TickClock(clock.clone())))
             .with_segments(segments.clone())
+            .with_metrics(metrics.clone())
             .with_default_tenant("acme"),
         );
 

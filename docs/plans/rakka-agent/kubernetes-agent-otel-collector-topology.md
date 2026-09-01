@@ -43,10 +43,19 @@ about what content will be called next time.
 Two tiers, because tail sampling requires two.
 
 **Agent (DaemonSet, node-local).** Receives OTLP on the node's `hostPort`
-4317/4318, enriches with `k8sattributes`, batches, and forwards. Traces and
-logs leave through a `loadbalancing` exporter with `routing_key: traceID`,
-resolving gateway **pod** addresses from the headless service; metrics leave
-through a plain `otlp/gateway` exporter.
+4317/4318, enriches with `k8sattributes` **scoped to its own node**
+(`filter.node_from_env_var: K8S_NODE_NAME`, projected from `spec.nodeName`),
+batches, and forwards. Traces and logs leave through a `loadbalancing`
+exporter with `routing_key: traceID`, resolving gateway **pod** addresses from
+the headless service; metrics leave through a plain `otlp/gateway` exporter.
+
+The node filter is not an optimisation. Without it each of N replicas holds a
+full cluster pod informer, so per-node memory grows with the cluster's total
+pod count rather than the node's own and the API server carries N full pod
+watches — against a 512Mi limit sized for a node-local cache. The pinned
+distribution resolves the variable at *validation* time, so a config carrying
+the filter is refused outright when it is unset; the gated arm below supplies
+it the same way the DaemonSet does.
 
 **Gateway (Deployment, 2 replicas).** Runs `transform/allowlist`, then
 `tail_sampling`, then `batch`, and exports to the operator's backend with a
@@ -141,6 +150,24 @@ in a trace wherever possible. It is recorded as an inferred claim in
 The application minimises **before** export — 17.14 puts the Collector second,
 as defence in depth — so these lists are the second of two layers, not the
 only one.
+
+**The datapoint rule is conditioned on `rakka.agent.*`; the span and log rules
+are not.** A `keep_keys` with no `where` deletes every key it does not name
+from every signal in the pipeline, and this is the *agent* label vocabulary —
+while the application's bridge exports the whole `MetricsSnapshot`, substrate
+instruments included. Unconditioned it was stripping `state` off
+`rakka.cluster.members` and `actor` off `rakka.actor.mailbox.depth`,
+collapsing each into one attribute-less last-write-wins series: destruction,
+not redaction. Spans and logs stay unconditioned deliberately — their
+vocabularies are closed sets the adapter writes, and the log rule is the last
+guard over `tracing` records whose fields are arbitrary and which arrive under
+a scope named for their target rather than the pinned one.
+
+`resource/rakka` uses `action: insert`, never `upsert`. `AgentOtelResource`
+lets a binary declare its own `service.namespace` and
+`deployment.environment.name`; upserting them replaces a deployment's
+`production` with this file's `local`, at both tiers, merging environments into
+one series behind environment-scoped alerting.
 
 ## Local validation
 

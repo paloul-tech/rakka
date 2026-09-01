@@ -630,7 +630,8 @@ impl World {
                         .expect("the registry projects valid policies"),
                 )
                 .with_delegation(delegation_config())
-                .with_workflow_tools(workflow_config()),
+                .with_workflow_tools(workflow_config())
+                .with_metrics(self.metrics.clone()),
             ),
         )
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))

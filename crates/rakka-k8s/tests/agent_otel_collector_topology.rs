@@ -293,6 +293,88 @@ fn the_backend_exporter_is_bounded_and_operator_selected() {
     }
 }
 
+/// The resource processor supplies defaults; it does not overwrite the
+/// emitter's own answer.
+///
+/// `AgentOtelResource` lets a binary declare its own `service.namespace` and
+/// `deployment.environment.name`, and the export acceptance binary declares
+/// both — which is exactly why an `upsert` here was invisible to every other
+/// test. In production it rewrote a binary's `production` to this file's
+/// `local`, at the node tier and again at the gateway, merging environments
+/// into one series behind environment-scoped alerting.
+#[test]
+fn the_resource_processor_defaults_rather_than_overwrites() {
+    for name in [
+        "rakka-agent-otel-agent-config",
+        "rakka-agent-otel-gateway-config",
+    ] {
+        let config = document_named("ConfigMap", name);
+        let processor = config
+            .split_once("      resource/rakka:\n")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("{name} declares no resource/rakka processor"));
+        let block = processor
+            .split_once("      batch:")
+            .map(|(block, _)| block)
+            .unwrap_or(processor);
+        assert!(
+            !block.contains("action: upsert"),
+            "{name}'s resource/rakka upserts, so it overwrites an attribute the \
+             application already declared instead of supplying a default"
+        );
+        assert_eq!(
+            block.matches("action: insert").count(),
+            2,
+            "{name}'s resource/rakka should insert both of its two attributes"
+        );
+    }
+}
+
+/// The node-local tier watches its own node, and declares no variable nothing
+/// reads.
+///
+/// A DaemonSet's `k8sattributes` without `filter.node_from_env_var` holds a
+/// full cluster pod informer on **every** node: memory grows with the
+/// cluster's total pod count rather than the node's own, and the API server
+/// carries one full pod watch per node. Nothing fails, the 512Mi limit is
+/// simply sized for a cache that is no longer node-local — and the gated
+/// `validate` arm accepts it, because an unfiltered watch is legal.
+///
+/// The second half is the reverse of `the_backend_exporter_is_bounded_and_
+/// operator_selected`'s check. That one proves every variable a config reads
+/// is declared; this proves every variable a container declares is read.
+/// `K8S_NODE_IP` was declared and read by nothing, carried over from the
+/// workflow topology's `kubeletstats` receiver, which this topology declines
+/// to run.
+#[test]
+fn the_daemonset_watches_only_its_own_node() {
+    let config = document_named("ConfigMap", "rakka-agent-otel-agent-config");
+    assert!(
+        config.contains("        filter:\n          node_from_env_var: K8S_NODE_NAME"),
+        "the DaemonSet tier's k8sattributes is not node-scoped, so every replica \
+         list/watches every pod in the cluster"
+    );
+
+    let daemonset = document_named("DaemonSet", "rakka-agent-otel-agent");
+    let declared: Vec<&str> = daemonset
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- name: "))
+        .filter(|name| name.starts_with("K8S_") || name.starts_with("RAKKA_"))
+        .collect();
+    assert!(
+        declared.contains(&"K8S_NODE_NAME"),
+        "the node filter reads K8S_NODE_NAME and the DaemonSet must project it; \
+         declared {declared:?}"
+    );
+    for name in declared {
+        assert!(
+            config.contains(name),
+            "the DaemonSet declares `{name}` and its configuration reads it \
+             nowhere, so it is carried weight rather than wiring"
+        );
+    }
+}
+
 #[test]
 fn the_readme_explains_the_contract_and_its_revalidation() {
     for required in [
@@ -387,6 +469,14 @@ fn optional_collector_config_validation_is_gated() {
                 "RAKKA_AGENT_OTEL_BACKEND_OTLP_ENDPOINT=otel-backend:4317",
                 "-e",
                 "RAKKA_AGENT_SETTINGS_REVISION_UNDER_INVESTIGATION=",
+                // `k8sattributes`' `filter.node_from_env_var` is resolved at
+                // *validation* time, not at first use: the distribution
+                // refuses the config outright with "`node_from_env_var` is
+                // configured but envvar \"K8S_NODE_NAME\" is not set". The
+                // DaemonSet projects it from `spec.nodeName`; this is the
+                // same projection, with a value a container can have.
+                "-e",
+                "K8S_NODE_NAME=validation-node",
                 COLLECTOR_IMAGE,
                 "validate",
                 "--config=/conf/collector.yaml",

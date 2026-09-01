@@ -82,6 +82,15 @@ data:
         spike_limit_percentage: 20
       k8sattributes:
         auth_type: serviceAccount
+        # Node-scoped, because this tier is a DaemonSet. Without the filter
+        # every replica list/watches every pod, namespace and node in the
+        # cluster: each of N nodes holds a full pod informer whose memory
+        # grows with the cluster's total pod count rather than its own node's,
+        # and the API server carries N full pod watches. The 512Mi limit below
+        # is sized for a node-local cache. `K8S_NODE_NAME` is projected from
+        # `spec.nodeName` in the DaemonSet's container spec.
+        filter:
+          node_from_env_var: K8S_NODE_NAME
         extract:
           metadata:
             - k8s.namespace.name
@@ -99,14 +108,24 @@ data:
                 name: k8s.pod.uid
           - sources:
               - from: connection
+      # `insert`, never `upsert`. Both keys are ones the application may
+      # already have declared — `AgentOtelResource` carries a service
+      # namespace and a deployment environment, and the export acceptance
+      # binary sets both — so `upsert` silently overwrites the emitter's own
+      # answer with this file's placeholder. A production binary declaring
+      # `deployment_environment("production")` would have every span, metric
+      # and log relabelled `local`, here and again at the gateway, merging
+      # production and staging into one series behind environment-scoped
+      # alerting that then covers the wrong fleet. These values are defaults
+      # for a signal that arrived without them.
       resource/rakka:
         attributes:
           - key: service.namespace
             value: rakka-system
-            action: upsert
+            action: insert
           - key: deployment.environment.name
             value: local
-            action: upsert
+            action: insert
       batch:
         timeout: 5s
         send_batch_size: 1024
@@ -219,19 +238,47 @@ data:
             - k8s.node.name
             - k8s.deployment.name
             - k8s.container.name
+      # `insert`, never `upsert`. Both keys are ones the application may
+      # already have declared — `AgentOtelResource` carries a service
+      # namespace and a deployment environment, and the export acceptance
+      # binary sets both — so `upsert` silently overwrites the emitter's own
+      # answer with this file's placeholder. A production binary declaring
+      # `deployment_environment("production")` would have every span, metric
+      # and log relabelled `local`, here and again at the gateway, merging
+      # production and staging into one series behind environment-scoped
+      # alerting that then covers the wrong fleet. These values are defaults
+      # for a signal that arrived without them.
       resource/rakka:
         attributes:
           - key: service.namespace
             value: rakka-system
-            action: upsert
+            action: insert
           - key: deployment.environment.name
             value: local
-            action: upsert
+            action: insert
       # Defence in depth, second (17.14): the application minimises before
       # export, and this keeps only what the adapter is allowed to write. The
       # three lists are `AGENT_SPAN_ATTRIBUTE_KEYS`, that set unioned with
       # `AGENT_LOG_ATTRIBUTE_KEYS`, and the bounded metric label vocabulary —
       # held to the code by `crates/rakka-agent/tests/collector_allowlist.rs`.
+      #
+      # **The metric rule is conditioned; the span and log rules are not, and
+      # the asymmetry is the point.** A `keep_keys` with no `where` deletes
+      # every key it does not name from every datapoint in the pipeline, and
+      # the metric list is the *agent* label vocabulary. The application's
+      # bridge exports the whole `MetricsSnapshot`, substrate instruments
+      # included, so the unconditioned rule was deleting `state` from
+      # `rakka.cluster.members`, `actor` from `rakka.actor.mailbox.depth`,
+      # `stream` from `rakka.stream.pressure` and so on — collapsing each into
+      # one attribute-less last-write-wins series. That is not redaction; it
+      # is silent destruction of a metric this list was never written for.
+      #
+      # Spans and logs stay unconditioned deliberately. Their vocabularies are
+      # closed sets the adapter writes, the log list is the last guard over
+      # `tracing` records whose fields are arbitrary, and those records reach
+      # the Collector under a scope named for their target rather than the
+      # pinned one — so conditioning on scope there would exempt exactly the
+      # records that most need the filter.
       transform/allowlist:
         error_mode: ignore
         trace_statements:
@@ -277,6 +324,7 @@ data:
                   "queue", "redaction", "retry_attempt_bucket", "safety_class", "signal",
                   "state_schema_version", "status", "step_kind", "target_class", "tenant_tier",
                   "timer_status", "transition", "trigger", "trigger_kind", "workflow_type"])
+                where IsMatch(metric.name, "^rakka\\.agent\\.")
       # All eight retention classes of specification 17.16, each selecting on
       # an attribute a mapping function actually writes. Every policy below is
       # a `string_attribute` or a `status_code`/`latency` policy and never a
@@ -497,14 +545,15 @@ spec:
           imagePullPolicy: IfNotPresent
           args: ["--config=/conf/collector.yaml"]
           env:
+            # Read by `k8sattributes`' `filter.node_from_env_var`. There was a
+            # `K8S_NODE_IP` beside it, carried over from the workflow
+            # topology where it feeds a `kubeletstats` receiver; this topology
+            # declines to run that receiver, so nothing referenced the
+            # variable and it is gone.
             - name: K8S_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: K8S_NODE_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.hostIP
           ports:
             - name: otlp-grpc
               containerPort: 4317

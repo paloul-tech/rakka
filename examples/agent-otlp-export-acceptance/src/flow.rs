@@ -266,9 +266,26 @@ pub async fn run_acceptance() -> AcceptanceReport {
         .flat_map(|resource| resource.scope_metrics.iter())
         .flat_map(|scope| scope.metrics.iter())
         .collect();
-    assert!(
-        !exported.is_empty(),
-        "the OTLP receiver was handed no metrics at all"
+    // The exact surface, not a floor. `exported.len() >= 7` passes just as
+    // happily when a recording site has been silenced by a missing
+    // `with_metrics` as when one has been added, which is how the delivery
+    // path came to record nothing at all. Naming them means a site that stops
+    // recording fails here with the instrument it lost.
+    let names: BTreeSet<&str> = exported.iter().map(|metric| metric.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "rakka.agent.decisions",
+            "rakka.agent.effect.outcomes",
+            "rakka.agent.effect.outstanding.duration",
+            "rakka.agent.recovery.duration",
+            "rakka.agent.recovery.events",
+            "rakka.agent.run.transitions",
+            "rakka.agent.turn.duration",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<&str>>(),
+        "the exported metric surface is not the one this walk records"
     );
     let united = exported
         .iter()

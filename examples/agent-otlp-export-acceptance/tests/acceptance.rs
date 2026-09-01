@@ -42,7 +42,12 @@ async fn the_transcript_is_exactly_the_documented_one() {
         report.histograms_with_exemplars, 3,
         "every exported histogram carries an exemplar"
     );
-    assert!(report.metrics_exported >= 7, "the metric surface exported");
+    assert_eq!(
+        report.metrics_exported, 7,
+        "the metric surface exported; the walk names every instrument it \
+         expects, so a changed count is a wiring change to look at rather \
+         than a floor to raise"
+    );
 }
 
 /// Line 12 reports a number; this proves the mechanism behind it.
