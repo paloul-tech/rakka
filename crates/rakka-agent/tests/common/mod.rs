@@ -2746,6 +2746,14 @@ impl AuthorityFixture {
         if let Some(metrics) = &self.fx.metrics {
             delivery = delivery.with_metrics(metrics.clone());
         }
+        // And the decision sink, for the same reason a field over: the
+        // delivered model result *is* the deciding transition of a model turn,
+        // so `run_at` wiring the sink while this driver did not left every
+        // pipeline-driven turn with no 17.7 record and no
+        // `rakka.agent.decisions` count.
+        if let Some(decisions) = &self.fx.decisions {
+            delivery = delivery.with_decision_events(decisions.clone());
+        }
         let mut pipeline = AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new(worker_id),
             self.workflow_store.clone(),

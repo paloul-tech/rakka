@@ -366,7 +366,8 @@ impl World {
                         .expect("the registry projects valid policies"),
                 )
                 .with_segments(self.segments.clone())
-                .with_metrics(self.metrics.clone()),
+                .with_metrics(self.metrics.clone())
+                .with_decision_events(self.decisions.clone()),
             ),
         )
         .with_segments(self.segments.clone())

@@ -137,6 +137,97 @@ fn exporter_config_accepts_otel_env_style_values() {
     );
 }
 
+/// A resolved exporter credential survives neither `Debug` nor `Serialize`.
+///
+/// `AgentOtlpExporterConfig::headers` is where an OTLP bearer token lives, and
+/// the config is a field of `AgentOtlpBridgeExport` — a record whose entire
+/// purpose is to be serialized and sent by application code. With both traits
+/// derived, one `tracing::debug!("{export:?}")` or one
+/// `serde_json::to_string(&export)` in a deploying binary wrote the token to a
+/// log file or to disk, which is the one thing the agent kernel forbids
+/// outright. The header *key* is deliberately still visible: "which header is
+/// set" is the question a rejected export raises, and a key is not a secret.
+#[test]
+fn a_resolved_exporter_credential_reaches_neither_debug_nor_serialization() {
+    const TOKEN: &str = "RAKKA-BEARER-SENTINEL";
+
+    let mut headers = AgentAttributes::new();
+    headers.insert("authorization".to_string(), format!("Bearer {TOKEN}"));
+    let config = AgentOtlpExporterConfig {
+        headers,
+        ..AgentOtlpExporterConfig::grpc("http://collector:4317")
+    };
+
+    // In memory it is intact — this is a redaction at the boundary, not a
+    // configuration that has lost the credential it needs to authenticate.
+    assert_eq!(
+        config.headers.get("authorization").map(String::as_str),
+        Some(format!("Bearer {TOKEN}").as_str()),
+        "the credential must still be readable to build an exporter"
+    );
+
+    let formatted = format!("{config:?}");
+    assert!(
+        !formatted.contains(TOKEN),
+        "the credential survives the config's Debug: {formatted}"
+    );
+    assert!(
+        formatted.contains("authorization"),
+        "the header key is withheld too, leaving no way to see which header is \
+         set: {formatted}"
+    );
+
+    let encoded = serde_json::to_string(&config).expect("the config serializes");
+    assert!(
+        !encoded.contains(TOKEN),
+        "the credential survives serializing the config: {encoded}"
+    );
+
+    // And through the record that actually travels, which is the path that
+    // made this reachable from an application at all.
+    let export = AgentOtlpBridgeExport::from_signals(
+        config,
+        resource(),
+        &InMemoryMetricsRecorder::new().snapshot(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("the bridge export builds");
+    assert!(
+        !format!("{export:?}").contains(TOKEN),
+        "the credential survives the bridge record's Debug"
+    );
+    let encoded = serde_json::to_string(&export).expect("the bridge record serializes");
+    assert!(
+        !encoded.contains(TOKEN),
+        "the credential survives serializing the bridge record: {encoded}"
+    );
+
+    // A serialized configuration decodes with no headers at all, rather than
+    // with a plausible-looking placeholder a caller would send as a token.
+    let credentialed = AgentOtlpExporterConfig {
+        headers: config_headers(),
+        ..AgentOtlpExporterConfig::grpc("http://collector:4317")
+    };
+    let encoded = serde_json::to_string(&credentialed).expect("the config serializes");
+    let decoded: AgentOtlpExporterConfig =
+        serde_json::from_str(&encoded).expect("a serialized config decodes");
+    assert!(
+        decoded.headers.is_empty(),
+        "a decoded config carries headers it was never allowed to persist"
+    );
+}
+
+/// One authorization header, for the round-trip half of the test above.
+fn config_headers() -> AgentAttributes {
+    let mut headers = AgentAttributes::new();
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer RAKKA-BEARER-SENTINEL".to_string(),
+    );
+    headers
+}
+
 #[tokio::test]
 async fn bridge_export_routes_metrics_spans_and_logs_to_deterministic_receiver() {
     let metrics = InMemoryMetricsRecorder::new();

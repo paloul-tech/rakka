@@ -53,7 +53,7 @@ use rakka_agent::otel::{agent_instrumentation_scope, AgentGenAiSpanExporter};
 use rakka_agent_workflow::{
     AgentAttributes, AgentLogEvent, AgentOtelInstrumentationScope, AgentOtelResource,
     AgentOtelSpanExport, AgentOtelSpanKind, AgentOtelSpanStatus, AgentOtlpExporterConfig,
-    AgentSpanLink,
+    AgentOtlpProtocol, AgentSpanLink,
 };
 use rakka_core::{
     MetricsRecorder, MetricsSnapshot, OpenTelemetryDataPoint, OpenTelemetryInstrumentKind,
@@ -251,19 +251,59 @@ impl AgentTelemetryExport {
     /// [`AgentOtlpExporterConfig`] is what the agent domain already uses to
     /// describe an exporter — endpoint, protocol, timeout, and headers — so
     /// the configuration the bridge validates is the configuration the real
-    /// exporter receives. Its headers are where **exporter credentials** enter:
-    /// they are read here and never persisted, logged, or exported.
+    /// exporter receives. Every one of those four is now read: the config is
+    /// put through its own `validate()` before anything is built from it, and
+    /// `protocol` is honoured by refusing a transport this binary does not
+    /// implement. It was previously the one field nothing consulted, so an
+    /// `http/protobuf` configuration built three gRPC exporters and pointed
+    /// them at the HTTP port. Its headers are where **exporter credentials** enter:
+    /// they are read here and never persisted, logged, or exported — and that
+    /// is now enforced by the type rather than asserted by this comment.
+    /// `AgentOtlpExporterConfig` withholds its header values from `Debug` and
+    /// omits them from `Serialize` entirely, because the config is a field of
+    /// the serializable `AgentOtlpBridgeExport` and this sentence was true of
+    /// nothing but intent while both traits were derived.
     pub fn install(
         config: &AgentOtlpExporterConfig,
         resource: &AgentOtelResource,
     ) -> Result<Self, String> {
+        // Checked before anything is built from it. It was not, so an endpoint
+        // or header the bridge would refuse produced three exporters that
+        // failed at the transport instead of one error naming the field.
+        config
+            .validate()
+            .map_err(|error| format!("exporter configuration: {error}"))?;
+        // And the protocol is honoured by *refusing* the one this binary does
+        // not implement, rather than by ignoring it. `opentelemetry-otlp` is
+        // pinned here with `default-features = false` and only `grpc-tonic`
+        // among its transports — the workspace manifest records why the pin is
+        // where it is — so `.with_http()` does not exist in this build. Every
+        // exporter below is `.with_tonic()`, and an `http/protobuf`
+        // configuration used to build all three that way and point them at
+        // 4318, this protocol's own default endpoint: every export then failed
+        // at the transport, all three `flush.failures` climbed, and no
+        // configuration error was ever surfaced. Refusing costs a deployment
+        // the same export it was not getting, and tells it why.
+        if config.protocol != AgentOtlpProtocol::Grpc {
+            return Err(format!(
+                "this binary exports over gRPC only, and `{}` is configured: \
+                 `opentelemetry-otlp` is pinned here without its HTTP transport, \
+                 so an HTTP/protobuf endpoint cannot be built rather than \
+                 silently exported to over gRPC",
+                config.protocol.as_env_value()
+            ));
+        }
+        // Once, and before any exporter is built: the three below share one
+        // credential, so parsing it per builder would report the same fault
+        // three times — or, as it did, drop it three times.
+        let metadata = credential_metadata(&config.headers)?;
         let scope = instrumentation_scope(&agent_instrumentation_scope());
         let sdk_resource = sdk_resource(resource);
 
         let mut spans = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(config.traces_endpoint.as_ref().unwrap_or(&config.endpoint))
-            .with_metadata(credential_metadata(&config.headers))
+            .with_metadata(metadata.clone())
             .with_timeout(export_timeout(config))
             .build()
             .map_err(|error| format!("span exporter: {error}"))?;
@@ -279,7 +319,7 @@ impl AgentTelemetryExport {
         let metrics = opentelemetry_otlp::MetricExporter::builder()
             .with_tonic()
             .with_endpoint(config.metrics_endpoint.as_ref().unwrap_or(&config.endpoint))
-            .with_metadata(credential_metadata(&config.headers))
+            .with_metadata(metadata.clone())
             .with_timeout(export_timeout(config))
             .with_temporality(Temporality::Cumulative)
             .build()
@@ -287,7 +327,7 @@ impl AgentTelemetryExport {
         let log_exporter = opentelemetry_otlp::LogExporter::builder()
             .with_tonic()
             .with_endpoint(config.logs_endpoint.as_ref().unwrap_or(&config.endpoint))
-            .with_metadata(credential_metadata(&config.headers))
+            .with_metadata(metadata.clone())
             .with_timeout(export_timeout(config))
             .build()
             .map_err(|error| format!("log exporter: {error}"))?;
@@ -444,20 +484,44 @@ impl AgentTelemetryExport {
         outcome
     }
 
-    /// Force-flushes and shuts down every exporter.
+    /// Force-flushes and shuts down every exporter, and releases the one that
+    /// cannot be shut down.
     ///
     /// This is the shutdown/flush half of the 17.17 application boundary, and
     /// the drain a coordinated shutdown calls.
     ///
+    /// **Takes `self`, and the span exporter is why.** The doc here used to say
+    /// "every exporter" while closing only logs and metrics: `SpanExporter::
+    /// shutdown` takes `&mut self` and this method took `&self`, so the
+    /// exporter that ships every span was the one the drain never touched.
+    /// Widening the receiver to `&mut self` is not the fix, because calling
+    /// `shutdown()` on it does nothing — `opentelemetry-otlp` 0.29's public
+    /// `SpanExporter` implements only `export` and `set_resource`, so it
+    /// inherits the trait's **no-op default** `shutdown` and never reaches the
+    /// `TonicTracesClient::shutdown` that would take its transport. (Its
+    /// `MetricExporter` does implement it, which is why the metric half below
+    /// is real.) Verified against the vendored 0.29 source, and against
+    /// behaviour: an exporter "shut down" that way keeps exporting happily.
+    ///
+    /// So the span transport is released the one way this pin allows — by
+    /// dropping the exporter, which drops the client and its channel — and
+    /// consuming `self` is what makes that a guarantee rather than a hope. Do
+    /// not "restore" a `self.spans.shutdown()` call here: it would return
+    /// `Ok(())`, close nothing, and read as though it did.
+    ///
     /// Async because the log half is a blocking wait that must not run on the
     /// caller's runtime thread — `off_runtime` in this module says why.
-    pub async fn shutdown(&self) -> Result<(), OTelSdkError> {
+    pub async fn shutdown(self) -> Result<(), OTelSdkError> {
         let provider = self.logs.clone();
         let logs = off_runtime(move || provider.shutdown()).await;
         // The metric half needs no blocking thread: `TonicMetricsClient`'s
         // shutdown takes its lock and drops the transport client, with nothing
         // in flight to wait on.
         let metrics = self.metrics.shutdown();
+        // Every half is attempted before any is reported, because a drain that
+        // stopped at the first error would leave a live transport behind for
+        // exactly the failure that most needs draining.
+        // `self` — and with it the span exporter — is dropped here.
         logs.and(metrics)
     }
 
@@ -971,17 +1035,54 @@ fn export_timeout(config: &AgentOtlpExporterConfig) -> Duration {
     Duration::from_millis(config.timeout_ms.unwrap_or(10_000))
 }
 
-fn credential_metadata(headers: &AgentAttributes) -> tonic::metadata::MetadataMap {
+/// The gRPC metadata carrying the exporter's credentials.
+///
+/// A header that cannot be represented is an **error**, not an omission. This
+/// was `if let (Ok(key), Ok(value)) = … { insert }`, so a header tonic could
+/// not parse was skipped in silence: `AgentOtlpExporterConfig::validate` bounds
+/// keys and values but knows nothing of gRPC's metadata rules, so a `-bin` key
+/// or a value carrying a control character passed validation and then vanished
+/// between the configuration and the wire. (A *high* byte does not: those are
+/// obs-text, which `HeaderValue` accepts, so a non-ASCII credential travels
+/// intact and is not one of the cases this refuses. It was worth checking
+/// rather than assuming — the two behave differently.) The exporter came up **unauthenticated**,
+/// the collector rejected every request, and the only signal was the same
+/// `flush.failures` climb an unreachable endpoint produces — with the
+/// configuration that caused it looking entirely well-formed.
+///
+/// Every error names the key and never the value. The value is the credential,
+/// and [`AgentOtlpExporterConfig`] goes to some trouble to keep it out of
+/// `Debug` and out of serialization; putting it in an error string would undo
+/// that at the first log line.
+fn credential_metadata(headers: &AgentAttributes) -> Result<tonic::metadata::MetadataMap, String> {
     let mut metadata = tonic::metadata::MetadataMap::new();
     for (key, value) in headers {
-        if let (Ok(key), Ok(value)) = (
-            key.parse::<tonic::metadata::MetadataKey<_>>(),
-            value.parse::<tonic::metadata::MetadataValue<_>>(),
-        ) {
-            metadata.insert(key, value);
-        }
+        // A `-bin` key is refused rather than guessed at. gRPC binary metadata
+        // is base64 on the wire, and `headers` is a `BTreeMap<String, String>`
+        // that records no encoding — so a configured value could equally be the
+        // raw bytes or already-encoded base64, and choosing wrong sends a
+        // corrupted credential that fails exactly like a missing one. Refusing
+        // is the only answer that cannot be silently wrong.
+        let parsed_key = key
+            .parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
+            .map_err(|_| {
+                format!(
+                    "exporter header `{key}` is not a valid ASCII gRPC metadata \
+                     key; binary (`-bin`) metadata is not supported here, because \
+                     the configuration records no encoding for its value"
+                )
+            })?;
+        let parsed_value = value
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            .map_err(|_| {
+                format!(
+                    "the value of exporter header `{key}` is not valid ASCII gRPC \
+                     metadata, so it cannot be sent as a credential"
+                )
+            })?;
+        metadata.insert(parsed_key, parsed_value);
     }
-    metadata
+    Ok(metadata)
 }
 
 /// The `signal` label values **this binary** writes onto

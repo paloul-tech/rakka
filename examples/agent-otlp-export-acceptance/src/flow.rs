@@ -451,8 +451,25 @@ pub async fn run_acceptance() -> AcceptanceReport {
         !payload.contains(EXPORTER_CREDENTIAL),
         "the exporter credential reached an exported record"
     );
-    lines[9] = "ok 10/12 no prompt, tool argument, result, or exporter credential appears \
-                anywhere in the decoded OTLP payload"
+    // And the record itself, not only what it put on the wire. The resolved
+    // exporter configuration rides `AgentOtlpBridgeExport`, which is `Debug`
+    // and `Serialize` by design — being serializable and application-sent is
+    // the record's entire purpose — so a credential surviving in either is a
+    // leak that no amount of wire redaction reaches. The sweep above read the
+    // decoded payload only, and passed while the bearer token sat one field
+    // away in the record that produced it.
+    assert!(
+        !format!("{bridge:?}").contains(EXPORTER_CREDENTIAL),
+        "the exporter credential survives the bridge record's Debug"
+    );
+    assert!(
+        !serde_json::to_string(&bridge)
+            .expect("the bridge record serializes")
+            .contains(EXPORTER_CREDENTIAL),
+        "the exporter credential survives serializing the bridge record"
+    );
+    lines[9] = "ok 10/12 no prompt, tool argument, result, or exporter credential appears in \
+                the decoded OTLP payload, the bridge record's Debug, or its serialization"
         .to_string();
 
     // 11/12 — the durable outcome is what it would have been untraced.
@@ -467,9 +484,24 @@ pub async fn run_acceptance() -> AcceptanceReport {
         1,
         "the external system was called exactly once"
     );
-    lines[10] = "ok 11/12 the run completed and the tool ran exactly once: telemetry changed \
-                 no durable outcome"
-        .to_string();
+    // The durable decision record of specification 17.7, and the reason this
+    // count is here rather than a `!is_empty()`. Every one of this run's four
+    // deciding transitions is committed by the *delivery* — that is what
+    // delivering a model result is — so an unwired delivery leaves exactly the
+    // one decision the sharded registration commits on its own and silently
+    // drops the other three. `rakka.agent.decisions` still appears in the
+    // exported surface either way, which is why the metric-name assertion
+    // above cannot see this: the sink's contents are the only witness.
+    let decisions = world.decisions.events(&run_scope).len();
+    assert_eq!(
+        decisions, 4,
+        "every deciding transition of the run is durably recorded; a delivery \
+         wired for segments and metrics but not decisions records only the first"
+    );
+    lines[10] = format!(
+        "ok 11/12 the run completed, the tool ran exactly once, and all {decisions} deciding \
+         transitions were durably recorded: telemetry changed no durable outcome"
+    );
 
     // 12/12 — the loss counters exist and read clean on a healthy path.
     let snapshot = world.metrics.snapshot();

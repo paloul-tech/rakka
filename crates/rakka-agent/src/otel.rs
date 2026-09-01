@@ -1000,6 +1000,10 @@ impl AgentGenAiSpanExporter {
     }
 
     /// How many mapped spans are waiting to be exported.
+    ///
+    /// `0` when the buffer is unreadable as well as when it is empty, so this
+    /// is not the value to publish as a queue-depth gauge — see the read in
+    /// [`Self::bridge_export`], which keeps the two apart.
     #[must_use]
     pub fn buffered(&self) -> usize {
         self.spans.lock().map(|spans| spans.len()).unwrap_or(0)
@@ -1050,10 +1054,20 @@ impl AgentGenAiSpanExporter {
         logs: Vec<AgentLogEvent>,
     ) -> AgentOtlpResult<AgentOtlpBridgeExport> {
         if let Some(metrics) = self.metrics.as_ref() {
+            // The lock is read here rather than through `buffered()`, which
+            // cannot distinguish an empty buffer from an unreadable one and
+            // answers `0` for both. `Some(0)` is a drained, healthy queue;
+            // poisoning is sticky, so a sink that will now drop every span it
+            // is handed for the life of the process would publish exactly that
+            // reading on every flush, forever. `None` is the only honest
+            // answer when the depth cannot be observed — the same distinction
+            // `InMemoryAgentSegmentSink::record` draws one type over, and the
+            // one `AgentSegmentSinkHealth::publish` documents.
+            let queued = self.spans.lock().ok().map(|spans| spans.len());
             self.health.publish(
                 metrics.as_ref(),
                 self.backend_name(),
-                Some(self.buffered()),
+                queued,
                 self.dropped(),
                 self.unmappable(),
             );
@@ -1147,6 +1161,79 @@ mod tests {
         assert!(
             schema_url.ends_with(AGENT_GENAI_CONVENTION_REVISION),
             "the schema url and the pinned revision must agree"
+        );
+    }
+
+    /// A poisoned buffer publishes no depth, rather than a drained one.
+    ///
+    /// The same distinction `InMemoryAgentSegmentSink::record` draws, at the
+    /// exporter's own flush. `bridge_export` published `Some(self.buffered())`,
+    /// and `buffered()` answers `0` for an unreadable buffer exactly as it
+    /// does for an empty one — so once a panic had poisoned the ring, every
+    /// flush for the life of the process reported
+    /// `rakka.agent.telemetry.export.queue = 0`: a healthy, drained pipeline,
+    /// for an exporter that now drops every span it is handed. The lock is
+    /// private, which is why this lives beside the code rather than in
+    /// `tests/otel_span_mapping.rs`.
+    #[test]
+    fn a_poisoned_buffer_publishes_no_queue_depth() {
+        let metrics = Arc::new(rakka_core::InMemoryMetricsRecorder::new());
+        let exporter = Arc::new(AgentGenAiSpanExporter::new().with_metrics(metrics.clone()));
+        let traced = AgentTelemetryContext {
+            trace_parent: Some(
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+            ),
+            ..AgentTelemetryContext::default()
+        };
+        exporter.record(
+            &AgentTelemetrySegment::new(
+                AgentSegmentOperation::Decide { phase: "propose" },
+                AgentTimestampMillis::new(1),
+                AgentTimestampMillis::new(2),
+            )
+            .telemetry(traced)
+            .ok(),
+        );
+
+        // One healthy flush, so there is a real depth on record to contrast
+        // the poisoned one against.
+        exporter
+            .bridge_export(
+                AgentOtlpExporterConfig::grpc("http://collector:4317"),
+                AgentOtelResource::new("rakka-agent"),
+                &metrics.snapshot(),
+                Vec::new(),
+            )
+            .expect("the first flush builds");
+
+        let poisoner = Arc::clone(&exporter);
+        let _panicked = std::thread::spawn(move || {
+            let _held = poisoner.spans.lock().expect("the lock is not yet poisoned");
+            panic!("poisoning the ring");
+        })
+        .join();
+        assert!(exporter.spans.lock().is_err(), "the lock is poisoned");
+
+        exporter
+            .bridge_export(
+                AgentOtlpExporterConfig::grpc("http://collector:4317"),
+                AgentOtelResource::new("rakka-agent"),
+                &metrics.snapshot(),
+                Vec::new(),
+            )
+            .expect("the flush still builds, over the spans it cannot read");
+
+        let depths: Vec<u64> = metrics
+            .snapshot()
+            .observations_named(crate::observability::METRIC_AGENT_TELEMETRY_EXPORT_QUEUE)
+            .iter()
+            .map(|observation| observation.value() as u64)
+            .collect();
+        assert_eq!(
+            depths,
+            vec![1],
+            "the poisoned flush adds no depth of its own; the gauge holds the \
+             last one this exporter could actually observe"
         );
     }
 

@@ -3004,6 +3004,7 @@ where
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
     segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
     metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
+    decisions: Option<Arc<dyn crate::observability::AgentDecisionEventSink>>,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -3029,6 +3030,7 @@ where
             delegation: None,
             segments: None,
             metrics: None,
+            decisions: None,
         }
     }
 
@@ -3083,6 +3085,24 @@ where
         self
     }
 
+    /// Wires the entity this delivery drives with a decision-event sink.
+    ///
+    /// The third field to need this and the third to have been missed. The
+    /// delivered model result *is* the deciding transition of a model turn —
+    /// it is the only place the turn's decision is recorded — so a sharded
+    /// registration wired with `with_decision_events` while the delivery
+    /// beside it is not writes no specification-17.7 record for exactly the
+    /// turns a model answered, and counts no `rakka.agent.decisions`. Both
+    /// halves read as wired; neither reports the gap.
+    #[must_use]
+    pub fn with_decision_events(
+        mut self,
+        sink: Arc<dyn crate::observability::AgentDecisionEventSink>,
+    ) -> Self {
+        self.decisions = Some(sink);
+        self
+    }
+
     /// Wires the entities this delivery builds to serve delegation — the
     /// delivered model result is where a fan-out turn is intercepted, so an
     /// unwired delivery would refuse the coordination and await verbs the
@@ -3119,6 +3139,9 @@ where
             }
             if let Some(metrics) = &self.metrics {
                 entity = entity.with_metrics(metrics.clone());
+            }
+            if let Some(decisions) = &self.decisions {
+                entity = entity.with_decision_events(decisions.clone());
             }
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity

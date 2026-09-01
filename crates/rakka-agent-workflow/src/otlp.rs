@@ -223,7 +223,15 @@ pub enum AgentOtlpSignal {
 }
 
 /// Application-owned OTLP exporter configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` and `Serialize` are **not** derived, because [`Self::headers`] is
+/// where a resolved credential lives — an OTLP endpoint is authenticated with
+/// an `authorization: Bearer …` header — and this type is reachable from
+/// [`AgentOtlpBridgeExport`], whose whole purpose is to be serialized and sent
+/// by application code. A derived pair meant one `tracing::debug!("{config:?}")`
+/// or one `serde_json::to_string(&export)` wrote the bearer token to a log file
+/// or to disk. See the two impls below.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct AgentOtlpExporterConfig {
     /// Base endpoint used when a signal-specific endpoint is not supplied.
     pub endpoint: String,
@@ -238,7 +246,69 @@ pub struct AgentOtlpExporterConfig {
     /// Export timeout budget in milliseconds.
     pub timeout_ms: Option<u64>,
     /// Headers to attach to outbound OTLP requests.
+    ///
+    /// Resolved credential material. It is read in memory to build an
+    /// exporter and travels no further: it is withheld from [`fmt::Debug`] and
+    /// omitted from `Serialize` entirely, so a serialized configuration always
+    /// decodes with this empty. That is deliberate rather than lossy — a
+    /// serialized configuration is a persisted one, and persisting a resolved
+    /// credential is what the agent kernel forbids outright. An application
+    /// that needs the header at the far end resolves it there, from its own
+    /// secret store, the way it resolved this one.
+    #[serde(default)]
     pub headers: AgentAttributes,
+}
+
+/// Header keys with their values withheld.
+///
+/// The keys are kept because "which header is set" is the question an operator
+/// debugging a rejected export actually has, and a key is not a secret; the
+/// values are the credential.
+struct RedactedHeaders<'a>(&'a AgentAttributes);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_map()
+            .entries(self.0.keys().map(|key| (key, "[redacted]")))
+            .finish()
+    }
+}
+
+impl fmt::Debug for AgentOtlpExporterConfig {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentOtlpExporterConfig")
+            .field("endpoint", &self.endpoint)
+            .field("traces_endpoint", &self.traces_endpoint)
+            .field("metrics_endpoint", &self.metrics_endpoint)
+            .field("logs_endpoint", &self.logs_endpoint)
+            .field("protocol", &self.protocol)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .finish()
+    }
+}
+
+// Serialization is hand-written for one reason: `headers` must never reach the
+// output. A `#[serde(skip_serializing)]` on the field would do it too, but it
+// fails open — a *new* field is serialized by default, so the next
+// credential-bearing field added to this struct would ship silently. Writing
+// the fields out explicitly fails closed instead: a new field is absent from
+// the output until someone adds it here, and the omission is visible.
+impl Serialize for AgentOtlpExporterConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("AgentOtlpExporterConfig", 6)?;
+        state.serialize_field("endpoint", &self.endpoint)?;
+        state.serialize_field("traces_endpoint", &self.traces_endpoint)?;
+        state.serialize_field("metrics_endpoint", &self.metrics_endpoint)?;
+        state.serialize_field("logs_endpoint", &self.logs_endpoint)?;
+        state.serialize_field("protocol", &self.protocol)?;
+        state.serialize_field("timeout_ms", &self.timeout_ms)?;
+        state.end()
+    }
 }
 
 impl AgentOtlpExporterConfig {

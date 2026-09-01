@@ -18,13 +18,17 @@
 
 use std::sync::Arc;
 
+use opentelemetry_otlp::WithExportConfig as _;
+use opentelemetry_sdk::trace::SpanExporter as _;
 use rakka_a2a::agents::A2AAgentTarget;
 use rakka_agent::otel::AgentGenAiSpanExporter;
 use rakka_agent::{
     AgentRunStatus, AgentSegmentOperation, AgentSegmentSink, AgentTelemetrySegment,
     METRIC_AGENT_TELEMETRY_EXPORT_DROPS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
 };
-use rakka_agent_workflow::{AgentTelemetryContext, AgentTimestampMillis};
+use rakka_agent_workflow::{
+    AgentOtlpExporterConfig, AgentOtlpProtocol, AgentTelemetryContext, AgentTimestampMillis,
+};
 use rakka_core::InMemoryMetricsRecorder;
 use rakka_example_agent_otlp_export_acceptance::collector::InProcessCollector;
 use rakka_example_agent_otlp_export_acceptance::flow::{
@@ -229,6 +233,116 @@ fn a_failed_flush_strands_nothing() {
     assert_eq!(exporter.buffered(), 0, "and only then is it cleared");
 }
 
+/// A protocol this binary cannot export over is refused, not ignored.
+///
+/// `AgentOtlpExporterConfig::protocol` was the one field `install` never read.
+/// All three exporters are `.with_tonic()` — `opentelemetry-otlp` is pinned
+/// here with only `grpc-tonic` among its transports — so an `http/protobuf`
+/// configuration built three gRPC exporters and aimed them at 4318, that
+/// protocol's own default endpoint. `install` returned `Ok`, every export then
+/// failed at the transport, all three `flush.failures` climbed, and nothing
+/// anywhere said the configuration was the reason. A deployment loses the same
+/// export either way; this way it is told why.
+///
+/// `#[tokio::test]` for the positive control only: refusing needs no runtime,
+/// because it happens before an exporter exists — which is itself the property
+/// under test — while the gRPC install below builds real tonic clients and
+/// panics outside a reactor.
+#[tokio::test]
+async fn an_http_protobuf_configuration_is_refused_rather_than_exported_over_grpc() {
+    let config = AgentOtlpExporterConfig {
+        protocol: AgentOtlpProtocol::HttpProtobuf,
+        ..exporter_config("http://collector:4318", EXPORTER_CREDENTIAL)
+    };
+
+    let refused = AgentTelemetryExport::install(&config, &export_resource())
+        .expect_err("an unimplemented transport is refused");
+    assert!(
+        refused.contains("http/protobuf"),
+        "the refusal must name the protocol that was configured: {refused}"
+    );
+    assert!(
+        !refused.contains(EXPORTER_CREDENTIAL),
+        "and must not quote the credential while doing it: {refused}"
+    );
+
+    // The gRPC configuration this binary does implement still installs, so the
+    // refusal is about the transport and not about the rest of the config.
+    let installed = AgentTelemetryExport::install(
+        &exporter_config(UNREACHABLE, EXPORTER_CREDENTIAL),
+        &export_resource(),
+    )
+    .expect("the implemented transport still builds");
+    let _drained = installed.shutdown().await;
+}
+
+/// A credential that cannot be sent is an error, not a silent omission.
+///
+/// `AgentOtlpExporterConfig::validate` bounds header keys and values but knows
+/// nothing of gRPC's metadata rules, so both headers below pass it. The
+/// metadata builder then used to skip whatever tonic could not parse, and the
+/// exporter came up **unauthenticated** — the collector rejecting every
+/// request, and `flush.failures` climbing exactly as it does for an endpoint
+/// nothing is listening on. The one thing no signal could tell an operator is
+/// that the credential never left the process.
+///
+/// The refusal names the header key and never its value, because the value is
+/// the credential and this binary works hard elsewhere to keep it out of
+/// `Debug` and serialization.
+#[test]
+fn a_credential_that_cannot_be_sent_is_refused_rather_than_dropped() {
+    let cases = [
+        // Binary metadata: legal gRPC, but the configuration records no
+        // encoding for the value, so it is refused rather than guessed at.
+        ("authorization-bin", format!("Bearer {EXPORTER_CREDENTIAL}")),
+        // A control character in the value. Not a high byte: those are
+        // obs-text, which `HeaderValue` accepts, so a non-ASCII credential
+        // reaches the wire intact and is *not* the failure mode here.
+        (
+            "authorization",
+            format!("Bearer {EXPORTER_CREDENTIAL}\u{007f}"),
+        ),
+    ];
+
+    for (key, value) in cases {
+        let mut config = exporter_config(UNREACHABLE, EXPORTER_CREDENTIAL);
+        config.headers.clear();
+        config.headers.insert(key.to_string(), value);
+        config
+            .validate()
+            .expect("the header passes the config's own validation, which is the point");
+
+        let refused = AgentTelemetryExport::install(&config, &export_resource())
+            .expect_err("a credential that cannot be sent is refused");
+        assert!(
+            refused.contains(key),
+            "the refusal must name the header that failed: {refused}"
+        );
+        assert!(
+            !refused.contains(EXPORTER_CREDENTIAL),
+            "and must not quote the credential while doing it: {refused}"
+        );
+    }
+}
+
+/// A configuration the bridge would refuse is refused before any exporter exists.
+///
+/// `install` never called `validate()`, so a blank endpoint — the field's own
+/// validation error — produced three live exporters that failed one request at
+/// a time instead of one error naming the field.
+#[test]
+fn an_invalid_configuration_is_refused_before_any_exporter_is_built() {
+    let refused = AgentTelemetryExport::install(
+        &exporter_config("", EXPORTER_CREDENTIAL),
+        &export_resource(),
+    )
+    .expect_err("a blank endpoint is refused");
+    assert!(
+        refused.contains("endpoint"),
+        "the refusal must name the field that failed: {refused}"
+    );
+}
+
 /// Every declared export signal is one this binary actually writes.
 ///
 /// The bijection `rakka_agent::AGENT_TELEMETRY_SIGNALS` keeps for the crate's
@@ -274,6 +388,12 @@ async fn every_declared_export_signal_is_written() {
             "`{signal}` is declared but this binary never writes it; wrote {written:?}"
         );
     }
+
+    // Drained, like every other arm. An exporter left open holds a live tonic
+    // transport and the batch log processor's thread past the end of the test,
+    // and until the span half was added to `shutdown` there was no arm here
+    // that would have noticed it staying open.
+    let _drained = export.shutdown().await;
 }
 
 fn log_event() -> rakka_agent_workflow::AgentLogEvent {
@@ -372,6 +492,62 @@ async fn the_in_process_receiver_accepts_what_the_walk_ships() {
         vec!["rakka-agent-otlp-export-acceptance".to_string()],
         "every exported ResourceSpans names the service that produced it"
     );
+
+    // Drained, like every other arm. An exporter left open holds a live tonic
+    // transport and the batch log processor's thread past the end of the test,
+    // and until the span half was added to `shutdown` there was no arm here
+    // that would have noticed it staying open.
+    let _drained = export.shutdown().await;
+}
+
+/// The pinned span exporter's `shutdown` is still a no-op — a drift guard.
+///
+/// `AgentTelemetryExport::shutdown` releases the span transport by *dropping*
+/// the exporter rather than by calling `shutdown()` on it, and this is the
+/// fact that makes that the right choice: `opentelemetry-otlp` 0.29's public
+/// `SpanExporter` implements only `export` and `set_resource`, so it inherits
+/// the trait's no-op default `shutdown` and never reaches the
+/// `TonicTracesClient::shutdown` that would take its transport.
+///
+/// This asserts the workaround is still needed. When a future
+/// `opentelemetry-otlp` implements it, the last line starts failing — and that
+/// is the signal to close the span exporter explicitly and delete this test,
+/// rather than carrying a drop-based drain nobody remembers the reason for.
+#[tokio::test]
+async fn the_pinned_span_exporters_shutdown_is_still_a_no_op() {
+    let collector = InProcessCollector::start().await;
+    let export = AgentTelemetryExport::install(
+        &exporter_config(collector.endpoint(), EXPORTER_CREDENTIAL),
+        &export_resource(),
+    )
+    .expect("the exporter builds");
+    let world = World::new(scripted_adapter(), agent_target());
+    let _run_scope = drive_run(&world).await;
+    let bridge = export
+        .bridge(&world.spans, &world.metrics.snapshot(), Vec::new())
+        .expect("the bridge builds");
+    let batch = export.span_batch(&bridge.spans);
+    assert!(!batch.is_empty(), "the run produced spans to ship");
+
+    // A raw exporter, because `AgentTelemetryExport::shutdown` consumes itself
+    // precisely so this cannot be done through it.
+    let mut raw = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(collector.endpoint())
+        .build()
+        .expect("a span exporter builds");
+    raw.export(batch.clone())
+        .await
+        .expect("the receiver accepts a batch from a live exporter");
+    raw.shutdown()
+        .expect("the wrapper's `shutdown` reports success, as a no-op does");
+    raw.export(batch).await.expect(
+        "`SpanExporter::shutdown` now closes the exporter: opentelemetry-otlp \
+         implements it, so `AgentTelemetryExport::shutdown` should close the \
+         span half explicitly and this drift guard should be deleted",
+    );
+
+    let _drained = export.shutdown().await;
 }
 
 /// A bridge that cannot build counts all three signals it just lost.
@@ -439,6 +615,12 @@ async fn a_refused_bridge_counts_every_signal_it_lost() {
         collector.received().traces().is_empty(),
         "and nothing was shipped, so the count is the only record of the loss"
     );
+
+    // Drained, like every other arm. An exporter left open holds a live tonic
+    // transport and the batch log processor's thread past the end of the test,
+    // and until the span half was added to `shutdown` there was no arm here
+    // that would have noticed it staying open.
+    let _drained = export.shutdown().await;
 }
 
 /// A log record reaches the wire with each field in the slot OTLP reads it from.
@@ -560,4 +742,10 @@ async fn an_exported_log_record_carries_its_name_scope_and_severity() {
         !fatal.span_id.is_empty(),
         "and so did the span it was propagated from"
     );
+
+    // Drained, like every other arm. An exporter left open holds a live tonic
+    // transport and the batch log processor's thread past the end of the test,
+    // and until the span half was added to `shutdown` there was no arm here
+    // that would have noticed it staying open.
+    let _drained = export.shutdown().await;
 }
