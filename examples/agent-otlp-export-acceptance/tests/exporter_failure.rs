@@ -42,6 +42,14 @@ use rakka_example_agent_otlp_export_acceptance::wiring::World;
 /// failure, not about timeouts.
 const UNREACHABLE: &str = "http://127.0.0.1:1";
 
+/// The durable `traceparent` the log arm correlates against.
+const TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+/// The trace id half of [`TRACEPARENT`], as OTLP's 16 raw bytes.
+const INGRESS_TRACE_ID: [u8; 16] = [
+    0x0a, 0xf7, 0x65, 0x19, 0x16, 0xcd, 0x43, 0xdd, 0x84, 0x48, 0xeb, 0x21, 0x1c, 0x80, 0x31, 0x9c,
+];
+
 fn agent_target() -> A2AAgentTarget {
     A2AAgentTarget::new(
         rakka_agent::AgentId::new("support-agent").expect("the agent id is valid"),
@@ -114,7 +122,7 @@ async fn an_unreachable_collector_changes_no_durable_outcome() {
 
     // The drain claim: shutdown still returns rather than hanging on a dead
     // endpoint. A drain that blocks here would block a coordinated shutdown.
-    let _drained = export.shutdown();
+    let _drained = export.shutdown().await;
 }
 
 /// A saturated buffer drops, counts, and keeps the run's outcome intact.
@@ -315,7 +323,7 @@ async fn optional_live_collector_export_is_gated() {
         "a live Collector accepts the batch this binary builds"
     );
     assert!(outcome.spans > 0, "and is handed the run's spans");
-    export.shutdown().expect("the live exporters drain");
+    export.shutdown().await.expect("the live exporters drain");
 }
 
 /// Keeps the in-process receiver reachable from this suite's imports.
@@ -338,8 +346,218 @@ async fn the_in_process_receiver_accepts_what_the_walk_ships() {
         )
         .await;
     assert_eq!(outcome.failed_signals, 0, "the receiver accepts the batch");
+    let traces = collector.received().traces();
+    assert!(!traces.is_empty(), "and holds what it was handed");
+
+    // The span exporter's resource, which is set nowhere near the other two.
+    // `SpanExporter` takes it through `set_resource` rather than a builder or
+    // a provider and starts at `Resource::default()`, so a missed call leaves
+    // every span under `unknown_service` while metrics and logs carry the
+    // deployment — and nothing else in this suite reads the field.
+    let service: Vec<String> = traces
+        .iter()
+        .filter_map(|resource| resource.resource.as_ref())
+        .flat_map(|resource| resource.attributes.iter())
+        .filter(|attribute| attribute.key == "service.name")
+        .filter_map(|attribute| attribute.value.as_ref())
+        .filter_map(|value| match &value.value {
+            Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(name)) => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        service,
+        vec!["rakka-agent-otlp-export-acceptance".to_string()],
+        "every exported ResourceSpans names the service that produced it"
+    );
+}
+
+/// A bridge that cannot build counts all three signals it just lost.
+///
+/// This arm is not the unreachable-endpoint one. There the bridge builds and
+/// `ship` counts each signal as its own export fails; here the batch is never
+/// built, so **every** signal is lost in one step — and that arm raised
+/// `failed_signals` to 3 while calling `count_failure` for none of them. A
+/// deployment with a misconfigured endpoint takes it on every periodic flush,
+/// losing everything with `rakka.agent.telemetry.flush.failures` reading zero.
+#[tokio::test]
+async fn a_refused_bridge_counts_every_signal_it_lost() {
+    let collector = InProcessCollector::start().await;
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let export = AgentTelemetryExport::install(
+        &exporter_config(collector.endpoint(), EXPORTER_CREDENTIAL),
+        &export_resource(),
+    )
+    .expect("the exporter builds against a reachable endpoint")
+    .with_metrics(metrics.clone());
+    let world = World::new(scripted_adapter(), agent_target());
+    let _run_scope = drive_run(&world).await;
+
+    // A blank event name is one of the two documented ways `bridge` refuses,
+    // and the one that leaves the endpoint healthy — so a failure here can
+    // only be the bridge's, never the socket's.
+    let outcome = export
+        .flush(
+            &world.spans,
+            &world.metrics.snapshot(),
+            vec![rakka_agent_workflow::AgentLogEvent::new(
+                "",
+                rakka_agent_workflow::AgentLogSeverity::Info,
+                AgentTimestampMillis::new(1),
+                AgentTimestampMillis::new(2),
+            )],
+            &world.exemplars,
+        )
+        .await;
+    assert_eq!(
+        outcome.failed_signals,
+        AGENT_OTLP_EXPORT_SIGNALS.len(),
+        "a refused bridge loses every signal"
+    );
+
+    let counted: std::collections::BTreeSet<String> = metrics
+        .snapshot()
+        .observations_named(METRIC_AGENT_TELEMETRY_FLUSH_FAILURES)
+        .iter()
+        .filter_map(|observation| {
+            observation
+                .attributes()
+                .iter()
+                .find(|attribute| attribute.key() == "signal")
+                .map(|attribute| attribute.value().to_string())
+        })
+        .collect();
+    for signal in AGENT_OTLP_EXPORT_SIGNALS {
+        assert!(
+            counted.contains(*signal),
+            "`{signal}` was lost and not counted; counted {counted:?}"
+        );
+    }
     assert!(
-        !collector.received().traces().is_empty(),
-        "and holds what it was handed"
+        collector.received().traces().is_empty(),
+        "and nothing was shipped, so the count is the only record of the loss"
+    );
+}
+
+/// A log record reaches the wire with each field in the slot OTLP reads it from.
+///
+/// Nothing in this suite decoded an exported log record before, and four
+/// defects were living in that one gap: the event name written into `target`,
+/// which OTLP reads as the **`ScopeLogs` grouping key** rather than as a name;
+/// `event_name` and `severity_text` exported empty as a result; the pinned
+/// instrumentation scope replaced by a bare `"rakka.agent"`; and every band
+/// above WARN — `AgentLogSeverity::Fatal` among them — collapsed onto ERROR.
+///
+/// Each assertion below fails on exactly one of those, and the two records
+/// carry deliberately different event names: under the old mapping they
+/// arrived as two scope blocks named after the events, so the "one scope"
+/// assertion is what pins `target` down.
+#[tokio::test]
+async fn an_exported_log_record_carries_its_name_scope_and_severity() {
+    let collector = InProcessCollector::start().await;
+    let export = AgentTelemetryExport::install(
+        &exporter_config(collector.endpoint(), EXPORTER_CREDENTIAL),
+        &export_resource(),
+    )
+    .expect("the exporter builds");
+    let world = World::new(scripted_adapter(), agent_target());
+
+    let outcome = export
+        .flush(
+            &world.spans,
+            &world.metrics.snapshot(),
+            vec![
+                log_event(),
+                rakka_agent_workflow::AgentLogEvent::new(
+                    "rakka.agent.run.failed",
+                    rakka_agent_workflow::AgentLogSeverity::Fatal,
+                    AgentTimestampMillis::new(3),
+                    AgentTimestampMillis::new(4),
+                )
+                .telemetry_context(&AgentTelemetryContext {
+                    trace_parent: Some(TRACEPARENT.to_string()),
+                    ..AgentTelemetryContext::default()
+                })
+                .expect("the durable trace context applies"),
+            ],
+            &world.exemplars,
+        )
+        .await;
+    assert_eq!(outcome.failed_signals, 0, "the receiver accepts the logs");
+    assert_eq!(outcome.logs, 2, "and both records were emitted");
+
+    let received = collector.received().logs();
+    let scopes: Vec<_> = received
+        .iter()
+        .flat_map(|resource| resource.scope_logs.iter())
+        .collect();
+    assert_eq!(
+        scopes.len(),
+        1,
+        "two event names must not split one batch into two scope blocks, saw {scopes:?}"
+    );
+    let scope = scopes[0].scope.as_ref().expect("the block names its scope");
+    let pinned = rakka_agent::otel::agent_instrumentation_scope();
+    assert_eq!(
+        scope.name, pinned.name,
+        "the pinned scope name reached logs"
+    );
+
+    // What the pinned SDK can carry, and what it drops. `emit_logs` builds the
+    // record on the full pinned scope, but 0.29's log transform reduces it:
+    // `group_logs_by_resource_and_scope` always passes its grouping key as the
+    // `Some(target)` arm of `InstrumentationScope::from`, and that arm hardcodes
+    // `version: String::new()` and `attributes: vec![]`. Only the name survives
+    // — and only because no `target` is set, so the key falls back to the
+    // scope's own name. The `ScopeLogs.schema_url` beside it is the *resource's*
+    // schema URL, which is a different claim and is deliberately unset.
+    //
+    // Asserted as empty rather than left unchecked so a future SDK bump that
+    // fixes the transform fails here instead of quietly changing the wire.
+    assert!(
+        scope.version.is_empty(),
+        "opentelemetry-proto 0.29 cannot carry a log scope version; if this now \
+         holds `{}`, assert it equals the pinned version instead",
+        scope.version
+    );
+    assert!(
+        scopes[0].schema_url.is_empty(),
+        "the log block's schema URL follows the resource, which declares none"
+    );
+
+    let records = &scopes[0].log_records;
+    assert_eq!(records.len(), 2, "both records are in the one block");
+    let names: std::collections::BTreeSet<&str> = records
+        .iter()
+        .map(|record| record.event_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["rakka.agent.run.failed", "rakka.agent.run.transition"]
+            .into_iter()
+            .collect(),
+        "each record carries its own event name in `event_name`"
+    );
+
+    let fatal = records
+        .iter()
+        .find(|record| record.event_name == "rakka.agent.run.failed")
+        .expect("the fatal record arrived");
+    assert_eq!(
+        fatal.severity_number,
+        i32::from(rakka_agent_workflow::AgentLogSeverity::Fatal.severity_number()),
+        "a fatal exports as FATAL, not as the ERROR the catch-all made of it"
+    );
+    assert_eq!(fatal.severity_text, "FATAL", "and names the band it is in");
+    assert_eq!(
+        fatal.trace_id,
+        INGRESS_TRACE_ID.to_vec(),
+        "the durable trace context reached the record"
+    );
+    assert!(
+        !fatal.span_id.is_empty(),
+        "and so did the span it was propagated from"
     );
 }

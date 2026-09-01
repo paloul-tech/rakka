@@ -168,14 +168,23 @@ pub async fn run_acceptance() -> AcceptanceReport {
 
     let run_scope = drive_run(&world).await;
 
-    // One flush of everything the run produced.
+    // One flush of everything the run produced — logs included. The sweep at
+    // 10/12 reads the decoded payload of all three signals, and shipping an
+    // always-empty logs vector made a third of that claim vacuous: it swept a
+    // formatted `[]` and would have printed the same line with the record
+    // redaction removed entirely.
     let bridge = export
-        .bridge(&world.spans, &world.metrics.snapshot(), Vec::new())
+        .bridge(
+            &world.spans,
+            &world.metrics.snapshot(),
+            vec![walk_log_event()],
+        )
         .expect("the bridge export builds");
     let span_batch = export.span_batch(&bridge.spans);
     let outcome = export.ship(&bridge, &world.exemplars).await;
     export
         .shutdown()
+        .await
         .expect("the exporters drain and shut down");
 
     lines[0] = format!(
@@ -323,6 +332,41 @@ pub async fn run_acceptance() -> AcceptanceReport {
         with_exemplar > 0,
         "no exported histogram carried an exemplar, so 17.12's link is a promise only"
     );
+    // An exemplar that a backend drops carries no link, so the link is not the
+    // whole claim: the sample has to be a value the distribution could have
+    // produced, at an instant inside the window it was collected in. Both were
+    // wrong at once — the value was the point's *cumulative* `sum`, which after
+    // a few observations sits past the `+Inf` edge of its own histogram, and
+    // the time came from the agent domain's logical clock, dating every
+    // exemplar to 1970 while its data point opened at `SystemTime::now()`.
+    for (name, histogram) in &histograms {
+        for point in &histogram.data_points {
+            for exemplar in &point.exemplars {
+                let value = match exemplar.value {
+                    Some(opentelemetry_proto::tonic::metrics::v1::exemplar::Value::AsDouble(
+                        value,
+                    )) => value,
+                    other => panic!("{name} exported an exemplar with no double value: {other:?}"),
+                };
+                let sum = point.sum.unwrap_or_default();
+                assert!(
+                    (value * point.count as f64 - sum).abs() < 1e-9,
+                    "{name}'s exemplar must be a value from the distribution, not its \
+                     running total: {value} against sum {sum} over {} observations",
+                    point.count
+                );
+                assert!(
+                    exemplar.time_unix_nano >= point.start_time_unix_nano
+                        && exemplar.time_unix_nano <= point.time_unix_nano,
+                    "{name}'s exemplar is dated outside the window it was collected in, \
+                     so a backend would drop it: {} not in {}..={}",
+                    exemplar.time_unix_nano,
+                    point.start_time_unix_nano,
+                    point.time_unix_nano
+                );
+            }
+        }
+    }
     lines[7] = format!(
         "ok  8/12 {with_exemplar} of {} exported histograms carry an exemplar linking to the \
          run's trace",
@@ -346,6 +390,34 @@ pub async fn run_acceptance() -> AcceptanceReport {
         format!("ok  9/12 {wire_spans} spans and every metric crossed a real OTLP gRPC socket");
 
     // 10/12 — scenario 25 at the last boundary it could leak from.
+    //
+    // The log half of the sweep is only a claim if a log record arrived, and
+    // only a claim about the *allowlist* if that record was carrying something
+    // the allowlist has to remove. Both are asserted here, before the sweep
+    // reads the same payload.
+    let wire_logs: Vec<_> = received
+        .logs()
+        .iter()
+        .flat_map(|resource| resource.scope_logs.iter())
+        .flat_map(|scope| scope.log_records.iter())
+        .cloned()
+        .collect();
+    assert_eq!(
+        wire_logs.len(),
+        1,
+        "the walk's log record reached the receiver, so the sweep covers logs"
+    );
+    let kept: Vec<&str> = wire_logs[0]
+        .attributes
+        .iter()
+        .map(|attribute| attribute.key.as_str())
+        .collect();
+    assert_eq!(
+        kept,
+        vec![rakka_agent_workflow::AGENT_LOG_ATTR_CORRELATION_ID],
+        "the log allowlist kept the correlation id and dropped the key carrying content"
+    );
+
     let payload = format!(
         "{:?}{:?}{:?}",
         received.traces(),
@@ -571,6 +643,26 @@ pub async fn drive_run(world: &World) -> AgentRunScope {
 
     pump().await;
     run_scope
+}
+
+/// The one durable log record the walk ships, so 10/12 sweeps all three signals.
+///
+/// It carries exactly one attribute of each kind the allowlist decides
+/// between: `correlation_id` is on the log vocabulary and must survive to the
+/// wire, and `prompt.text` is not — it holds a content sentinel, so a record
+/// that reached the receiver with it is the leak scenario 25 forbids.
+fn walk_log_event() -> rakka_agent_workflow::AgentLogEvent {
+    rakka_agent_workflow::AgentLogEvent::new(
+        "rakka.agent.run.transition",
+        rakka_agent_workflow::AgentLogSeverity::Info,
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .attribute(
+        rakka_agent_workflow::AGENT_LOG_ATTR_CORRELATION_ID,
+        "walk-1",
+    )
+    .attribute("prompt.text", CONTENT_SENTINELS[0])
 }
 
 fn run_scope_of(task_scope: &AgentTaskScope) -> AgentRunScope {
