@@ -25,7 +25,7 @@ The agent domain (`docs/rakka-agents.md`) ships outside the publishable crate se
 
 - `docs/rakka-agent-security-validation-matrix.md`, "Owed": the guardrail boundaries with no evaluation point, communal retrieval, and the knowledge graph's absent retention, tombstone, and deletion path.
 - `docs/rakka-agent-telemetry-validation-matrix.md`, "Owed" and "Inferred": the segment classes with no production call site, and tail sampling untested against a running two-replica gateway.
-- `docs/rakka-agent-fault-injection-matrix.md`, "Production interpretation": the coordination workload across pods, a PostgreSQL arm for the shared substrate, and detected rather than announced departure.
+- `docs/rakka-agent-fault-injection-matrix.md`: under "Multi-pod matrix", the team and conversation entities the multi-pod workload registers but does not exercise; under "Production interpretation", a PostgreSQL arm for the shared substrate and detected rather than announced departure.
 - `docs/rakka-agent-recovery-scenarios.md`, "What the roster does not claim".
 
 ## Post-V1 Roadmap

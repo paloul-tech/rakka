@@ -227,7 +227,36 @@ fn facade_prelude_is_curated() {
         );
     }
 
+    // The agent domain stays out of the prelude; the A2A adapter's service
+    // types are its one feature-gated exception, and the inventory names them.
+    for agent_crate in [
+        "rakka_agent::",
+        "rakka_agent_workflow::",
+        "rakka_a2a::agents",
+    ] {
+        assert!(
+            !prelude.contains(agent_crate),
+            "prelude should not expose the agent domain: {agent_crate}"
+        );
+    }
     let api_inventory = read("docs/rakka-api-boundary-inventory.md");
+    for a2a in [
+        "RakkaA2AHandlerError",
+        "RakkaA2ABuildError",
+        "RakkaA2ARequestHandler",
+        "RakkaA2AService",
+        "RakkaA2AServiceBuilder",
+        "RakkaA2ASettings",
+    ] {
+        assert!(
+            prelude.contains(a2a),
+            "the prelude no longer re-exports {a2a}; update docs/rakka-api-boundary-inventory.md"
+        );
+        assert!(
+            api_inventory.contains(a2a),
+            "docs/rakka-api-boundary-inventory.md does not list the prelude's {a2a}"
+        );
+    }
     assert!(api_inventory.contains("Facade"));
     assert!(api_inventory.contains("Foundation"));
     assert!(api_inventory.contains("Adapter"));

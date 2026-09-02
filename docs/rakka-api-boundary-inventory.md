@@ -97,6 +97,11 @@ Component crates continue to own implementation-specific concepts:
 - Stream basics when the `stream` feature is enabled:
   `BoundedStream`, `StreamSink`, `StreamSource`, `StreamError`, and
   `StreamResult`.
+- A2A adapter (feature-gated, the only non-core re-exports): under `a2a`,
+  `RakkaA2AHandlerError`; under `a2a-server`, `RakkaA2ABuildError`,
+  `RakkaA2ARequestHandler`, `RakkaA2AService`, `RakkaA2AServiceBuilder`, and
+  `RakkaA2ASettings`. Nothing from `rakka-agent`, `rakka-agent-workflow`, or
+  the `agents` feature of `rakka-a2a` is re-exported here.
 
 The prelude does not expose low-level coordinator, route, TCP transport, remote
 envelope, Kubernetes drain report, or node runtime types. Those remain available
@@ -106,8 +111,10 @@ The agent surface is reached through feature-gated facade modules rather than
 the prelude: `rakka::agent_workflow` (default feature `agent-workflow`),
 `rakka::agent` (`agent`, with `agent-rig` and `agent-otel` passthroughs), and
 `rakka::a2a` (`a2a`, with `a2a-server`, `a2a-sharding`, `a2a-postgres`,
-`a2a-http`, `a2a-k8s`, `a2a-otel`, `a2a-testkit`, and `a2a-agents`). No agent
-type enters `rakka::prelude`; the surface is documented in
+`a2a-http`, `a2a-k8s`, `a2a-otel`, `a2a-testkit`, and `a2a-agents`). No
+agent-domain type enters `rakka::prelude`; the A2A adapter's service types
+listed under "A2A adapter" in the Prelude Inventory above are its only
+feature-gated re-exports there. The surface is documented in
 [`rakka-agents.md`](rakka-agents.md).
 
 ## Compatibility Rules During Facade Migration

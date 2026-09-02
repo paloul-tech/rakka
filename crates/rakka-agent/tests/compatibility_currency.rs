@@ -345,12 +345,86 @@ fn every_pinned_dependency_matches_its_manifest_or_constant() {
     }
 }
 
+/// The telemetry validation matrix repeats four pins beside its rationale. A
+/// hand-copied pin is exactly what drifts when the compatibility table moves,
+/// so each row is held to the pin the manifests and constants declare.
+#[test]
+fn the_telemetry_matrix_repeats_the_pins_the_compatibility_table_holds() {
+    const MATRIX: &str = include_str!("../../../docs/rakka-agent-telemetry-validation-matrix.md");
+    let declared = declared_pins();
+    let rows: BTreeMap<String, Vec<String>> = section(MATRIX, "## Pinned versions")
+        .lines()
+        .filter(|line| line.starts_with("| ") && !line.starts_with("| ---"))
+        .skip(1)
+        .map(|line| {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            assert!(
+                cells.len() >= 4,
+                "a pinned-versions row has fewer than three cells: {line:?}"
+            );
+            (cells[1].to_string(), backticked(cells[2]))
+        })
+        .collect();
+    type PinReader = fn(&str) -> String;
+    let expectations: [(&str, &str, PinReader); 4] = [
+        ("OpenTelemetry Rust SDK", "opentelemetry", |token| {
+            token.to_string()
+        }),
+        (
+            "Collector distribution (agent domain)",
+            "opentelemetry-collector-contrib (agent)",
+            |token| {
+                token
+                    .rsplit_once(':')
+                    .map(|(_, tag)| tag.to_string())
+                    .unwrap_or_default()
+            },
+        ),
+        (
+            "Collector distribution (workflow domain)",
+            "opentelemetry-collector-contrib (workflow)",
+            |token| {
+                token
+                    .rsplit_once(':')
+                    .map(|(_, tag)| tag.to_string())
+                    .unwrap_or_default()
+            },
+        ),
+        (
+            "GenAI semantic conventions",
+            "GenAI semantic conventions",
+            |token| token.to_string(),
+        ),
+    ];
+    assert_eq!(
+        rows.len(),
+        expectations.len(),
+        "the matrix's pinned-versions table gained or lost a row: {:?}",
+        rows.keys().collect::<Vec<_>>()
+    );
+    for (component, pin, read) in expectations {
+        let tokens = rows
+            .get(component)
+            .unwrap_or_else(|| panic!("the matrix has no pinned-versions row for {component}"));
+        let documented = tokens
+            .last()
+            .map(|token| read(token))
+            .unwrap_or_else(|| panic!("the {component} row has no backticked pin"));
+        assert_eq!(
+            &documented, &declared[pin],
+            "the matrix pins {component} at {documented}, but the tree declares {}",
+            declared[pin]
+        );
+    }
+}
+
 #[test]
 fn the_tests_section_names_the_commands_that_hold_the_tables() {
     let tests = section(COMPATIBILITY, "## Tests");
     for command in [
         "cargo test -p rakka-agent --features otel --test compatibility_currency",
         "cargo test -p rakka-agent-knowledge-graph --test compatibility_currency",
+        "cargo test -p rakka-agent --test product_doc_currency",
         "cargo test -p rakka-agent --test recovery_scenario_roster",
         "cargo test -p rakka-testkit --test repository_hygiene",
     ] {

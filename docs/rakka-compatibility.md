@@ -229,6 +229,7 @@ Hold the agent-domain tables above to the code, the manifests, and the tests tha
 ```sh
 cargo test -p rakka-agent --features otel --test compatibility_currency
 cargo test -p rakka-agent-knowledge-graph --test compatibility_currency
+cargo test -p rakka-agent --test product_doc_currency
 cargo test -p rakka-agent --test recovery_scenario_roster
 cargo test -p rakka-testkit --test repository_hygiene
 ```

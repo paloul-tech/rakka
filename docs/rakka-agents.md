@@ -15,7 +15,11 @@ durable trigger, on whichever node then owns its shard.
 This document describes the surface as it behaves. The normative text is
 [the specification](plans/rakka-agent/spec.md); where the two differ, the
 specification governs and the difference is a defect. The companion documents
-are validation artifacts, each held to the code by a test:
+are validation artifacts. Where one states something the code can contradict —
+a scenario's proving file, a schema version, a pin, a crate row, a link — a
+test holds it; the fault, security, and telemetry matrices' clause dispositions
+(enforced, delegated, inferred, owed) are hand-recorded and dated, and each
+enforced row names the test behind it:
 
 | Document | What it records |
 | --- | --- |
@@ -38,9 +42,12 @@ are validation artifacts, each held to the code by a test:
 | `rakka-a2a` (`agents` feature) | The typed A2A surface over the entities: ingress, the state projection, the agent-management and collaboration extensions, replay, and the goal view. | `a2a-agents`; `a2a-otel` adds the ingress span |
 
 Application code reaches the surface through `rakka::agent`,
-`rakka::agent_workflow`, and `rakka::a2a`; no agent type enters
-`rakka::prelude`. `rakka-agent` builds and passes its tests with
-`--no-default-features` (Rig is its only default feature and the facade makes
+`rakka::agent_workflow`, and `rakka::a2a`; no agent-domain type enters
+`rakka::prelude`. The A2A adapter's service builder, request handler,
+settings, and two error types are the one feature-gated exception, re-exported
+from the prelude under `a2a` and `a2a-server` and listed in the
+[boundary inventory](rakka-api-boundary-inventory.md). `rakka-agent` builds
+and passes its tests with `--no-default-features` (Rig is its only default feature and the facade makes
 it opt-in), and the `otel` feature adds no dependency: no crate under
 `crates/` imports an OpenTelemetry SDK, which specification 17.17 places at the
 application binary. The agent crates are outside the publishable crate set
@@ -80,14 +87,22 @@ its content rather than generating one, and the derived id is the durable
 inbox's deduplication key, so a retried command is answered from the record
 and a different command under a reused key derives a different operation.
 
-Entities talk to each other only through **exchanges**: creation, assignment,
-run acceptance, result proposal and decision, allocation, settlement and
-return, delegation and delegation result, run and delegation cancellation,
-handoff and handoff result, team claim and claim result, dependency
-registration and its result, and the two terminal notices. An exchange is a
-journal entry on the sender, re-driven by a courier until the receiver answers
-from its own record; acceptance makes local progress only and never drives an
-owed exchange of its own, which is what keeps the choreography acyclic. The
+Entities talk to each other only through **exchanges**, of which there are
+eighteen kinds: `creation`, `assignment`, `result-proposal`,
+`budget-allocation`, `budget-settlement`, `budget-return`, `epoch-result`,
+`goal-evaluation`, `delegation-result`, `run-cancel`, `delegation-cancel`,
+`handoff-result`, `team-claim`, `team-claim-result`, `dependency-registration`,
+`dependency-outcome`, `team-terminal-notice`, and
+`conversation-terminal-notice` (`AgentExchangeKind::ALL`, held to this list by
+a test). Run acceptance and the result decision are the replies to assignment
+and proposal, not exchanges of their own. A delegation or handoff *send* is not
+an exchange either: it is an A2A outbox effect claimed by the dispatcher, whose
+exhaustion becomes a fan-in disposition or a handoff refusal rather than a
+courier re-drive, and only its result comes back as an exchange. An exchange is
+a journal entry on the sender, re-driven by a courier
+until the receiver answers from its own record; acceptance makes local
+progress only and never drives an owed exchange of its own, which is what
+keeps the choreography acyclic. The
 route resolves the target's shard owner and either asks the local entity or
 crosses `rakka-remote` under a versioned codec; the durable record an exchange
 leaves behind is the same either way.
@@ -152,8 +167,11 @@ fenced, and a pod, actor, or dispatcher restart never creates a wake by
 itself. Failure backs the goal off through durable re-wakes and escalates into
 suspension; an exhausted goal window defers to the window boundary. Between
 every wake, admission, epoch, and result the controller, task, and run may
-passivate, and the wake scanner over the durable timer index is the only thing
-that reactivates them.
+passivate. Three things reactivate them, and nothing else: the wake scanner
+over the durable timer index for a scheduled occurrence, an `AdmitWake` command
+at the task for an event, callback, command, or A2A-trigger occurrence, and the
+courier re-driving an owed exchange at its receiver — a restart by itself never
+does.
 
 An operator asking what a goal or run is doing gets an **authoritative
 operational snapshot** from the durable record, with the revision it read,
@@ -230,10 +248,13 @@ With the `agents` feature, `rakka-a2a` serves the entities as A2A agents: the
 public task id is the `AgentTaskId` verbatim, ingress is deduplicated by the
 owning entity before it is acknowledged, and task state is projected
 row-for-row from the authoritative task and run condition. Two versioned
-extensions carry what plain A2A cannot: agent management (definition and
-settings revisions, lifecycle, admission) and collaboration (delegation,
-handoff, team claims, conversation turns, typed result submission), each
-identified by a versioned URI with the envelope schema inside it. Reads —
+extensions carry what plain A2A cannot: agent management (settings updates,
+suspension, resumption, termination, and description) and collaboration
+(delegation, handoff, team claims, and conversation turns), each identified by
+a versioned URI with the envelope schema inside it. Typed result submission is
+plain ingress — a message carrying the `io.rakka.agent.result` metadata key —
+and admission has no wire operation at all: it is an entity command an
+authorized evaluator issues, deliberately outside the A2A surface. Reads —
 task state, task-event replay, coordination-event replay across task, team,
 and conversation logs, and the bounded goal view — answer from durable state
 with explicit cursors and an explicit `WindowExpired` when a retention window
@@ -292,8 +313,15 @@ table a test holds to the manifests. See the Agent Domain section of
 
 ## Examples
 
-Each example is in-process and deterministic unless it says otherwise, prints
-a numbered transcript, and has a test that asserts that transcript verbatim.
+The five acceptance walks (durable agent, continuous goal, multi-agent goal,
+coordination capability, OTLP export) are in-process and deterministic, print a
+numbered transcript, and have a test that asserts that transcript verbatim. The
+other three differ: the minimal kernel example prints six fixed lines whose
+typed facts `rakka-agent-workflow`'s `minimal_local_workflow` test holds (the
+lines themselves are documented in its README, not asserted); the multi-pod
+soak's counts vary run to run, and its gate is the compatibility matrix's
+gated exit-status check; the clustered A2A example is a long-running server
+with fixtures only.
 
 | Example | Demonstrates |
 | --- | --- |
