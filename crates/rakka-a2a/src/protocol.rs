@@ -469,17 +469,71 @@ mod tests {
         );
     }
 
+    /// A repository file read at runtime rather than `include_str!`: this
+    /// crate is in the publishable set, and a packaged crate carries no
+    /// `docs/` or workspace manifest.
+    fn repository_file(relative: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
+
+    /// The backticked tokens of one Markdown table cell, in order.
+    fn backticked(cell: &str) -> Vec<&str> {
+        cell.split('`').skip(1).step_by(2).collect()
+    }
+
     #[test]
     fn the_compatibility_document_pins_the_advertised_protocol_version() {
-        // Read at runtime rather than `include_str!`: this crate is in the
-        // publishable set, and a packaged crate carries no `docs/`.
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/rakka-compatibility.md");
-        let document = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        let row = format!("| `A2A protocol` | `{A2A_PROTOCOL_VERSION}` |");
-        assert!(
-            document.contains(&row),
-            "docs/rakka-compatibility.md must carry the pinned dependency row {row:?}"
+        // Parsed the way rakka-agent's compatibility_currency parses the same
+        // table — cells trimmed — rather than matched as one exact substring,
+        // so a table reformat cannot fail one test and pass the other.
+        let document = repository_file("../../docs/rakka-compatibility.md");
+        let row = document
+            .lines()
+            .find(|line| {
+                line.split('|')
+                    .nth(1)
+                    .is_some_and(|cell| backticked(cell) == ["A2A protocol"])
+            })
+            .expect("docs/rakka-compatibility.md carries the `A2A protocol` pinned-dependency row");
+        let pin = row.split('|').nth(2).map(backticked).unwrap_or_default();
+        assert_eq!(
+            pin,
+            [A2A_PROTOCOL_VERSION],
+            "the `A2A protocol` row pins a different version than the adapter advertises"
         );
+    }
+
+    /// The crate doc states the SDK pin policy with the pinned minors spelled
+    /// out (`a2a-lf 0.3.x`, `a2a-server-lf 0.4.x`); those two spellings are
+    /// held to the workspace manifest, which is the one place the pins live.
+    #[test]
+    fn the_crate_doc_names_the_pinned_sdk_minors() {
+        let manifest = repository_file("../../Cargo.toml");
+        let crate_doc = include_str!("lib.rs");
+        for (dependency, package) in [("a2a", "a2a-lf"), ("a2a-server", "a2a-server-lf")] {
+            let line = manifest
+                .lines()
+                .find(|line| line.starts_with(&format!("{dependency} = {{")))
+                .unwrap_or_else(|| panic!("the workspace manifest declares {dependency}"));
+            let version = line
+                .split_once("version = \"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(version, _)| version)
+                .unwrap_or_else(|| panic!("{dependency} carries a quoted version"));
+            let (major, rest) = version
+                .split_once('.')
+                .expect("a version has a major component");
+            let minor = rest
+                .split('.')
+                .next()
+                .expect("a version has a minor component");
+            let spelled = format!("`{package} {major}.{minor}.x`");
+            assert!(
+                crate_doc.contains(&spelled),
+                "the crate doc's SDK version policy must name {spelled}, the minor the manifest pins"
+            );
+        }
     }
 }

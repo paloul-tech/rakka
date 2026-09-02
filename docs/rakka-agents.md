@@ -145,8 +145,10 @@ leaves behind is the same either way.
    costs bounded iterations. The terminal transition stamps the run's
    `terminal_at`, the clock retention is measured from.
 
-Every step above is a durable write, and every durable write is a place the
-fault-injection suites kill the owner.
+Every step above is a durable write, and each is a boundary the fault-injection
+suites kill the owner at; the [fault-injection
+matrix](rakka-agent-fault-injection-matrix.md) records, per boundary, which
+sweeps are demonstrated and which are still inferred.
 
 ## Goals: finite and continuous
 

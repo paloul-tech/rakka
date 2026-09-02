@@ -14,8 +14,6 @@
 #![cfg(feature = "otel")]
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 
 use rakka_agent::otel::AGENT_GENAI_CONVENTION_REVISION;
 use rakka_agent::AgentRecordKind;
@@ -28,35 +26,8 @@ const COMPATIBILITY: &str = include_str!("../../../docs/rakka-compatibility.md")
 const RECORDS_HEADING: &str = "### Durable record schema versions";
 const PINS_HEADING: &str = "### Pinned dependencies";
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("rakka-agent manifest should live under crates/rakka-agent")
-        .to_path_buf()
-}
-
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    fs::read_to_string(&path).unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
-}
-
-/// The text between a heading and the next heading of any level.
-fn section(document: &str, heading: &str) -> String {
-    let (_, rest) = document
-        .split_once(heading)
-        .unwrap_or_else(|| panic!("docs/rakka-compatibility.md has no heading {heading:?}"));
-    rest.split("\n#").next().unwrap_or(rest).to_string()
-}
-
-/// The backticked tokens of one table cell, in order.
-fn backticked(cell: &str) -> Vec<String> {
-    cell.split('`')
-        .skip(1)
-        .step_by(2)
-        .map(str::to_string)
-        .collect()
-}
+mod doc_support;
+use doc_support::{backticked, read, section};
 
 /// Table rows whose first cell is backticked: `(key, remaining cells)`.
 ///
@@ -204,33 +175,7 @@ fn declared_pins() -> BTreeMap<String, String> {
     let root_manifest = read("Cargo.toml");
     let workspace = manifest_section(&root_manifest, "[workspace.dependencies]");
     let agent_manifest = read("crates/rakka-agent/Cargo.toml");
-
-    assert_eq!(manifest_value(&workspace, "a2a", "package"), "a2a-lf");
-    assert_eq!(
-        manifest_value(&workspace, "a2a-server", "package"),
-        "a2a-server-lf"
-    );
-    // The `a2a-server-lf` row promises that no TLS provider is forced on
-    // applications; that promise is the one `default-features = false` on
-    // the workspace line, which every member inherits, so it is held here.
-    assert_eq!(
-        manifest_value(&workspace, "a2a-server", "default-features"),
-        "false",
-        "a2a-server must be imported without default features"
-    );
     let opentelemetry = manifest_value(&workspace, "opentelemetry", "version");
-    for sibling in [
-        "opentelemetry-appender-tracing",
-        "opentelemetry-otlp",
-        "opentelemetry_sdk",
-        "opentelemetry-proto",
-    ] {
-        assert_eq!(
-            manifest_value(&workspace, sibling, "version"),
-            opentelemetry,
-            "{sibling} is pinned apart from the SDK generation"
-        );
-    }
 
     BTreeMap::from([
         (
@@ -261,11 +206,46 @@ fn declared_pins() -> BTreeMap<String, String> {
     ])
 }
 
+/// What the pinned-dependency rows say *about* the pins, beyond their values:
+/// the two SDK crates are imported under the short names, `a2a-server` forces
+/// no TLS provider on applications, and the OpenTelemetry family moves as one
+/// generation. Each is a sentence in the table's `Declared in` or `Bump
+/// policy` column, held here rather than as a side effect of reading the pins.
+#[test]
+fn the_pin_rows_describe_the_manifest_they_point_at() {
+    let root_manifest = read("Cargo.toml");
+    let workspace = manifest_section(&root_manifest, "[workspace.dependencies]");
+
+    assert_eq!(manifest_value(&workspace, "a2a", "package"), "a2a-lf");
+    assert_eq!(
+        manifest_value(&workspace, "a2a-server", "package"),
+        "a2a-server-lf"
+    );
+    assert_eq!(
+        manifest_value(&workspace, "a2a-server", "default-features"),
+        "false",
+        "the a2a-server-lf row promises no TLS provider is forced; that promise is this flag"
+    );
+    let opentelemetry = manifest_value(&workspace, "opentelemetry", "version");
+    for sibling in [
+        "opentelemetry-appender-tracing",
+        "opentelemetry-otlp",
+        "opentelemetry_sdk",
+        "opentelemetry-proto",
+    ] {
+        assert_eq!(
+            manifest_value(&workspace, sibling, "version"),
+            opentelemetry,
+            "{sibling} is pinned apart from the SDK generation"
+        );
+    }
+}
+
 #[test]
 fn every_durable_record_schema_version_is_documented_and_current() {
     let declared = declared_schema_versions();
     let documented: BTreeMap<String, (String, u32)> =
-        table_rows(&section(COMPATIBILITY, RECORDS_HEADING))
+        table_rows(section(COMPATIBILITY, RECORDS_HEADING))
             .into_iter()
             .map(|(key, cells)| {
                 let crate_name = backticked(&cells[0])
@@ -313,7 +293,7 @@ fn every_durable_record_schema_version_is_documented_and_current() {
 #[test]
 fn every_pinned_dependency_matches_its_manifest_or_constant() {
     let declared = declared_pins();
-    let documented: BTreeMap<String, String> = table_rows(&section(COMPATIBILITY, PINS_HEADING))
+    let documented: BTreeMap<String, String> = table_rows(section(COMPATIBILITY, PINS_HEADING))
         .into_iter()
         .map(|(key, cells)| {
             let pin = backticked(&cells[0])

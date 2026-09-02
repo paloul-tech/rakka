@@ -157,7 +157,7 @@ The reviewed pins behind the agent surface. A bump in any of them is a reviewed 
 
 | Dependency | Pin | Declared in | Bump policy |
 | --- | --- | --- | --- |
-| `A2A protocol` | `1.0` | `rakka_a2a::protocol::A2A_PROTOCOL_VERSION`, stamped on every interface of the agent card | Held equal to the SDK's `a2a::VERSION` by a unit test. A wire-version move is the specification 20 review: a bridged or retained older surface needs a documented state/operation mapping and explicit negotiation. |
+| `A2A protocol` | `1.0` | `rakka_a2a::protocol::A2A_PROTOCOL_VERSION`, stamped on every interface of the agent card the adapter builds; a card supplied to the service builder carries whatever its author stamped | Held equal to the SDK's `a2a::VERSION` by a unit test. A wire-version move is the specification 20 review: a bridged or retained older surface needs a documented state/operation mapping and explicit negotiation. |
 | `a2a-lf` | `0.3.0` | `Cargo.toml` `[workspace.dependencies]`, imported as `a2a` | Minor-level pin. An SDK minor bump is a semver-visible change of `rakka-a2a`, because SDK request/response types appear in its public API; a patch bump is not. |
 | `a2a-server-lf` | `0.4.0` | `Cargo.toml` `[workspace.dependencies]`, imported as `a2a-server` without default features | Same policy as `a2a-lf`; no TLS provider is forced on applications. |
 | `rig-core` | `=0.37.0` | `crates/rakka-agent/Cargo.toml`, behind the `rig` feature | Exact pin. An upgrade that changes request, tool-call, message, or serialized-run semantics is an adapter compatibility review and a serialized-artifact review (specification 20); the adapter's own semantics version is `CURRENT_AGENT_LOOP_ADAPTER_VERSION`, and moving it is an explicit migration. |

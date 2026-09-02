@@ -374,9 +374,11 @@ fn workspace_crates() -> Vec<String> {
     let mut members: Vec<String> = read("Cargo.toml")
         .lines()
         .filter_map(|line| {
-            line.trim()
+            // The last member of a TOML array may omit its trailing comma.
+            let member = line.trim().trim_end_matches(',');
+            member
                 .strip_prefix("\"crates/")
-                .and_then(|rest| rest.strip_suffix("\","))
+                .and_then(|rest| rest.strip_suffix('"'))
                 .map(str::to_string)
         })
         .collect();

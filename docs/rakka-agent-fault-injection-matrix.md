@@ -58,7 +58,10 @@ Harness: [`examples/multi-pod-agent-fault-soak`](../examples/multi-pod-agent-fau
 Specification 18 scenarios this re-proves at multi-pod fidelity: **1** (the
 creation-deduplication half), **2**, and **60**. That list is the authority for
 slice 6.4's done-when: every other shipped scenario is proven in-process, and a
-scenario moves here only when its claim cannot be reached by an in-process kill. It also satisfies section 18's
+scenario is added here only when part of its claim cannot be reached by an
+in-process kill — it keeps its in-process proof for the part that can, which is
+why the roster marks these three at both fidelities rather than moving them. It
+also satisfies section 18's
 closing fault-injection directive — kill the owner at every durable effect
 boundary, including after a test external system commits but before it returns
 the receipt.

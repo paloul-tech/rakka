@@ -16,10 +16,8 @@ use rakka_agent::AgentExchangeKind;
 const AGENTS: &str = include_str!("../../../docs/rakka-agents.md");
 const RELIABILITY: &str = include_str!("../../../docs/rakka-v1-reliability-boundaries.md");
 
-/// The backticked tokens of one passage, in order.
-fn backticked(passage: &str) -> Vec<&str> {
-    passage.split('`').skip(1).step_by(2).collect()
-}
+mod doc_support;
+use doc_support::backticked;
 
 /// The paragraph (up to a blank line) that begins at the first occurrence of
 /// `opening`.
@@ -36,7 +34,6 @@ fn listed_labels(passage: &str) -> BTreeSet<String> {
     backticked(passage)
         .into_iter()
         .take_while(|token| !token.contains("::"))
-        .map(str::to_string)
         .collect()
 }
 

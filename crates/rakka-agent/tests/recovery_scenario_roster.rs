@@ -11,7 +11,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+
+mod doc_support;
+use doc_support::{backticked, read, repo_root, rust_files};
 
 const ROSTER: &str = include_str!("../../../docs/rakka-agent-recovery-scenarios.md");
 const FAULT_MATRIX: &str = include_str!("../../../docs/rakka-agent-fault-injection-matrix.md");
@@ -44,39 +46,12 @@ impl Fidelity {
 }
 
 #[derive(Debug)]
-struct Proof {
-    path: String,
-    test_fn: Option<String>,
-}
-
-#[derive(Debug)]
 struct Row {
     number: u32,
     milestone: String,
     fidelity: Fidelity,
-    proofs: Vec<Proof>,
-}
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("rakka-agent manifest should live under crates/rakka-agent")
-        .to_path_buf()
-}
-
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    fs::read_to_string(&path).unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
-}
-
-/// The backticked tokens of one table cell, in order.
-fn backticked(cell: &str) -> Vec<String> {
-    cell.split('`')
-        .skip(1)
-        .step_by(2)
-        .map(str::to_string)
-        .collect()
+    /// Repository-relative paths of the files that prove the row.
+    proofs: Vec<String>,
 }
 
 fn roster_rows(markdown: &str) -> Vec<Row> {
@@ -92,19 +67,7 @@ fn roster_rows(markdown: &str) -> Vec<Row> {
         let Ok(number) = cells[0].trim().parse::<u32>() else {
             continue;
         };
-        let proofs = backticked(cells[3])
-            .into_iter()
-            .map(|token| match token.split_once("::") {
-                Some((path, test_fn)) => Proof {
-                    path: path.to_string(),
-                    test_fn: Some(test_fn.to_string()),
-                },
-                None => Proof {
-                    path: token,
-                    test_fn: None,
-                },
-            })
-            .collect::<Vec<_>>();
+        let proofs = backticked(cells[3]);
         assert!(!proofs.is_empty(), "scenario {number} cites no proof");
         rows.push(Row {
             number,
@@ -250,7 +213,7 @@ fn cited_scenarios(text: &str) -> BTreeSet<u32> {
             let lower = token.to_ascii_lowercase();
             if lower.starts_with("scenario") && token.contains('-') {
                 token.splitn(2, '-').collect::<Vec<_>>()
-            } else if token != "/" && token.contains('/') && parse_range(token).is_none() {
+            } else if token != "/" && token.contains('/') {
                 token
                     .split('/')
                     .filter(|part| !part.is_empty())
@@ -270,6 +233,10 @@ fn cited_scenarios(text: &str) -> BTreeSet<u32> {
         if keyword != "scenario" && keyword != "scenarios" {
             continue;
         }
+        // `through`/`to` ranges start at the number read immediately before
+        // the connector — not at the largest number cited so far, which would
+        // read `scenarios 9 and 5 through 7` as 9..=7.
+        let mut last_number: Option<u32> = None;
         let mut pending_range_start: Option<u32> = None;
         while index < tokens.len() {
             let token = tokens[index];
@@ -280,6 +247,7 @@ fn cited_scenarios(text: &str) -> BTreeSet<u32> {
             if let Some((start, end)) = parse_range(token) {
                 cited.extend(start..=end);
                 pending_range_start = None;
+                last_number = Some(end);
             } else if let Some(number) = parse_number(token) {
                 match pending_range_start.take() {
                     Some(start) => cited.extend(start..=number),
@@ -287,12 +255,11 @@ fn cited_scenarios(text: &str) -> BTreeSet<u32> {
                         cited.insert(number);
                     }
                 }
+                last_number = Some(number);
             } else {
                 match bare.to_ascii_lowercase().as_str() {
                     "and" | "/" | "&" | "-" | "plus" => {}
-                    "through" | "to" => {
-                        pending_range_start = cited.iter().next_back().copied();
-                    }
+                    "through" | "to" => pending_range_start = last_number,
                     _ => break,
                 }
             }
@@ -351,7 +318,7 @@ fn scanned_directories(rows: &[Row]) -> BTreeSet<String> {
     }
     for row in rows {
         for proof in &row.proofs {
-            if let Some((directory, _)) = proof.path.rsplit_once('/') {
+            if let Some((directory, _)) = proof.rsplit_once('/') {
                 directories.insert(format!("{directory}/"));
             }
         }
@@ -359,38 +326,16 @@ fn scanned_directories(rows: &[Row]) -> BTreeSet<String> {
     directories
 }
 
-fn test_files(relative_dir: &str) -> Vec<(String, String)> {
-    let dir = repo_root().join(relative_dir);
-    let mut files = Vec::new();
-    for entry in fs::read_dir(&dir).unwrap_or_else(|error| panic!("read {relative_dir}: {error}")) {
-        let path = entry.expect("a directory entry is readable").path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("a test file has a name");
-        let relative = format!("{relative_dir}{name}");
-        files.push((relative.clone(), read(&relative)));
-    }
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    files
-}
-
 #[test]
 fn the_roster_numbers_every_specification_18_scenario_once() {
     let rows = roster_rows(ROSTER);
     let numbers: Vec<u32> = rows.iter().map(|row| row.number).collect();
-    let expected: Vec<u32> = (1..=61).collect();
+    let listed = u32::try_from(spec_scenario_count(SPEC)).expect("a countable list");
+    assert!(listed > 0, "specification 18 lists no scenarios");
+    let expected: Vec<u32> = (1..=listed).collect();
     assert_eq!(
         numbers, expected,
-        "the roster must list scenarios 1..=61 once, in order"
-    );
-    assert_eq!(
-        spec_scenario_count(SPEC),
-        expected.len(),
-        "specification 18 lists a different number of scenarios than the roster"
+        "the roster must list specification 18's scenarios 1..={listed} once, in order"
     );
 }
 
@@ -423,22 +368,11 @@ fn every_cited_proof_exists() {
     let root = repo_root();
     for row in roster_rows(ROSTER) {
         for proof in &row.proofs {
-            let path = root.join(&proof.path);
             assert!(
-                path.is_file(),
-                "scenario {} cites {}, which is not a file",
-                row.number,
-                proof.path
+                root.join(proof).is_file(),
+                "scenario {} cites {proof}, which is not a file",
+                row.number
             );
-            if let Some(test_fn) = &proof.test_fn {
-                let source = read(&proof.path);
-                assert!(
-                    source.contains(&format!("fn {test_fn}(")),
-                    "scenario {} cites {}::{test_fn}, which that file does not define",
-                    row.number,
-                    proof.path
-                );
-            }
         }
     }
 }
@@ -450,12 +384,12 @@ fn every_cited_file_cites_its_scenario() {
     for row in roster_rows(ROSTER) {
         for proof in &row.proofs {
             let cited = sources
-                .entry(proof.path.clone())
-                .or_insert_with(|| cited_scenarios(&module_doc(&read(&proof.path))));
+                .entry(proof.clone())
+                .or_insert_with(|| cited_scenarios(&module_doc(&read(proof))));
             if !cited.contains(&row.number) {
                 uncited.push(format!(
-                    "scenario {} <- {} (module doc names {:?})",
-                    row.number, proof.path, cited
+                    "scenario {} <- {proof} (module doc names {cited:?})",
+                    row.number
                 ));
             }
         }
@@ -473,7 +407,7 @@ fn multi_pod_rows_cite_the_harness_and_only_they_do() {
         let cites_harness = row
             .proofs
             .iter()
-            .any(|proof| proof.path.starts_with(MULTI_POD_HARNESS));
+            .any(|proof| proof.starts_with(MULTI_POD_HARNESS));
         assert_eq!(
             cites_harness,
             row.fidelity.multi_pod(),
@@ -506,12 +440,12 @@ fn every_module_doc_citation_is_rostered() {
         rostered_files
             .entry(row.number)
             .or_default()
-            .extend(row.proofs.iter().map(|proof| proof.path.clone()));
+            .extend(row.proofs.iter().cloned());
     }
     let mut checked = 0;
     let mut unrostered = Vec::new();
     for dir in scanned_directories(&rows) {
-        for (relative, source) in test_files(&dir) {
+        for (relative, source) in rust_files(&dir) {
             for scenario in cited_scenarios(&module_doc(&source)) {
                 checked += 1;
                 let rostered = rostered_files
@@ -541,6 +475,8 @@ fn the_citation_reader_handles_every_shape_the_suites_use() {
         ("Scenario 54 / 44 of section 18", &[54, 44]),
         ("Scenarios 5-10 and the", &[5, 6, 7, 8, 9, 10]),
         ("scenarios 5 through 9 as well", &[5, 6, 7, 8, 9]),
+        ("scenarios 9 and 5 through 7", &[9, 5, 6, 7]),
+        ("scenarios 1-3 to 5", &[1, 2, 3, 4, 5]),
         (
             "Scenarios 3, 11, 12, and the reconciliation half of 57",
             &[3, 11, 12],

@@ -19,12 +19,26 @@ const COMPATIBILITY: &str = include_str!("../../../docs/rakka-compatibility.md")
 const RECORDS_HEADING: &str = "### Durable record schema versions";
 const CRATE: &str = "rakka-agent-knowledge-graph";
 
-/// The text between a heading and the next heading of any level.
+/// The text after a heading, up to the next heading of any level; a `#`
+/// inside a fenced block is a shell comment and does not end the section.
+/// (A copy of `rakka-agent`'s `tests/doc_support` reader: the crate DAG keeps
+/// this crate's tests from sharing that module.)
 fn section<'a>(document: &'a str, heading: &str) -> &'a str {
-    let (_, rest) = document
-        .split_once(heading)
+    let start = document
+        .find(heading)
         .unwrap_or_else(|| panic!("docs/rakka-compatibility.md has no heading {heading:?}"));
-    rest.split("\n#").next().unwrap_or(rest)
+    let rest = &document[start + heading.len()..];
+    let mut in_fence = false;
+    let mut end = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence && line.starts_with('#') {
+            return &rest[..end];
+        }
+        end += line.len();
+    }
+    rest
 }
 
 /// The first backticked token of one table cell.

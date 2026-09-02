@@ -65,17 +65,11 @@ license-file = "LICENSE"
 # `package = "a2a-lf"` lives here because a member inherits the rename and
 # cannot re-specify it; likewise `default-features = false` must sit on the
 # workspace entry, since a member's own is ignored. One declaration keeps
-# `rakka-a2a` and its five example consumers on one SDK generation.
-#
-# Pinned at the minor level rather than exactly, unlike the OpenTelemetry
-# family below: `rakka-a2a`'s SDK version policy (its crate doc, "A2A SDK
-# version policy") treats an SDK *minor* bump as a semver-visible change of
-# the adapter because A2A request/response types appear in its public API, so
-# a minor bump is a reviewed decision and a patch bump is not. `a2a-server` is
-# consumed without default features so no TLS provider is forced on
-# applications. The wire protocol version the SDK implements is held equal to
-# `rakka_a2a::protocol::A2A_PROTOCOL_VERSION` by a test, and both pins are
-# recorded in `docs/rakka-compatibility.md`.
+# `rakka-a2a` and its five example consumers on one SDK generation. The pin
+# policy (minor-level, unlike the exact OpenTelemetry pins below) is stated
+# once, in `rakka-a2a`'s crate doc under "A2A SDK version policy", and both
+# pins are recorded in `docs/rakka-compatibility.md`; tests hold the crate doc
+# and the document to the versions on the two lines below.
 a2a = { package = "a2a-lf", version = "0.3.0" }
 a2a-server = { package = "a2a-server-lf", version = "0.4.0", default-features = false }
 axum = { version = "0.8", features = ["ws"] }
