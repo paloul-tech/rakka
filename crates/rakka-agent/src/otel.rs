@@ -450,6 +450,8 @@ pub enum AgentGenAiOperation {
     },
     /// Opening a durable checkpoint; the span ends at the durable park.
     CheckpointOpen,
+    /// Resolving a parked checkpoint; the span links the park and the request.
+    CheckpointResolve,
     /// Resuming a run after a durable wait.
     RunResume,
     /// Recovering a run after restart, passivation, or shard movement.
@@ -492,6 +494,7 @@ impl AgentGenAiOperation {
             Self::ToolAuthorize => "rakka.agent.tool.authorize".to_string(),
             Self::ExecuteTool { tool_name } => format!("execute_tool {tool_name}"),
             Self::CheckpointOpen => "rakka.agent.checkpoint.open".to_string(),
+            Self::CheckpointResolve => "rakka.agent.checkpoint.resolve".to_string(),
             Self::RunResume => "rakka.agent.run.resume".to_string(),
             Self::RunRecover => "rakka.agent.run.recover".to_string(),
             Self::AutonomyAdmit => "rakka.agent.autonomy.admit".to_string(),
@@ -535,6 +538,7 @@ impl AgentGenAiOperation {
             | Self::ToolAuthorize
             | Self::ExecuteTool { .. }
             | Self::CheckpointOpen
+            | Self::CheckpointResolve
             | Self::RunResume
             | Self::RunRecover
             | Self::AutonomyAdmit
@@ -626,6 +630,7 @@ pub fn genai_operation(operation: &AgentSegmentOperation) -> AgentGenAiOperation
             data_source: backend.clone(),
         },
         AgentSegmentOperation::CheckpointOpen => AgentGenAiOperation::CheckpointOpen,
+        AgentSegmentOperation::CheckpointResolve => AgentGenAiOperation::CheckpointResolve,
         AgentSegmentOperation::RunResume => AgentGenAiOperation::RunResume,
         AgentSegmentOperation::RunRecover => AgentGenAiOperation::RunRecover,
     }
@@ -761,12 +766,22 @@ pub fn segment_span(segment: &AgentTelemetrySegment) -> AgentOtlpResult<AgentOte
         span = span.event(event);
     }
 
-    // The record is complete, so its span id is re-derived over everything it
-    // carries rather than over the name and time window alone. Without this a
-    // run's `decide` spans — same name, same operation, same millisecond —
-    // would be one span to a backend. Two records that are *still* identical
-    // are separated by the emitting sink, which knows they are two.
-    Ok(span.with_derived_span_id(&[]))
+    // A segment with a durable identity exports under it verbatim: the id was
+    // derived from the record's own durable material so that another
+    // component could link to it, and re-deriving it here would break every
+    // such link. The record is otherwise complete, so its span id is
+    // re-derived over everything it carries rather than over the name and
+    // time window alone. Without this a run's `decide` spans — same name,
+    // same operation, same millisecond — would be one span to a backend. Two
+    // records that are *still* identical are separated by the emitting sink,
+    // which knows they are two.
+    Ok(match &segment.span_id {
+        Some(span_id) => {
+            span.span_id = span_id.clone();
+            span
+        }
+        None => span.with_derived_span_id(&[]),
+    })
 }
 
 /// The convention identity of one segment's durable identities.
@@ -1122,8 +1137,14 @@ impl AgentSegmentSink for AgentGenAiSpanExporter {
         // millisecond, and the effect's identity is not a span attribute. The
         // sink is the one thing that knows they are two records rather than
         // one, so its emission ordinal is what separates their ids.
+        // A durable identity is already distinguished — it names one durable
+        // record — and is what a link elsewhere points at, so it is kept.
         let emission = self.emitted.fetch_add(1, Ordering::SeqCst).to_string();
-        let span = span.with_derived_span_id(&[emission.as_str()]);
+        let span = if segment.span_id.is_some() {
+            span
+        } else {
+            span.with_derived_span_id(&[emission.as_str()])
+        };
         // A record that cannot pass export validation must not enter the ring
         // at all. The buffer is now cleared only on a *successful* flush, so
         // admitting one would fail every later flush and strand every span

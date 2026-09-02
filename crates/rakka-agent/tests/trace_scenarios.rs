@@ -31,10 +31,7 @@ use rakka_agent::{
     CURRENT_AGENT_LOOP_ADAPTER_VERSION, METRIC_AGENT_DECISIONS, METRIC_AGENT_EFFECT_OUTCOMES,
     METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
 };
-use rakka_agent_workflow::{
-    agent_durable_resume_telemetry_context, AgentAttributes, AgentTelemetryContext,
-    AgentTimestampMillis,
-};
+use rakka_agent_workflow::{AgentTelemetryContext, AgentTimestampMillis};
 use rakka_core::InMemoryMetricsRecorder;
 
 mod common;
@@ -139,11 +136,30 @@ async fn ingress_context_flows_to_every_effect_and_survives_owner_loss() {
 }
 
 /// Scenario 22: a run parked behind a checkpoint holds only serializable
-/// context — the parked segment rides the checkpoint record — and the resume
-/// context links both the parked span and the triggering decision's span.
+/// context — the checkpoint record stores the parked span's own durable
+/// identity, and the `checkpoint-open` segment exports under it — and the
+/// resolution segment the runtime closes links both the parked span and the
+/// incoming request's span ([specification 17.11]).
+///
+/// Every assertion is over a segment the runtime produced or a record the
+/// runtime persisted. The test constructs no link of its own: an earlier
+/// version built both links in its body and asserted on its construction,
+/// which proved the helper and not the runtime, and the matrix recorded the
+/// MUST as unmet for exactly that reason.
 #[tokio::test]
 async fn a_parked_checkpoint_carries_the_segment_a_resume_doubly_links() {
-    let fx = checkpointed_fixture();
+    use rakka_agent::{
+        AgentApprovalDecision, AgentCheckpoint, AgentCheckpointDecision, AgentOperationId,
+        AgentOperationKind, AgentRunEntityCommand, AgentSegmentOperation, InMemoryAgentSegmentSink,
+        ATTR_AGENT_TELEMETRY_LINK_KIND, LINK_KIND_PARKED_CHECKPOINT, LINK_KIND_RESUME_REQUEST,
+        SEGMENT_ATTR_CHECKPOINT_KIND,
+    };
+    use rakka_agent_workflow::PrincipalRef;
+
+    const REQUEST_PARENT: &str = "00-1bf7651916cd43dd8448eb211c80319d-c7ad6b7169203332-01";
+
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fx = checkpointed_fixture().with_segments(sink.clone());
     fx.instantiate_agent().await;
     fx.create_task_traced(ingress_context(INGRESS_PARENT)).await;
     fx.pump().await.expect("the run parks on its checkpoint");
@@ -156,38 +172,128 @@ async fn a_parked_checkpoint_carries_the_segment_a_resume_doubly_links() {
     let checkpoint = loop_state
         .open_checkpoints()
         .first()
-        .expect("the approval checkpoint is open");
+        .expect("the approval checkpoint is open")
+        .clone();
+    let effect = loop_state
+        .effects()
+        .iter()
+        .find(|effect| effect.effect_id == checkpoint.bound_effect.effect_id)
+        .expect("the gated effect is on the loop")
+        .clone();
+
+    // The parked span's identity is derived from the gated effect's context
+    // and the checkpoint id — the two facts any later reader also holds.
+    let parked =
+        AgentCheckpoint::parked_span_identity(&effect.telemetry, &checkpoint.checkpoint_id)
+            .expect("a traced effect derives a parked identity");
+    assert_eq!(parked.trace_id, "0af7651916cd43dd8448eb211c80319c");
     assert_eq!(
         checkpoint.telemetry.trace_parent.as_deref(),
-        Some(INGRESS_PARENT),
-        "the parked segment is durable on the checkpoint, not held in memory"
+        Some(parked.trace_parent().as_str()),
+        "the record stores the parked span's own identity, durably"
     );
 
-    // The resume after the human decision: a new bounded segment that links
-    // the parked span (from the checkpoint record) and the triggering
-    // request's span (from the resolution command's context).
-    let resumed = agent_durable_resume_telemetry_context(
-        &checkpoint.telemetry,
-        "00f067aa0ba902b7",
-        AgentAttributes::new(),
-    )
-    .expect("the resume context derives");
-    let trigger = ingress_context("00-1bf7651916cd43dd8448eb211c80319d-c7ad6b7169203332-01");
-    let mut resumed = resumed;
-    resumed.span_links.push(
-        rakka_agent_workflow::require_agent_trace_context(&trigger)
-            .expect("the trigger context parses")
-            .to_span_link(AgentAttributes::new()),
+    let opened: Vec<_> = sink
+        .segments()
+        .into_iter()
+        .filter(|segment| matches!(segment.operation, AgentSegmentOperation::CheckpointOpen))
+        .collect();
+    assert_eq!(opened.len(), 1, "{:?}", sink.operations());
+    assert_eq!(
+        opened[0].span_id.as_deref(),
+        Some(parked.span_id.as_str()),
+        "the parked segment exports under the identity the record stores"
     );
-    assert_eq!(resumed.span_links.len(), 2, "parked plus trigger");
-    assert!(resumed
-        .span_links
-        .iter()
-        .any(|link| link.span_id == "b7ad6b7169203331"));
-    assert!(resumed
-        .span_links
-        .iter()
-        .any(|link| link.span_id == "c7ad6b7169203332"));
+    assert_eq!(
+        opened[0].telemetry.trace_parent.as_deref(),
+        Some(INGRESS_PARENT),
+        "and stays a child of the ingress that activated the run"
+    );
+
+    // The human decision arrives carrying its own request span.
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "d1",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            resolver: PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "approver".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(AgentCheckpointDecision::Approval(
+                AgentApprovalDecision::Approve {
+                    credential_binding: None,
+                    expires_at: AgentTimestampMillis::new(1_000_000),
+                    allowed_use_count: 1,
+                },
+            )),
+            telemetry: ingress_context(REQUEST_PARENT),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the decision applies");
+
+    let resolved: Vec<_> = sink
+        .segments()
+        .into_iter()
+        .filter(|segment| matches!(segment.operation, AgentSegmentOperation::CheckpointResolve))
+        .collect();
+    assert_eq!(resolved.len(), 1, "{:?}", sink.operations());
+    let resolution = &resolved[0];
+    let identity =
+        AgentCheckpoint::resolve_span_identity(&effect.telemetry, &checkpoint.checkpoint_id)
+            .expect("the resolve identity derives");
+    assert_eq!(
+        resolution.span_id.as_deref(),
+        Some(identity.span_id.as_str()),
+        "the resolution exports under the identity a park can name in advance"
+    );
+    assert_eq!(
+        resolution.attributes.get(SEGMENT_ATTR_CHECKPOINT_KIND),
+        Some(&"approval".to_string())
+    );
+    assert_eq!(
+        resolution.telemetry.trace_parent.as_deref(),
+        Some(INGRESS_PARENT),
+        "the resolution is still a child of the run's ingress; the links say what caused it"
+    );
+    let link_to = |kind: &str| {
+        resolution
+            .telemetry
+            .span_links
+            .iter()
+            .find(|link| {
+                link.attributes.get(ATTR_AGENT_TELEMETRY_LINK_KIND) == Some(&kind.to_string())
+            })
+            .unwrap_or_else(|| panic!("a `{kind}` link: {:?}", resolution.telemetry.span_links))
+    };
+    let parked_link = link_to(LINK_KIND_PARKED_CHECKPOINT);
+    assert_eq!(parked_link.trace_id, parked.trace_id);
+    assert_eq!(
+        parked_link.span_id, parked.span_id,
+        "the resolution links the span the park exported under"
+    );
+    let request_link = link_to(LINK_KIND_RESUME_REQUEST);
+    assert_eq!(request_link.trace_id, "1bf7651916cd43dd8448eb211c80319d");
+    assert_eq!(request_link.span_id, "c7ad6b7169203332");
+
+    // And the links survive the bridge into the export record, when the
+    // bridge is built at all.
+    #[cfg(feature = "otel")]
+    {
+        let exported = rakka_agent::segment_span(resolution).expect("the resolution maps");
+        assert_eq!(exported.span_id, identity.span_id);
+        assert_eq!(exported.links.len(), 2);
+    }
 }
 
 /// Scenario 24: the W3C sampled flag changes trace recording downstream and

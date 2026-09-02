@@ -104,6 +104,7 @@ fn every_operation() -> Vec<AgentSegmentOperation> {
             backend: "pgvector".to_string(),
         },
         AgentSegmentOperation::CheckpointOpen,
+        AgentSegmentOperation::CheckpointResolve,
         AgentSegmentOperation::RunResume,
         AgentSegmentOperation::RunRecover,
     ]
@@ -1168,4 +1169,39 @@ fn an_unprofiled_model_call_names_the_bare_operation() {
         "the operation is still named"
     );
     span.validate().expect("the record is valid");
+}
+
+/// A segment carrying a durable span identity exports under exactly that id,
+/// through the mapping and through the exporter's ordinal re-derivation alike.
+///
+/// The re-derivations exist to separate two indistinguishable records; a
+/// durable identity is already distinguished — it was derived from the
+/// record's own durable material — and re-deriving it would break every link
+/// another component derived to point at it.
+#[test]
+fn a_segment_with_a_durable_identity_exports_under_that_id() {
+    const IDENTITY: &str = "c0ffee0123456789";
+
+    let identified = segment(AgentSegmentOperation::CheckpointOpen).span_id(IDENTITY);
+    let mapped = segment_span(&identified).expect("the segment maps");
+    assert_eq!(mapped.span_id, IDENTITY);
+    assert_eq!(
+        mapped.parent_span_id.as_deref(),
+        Some("b7ad6b7169203331"),
+        "the identity is the span's own id; the context still names its parent"
+    );
+
+    let exporter = AgentGenAiSpanExporter::new();
+    exporter.record(&identified);
+    exporter.record(&segment(AgentSegmentOperation::CheckpointOpen));
+    let spans = exporter.drain();
+    assert_eq!(spans.len(), 2);
+    assert_eq!(
+        spans[0].span_id, IDENTITY,
+        "the exporter keeps a durable identity"
+    );
+    assert_ne!(
+        spans[1].span_id, IDENTITY,
+        "and still derives one for a segment that has none"
+    );
 }

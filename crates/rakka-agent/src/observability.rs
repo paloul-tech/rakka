@@ -22,8 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rakka_agent_workflow::{
-    validate_agent_span_link, validate_agent_telemetry_context, AgentAttributes, AgentCausationId,
-    AgentCorrelationId, AgentTelemetryContext, AgentTimestampMillis, StateSchemaVersion,
+    agent_derived_span_id, require_agent_trace_context, validate_agent_span_link,
+    validate_agent_telemetry_context, AgentAttributes, AgentCausationId, AgentCorrelationId,
+    AgentTelemetryContext, AgentTimestampMillis, AgentTraceContext, StateSchemaVersion,
 };
 use rakka_core::{MetricAttributes, MetricKind, MetricsRecorder, OpenTelemetryInstrumentView};
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,103 @@ use crate::schema::{
 /// resume links backwards and the most recent causes are the ones an operator
 /// walks first.
 pub const AGENT_TELEMETRY_MAX_SPAN_LINKS: usize = 8;
+
+/// Derives the durable span identity of one bounded operation from the trace
+/// context a durable record already holds and the record's own durable
+/// material.
+///
+/// Every exported span id is otherwise minted at export time — from the
+/// record's fields and the exporter's emission ordinal — so no component can
+/// name a span it did not export itself, and a span link needs a name.
+/// Specification [17.9](../../../docs/plans/rakka-agent/spec.md) and
+/// [17.11](../../../docs/plans/rakka-agent/spec.md) both require links
+/// between spans that *different* components close: the run entity parks a
+/// checkpoint and a resolution resumes it; the dispatcher attempts an effect
+/// and the run records that the attempt was ambiguous. Those components hold
+/// the same durable record — the effect, the checkpoint — and nothing else in
+/// common, so the identity is a pure function of that record: the same inputs
+/// derive the same id on any node, at any time, without a message between
+/// them.
+///
+/// The returned context is a *child* of `context` whose span id is the
+/// derived one. Used as a span link (`to_span_link`) it names the operation;
+/// stored on a record (`to_telemetry_context`) it lets a later reader link the
+/// operation back. A segment closed with that id as its
+/// [`AgentTelemetrySegment::span_id`] exports under it verbatim.
+///
+/// `None` when the context carries no trace: a record without a trace has no
+/// identity to derive, and telemetry never fails a transition
+/// ([17.1](../../../docs/plans/rakka-agent/spec.md)).
+#[must_use]
+pub fn agent_durable_span_identity(
+    context: &AgentTelemetryContext,
+    material: &[&str],
+) -> Option<AgentTraceContext> {
+    let parent = require_agent_trace_context(context).ok()?;
+    let span_id = agent_derived_span_id(&parent.trace_id, &parent.span_id, material);
+    parent.child(span_id).ok()
+}
+
+/// Link-kind value: the parked `checkpoint-open` span a resolution resumes
+/// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md)).
+pub const LINK_KIND_PARKED_CHECKPOINT: &str = "parked-checkpoint";
+/// Link-kind value: the incoming human or service request span whose command
+/// resolved a checkpoint ([17.11](../../../docs/plans/rakka-agent/spec.md)).
+pub const LINK_KIND_RESUME_REQUEST: &str = "resume-request";
+/// Link-kind value: the dispatch attempt whose outcome could not be
+/// established ([17.9](../../../docs/plans/rakka-agent/spec.md)).
+pub const LINK_KIND_AMBIGUOUS_ATTEMPT: &str = "ambiguous-attempt";
+/// Link-kind value: the `checkpoint-resolve` span of the reconciliation
+/// decision an indeterminate transition waits for — linked *forward*, which is
+/// possible because the decision's identity is derived from the same durable
+/// record before the decision exists
+/// ([17.9](../../../docs/plans/rakka-agent/spec.md)).
+pub const LINK_KIND_RECONCILIATION_DECISION: &str = "reconciliation-decision";
+
+/// A span link to `target`, carrying only its kind.
+#[must_use]
+pub fn agent_span_link(
+    target: &AgentTraceContext,
+    kind: &str,
+) -> rakka_agent_workflow::AgentSpanLink {
+    let mut attributes = AgentAttributes::new();
+    attributes.insert(
+        crate::effect::ATTR_AGENT_TELEMETRY_LINK_KIND.to_string(),
+        kind.to_string(),
+    );
+    target.to_span_link(attributes)
+}
+
+/// `base` with `links` appended, through the durable write gate.
+///
+/// The parent stays `base`'s: a segment that links elsewhere is still a child
+/// of the operation that activated its entity, and the links say what else
+/// caused it. The gate bounds the result, so a segment that accumulates links
+/// across a long wait stays exportable.
+#[must_use]
+pub fn agent_linked_telemetry_context(
+    base: &AgentTelemetryContext,
+    links: impl IntoIterator<Item = rakka_agent_workflow::AgentSpanLink>,
+) -> AgentTelemetryContext {
+    let mut context = base.clone();
+    context.span_links.extend(links);
+    sanitize_agent_telemetry_context(context)
+}
+
+/// Every `rakka.agent.link.kind` value this crate writes onto a span link.
+///
+/// A link kind is the one attribute a persisted link carries and the thing an
+/// operator walks a trace by, so it is a compatibility surface like the
+/// segment error types — and `tests/telemetry_context.rs` holds it the same
+/// way, in both directions: a kind defined here and written nowhere fails,
+/// and a kind written but not catalogued fails.
+pub const AGENT_TELEMETRY_LINK_KINDS: &[&str] = &[
+    crate::effect::LINK_KIND_SUPERSEDED_GENERATION,
+    LINK_KIND_PARKED_CHECKPOINT,
+    LINK_KIND_RESUME_REQUEST,
+    LINK_KIND_AMBIGUOUS_ATTEMPT,
+    LINK_KIND_RECONCILIATION_DECISION,
+];
 
 /// Admits a telemetry context to durable state: strict on write, so reads can
 /// be permissive.
@@ -1547,6 +1645,13 @@ pub enum AgentSegmentOperation {
     },
     /// Opening a durable checkpoint; the segment ends at the durable park.
     CheckpointOpen,
+    /// Resolving a parked checkpoint: the transition an incoming human or
+    /// service decision commits. Its identity is derived from the checkpoint
+    /// record, so the park that waits for it can link to it before it exists
+    /// ([specification 17.9](../../../docs/plans/rakka-agent/spec.md)), and
+    /// it links the parked span and the request that resolved it
+    /// ([17.11](../../../docs/plans/rakka-agent/spec.md)).
+    CheckpointResolve,
     /// Resuming a run after a durable wait.
     RunResume,
     /// Recovering a run after restart, passivation, or shard movement.
@@ -1584,6 +1689,7 @@ impl AgentSegmentOperation {
             Self::MemoryOperation { .. } => "memory-operation",
             Self::Retrieval { .. } => "retrieval",
             Self::CheckpointOpen => "checkpoint-open",
+            Self::CheckpointResolve => "checkpoint-resolve",
             Self::RunResume => "run-resume",
             Self::RunRecover => "run-recover",
         }
@@ -1723,6 +1829,15 @@ pub struct AgentTelemetrySegment {
     pub usage: Option<crate::model::AgentModelUsage>,
     /// The durable trace context the operation belongs to.
     pub telemetry: AgentTelemetryContext,
+    /// The operation's own span id, when it has a durable identity.
+    ///
+    /// Absent for most segments: their ids are minted at export, which is
+    /// enough for a span nothing links to. Present when another component
+    /// needs to name this operation — a parked checkpoint a resolution links
+    /// back to, an attempt an indeterminate transition links to — and then it
+    /// is the id [`agent_durable_span_identity`] derived from the durable
+    /// record both components hold, exported verbatim.
+    pub span_id: Option<String>,
 }
 
 impl AgentTelemetrySegment {
@@ -1745,6 +1860,7 @@ impl AgentTelemetrySegment {
             decisions: Vec::new(),
             usage: None,
             telemetry: AgentTelemetryContext::default(),
+            span_id: None,
         }
     }
 
@@ -1790,6 +1906,14 @@ impl AgentTelemetrySegment {
     #[must_use]
     pub fn telemetry(mut self, telemetry: AgentTelemetryContext) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    /// Gives the operation the durable span identity another component can
+    /// link to.
+    #[must_use]
+    pub fn span_id(mut self, span_id: impl Into<String>) -> Self {
+        self.span_id = Some(span_id.into());
         self
     }
 

@@ -2734,6 +2734,9 @@ impl AuthorityFixture {
         if let Some(config) = &self.fx.workflow_tools {
             delivery = delivery.with_workflow_tools(config.clone());
         }
+        if let Some(memory) = &self.fx.memory {
+            delivery = delivery.with_memory(memory.clone());
+        }
         if let Some(segments) = &self.fx.segments {
             delivery = delivery.with_segments(segments.clone());
         }

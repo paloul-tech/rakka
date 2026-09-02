@@ -78,6 +78,7 @@ use crate::definition::{
     AgentModelProfileId, AgentRevisionNumber, AgentSamplingSettings, AgentSettings,
     AgentSetupRevision, AgentToolDeclaration, AgentToolId, SettingsRevision,
 };
+use crate::effect::AGENT_TOOL_RESULT_MAX_BYTES;
 use crate::effect::{
     AgentEffectError, AgentEffectGeneration, AgentEffectResult, AgentEffectSpec,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectRequest,
@@ -89,7 +90,7 @@ use crate::guardrails::{
 use crate::identity::{AgentGoalId, AgentRunScope, AgentTaskId};
 use crate::memory::AgentRunMemory;
 use crate::model::{AgentToolCallRequest, AGENT_TOOL_ARGUMENTS_MAX_BYTES};
-use crate::task::{AgentContentDigest, AgentSchemaRef};
+use crate::task::{AgentContentDigest, AgentSchemaRef, AgentTaskContent};
 
 /// Largest model-visible tool description, in bytes.
 pub const AGENT_TOOL_DESCRIPTION_MAX_LENGTH: usize = 1024;
@@ -124,9 +125,10 @@ pub const AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS: u64 = 60_000;
 /// the retrieval bundle's chain. A deployment with no retrieval wired is not
 /// fail-open — no memory ever crosses the boundary, so there is nothing an
 /// ingress stage could have protected.
-pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 3] = [
+pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 4] = [
     AgentGuardrailBoundary::ModelRequest,
     AgentGuardrailBoundary::ToolRequest,
+    AgentGuardrailBoundary::ToolResponse,
     AgentGuardrailBoundary::MemoryIngress,
 ];
 
@@ -142,9 +144,10 @@ pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 3] = [
 /// `guardrail-stage-unevaluated`, which is the correct answer: this authority
 /// cannot see a retrieval bundle, so it cannot vouch for one it was never
 /// shown.
-pub const AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 2] = [
+pub const AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 3] = [
     AgentGuardrailBoundary::ModelRequest,
     AgentGuardrailBoundary::ToolRequest,
+    AgentGuardrailBoundary::ToolResponse,
 ];
 
 /// Result type for tool registry operations.
@@ -1042,7 +1045,121 @@ pub struct AgentToolAuthority {
     grant_ttl_ms: u64,
 }
 
+/// What the `ToolResponse` boundary decided about one executed tool's result.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct AgentToolResponseReview {
+    /// The content the run receives: the result unchanged, or the chain's
+    /// deterministic transform of it.
+    pub content: AgentTaskContent,
+    /// Whether a stage replaced the content.
+    pub transformed: bool,
+    /// Every transform applied, with its reason, for the dispatch trace.
+    pub transforms: Vec<AgentGuardrailTransform>,
+    /// Every report-only finding, for the dispatch trace.
+    pub reports: Vec<AgentGuardrailReport>,
+}
+
+impl AgentToolResponseReview {
+    /// A review that changed nothing: no chain is configured, or every stage
+    /// allowed the result.
+    #[must_use]
+    pub fn unchanged(content: AgentTaskContent) -> Self {
+        Self {
+            content,
+            transformed: false,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+        }
+    }
+}
+
 impl AgentToolAuthority {
+    /// Evaluates one executed tool's result at
+    /// [`AgentGuardrailBoundary::ToolResponse`], before the result becomes
+    /// durable anywhere.
+    ///
+    /// The tool already ran, so the boundary decides what the *run* receives,
+    /// never whether the tool executes: a blocked result is a determinate
+    /// failure of an effect that did run (`guardrail-blocked`), delivered once
+    /// and never retried, and a transformed result is what is delivered — so
+    /// a redelivery carries the same content and no retry re-evaluates
+    /// ([specification 16](../../../docs/plans/rakka-agent/spec.md): a
+    /// transformation is deterministic under a recorded revision, and the
+    /// accepted transformed input is reused). Nothing a stage blocks reaches
+    /// the run, its session memory, or a later context snapshot, which is the
+    /// poisoning surface this boundary exists to close.
+    ///
+    /// The content evaluated is the inline value, or the artifact reference
+    /// for reference content — the memory-ingress precedent. A transform is
+    /// honoured for inline content only, bounded at
+    /// [`AGENT_TOOL_RESULT_MAX_BYTES`]; a transform of reference content is
+    /// refused (`guardrail-transform-unsupported`), since replacing a
+    /// reference would fabricate an artifact. `RequireCheckpoint` fails closed
+    /// (`checkpoint-required`): no checkpoint can gate a response that already
+    /// exists, and a stage wanting a human on tool output should block and
+    /// report instead.
+    ///
+    /// # Errors
+    ///
+    /// The refusal the disposition maps to, with the stable code.
+    pub fn review_tool_response(
+        &self,
+        scope: &AgentRunScope,
+        tool: Option<&AgentToolId>,
+        content: AgentTaskContent,
+    ) -> Result<AgentToolResponseReview, AgentAuthorityRefusal> {
+        let Some(chain) = &self.guardrails else {
+            return Ok(AgentToolResponseReview::unchanged(content));
+        };
+        let value = match content.inline_value() {
+            Some(value) => value.clone(),
+            None => match content.artifact_ref() {
+                Some(artifact) => serde_json::to_value(artifact).map_err(|error| {
+                    AgentAuthorityRefusal::of(
+                        "guardrail-content-unencodable",
+                        format!("the tool result's artifact reference does not encode: {error}"),
+                    )
+                })?,
+                None => {
+                    return Err(AgentAuthorityRefusal::of(
+                        "guardrail-content-unencodable",
+                        "the tool result carries neither an inline value nor an artifact \
+                         reference",
+                    ))
+                }
+            },
+        };
+        let mut guardrail_context =
+            AgentGuardrailContext::new(AgentGuardrailBoundary::ToolResponse, scope);
+        if let Some(tool) = tool {
+            guardrail_context = guardrail_context.with_tool(tool);
+        }
+        let decision =
+            chain.evaluate_bounded(&guardrail_context, &value, AGENT_TOOL_RESULT_MAX_BYTES);
+        refuse_guardrail_disposition(&decision.disposition, "the tool response", false)?;
+        let mut review = AgentToolResponseReview::unchanged(content);
+        review.transforms = decision.transforms;
+        review.reports = decision.reports;
+        if decision.transformed {
+            if review.content.inline_value().is_none() {
+                return Err(AgentAuthorityRefusal::of(
+                    "guardrail-transform-unsupported",
+                    "a guardrail stage transformed a tool result held behind an artifact \
+                     reference; a reference cannot be rewritten into inline content",
+                ));
+            }
+            review.content = AgentTaskContent::inline(decision.content).map_err(|error| {
+                AgentAuthorityRefusal::of(
+                    "guardrail-transform-invalid",
+                    format!("the transformed tool result is not a bounded inline result: {error}"),
+                )
+            })?;
+            review.transformed = true;
+        }
+        Ok(review)
+    }
+
     /// An authority over the given registry, with no guardrail chain and no
     /// execution-policy router.
     #[must_use]
@@ -1166,7 +1283,10 @@ impl AgentToolAuthority {
 
     /// The boundaries this authority's coverage check treats as evaluated.
     ///
-    /// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] plus
+    /// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] — the two request
+    /// boundaries before every attempt and
+    /// [`AgentGuardrailBoundary::ToolResponse`] after every tool execution
+    /// ([`Self::review_tool_response`]) — plus
     /// [`AgentGuardrailBoundary::MemoryIngress`] once a deployment has
     /// attested its retrieval bundle.
     #[must_use]

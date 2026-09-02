@@ -1855,6 +1855,30 @@ impl AgentRunEffect {
         self.last_fence = Some(fence);
     }
 
+    /// The durable span identity of one dispatch attempt of the current
+    /// generation: the id the dispatcher's `effect-dispatch` segment for that
+    /// attempt exports under, derived from this record so that the run — which
+    /// never sees the dispatcher's segment — can link an indeterminate
+    /// transition to the attempt whose outcome it could not establish
+    /// ([specification 17.9](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// `None` when the effect carries no trace context.
+    #[must_use]
+    pub fn attempt_span_identity(
+        &self,
+        attempt: u32,
+    ) -> Option<rakka_agent_workflow::AgentTraceContext> {
+        crate::observability::agent_durable_span_identity(
+            &self.telemetry,
+            &[
+                "effect-dispatch",
+                self.effect_id.as_str(),
+                &self.generation.get().to_string(),
+                &attempt.to_string(),
+            ],
+        )
+    }
+
     /// Begins the next generation after an operator proved the previous
     /// invocation never happened
     /// ([specification 11.3](../../../docs/plans/rakka-agent/spec.md): "if a

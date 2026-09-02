@@ -208,6 +208,7 @@ fn resolve_command(
         checkpoint_id,
         resolver: resolver(),
         decision,
+        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
     }
 }
 

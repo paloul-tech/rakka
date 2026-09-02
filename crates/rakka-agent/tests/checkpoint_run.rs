@@ -152,6 +152,7 @@ async fn a_checkpoint_required_tool_parks_then_dispatches_under_an_approval() {
                 checkpoint_id,
                 resolver: resolver(),
                 decision: approve(),
+                telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
             },
             &fx.router,
             fx.now(),
@@ -177,6 +178,7 @@ async fn a_duplicate_checkpoint_decision_does_not_resume_twice() {
         checkpoint_id: cp,
         resolver: resolver(),
         decision: approve(),
+        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
     };
 
     let mut run = fx.run();
@@ -216,6 +218,7 @@ async fn a_denied_checkpoint_fails_the_gated_effect() {
                     reason: "not this time".to_string(),
                 },
             )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
         },
         &fx.router,
         fx.now(),
@@ -288,6 +291,7 @@ async fn an_authorization_required_tool_parks_then_dispatches_under_the_authoriz
         checkpoint_id: cp,
         resolver: resolver(),
         decision: approve(),
+        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
     };
     let mut run = fx.run();
     run.recover(fx.now()).await.expect("the run recovers");
@@ -387,6 +391,7 @@ async fn drive_gated_flow(fx: &Fixture, checkpoint_id: &HumanCheckpointId) -> Re
                 checkpoint_id: checkpoint_id.clone(),
                 resolver: resolver(),
                 decision: approve(),
+                telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
             },
             &fx.router,
             fx.now(),
@@ -486,6 +491,7 @@ async fn the_gated_park_decide_resume_flow_survives_any_owner_loss() {
                         checkpoint_id,
                         resolver: resolver(),
                         decision: approve(),
+                        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
                     },
                     &fx.router,
                     fx.now(),

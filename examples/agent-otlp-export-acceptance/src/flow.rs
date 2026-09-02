@@ -679,6 +679,7 @@ pub async fn drive_run(world: &World) -> AgentRunScope {
                             allowed_use_count: 1,
                         },
                     )),
+                    telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
                 }),
                 reply_to,
             },

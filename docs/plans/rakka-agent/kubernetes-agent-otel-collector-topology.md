@@ -93,7 +93,7 @@ arithmetic:
 | `expected_new_traces_per_sec` | 200 | The rate the gateway pair is sized for. |
 | `decision_wait` | 30s | 200/s × 30s ≈ 6,000 traces undecided at any moment. |
 | `num_traces` | 50,000 | The LRU of traces held: an order of magnitude above the undecided set, so late spans of a decided trace still land in it. |
-| gateway memory limit | 4Gi | One full agent run produced 38 spans in the export walk; 50,000 traces is ~1.9M spans worst case. |
+| gateway memory limit | 4Gi | One full agent run produced 39 spans in the export walk; 50,000 traces is ~1.9M spans worst case. |
 | `memory_limiter` | 80% / 20% spike | Bounds the above rather than trusting the estimate. |
 | backend `sending_queue` | 4,096 | Sized to drain a decision burst, not a steady rate: tail sampling emits in bursts as decisions land. |
 | backend `retry_on_failure` | 1s → 10s, 60s cap | Bounded, so a backend outage sheds load rather than growing the queue without limit. |

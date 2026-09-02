@@ -1009,6 +1009,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
                                 }),
                             },
                         )),
+                        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
                     }),
                     reply_to,
                 },

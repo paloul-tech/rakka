@@ -372,7 +372,7 @@ data:
         # 30-second decision wait leaves ~6,000 traces undecided at any moment;
         # `num_traces` is the LRU of traces held, set an order of magnitude
         # above that so late spans of an undecided trace still land in it. One
-        # full agent run produced 38 spans in the export walk, so 50,000 traces
+        # full agent run produced 39 spans in the export walk, so 50,000 traces
         # is ~1.9M spans worst case; the memory limiter at 80% of the 4Gi limit
         # below is what bounds that, and the queue and retry settings on the
         # backend exporter are sized to drain a decision burst rather than a
