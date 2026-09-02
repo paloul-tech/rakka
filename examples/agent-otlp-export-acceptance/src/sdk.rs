@@ -8,7 +8,8 @@
 //! does lives in a `crates/` directory.
 //!
 //! Spans and metrics are handed to the OTLP exporters **directly**, as batches
-//! this module builds from [`AgentOtlpBridgeExport`]. That is deliberate and it
+//! this module builds from [`AgentOtlpBridgeExport`](rakka_agent_workflow::AgentOtlpBridgeExport).
+//! That is deliberate and it
 //! is the only mapping that preserves what 17.17 requires. A span's trace and
 //! span ids are already authoritative in the durable record, so minting a new
 //! span through the `Tracer` API would replace them; and Rakka's metrics
@@ -68,7 +69,8 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 /// An exemplar links a representative measurement to the trace that produced
 /// it, and Rakka's `MetricsRecorder` has no trace identity to read — trace
 /// context here is an explicit value on a durable record, never an ambient one
-/// ([`docs/rakka-v1-observability-exporters.md`]). What *does* carry both is a
+/// ([`rakka-v1-observability-exporters.md`](../../../docs/rakka-v1-observability-exporters.md)).
+/// What *does* carry both is a
 /// closed [`AgentTelemetrySegment`]: it ends in the same synchronous region
 /// that records the measurement, and it carries the run's durable trace
 /// context. See [`ExemplarIdentity`] for exactly which span the resulting
