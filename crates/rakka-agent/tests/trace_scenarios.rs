@@ -149,10 +149,10 @@ async fn ingress_context_flows_to_every_effect_and_survives_owner_loss() {
 #[tokio::test]
 async fn a_parked_checkpoint_carries_the_segment_a_resume_doubly_links() {
     use rakka_agent::{
-        segment_span, AgentApprovalDecision, AgentCheckpoint, AgentCheckpointDecision,
-        AgentOperationId, AgentOperationKind, AgentRunEntityCommand, AgentSegmentOperation,
-        InMemoryAgentSegmentSink, ATTR_AGENT_TELEMETRY_LINK_KIND, LINK_KIND_PARKED_CHECKPOINT,
-        LINK_KIND_RESUME_REQUEST, SEGMENT_ATTR_CHECKPOINT_KIND,
+        AgentApprovalDecision, AgentCheckpoint, AgentCheckpointDecision, AgentOperationId,
+        AgentOperationKind, AgentRunEntityCommand, AgentSegmentOperation, InMemoryAgentSegmentSink,
+        ATTR_AGENT_TELEMETRY_LINK_KIND, LINK_KIND_PARKED_CHECKPOINT, LINK_KIND_RESUME_REQUEST,
+        SEGMENT_ATTR_CHECKPOINT_KIND,
     };
     use rakka_agent_workflow::PrincipalRef;
 
@@ -286,10 +286,14 @@ async fn a_parked_checkpoint_carries_the_segment_a_resume_doubly_links() {
     assert_eq!(request_link.trace_id, "1bf7651916cd43dd8448eb211c80319d");
     assert_eq!(request_link.span_id, "c7ad6b7169203332");
 
-    // And the links survive the bridge into the export record.
-    let exported = segment_span(resolution).expect("the resolution maps");
-    assert_eq!(exported.span_id, identity.span_id);
-    assert_eq!(exported.links.len(), 2);
+    // And the links survive the bridge into the export record, when the
+    // bridge is built at all.
+    #[cfg(feature = "otel")]
+    {
+        let exported = rakka_agent::segment_span(resolution).expect("the resolution maps");
+        assert_eq!(exported.span_id, identity.span_id);
+        assert_eq!(exported.links.len(), 2);
+    }
 }
 
 /// Scenario 24: the W3C sampled flag changes trace recording downstream and
