@@ -64,8 +64,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCorrelationId, AgentEffectId, AgentTelemetryContext,
-    AgentTimestampMillis, ArtifactRef, HumanCheckpointId, PrincipalRef, StateSchemaVersion,
+    require_agent_trace_context, AgentCausationId, AgentCorrelationId, AgentEffectId,
+    AgentSpanLink, AgentTelemetryContext, AgentTimestampMillis, ArtifactRef, HumanCheckpointId,
+    PrincipalRef, StateSchemaVersion,
 };
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, MetricsRecorder,
@@ -108,17 +109,19 @@ use crate::memory::{
 };
 use crate::model::AgentModelError;
 use crate::observability::{
-    record_agent_domain_counter, record_agent_domain_duration, record_agent_domain_gauge,
-    record_agent_domain_histogram, record_unsettleable_exchanges, AgentDecisionDraft,
-    AgentDecisionEvent, AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource,
-    AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink, AgentSegmentTimer,
-    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
-    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
-    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
-    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION,
-    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_TURN_DURATION,
-    METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND, SEGMENT_ATTR_LOOP_TRANSITIONS,
+    agent_linked_telemetry_context, agent_span_link, record_agent_domain_counter,
+    record_agent_domain_duration, record_agent_domain_gauge, record_agent_domain_histogram,
+    record_unsettleable_exchanges, AgentDecisionDraft, AgentDecisionEvent, AgentDecisionEventSink,
+    AgentDecisionKind, AgentDecisionSource, AgentSegmentIdentity, AgentSegmentOperation,
+    AgentSegmentSink, AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT,
+    LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST, METRIC_AGENT_DECISIONS,
+    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
+    METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_FAN_IN_RESOLUTIONS,
+    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
+    METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION, METRIC_AGENT_RECOVERY_EVENTS,
+    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+    METRIC_AGENT_TURN_DURATION, METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND,
+    SEGMENT_ATTR_EFFECT_ATTEMPT, SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS,
     SEGMENT_ATTR_SETTINGS_REVISION,
 };
 use crate::schema::{
@@ -4950,24 +4953,6 @@ fn agent_principal(scope: &AgentRunScope) -> PrincipalRef {
     }
 }
 
-/// The stable, derived id of the checkpoint of one kind gating one effect
-/// generation, so a re-driven transition opens the same checkpoint rather than
-/// a second one. The kind is folded in because one generation can wait on more
-/// than one kind over its life — an approval before dispatch, a reconciliation
-/// after an ambiguous loss — and the two are different records.
-fn checkpoint_id_for(effect: &AgentRunEffect, kind: AgentCheckpointKind) -> HumanCheckpointId {
-    let tag = match kind {
-        AgentCheckpointKind::Approval => "approval",
-        AgentCheckpointKind::SecurityAuthorization => "authz",
-        AgentCheckpointKind::IndeterminateEffectReconciliation => "reconcile",
-    };
-    HumanCheckpointId::new(format!(
-        "{}#ck-{tag}-g{}",
-        effect.effect_id.as_str(),
-        effect.generation.get()
-    ))
-}
-
 /// Opens a checkpoint of `kind` bound to the exact effect intent, carrying the
 /// run's identity and pinned revisions, and records it on the loop state.
 fn open_effect_checkpoint(
@@ -4990,7 +4975,7 @@ fn open_effect_checkpoint(
             effect_id: effect_id.clone(),
         });
     };
-    let checkpoint_id = checkpoint_id_for(&effect, kind);
+    let checkpoint_id = AgentCheckpoint::id_for_effect(&effect.effect_id, effect.generation, kind);
     let verb = match kind {
         AgentCheckpointKind::Approval => "Approve",
         AgentCheckpointKind::SecurityAuthorization => "Authorize",
@@ -5004,7 +4989,16 @@ fn open_effect_checkpoint(
     let goal = run.loop_state.goal().cloned();
     let settings_revision = run.loop_state.agent_settings_revision();
     let definition_revision = run.loop_state.agent_definition_revision();
-    let telemetry = run.loop_state.telemetry().clone();
+    // The record carries the parked span's *own* identity, derived from the
+    // gated effect's context and the checkpoint id, so the resolution that
+    // arrives later — from any node, after any passivation — can link back to
+    // the span that parked ([specification 17.11]). A run without a trace
+    // stores what it has, as before.
+    let telemetry = AgentCheckpoint::parked_span_identity(&effect.telemetry, &checkpoint_id)
+        .map_or_else(
+            || run.loop_state.telemetry().clone(),
+            |parked| parked.to_telemetry_context(),
+        );
     let mut checkpoint = AgentCheckpoint::open(
         checkpoint_id,
         kind,
@@ -6477,6 +6471,10 @@ where
             .and_then(|state| state.loop_state().map(AgentLoopState::phase))
             .filter(|phase| phase.is_waiting())
             .map(|_| AgentSegmentTimer::start(now));
+        // A resolution's segment: read before the transition drops the
+        // checkpoint record, closed only once the transition committed.
+        let resolving = self.resolving_checkpoint(&command);
+        let resolve_timer = resolving.as_ref().map(|_| AgentSegmentTimer::start(now));
         let reverify = command.clone();
         let reply = match self.apply_command(command, router, now).await {
             // A command that *commits* is fenced by its own compare-and-set:
@@ -6501,6 +6499,25 @@ where
             other => other,
         };
         self.record_fan_in_resolution(resolution_before);
+        // The resolution segment links the parked span and the incoming
+        // request ([specification 17.11]), and exports under the identity the
+        // park linked forward to ([17.9]). A duplicate or a refusal resolved
+        // nothing and closes nothing.
+        let resolved = matches!(reply, Ok(AgentRunEntityReply::Applied { .. }));
+        let mut links = Vec::new();
+        if let (Some(resolving), Some(timer), true) = (resolving, resolve_timer, resolved) {
+            links = resolving.links();
+            let mut segment = timer
+                .close(AgentSegmentOperation::CheckpointResolve)
+                .attribute(SEGMENT_ATTR_CHECKPOINT_KIND, resolving.kind.as_label());
+            if let Some(identity) = AgentCheckpoint::resolve_span_identity(
+                &resolving.effect_telemetry,
+                &resolving.checkpoint_id,
+            ) {
+                segment = segment.span_id(identity.span_id);
+            }
+            self.close_segment_linked(segment.ok(), links.clone());
+        }
         // Closed only when the wait actually ended. A command that arrives at
         // a waiting run and leaves it waiting — a duplicate, a refusal, a
         // partial fan-in — discharged nothing, and a resume segment for it
@@ -6512,7 +6529,10 @@ where
                 .and_then(|state| state.loop_state().map(AgentLoopState::phase))
                 .is_some_and(|phase| !phase.is_waiting());
             if resumed {
-                self.close_segment(timer.close(AgentSegmentOperation::RunResume).ok());
+                self.close_segment_linked(
+                    timer.close(AgentSegmentOperation::RunResume).ok(),
+                    links,
+                );
             }
         }
         reply
@@ -6578,6 +6598,11 @@ where
                             )
                         })
                 });
+                let marks = self
+                    .state()
+                    .ok()
+                    .and_then(|state| state.loop_state().map(segment_marks))
+                    .unwrap_or_default();
                 let reply = self
                     .transition(now, move |state| {
                         record_effect_result(
@@ -6587,6 +6612,19 @@ where
                         Ok(operation_id)
                     })
                     .await?;
+                // An indeterminate result parks a reconciliation checkpoint in
+                // this transition, and that park is the indeterminate
+                // transition specification 17.9 makes an error event.
+                let opened = self
+                    .state()
+                    .ok()
+                    .and_then(|state| {
+                        state
+                            .loop_state()
+                            .map(|loop_state| segment_additions(loop_state, &marks).1)
+                    })
+                    .unwrap_or_default();
+                self.close_checkpoint_open_segments(opened, now);
                 // Counted after the resolving transition committed; a replayed
                 // result answers from the operation log above and never
                 // reaches this arm, so a generation resolves in the metric at
@@ -6623,6 +6661,7 @@ where
                 effect_id,
                 generation,
                 resolution,
+                ..
             } => {
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
@@ -6645,6 +6684,7 @@ where
                 checkpoint_id,
                 resolver,
                 decision,
+                ..
             } => {
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
@@ -7353,18 +7393,7 @@ where
                     .decisions(decisions)
                     .ok(),
             );
-            // The checkpoint segment ends after the durable park, which is
-            // this same commit: specification 17.11 requires the opening span
-            // to end once the wait and its notification are accepted, and
-            // forbids holding a span object across the wait itself.
-            for kind in opened {
-                self.close_segment(
-                    AgentSegmentTimer::start(now)
-                        .close(AgentSegmentOperation::CheckpointOpen)
-                        .attribute(SEGMENT_ATTR_CHECKPOINT_KIND, kind)
-                        .ok(),
-                );
-            }
+            self.close_checkpoint_open_segments(opened, now);
             if let Some((usage, started_at)) = turn_measurements {
                 if let Some(started_at) = started_at {
                     record_agent_domain_duration(
@@ -7432,23 +7461,155 @@ where
     /// segment links to the operation that caused it across every passivation
     /// and shard movement in between.
     fn close_segment(&self, segment: crate::observability::AgentTelemetrySegment) {
-        let Some(sink) = self.segments.as_ref() else {
-            return;
-        };
-        let telemetry = self
-            .state()
+        self.close_segment_linked(segment, Vec::new());
+    }
+
+    /// The trace context the run's durable state carries.
+    fn loop_telemetry(&self) -> AgentTelemetryContext {
+        self.state()
             .ok()
             .and_then(|state| {
                 state
                     .loop_state()
                     .map(|loop_state| loop_state.telemetry().clone())
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// [`Self::close_segment`] with span links appended to the run's context:
+    /// the segment stays a child of the operation that activated the run, and
+    /// the links name what else caused it.
+    fn close_segment_linked(
+        &self,
+        segment: crate::observability::AgentTelemetrySegment,
+        links: Vec<AgentSpanLink>,
+    ) {
+        let Some(sink) = self.segments.as_ref() else {
+            return;
+        };
+        let telemetry = self.loop_telemetry();
+        let telemetry = if links.is_empty() {
+            telemetry
+        } else {
+            agent_linked_telemetry_context(&telemetry, links)
+        };
         sink.record(
             &segment
                 .identity(AgentSegmentIdentity::of_run(&self.scope))
                 .telemetry(telemetry),
         );
+    }
+
+    /// Closes one `checkpoint-open` segment per checkpoint a committed
+    /// transition opened.
+    ///
+    /// The segment ends after the durable park, which is the commit that
+    /// opened it: specification 17.11 requires the opening span to end once
+    /// the wait and its notification are accepted, and forbids holding a span
+    /// object across the wait itself. It exports under the parked identity the
+    /// record stores, so the resolution links to it by name.
+    ///
+    /// A reconciliation park is the *indeterminate transition* of
+    /// [specification 17.9](../../../docs/plans/rakka-agent/spec.md): an error
+    /// event a retention policy keeps, linking the attempt whose outcome could
+    /// not be established and — forward, by derived identity — the
+    /// reconciliation decision the run now waits for.
+    fn close_checkpoint_open_segments(
+        &self,
+        opened: Vec<OpenedCheckpoint>,
+        now: AgentTimestampMillis,
+    ) {
+        if self.segments.is_none() || opened.is_empty() {
+            return;
+        }
+        for checkpoint in opened {
+            let effect = self.state().ok().and_then(|state| {
+                state.loop_state().and_then(|loop_state| {
+                    loop_state
+                        .effects()
+                        .iter()
+                        .find(|effect| effect.effect_id == checkpoint.effect_id)
+                        .cloned()
+                })
+            });
+            let mut segment = AgentSegmentTimer::start(now)
+                .close(AgentSegmentOperation::CheckpointOpen)
+                .attribute(SEGMENT_ATTR_CHECKPOINT_KIND, checkpoint.kind.as_label());
+            let mut links = Vec::new();
+            if let Some(effect) = &effect {
+                if let Some(parked) = AgentCheckpoint::parked_span_identity(
+                    &effect.telemetry,
+                    &checkpoint.checkpoint_id,
+                ) {
+                    segment = segment.span_id(parked.span_id);
+                }
+                if checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation {
+                    links = indeterminate_transition_links(effect, &checkpoint.checkpoint_id);
+                    let code = effect.last_error_code.clone().unwrap_or_else(|| {
+                        AgentRunEffectStatus::Indeterminate.as_label().to_string()
+                    });
+                    segment = segment
+                        .attribute(
+                            SEGMENT_ATTR_EFFECT_STATUS,
+                            AgentRunEffectStatus::Indeterminate.as_label(),
+                        )
+                        .attribute(SEGMENT_ATTR_EFFECT_ATTEMPT, effect.attempts.to_string())
+                        .failed("rakka.agent.effect", code);
+                }
+            }
+            let segment =
+                if checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation {
+                    segment
+                } else {
+                    segment.ok()
+                };
+            self.close_segment_linked(segment, links);
+        }
+    }
+
+    /// The checkpoint `command` resolves, when it is one of the two resolution
+    /// commands and the checkpoint is open — read before the transition, which
+    /// drops the record.
+    fn resolving_checkpoint(&self, command: &AgentRunEntityCommand) -> Option<ResolvingCheckpoint> {
+        let (checkpoint_id, request) = match command {
+            AgentRunEntityCommand::ResolveCheckpoint {
+                checkpoint_id,
+                telemetry,
+                ..
+            } => (checkpoint_id.clone(), telemetry.clone()),
+            AgentRunEntityCommand::ResolveIndeterminateEffect {
+                effect_id,
+                generation,
+                telemetry,
+                ..
+            } => (
+                AgentCheckpoint::id_for_effect(
+                    effect_id,
+                    *generation,
+                    AgentCheckpointKind::IndeterminateEffectReconciliation,
+                ),
+                telemetry.clone(),
+            ),
+            _ => return None,
+        };
+        let loop_state = self.state().ok()?.loop_state()?;
+        let checkpoint = loop_state
+            .open_checkpoints()
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)?;
+        let effect_telemetry = loop_state
+            .effects()
+            .iter()
+            .find(|effect| effect.effect_id == checkpoint.bound_effect.effect_id)
+            .map(|effect| effect.telemetry.clone())
+            .unwrap_or_default();
+        Some(ResolvingCheckpoint {
+            kind: checkpoint.kind,
+            parked: checkpoint.telemetry.clone(),
+            effect_telemetry,
+            checkpoint_id,
+            request,
+        })
     }
 
     /// Commits the workflow-cancel decisions a wind-down or straggler chase
@@ -7856,6 +8017,12 @@ pub enum AgentRunEntityCommand {
         generation: AgentEffectGeneration,
         /// The decision.
         resolution: Box<AgentEffectResolution>,
+        /// Trace context of the incoming service request, which the
+        /// resolution segment links ([specification 17.11]). Observability
+        /// only: a command encoded before this field decodes to the empty
+        /// context, and resolution never reads it.
+        #[serde(default)]
+        telemetry: AgentTelemetryContext,
     },
     /// An authenticated decision on an approval or authorization checkpoint the
     /// run is waiting on
@@ -7873,6 +8040,12 @@ pub enum AgentRunEntityCommand {
         resolver: PrincipalRef,
         /// The decision.
         decision: Box<AgentCheckpointDecision>,
+        /// Trace context of the incoming human or service request, which the
+        /// resolution segment links ([specification 17.11]). Observability
+        /// only: a command encoded before this field decodes to the empty
+        /// context, and resolution never reads it.
+        #[serde(default)]
+        telemetry: AgentTelemetryContext,
     },
     /// Fire the durable SLA and expiration timers on the run's open checkpoints
     /// ([specification 12.6](../../../docs/plans/rakka-agent/spec.md)). A
@@ -8767,12 +8940,21 @@ fn segment_marks(loop_state: &AgentLoopState) -> AgentSegmentMarks {
     }
 }
 
-/// The decisions a transition committed and the checkpoint kinds it opened,
-/// diffed against [`segment_marks`] by identity.
+/// One checkpoint a transition opened, as the `checkpoint-open` segment that
+/// closes at the park needs it.
+#[derive(Debug, Clone)]
+struct OpenedCheckpoint {
+    checkpoint_id: HumanCheckpointId,
+    kind: AgentCheckpointKind,
+    effect_id: AgentEffectId,
+}
+
+/// The decisions a transition committed and the checkpoints it opened, diffed
+/// against [`segment_marks`] by identity.
 fn segment_additions(
     loop_state: &AgentLoopState,
     marks: &AgentSegmentMarks,
-) -> (Vec<AgentDecisionEvent>, Vec<&'static str>) {
+) -> (Vec<AgentDecisionEvent>, Vec<OpenedCheckpoint>) {
     (
         loop_state
             .decision_outbox()
@@ -8784,9 +8966,65 @@ fn segment_additions(
             .open_checkpoints()
             .iter()
             .filter(|checkpoint| !marks.checkpoints.contains(&checkpoint.checkpoint_id))
-            .map(|checkpoint| checkpoint.kind.as_label())
+            .map(|checkpoint| OpenedCheckpoint {
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                kind: checkpoint.kind,
+                effect_id: checkpoint.bound_effect.effect_id.clone(),
+            })
             .collect(),
     )
+}
+
+/// The links an indeterminate transition carries
+/// ([specification 17.9](../../../docs/plans/rakka-agent/spec.md)): the
+/// ambiguous attempt — the effect's latest, since the indeterminate outcome
+/// is what its attempt returned — and, forward by derived identity, the
+/// reconciliation decision that resolves `checkpoint_id`.
+fn indeterminate_transition_links(
+    effect: &AgentRunEffect,
+    checkpoint_id: &HumanCheckpointId,
+) -> Vec<AgentSpanLink> {
+    let mut links = Vec::new();
+    if let Some(attempt) = effect.attempt_span_identity(effect.attempts) {
+        links.push(agent_span_link(&attempt, LINK_KIND_AMBIGUOUS_ATTEMPT));
+    }
+    if let Some(decision) = AgentCheckpoint::resolve_span_identity(&effect.telemetry, checkpoint_id)
+    {
+        links.push(agent_span_link(
+            &decision,
+            LINK_KIND_RECONCILIATION_DECISION,
+        ));
+    }
+    links
+}
+
+/// The checkpoint a resolution command names, read before the transition that
+/// retires it, with everything the `checkpoint-resolve` segment links.
+#[derive(Debug, Clone)]
+struct ResolvingCheckpoint {
+    kind: AgentCheckpointKind,
+    /// The parked span, as the record stored it at open.
+    parked: AgentTelemetryContext,
+    /// The gated effect's context, which the resolve identity derives from.
+    effect_telemetry: AgentTelemetryContext,
+    checkpoint_id: HumanCheckpointId,
+    /// The incoming request's context, from the command.
+    request: AgentTelemetryContext,
+}
+
+impl ResolvingCheckpoint {
+    /// The links a resolution carries: the parked span and the request span
+    /// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md)).
+    fn links(&self) -> Vec<AgentSpanLink> {
+        let mut links = Vec::new();
+        if let Ok(parked) = require_agent_trace_context(&self.parked) {
+            links.push(agent_span_link(&parked, LINK_KIND_PARKED_CHECKPOINT));
+        }
+        if let Ok(request) = require_agent_trace_context(&self.request) {
+            links.push(agent_span_link(&request, LINK_KIND_RESUME_REQUEST));
+        }
+        links
+    }
 }
 
 fn run_refusal_may_be_stale(error: &AgentRunError) -> bool {
@@ -9491,7 +9729,10 @@ mod tests {
         );
         let (_, opened) = segment_additions(&loop_state, &marks);
         assert_eq!(
-            opened,
+            opened
+                .iter()
+                .map(|checkpoint| checkpoint.kind.as_label())
+                .collect::<Vec<_>>(),
             vec!["security-authorization"],
             "the newly opened checkpoint must reach a segment"
         );

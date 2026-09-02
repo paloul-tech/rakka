@@ -4948,6 +4948,71 @@ already carry, unchanged by this slice.
 
 ---
 
+## Post-Phase-6 gap slices
+
+The three matrices and the telemetry matrix's post-phase rows record what the
+phases left owed. Gap slices close owed items one mechanism at a time, each
+holding its claim by test the way the phases did.
+
+### Gap slice 1 — The two telemetry MUSTs and the `ToolResponse` boundary
+
+Spec: [17.9](spec.md#179-tool-and-effect-observability),
+[17.11](spec.md#1711-hitl-authorization-wait-and-recovery-observability),
+[16](spec.md#16-security-and-authorization).
+
+Status: implemented (2026-09-02, branch `rakka-agents-phase-gap1`). Design in
+`docs/superpowers/specs/2026-09-02-phase-gap1-telemetry-musts-and-tool-response-design.md`.
+
+- **One mechanism for both MUSTs: a durable span identity.** Every exported
+  span id was minted at export, from the record's fields and the exporter's
+  emission ordinal, so no component could name a span it did not export — and
+  both MUSTs are links between spans that *different* components close.
+  `agent_durable_span_identity` derives an id from the trace context a
+  durable record already holds and the record's own identity;
+  `AgentTelemetrySegment::span_id` exports it verbatim (the mapping and the
+  exporter both skip re-derivation for it). Two components holding the same
+  record derive the same id without a message, and a link can be written
+  before its target exists.
+- **17.11.** `open_effect_checkpoint` stores the parked identity on
+  `AgentCheckpoint::telemetry` (the field's doc had claimed that role since
+  slice 1.13); the `checkpoint-open` segment exports under it. The new
+  `checkpoint-resolve` class closes on `ResolveCheckpoint` and
+  `ResolveIndeterminateEffect` once the transition commits, under the
+  pre-derived resolve identity, linking `parked-checkpoint` (from the record)
+  and `resume-request` (from the commands' new `telemetry` field); the
+  `run-resume` the same command discharges carries the same links. The
+  workflow substrate's `agent_durable_resume_telemetry_context` stays
+  uncalled here by decision: it re-parents, and the agent domain keeps one
+  parent per activation and expresses causes as links.
+- **17.9.** The attempt segment exports under
+  `AgentRunEffect::attempt_span_identity`. The dispatcher's park close and the
+  run's reconciliation `checkpoint-open` — which now closes at all, as an
+  error event on the `RecordEffectResult` that parks, through the same
+  marks-and-additions diff `advance` uses — link `ambiguous-attempt` and,
+  forward, `reconciliation-decision`, because `AgentCheckpoint::id_for_effect`
+  (moved out of `run.rs` for the purpose) makes the checkpoint id a pure
+  function of effect and generation.
+- **`ToolResponse`.** `AgentToolAuthority::review_tool_response` evaluates
+  the chain in the dispatcher after execution and before delivery, the last
+  point at which nothing durable holds the result. A refusal becomes a
+  determinate `Failed` outcome under the refusal's code (the tool ran; it is
+  not re-invoked), a transform replaces the delivered content (so a
+  redelivery carries the same content and no retry re-evaluates), and
+  `RequireCheckpoint` fails closed. Both evaluated-boundary constants gain the
+  boundary; the unevaluated-boundary test moved to `ModelResponse`. The
+  in-process result delivery gained `with_memory` because the transform proof
+  reads the result back from session memory, and a driver without the bundle
+  owes no entry — the every-driver rule, met one field later than segments.
+- **Held by:** `telemetry_context.rs` (identity derivation; link-kind
+  vocabulary bijection), `otel_span_mapping.rs` (identity survives the
+  exporter's ordinal), `trace_scenarios.rs` scenario 22 (rewritten over
+  runtime-produced segments), `effect_dispatch.rs::an_indeterminate_transition_links_the_ambiguous_attempt_and_the_reconciliation_decision`,
+  and four `tool_authority.rs` tests. Documentation: both matrices, the
+  catalogue's new span-link section, `docs/rakka-compatibility.md`.
+- **Owed onward:** a wait segment for timer and child waits (no parked span
+  exists to link), the `ModelResponse` and A2A guardrail points, and
+  everything else the matrices' owed sections carry, unchanged.
+
 ## Appendix — Scenario-to-Slice Coverage
 
 All scenario numbers refer to

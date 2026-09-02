@@ -15,12 +15,15 @@
 //!
 //! The dispatch authority runs [`AgentGuardrailBoundary::ToolRequest`] and
 //! [`AgentGuardrailBoundary::ModelRequest`] before every attempt's durable
-//! `Started` (slice 1.8), and the snapshot-assembly retrieval path runs
+//! `Started` (slice 1.8) and [`AgentGuardrailBoundary::ToolResponse`] on every
+//! executed tool's result before it is delivered to the run
+//! ([`crate::tools::AgentToolAuthority::review_tool_response`]), and the
+//! snapshot-assembly retrieval path runs
 //! [`AgentGuardrailBoundary::MemoryIngress`] on every retrieved private memory
 //! before it enters a model context (slice 2.2,
-//! [`crate::retrieval::assemble_context`]). The remaining boundaries —
-//! model/tool response, A2A ingress/egress — are declared here so chains can
-//! be configured for them, but their evaluation points arrive with the slices
+//! [`crate::retrieval::assemble_context`]). The remaining boundaries — model
+//! response, A2A ingress/egress — are declared here so chains can be
+//! configured for them, but their evaluation points arrive with the slices
 //! that own those flows.
 //!
 //! A stage bound only to a not-yet-evaluated boundary therefore protects

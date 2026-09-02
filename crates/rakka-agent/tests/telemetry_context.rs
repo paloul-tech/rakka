@@ -353,3 +353,118 @@ fn the_write_gate_bounds_a_span_links_attributes_too() {
     .validate()
     .expect("a persisted link must never make a record unexportable");
 }
+
+/// A durable span identity is a pure function of the context a record already
+/// holds and the record's own durable material, so two components holding the
+/// same record — the run entity that parks and the dispatcher that attempts,
+/// on different nodes — derive the same id without communicating. That is
+/// what lets one of them *link* to a span the other closed: a link needs a
+/// name, and every exported span id used to be minted at export time, where
+/// nobody else could know it.
+#[test]
+fn a_durable_span_identity_is_a_function_of_its_context_and_material() {
+    use rakka_agent::agent_durable_span_identity;
+
+    let parked = agent_durable_span_identity(&stamped_context(), &["checkpoint-open", "ck-1"])
+        .expect("a stamped context derives an identity");
+    assert_eq!(parked.trace_id, "0af7651916cd43dd8448eb211c80319c");
+    assert_ne!(
+        parked.span_id, "b7ad6b7169203331",
+        "the identity is a child of the context, never the context's own span"
+    );
+    assert_eq!(parked.trace_state.as_deref(), Some("vendor=value"));
+
+    let again = agent_durable_span_identity(&stamped_context(), &["checkpoint-open", "ck-1"])
+        .expect("derives again");
+    assert_eq!(
+        parked, again,
+        "the same record derives the same id anywhere"
+    );
+
+    let other = agent_durable_span_identity(&stamped_context(), &["checkpoint-open", "ck-2"])
+        .expect("derives");
+    assert_ne!(
+        parked.span_id, other.span_id,
+        "material tells siblings apart"
+    );
+
+    let resolve = agent_durable_span_identity(&stamped_context(), &["checkpoint-resolve", "ck-1"])
+        .expect("derives");
+    assert_ne!(parked.span_id, resolve.span_id);
+
+    assert!(
+        agent_durable_span_identity(&AgentTelemetryContext::default(), &["checkpoint-open"])
+            .is_none(),
+        "a record without a trace has no identity to derive, and no error either"
+    );
+}
+
+/// Every link kind this crate can write is catalogued, and every catalogued
+/// kind is written somewhere other than its own definition — the same
+/// bijection the error types get, and for the same reason: a link kind is the
+/// only attribute a span link carries, an operator walks a trace by it, and a
+/// kind that is declared and never written is the defect class slice 6.3a
+/// found three times.
+#[test]
+fn every_link_kind_is_catalogued_and_written() {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut defined: BTreeMap<String, String> = BTreeMap::new();
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(&src).expect("src is readable") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("source is readable");
+        for line in source.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("pub const LINK_KIND_") else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(": &str = \"") else {
+                continue;
+            };
+            let value = value.trim_end_matches("\";");
+            defined.insert(format!("LINK_KIND_{name}"), value.to_string());
+        }
+        sources.push((path, source));
+    }
+    assert!(
+        !defined.is_empty(),
+        "the scan found no link kinds, so it proves nothing"
+    );
+
+    let catalogued: std::collections::BTreeSet<&str> = rakka_agent::AGENT_TELEMETRY_LINK_KINDS
+        .iter()
+        .copied()
+        .collect();
+    for (name, value) in &defined {
+        assert!(
+            catalogued.contains(value.as_str()),
+            "`{name}` = `{value}` is defined but not in AGENT_TELEMETRY_LINK_KINDS"
+        );
+        let written = sources.iter().any(|(path, source)| {
+            path.file_name().and_then(|file| file.to_str()) != Some("lib.rs")
+                && source
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("pub const "))
+                    .filter(|line| !line.trim_start().starts_with("///"))
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    // The catalogue's own rows are not writes.
+                    .filter(|line| !line.trim().trim_end_matches(',').ends_with(name.as_str()))
+                    .any(|line| line.contains(name.as_str()))
+        });
+        assert!(
+            written,
+            "`{name}` is catalogued but this crate writes it nowhere"
+        );
+    }
+    for value in &catalogued {
+        assert!(
+            defined.values().any(|defined| defined == value),
+            "`{value}` is catalogued but no LINK_KIND_ constant defines it"
+        );
+    }
+}

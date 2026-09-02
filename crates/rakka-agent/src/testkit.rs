@@ -3002,6 +3002,7 @@ where
     policies: AgentEffectPolicies,
     workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
+    memory: Option<crate::memory::AgentRunMemory>,
     segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
     metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
     decisions: Option<Arc<dyn crate::observability::AgentDecisionEventSink>>,
@@ -3028,6 +3029,7 @@ where
             policies: AgentEffectPolicies::default(),
             workflow_tools: None,
             delegation: None,
+            memory: None,
             segments: None,
             metrics: None,
             decisions: None,
@@ -3064,6 +3066,18 @@ where
     #[must_use]
     pub fn with_segments(mut self, sink: Arc<dyn crate::observability::AgentSegmentSink>) -> Self {
         self.segments = Some(sink);
+        self
+    }
+
+    /// Wires the entity this delivery drives with the run's memory bundle.
+    ///
+    /// The same every-driver rule: delivering a tool result is what makes
+    /// the turn record, and a turn recorded by a driver without the bundle
+    /// owes no session entry — so a deployment whose run reads its own tool
+    /// results back from session memory must wire the delivery too.
+    #[must_use]
+    pub fn with_memory(mut self, memory: crate::memory::AgentRunMemory) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -3133,6 +3147,9 @@ where
             }
             if let Some(config) = &self.delegation {
                 entity = entity.with_delegation(config.clone());
+            }
+            if let Some(memory) = &self.memory {
+                entity = entity.with_memory(memory.clone());
             }
             if let Some(segments) = &self.segments {
                 entity = entity.with_segments(segments.clone());

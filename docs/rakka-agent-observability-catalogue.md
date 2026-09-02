@@ -195,6 +195,7 @@ a resume link back to the operation that parked.
 | `goal-evaluate` | Goal evaluation |
 | `memory-operation`, `retrieval` | Memory operation, retrieval |
 | `checkpoint-open` | Checkpoint open |
+| `checkpoint-resolve` | Checkpoint resolution — the transition an incoming human or service decision commits (17.11's resolution span) |
 | `run-resume`, `run-recover` | Run resume/recovery |
 
 Two rows of 17.6 are absent because the operations do not exist: `embeddings
@@ -208,7 +209,7 @@ milestones; the emission is not, and this is the list rather than a silence.
 
 | Closed by | Classes |
 | --- | --- |
-| The run entity | `decide`, `invoke-agent`, `effect-schedule`, `checkpoint-open`, `run-resume`, `run-recover` |
+| The run entity | `decide`, `invoke-agent`, `effect-schedule`, `checkpoint-open`, `checkpoint-resolve`, `run-resume`, `run-recover` |
 | The dispatcher | `tool-authorize`, `effect-dispatch`, `model-inference`, `execute-tool` |
 | The A2A service | `a2a-ingress` |
 
@@ -234,7 +235,7 @@ for the deployment slice to discover:
 | 17.16 retention class | Selectable on |
 | --- | --- |
 | `ERROR` status or stable failure code | span status, `error.type`, `rakka.error.code` |
-| Indeterminate effect or reconciliation | `rakka.agent.effect.status` = `indeterminate`, on an error-status dispatch span closed at the park |
+| Indeterminate effect or reconciliation | `rakka.agent.effect.status` = `indeterminate`, on the error-status dispatch span the dispatcher closes at the park and on the error-status `rakka.agent.checkpoint.open` span (kind `indeterminate-effect-reconciliation`) the run closes when it records the park |
 | Security denial, policy override, revocation | the refusal code on a failed `rakka.agent.tool.authorize` span |
 | Checkpoint escalation or timeout | `rakka.agent.checkpoint.kind` on `rakka.agent.checkpoint.open` |
 | Recovery failure | error status on `rakka.agent.run.recover` |
@@ -245,6 +246,36 @@ for the deployment slice to discover:
 Stale-owner conflict is the one 17.16 case with no dedicated attribute: it
 surfaces today as a failed transition's stable error code rather than as a
 class of its own.
+
+### Span links and durable span identities
+
+A segment's span id is minted at export — from the record's fields and the
+exporter's emission ordinal — unless the segment carries a **durable span
+identity** (`AgentTelemetrySegment::span_id`), in which case it exports under
+that id verbatim. An identity is derived, never drawn
+(`agent_durable_span_identity`): a hash of the trace context a durable record
+already holds and the record's own identity, so two components holding the
+same record derive the same id without a message between them, and one can
+link to a span the other closes — before it closes. Three records carry one:
+
+| Segment | Identity derived from | Stored on |
+| --- | --- | --- |
+| `effect-dispatch` (one attempt) | the effect's context, effect id, generation, attempt | nothing — re-derived by whoever links to it |
+| `checkpoint-open` | the gated effect's context and the checkpoint id | `AgentCheckpoint::telemetry`, at open |
+| `checkpoint-resolve` | the gated effect's context and the checkpoint id | nothing — named forward by the park, re-derived at resolution |
+
+Every span link carries one attribute, `rakka.agent.link.kind`, and its
+values are a bounded vocabulary held as data in `AGENT_TELEMETRY_LINK_KINDS`,
+checked against the writers in both directions by
+`cargo test -p rakka-agent --test telemetry_context`:
+
+| Link kind | Written on | Points at |
+| --- | --- | --- |
+| `superseded-generation` | a regenerated effect's context | the generation it replaced |
+| `parked-checkpoint` | `checkpoint-resolve`, and the `run-resume` the same command discharged | the `checkpoint-open` span that parked |
+| `resume-request` | `checkpoint-resolve`, and that `run-resume` | the incoming request's span, from the resolving command's `telemetry` |
+| `ambiguous-attempt` | the dispatcher's indeterminate `effect-dispatch` close, and the run's reconciliation `checkpoint-open` | the attempt whose outcome could not be established |
+| `reconciliation-decision` | the same two segments | the `checkpoint-resolve` span of the decision the run now waits for — linked forward |
 
 `error.type` is a bounded vocabulary, held as data in
 `AGENT_SEGMENT_ERROR_TYPES` and checked against the call sites in both

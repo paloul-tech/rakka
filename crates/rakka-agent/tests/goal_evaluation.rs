@@ -254,6 +254,7 @@ async fn approve_open_review(fx: &Fixture) {
                     allowed_use_count: 1,
                 },
             )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
         },
     )
     .await
@@ -789,6 +790,7 @@ async fn a_human_review_approval_satisfies_with_the_resolver_on_record() {
                     allowed_use_count: 1,
                 },
             )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
         },
     )
     .await
@@ -857,6 +859,7 @@ async fn a_denied_human_review_fails_the_evaluation_and_the_goal_stays_active() 
                     reason: "not convinced".to_string(),
                 },
             )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
         },
     )
     .await

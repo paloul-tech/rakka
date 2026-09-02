@@ -437,6 +437,7 @@ impl Sharded {
                                 allowed_use_count: 1,
                             },
                         )),
+                        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
                     }),
                     reply_to,
                 },

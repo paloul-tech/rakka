@@ -56,8 +56,8 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use rakka_agent_workflow::{
-    AgentAuditEventId, AgentEffectId, AgentTelemetryContext, AgentTimestampMillis, ArtifactRef,
-    HumanCheckpointId, PrincipalRef, StateSchemaVersion,
+    AgentAuditEventId, AgentEffectId, AgentTelemetryContext, AgentTimestampMillis,
+    AgentTraceContext, ArtifactRef, HumanCheckpointId, PrincipalRef, StateSchemaVersion,
 };
 use serde::{Deserialize, Serialize};
 
@@ -749,6 +749,69 @@ pub struct AgentCheckpoint {
 }
 
 impl AgentCheckpoint {
+    /// The durable span identity of the `checkpoint-open` segment that parks
+    /// `checkpoint_id`, derived from the gated effect's trace context.
+    ///
+    /// Stored on the record at open as [`Self::telemetry`], so the resolution
+    /// can link back to the parked span
+    /// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub fn parked_span_identity(
+        effect_telemetry: &AgentTelemetryContext,
+        checkpoint_id: &HumanCheckpointId,
+    ) -> Option<AgentTraceContext> {
+        crate::observability::agent_durable_span_identity(
+            effect_telemetry,
+            &["checkpoint-open", checkpoint_id.as_str()],
+        )
+    }
+
+    /// The durable span identity of the `checkpoint-resolve` segment that
+    /// will resolve `checkpoint_id`, derived from the gated effect's trace
+    /// context — before the resolution exists, which is what lets an
+    /// indeterminate park link *forward* to the reconciliation decision it
+    /// waits for ([specification 17.9](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub fn resolve_span_identity(
+        effect_telemetry: &AgentTelemetryContext,
+        checkpoint_id: &HumanCheckpointId,
+    ) -> Option<AgentTraceContext> {
+        crate::observability::agent_durable_span_identity(
+            effect_telemetry,
+            &["checkpoint-resolve", checkpoint_id.as_str()],
+        )
+    }
+
+    /// The stable, derived id of the checkpoint of `kind` gating one effect
+    /// generation, so a re-driven transition opens the same checkpoint rather
+    /// than a second one.
+    ///
+    /// The kind is folded in because one generation can wait on more than one
+    /// kind over its life — an approval before dispatch, a reconciliation after
+    /// an ambiguous loss — and the two are different records. The derivation is
+    /// public because the dispatcher names the reconciliation checkpoint an
+    /// indeterminate park will open *before* the run opens it: the park's span
+    /// links forward to the decision that resolves that checkpoint
+    /// ([specification 17.9](../../../docs/plans/rakka-agent/spec.md)), which
+    /// is only possible when both sides derive the same id from the effect.
+    #[must_use]
+    pub fn id_for_effect(
+        effect_id: &AgentEffectId,
+        generation: AgentEffectGeneration,
+        kind: AgentCheckpointKind,
+    ) -> HumanCheckpointId {
+        let tag = match kind {
+            AgentCheckpointKind::Approval => "approval",
+            AgentCheckpointKind::SecurityAuthorization => "authz",
+            AgentCheckpointKind::IndeterminateEffectReconciliation => "reconcile",
+        };
+        HumanCheckpointId::new(format!(
+            "{}#ck-{tag}-g{}",
+            effect_id.as_str(),
+            generation.get()
+        ))
+    }
+
     /// Opens a checkpoint of `kind` bound to `effect`, with the default allowed
     /// decision set for the kind.
     ///

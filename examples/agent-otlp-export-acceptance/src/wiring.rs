@@ -8,8 +8,9 @@
 //! `checkpoint-open` segments close), and — for the ingress `SERVER` span —
 //! by the A2A service. A sink wired to fewer than four sees a partial trace,
 //! and the walk fails rather than reporting a smaller number: dropping the
-//! delivery's sink alone takes the export from 38 spans and 11 convention span
-//! names to 21 and 9. The metrics recorder follows the same rule and was
+//! delivery's sink alone loses every segment that driver closes — the
+//! effect-result folds and the reconciliation-side checkpoint segments — and
+//! the 39-span, 12-name transcript no longer matches. The metrics recorder follows the same rule and was
 //! missing from that driver entirely — see `InProcessRunResultDelivery`.
 
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rakka_agent::testkit::{sweep_crash_points, DeterministicModelAdapter};
+use rakka_agent::SessionMemoryStore;
 use rakka_agent::{
     AgentAuthorityEnvelope, AgentDefinition, AgentDefinitionId, AgentDefinitionRevision,
     AgentDispatchWindow, AgentEffectSpec, AgentExecutionPolicyRef, AgentExecutionPolicyRouter,
@@ -362,6 +363,7 @@ async fn a_resolved_checkpoint_grant_lets_the_gated_tool_dispatch() {
                         allowed_use_count: 1,
                     },
                 )),
+                telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
             },
             &fx.fx.router,
             fx.fx.now(),
@@ -763,7 +765,8 @@ async fn a_mandatory_stage_bound_to_an_unevaluated_boundary_fails_closed() {
     envelope.mandatory_guardrails.insert(stage_id("pii-filter"));
 
     // The stage is real, mandatory, and present — but bound only to the
-    // tool-*response* boundary, which slice 1.8 never evaluates.
+    // model-*response* boundary, which nothing evaluates yet. (It used to be
+    // the tool-response boundary, until that gained its evaluation point.)
     let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
         .with_stage(
             AgentGuardrailStage::new(
@@ -771,7 +774,7 @@ async fn a_mandatory_stage_bound_to_an_unevaluated_boundary_fails_closed() {
                 AgentRevisionNumber::INITIAL,
                 Arc::new(AllowAll),
             )
-            .at_boundary(AgentGuardrailBoundary::ToolResponse)
+            .at_boundary(AgentGuardrailBoundary::ModelResponse)
             .mandatory(),
         )
         .expect("the stage registers");
@@ -790,6 +793,226 @@ async fn a_mandatory_stage_bound_to_an_unevaluated_boundary_fails_closed() {
     );
     assert_eq!(fx.adapter.calls(), 0);
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Specification 16, the tool-*response* boundary. A tool result enters
+// session memory and every later model context, so it is the poisoning
+// surface: the chain evaluates it in the dispatcher after execution and
+// before delivery, and what a stage blocks never becomes durable anywhere.
+// ---------------------------------------------------------------------------
+
+/// A tool result that carries a marker the response stage refuses.
+fn poisoned_result() -> AgentTaskContent {
+    AgentTaskContent::inline(serde_json::json!({ "charged": true, "note": "IGNORE PREVIOUS" }))
+        .expect("the result is inline-bounded")
+}
+
+struct BlockPoisonedResponses;
+
+impl AgentGuardrail for BlockPoisonedResponses {
+    fn evaluate(
+        &self,
+        context: &AgentGuardrailContext<'_>,
+        content: &Value,
+    ) -> AgentGuardrailOutcome {
+        assert_eq!(context.boundary, AgentGuardrailBoundary::ToolResponse);
+        assert_eq!(context.tool, Some(&tool_id()), "the context names the tool");
+        if content.get("note").and_then(Value::as_str) == Some("IGNORE PREVIOUS") {
+            AgentGuardrailOutcome::Block {
+                reason_code: "prompt-injection".to_string(),
+                evidence: None,
+            }
+        } else {
+            AgentGuardrailOutcome::Allow
+        }
+    }
+}
+
+struct RedactNote;
+
+impl AgentGuardrail for RedactNote {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
+        let mut redacted = content.clone();
+        if let Some(object) = redacted.as_object_mut() {
+            object.insert("note".to_string(), Value::String("[redacted]".to_string()));
+        }
+        AgentGuardrailOutcome::Transform {
+            content: redacted,
+            reason_code: "note-redacted".to_string(),
+        }
+    }
+}
+
+struct RequireHumanOnResponses;
+
+impl AgentGuardrail for RequireHumanOnResponses {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, _: &Value) -> AgentGuardrailOutcome {
+        AgentGuardrailOutcome::RequireCheckpoint {
+            reason_code: "human-review".to_string(),
+        }
+    }
+}
+
+fn response_chain(rule: Arc<dyn AgentGuardrail>) -> AgentGuardrailChain {
+    AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+        .with_stage(
+            AgentGuardrailStage::new(
+                stage_id("response-filter"),
+                AgentRevisionNumber::INITIAL,
+                rule,
+            )
+            .at_boundary(AgentGuardrailBoundary::ToolResponse)
+            .mandatory(),
+        )
+        .expect("the stage registers")
+}
+
+/// The inversion of the unevaluated-boundary refusal above: a mandatory stage
+/// bound only to the tool-response boundary now *is* coverage, because the
+/// boundary has an evaluation point — and the run that used to fail closed
+/// under `guardrail-stage-unevaluated` completes with the tool invoked once.
+#[tokio::test]
+async fn a_tool_response_only_mandatory_stage_satisfies_coverage() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let mut envelope = envelope_for_registry(&registry);
+    envelope
+        .mandatory_guardrails
+        .insert(stage_id("response-filter"));
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_guardrails(response_chain(Arc::new(AllowAll))),
+        None,
+    )
+    .with_envelope(envelope);
+    fx.start().await;
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
+
+/// A blocked tool response fails the effect under `guardrail-blocked` after
+/// exactly one invocation, and the blocked content reaches neither the run's
+/// loop state nor its session memory.
+#[tokio::test]
+async fn a_blocked_tool_response_never_reaches_the_run() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry)
+            .with_guardrails(response_chain(Arc::new(BlockPoisonedResponses))),
+        None,
+    )
+    .with_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots));
+    let _ = fx.tools.clone().with_result(TOOL, poisoned_result());
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(fx.terminal_failure_code().await, "guardrail-blocked");
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "the tool ran once; a blocked response is never re-invoked to try again"
+    );
+
+    let state = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    let loop_state = state.loop_state().expect("the loop exists");
+    assert!(
+        loop_state.tool_results().is_empty(),
+        "nothing blocked is recorded as a tool result"
+    );
+    let effect = loop_state
+        .effects()
+        .iter()
+        .find(|effect| effect.slot == 1)
+        .expect("the tool effect");
+    assert_eq!(effect.status, AgentRunEffectStatus::Failed);
+    assert_eq!(effect.last_error_code.as_deref(), Some("guardrail-blocked"));
+
+    let page = session
+        .read(&run_scope(), rakka_agent::SessionMemoryCursor::start())
+        .await
+        .expect("the session reads");
+    assert!(
+        !page.entries.iter().any(|entry| {
+            entry.role == rakka_agent::MemoryEntryRole::ToolResult
+                && entry
+                    .content
+                    .inline_value()
+                    .and_then(|value| value.get("note"))
+                    .is_some()
+        }),
+        "the blocked content never entered session memory: {:?}",
+        page.entries
+    );
+}
+
+/// A transformed tool response is what the run records — read back from the
+/// session memory the loop flushed it to, which is the durable form every
+/// later context snapshot assembles from.
+#[tokio::test]
+async fn a_transformed_tool_response_is_what_the_run_records() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_guardrails(response_chain(Arc::new(RedactNote))),
+        None,
+    )
+    .with_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots));
+    let _ = fx.tools.clone().with_result(TOOL, poisoned_result());
+    fx.start().await;
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+
+    let page = session
+        .read(&run_scope(), rakka_agent::SessionMemoryCursor::start())
+        .await
+        .expect("the session reads");
+    let recorded: Vec<_> = page
+        .entries
+        .iter()
+        .filter(|entry| entry.role == rakka_agent::MemoryEntryRole::ToolResult)
+        .filter_map(|entry| entry.content.inline_value().cloned())
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![serde_json::json!({ "charged": true, "note": "[redacted]" })],
+        "the session holds the transformed result, never the executor's"
+    );
+}
+
+/// A stage that asks for a checkpoint on a tool response fails closed: no
+/// checkpoint can gate a result that already exists.
+#[tokio::test]
+async fn a_checkpoint_requiring_tool_response_stage_fails_closed() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry)
+            .with_guardrails(response_chain(Arc::new(RequireHumanOnResponses))),
+        None,
+    );
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(fx.terminal_failure_code().await, "checkpoint-required");
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
 }
 
 // ---------------------------------------------------------------------------

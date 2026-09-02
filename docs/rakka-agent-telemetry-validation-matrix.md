@@ -39,14 +39,14 @@ recorded with the falsification that proves its test is load-bearing.
 | 17.1 telemetry is never a correctness input | Every sink is synchronous, infallible, and bounded; `AgentSegmentSink` states the rule | `trace_scenarios.rs` (scenario 26), `exporter_failure.rs::an_unreachable_collector_changes_no_durable_outcome` | Met |
 | 17.2 instrumentation scope and resource | `agent_instrumentation_scope`, stamped on every batch by `bridge_export` | Export walk line 4 — every span on the wire carries schema URL `1.36.0` | Met |
 | 17.3 session/task/goal correlation | `AgentSegmentIdentity`, `AgentGenAiIdentity` | `otel_span_mapping.rs` | Met for run identity; `of_task` still has no production caller, so `rakka.agent.task.id` and `.goal.id` are declared and unwritten — see "Owed" |
-| 17.4 bounded trace segments | 24 `AgentSegmentOperation` classes closed at entity, dispatcher and A2A boundaries | `telemetry_segments.rs`; export walk line 2 (11 distinct span names on the wire) | **11 of 24 classes have a production call site** — see "Owed" |
-| 17.5 durable trace context | `AgentTelemetryContext` persisted through every durable boundary | Export walk line 5 — all 38 spans of one run joined the ingress trace | Met |
+| 17.4 bounded trace segments | 25 `AgentSegmentOperation` classes closed at entity, dispatcher and A2A boundaries | `telemetry_segments.rs`; export walk line 2 (12 distinct span names on the wire) | **12 of 25 classes have a production call site** — see "Owed" |
+| 17.5 durable trace context | `AgentTelemetryContext` persisted through every durable boundary | Export walk line 5 — all 39 spans of one run joined the ingress trace | Met |
 | 17.6 required span model | `AgentGenAiOperation::span_name` / `span_kind` / status mapping | Export walk line 3 — all five span kinds reached the wire | Met |
 | 17.7 every loop decision is a durable event and a correlated span event | `AgentDecisionEvent` recorded by `AgentLoopState::record_decision`, flushed after commit through `AgentDecisionEventSink`; `decision_span_event` attaches each one to the `decide` span under the closed allowlist | `decision_events.rs` (exactly-once across owner loss; a drop is a declared gap), `otel_span_mapping.rs::decisions_and_usage_reach_the_span_through_their_mappers`; the no-reasoning rule swept on the decoded wire by export walk line 10 | Met for the mechanism. **Partial for the vocabulary and the field list**: 4 of 13 decision kinds and 2 of 4 sources have a writer, `safety_class` and `reason_code` have none, and sequence, causation, correlation, selected tools, budget outcome, gate result, and before/after labels stay on the durable event and never reach the span — see "Owed" |
 | 17.8 model calls are GenAI `chat` spans | `AgentSegmentOperation::ModelInference` closed by the dispatch pipeline → `chat {profile}`, `CLIENT`, `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`; failures carry `error.type` and `rakka.error.code`; tokens are never invented (a zero direction is omitted, not written) | `telemetry_segments.rs::the_real_dispatch_pipeline_closes_its_own_segments`, `otel_span_mapping.rs::the_genai_attributes_are_written_by_the_mapping`, `::a_usage_direction_with_no_evidence_is_omitted_rather_than_written_as_zero`, `agent_metrics.rs::a_direction_the_provider_did_not_report_records_no_sample` | **Partial.** `gen_ai.usage.*` is attached to the `effect-dispatch` `CONSUMER` span, not the `chat` span; the provider name is the adapter boundary and the request model is the bounded profile; no response model, finish reason, cached/reasoning tokens, streaming timing, snapshot digest, or model-call latency instrument — see "Owed" |
-| 17.9 effects are traceable from decision to outcome | `EffectSchedule` (`PRODUCER`, after durable acceptance), `ToolAuthorize`, `EffectDispatch` (`CONSUMER`, after the durable `Started` write), `ExecuteTool` (`gen_ai.tool.name`/`.type`) with `rakka.agent.effect.kind`, `.attempt`, `.status` (incl. `indeterminate`) and a bounded error code; the indeterminate close is an `ERROR` span two retention policies select on; the superseded-generation span link ties a re-dispatch to the attempt it replaced | `telemetry_segments.rs::the_real_dispatch_pipeline_closes_its_own_segments`, `effect_dispatch.rs::the_ambiguous_recovery_settlements_close_the_segments_that_select_them`, `otel_span_mapping.rs::the_spans_of_a_reconciled_re_invocation_reach_the_exporter`, `collector_allowlist.rs` (policy values against `AgentRunEffectStatus::as_label`) | Met for kind, attempt, outcome, error code, retention, and "never the idempotency key". **Partial** for the rest: no generation, safety class, or idempotency class on an effect span, durations rather than timestamps, no queue-delay instrument, and the indeterminate span links neither the ambiguous attempt nor a reconciliation decision — see "Owed". A tool's own HTTP/RPC/database child spans are the application's — see "Delegated" |
+| 17.9 effects are traceable from decision to outcome | `EffectSchedule` (`PRODUCER`, after durable acceptance), `ToolAuthorize`, `EffectDispatch` (`CONSUMER`, after the durable `Started` write), `ExecuteTool` (`gen_ai.tool.name`/`.type`) with `rakka.agent.effect.kind`, `.attempt`, `.status` (incl. `indeterminate`) and a bounded error code; the indeterminate close is an `ERROR` span two retention policies select on; the superseded-generation span link ties a re-dispatch to the attempt it replaced. The indeterminate transition links the ambiguous attempt (`ambiguous-attempt`) and, forward, the reconciliation decision (`reconciliation-decision`): every attempt segment exports under a durable identity derived from the effect record (`AgentRunEffect::attempt_span_identity`), the reconciliation checkpoint's id is a pure function of effect and generation, and the decision's `checkpoint-resolve` identity derives from it — so the dispatcher's park segment and the run's reconciliation `checkpoint-open` segment (error status, closed on the `RecordEffectResult` that parks) both name the attempt and the decision before the decision exists | `telemetry_segments.rs::the_real_dispatch_pipeline_closes_its_own_segments`, `effect_dispatch.rs::the_ambiguous_recovery_settlements_close_the_segments_that_select_them`, `effect_dispatch.rs::an_indeterminate_transition_links_the_ambiguous_attempt_and_the_reconciliation_decision` (attempt id, both links on both segments, and the later decision exporting under the linked id), `otel_span_mapping.rs::the_spans_of_a_reconciled_re_invocation_reach_the_exporter`, `otel_span_mapping.rs::a_segment_with_a_durable_identity_exports_under_that_id`, `collector_allowlist.rs` (policy values against `AgentRunEffectStatus::as_label`) | Met for kind, attempt, outcome, error code, retention, the indeterminate links, and "never the idempotency key". **Partial** for the rest: no generation, safety class, or idempotency class on an effect span, durations rather than timestamps, no queue-delay instrument — see "Owed". A tool's own HTTP/RPC/database child spans are the application's — see "Delegated" |
 | 17.10 memory tier and retrieval outcome are distinguishable | `rakka.agent.memory.retrievals` (`backend`, `outcome`) and `rakka.agent.memory.ingress.outcomes` recorded from `RetrievalReport` at the turn fold; content is structurally unreachable — the snapshot types no mapper reads, a closed metric label set, a closed span allowlist | `metric_catalogue.rs` (bijection and bounded labels), `secret_exclusion.rs::the_metric_series_of_a_credentialed_run_carry_no_identifier_or_secret`, `agent_metrics.rs::a_run_records_bounded_agent_metrics_and_no_identifiers` | **Partial.** The two memory instruments have no test asserting a run records them; the `memory-operation` and `retrieval` segment classes are mapped and closed by nobody, so `rakka.agent.memory.tier` is allowlisted and unwritten; record count, latency, embedding, digest, and watermark reach no signal — see "Owed" |
-| 17.11 checkpoints are distinguished and no span is held across a wait | `rakka.agent.checkpoint.kind` over `AgentCheckpointKind::as_label` on the `checkpoint-open` segment, closed inside the commit that parks the run; `run-resume` closes only when the phase actually leaves a wait; `AgentSegmentTimer` has no open-span type | `telemetry_segments.rs::a_checkpoint_park_closes_its_segment_and_holds_none_open`, `::a_run_closes_a_segment_for_every_committed_transition`, `otel_span_mapping.rs::the_retention_classes_have_attributes_to_select_on`; the parked context is durable per `trace_scenarios.rs::a_parked_checkpoint_carries_the_segment_a_resume_doubly_links` | Met for kind and for the no-held-span rule. **Unmet: the resume span links neither the parked span nor the incoming request span** — `agent_durable_resume_telemetry_context` has no production caller and `close_segment` stamps the run's ordinary context; scenario 22 builds the links in its own body. Status, resolver class, policy class, and wait duration reach no signal — see "Owed" |
+| 17.11 checkpoints are distinguished and no span is held across a wait; the resolution links the parked span and the request | `rakka.agent.checkpoint.kind` over `AgentCheckpointKind::as_label` on the `checkpoint-open` segment, closed inside the commit that parks the run and exported under a durable identity derived from the gated effect's context and the checkpoint id (`AgentCheckpoint::parked_span_identity`), which the checkpoint record stores; the `checkpoint-resolve` segment closed by `ResolveCheckpoint`/`ResolveIndeterminateEffect` once the transition commits links it (`parked-checkpoint`) and the command's own context (`resume-request`, the `telemetry` field both commands carry), and exports under the pre-derived resolve identity; `run-resume` closes only when the phase actually leaves a wait and carries the same links when the same command discharged it; `AgentSegmentTimer` has no open-span type | `telemetry_segments.rs::a_checkpoint_park_closes_its_segment_and_holds_none_open`, `::a_run_closes_a_segment_for_every_committed_transition`, `otel_span_mapping.rs::the_retention_classes_have_attributes_to_select_on`, `trace_scenarios.rs::a_parked_checkpoint_carries_the_segment_a_resume_doubly_links` (every assertion over a runtime-produced segment or persisted record: the stored identity, the park exporting under it, the resolution's two links and their survival through `segment_span`) | Met for kind, for the no-held-span rule, and for the parked and request links. Status, resolver class, policy class, and wait duration reach no signal, and a timer or child wait closes no park segment to link — see "Owed" |
 | 17.11 recovery spans carry cause and outcome | `run-recover` closed on both paths of `AgentRunFacade::recover`, `rakka.agent.recovery.events` and `.duration` by `outcome`, error type `rakka.agent.recovery`; no identity is a metric label | `run_sharding_wiring.rs::a_sharded_run_records_its_metrics_through_the_settings_recorder`, `acceptance.rs::a_segment_without_a_trace_is_counted_not_invented`, export walk line 8 (the recovery histogram's exemplar is the recovery span) | **Partial.** Outcome and duration only: the segment closes with no attribute, so cause, prior state, new owner, recovered pending counts, and stale-write conflicts are absent — see "Owed" |
 | 17.12 metrics: catalogue and bounded labels | `AGENT_DOMAIN_METRIC_INSTRUMENTS` (30 instruments) | `metric_catalogue.rs` — bijection in both directions, plus the `signal` and `error.type` vocabularies | Met for the instruments that exist; the 17.12 clauses with no instrument are listed in the catalogue's own "Owed" section |
 | 17.12 export queue, drops, failures | `rakka.agent.telemetry.export.{queue,drops,unmappable}` and the `flush.failures` signal vocabulary | `telemetry_segments.rs::a_bounded_sink_publishes_its_loss_once_per_drop`; `exporter_failure.rs` | Met |
@@ -179,7 +179,7 @@ moving it is not this slice's change. The spread — a 2024 distribution against
 
 ## Owed, and why
 
-- **13 of 24 segment classes have no production call site.** `wake-admit`,
+- **13 of 25 segment classes have no production call site.** `wake-admit`,
   `autonomy-admit`, `budget-reserve`, `budget-settle`, `validate-task-result`,
   `handoff`, `team-operation`, `moderation-turn`, `workflow-invoke`,
   `goal-evaluate`, `delegate-to-peer`, `memory-operation`, and `retrieval` are
@@ -199,22 +199,29 @@ moving it is not this slice's change. The spread — a 2024 distribution against
 
 The rows for 17.7 through 17.11, 17.13's audit half, 17.18, and 17.19 were
 added after the phase closed, on a reading of each section against the code
-rather than against the slice plans. They owe the following, and two of them
-are MUSTs the runtime does not meet today.
+rather than against the slice plans. Two of them surfaced MUSTs the runtime
+did not meet — the resume span linked neither the parked span nor the request,
+and the indeterminate transition linked neither the ambiguous attempt nor the
+reconciliation decision — and both were closed by the first post-Phase-6 gap
+slice through one mechanism: a **durable span identity**
+(`agent_durable_span_identity`, `AgentTelemetrySegment::span_id`), derived
+from the trace context a durable record already holds plus the record's own
+identity, so the two components that close the linked spans — the run that
+parks, the dispatcher that attempts, the command that resolves — derive the
+same id without communicating, and a link can be written before its target
+exists. What the sections still owe:
 
-- **The resume span does not link the parked span** (17.11 MUST). The
-  parked context is durable, `AgentTelemetryContext::span_links` is bounded
-  and exported, and `agent_durable_resume_telemetry_context` builds the link —
-  but nothing in `rakka-agent` calls it, and `close_segment` stamps every
-  segment with the run's ordinary context. Scenario 22 constructs both links
-  inside the test and asserts on its own construction, so it proves the
-  helper, not the runtime. The same gap covers the incoming human or service
-  request span.
-- **The indeterminate transition links neither the ambiguous attempt nor a
-  reconciliation decision** (17.9 MUST). The indeterminate close is a sibling
-  of the attempt under the same parent, and there is no reconciliation segment
-  class to link forward to; the only production span link runs the other way,
-  from a re-dispatch to the generation it superseded.
+- **A timer or child wait closes no park segment.** Only a checkpoint park
+  closes `checkpoint-open`; a run waiting on a timer or on fan-in members has
+  no parked span for its resume to link, so the 17.11 link holds for the
+  checkpoint case and has nothing to hold for the others until a wait class
+  exists.
+- **`agent_durable_resume_telemetry_context` still has no production caller.**
+  It re-parents the resumed context under a new span; the agent domain keeps
+  every segment a child of the operation that activated its entity and
+  expresses the causes as links, so the resolution segment is built through
+  `agent_linked_telemetry_context` instead. The helper stays the workflow
+  substrate's contract for its own timer and callback commands.
 - **Token usage rides the wrong span.** `gen_ai.usage.input_tokens` and
   `.output_tokens` are attached to the `effect-dispatch` `CONSUMER` segment at
   the attempt close, not to the `chat` `CLIENT` segment the convention places
@@ -243,8 +250,10 @@ are MUSTs the runtime does not meet today.
 - **Span-link attributes are bounded, not allowlisted.** `segment_span`
   allowlists span and event attributes; link attributes are copied from the
   persisted context, bounded in count and length at persist and validated for
-  shape at export, but not filtered by key. The one production writer sets
-  `rakka.agent.link.kind`.
+  shape at export, but not filtered by key. Every production writer sets only
+  `rakka.agent.link.kind`, whose five values are held as data in
+  `AGENT_TELEMETRY_LINK_KINDS` and checked against the writers in both
+  directions by `telemetry_context.rs::every_link_kind_is_catalogued_and_written`.
 - **The memory instruments are recorded and unproven.**
   `rakka.agent.memory.retrievals` and `.ingress.outcomes` are written at the
   turn fold and asserted by no test outside the catalogue bijection;

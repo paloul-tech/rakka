@@ -112,7 +112,10 @@ use rakka_agent_workflow::{
 use rakka_persistence::DurableStateStore;
 
 use crate::agent::{load_agent_entity_state, AgentEntityError, AgentEntityState};
-use crate::definition::{AgentCredentialBindingRef, AgentEffectSafetyClass, AgentSetupRevision};
+use crate::checkpoints::{AgentCheckpoint, AgentCheckpointKind};
+use crate::definition::{
+    AgentCredentialBindingRef, AgentEffectSafetyClass, AgentSetupRevision, AgentToolId,
+};
 use crate::effect::{
     compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentMemoryPromotionRequest,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
@@ -124,9 +127,10 @@ use crate::memory::{
     AgentPromotedMemoryRef, MemoryError, MemoryOperationId, MemorySequence,
     PrivateMemoryExpectation, SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
 };
-use crate::model::{AgentModelAdapter, AgentModelRequest, AgentToolCallRequest};
+use crate::model::{AgentModelAdapter, AgentModelRequest, AgentToolCallId, AgentToolCallRequest};
 use crate::observability::{
-    AgentSegmentOperation, AgentSegmentTimer, SEGMENT_ATTR_EFFECT_ATTEMPT,
+    agent_linked_telemetry_context, agent_span_link, AgentSegmentOperation, AgentSegmentTimer,
+    LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_RECONCILIATION_DECISION, SEGMENT_ATTR_EFFECT_ATTEMPT,
     SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_SETTINGS_REVISION,
 };
 use crate::run::{
@@ -137,6 +141,7 @@ use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
 use crate::task::AgentTaskContent;
 use crate::tools::{
     AgentAuthorityContext, AgentAuthorityRefusal, AgentGrantedDispatch, AgentToolAuthority,
+    AgentToolResponseReview,
 };
 
 /// Result type for dispatch pipeline operations.
@@ -1392,6 +1397,38 @@ pub trait AgentDispatchAuthority: Send + Sync {
         attempt: u32,
         now: rakka_agent_workflow::AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentDispatchDecision>;
+
+    /// Reviews one executed tool's result at the `ToolResponse` boundary,
+    /// before the pipeline delivers it
+    /// ([`AgentToolAuthority::review_tool_response`]).
+    ///
+    /// The default accepts the result unchanged, for an authority that
+    /// evaluates no response chain; [`AgentEntityAuthority`] delegates to the
+    /// tool authority it wraps.
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
+        let _ = (scope, intent, tool);
+        Box::pin(async move {
+            Ok(AgentToolResponseDecision::Accepted(Box::new(
+                AgentToolResponseReview::unchanged(content),
+            )))
+        })
+    }
+}
+
+/// What the `ToolResponse` boundary decided about an executed tool's result.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentToolResponseDecision {
+    /// The run receives the reviewed content.
+    Accepted(Box<AgentToolResponseReview>),
+    /// The result is refused: the effect fails under the refusal's code.
+    Refused(AgentAuthorityRefusal),
 }
 
 /// Resolves the setup revision one run was created under, so the dispatch
@@ -1563,6 +1600,23 @@ where
                 Err(refusal) => AgentDispatchDecision::Refused(refusal),
             };
             Ok(decision)
+        })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        tool: Option<&'a AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
+        Box::pin(async move {
+            Ok(
+                match self.authority.review_tool_response(scope, tool, content) {
+                    Ok(review) => AgentToolResponseDecision::Accepted(Box::new(review)),
+                    Err(refusal) => AgentToolResponseDecision::Refused(refusal),
+                },
+            )
         })
     }
 }
@@ -2539,7 +2593,11 @@ where
         // specification 17.9 requires to be retainable; the attempt number is
         // what "excessive retry" means; and the settings revision is what
         // "a newly deployed version under investigation" means.
-        let attempt_segment = attempt_timer
+        // The attempt exports under the identity the run can derive from the
+        // effect record alone, so an indeterminate transition recorded on
+        // another node can link to exactly this attempt
+        // ([specification 17.9](../../../docs/plans/rakka-agent/spec.md)).
+        let mut attempt_segment = attempt_timer
             .close(AgentSegmentOperation::EffectDispatch {
                 effect_kind: intent.kind().as_label(),
             })
@@ -2548,6 +2606,9 @@ where
                 SEGMENT_ATTR_SETTINGS_REVISION,
                 granted.grant.settings_revision.get().to_string(),
             );
+        if let Some(identity) = intent.attempt_span_identity(attempt) {
+            attempt_segment = attempt_segment.span_id(identity.span_id);
+        }
         let attempt_segment = match &invoked {
             Ok(outcome) => attempt_segment
                 .attribute(
@@ -2919,9 +2980,31 @@ where
         // the dispatch attempt's own segment cannot describe, because the
         // attempt did not conclude: this is the *decision* that its outcome is
         // unknowable, taken after the fact and often on a different worker.
+        // The park links the attempt whose outcome could not be established
+        // and, forward, the reconciliation decision the run now waits for: the
+        // decision's identity is derived from the checkpoint id, which is a
+        // pure function of the effect and generation, so it can be named here
+        // before the run has even opened the checkpoint.
+        let mut links = Vec::new();
+        if let Some(ambiguous) = intent.attempt_span_identity(attempt) {
+            links.push(agent_span_link(&ambiguous, LINK_KIND_AMBIGUOUS_ATTEMPT));
+        }
+        let checkpoint_id = AgentCheckpoint::id_for_effect(
+            &intent.effect_id,
+            intent.generation,
+            AgentCheckpointKind::IndeterminateEffectReconciliation,
+        );
+        if let Some(decision) =
+            AgentCheckpoint::resolve_span_identity(&intent.telemetry, &checkpoint_id)
+        {
+            links.push(agent_span_link(
+                &decision,
+                LINK_KIND_RECONCILIATION_DECISION,
+            ));
+        }
         self.close_segment(
             scope,
-            &intent.telemetry,
+            &agent_linked_telemetry_context(&intent.telemetry, links),
             timer
                 .close(AgentSegmentOperation::EffectDispatch {
                     effect_kind: intent.kind().as_label(),
@@ -3104,6 +3187,76 @@ where
     /// generation — identically because the attempt was refused upstream
     /// unless the current chain revision matches the one the intent pinned at
     /// commit.
+    /// The outcome the run receives for an executed tool or compensation,
+    /// once the `ToolResponse` boundary has reviewed the result.
+    ///
+    /// The review sits here — after execution, before the outcome exists —
+    /// because this is the last point at which the result is in memory and
+    /// nothing durable has recorded it: the attempt segment, the delivery,
+    /// the run's effect record, its session memory, and every later context
+    /// snapshot all lie downstream. A refusal becomes a determinate `Failed`
+    /// outcome under the refusal's stable code: the tool ran, its result is
+    /// not admissible, and the effect fails exactly as a blocked request
+    /// does — delivered once, never retried, so the target is never invoked
+    /// again to produce a result the chain would refuse again.
+    async fn reviewed_tool_outcome(
+        &self,
+        scope: &AgentRunScope,
+        intent: &AgentRunEffect,
+        tool: Option<&AgentToolId>,
+        call_id: AgentToolCallId,
+        content: AgentTaskContent,
+    ) -> AgentDispatchResult<AgentRunEffectOutcome> {
+        match self
+            .authority
+            .review_tool_response(scope, intent, tool, content)
+            .await?
+        {
+            AgentToolResponseDecision::Accepted(review) => {
+                for transform in &review.transforms {
+                    tracing::info!(
+                        effect_id = intent.effect_id.as_str(),
+                        generation = %intent.generation,
+                        stage = %transform.stage,
+                        stage_revision = %transform.revision,
+                        reason_code = %transform.reason_code,
+                        "guardrail transform applied to the tool response"
+                    );
+                }
+                for report in &review.reports {
+                    tracing::info!(
+                        effect_id = intent.effect_id.as_str(),
+                        generation = %intent.generation,
+                        stage = %report.stage,
+                        stage_revision = %report.revision,
+                        reason_code = %report.reason_code,
+                        evidence = report
+                            .evidence
+                            .as_ref()
+                            .map(|artifact| artifact.artifact_id.as_str()),
+                        "guardrail report-only finding on the tool response"
+                    );
+                }
+                Ok(AgentRunEffectOutcome::Tool {
+                    call_id,
+                    content: review.content,
+                })
+            }
+            AgentToolResponseDecision::Refused(refusal) => {
+                tracing::warn!(
+                    effect_id = intent.effect_id.as_str(),
+                    generation = %intent.generation,
+                    code = %refusal.code,
+                    "guardrail refused the tool response; the effect fails"
+                );
+                Ok(AgentRunEffectOutcome::Failed {
+                    code: bounded_failure_code(&refusal.code),
+                    message: bounded_failure_detail(&refusal.message),
+                })
+            }
+        }
+    }
+
     async fn invoke(
         &self,
         scope: &AgentRunScope,
@@ -3171,10 +3324,14 @@ where
                     },
                 );
                 let content = executed?;
-                Ok(AgentRunEffectOutcome::Tool {
-                    call_id: call.call_id.clone(),
+                self.reviewed_tool_outcome(
+                    scope,
+                    intent,
+                    Some(&call.tool),
+                    call.call_id.clone(),
                     content,
-                })
+                )
+                .await
             }
             AgentRunEffectRequest::Compensation { compensation, .. } => {
                 let Some(executor) = self.compensations.as_ref() else {
@@ -3190,10 +3347,14 @@ where
                 let content = executor
                     .execute(scope, intent, compensation, credential)
                     .await?;
-                Ok(AgentRunEffectOutcome::Tool {
-                    call_id: compensation_call_id(intent),
+                self.reviewed_tool_outcome(
+                    scope,
+                    intent,
+                    None,
+                    compensation_call_id(intent),
                     content,
-                })
+                )
+                .await
             }
             AgentRunEffectRequest::MemoryPromotion { promotion } => {
                 let Some(executor) = self.memory_promotions.as_ref() else {

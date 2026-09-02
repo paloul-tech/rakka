@@ -144,6 +144,7 @@ async fn approve(
                         allowed_use_count: 1,
                     },
                 )),
+                telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
             },
             &fx.fx.router,
             fx.fx.now(),
