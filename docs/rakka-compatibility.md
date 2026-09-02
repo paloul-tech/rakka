@@ -14,6 +14,8 @@ The v1 compatibility matrix tracks these dimensions together:
 | Message schema version | Remote payloads carry `codec_id`, `message_type_id`, and `schema_version`; Protobuf is the default payload codec. |
 | Kubernetes manifest version | Manifests carry compatibility metadata through env vars and `rakka.rs/*` annotations. |
 | Generated API version | HTTP and gRPC adapter contracts expose stable generated/public API version constants. |
+| Agent durable record schema version | Every agent-domain record carries a `StateSchemaVersion`; a binary reads the version it writes and the one before it (`AgentSchemaPolicy`, N/N+1), and fails closed on anything else with `schema-version-ahead` or `schema-version-too-old`. |
+| Agent protocol and convention pins | The A2A wire protocol version, the A2A SDK, Rig, the OpenTelemetry SDK, the GenAI semantic-convention revision, and the Collector distribution are pinned, recorded in this document, and held to the manifests and constants by tests. |
 
 The shared fixture lives in `rakka_testkit::compatibility::V1CompatibilityFixture`.
 
@@ -84,13 +86,70 @@ Rakka does not automatically diff Protobuf descriptors in v1. Schema compatibili
 - `handoff-task-terminal`: the resolution code of a handoff the task's terminal transition settled because the task ended while the transfer was still unresolved. A pending transfer must not cross the terminal boundary unresolved — the owed handoff result derives only from a settled provenance, so an `Initiated` cell surviving the terminal would strand the fenced source run forever. A result accepted from the transfer's own minted generation settles the provenance `Accepted` (the target durably held responsibility; its acceptance reply may still be in flight); every other terminal flavor settles it `Refused` under this code, which reaches the source run through its handoff-result notice and resumes it exactly as any other definitive resolution does.
 - Slice 6.2 adds two stable refusal codes and changes what one existing code *carries*, without changing the code itself. `guardrail-chain-mismatch`: a deployment attesting through `AgentToolAuthority::with_memory_ingress` that its run memory evaluates the memory-ingress boundary under the authority's own chain, whose two chains declare different evaluations. It takes the `AgentRunMemory` rather than a bare `AgentMemoryRetrieval`, because the object attested must be the object the run assembles through — a bundle handed in for the occasion proves only that a matching chain exists somewhere — and a memory carrying no retrieval bundle is refused under the same code, as is an authority with no chain attesting one (two absences are not an agreement). `AgentToolAuthority::attests` re-checks the claim against a memory assembled elsewhere. It is a **wiring-time** refusal, not a dispatch one — a misconfigured deployment fails at startup — and the comparison is a *declaration digest* (revision, policy reference, and each stage's id, revision, boundary set, and mandatory flag), never the rule objects, which have no equality. Comparing declarations rather than revisions is what catches the shape a deployment actually lands in: an empty bundle chain carrying the same revision number as the authority's populated one. A deployment that does not attest is not silently unprotected — the authority stops counting the memory-ingress boundary, so an envelope requiring a memory-ingress-only stage refuses dispatch with the already-registered `guardrail-stage-unevaluated`. `execution-policy-required`: an opt-in refusal, off by default, of an intent that names no `AgentExecutionPolicyRef` at a deployment that has called `with_required_execution_policy`; specification 11.8 says an intent *SHOULD* carry one, so the permissive default is unchanged, and this is the switch that makes a workload-isolation claim checkable rather than asserted. It is definitive rather than transient: no worker will ever accept a class that does not exist. The requirement covers *every* intent, not only tool calls — a model call, a compensation, an A2A send and a workflow start all reach a worker the same way — so `with_required_execution_policy(substrate)` takes the class the substrate's own effects run under, which `AgentToolAuthority::effect_policies` stamps onto them (`AgentEffectPolicies::with_substrate_execution_policy` for a hand-assembled policy set). Registered tools keep taking their class from their binding declaration, and an unclassified one is what the switch exists to refuse. A deployment enabling it must ensure its router accepts the substrate class and some worker serves it. And `credential-resolution-failed` keeps its code, its attempt accounting, and its place in `AgentRunEffectOutcome::Exhausted` — what changed is that the *detail* beside it is now Rakka-authored, naming the logical `AgentCredentialBindingRef` rather than interpolating the application resolver's own failure text, which was reaching the durable outbox row and the dispatcher fleet index verbatim. Every persisted attempt detail is now truncated at `AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH` (512 bytes, single line), and that bound describes the *record*, not one half of it: an application-supplied stable code is bounded separately and tighter at `AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH` (128 bytes) so a verbose code cannot crowd the detail out of a line they share, and the composed `code: detail` line is bounded again. A code longer than 128 bytes is truncated, which by construction leaves a string equal to no registered code. The bound itself is declared once, by the substrate that owns the records it protects (`rakka_agent_workflow::AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH`), and applied at each durable write rather than at each caller: `AgentDispatchEntry::last_error_code` — one field on the single fleet-index record every worker loads and re-persists on every claim pass — bounds whatever any writer hands it, including a telemetry event a caller built by hand. Clients parsing the tail of a long collaborator error must not rely on it surviving.
 - A dispatcher worker may declare the execution classes it serves (`AgentRunEffectDispatcher::with_execution_classes`, and `AgentDispatcherWorker::with_claim_filter`/`set_claim_filter` for the substrate's own worker over the same shared index — without which that worker served every class with no way to say otherwise, and a fleet mixing it with class-restricted workers kept the race the filter removes). A ticket whose intent names a class outside that set is never *claimed* by that worker and stays claimable for one that serves it; the skip is reported on `AgentDispatchClaimBatch::class_filtered` and `AgentDispatchPass::class_filtered`, and costs no durable write. A worker that declares no classes serves everything, which is the pre-existing behaviour and the correct default for a homogeneous fleet, so no deployment changes behaviour by upgrading. Unclassified intents stay claimable by every worker. The consequence a heterogeneous deployment must plan for: a class *no* worker serves now waits indefinitely rather than failing fast — a persistently non-zero `class_filtered` beside a non-zero `due_dispatch_count` is that condition — where previously the first worker to claim it failed the effect permanently under `execution-policy-unroutable`. Both counters mean what they say from this release on: `class_filtered` is complete over the claimable entries rather than over the ones a pass had room to consider (a batch-size break above the filter check reported zero on every busy pass, which is exactly when an unservable class stalls), and `backpressure_limited` compares *servable* due work against what the pass claimed rather than the fleet-wide due count, so a worker that declares a class no longer reports backpressure forever for work that was never its to do. That refusal remains, and is still the backstop for a ticket whose class is retagged between claim and grant.
-- The durable agent run state (`AgentRecordKind::RunState`) is at schema version **2**. Version 2 carries `AgentRun::terminal_at`, the clock short-term memory retention is measured from. Under the N/N+1 policy a version-1 binary fails closed on a version-2 record rather than loading it — which is the point: serde drops a field it does not know, a terminal run keeps accepting settlement and return commands, and the stamp is written exactly once under an already-terminal guard, so an older peer that loaded such a record would erase the stamp with no way to restore it and the run's session rows and snapshots would never be purged. A record created before the bump keeps saying version 1 and both generations round-trip it losslessly, so no live run is stalled by the bump; it upgrades its own stamp at the terminal transition, which is what gives it the version-2 field. Deploy the version-2 binaries before relying on retention discharge.
-- **Runs that were already terminal when version 2 shipped need a one-time repair.** The stamp is written under the already-terminal guard that makes it once-only, so a run that had already reached a terminal status never re-enters the transition that would give it one: its retention is refused (`terminal-time-unknown`) permanently, and its session rows and context snapshots are never purged. `AgentRunTerminalStampBackfill` (`rakka-agent`) stamps those records from their own `updated_at`, which for a terminal run is never earlier than the true terminal time, so a repaired deadline falls at or after the real one — retained longer than required, never purged early. It is opt-in, idempotent, and compare-and-set against the revision it read, so a raced record reports `conflicted` instead of being clobbered. **Run it once the fleet is fully on version-2 binaries, not during the rolling update:** a repaired record carries version 2, which a version-1 peer fails closed on. A migration is complete when a pass over the same scopes reports `conflicted: 0` and `stamped: 0`.
+- The durable agent record schema versions, including the run state's move to version 2 and its one-time repair, are recorded under [Agent Domain](#agent-domain) below.
 - The PostgreSQL A2A schema evolves additively within a release: new tables, new nullable/defaulted columns, and new indexes only, applied by an idempotent, advisory-lock-guarded migration so N and N+1 pods share the schema during rolling updates.
 
 ## Agent Domain
 
 The agent domain — `rakka-agent-workflow`, `rakka-agent`, `rakka-agent-postgres`, `rakka-agent-knowledge-graph`, `rakka-agent-knowledge-graph-postgres`, and the `rakka-a2a` `agents` feature — adds compatibility commitments of its own on top of the A2A adapter's above. The tables in this section are held to the code by `cargo test -p rakka-agent --features otel --test compatibility_currency` and, for the A2A protocol row, by `rakka-a2a`'s own unit tests: a row that disagrees with a constant or a manifest fails validation, in either direction.
+
+### Durable records under N/N+1
+
+Every persisted agent record carries its schema version, and the version is checked on the load path rather than trusted:
+
+- The default policy is one rolling-update window: a binary reads the version it writes and the version immediately before it (`AgentSchemaCompatibility::n_plus_one`, one window per `AgentRecordKind` in `AgentSchemaPolicy`). A record from a newer binary fails closed with `schema-version-ahead`; a record older than the window fails closed with `schema-version-too-old`. Neither is ever read with guessed semantics. Nested records — a definition or settings revision inside an entity record — are checked with their own versions, and the entity-store recovery path checks before it materializes.
+- The knowledge graph applies the same window to its two record kinds locally (`ClaimError` answers the same two codes), so a graph backend and the agent domain share one posture without a dependency between them.
+- A bump is additive within the window: a record written before the bump keeps its old version and both generations round-trip it losslessly, so no live entity is stalled by a rollout. A record acquires the new version only when a transition rewrites it, which is what makes the N binary's fail-closed on an N+1 record the safe direction — the field it cannot see is one it would otherwise erase.
+- Deploy the N+1 binaries fleet-wide before running any one-time repair that rewrites records at the new version (see the run state's backfill below); a repaired record is an N+1 record.
+- The inter-entity exchange protocol is versioned at the codec layer as well as in the record: codec id `rakka-agent-json`, message type ids `rakka.agent.ExchangeEnvelope` and `rakka.agent.ExchangeReply`, and `AGENT_EXCHANGE_REMOTE_SCHEMA_VERSION` (1) are commitments adjacent node versions must agree on, registered with an exact policy, so an unknown envelope version fails closed with `RemoteError::UnknownCodec` before any entity sees it.
+- The A2A agent extensions carry their version in the URI (`urn:rakka:a2a-extension:agent-management:v1`, `urn:rakka:a2a-extension:collaboration:v1`) with the envelope schema number inside (`AGENT_MANAGEMENT_SCHEMA_VERSION`, `AGENT_COLLABORATION_SCHEMA_VERSION`, both 1); a version the receiving node does not serve is refused as `unsupported-operation` rather than interpreted.
+- Two adapter semantics versions sit beside the schema versions and are deliberately not schema versions: `CURRENT_AGENT_LOOP_ADAPTER_VERSION` (the meaning a model adapter gives the turns a loop-state record carries; a Rig upgrade that changes request, tool-call, message, or serialized-run semantics moves it as an explicit migration, never a silent reinterpretation) and `AGENT_GENAI_CONVENTION_REVISION` (the telemetry mapping; its upgrade is a specification 17.20 review and never a durable-state migration).
+
+### Durable record schema versions
+
+One row per record kind the agent domain persists, keyed by the record's stable label where it has one and by its constant where it does not. The version is the one the current binary writes; the window it reads is that version and the one before.
+
+| Record | Crate | Version |
+| --- | --- | --- |
+| `agent-entity-state` | `rakka-agent` | 1 |
+| `agent-definition-revision` | `rakka-agent` | 1 |
+| `agent-settings-revision` | `rakka-agent` | 1 |
+| `agent-setup-revision` | `rakka-agent` | 1 |
+| `agent-task-state` | `rakka-agent` | 1 |
+| `agent-task-definition` | `rakka-agent` | 1 |
+| `agent-task-history-entry` | `rakka-agent` | 1 |
+| `agent-run-state` | `rakka-agent` | 2 |
+| `agent-loop-state` | `rakka-agent` | 1 |
+| `agent-run-effect` | `rakka-agent` | 1 |
+| `agent-model-turn` | `rakka-agent` | 1 |
+| `agent-escrow-ledger` | `rakka-agent` | 1 |
+| `agent-admission-decision` | `rakka-agent` | 1 |
+| `agent-exchange-journal` | `rakka-agent` | 1 |
+| `agent-exchange-envelope` | `rakka-agent` | 1 |
+| `agent-exchange-reply` | `rakka-agent` | 1 |
+| `agent-checkpoint` | `rakka-agent` | 1 |
+| `agent-session-memory-entry` | `rakka-agent` | 1 |
+| `agent-memory-context-snapshot` | `rakka-agent` | 1 |
+| `agent-decision-event` | `rakka-agent` | 1 |
+| `agent-private-memory` | `rakka-agent` | 1 |
+| `agent-wake-policy-revision` | `rakka-agent` | 1 |
+| `agent-wake-timer-state` | `rakka-agent` | 1 |
+| `agent-goal-spec` | `rakka-agent` | 1 |
+| `agent-goal-evaluation` | `rakka-agent` | 1 |
+| `agent-team-state` | `rakka-agent` | 1 |
+| `agent-team-history-entry` | `rakka-agent` | 1 |
+| `agent-conversation-state` | `rakka-agent` | 1 |
+| `agent-conversation-history-entry` | `rakka-agent` | 1 |
+| `CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION` | `rakka-agent-workflow` | 1 |
+| `CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION` | `rakka-agent-workflow` | 1 |
+| `CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION` | `rakka-agent-workflow` | 1 |
+| `claim` | `rakka-agent-knowledge-graph` | 1 |
+| `claim-trust-transition` | `rakka-agent-knowledge-graph` | 1 |
+
+The one record above version 1, and what its bump requires of a rollout:
+
+- The durable agent run state (`AgentRecordKind::RunState`) is at schema version **2**. Version 2 carries `AgentRun::terminal_at`, the clock short-term memory retention is measured from. Under the N/N+1 policy a version-1 binary fails closed on a version-2 record rather than loading it — which is the point: serde drops a field it does not know, a terminal run keeps accepting settlement and return commands, and the stamp is written exactly once under an already-terminal guard, so an older peer that loaded such a record would erase the stamp with no way to restore it and the run's session rows and snapshots would never be purged. A record created before the bump keeps saying version 1 and both generations round-trip it losslessly, so no live run is stalled by the bump; it upgrades its own stamp at the terminal transition, which is what gives it the version-2 field. Deploy the version-2 binaries before relying on retention discharge.
+- **Runs that were already terminal when version 2 shipped need a one-time repair.** The stamp is written under the already-terminal guard that makes it once-only, so a run that had already reached a terminal status never re-enters the transition that would give it one: its retention is refused (`terminal-time-unknown`) permanently, and its session rows and context snapshots are never purged. `AgentRunTerminalStampBackfill` (`rakka-agent`) stamps those records from their own `updated_at`, which for a terminal run is never earlier than the true terminal time, so a repaired deadline falls at or after the real one — retained longer than required, never purged early. It is opt-in, idempotent, and compare-and-set against the revision it read, so a raced record reports `conflicted` instead of being clobbered. **Run it once the fleet is fully on version-2 binaries, not during the rolling update:** a repaired record carries version 2, which a version-1 peer fails closed on. A migration is complete when a pass over the same scopes reports `conflicted: 0` and `stamped: 0`.
 
 ### Pinned dependencies
 
@@ -163,6 +222,14 @@ Run the Kubernetes manifest contract tests:
 
 ```sh
 cargo test -p rakka-k8s --test kubernetes_manifests
+```
+
+Hold the agent-domain tables above to the code, the manifests, and the tests that prove each recovery scenario:
+
+```sh
+cargo test -p rakka-agent --features otel --test compatibility_currency
+cargo test -p rakka-agent --test recovery_scenario_roster
+cargo test -p rakka-testkit --test repository_hygiene
 ```
 
 Run the gated multi-process loopback compatibility check:
