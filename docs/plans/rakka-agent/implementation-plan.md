@@ -4914,3 +4914,5 @@ All scenario numbers refer to
 | 42 | M5 | 5.2 |
 | 43 | M5 | 5.3 |
 | 45 | M5 | 5.5 |
+| 1 (creation-deduplication half), 2, 60 | — | 6.1, re-proven at multi-pod fidelity (`examples/multi-pod-agent-fault-soak`) |
+| 1–61 | — | 6.4, rostered against their proving tests in `docs/rakka-agent-recovery-scenarios.md`, held by `cargo test -p rakka-agent --test recovery_scenario_roster` |

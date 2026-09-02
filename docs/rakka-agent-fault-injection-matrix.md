@@ -33,6 +33,13 @@ It is gated, because it spawns processes.
 Neither subsumes the other. The in-process matrix has the coverage; the
 multi-pod harness has the fidelity.
 
+This document is organised by *failure* — which durable boundary is killed,
+and what must hold afterwards. The scenario view of the same evidence, one row
+per specification 18 scenario naming the test that proves it, is the
+[recovery scenario roster](rakka-agent-recovery-scenarios.md); a test holds
+that roster to the tree, and holds its multi-pod rows to the sentence below
+that names them.
+
 ## Multi-pod matrix
 
 Harness: [`examples/multi-pod-agent-fault-soak`](../examples/multi-pod-agent-fault-soak).
@@ -141,6 +148,7 @@ and the series count are unchanged while observation volume grows twentyfold.
 ## Repeatable commands
 
 ```sh
+cargo test -p rakka-agent --test recovery_scenario_roster
 cargo test -p rakka-agent --test fan_in_recovery
 cargo test -p rakka-agent --test cancellation_recovery
 cargo test -p rakka-agent --test delegation_limits
@@ -177,4 +185,6 @@ table names. It does not remove the need for:
 - security validation, recorded in
   [`rakka-agent-security-validation-matrix.md`](rakka-agent-security-validation-matrix.md),
   and telemetry/Collector validation, recorded in
-  [`rakka-agent-telemetry-validation-matrix.md`](rakka-agent-telemetry-validation-matrix.md).
+  [`rakka-agent-telemetry-validation-matrix.md`](rakka-agent-telemetry-validation-matrix.md),
+  with the metric and span vocabulary those dashboards read in
+  [`rakka-agent-observability-catalogue.md`](rakka-agent-observability-catalogue.md).
