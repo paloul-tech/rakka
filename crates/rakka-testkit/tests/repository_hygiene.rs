@@ -331,3 +331,126 @@ fn implementation_plans_are_separated_from_product_docs() {
     let review = read("docs/rakka-v1-release-candidate-review.md");
     assert!(review.contains("Historical and active implementation plans live under `docs/plans/`"));
 }
+
+/// Every `crates/*` directory, which must also be the workspace's crate member
+/// set.
+fn workspace_crates() -> Vec<String> {
+    let mut crates: Vec<String> = fs::read_dir(repo_root().join("crates"))
+        .expect("crates/ is readable")
+        .map(|entry| entry.expect("a directory entry is readable"))
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    crates.sort();
+    let mut members: Vec<String> = read("Cargo.toml")
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("\"crates/")
+                .and_then(|rest| rest.strip_suffix("\","))
+                .map(str::to_string)
+        })
+        .collect();
+    members.sort();
+    assert_eq!(
+        crates, members,
+        "every crates/ directory must be a workspace member, and vice versa"
+    );
+    crates
+}
+
+#[test]
+fn crate_inventories_name_every_workspace_crate() {
+    let crates = workspace_crates();
+    assert!(
+        crates.len() > 1,
+        "the crate scan found nothing, so nothing is checked"
+    );
+    for (document, start, end) in [
+        (
+            "docs/rakka-api-boundary-inventory.md",
+            "## Crate Inventory",
+            "## Prelude Inventory",
+        ),
+        (
+            "docs/rakka-v1-api-review.md",
+            "## Crate Map",
+            "## Feature Boundaries",
+        ),
+    ] {
+        let contents = read(document);
+        let table = section_between(&contents, start, end);
+        for name in &crates {
+            assert!(
+                table.contains(&format!("| `{name}` |")),
+                "{document} has no crate row for `{name}`"
+            );
+        }
+        for row in table.lines().filter(|line| line.starts_with("| `")) {
+            let name = row
+                .split('`')
+                .nth(1)
+                .expect("a crate row names its crate in backticks");
+            assert!(
+                crates.iter().any(|known| known == name),
+                "{document} lists `{name}`, which is not a crate in crates/"
+            );
+        }
+    }
+}
+
+/// Every relative link in a Markdown file, as `(link, resolved path)`.
+fn relative_links(relative: &str) -> Vec<(String, PathBuf)> {
+    let contents = read(relative);
+    let directory = repo_root()
+        .join(relative)
+        .parent()
+        .expect("a document has a parent directory")
+        .to_path_buf();
+    let mut links = Vec::new();
+    for chunk in contents.split("](").skip(1) {
+        let Some((target, _)) = chunk.split_once(')') else {
+            continue;
+        };
+        let target = target.split_whitespace().next().unwrap_or("");
+        let (path, _anchor) = target.split_once('#').unwrap_or((target, ""));
+        if path.is_empty() || path.contains("://") || path.starts_with("mailto:") {
+            continue;
+        }
+        links.push((target.to_string(), directory.join(path)));
+    }
+    links
+}
+
+#[test]
+fn documentation_relative_links_resolve() {
+    let mut documents = vec!["README.md".to_string()];
+    let mut docs: Vec<String> = fs::read_dir(repo_root().join("docs"))
+        .expect("docs/ is readable")
+        .map(|entry| entry.expect("a directory entry is readable").path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("md"))
+        .map(|path| format!("docs/{}", path.file_name().unwrap().to_string_lossy()))
+        .collect();
+    docs.sort();
+    documents.extend(docs);
+
+    let mut broken = Vec::new();
+    let mut checked = 0;
+    for document in &documents {
+        for (link, resolved) in relative_links(document) {
+            checked += 1;
+            if !resolved.exists() {
+                broken.push(format!("{document} -> {link}"));
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "no relative link was found, so nothing was checked"
+    );
+    assert!(
+        broken.is_empty(),
+        "relative links that resolve to nothing:\n{}",
+        broken.join("\n")
+    );
+}

@@ -25,6 +25,12 @@ This note records the current public API boundary for the v1 hardening work. It 
 | `rakka-sharding-postgres` | Adapter candidate | PostgreSQL shard coordinator store, lease, remembered entity store, migration SQL, backend constants, namespace-isolated coordinator snapshots, and fencing tokens. |
 | `rakka-process` | Adapter candidate | Managed process ownership, process actor runtime, stdio/file/socket/local-gRPC modes, process-backed entities, and `ProcessError`. |
 | `rakka-workflow` | V1 candidate | Durable inbox/outbox model, workflow clocks, recovery, retry scheduling, and `WorkflowError`. |
+| `rakka-discovery-etcd` | Adapter candidate | etcd external-arbiter discovery provider: leased node registration, prefix-ranged peer discovery, and the strongly consistent membership that deterministic shard allocation relies on. |
+| `rakka-agent-workflow` | V1 candidate | Compiled execution IR, durable graph run state, deterministic graph scheduler, outbox effect bridge, dispatcher fleet and claim filters, timers, triggers, runtime events, OTLP bridge, and the agent-dispatch bounds. Outside the publishable crate set until it enters it (see `docs/rakka-v1-release-packaging.md`). |
+| `rakka-agent` | V1 candidate | Agent, task, run, team, and conversation entities, exchange choreography, loop runtime, model adapter trait (`rig` feature), effects and tool authority, budgets, admission, guardrails, checkpoints, goals and wakes, delegation and coordination, memory traits, telemetry (`otel` feature), operational queries, `AgentSchemaPolicy`, and the deterministic testkit. Outside the publishable crate set until it enters it. |
+| `rakka-agent-postgres` | Adapter candidate | PostgreSQL session, snapshot, and private-memory stores, the pgvector retriever, and crate-owned migrations for the agent memory contracts. Outside the publishable crate set until it enters it. |
+| `rakka-agent-knowledge-graph` | V1 candidate | Communal claims with provenance and the trust lattice, append-only transitions, the promotion gate, the portable store SPI, the in-memory reference store, and the backend conformance harness. Outside the publishable crate set until it enters it. |
+| `rakka-agent-knowledge-graph-postgres` | Adapter candidate | PostgreSQL binding of the knowledge-graph store SPI with compare-and-set transitions and migrations. Outside the publishable crate set until it enters it. |
 | `rakka-stream` | V1 candidate | Bounded stream source/sink primitives, lifecycle snapshots, stream errors, telemetry labels, and optional adapters. |
 | `rakka-http` | Adapter candidate | Axum-backed route adapters, HTTP server helpers, streaming adapters, public API compatibility constants, and `HttpError`. |
 | `rakka-grpc` | Adapter candidate | Tonic-backed unary/streaming adapters, generated API compatibility constants, and `GrpcError`. |
@@ -49,11 +55,16 @@ cargo check -p rakka-process --no-default-features
 cargo check -p rakka-a2a --no-default-features
 ```
 
+`rakka-agent` ships `default = ["rig"]` and builds and tests with
+`--no-default-features` (the validation script enforces it); `otel` gates the
+GenAI convention mapping and adds no dependency. The `rakka` facade exposes them
+as `agent`, `agent-rig`, and `agent-otel`, making Rig opt-in at the facade.
+
 `rakka-a2a` ships `default = []`; every adapter surface is opt-in through the
-`server`, `sharding`, `postgres`, `http`, `k8s`, `otel`, and `testkit` features,
-exposed through the gated `rakka` facade features `a2a`, `a2a-server`,
-`a2a-sharding`, `a2a-postgres`, `a2a-http`, `a2a-k8s`, `a2a-otel`, and
-`a2a-testkit`. `otel` gates the OpenTelemetry GenAI convention mapping for the
+`server`, `sharding`, `postgres`, `http`, `k8s`, `otel`, `testkit`, and
+`agents` features, exposed through the gated `rakka` facade features `a2a`,
+`a2a-server`, `a2a-sharding`, `a2a-postgres`, `a2a-http`, `a2a-k8s`,
+`a2a-otel`, `a2a-testkit`, and `a2a-agents`. `otel` gates the OpenTelemetry GenAI convention mapping for the
 A2A edge — the ingress `SERVER` span the agent domain's adapter defers to the
 protocol adapter — and activates `rakka-agent/otel`. It deliberately does not
 gate trace-context propagation: extraction on ingress and injection on egress
