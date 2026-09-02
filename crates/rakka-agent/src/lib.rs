@@ -3,17 +3,16 @@
 
 //! Durable agent domain, loop runtime, and provider-neutral model adapter.
 //!
-//! This crate is the M1 home for the Rakka agent surface: the goal, typed-task,
-//! run, evaluation, handoff, delegation, team, moderation, and workflow-tool
+//! This crate is the Rakka agent surface: the goal, typed-task, run,
+//! evaluation, handoff, delegation, team, moderation, and workflow-tool
 //! domain, the typed client, the durable loop runtime, the model adapter trait,
 //! the continuous wake controller, the escrow budget ledger, autonomy
 //! admission, guardrails, gates, tool binding and dispatch grants, execution
-//! policy references, bounded operational queries, memory traits, structured
-//! telemetry, and deterministic test support.
-//!
-//! Only the module map exists today. Each module documents the specification
-//! section it implements and the implementation slice that fills it, so the
-//! crate shape is reviewable before any behavior lands.
+//! policy references, bounded operational queries, memory traits and
+//! retrieval, structured telemetry, the schema policy, and deterministic test
+//! support. Each module documents the specification section it implements
+//! and the slice that filled it; the surface as a whole, and where each claim
+//! is proven, is described in `docs/rakka-agents.md`.
 //!
 //! # Boundaries
 //!
@@ -72,6 +71,8 @@ pub mod guardrails;
 pub mod identity;
 pub mod loop_runtime;
 pub mod memory;
+pub mod memory_conformance;
+pub mod memory_retention;
 pub mod model;
 pub mod observability;
 #[cfg(feature = "otel")]
@@ -154,7 +155,8 @@ pub use dispatch::{
     AgentReconciliationFinding, AgentRunEffectDispatcher, AgentRunResultDelivery,
     AgentRunSetupResolver, AgentWorkflowCancelExecutor, AgentWorkflowCancelFinding,
     AgentWorkflowStartExecutor, AgentWorkflowStartFinding, SessionMemoryPromotionExecutor,
-    WorkflowAgentRunEffectSink,
+    WorkflowAgentRunEffectSink, AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH,
+    AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH,
 };
 pub use effect::{
     compensation_call_id, effect_id_for, external_idempotency_key_for, AgentClaimAppendProvenance,
@@ -219,6 +221,11 @@ pub use memory::{
     AGENT_SESSION_WINDOW_MAX_ENTRIES, AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES,
     AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_ENTRIES,
 };
+pub use memory_retention::{
+    backfill_run_terminal_stamp, discharge_run_memory_retention, AgentMemoryRetentionReport,
+    AgentMemoryRetentionSweep, AgentRunRetentionOutcome, AgentRunTerminalStampBackfill,
+    AgentRunTerminalStampOutcome, AgentRunTerminalStampReport,
+};
 pub use model::{
     AgentModelAdapter, AgentModelError, AgentModelFuture, AgentModelRequest, AgentModelResult,
     AgentModelRetryPolicy, AgentModelTurn, AgentModelUsage, AgentToolCallId, AgentToolCallRequest,
@@ -226,31 +233,50 @@ pub use model::{
     AGENT_TOOL_ARGUMENTS_MAX_BYTES,
 };
 pub use observability::{
-    record_agent_domain_counter, record_agent_domain_gauge, record_unsettleable_exchanges,
-    sanitize_agent_telemetry_context, validate_agent_domain_metric_attributes, AgentDecisionDraft,
-    AgentDecisionEvent, AgentDecisionEventPage, AgentDecisionEventSink, AgentDecisionKind,
-    AgentDecisionSource, AgentDecisionWriteStatus, AgentObservabilityError,
-    AgentObservabilityFuture, AgentObservabilityResult, InMemoryAgentDecisionEventSink,
-    AGENT_DECISION_EVENT_RETENTION, AGENT_DECISION_REASON_MAX_LENGTH, AGENT_METRIC_FIELDS,
-    AGENT_TELEMETRY_MAX_SPAN_LINKS, METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS,
-    METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_DEPENDENCY_OUTCOMES,
-    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EPOCHS, METRIC_AGENT_EXCHANGE_UNSETTLEABLE,
-    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION,
-    METRIC_AGENT_GOAL_STATUS, METRIC_AGENT_HANDOFF_RESULTS, METRIC_AGENT_HUMAN_RESULTS,
-    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
-    METRIC_AGENT_MODERATION_TURNS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TEAM_OPERATIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
-    METRIC_AGENT_WAKE_DISPOSITIONS, METRIC_AGENT_WORKFLOW_RESULTS,
+    agent_domain_instrument_views, agent_domain_metric_instrument, record_agent_domain_counter,
+    record_agent_domain_duration, record_agent_domain_gauge, record_agent_domain_histogram,
+    record_unsettleable_exchanges, sanitize_agent_telemetry_context,
+    validate_agent_domain_metric_attributes, AgentDecisionDraft, AgentDecisionEvent,
+    AgentDecisionEventPage, AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource,
+    AgentDecisionWriteStatus, AgentDomainMetricInstrument, AgentObservabilityError,
+    AgentObservabilityFuture, AgentObservabilityResult, AgentSegmentIdentity,
+    AgentSegmentOperation, AgentSegmentOutcome, AgentSegmentSink, AgentSegmentSinkHealth,
+    AgentSegmentTimer, AgentTelemetrySegment, InMemoryAgentDecisionEventSink,
+    InMemoryAgentSegmentSink, AGENT_COUNT_BUCKETS, AGENT_DECISION_EVENT_RETENTION,
+    AGENT_DECISION_REASON_MAX_LENGTH, AGENT_DOMAIN_METRIC_INSTRUMENTS, AGENT_LATENCY_BUCKETS_MS,
+    AGENT_METRIC_FIELDS, AGENT_SEGMENT_ERROR_CODE_MAX_LENGTH, AGENT_SEGMENT_ERROR_TYPES,
+    AGENT_TELEMETRY_MAX_SPAN_LINKS, AGENT_TELEMETRY_SIGNALS, DEFAULT_AGENT_SEGMENT_SINK_CAPACITY,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
+    METRIC_AGENT_DEPENDENCY_OUTCOMES, METRIC_AGENT_EFFECT_OUTCOMES,
+    METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_EPOCHS,
+    METRIC_AGENT_EXCHANGE_UNSETTLEABLE, METRIC_AGENT_FAN_IN_RESOLUTIONS,
+    METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION, METRIC_AGENT_GOAL_STATUS,
+    METRIC_AGENT_HANDOFF_RESULTS, METRIC_AGENT_HUMAN_RESULTS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_MODERATION_TURNS,
+    METRIC_AGENT_RECOVERY_DURATION, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    METRIC_AGENT_TEAM_OPERATIONS, METRIC_AGENT_TELEMETRY_EXPORT_DROPS,
+    METRIC_AGENT_TELEMETRY_EXPORT_QUEUE, METRIC_AGENT_TELEMETRY_EXPORT_UNMAPPABLE,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_TURN_DURATION,
+    METRIC_AGENT_WAKE_DISPOSITIONS, METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND,
+    SEGMENT_ATTR_EFFECT_ATTEMPT, SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS,
+    SEGMENT_ATTR_SETTINGS_REVISION,
 };
 #[cfg(feature = "otel")]
 pub use otel::{
-    agent_instrumentation_scope, decision_span_event, usage_attributes, AgentGenAiIdentity,
-    AgentGenAiOperation, AGENT_DECISION_SPAN_EVENT, AGENT_GENAI_CONVENTION_REVISION,
-    AGENT_GENAI_SCHEMA_URL, AGENT_OTEL_SCOPE_NAME, AGENT_OTEL_SCOPE_VERSION, ATTR_GEN_AI_AGENT_ID,
-    ATTR_GEN_AI_AGENT_NAME, ATTR_GEN_AI_AGENT_VERSION, ATTR_GEN_AI_CONVERSATION_ID,
-    ATTR_GEN_AI_OPERATION_NAME, ATTR_GEN_AI_PROVIDER_NAME, ATTR_GEN_AI_TOOL_NAME,
-    ATTR_GEN_AI_TOOL_TYPE, ATTR_GEN_AI_USAGE_INPUT_TOKENS, ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
-    ATTR_RAKKA_AGENT_DELEGATION_ID, ATTR_RAKKA_AGENT_GOAL_ID, ATTR_RAKKA_AGENT_TASK_ID,
+    agent_instrumentation_scope, allowlist_agent_log, decision_span_event, genai_operation,
+    is_agent_log_attribute, is_agent_span_attribute, segment_span, usage_attributes,
+    validate_agent_span_attributes, AgentGenAiIdentity, AgentGenAiOperation,
+    AgentGenAiSpanExporter, AGENT_DECISION_SPAN_EVENT, AGENT_GENAI_CONVENTION_REVISION,
+    AGENT_GENAI_SCHEMA_URL, AGENT_LOG_ATTRIBUTE_KEYS, AGENT_OTEL_SCOPE_NAME,
+    AGENT_OTEL_SCOPE_VERSION, AGENT_SPAN_ATTRIBUTE_KEYS, AGENT_SPAN_ATTRIBUTE_VALUE_MAX_BYTES,
+    ATTR_ERROR_TYPE, ATTR_GEN_AI_AGENT_ID, ATTR_GEN_AI_AGENT_NAME, ATTR_GEN_AI_AGENT_VERSION,
+    ATTR_GEN_AI_CONVERSATION_ID, ATTR_GEN_AI_OPERATION_NAME, ATTR_GEN_AI_PROVIDER_NAME,
+    ATTR_GEN_AI_REQUEST_MODEL, ATTR_GEN_AI_TOOL_NAME, ATTR_GEN_AI_TOOL_TYPE,
+    ATTR_GEN_AI_USAGE_INPUT_TOKENS, ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
+    ATTR_RAKKA_AGENT_CHECKPOINT_KIND, ATTR_RAKKA_AGENT_DELEGATION_ID,
+    ATTR_RAKKA_AGENT_EFFECT_ATTEMPT, ATTR_RAKKA_AGENT_EFFECT_STATUS, ATTR_RAKKA_AGENT_GOAL_ID,
+    ATTR_RAKKA_AGENT_LOOP_TRANSITIONS, ATTR_RAKKA_AGENT_SETTINGS_REVISION,
+    ATTR_RAKKA_AGENT_TASK_ID, ATTR_RAKKA_ERROR_CODE, DEFAULT_AGENT_SPAN_BUFFER_CAPACITY,
 };
 pub use query::{
     agent_conversation_struggle_signals, agent_goal_view_omission_code, agent_operational_snapshot,
@@ -273,8 +299,9 @@ pub use retrieval::{
     AgentMemoryEmbedder, AgentMemoryRetrieval, AgentPrivateMemoryRetriever, AssembledContext,
     InMemoryPrivateMemoryRetriever, MemoryRetrievalOutcome, MemoryRetrievalPolicy,
     MemoryRetrievalQuery, RetrievalReport, RetrievedPrivateMemory,
-    AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH, AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES,
-    AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES, AGENT_MEMORY_RETRIEVAL_SCAN_MAX_ENTRIES,
+    AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH, AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS,
+    AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES, AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES,
+    AGENT_MEMORY_RETRIEVAL_RESOLUTION_FACTOR, AGENT_MEMORY_RETRIEVAL_SCAN_MAX_ENTRIES,
 };
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,
@@ -514,9 +541,9 @@ pub use tools::{
     AgentEnvironmentConcurrencyProtocol, AgentExecutionPolicyRouter, AgentGrantDescriptor,
     AgentGrantedDispatch, AgentToolAuthority, AgentToolBinding, AgentToolDescriptor,
     AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResultBehavior,
-    AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
-    AGENT_TOOL_DESCRIPTION_MAX_LENGTH, AGENT_TOOL_PARAMETERS_MAX_BYTES,
-    AGENT_TOOL_REGISTRY_MAX_TOOLS,
+    AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
+    AGENT_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_TOOL_DESCRIPTION_MAX_LENGTH,
+    AGENT_TOOL_PARAMETERS_MAX_BYTES, AGENT_TOOL_REGISTRY_MAX_TOOLS,
 };
 pub use workflow_tool::{
     child_workflow_run_id, workflow_cancel_command, workflow_cancel_command_id,

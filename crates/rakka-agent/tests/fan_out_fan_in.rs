@@ -14,165 +14,25 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use common::{
-    delegation_config_with_fan_in, delegation_tool_id, fan_in_tool_id, goal_spec_draft,
-    goal_spec_with_fan_out, goal_task_creation_command, run_scope, task_definition, task_scope,
-    Fixture, SKILL, SKILL_2, TENANT,
+    child_result_envelope, committed_children, create_fan_out_task, delegation_config_with_fan_in,
+    delegation_tool_id, fan_in_tool_id, fan_out_fixture, proposing_turn, run_scope,
+    task_definition, task_scope, Fixture, SkillNamedExecutor, SKILL, SKILL_2, TENANT,
 };
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    delegation_result_operation_id, AgentA2aSendExecutor, AgentA2aSendFinding,
-    AgentDelegationRecord, AgentDelegationReport, AgentDelegationStatus, AgentDispatchFuture,
-    AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload,
-    AgentFanInPolicy, AgentLoopPhase, AgentModelTurn, AgentRunEffect, AgentRunEffectOutcome,
-    AgentRunEffectRequest, AgentRunEntityCommand, AgentRunScope, AgentRunStatus, AgentTaskContent,
-    AgentTaskId, AgentTaskScope, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest, TenantId,
-    AGENT_DELEGATION_RESULT_PAYLOAD_TYPE, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    delegation_result_operation_id, AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeKind,
+    AgentExchangePayload, AgentFanInPolicy, AgentLoopPhase, AgentModelTurn, AgentRunEffect,
+    AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEntityCommand, AgentRunStatus,
+    AgentTaskContent, AgentTaskId, AgentTaskScope, AgentTaskStatus, AgentToolCallId,
+    AgentToolCallRequest, TenantId, AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
-use rakka_agent_workflow::{AgentCorrelationId, AgentEphemeralCredential};
+use rakka_agent_workflow::AgentCorrelationId;
 use rakka_core::InMemoryMetricsRecorder;
 use serde_json::json;
-
-/// A send executor that names each child after the skill it serves, so a
-/// two-skill fan-out creates two distinct children.
-struct SkillNamedExecutor {
-    seen: Mutex<Vec<AgentDelegationRecord>>,
-    fail_skill: Option<&'static str>,
-}
-
-impl SkillNamedExecutor {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            seen: Mutex::new(Vec::new()),
-            fail_skill: None,
-        })
-    }
-
-    fn failing(skill: &'static str) -> Arc<Self> {
-        Arc::new(Self {
-            seen: Mutex::new(Vec::new()),
-            fail_skill: Some(skill),
-        })
-    }
-}
-
-fn child_task_for(skill: &str) -> AgentTaskId {
-    AgentTaskId::new(format!("child-{skill}")).expect("task id should be valid")
-}
-
-impl AgentA2aSendExecutor for SkillNamedExecutor {
-    fn execute<'a>(
-        &'a self,
-        _scope: &'a AgentRunScope,
-        _intent: &'a AgentRunEffect,
-        delegation: &'a AgentDelegationRecord,
-        _credential: Option<&'a AgentEphemeralCredential>,
-    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding> {
-        self.seen
-            .lock()
-            .expect("the record log should not be poisoned")
-            .push(delegation.clone());
-        let skill = delegation.requested_skill.as_str().to_string();
-        let refused = self.fail_skill == Some(skill.as_str());
-        Box::pin(async move {
-            if refused {
-                return Ok(AgentA2aSendFinding::Refused {
-                    code: "peer-unavailable".to_string(),
-                    message: "the specialist surface refused the send".to_string(),
-                });
-            }
-            Ok(AgentA2aSendFinding::Sent {
-                child_task: child_task_for(&skill),
-                child_run: None,
-                peer_status: "submitted".to_string(),
-            })
-        })
-    }
-}
-
-fn fan_out_turn() -> AgentModelTurn {
-    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
-        .with_text("Fanning out to both specialists and awaiting them.")
-        .with_tool_call(
-            AgentToolCallRequest::new(
-                AgentToolCallId::new("delegate-1").expect("call id should be valid"),
-                delegation_tool_id(),
-                json!({ "skill": SKILL, "input": { "text": "hello" } }),
-            )
-            .expect("the tool call is bounded"),
-        )
-        .with_tool_call(
-            AgentToolCallRequest::new(
-                AgentToolCallId::new("delegate-2").expect("call id should be valid"),
-                delegation_tool_id(),
-                json!({ "skill": SKILL_2, "input": { "text": "hello" } }),
-            )
-            .expect("the tool call is bounded"),
-        )
-        .with_tool_call(
-            AgentToolCallRequest::new(
-                AgentToolCallId::new("await-1").expect("call id should be valid"),
-                fan_in_tool_id(),
-                json!({}),
-            )
-            .expect("the tool call is bounded"),
-        )
-}
-
-fn proposing_turn() -> AgentModelTurn {
-    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
-        .with_text("Synthesizing the children's evidence.")
-        .with_proposal(
-            AgentTaskContent::inline(json!({ "answer": "synthesized" }))
-                .expect("the proposal is inline-bounded"),
-        )
-}
-
-fn fan_out_fixture(executor: Arc<SkillNamedExecutor>) -> Fixture {
-    Fixture::new(
-        ScriptedDispatcher::with_adapter(
-            DeterministicModelAdapter::new()
-                .with_turn(fan_out_turn())
-                .with_turn(proposing_turn()),
-        )
-        .with_a2a_send_executor(executor),
-    )
-    .with_delegation(delegation_config_with_fan_in())
-}
-
-async fn create_fan_out_task(fixture: &Fixture, policy: Option<AgentFanInPolicy>) {
-    fixture.instantiate_agent().await;
-    fixture
-        .apply_task_command(goal_task_creation_command(
-            task_definition(),
-            goal_spec_draft(goal_spec_with_fan_out(policy, None), true),
-        ))
-        .await
-        .expect("the goal task should create");
-}
-
-/// The committed members, read from the durable cells: `(delegation id,
-/// created child task)` per settled cell, in deterministic map order.
-async fn committed_children(
-    fixture: &Fixture,
-) -> Vec<(rakka_agent::AgentDelegationId, AgentTaskId)> {
-    let mut run = fixture.run();
-    run.recover(fixture.now()).await.expect("recover");
-    let state = run.state().expect("state");
-    let loop_state = state.loop_state().expect("the loop is running");
-    loop_state
-        .delegations()
-        .iter()
-        .filter_map(|(id, cell)| match &cell.status {
-            AgentDelegationStatus::ChildCreated { child_task, .. } => {
-                Some((id.clone(), child_task.clone()))
-            }
-            _ => None,
-        })
-        .collect()
-}
 
 async fn parked_phase(fixture: &Fixture) -> (AgentLoopPhase, Option<AgentRunStatus>, usize) {
     let mut run = fixture.run();
@@ -185,47 +45,6 @@ async fn parked_phase(fixture: &Fixture) -> (AgentLoopPhase, Option<AgentRunStat
         .filter(|effect| effect.is_outstanding())
         .count();
     (loop_state.phase(), state.status(), outstanding)
-}
-
-/// One child's terminal report, exactly as the child task's owed exchange
-/// carries it.
-fn child_result_envelope(
-    fixture: &Fixture,
-    delegation: &rakka_agent::AgentDelegationId,
-    child_task: &AgentTaskId,
-    status: AgentTaskStatus,
-) -> AgentExchangeEnvelope {
-    let tenant = TenantId::new(TENANT);
-    let operation_id =
-        delegation_result_operation_id(&tenant, delegation).expect("the operation id derives");
-    let report = AgentDelegationReport {
-        delegation: delegation.clone(),
-        child_task: child_task.clone(),
-        child_run: None,
-        status,
-        terminal_reason: (status != AgentTaskStatus::Completed)
-            .then(|| "cancellation-requested".to_string()),
-        result_digest: (status == AgentTaskStatus::Completed).then(|| {
-            AgentTaskContent::inline(json!({ "answer": "done" }))
-                .expect("the content is inline-bounded")
-                .digest()
-        }),
-        descendants_created: 0,
-    };
-    let payload = AgentExchangePayload::encode(AGENT_DELEGATION_RESULT_PAYLOAD_TYPE, &report)
-        .expect("the report encodes");
-    let child_scope =
-        AgentTaskScope::new(tenant, child_task.clone()).expect("the child scope is valid");
-    AgentExchangeEnvelope::new(
-        operation_id.clone(),
-        AgentExchangeKind::DelegationResult,
-        AgentEntityAddress::Task(child_scope),
-        AgentEntityAddress::Run(run_scope()),
-        payload,
-        AgentCorrelationId::new(operation_id.as_str()),
-        fixture.now(),
-    )
-    .expect("the envelope is valid")
 }
 
 async fn deliver(fixture: &Fixture, envelope: &AgentExchangeEnvelope) -> bool {

@@ -2,7 +2,9 @@
 //! injected at every durable boundary.
 //!
 //! Specification: sections 11.3 through 11.6; scenarios 5 through 9 of
-//! section 18, and the dispatch invariants of 11.4. The run's effects travel
+//! section 18, the generation half of scenario 10, the dispatcher-restart
+//! half of scenario 23, the effect half of scenario 57, and the dispatch
+//! invariants of 11.4. The run's effects travel
 //! the production path here: committed into the run's durable state, flushed
 //! as dispatch tickets into the agent-workflow outbox, leased and fenced by
 //! the dispatcher fleet, invoked through the model adapter and tool executor,
@@ -90,6 +92,7 @@ struct DispatchFixture {
     credentials: ScriptedCredentialResolver,
     probe: KillSwitchProbe,
     promotions: Option<Arc<dyn rakka_agent::AgentMemoryPromotionExecutor>>,
+    segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
 }
 
 impl DispatchFixture {
@@ -134,7 +137,15 @@ impl DispatchFixture {
             credentials: ScriptedCredentialResolver::new("live-secret-token"),
             probe: KillSwitchProbe::new(),
             promotions: None,
+            segments: None,
         }
+    }
+
+    /// Wires the dispatch pipeline with a segment sink, so what the worker
+    /// closes is observable.
+    fn with_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
+        self.segments = Some(sink);
+        self
     }
 
     /// Wires the run with session memory and the pipeline with the promotion
@@ -170,15 +181,19 @@ impl DispatchFixture {
                 self.fx.agents.clone(),
                 AgentToolAuthority::new(self.registry.clone()),
             )),
-            Arc::new(
-                InProcessRunResultDelivery::new(
+            Arc::new({
+                let mut delivery = InProcessRunResultDelivery::new(
                     self.fx.runs.clone(),
                     self.fx.effects.clone(),
                     self.fx.router.clone(),
                     self.fx.clock.clone(),
                 )
-                .with_effect_policies(self.fx.policies.clone()),
-            ),
+                .with_effect_policies(self.fx.policies.clone());
+                if let Some(metrics) = &self.fx.metrics {
+                    delivery = delivery.with_metrics(metrics.clone());
+                }
+                delivery
+            }),
         )
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
         .with_probe(Arc::new(self.probe.clone()))
@@ -186,6 +201,9 @@ impl DispatchFixture {
         .with_credential_resolver(Arc::new(self.credentials.clone()));
         if let Some(promotions) = &self.promotions {
             pipeline = pipeline.with_memory_promotion_executor(promotions.clone());
+        }
+        if let Some(segments) = &self.segments {
+            pipeline = pipeline.with_segments(segments.clone());
         }
         pipeline
     }
@@ -687,6 +705,121 @@ async fn an_unknown_reconciliation_finding_is_requeried_before_any_retry() {
     );
     let run = fx.fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+/// The two ambiguous-recovery settlements that export nothing without this.
+///
+/// `park_indeterminate` was given a segment carrying
+/// `rakka.agent.effect.status = indeterminate`, but the arms that reach the
+/// *same* durable outcome by another route were not: the `NonIdempotent` arm
+/// of `recover_ambiguous` hand-rolled the delivery, the counter, and the ticket
+/// settlement without a segment, and `retry_ambiguous` closed none when the
+/// ambiguous losses spent the last of the generation's budget. Between them
+/// they cover the canonical case — a worker that dies after the durable
+/// `Started` write — so a tail-sampling policy keyed on the status attribute
+/// retained nothing for the outcome the attribute exists to select.
+#[tokio::test]
+async fn the_ambiguous_recovery_settlements_close_the_segments_that_select_them() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_segments(segments.clone());
+    fx.start().await;
+
+    fx.pump_until_tool_ticket().await;
+    fx.probe.arm(AgentDispatchWindow::AfterInvocation);
+    let _pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Indeterminate),
+        "the non-idempotent generation parks, or this proves nothing"
+    );
+    let parked: Vec<_> = segments
+        .segments()
+        .into_iter()
+        .filter(|segment| {
+            segment
+                .attributes
+                .get(rakka_agent::SEGMENT_ATTR_EFFECT_STATUS)
+                == Some(&AgentRunEffectStatus::Indeterminate.as_label().to_string())
+        })
+        .collect();
+    assert!(
+        !parked.is_empty(),
+        "the indeterminate park must close a segment a retention rule can select"
+    );
+    assert!(
+        parked
+            .iter()
+            .all(|segment| segment.outcome == rakka_agent::AgentSegmentOutcome::Error),
+        "an indeterminate outcome is an error event under 17.9"
+    );
+    assert!(
+        parked
+            .iter()
+            .all(|segment| segment.error_code.as_deref() == Some("dispatcher-lost-after-started")),
+        "and it names the stable code the loss produced: {parked:?}"
+    );
+}
+
+/// The other half: an ambiguous loss that spends the generation's last attempt
+/// settles `Exhausted`, and every attempt that could have described it was lost
+/// before it closed a segment.
+#[tokio::test]
+async fn an_ambiguous_loss_that_exhausts_the_budget_closes_a_segment() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_segments(segments.clone());
+    fx.start().await;
+    fx.settle().await;
+
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert!(pass.died, "the worker dies after the durable Started write");
+
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(
+        fx.effect_status(0).await,
+        Some(AgentRunEffectStatus::Exhausted),
+        "the single-attempt policy exhausts, or this proves nothing"
+    );
+    assert!(
+        segments.segments().iter().any(|segment| {
+            segment
+                .attributes
+                .get(rakka_agent::SEGMENT_ATTR_EFFECT_STATUS)
+                == Some(&AgentRunEffectStatus::Exhausted.as_label().to_string())
+                && segment.error_code.as_deref() == Some("dispatcher-lost-after-started")
+        }),
+        "the exhausting settlement must close a segment: {:?}",
+        segments.operations()
+    );
 }
 
 // ---------------------------------------------------------------------------

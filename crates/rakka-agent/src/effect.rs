@@ -869,6 +869,45 @@ impl AgentEffectPolicies {
         self
     }
 
+    /// Stamps the trust class every effect *Rakka itself* commits runs under:
+    /// the model call, a compensation, a memory promotion, a goal evaluation,
+    /// an A2A send, a workflow start or cancel, and a claim append
+    /// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// These are the effects no application declaration names, and without
+    /// this they can carry no class at all — which is what makes
+    /// [`crate::tools::AgentToolAuthority::with_required_execution_policy`]
+    /// enforceable rather than a switch that refuses every run's first model
+    /// call.
+    ///
+    /// Registered tools are deliberately untouched: a tool's class comes from
+    /// its [`crate::tools::AgentToolBinding`] declaration, and the dispatch
+    /// gate refuses an intent whose class disagrees with that binding. So is
+    /// the unclassified-tool default, which must stay refusable — a tool the
+    /// deployment never classified is exactly what a required execution
+    /// policy exists to catch.
+    ///
+    /// Prefer deriving policies through
+    /// [`crate::tools::AgentToolAuthority::effect_policies`], which applies
+    /// this stamp from the class the authority requires, so the gate and the
+    /// specs that satisfy it cannot drift.
+    #[must_use]
+    pub fn with_substrate_execution_policy(mut self, policy: AgentExecutionPolicyRef) -> Self {
+        for spec in [
+            &mut self.model,
+            &mut self.compensation,
+            &mut self.memory_promotion,
+            &mut self.goal_evaluation,
+            &mut self.a2a_send,
+            &mut self.workflow_start,
+            &mut self.workflow_cancel,
+            &mut self.claim_append,
+        ] {
+            spec.execution_policy = Some(policy.clone());
+        }
+        self
+    }
+
     /// The spec one request dispatches under.
     #[must_use]
     pub fn spec_for(&self, request: &AgentRunEffectRequest) -> &AgentEffectSpec {
@@ -1983,11 +2022,23 @@ pub const LINK_KIND_SUPERSEDED_GENERATION: &str = "superseded-generation";
 /// superseded generation's segment must not parent the reconciled re-dispatch —
 /// and a span link back to it, so the causal chain across generations stays
 /// walkable ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
-/// The new generation starts parent-less on purpose: its dispatch is caused by
-/// a reconciliation decision, not by the segment that scheduled the attempt an
-/// operator just proved never executed.
+///
+/// The new generation keeps the run's trace and its propagated parent, so its
+/// spans are *siblings* of the superseded attempt's rather than children of
+/// them: the re-dispatch is caused by a reconciliation decision, not by the
+/// segment that scheduled the attempt an operator just proved never executed.
+/// This context used to be built from `default()` to express that, which
+/// dropped the `traceparent` along with the parentage — and once a context's
+/// span id became a span's *parent* rather than its identity, a context with
+/// no `traceparent` belongs to no trace at all. Every span of the
+/// re-invocation was then refused by the mapper and counted `unmappable`:
+/// `tool-authorize`, `effect-dispatch`, `model-inference`, and `execute-tool`
+/// all vanished for exactly the re-invocation an incident is about, and
+/// silently, because `unmappable` labels no `rakka.agent.*` instrument.
 fn superseded_generation_telemetry(prior: &AgentTelemetryContext) -> AgentTelemetryContext {
     let mut next = AgentTelemetryContext {
+        trace_parent: prior.trace_parent.clone(),
+        trace_state: prior.trace_state.clone(),
         span_links: prior.span_links.clone(),
         ..AgentTelemetryContext::default()
     };

@@ -22,29 +22,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rakka_agent::testkit::{
-    run_entity, CrashingStateStore, DeferredExchangeRouter, InProcessRunEntityTransport,
-    InProcessTaskEntityTransport, InProcessWakeDelivery, ScriptedDispatcher,
-    SharedAtomicWorkflowClock,
+    run_entity, CrashingStateStore, DeferredExchangeRouter, DeterministicModelAdapter,
+    InProcessRunEntityTransport, InProcessRunResultDelivery, InProcessTaskEntityTransport,
+    InProcessWakeDelivery, KillSwitchProbe, RecordingToolExecutor, ScriptedCredentialResolver,
+    ScriptedDispatcher, SharedAtomicWorkflowClock,
 };
 use rakka_agent::{
-    AgentAuthorityEnvelope, AgentBudgetAllocation, AgentBudgetCeilings, AgentBudgetDimension,
-    AgentContinuousGoalSpec, AgentDefinition, AgentDefinitionId, AgentEffectPolicies,
-    AgentEffectSpec, AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore,
-    AgentEpochSpec, AgentExchangeRouter, AgentGoalId, AgentGoalMode, AgentId, AgentModelAdapter,
+    delegation_result_operation_id, AgentA2aSendExecutor, AgentA2aSendFinding,
+    AgentAuthorityEnvelope, AgentAuthorityRefusal, AgentBudgetAllocation, AgentBudgetCeilings,
+    AgentBudgetDimension, AgentContinuousGoalSpec, AgentDefinition, AgentDefinitionId,
+    AgentDelegationId, AgentDelegationRecord, AgentDelegationReport, AgentDelegationStatus,
+    AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentDispatchPass,
+    AgentEffectPolicies, AgentEffectSpec, AgentEntityAddress, AgentEntityAuthority,
+    AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentEpochSpec,
+    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter,
+    AgentFanInPolicy, AgentGoalId, AgentGoalMode, AgentId, AgentModelAdapter, AgentModelTurn,
     AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentRevisionNumber,
-    AgentRevisionProvenance, AgentRunEffectSink, AgentRunEntityStore, AgentRunMemory,
-    AgentRunScope, AgentRunSnapshot, AgentRunState, AgentRunStatus, AgentSchemaId, AgentSchemaRef,
-    AgentScope, AgentSettings, AgentTaskContent, AgentTaskCreation, AgentTaskDefinition,
-    AgentTaskDefinitionId, AgentTaskEntityCommand, AgentTaskEntityStore, AgentTaskResultCheck,
-    AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskSnapshot, AgentTaskState,
-    AgentToolBinding, AgentToolDeclaration, AgentToolDescriptor, AgentToolKind, AgentToolRegistry,
-    AgentWakeBinding, AgentWakeOccurrence, AgentWakePolicy, AgentWakePolicyRevision,
-    AgentWakeScanner, AgentWakeScannerSettings, AgentWakeTimerEntry, AgentWakeTimerStore,
-    AgentWakeTimerStoreState, AgentWakeTriggerKind, InMemoryAgentRunEffectSink,
-    InMemoryAgentTaskHistoryStore, ScheduleRevision, TenantId,
+    AgentRevisionProvenance, AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectSink,
+    AgentRunEffectStatus, AgentRunEntityStore, AgentRunMemory, AgentRunScope, AgentRunSnapshot,
+    AgentRunState, AgentRunStatus, AgentRunTerminalReason, AgentSchemaId, AgentSchemaRef,
+    AgentScope, AgentSettings, AgentSettingsChange, AgentSetupRevision, AgentTaskContent,
+    AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand,
+    AgentTaskEntityStore, AgentTaskId, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId,
+    AgentTaskScope, AgentTaskSnapshot, AgentTaskState, AgentTaskStatus, AgentToolAuthority,
+    AgentToolBinding, AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration,
+    AgentToolDescriptor, AgentToolKind, AgentToolRegistry, AgentWakeBinding, AgentWakeOccurrence,
+    AgentWakePolicy, AgentWakePolicyRevision, AgentWakeScanner, AgentWakeScannerSettings,
+    AgentWakeTimerEntry, AgentWakeTimerStore, AgentWakeTimerStoreState, AgentWakeTriggerKind,
+    InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore, ScheduleRevision, TenantId,
+    WorkflowAgentRunEffectSink, AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
+use rakka_agent_workflow::substrate::WorkflowState;
 use rakka_agent_workflow::{
-    AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef,
+    AgentAuditEventId, AgentCausationId, AgentCorrelationId, AgentDispatcherFleetSettings,
+    AgentDispatcherFleetState, AgentDispatcherWorkerId, AgentEphemeralCredential,
+    AgentTimestampMillis, PrincipalRef,
 };
 
 /// Durable store for the task entity class; a pass-through until a crash
@@ -814,6 +827,9 @@ pub struct Fixture<
     /// enables it. Absent by default, so the run records no decision events —
     /// the pre-slice-1.13 behavior.
     pub decisions: Option<Arc<dyn rakka_agent::AgentDecisionEventSink>>,
+    /// The bounded-segment sink the run entity is wired with, when a test
+    /// enables it. Absent by default, so the run closes no segments.
+    pub segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
     /// The metrics recorder the run entity is wired with, when a test enables
     /// it. Absent by default, so the run records no metrics.
     pub metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
@@ -930,6 +946,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             clock,
             memory: None,
             decisions: None,
+            segments: None,
             metrics: None,
             delegation: None,
             workflow_tools: None,
@@ -977,6 +994,15 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     ) -> Self {
         self.run_transport.install_decisions(sink.clone());
         self.decisions = Some(sink);
+        self
+    }
+
+    /// Wires the run entity with a bounded-segment sink, under the same
+    /// every-driver rule as [`Self::with_memory`].
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
+        self.run_transport.install_segments(sink.clone());
+        self.segments = Some(sink);
         self
     }
 
@@ -1284,6 +1310,9 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         if let Some(decisions) = &self.decisions {
             entity = entity.with_decision_events(decisions.clone());
         }
+        if let Some(segments) = &self.segments {
+            entity = entity.with_segments(segments.clone());
+        }
         if let Some(metrics) = &self.metrics {
             entity = entity.with_metrics(metrics.clone());
         }
@@ -1558,6 +1587,9 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         }
         if let Some(decisions) = &self.decisions {
             entity = entity.with_decision_events(decisions.clone());
+        }
+        if let Some(segments) = &self.segments {
+            entity = entity.with_segments(segments.clone());
         }
         if let Some(metrics) = &self.metrics {
             entity = entity.with_metrics(metrics.clone());
@@ -2136,5 +2168,959 @@ impl rakka_agent::AgentA2aHandoffSendExecutor for ApplyingHandoffExecutor {
             .expect("the record log should not be poisoned")
             .push(handoff.clone());
         Box::pin(async move { Ok(self.apply(handoff).await) })
+    }
+}
+
+/// A send executor that names each child after the skill it serves, so a
+/// two-skill fan-out creates two distinct children.
+///
+/// The fan-out tests, the cancellation tests, and the recovery sweeps all
+/// delegate through this one executor: a child's identity must be a pure
+/// function of the skill, or a re-drive after a crash could not be told from
+/// a second logical child.
+pub struct SkillNamedExecutor {
+    pub seen: std::sync::Mutex<Vec<AgentDelegationRecord>>,
+    fail_skill: Option<&'static str>,
+}
+
+impl SkillNamedExecutor {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail_skill: None,
+        })
+    }
+
+    /// An executor whose send for one skill is refused by the peer surface.
+    pub fn failing(skill: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail_skill: Some(skill),
+        })
+    }
+
+    /// How many sends the executor was asked to perform.
+    pub fn invocations(&self) -> usize {
+        self.seen
+            .lock()
+            .expect("the record log should not be poisoned")
+            .len()
+    }
+
+    /// The distinct delegation identities the executor was asked to send.
+    ///
+    /// This, not [`Self::invocations`], is the at-most-once assertion a crash
+    /// sweep wants: a redispatched send is a retry of one logical delegation,
+    /// and the derived identity is what proves it never became a second child.
+    pub fn delegations(&self) -> std::collections::BTreeSet<AgentDelegationId> {
+        self.seen
+            .lock()
+            .expect("the record log should not be poisoned")
+            .iter()
+            .map(|record| record.delegation.clone())
+            .collect()
+    }
+}
+
+/// The child task identity the peer surface derives for one skill.
+pub fn child_task_for(skill: &str) -> AgentTaskId {
+    AgentTaskId::new(format!("child-{skill}")).expect("task id should be valid")
+}
+
+impl AgentA2aSendExecutor for SkillNamedExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        delegation: &'a AgentDelegationRecord,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding> {
+        let recorded = delegation.clone();
+        let skill = delegation.requested_skill.as_str().to_string();
+        let refused = self.fail_skill == Some(skill.as_str());
+        Box::pin(async move {
+            // Recorded when the send runs, not when its future is built. Built
+            // outside the async block, a dispatch path that constructs this
+            // future and abandons it unpolled — an armed store crash between
+            // the intent commit and the await, a cancelled dispatch, a timeout
+            // — logged an invocation for a send that never reached the peer,
+            // while `cancellation_recovery.rs` and `delegation_limits.rs`
+            // assert at-most-once semantics off this very log.
+            self.seen
+                .lock()
+                .expect("the record log should not be poisoned")
+                .push(recorded);
+            if refused {
+                return Ok(AgentA2aSendFinding::Refused {
+                    code: "peer-unavailable".to_string(),
+                    message: "the specialist surface refused the send".to_string(),
+                });
+            }
+            Ok(AgentA2aSendFinding::Sent {
+                child_task: child_task_for(&skill),
+                child_run: None,
+                peer_status: "submitted".to_string(),
+            })
+        })
+    }
+}
+
+/// The turn that fans out to both specialists and closes the group.
+pub fn fan_out_turn() -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Fanning out to both specialists and awaiting them.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-1").expect("call id should be valid"),
+                delegation_tool_id(),
+                serde_json::json!({ "skill": SKILL, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-2").expect("call id should be valid"),
+                delegation_tool_id(),
+                serde_json::json!({ "skill": SKILL_2, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                serde_json::json!({}),
+            )
+            .expect("the tool call is bounded"),
+        )
+}
+
+/// The turn the resumed parent proposes its own result from.
+pub fn proposing_turn() -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Synthesizing the children's evidence.")
+        .with_proposal(
+            AgentTaskContent::inline(serde_json::json!({ "answer": "synthesized" }))
+                .expect("the proposal is inline-bounded"),
+        )
+}
+
+/// A fixture whose scripted model fans out and then proposes.
+///
+/// Keyed by turn number rather than by call order. A crash sweep re-asks a turn
+/// whose commit was rolled back, and an order-keyed script answers that re-ask
+/// with the *next* entry — the proposing turn for a re-asked turn 1, then an
+/// empty turn once the queue drains — so the sweep would measure the script's
+/// position rather than the run's recovery. `fan_in_recovery.rs` builds this
+/// same world by hand for exactly that reason.
+pub fn fan_out_fixture(executor: Arc<SkillNamedExecutor>) -> Fixture {
+    Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn_for(1, fan_out_turn())
+                .with_turn_for(2, proposing_turn()),
+        )
+        .with_a2a_send_executor(executor),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+}
+
+/// Instantiates the agent and creates the fan-out goal task.
+pub async fn create_fan_out_task(fixture: &Fixture, policy: Option<AgentFanInPolicy>) {
+    fixture.instantiate_agent().await;
+    fixture
+        .apply_task_command(goal_task_creation_command(
+            task_definition(),
+            goal_spec_draft(goal_spec_with_fan_out(policy, None), true),
+        ))
+        .await
+        .expect("the goal task should create");
+}
+
+/// The committed members, read from the durable cells: `(delegation id,
+/// created child task)` per settled cell, in deterministic map order.
+pub async fn committed_children(fixture: &Fixture) -> Vec<(AgentDelegationId, AgentTaskId)> {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let loop_state = state.loop_state().expect("the loop is running");
+    loop_state
+        .delegations()
+        .iter()
+        .filter_map(|(id, cell)| match &cell.status {
+            AgentDelegationStatus::ChildCreated { child_task, .. } => {
+                Some((id.clone(), child_task.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// One child's terminal report, exactly as the child task's owed exchange
+/// carries it.
+pub fn child_result_envelope(
+    fixture: &Fixture,
+    delegation: &AgentDelegationId,
+    child_task: &AgentTaskId,
+    status: AgentTaskStatus,
+) -> AgentExchangeEnvelope {
+    let tenant = TenantId::new(TENANT);
+    let operation_id =
+        delegation_result_operation_id(&tenant, delegation).expect("the operation id derives");
+    let report = AgentDelegationReport {
+        delegation: delegation.clone(),
+        child_task: child_task.clone(),
+        child_run: None,
+        status,
+        terminal_reason: (status != AgentTaskStatus::Completed)
+            .then(|| "cancellation-requested".to_string()),
+        result_digest: (status == AgentTaskStatus::Completed).then(|| {
+            AgentTaskContent::inline(serde_json::json!({ "answer": "done" }))
+                .expect("the content is inline-bounded")
+                .digest()
+        }),
+        descendants_created: 0,
+    };
+    let payload = AgentExchangePayload::encode(AGENT_DELEGATION_RESULT_PAYLOAD_TYPE, &report)
+        .expect("the report encodes");
+    let child_scope =
+        AgentTaskScope::new(tenant, child_task.clone()).expect("the child scope is valid");
+    AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        AgentExchangeKind::DelegationResult,
+        AgentEntityAddress::Task(child_scope),
+        AgentEntityAddress::Run(run_scope()),
+        payload,
+        AgentCorrelationId::new(operation_id.as_str()),
+        fixture.now(),
+    )
+    .expect("the envelope is valid")
+}
+
+/// Creates one real delegated child task under the provenance its creation
+/// validated, human-owned so it terminates without the assignment machinery.
+pub async fn create_real_child(
+    fixture: &Fixture,
+    delegation: &rakka_agent::AgentDelegationId,
+    child_task: &AgentTaskId,
+    skill: &str,
+) {
+    let tenant = TenantId::new(TENANT);
+    let scope = AgentTaskScope::new(tenant, child_task.clone()).expect("the scope is valid");
+    let provenance = rakka_agent::AgentTaskDelegationProvenance {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
+        delegation: delegation.clone(),
+        parent_task: task_scope().task().clone(),
+        parent_run: run_scope(),
+        lineage: Vec::new(),
+        ancestors: Vec::new(),
+        depth: 1,
+        requested_skill: rakka_agent::AgentCapabilityId::new(skill)
+            .expect("capability id should be valid"),
+        capability_scopes: Default::default(),
+        credential_bindings: Vec::new(),
+        result_schema: None,
+        budget: None,
+        deadline: None,
+    };
+    fixture
+        .apply_task_command_at(
+            &scope,
+            rakka_agent::AgentTaskEntityCommand::Create {
+                operation_id: rakka_agent::AgentOperationId::new(
+                    rakka_agent::AgentOperationKind::TaskCreation,
+                    [TENANT, child_task.as_str(), "1"],
+                )
+                .expect("the operation id derives"),
+                creation: Box::new(rakka_agent::AgentTaskCreation {
+                    definition: task_definition()
+                        .with_ownership(rakka_agent::AgentTaskOwnership::Human),
+                    input: AgentTaskContent::inline(serde_json::json!({ "text": "hello" }))
+                        .expect("the input is inline-bounded"),
+                    assignee: None,
+                    team: None,
+                    goal: None,
+                    goal_mode: Default::default(),
+                    goal_spec: None,
+                    parent: Some(task_scope().task().clone()),
+                    dependencies: Vec::new(),
+                    escrow: None,
+                    wake: None,
+                    delegation: Some(Box::new(provenance)),
+                    telemetry: Default::default(),
+                }),
+            },
+        )
+        .await
+        .expect("the child task creates");
+}
+
+// Crash-armable, like every other store the fixture owns: the durable
+// workflow substrate is where a dispatch attempt's failure detail actually
+// lands, so a sweep that cannot kill a worker mid-write to it is not sweeping
+// the surface it claims to. `effect_dispatch.rs` already declared these two
+// aliases locally; this is the one copy.
+pub type WorkflowStore = CrashingStateStore<WorkflowState>;
+pub type FleetStore = CrashingStateStore<AgentDispatcherFleetState>;
+pub type WorkflowSink = WorkflowAgentRunEffectSink<WorkflowStore, SharedAtomicWorkflowClock>;
+pub type Pipeline =
+    AgentRunEffectDispatcher<WorkflowStore, FleetStore, RunStore, SharedAtomicWorkflowClock>;
+
+pub const LEASE_MS: u64 = 60_000;
+
+/// An [`AgentDispatchAuthority`] decorator that backdates every issued
+/// grant's expiry, so the dispatcher's own pre-attempt revalidation — not the
+/// authority — is what refuses the attempt.
+pub struct ExpiredGrantAuthority<Inner>(Inner);
+
+impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAuthority<Inner> {
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        let inner = self.0.authorize(scope, run, intent, attempt, now);
+        Box::pin(async move {
+            match inner.await? {
+                AgentDispatchDecision::Granted(mut granted) => {
+                    granted.grant.expires_at =
+                        AgentTimestampMillis::new(now.as_millis().saturating_sub(1));
+                    Ok(AgentDispatchDecision::Granted(granted))
+                }
+                refused => Ok(refused),
+            }
+        })
+    }
+}
+
+/// A gate that answers one fixed refusal for every intent.
+///
+/// The refusal's code and message are *application*-authored on the real
+/// trait, so this is how a test drives the refusal-settlement paths with
+/// strings of its own choosing — which is the only way to see what those paths
+/// persist.
+pub struct FixedRefusalAuthority(pub AgentAuthorityRefusal);
+
+impl AgentDispatchAuthority for FixedRefusalAuthority {
+    fn authorize<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _run: &'a AgentRunState,
+        _intent: &'a AgentRunEffect,
+        _attempt: u32,
+        _now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        let refusal = self.0.clone();
+        Box::pin(async move { Ok(AgentDispatchDecision::Refused(refusal)) })
+    }
+}
+
+/// The authority fixture: the common task-and-run fixture over the durable
+/// workflow-outbox sink, plus the fleet, the executor, the kill-switch probe,
+/// and a configurable [`AgentToolAuthority`] behind the pipeline's required
+/// gate.
+pub struct AuthorityFixture {
+    pub fx: Fixture<DeterministicModelAdapter, WorkflowSink>,
+    pub adapter: DeterministicModelAdapter,
+    pub registry: AgentToolRegistry,
+    pub authority: AgentToolAuthority,
+    pub setup: Option<AgentSetupRevision>,
+    pub envelope: AgentAuthorityEnvelope,
+    pub workflow_store: WorkflowStore,
+    pub fleet_store: FleetStore,
+    pub wf_clock: SharedAtomicWorkflowClock,
+    pub tools: RecordingToolExecutor,
+    pub probe: KillSwitchProbe,
+    pub credentials: Option<Arc<ScriptedCredentialResolver>>,
+    pub expire_grants: bool,
+    pub fixed_refusal: Option<AgentAuthorityRefusal>,
+}
+
+impl AuthorityFixture {
+    /// A fixture whose commit-time policies are the given authority's own
+    /// projection ([`AgentToolAuthority::effect_policies`]), so the intents
+    /// the run commits carry the guardrail-revision pin the dispatch gate
+    /// validates.
+    pub fn new(
+        adapter: DeterministicModelAdapter,
+        authority: AgentToolAuthority,
+        model_spec: Option<AgentEffectSpec>,
+    ) -> Self {
+        let registry = authority.registry().clone();
+        let mut policies = authority
+            .effect_policies()
+            .expect("the authority projects valid policies");
+        if let Some(spec) = model_spec {
+            policies = policies
+                .with_model_spec(spec)
+                .expect("the model spec is valid");
+        }
+        let counter = Arc::new(AtomicU64::new(1));
+        let wf_clock = SharedAtomicWorkflowClock::new(counter.clone());
+        let workflow_store = WorkflowStore::new();
+        let fleet_store = FleetStore::new();
+        let sink = WorkflowAgentRunEffectSink::new(workflow_store.clone(), wf_clock.clone());
+        let fx = Fixture::with_sink(
+            ScriptedDispatcher::with_adapter(adapter.clone()),
+            sink,
+            policies,
+            counter,
+        );
+        let envelope = envelope_for_registry(&registry);
+        Self {
+            fx,
+            adapter,
+            registry,
+            authority,
+            setup: None,
+            envelope,
+            workflow_store,
+            fleet_store,
+            wf_clock,
+            tools: RecordingToolExecutor::new(),
+            probe: KillSwitchProbe::new(),
+            credentials: None,
+            expire_grants: false,
+            fixed_refusal: None,
+        }
+    }
+
+    /// A fixture over the plain authority of one registry.
+    pub fn over(
+        adapter: DeterministicModelAdapter,
+        registry: AgentToolRegistry,
+        model_spec: Option<AgentEffectSpec>,
+    ) -> Self {
+        Self::new(adapter, AgentToolAuthority::new(registry), model_spec)
+    }
+
+    /// Replaces the dispatch-gate authority *without* recomputing the
+    /// commit-time policies — the deliberate commit/dispatch drift the
+    /// guardrail-revision pin must catch.
+    pub fn with_gate_authority(mut self, authority: AgentToolAuthority) -> Self {
+        self.authority = authority;
+        self
+    }
+
+    /// Wires a dispatch-time credential resolver, so an intent that carries a
+    /// credential binding can reach its target at all. Without one the
+    /// pipeline refuses `credential-resolver-missing` before any grant check,
+    /// which is correct but hides every later gate.
+    pub fn with_credential_resolver(mut self, token: &str) -> Self {
+        self.credentials = Some(Arc::new(ScriptedCredentialResolver::new(token)));
+        self
+    }
+
+    /// Wires a credential resolver that always fails.
+    ///
+    /// The failure path — not the happy path — is where an application-supplied
+    /// string reaches a durable record, so a sweep that only ever resolves
+    /// successfully cannot see the surface it exists to check.
+    pub fn with_failing_credential_resolver(mut self, code: &str, message: &str) -> Self {
+        self.credentials = Some(Arc::new(ScriptedCredentialResolver::failing(code, message)));
+        self
+    }
+
+    /// Refuses every intent with the given refusal, so a test can choose the
+    /// application-authored code and message the settlement paths persist.
+    pub fn with_fixed_refusal(mut self, refusal: AgentAuthorityRefusal) -> Self {
+        self.fixed_refusal = Some(refusal);
+        self
+    }
+
+    /// Backdates every issued grant's expiry, so the dispatcher's
+    /// pre-attempt revalidation refuses it.
+    pub fn with_expired_grants(mut self) -> Self {
+        self.expire_grants = true;
+        self
+    }
+
+    /// Wires the run entity with a memory bundle, so the loop assembles real
+    /// context snapshots — and, with a retrieval bundle installed, evaluates
+    /// the memory-ingress boundary while it does.
+    ///
+    /// A test that attests a bundle to the dispatch authority must pass the
+    /// *same* `AgentRunMemory` here, or it proves only that the deployment
+    /// owns a matching chain somewhere.
+    pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
+        self.fx = self.fx.with_memory(memory);
+        self
+    }
+
+    /// Wires the run entity with a bounded-segment sink.
+    ///
+    /// The dispatch pipeline takes its own through `pipeline().with_segments`:
+    /// the two are separate wirings because they are separate processes in a
+    /// real deployment, and a test that wires only one is asserting about only
+    /// one.
+    pub fn with_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
+        self.fx = self.fx.with_segments(sink);
+        self
+    }
+
+    /// Replaces the envelope the agent is instantiated under.
+    pub fn with_envelope(mut self, envelope: AgentAuthorityEnvelope) -> Self {
+        self.envelope = envelope;
+        self
+    }
+
+    /// Enforces the given run setup at dispatch, for this fixture's run.
+    pub fn with_setup(mut self, setup: AgentSetupRevision) -> Self {
+        self.setup = Some(setup);
+        self
+    }
+
+    /// Wires the run entity to serve workflow tools, so the loop intercepts
+    /// the calls and the dispatch gate sees real `WorkflowStart` intents.
+    pub fn with_workflow_tools(mut self, config: rakka_agent::AgentRunWorkflowConfig) -> Self {
+        self.fx = self.fx.with_workflow_tools(config);
+        self
+    }
+
+    pub async fn start(&self) {
+        self.fx
+            .instantiate_agent_with_envelope(self.envelope.clone())
+            .await;
+        self.fx.create_task().await;
+    }
+
+    /// A fresh dispatch worker over the shared durable stores, named, with its
+    /// own tool executor and an optional set of execution classes it serves.
+    ///
+    /// `pipeline()` is this with the fixture's own executor, the shared
+    /// worker id, and no class restriction. A routing proof needs two workers
+    /// with *separate* executors so it can name which one invoked.
+    pub fn worker(
+        &self,
+        worker_id: &str,
+        tools: RecordingToolExecutor,
+        classes: Option<&[&str]>,
+    ) -> Pipeline {
+        let mut pipeline = self.build_pipeline(worker_id, tools);
+        if let Some(classes) = classes {
+            pipeline = pipeline.with_execution_classes(classes.iter().map(|class| {
+                rakka_agent::AgentExecutionPolicyRef::new(*class).expect("the class ref is valid")
+            }));
+        }
+        pipeline
+    }
+
+    /// A fresh dispatch worker over the shared durable stores.
+    pub fn pipeline(&self) -> Pipeline {
+        self.build_pipeline("worker-1", self.tools.clone())
+    }
+
+    fn build_pipeline(&self, worker_id: &str, tools: RecordingToolExecutor) -> Pipeline {
+        let mut gate = AgentEntityAuthority::new(self.fx.agents.clone(), self.authority.clone());
+        if let Some(setup) = &self.setup {
+            gate = gate.with_setup_for_run(run_scope(), setup.clone());
+        }
+        let gate: Arc<dyn AgentDispatchAuthority> = match &self.fixed_refusal {
+            Some(refusal) => Arc::new(FixedRefusalAuthority(refusal.clone())),
+            None if self.expire_grants => Arc::new(ExpiredGrantAuthority(gate)),
+            None => Arc::new(gate),
+        };
+        let mut delivery = InProcessRunResultDelivery::new(
+            self.fx.runs.clone(),
+            self.fx.effects.clone(),
+            self.fx.router.clone(),
+            self.fx.clock.clone(),
+        )
+        .with_effect_policies(self.fx.policies.clone());
+        if let Some(config) = &self.fx.workflow_tools {
+            delivery = delivery.with_workflow_tools(config.clone());
+        }
+        if let Some(segments) = &self.fx.segments {
+            delivery = delivery.with_segments(segments.clone());
+        }
+        // The recorder too. `Fixture::with_metrics` wires thirteen entity
+        // sites and this one was not among them, so a suite driving
+        // `pipeline()` with metrics enabled saw zero `rakka.agent.turn.
+        // duration`, `.model.tokens`, `.effect.outcomes` and
+        // `.effect.outstanding.duration` — the delivery is their only
+        // recording site — while the sharded entity beside it looked healthy.
+        if let Some(metrics) = &self.fx.metrics {
+            delivery = delivery.with_metrics(metrics.clone());
+        }
+        // And the decision sink, for the same reason a field over: the
+        // delivered model result *is* the deciding transition of a model turn,
+        // so `run_at` wiring the sink while this driver did not left every
+        // pipeline-driven turn with no 17.7 record and no
+        // `rakka.agent.decisions` count.
+        if let Some(decisions) = &self.fx.decisions {
+            delivery = delivery.with_decision_events(decisions.clone());
+        }
+        let mut pipeline = AgentRunEffectDispatcher::new(
+            AgentDispatcherWorkerId::new(worker_id),
+            self.workflow_store.clone(),
+            self.fleet_store.clone(),
+            self.fx.runs.clone(),
+            self.wf_clock.clone(),
+            Arc::new(self.adapter.clone()),
+            Arc::new(tools),
+            gate,
+            Arc::new(delivery),
+        )
+        .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
+        .with_probe(Arc::new(self.probe.clone()));
+        if let Some(credentials) = &self.credentials {
+            pipeline = pipeline.with_credential_resolver(credentials.clone());
+        }
+        pipeline
+    }
+
+    /// Every durable surface this fixture owns, as `(label, serialized json)`.
+    ///
+    /// The list is the sweep's whole reach, so it lives here rather than in
+    /// any one test: a store added to the fixture is scanned by every test
+    /// that scans, instead of by whichever ones remembered to.
+    ///
+    /// It deliberately includes the two workflow-substrate records — the run's
+    /// inbox/outbox `WorkflowState` and the dispatcher fleet index — which
+    /// carry no `AgentRecordKind` and are therefore invisible to a sweep that
+    /// enumerates the agent record catalogue alone. They are also exactly
+    /// where a failed dispatch attempt's detail is persisted.
+    pub async fn durable_surfaces(&self) -> Vec<(&'static str, String)> {
+        async fn dump<S>(
+            store: &CrashingStateStore<S>,
+            id: &rakka_persistence::PersistenceId,
+        ) -> String
+        where
+            S: rakka_persistence::DurableState + serde::Serialize,
+        {
+            use rakka_persistence::DurableStateStore;
+            let record = store.load(id).await.expect("the store loads");
+            match record {
+                Some(record) => {
+                    serde_json::to_string(&record.state).expect("the record serializes")
+                }
+                None => String::new(),
+            }
+        }
+
+        let run = run_scope();
+        let task = task_scope();
+        let agent = agent_scope();
+        let workflow_id = rakka_persistence::PersistenceId::new(
+            rakka_agent::workflow_run_id(&run).as_str().to_string(),
+        );
+        let fleet_id = rakka_persistence::PersistenceId::new(
+            rakka_agent_workflow::agent_dispatcher_fleet_persistence_id()
+                .as_str()
+                .to_string(),
+        );
+        vec![
+            (
+                "agents",
+                dump(&self.fx.agents, &agent.persistence_id()).await,
+            ),
+            ("tasks", dump(&self.fx.tasks, &task.persistence_id()).await),
+            ("runs", dump(&self.fx.runs, &run.persistence_id()).await),
+            ("workflow", dump(&self.workflow_store, &workflow_id).await),
+            ("fleet", dump(&self.fleet_store, &fleet_id).await),
+            ("task-history", self.task_history_dump(&task).await),
+        ]
+    }
+
+    /// The task history log, paged whole and serialized.
+    async fn task_history_dump(&self, scope: &AgentTaskScope) -> String {
+        use rakka_agent::AgentTaskHistoryStore;
+        let mut cursor = rakka_agent::AgentTaskHistoryCursor::start();
+        let mut entries = Vec::new();
+        // Bounded: a fixture's log is short, and a runaway page loop would
+        // hang the sweep rather than fail it.
+        for _page in 0..64 {
+            let Ok(page) = self.fx.history.read(scope, cursor).await else {
+                break;
+            };
+            entries.extend(page.entries);
+            match page.next {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        serde_json::to_string(&entries).expect("the history entries serialize")
+    }
+
+    /// Every telemetry surface this fixture can render, as
+    /// `(label, rendered)`.
+    ///
+    /// Rendered, not serialized: a metric observation set has no wire form,
+    /// and what matters for a content sweep is the text a reader would see.
+    /// Rendered, not serialized: a metric observation set has no wire form,
+    /// and what matters for a content sweep is the text a reader would see.
+    /// The recorder arrives as an argument because the fixture holds only an
+    /// `Arc<dyn MetricsRecorder>`, which cannot be rendered — the caller owns
+    /// the concrete handle it installed.
+    pub fn telemetry_surfaces(
+        &self,
+        metrics: &rakka_core::InMemoryMetricsRecorder,
+    ) -> Vec<(&'static str, String)> {
+        vec![(
+            "metrics",
+            format!("{:?}", metrics.snapshot().observations()),
+        )]
+    }
+
+    /// Advances the shared clock past the fleet lease.
+    pub fn expire_lease(&self) {
+        self.wf_clock.advance(LEASE_MS + 1);
+    }
+
+    /// The durable status of the effect at one slot of the run's loop state.
+    pub async fn effect_status(&self, slot: usize) -> Option<AgentRunEffectStatus> {
+        let state = rakka_agent::load_agent_run_state(
+            &self.fx.runs,
+            &run_scope(),
+            &rakka_agent::AgentSchemaPolicy::default(),
+        )
+        .await
+        .expect("the run state loads")?;
+        state
+            .loop_state()?
+            .effects()
+            .iter()
+            .find(|effect| effect.slot == slot)
+            .map(|effect| effect.status)
+    }
+
+    /// Drives the run until its tool ticket is flushed and ready to claim.
+    pub async fn pump_until_tool_ticket(&self) {
+        for _round in 0..8 {
+            self.settle().await;
+            let ready = self.effect_status(1).await == Some(AgentRunEffectStatus::Ready);
+            if ready {
+                // Flush the ticket to the outbox once more (idempotent), so
+                // the pipeline can register it.
+                self.settle().await;
+                return;
+            }
+            let _pass = self
+                .pipeline()
+                .pump_run(&run_scope())
+                .await
+                .expect("the pass runs");
+        }
+        panic!("the tool ticket never became ready");
+    }
+
+    /// Settles the entities from durable state: the task drives its owed
+    /// exchanges, the run cranks its loop and flushes its tickets.
+    pub async fn settle(&self) {
+        let now = self.fx.now();
+        let mut task = rakka_agent::AgentTaskEntityStore::new(
+            task_scope(),
+            self.fx.tasks.clone(),
+            self.fx.agents.clone(),
+            self.fx.history.clone(),
+        );
+        task.recover(now).await.expect("the task recovers");
+        task.settle_side_effects(&self.fx.router, now)
+            .await
+            .expect("the task settles");
+
+        let now = self.fx.now();
+        let mut run = self.fx.run();
+        run.recover(now).await.expect("the run recovers");
+        run.settle_side_effects(&self.fx.router, now)
+            .await
+            .expect("the run settles");
+    }
+
+    /// One settle-and-dispatch round.
+    pub async fn one_pass(&self) -> AgentDispatchPass {
+        self.settle().await;
+        self.pipeline()
+            .pump_run(&run_scope())
+            .await
+            .expect("the dispatch pass runs")
+    }
+
+    /// Drives entities and the dispatch pipeline until the run is terminal or
+    /// nothing moves. Each round uses a fresh worker.
+    pub async fn pump(&self) {
+        for _round in 0..16 {
+            let pass = self.one_pass().await;
+            let snapshot = self.fx.run_snapshot().await;
+            let terminal = snapshot
+                .as_ref()
+                .is_some_and(|run| run.status.is_terminal());
+            if terminal {
+                self.settle().await;
+                return;
+            }
+            if pass.registered == 0
+                && pass.claimed == 0
+                && pass.delivered == 0
+                && pass.cancelled == 0
+            {
+                return;
+            }
+        }
+        panic!("the dispatch pump did not quiesce");
+    }
+
+    /// The failure code of the run's one workflow-invocation cell, read from
+    /// durable state. A definitively failed workflow start is a fan-in
+    /// disposition the coordinator survives, so the cell — not the run's
+    /// terminal reason — is where its refusal code lands.
+    pub async fn workflow_cell_failure_code(&self) -> Option<String> {
+        let state = rakka_agent::load_agent_run_state(
+            &self.fx.runs,
+            &run_scope(),
+            &rakka_agent::AgentSchemaPolicy::default(),
+        )
+        .await
+        .expect("the run state loads")?;
+        let loop_state = state.loop_state()?;
+        let cell = loop_state.workflow_invocations().values().next()?;
+        match &cell.status {
+            rakka_agent::AgentWorkflowInvocationStatus::Failed { code } => Some(code.clone()),
+            _ => None,
+        }
+    }
+
+    /// The stable code of the effect failure that stopped the run.
+    pub async fn terminal_failure_code(&self) -> String {
+        let run = self.fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Failed,
+            "the run should have stopped on the refused effect"
+        );
+        match run.terminal_reason {
+            Some(AgentRunTerminalReason::EffectFailed { code, .. }) => code,
+            other => panic!("expected an effect failure, found {other:?}"),
+        }
+    }
+
+    /// Applies a settings update to the agent entity — an immediate-safety
+    /// change once it carries a revocation.
+    pub async fn apply_settings(&self, discriminator: &str, changes: Vec<AgentSettingsChange>) {
+        let mut agent = AgentEntityStore::new(agent_scope(), self.fx.agents.clone());
+        agent.recover().await.expect("the agent recovers");
+        let expected_revision = agent
+            .state()
+            .expect("the state reads")
+            .expect("the agent exists")
+            .settings()
+            .revision();
+        agent
+            .apply(AgentEntityCommand::UpdateSettings {
+                operation_id: AgentOperationId::for_agent(
+                    AgentOperationKind::SettingsUpdate,
+                    &agent_scope(),
+                    discriminator,
+                )
+                .expect("operation id should be derivable"),
+                expected_revision,
+                changes,
+                provenance: Box::new(provenance(90)),
+            })
+            .await
+            .expect("the settings update applies");
+    }
+
+    /// Suspends or resumes the agent through its lifecycle protocol.
+    pub async fn set_suspended(&self, suspended: bool, discriminator: &str) {
+        let mut agent = AgentEntityStore::new(agent_scope(), self.fx.agents.clone());
+        agent.recover().await.expect("the agent recovers");
+        let expected_lifecycle_revision = agent
+            .state()
+            .expect("the state reads")
+            .expect("the agent exists")
+            .lifecycle_revision();
+        let operation_id = AgentOperationId::for_agent(
+            AgentOperationKind::LifecycleCommand,
+            &agent_scope(),
+            discriminator,
+        )
+        .expect("operation id should be derivable");
+        let command = if suspended {
+            AgentEntityCommand::Suspend {
+                operation_id,
+                expected_lifecycle_revision,
+                provenance: Box::new(provenance(91)),
+            }
+        } else {
+            AgentEntityCommand::Resume {
+                operation_id,
+                expected_lifecycle_revision,
+                provenance: Box::new(provenance(92)),
+            }
+        };
+        agent
+            .apply(command)
+            .await
+            .expect("the lifecycle command applies");
+    }
+}
+
+impl AuthorityFixture {
+    /// [`Self::settle`], but surfacing the first error instead of panicking —
+    /// what a sweep needs, because an armed crash point kills the run's owner
+    /// mid-settle and the injected loss is the point, not a failure.
+    pub async fn try_settle(&self) -> Result<(), String> {
+        let now = self.fx.now();
+        let mut task = rakka_agent::AgentTaskEntityStore::new(
+            task_scope(),
+            self.fx.tasks.clone(),
+            self.fx.agents.clone(),
+            self.fx.history.clone(),
+        );
+        task.recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        task.settle_side_effects(&self.fx.router, now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+
+        let now = self.fx.now();
+        let mut run = self.fx.run();
+        run.recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        run.settle_side_effects(&self.fx.router, now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        Ok(())
+    }
+
+    /// [`Self::pump`], but surfacing the first error instead of panicking,
+    /// under the same sweep contract as [`Self::try_settle`].
+    pub async fn try_pump(&self) -> Result<(), String> {
+        for _round in 0..16 {
+            self.try_settle().await?;
+            let pass = self
+                .pipeline()
+                .pump_run(&run_scope())
+                .await
+                .map_err(|error| error.code().to_string())?;
+            let terminal = {
+                let mut run = self.fx.run();
+                run.recover(self.fx.now())
+                    .await
+                    .map_err(|error| error.code().to_string())?;
+                run.snapshot()
+                    .map_err(|error| error.code().to_string())?
+                    .is_some_and(|snapshot| snapshot.status.is_terminal())
+            };
+            if terminal {
+                self.try_settle().await?;
+                return Ok(());
+            }
+            if pass.registered == 0
+                && pass.claimed == 0
+                && pass.delivered == 0
+                && pass.cancelled == 0
+            {
+                return Ok(());
+            }
+        }
+        Err("the dispatch pump did not quiesce".to_string())
     }
 }

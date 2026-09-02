@@ -548,7 +548,6 @@ fn feature_flags_are_additive_and_match_api_review_boundaries() {
         "grpc = [\"dep:rakka-grpc\"]",
         "http = [\"dep:rakka-http\"]",
         "k8s = [\"dep:rakka-k8s\"]",
-        "otel = []",
         "postgres = [\"dep:rakka-persistence-postgres\", \"dep:rakka-sharding-postgres\", \"dep:tokio-postgres\"]",
         "process-tools = [\"dep:rakka-process\"]",
         "sharding = [\"dep:rakka-sharding\"]",
@@ -556,6 +555,17 @@ fn feature_flags_are_additive_and_match_api_review_boundaries() {
     ] {
         assert!(CARGO_TOML.contains(expected), "missing feature line {expected}");
     }
+    // `otel` used to be declared here and gated nothing: this crate's OTLP
+    // bridge compiles unconditionally, the `rakka` facade had no passthrough
+    // for it, and turning it on produced byte-identical builds. A
+    // declared-inert feature is a promise the crate cannot keep, so it was
+    // removed rather than given content — giving it content would have meant
+    // moving currently-public, facade-re-exported types out of a default
+    // build. This assertion is what keeps it from coming back by habit.
+    assert!(
+        !CARGO_TOML.contains("\notel = "),
+        "the inert `otel` feature must not be reintroduced; the OTLP bridge is unconditional"
+    );
     assert!(CARGO_TOML.contains("rakka-core = { path = \"../rakka-core\", version = \"0.1.0\" }"));
     assert!(CARGO_TOML
         .contains("rakka-workflow = { path = \"../rakka-workflow\", version = \"0.1.0\" }"));

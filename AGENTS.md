@@ -3,7 +3,7 @@
 ## 1. System & Tech Stack
 
 - Rakka is a Rust 2021 Cargo workspace for an Akka-inspired actor framework: typed actors, actor refs/paths, supervision, cluster membership, remoting, sharding, durable state/event sourcing, durable workflow inbox/outbox, bounded streams, process actors, HTTP/gRPC adapters, Kubernetes health/drain hooks, metrics, and operational snapshots. See `README.md`, `CLAUDE.md`, and `docs/rakka-actor-framework-spec.md`.
-- The repo is a v1 release-candidate foundation plus active `rakka-agent-workflow` work for durable agent/compiled-workflow execution. Agent workflow plans live under `docs/plans/agentic-workflow/` and `docs/plans/compiled_execution_with_graph_schdlr/`.
+- The repo is a v1 release-candidate foundation plus the durable agent domain (`rakka-agent-workflow`, `rakka-agent`, `rakka-agent-postgres`, `rakka-agent-knowledge-graph`, `rakka-agent-knowledge-graph-postgres`, and the `rakka-a2a` `agents` feature). The product doc is `docs/rakka-agents.md`; the agent domain's plans live under `docs/plans/rakka-agent/`, and the workflow kernel's under `docs/plans/agentic-workflow/` and `docs/plans/compiled_execution_with_graph_schdlr/`.
 - MSRV is Rust `1.85` from the workspace manifest; `rust-toolchain.toml` uses stable with `clippy` and `rustfmt`. gRPC/protobuf crates and examples require `protoc`.
 - Main dependencies by surface: Tokio runtime, `prost`/`tonic` for Protobuf/gRPC, `axum` for HTTP, `tokio-postgres` for PostgreSQL adapters, `etcd-client` for etcd discovery, `serde`/`serde_json`, and `tracing`.
 - Application code should prefer the top-level `rakka` crate and `rakka::prelude`; component crates remain public for foundations, adapters, advanced wiring, and tests. See `docs/rakka-api-boundary-inventory.md` and `docs/rakka-v1-api-review.md`.
@@ -26,10 +26,11 @@
   - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres`
   - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-sharding-postgres`
   - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-knowledge-graph-postgres`
-  - `RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix optional_multi_process_compatibility_example_is_gated -- --nocapture`
+  - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-postgres` — add `RAKKA_POSTGRES_PGVECTOR_REQUIRED=1` to refuse, rather than announce, a run whose image lacks the `vector` extension and so cannot exercise the three retriever conformance clauses
+  - `RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture` (both multi-process gates: the loopback compatibility example and the multi-pod agent fault sweep)
   - `RAKKA_ETCD_TEST_ENDPOINTS=http://127.0.0.1:2379 cargo test -p rakka-discovery-etcd --test etcd_discovery -- --nocapture`
   - `RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image> examples/kubernetes/local-cluster-scenario.sh`
-- Examples are runnable packages and double as behavioral documentation; expected output is in `README.md` and example READMEs.
+- Examples are runnable packages and double as behavioral documentation; expected output is in `README.md` and example READMEs. `cargo run -p rakka-example-multi-pod-agent-fault-soak` runs the multi-pod agent fault sweep directly, without a gate, in about two minutes.
 
 ## 3. Architecture & Code Map
 

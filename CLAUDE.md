@@ -39,6 +39,8 @@ Examples are runnable and self-contained (most need no external services); each 
 ```sh
 cargo run -p rakka-example-minimal-system
 cargo run -p rakka-example-multi-node-sharding -- --networked-loopback
+cargo run -p rakka-example-multi-pod-agent-fault-soak      # multi-pod agent fault sweep, ~2 min
+cargo run -p rakka-example-agent-otlp-export-acceptance    # a real OTel SDK exporting one real run over OTLP
 ```
 
 ### Gated / optional tests
@@ -48,10 +50,19 @@ These are skipped by default and require env vars and/or external services:
 ```sh
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-postgres
+# The memory conformance suite's retriever clauses need the `vector` extension; without
+# it they announce the clauses they skipped. Set this to make that a failure instead:
+RAKKA_POSTGRES_TEST_DSN=... RAKKA_POSTGRES_PGVECTOR_REQUIRED=1 cargo test -p rakka-agent-postgres
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-knowledge-graph-postgres
-RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
+RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture   # both multi-process gates
 RAKKA_K8S_SCENARIO_DRY_RUN=1 examples/kubernetes/local-cluster-scenario.sh         # preview, no cluster touched
 RAKKA_K8S_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s optional_kubectl_manifest_validation_is_gated -- --nocapture
+# Agent Collector topology: kubectl objects, and the configs against the pinned
+# distribution (needs a container runtime). The second found two real defects.
+RAKKA_AGENT_OTEL_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s --test agent_otel_collector_topology -- --nocapture
+RAKKA_AGENT_OTEL_VALIDATE_COLLECTOR_CONFIG=1 cargo test -p rakka-k8s --test agent_otel_collector_topology -- --nocapture
+# Export to a live Collector rather than the in-process OTLP receiver.
+RAKKA_AGENT_OTEL_COLLECTOR_ENDPOINT=http://127.0.0.1:4317 cargo test -p rakka-example-agent-otlp-export-acceptance --test exporter_failure -- --nocapture
 ```
 
 ## Architecture

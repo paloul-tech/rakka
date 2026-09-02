@@ -7,10 +7,11 @@
 //! crates such as `rakka-core`, `rakka-sharding`, and `rakka-persistence` remain
 //! available for advanced users, tests, and implementation-specific wiring.
 //!
-//! Phase 0 of the Akka parity plan keeps the prelude intentionally curated. It
-//! exposes the common primitives needed by application code today while later
-//! phases add higher-level actor, cluster, sharding, persistence, and stream
-//! facades.
+//! The prelude is intentionally curated: it exposes the common actor,
+//! persistence, cluster, sharding, and stream primitives application code
+//! needs. The durable agent domain and the A2A adapter are reached through the
+//! feature-gated `agent`, `agent_workflow`, and `a2a` modules rather than the
+//! prelude; `docs/rakka-agents.md` describes that surface.
 //!
 //! ```no_run
 //! use std::time::Duration;

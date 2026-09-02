@@ -215,6 +215,25 @@ Non-guarantees:
 - External model calls, tool calls, and peer A2A calls are at-least-once unless the target participates in idempotency.
 - Rakka remoting stays trusted private cluster traffic and is never used as public A2A transport; authentication, authorization, TLS, and ingress policy remain application/operator responsibilities.
 
+## Agent Domain
+
+`rakka-agent` and its sibling crates build durable, goal-driven agents — agent, task, run, team, and conversation entities, the durable loop, effects, budgets, checkpoints, memory, and the communal knowledge graph — on top of the agent-workflow substrate. The `rakka-a2a` `agents` feature layers the typed agent surface over the A2A adapter described above; that section's guarantees carry over unchanged, and this one adds the agent domain's own.
+
+Guarantees:
+
+- Every cross-entity exchange (`creation`, `assignment`, `result-proposal`, `budget-allocation`, `budget-settlement`, `budget-return`, `epoch-result`, `goal-evaluation`, `delegation-result`, `run-cancel`, `delegation-cancel`, `handoff-result`, `team-claim`, `team-claim-result`, `dependency-registration`, `dependency-outcome`, `team-terminal-notice`, `conversation-terminal-notice` — `AgentExchangeKind::ALL`, held to this list by a test) is a durable journal entry on the sender re-driven by a courier until the receiver answers from its own record, and every command derives a stable operation id from its content, so a replayed command or a lost reply produces one logical transition on both entities. A delegation or handoff *send* is not in this list: it is an A2A outbox effect under the dispatcher's attempt accounting, whose exhaustion is a fan-in disposition or a handoff refusal rather than an indefinite re-drive; only its result exchange carries the guarantee above.
+- Recovery needs nothing but durable state: an entity materializes from its record on whichever node owns its shard, a passivated run consumes no live execution task while it waits, and a stale owner's write is rejected by a compare-and-set fence rather than merged.
+- An effect that may have run is never re-invoked silently: a non-idempotent effect lost in its ambiguous window parks as `Indeterminate` and waits for an explicit reconciliation decision, and a `Started` attempt that becomes `Indeterminate` still consumes the budget it reserved.
+- No resolved credential or secret is persisted in durable state, effects, memory, runtime events, telemetry, logs, metrics, or snapshots; every persisted record carries a schema version and an unsupported version fails closed.
+- Which of these claims is proven at which fidelity is recorded, per durable boundary, in `docs/rakka-agent-fault-injection-matrix.md`, and per specification scenario in `docs/rakka-agent-recovery-scenarios.md`.
+
+Non-guarantees:
+
+- Model calls, tool calls, workflow-tool invocations, and A2A sends are at-least-once unless the target participates in idempotency; the agent domain supplies the stable key and the reconciliation decision, not the target's deduplication.
+- Telemetry is never a correctness input: a sampled, delayed, or dropped span, metric, or decision event changes no durable outcome, and the authoritative view of a run is its durable record and operational queries, not its trace.
+- Memory retrieval is advisory and bounded; an outage of a retriever or a store degrades a turn's context, never its durability. The knowledge graph's retention, tombstone, and deletion semantics are not yet implemented on any backend (recorded as owed in `docs/rakka-agent-security-validation-matrix.md`).
+- Multi-pod fidelity is proven for the scenarios the fault-injection matrix names and inferred for the rest; membership tuning, downing policy, and a shared durable backend remain the deployment's.
+
 ## Kubernetes Operation
 
 `rakka-k8s` and `examples/kubernetes` provide readiness, liveness, drain, metrics, snapshot, remoting, and rolling-update examples.

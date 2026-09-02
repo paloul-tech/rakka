@@ -660,6 +660,21 @@ pub enum SessionPurgeOutcome {
     NotYetDue,
 }
 
+impl SessionPurgeOutcome {
+    /// How many records this call actually removed.
+    ///
+    /// Zero for a hold, for a window that has not elapsed, *and* for the
+    /// replay of an already purged run — [`Self::Purged`] reports what this
+    /// call removed, not what the run once held.
+    #[must_use]
+    pub const fn entries_deleted(self) -> u64 {
+        match self {
+            Self::Purged { entries } => entries,
+            Self::Held | Self::NotYetDue => 0,
+        }
+    }
+}
+
 /// The future a [`SessionMemoryStore`] or [`ContextSnapshotStore`] operation
 /// returns.
 pub type MemoryFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MemoryError>> + Send + 'a>>;
@@ -2645,8 +2660,15 @@ impl AgentRunMemory {
     ///
     /// The run entity itself never touches it — transitions perform no I/O,
     /// and promotion is executed dispatcher-side — but the bundle is where a
-    /// deployment names the agent's stores together, and the slice 2.2
-    /// retrieval path assembles snapshots from it.
+    /// deployment names the agent's stores together.
+    ///
+    /// This names the store only for a deployment with **no** retrieval
+    /// bundle. With one wired, the bundle's authoritative store is the run's
+    /// private store and [`Self::private`] answers from there, whatever order
+    /// the builders were called in: the retrieval path resolves every ranked
+    /// identity through the bundle, so a second store named here could only
+    /// ever be a way to be silently wrong about where this agent's long-term
+    /// memory lives.
     #[must_use]
     pub fn with_private_store(mut self, private: Arc<dyn AgentPrivateMemoryStore>) -> Self {
         self.private = Some(private);
@@ -2676,6 +2698,14 @@ impl AgentRunMemory {
         self.session.as_ref()
     }
 
+    /// The session-memory store as a shared handle, for a collaborator that
+    /// must hold *this* store — see
+    /// [`crate::dispatch::SessionMemoryPromotionExecutor::for_memory`].
+    #[must_use]
+    pub const fn session_handle(&self) -> &Arc<dyn SessionMemoryStore> {
+        &self.session
+    }
+
     /// The context-snapshot store.
     #[must_use]
     pub fn snapshots(&self) -> &dyn ContextSnapshotStore {
@@ -2691,7 +2721,16 @@ impl AgentRunMemory {
     /// The agent-private long-term store, when one is wired.
     #[must_use]
     pub fn private(&self) -> Option<&Arc<dyn AgentPrivateMemoryStore>> {
-        self.private.as_ref()
+        // The bundle's authority wins, because it is the store the retrieval
+        // path actually reads through. A deployment that named a different
+        // one with `with_private_store` would otherwise have an agent whose
+        // promotions land where nothing looks for them — visible only as
+        // `RetrievalReport::unverified`, which is indistinguishable from a
+        // hostile retriever.
+        self.retrieval
+            .as_ref()
+            .map(crate::retrieval::AgentMemoryRetrieval::authority_handle)
+            .or(self.private.as_ref())
     }
 
     /// The private-memory retrieval bundle, when one is wired.

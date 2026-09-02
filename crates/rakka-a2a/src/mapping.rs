@@ -988,6 +988,7 @@ fn telemetry_context(
 /// before authorization ever saw it. Those principals ride the object form
 /// instead, which [`principal_ref_from_value`] has always accepted and which
 /// round-trips every component verbatim.
+#[cfg(feature = "agents")]
 pub(crate) fn principal_ref_to_value(principal: &PrincipalRef) -> Value {
     let colon_free = !principal.principal_type.contains(':')
         && !principal.principal_id.contains(':')
@@ -1025,6 +1026,7 @@ pub(crate) fn principal_ref_to_value(principal: &PrincipalRef) -> Value {
 /// object (which no legacy join can collide with — a join never starts with
 /// `{`), so `("user:a", "b")` and `("user", "a:b")` stay distinguishable in
 /// the durable record instead of collapsing to the same bytes.
+#[cfg(feature = "agents")]
 pub(crate) fn principal_provenance_label(principal: &PrincipalRef) -> String {
     if !principal.principal_type.contains(':') && !principal.principal_id.contains(':') {
         return format!("{}:{}", principal.principal_type, principal.principal_id);
@@ -1270,6 +1272,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn principal_refs_round_trip_colon_bearing_ids_unbroken() {
         // Colon-free principals keep the compact string byte-identical to

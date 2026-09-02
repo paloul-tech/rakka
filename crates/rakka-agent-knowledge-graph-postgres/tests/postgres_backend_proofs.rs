@@ -5,7 +5,8 @@
 //! the shared semantics; this file proves the properties that need real
 //! durability and real concurrency — replays answering across a reconnect,
 //! genuinely concurrent compare-and-set races over two connections, the
-//! concurrent-migrator race, and fail-closed decoding of doctored rows.
+//! concurrent-migrator race, and fail-closed decoding of doctored rows —
+//! including scenario 33's concurrent specialist appends to one space.
 //!
 //! Every test is gated on `RAKKA_POSTGRES_TEST_DSN` and passes silently
 //! without it.

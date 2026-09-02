@@ -72,7 +72,7 @@ These are restated here because every slice touches them:
 | 3 | M3 | Continuous goals: wake identity/policy, controller, epochs, fencing | [Continuous Goal Milestone](spec.md#continuous-goal-milestone-m3) |
 | 4 | M4 | Multi-agent goals: goal contract, evaluation, delegation, fan-in, workflow tools, cancellation propagation | [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4) |
 | 5 | M5 | Coordination: handoff, teams, moderation, human-owned tasks, replayable events | [Coordination Capability Milestone](spec.md#coordination-capability-milestone-m5) |
-| 6 | — | Production fault, security, and telemetry validation; docs | Phase 6 exit criteria below |
+| 6 | — | Production fault, security, and telemetry validation; docs | Phase 6 exit criteria below (met 2026-09-01) |
 
 Sequencing: Phase 1 is the base for everything. Phases 2-5 may be re-ordered
 per [spec 2.1](spec.md#21-milestone-binding), with these practical
@@ -4259,6 +4259,15 @@ fault injection.
 No new milestone; this hardens whatever phases have shipped
 (guidance [Slice 7](technical-guidance.md#slice-7-production-fault-and-security-validation)).
 
+Phase 6 exit criteria (stated here because the phase map promised them and no
+slice had): slices 6.1 through 6.4 landed; the fault-injection, security, and
+telemetry matrices, the observability catalogue, and the recovery scenario
+roster are current and each is held to the tree by a test; every in-process
+suite is green under `scripts/validate.sh`; the multi-pod harness passes behind
+its gate; and the documentation set — product doc, compatibility policy,
+inventories, changelog — describes what shipped. **Met 2026-09-01** with slice
+6.4.
+
 ### Slice 6.1 — Multi-pod fault and soak validation
 
 Spec: [15](spec.md#15-passivation-recovery-and-shard-movement),
@@ -4269,6 +4278,87 @@ Spec: [15](spec.md#15-passivation-recovery-and-shard-movement),
   dispatchers at every durable boundary including after external commit.
 - Settings changes and credential revocation injected during waits.
 
+**Amended as implemented (2026-08-24):**
+
+- **The gap was wider than "add more crashes".** Five public functions —
+  `init_agent_{entity,task,run,team,conversation}_entity_remote_sharding` — were
+  defined, re-exported, and called nowhere; the production `ShardedExchangeRoute`
+  was exercised only by the synthetic `ChoreographyProbe`; and every agent proof
+  ran in one process over one in-memory store, which can demonstrate
+  re-materialization but not spec 15's actual requirement that durable state
+  suffice *on a different pod, without node-local memory*. The existing
+  `RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY` gate did no fault injection at all: it
+  shelled `examples/multi-node-sharding`, sent one hardcoded `CartCommand`, and
+  asserted a stdout marker.
+- **`examples/multi-pod-agent-fault-soak` is the answer, and it is the first
+  consumer of all five registrations and of the production route.** Two real OS
+  processes, one shared directory whose commits are `hard_link` claims (so two
+  pods racing one compare-and-set cannot both win), all five entity classes
+  registered remotely, the task and the run landing on different pods so their
+  exchanges cross TCP, and a model adapter that commits to a shared ledger
+  *before* it answers — spec 18's "after a test external system commits but
+  before it returns the receipt", made observable across the death of the pod
+  that committed it. The crash-free reference reports each pod's durable write
+  count and the sweep replays the world once per `(pod, store, ordinal, window)`,
+  arming that pod to `abort()` there. 32 pod-loss windows converge on
+  `Completed` from the shared record with exactly one logical external turn.
+  Departure is *announced* and the survivor calls `mark_down` — not
+  `mark_leaving`, because a killed pod never got to leave — after which the
+  shards move and the entities re-materialize.
+- **The parked 4.4 and 4.6 crash-sweep debt is closed.** `fan_in_recovery.rs`
+  sweeps every run- and task-store write of the fan-out → child-result → fan-in
+  resolution (46 windows) plus the `DelegationResult` fault triple at the real
+  entity; `cancellation_recovery.rs` sweeps every write of the propagation spine
+  (38 windows), asserting every child terminal under the requested reason, every
+  chase accepted, and no propagation leg replaying a send. `delegation_limits.rs`
+  gained scenario 34's recovery clause as a fact rather than an inference: its
+  module doc argued that re-materialization is already a coordinator loss, which
+  is true of the *read* path but says nothing about a loss inside the
+  compare-and-set that spends the ceiling. It is swept now, and the quota is
+  charged once.
+- **Revocation during a wait had no coverage at all.** Every scenario-13 proof
+  applied the change *before* the first dispatch pass, so the run was never
+  waiting when the operator acted. `wait_invalidation.rs` parks the run first:
+  all three `ImmediateSafety` change kinds, both orderings against the human
+  decision, an agent suspended mid-wait (which must *defer* without spending
+  budget, not fail closed), a grant that binds another credential than the
+  intent carries, a guardrail chain upgraded on the fleet while the intent stays
+  pinned, a definition narrowed while a task is blocked on a dependency, and the
+  whole revocation flow swept under owner loss.
+- **Two dispositions worth recording, because the slice plan predicted
+  otherwise.** `effective_settings_for_turn` is documented as the
+  pinned-versus-current resolution point and has no production call site — but
+  neither do the two `RunPinned` fields it resolves (`loop_state_schema_version`,
+  `memory_schema_version`), which are stored and read nowhere. Wiring it today
+  would change nothing observable, so the honest outcome is a behavioural test
+  that a run-pinned change is inert for a run in flight, and this note.
+  Separately, `AgentRunStatus::WaitingForTimer` is declared, labelled, and
+  counted by `is_waiting()` but never assigned: durable timers are owned by the
+  goal/wake layer, and it stays reserved rather than acquiring an invented park.
+- **Soak is a property test, not a timing one.** `agent_soak.rs` drives many
+  tasks through one agent and asserts what must *not* grow: the agent's durable
+  record (identical at 24 and 500 tasks), the metric series set (6 series while
+  observations grow from 192 to 4000), each task's materialized bound, and the
+  exchange journals settling empty. `RAKKA_AGENT_SOAK_ITERATIONS` scales it.
+- **Shared fixtures rather than a fourth copy.** `SkillNamedExecutor` and the
+  fan-out helpers were already duplicated across `fan_out_fan_in.rs` and
+  `cancellation_propagation.rs`; they, `create_real_child`, and the whole
+  `AuthorityFixture` (the only fixture that drives the *real* dispatch pipeline,
+  which is the only place an authority gate is consulted) moved to
+  `tests/common/mod.rs`. The fixture also gained a credential resolver, without
+  which an intent carrying a binding is refused `credential-resolver-missing`
+  before any later gate can be observed.
+- Proof roster: `examples/multi-pod-agent-fault-soak` (1 gated test plus the
+  driver), `tests/fan_in_recovery.rs` (3), `tests/cancellation_recovery.rs` (2),
+  `tests/wait_invalidation.rs` (12), `tests/agent_soak.rs` (1), the scenario-34
+  sweep in `tests/delegation_limits.rs`, and the second gated entry in
+  `crates/rakka-testkit/tests/compatibility_matrix.rs`. Documentation:
+  `docs/rakka-agent-fault-injection-matrix.md`. Owed onward: a file-backed task
+  history passing `assert_task_history_store_contract`, a coordination workload
+  across pods (team and conversation are registered but unexercised), a
+  PostgreSQL arm for the shared substrate, and detected rather than announced
+  departure.
+
 ### Slice 6.2 — Security validation
 
 Spec: [16](spec.md#16-security-and-authorization),
@@ -4278,14 +4368,495 @@ Spec: [16](spec.md#16-security-and-authorization),
   cross-tenant existence-leak tests, executor trust-class routing, secret
   exclusion sweeps over state/events/telemetry.
 
-### Slice 6.3 — Telemetry and Collector validation
+**Amended as implemented (2026-08-25):**
 
-Spec: [17.14-17.17](spec.md#1714-content-capture-and-redaction),
+- **Four of the five items were fail-opens, not missing tests.** Like 6.1, the
+  gap was wider than the line item suggested: in each case the code was wrong
+  and no test would have noticed. Each fix is verified by *falsification* —
+  reverted, the suite confirmed failing, restored — which is the standing
+  lesson from the 6.1 review that a fix proven only by a green suite is not
+  proven.
+- **The retriever was trusted for content and for scope, and the trait doc
+  said that was unavoidable.** `assemble_context` re-checked every property a
+  retrieved record carried except the one deciding whose memory it is, and
+  `AgentPrivateMemoryRetriever`'s doc called scope "the one contract clause no
+  downstream layer can catch a violation of" — because an `AgentPrivateMemory`
+  carries no tenant or agent. That reasoning was wrong: the assembly holds the
+  authoritative `AgentScope`, the store is scope-addressed, and the crate's own
+  boundary already says the index is a rebuildable projection while the store
+  holds the authoritative record. **The retriever now supplies a ranking and
+  the store supplies the record.** Resolving each ranked identity through
+  `AgentPrivateMemoryStore::get` closes four things at once, three of which
+  nobody had named: cross-scope leakage, content forgery, metadata forgery (a
+  fabricated classification or confidence no longer passes `admits`), and index
+  drift — including a memory tombstoned *after* it was indexed, which the old
+  path embedded because it checked the retriever's pre-tombstone copy. A
+  ranked identity the store does not hold is dropped and counted on
+  `RetrievalReport::unverified`; the resulting snapshot is byte-identical to
+  one assembled from an empty ranking, so the drop is not an existence oracle.
+  `AgentMemoryRetrieval::new` takes the store as a required argument, on the
+  same argument that already made the chain required.
+- **The two-chain wiring was documented and unverifiable.**
+  `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` unconditionally claimed memory-ingress
+  was evaluated, so `validate_covers` admitted a mandatory ingress-only stage
+  at an authority that had never seen a bundle. Now the deployment attests
+  (`AgentToolAuthority::with_memory_ingress`) and the attestation is *checked*
+  against `AgentGuardrailChain::declaration_digest`, which compares stage
+  declarations rather than revisions — the shape a deployment actually lands
+  in is an empty bundle chain carrying the *same* revision number, which a
+  revision comparison waves through. Unattested, the authority counts only
+  `AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES` and fails closed on the
+  existing `guardrail-stage-unevaluated`. Two alternatives were rejected:
+  `Arc::ptr_eq` (unforgeable, but refuses a deployment that legitimately
+  rebuilds an identical chain from one config) and a factory minting both
+  consumers (convention, not enforcement — the plain constructors would
+  remain, and omission would not fail closed).
+- **A credential resolver's failure text was reaching durable state, and the
+  substrate already knew better.** The leak was not in run state — `run.rs`
+  persists `bounded_detail(code)` — but in the workflow outbox row's
+  `last_error` and the fleet index's `last_error_code`, both unbounded and
+  fleet-readable, neither enumerated by `AgentRecordKind`. Two facts that
+  reinforce each other, and the reason the sweep scans the substrate beside the
+  catalogue. `AgentCredentialError::to_outbox_dispatch_result` already emitted
+  its code alone, so this was bringing `rakka-agent` into line with its own
+  substrate rather than inventing policy. Every persisted attempt detail is now
+  bounded at 512 bytes, and the bounding-is-not-sanitizing distinction is
+  stated on all nine executor traits.
+- **There was no trust-class routing, and the fix is not the obvious one.**
+  Making `execution-policy-unroutable` *retryable* was the first instinct and
+  is wrong three ways: it turns a shipped definitive failure into an unbounded
+  spin for a single-worker deployment; it is a claim-then-release race, so the
+  non-accepting worker holds the lease while the serving one cannot claim; and
+  `defer_dispatch` writes to the durable fleet index on every refusal, giving
+  write amplification proportional to workers × classes. The refusal is
+  downstream of the mistake. Filtering happens **at the claim**, and needs no
+  durable schema change because `ATTR_AGENT_EFFECT_EXECUTION_POLICY` already
+  rides the ticket into the fleet index. Partitioning the fleet persistence id
+  by class was also rejected: `pump_run` registers a run's whole due-effect
+  batch in one write and a run's effects span classes, so every worker would
+  still need write access to every class's index — no isolation gained, and a
+  retag strands tickets with no migration path. The cost accepted: a class no
+  worker serves now waits rather than failing fast, which is why
+  `class_filtered` exists beside `due_dispatch_count`.
+- **Retention had no production caller, and `updated_at` could not have been
+  the clock.** A terminal run keeps accepting settlement and return commands,
+  each advancing `updated_at`, so a deadline measured from it recedes
+  indefinitely. `AgentRun::terminal_at` stamps the single terminal transition
+  under its existing once-only guard. `discharge_run_memory_retention` purges
+  snapshots *before* session rows, so a kill between them leaves the copy
+  something else can still sweep rather than stranding content in the immutable
+  tier. Private memory is untouched by design.
+- **Two things documented rather than fixed, with the reasons recorded.**
+  `SessionPurgeOutcome::Purged { entries }` is a cardinality oracle — a
+  nonexistent scope answers zero — and stays one: the count is what makes a
+  fleet sweep observable and a purge auditable, no memory surface is reachable
+  from A2A or `query.rs`, and a conformance clause asserting otherwise would
+  freeze the leak into the contract. And a private `delete` does not discharge
+  an erasure request on its own, because a snapshot that embedded the memory
+  keeps its copy until the run's snapshot purge — required by scenario 17's
+  retry determinism, bounded by the retention window, and now proven as a fact
+  with its bound rather than left a footnote.
+- **One memory contract, run by both backends.** Four traits with two
+  implementations each, and the semantics were asserted *twice by hand* — once
+  in `memory.rs`'s unit tests and once, copied, in the PostgreSQL adapter's.
+  `rakka_agent::memory_conformance` is now the single suite, following the
+  knowledge graph's `conformance.rs` idiom rather than the testkit's
+  `assert_*_store_contract` shape for two structural reasons: the subject is
+  inherently *three*-scoped (a primary, a foreign, and a third
+  genuinely-empty scope to compare against), and a live-DSN runner needs
+  per-run namespacing once rather than at every call site. The isolation
+  clauses compare by **whole value** against the empty scope: `is_empty()` and
+  `is_none()`, which both hand-written copies used, are satisfied by a backend
+  that answers "empty" *differently* from how it answers an unknown scope —
+  a distinguishable `Ok` versus error, a different page shape — which is
+  exactly the disclosure the clause forbids. Exhaustiveness is a compiler
+  matter: one `…Operation` enum per trait, matched without a wildcard, so a
+  new method fails to compile until its isolation arm is written. Writing the
+  suite found two things about *the clauses*, both instructive: an isolation
+  clause must do all its reads before any of its writes, and a "duplicate
+  create" that reuses the original's derived operation id is answered from the
+  ledger as a replay — the idempotence contract working, not a violation.
+- Proof roster: `tests/memory_store_contract.rs` (14),
+  `crates/rakka-agent-postgres/tests/memory_conformance.rs` (12, DSN-gated),
+  `tests/memory_scope_fence.rs` (7), `tests/memory_guardrail_chain_consistency.rs`
+  (10), `tests/memory_retention.rs` (8), `tests/secret_exclusion.rs` (9),
+  `tests/executor_isolation.rs` (6), `tests/tenant_isolation.rs` (5).
+  Documentation: `docs/rakka-agent-security-validation-matrix.md`, plus the new
+  stable codes in `docs/rakka-compatibility.md`.
+- Owed onward, and recorded in the matrix: guardrail evaluation points for
+  `ModelResponse`, `ToolResponse`, `A2aIngress`, and `A2aEgress` — 4 of 7
+  declared boundaries, with `ToolResponse` the poisoning-relevant one, since a
+  tool result enters session memory and every later model context without
+  crossing a boundary; communal retrieval and `SnapshotCommunalClaim` (slice
+  4.6's deferral stands, and until it exists there is no communal poisoning
+  surface); the knowledge graph's absent retention/tombstone/deletion, an
+  absolute spec-13.1 requirement; the unwired model-visible descriptor rung;
+  descriptor revision pinning across recovery; tenant-scoped mandatory
+  guardrails; the non-atomic revocation re-check; the exhaustive
+  `A2AOperation::ALL` deny-is-absent sweep at the A2A surface, whose two doors
+  that fail open on tenancy by design (`A2AHeaderTenantResolver`'s
+  request-supplied tenant and the `default_tenant` fallback) are named in the
+  matrix but not yet driven under a denying authorizer; and the PostgreSQL
+  adapter's hand-written store assertions, which the shared suite now
+  duplicates and which should be reduced to backend-only proofs — the
+  two-connection compare-and-set, migration idempotence, the doctored-row
+  fail-closed, and the vector-encoding round trip.
+
+### Slice 6.3a — GenAI adapter, metric catalogue, and export redaction
+
+Spec: [17.2](spec.md#172-instrumentation-scope-and-resource),
+[17.6](spec.md#176-required-span-model), [17.12](spec.md#1712-metrics),
+[17.14](spec.md#1714-content-capture-and-redaction),
+[17.15](spec.md#1715-baggage),
 [17.20](spec.md#1720-semantic-convention-compatibility).
 
-- Native OTLP wiring at an application binary, pinned GenAI convention
-  review, redaction/allowlist processors, tail-sampling retention rules,
-  Collector loss visibility, exporter failure behavior.
+Slice 6.3 was split on 2026-08-27 after a survey of what it would have to
+touch. The single entry read as validation work — wire the exporter, review
+the pinning, add Collector rules — but four of its six items are blocked on
+emission that does not exist: a tail-sampling policy selects on attributes no
+mapping function writes, a redaction allowlist has nothing to allow until the
+adapter names its keys, and both GenAI client metrics are histograms in a
+crate that records none. 6.3a is that emission work; 6.3b is the deployment
+validation that can only be honest once 6.3a has landed. The ordering is a
+dependency, not a preference.
+
+Two scope decisions are user-approved (2026-08-27): the **full metric
+catalogue** of [17.12](spec.md#1712-metrics) is in scope rather than a named
+subset, and 6.3b wires a **real OpenTelemetry SDK** rather than a fourth
+serializable bridge record.
+
+- **The `otel` module has no production consumer.** `AgentGenAiOperation`,
+  `agent_instrumentation_scope`, `decision_span_event`, `usage_attributes`,
+  and `AgentGenAiIdentity` are reached only from their own `#[cfg(test)]`
+  block and the `lib.rs` re-export, and nothing in the workspace constructs an
+  `AgentOtlpBridgeExport` outside tests. This is the shape slice 6.1 found in
+  the five `init_agent_*_entity_remote_sharding` registrations, and the same
+  corrective applies: the module needs a call site on the path a run actually
+  takes, not more unit tests.
+- **The convention pin is a string, not a review.**
+  [17.20](spec.md#1720-semantic-convention-compatibility) requires an upgrade
+  to review span names and kinds, metric names, units, and buckets, required
+  attributes, operation values, content-capture guidance, and Collector rules.
+  Span names and kinds are mapped; the rest are not.
+  `ATTR_GEN_AI_OPERATION_NAME`, `ATTR_GEN_AI_PROVIDER_NAME`,
+  `ATTR_GEN_AI_TOOL_NAME`, and `ATTR_GEN_AI_TOOL_TYPE` are declared and
+  re-exported but written by no mapping function; `ATTR_ERROR_TYPE`,
+  `ATTR_RAKKA_ERROR_CODE`, and `ATTR_RAKKA_AGENT_EFFECT_STATUS` are declared,
+  unexported, and unused; `AgentGenAiOperation::span` leaves every status
+  `Unset`. Status and error mapping is load-bearing for 6.3b, whose retention
+  policies select on exactly those attributes.
+- **The full 17.12 catalogue, into a crate that records no histogram.** Every
+  duration the section lists — decision, goal evaluation, delegation,
+  workflow-tool, assignment/handoff/result-validation/dependency, wake and
+  epoch, autonomy admission and budget, team and moderation, active turn,
+  wait, effect queue and dispatch, model and tool, memory and retrieval,
+  recovery — is unrecorded, and both GenAI client metrics (operation
+  duration, token usage) are histograms. The section's gauges join them:
+  logically active and waiting by bounded status class, resident entities and
+  activation/passivation rate, trigger/timer/outbox backlog and oldest age,
+  shard ownership distribution. Every new label key joins
+  `AGENT_METRIC_FIELDS` and passes `validate_agent_domain_metric_attributes`,
+  and the catalogue is written down — 17.12 requires labels to be bounded
+  *and documented*, and no document lists them today.
+- **Units, buckets, and exemplars are structurally unrepresentable.**
+  `rakka_core::OpenTelemetryMetric` carries name, kind, temporality, and data
+  points and no unit; `OpenTelemetryDataPoint` carries attributes, value,
+  count, and sum and no bucket boundaries or exemplars.
+  [17.17](spec.md#1717-otlp-and-collector-boundary) permits extending the
+  bridge additively or mapping directly into the application SDK, and forbids
+  dropping the field silently while claiming semantic-convention compliance.
+  `rakka-core` is in the publishable set and
+  `docs/rakka-v1-observability-exporters.md` currently documents count/sum
+  only as a deliberate choice, so whichever way this resolves it is a recorded
+  decision with a doc change, not an implementation detail.
+- **Redaction owes an allowlist before export, not only at the Collector.**
+  `AgentOtelSpanExport::from_telemetry_context` copies
+  `telemetry_context.baggage` straight into span attributes, and `validate()`
+  checks only the trace context: there is a bounded-label validator for
+  metrics and no counterpart for spans or logs. The agent domain clears
+  baggage on persist through `sanitize_agent_telemetry_context`, which does
+  nothing for a caller that builds a span from a context it was handed.
+  [17.14](spec.md#1714-content-capture-and-redaction) puts minimization at the
+  application and the Collector second, as defense in depth, and
+  [17.15](spec.md#1715-baggage) makes received baggage untrusted.
+- **Two `otel` features gate nothing.** `rakka-agent-workflow` and
+  `rakka-a2a` each declare `otel = []`; the only `#[cfg(feature = "otel")]` in
+  the workspace is `rakka-agent`'s. The A2A one is documented as gating
+  trace-context propagation and attribute helpers, which is also why the A2A
+  ingress `SERVER` span that `otel.rs` defers to the protocol adapter is built
+  by nobody, leaving scenario 21's ingress row without its span half. Each
+  feature is implemented or removed; a declared-inert feature is the finding,
+  not the fix.
+
+Done when: every span row, metric, and attribute the reviewed revision
+requires for the shipped milestones is emitted by a mapping function with a
+production call site; the 17.12 catalogue is recorded, its labels documented
+and validated; unit, bucket, and exemplar semantics are either represented in
+the bridge or documented as mapped in the application; and an attribute
+outside the allowlist cannot reach a span or log export record. Scenario 25 is
+re-proven at the export boundary rather than only at durable state.
+
+**Landed.** Four decisions were taken, each because the obvious alternative was
+wrong in a specific way rather than merely less tidy.
+
+- **Emission is a neutral vocabulary, and only the mapping is gated.** The
+  loop, the entities, and the dispatcher close `AgentTelemetrySegment` values
+  named by `AgentSegmentOperation` with no feature gate, and `otel` owns the
+  translation to `invoke_agent`, `execute_tool`, and the rest. Emitting the
+  convention records directly under `#[cfg(feature = "otel")]` was rejected:
+  it puts the GenAI vocabulary on the durable execution path, and it makes the
+  emission absent from every default build — including the
+  `cargo test -p rakka-agent --no-default-features` run that `validate.sh`
+  performs, which is exactly where an unreachable adapter would hide again.
+  `AgentGenAiSpanExporter` is the segment sink that closes the loop, and
+  `genai_operation` is total over the Rakka vocabulary and matched without a
+  wildcard, so adding a class fails to compile until its convention row exists.
+- **Durations have two rules, because they have two kinds of endpoint.** A
+  duration spanning a durable boundary — an outstanding effect, a turn — is the
+  difference of two persisted timestamps, so a run that passivated or moved
+  shard mid-effect reports what a resident one would. A duration inside one
+  process has exactly one injected `now` available and measures its own
+  monotonic width, anchored at that timestamp. Using the injected clock for
+  both would have reported every live operation as instantaneous; using
+  `Instant` for both would have made a figure that survives passivation
+  impossible to compute. The effect pair was deliberately *not* split into
+  queue and dispatch: `dispatched_at` is stamped when the run hands the effect
+  to the outbox, not when a worker begins an attempt, so the split would report
+  the run's hand-off latency under a name promising queue delay.
+- **The catalogue is data, and a source scan holds it to the code.** 17.12
+  requires labels to be bounded *and documented*, and the two prose tables that
+  existed were both wrong — the technical guidance named fifteen metrics that
+  did not exist, and the in-crate label list had gone stale on four keys in
+  use. A third prose copy would have gone the same way, so
+  `AGENT_DOMAIN_METRIC_INSTRUMENTS` carries name, kind, unit, labels, and
+  buckets, and `tests/metric_catalogue.rs` scans the crate's own sources in
+  both directions. The 17.12 gauges the substrate already publishes are
+  deliberately absent rather than mirrored, with the providing instrument named
+  in the catalogue page: two names for one number is two catalogues that drift.
+- **Redaction is two layers, because bounding is not sanitizing.** The bridge
+  stopped copying the durable context's baggage into span attributes — baggage
+  is a propagation context, externally received baggage is untrusted, and the
+  agent domain's own sanitizer runs on the persist path and so never saw a span
+  built from a handed-in context — and gained the generic attribute, count, and
+  ordering bounds the metric vocabulary always had. On top of that the adapter
+  applies a closed allowlist before a record is built, because which keys may
+  be exported is a domain decision and a denylist is a guess about what content
+  will be called next time. Both were falsified: restoring the baggage copy
+  fails the bridge test, removing the allowlist filter leaks `tool_arguments`.
+
+A follow-up pass closed what the first left open, and the gap is worth
+recording because it was the slice's own defect class recurring: three
+attributes had been *declared and allowlisted* while nothing wrote them, which
+is exactly the shape — a vocabulary that reads complete and emits nothing —
+that made the adapter unreachable in the first place. Four of
+[17.16](spec.md#1716-sampling)'s eight retention classes had nothing to select
+on, so a Collector rule expressing them would have matched nothing in
+production while passing its own tests. `rakka.agent.effect.status`,
+`rakka.agent.effect.attempt`, `rakka.agent.checkpoint.kind`, and
+`rakka.agent.settings_revision` now ride the segments that know them; the
+`checkpoint-open` and `run-resume` rows are wired; the two remaining orphaned
+mapping functions (`decision_span_event`, `usage_attributes`) have callers
+through segment fields; and the log allowlist joins the span one — wider by
+design, since a structured log carries the durable identities a metric may not.
+The convention constants alias the ungated segment keys, so one key can never
+again be two literals across a feature boundary.
+
+Of the two inert features, `rakka-agent-workflow`'s was removed and
+`rakka-a2a`'s was implemented — the ingress `SERVER` span, which closes
+scenario 21's ingress half and is the only `AgentOtelSpanKind::Server` the
+workspace constructs. Propagation stayed unconditional; gating it would have
+removed trace continuity from a default build, which is the opposite of what
+the feature claimed.
+
+Owed onward, and named in
+`docs/rakka-agent-observability-catalogue.md` rather than left silent: the
+17.12 clauses with no instrument yet — logically active and waiting goals and
+runs by status class, activation/passivation rate and cold-activation latency,
+trigger and timer backlog with oldest age, wait duration by kind, the
+delegation, workflow-tool, task-operation, wake, epoch, autonomy, budget, team,
+and moderation *durations* whose counters exist, memory and retrieval latency,
+and context snapshot size — several of which need the bounded,
+deployment-invoked sweep shape of `AgentMemoryRetentionSweep`, because Rakka
+keeps no index to enumerate them from. Exemplars are 6.3b's, by decision.
+
+### Slice 6.3b — Application binary, Collector, sampling, and exporter failure
+
+Spec: [17.14](spec.md#1714-content-capture-and-redaction),
+[17.16](spec.md#1716-sampling),
+[17.17](spec.md#1717-otlp-and-collector-boundary).
+
+The deployment half of the split described in 6.3a, and it depends on 6.3a
+whole: a Collector rule can only allowlist keys the adapter emits, and a
+tail-sampling policy can only retain traces whose spans carry a status and an
+error code. Wiring it first would produce configuration that passes its own
+string-matching tests and drops everything in production.
+
+- **A real SDK at a real binary** (user-approved 2026-08-27). The workspace
+  depends on neither `opentelemetry` nor `tracing-subscriber` today —
+  `rakka-agent`'s testkit hand-rolls `CapturingSubscriber` to avoid the
+  latter. [17.17](spec.md#1717-otlp-and-collector-boundary) puts the SDK, the
+  `tracing` subscriber and layer, the OTLP exporter, exporter credentials, and
+  shutdown/flush at the application boundary, so this lands in a new
+  `publish = false` example that owns all five and drives a real agent run
+  through them. The workspace's pinned tonic 0.12 / prost 0.13 generation
+  constrains the SDK version; that pin is reviewed and recorded like the Rig
+  and A2A pins. Core crates stay SDK-neutral, and `scripts/package-check.sh`
+  stays offline and green.
+- **Spans come from the live loop, not from durable state** (resolved in
+  planning). `AgentGenAiOperation::span` needs a start and an end per bounded
+  segment, and durable records carry only `occurred_at`. Stamping segment
+  boundaries into persisted schema would make a telemetry change a durable
+  migration, which [17.20](spec.md#1720-semantic-convention-compatibility)
+  forbids absent an independent domain change. The loop emits its own bounded
+  segments and the persisted context supplies links and resume — the model
+  [17.4](spec.md#174-bounded-trace-segments) already describes.
+- **An agent-domain Collector configuration.** The shipped topology under
+  `docs/plans/agentic-workflow/` is the workflow domain's: its
+  `transform/redact` is a denylist of six keys (`prompt_text`,
+  `completion_text`, `tool_arguments`, `tool_output`, `artifact_uri`,
+  `authorization`), none of which the GenAI vocabulary uses, and its metric
+  rules drop workflow identifiers. The agent domain needs its own, keyed on
+  `gen_ai.*` and `rakka.agent.*` and expressed as the allowlist
+  [17.14](spec.md#1714-content-capture-and-redaction) asks for. Contract tests
+  mirror `crates/rakka-k8s/tests/agent_workflow_otel_collector_topology.rs`,
+  including its gated `kubectl` validation. The Collector distribution and
+  component versions are pinned with a stated revalidation procedure; the
+  present manifests pin `otel/opentelemetry-collector-contrib:0.107.0` against
+  a convention revision of 1.36.0, which the review either reconciles or
+  records.
+- **Tail sampling, with the routing it requires.** The gateway runs
+  `probabilistic_sampler` and no `tail_sampling`, and the agent-to-gateway hop
+  is a plain `otlp/gateway` exporter, so nothing guarantees
+  [17.16](spec.md#1716-sampling)'s requirement that every span of one trace
+  reach the same decision instance. A `loadbalancing` exporter with
+  trace-ID-aware routing and a `tail_sampling` policy expressing all eight
+  retention classes — error status or stable failure code, indeterminate
+  effect or reconciliation, security denial, policy override, or revocation,
+  checkpoint escalation or timeout, recovery failure or stale-owner conflict,
+  configured high latency, excessive retry, and a newly deployed version under
+  investigation — replaces it, sized together with decision wait, trace
+  buffers, memory limiter, queues, and exporter retry as the section requires.
+- **Loss visibility on the export path, not on one sink.**
+  `METRIC_AGENT_TELEMETRY_FLUSH_FAILURES` has a single recording site — the
+  decision sink's refusal in `run.rs` — with `METRIC_AGENT_DECISION_DROPS` as
+  a gauge beside it, and scenario 26 is proven against that sink alone.
+  [17.12](spec.md#1712-metrics) asks for export queue, drops, failures, and
+  Collector/exporter health, and neither Collector configuration enables
+  `service.telemetry`, which is where the refusal, queue, drop, processing,
+  and export-failure counters
+  [17.17](spec.md#1717-otlp-and-collector-boundary) lists come from.
+- **Exporter failure proven by behavior, not by grep.** The gateway config
+  carries `sending_queue` and `retry_on_failure`, and the existing test
+  asserts those strings are present. 6.3b drives an unreachable endpoint and a
+  saturated queue against the real exporter and asserts the run still
+  converges from durable state, that the loss is counted, and that drain still
+  flushes. A live-Collector arm is gated in the established idiom (an endpoint
+  environment variable, as `RAKKA_POSTGRES_TEST_DSN` gates the PostgreSQL
+  suites); a deterministic in-process arm always runs, so the claim is never
+  gate-only.
+- **Falsification, per the standing lesson of 6.1 and 6.2.** Every fix across
+  6.3a and 6.3b is reverted, the suite confirmed failing, and restored, with
+  the falsification recorded. A green suite over a silent path proves nothing,
+  which is exactly how the adapter arrived at this slice fully unit-tested and
+  entirely unreachable.
+
+Done when: an example binary exports agent traces, metrics, and logs to a
+Collector over OTLP through a pinned SDK it owns; the agent Collector
+configuration allowlists, tail-samples with trace-ID-aware routing, and
+reports its own health; an unavailable exporter changes no durable outcome and
+is visible in bounded counters; and
+`docs/rakka-agent-telemetry-validation-matrix.md` records the reviewed
+convention revision, the pinned distribution and component versions, and which
+telemetry claims are enforced, which are delegated to the deployment, and
+which remain inferred — the third companion to the fault-injection and
+security matrices.
+
+**Landed.** Five decisions, and three defects that only a real SDK, a real
+socket, and a real Collector could have found.
+
+- **The SDK pin is decided by an API boundary, not by recency.** `opentelemetry`
+  0.29 is both the highest release on the workspace's `tonic 0.12` / `prost
+  0.13` generation *and* the last one whose `metrics::data` types an
+  application can construct — 0.30 sealed `ResourceMetrics`, `Histogram`, and
+  `HistogramDataPoint`. That second constraint is the load-bearing one: Rakka
+  arrives at the boundary with metrics **already aggregated**, carrying the
+  catalogue's declared units and bucket boundaries, and 0.29 is the last
+  generation that can accept them as they are. On 0.30 or later the only path
+  is re-recording every measurement through the `Meter` API and re-declaring
+  the buckets in the binary, which makes the catalogue advisory and
+  [17.17](spec.md#1717-otlp-and-collector-boundary)'s "MUST NOT silently drop
+  the field" hard to keep. Recorded as a design change rather than a version
+  bump.
+- **The receiver is in-process, so the wire claim is never gate-only.** The
+  export walk stands up a real gRPC server speaking the generated OTLP service
+  definitions on an ephemeral port and asserts on the **decoded protobuf** it
+  was handed. Asserting on the batch the mapping built would have proven the
+  mapping and nothing about the export — a serialization OTLP rejects, a signal
+  wired to the wrong service, a unit dropped in translation would all have
+  passed. A live-Collector arm exists and is gated; it is not what the claim
+  rests on.
+- **Exemplars are declared, not inferred.** 6.3a recorded them as owed to this
+  boundary because `MetricsRecorder` has no trace identity to read — trace
+  context here is an explicit value on a durable record, never an ambient one.
+  A closed `AgentTelemetrySegment` is the one value carrying a measurement's
+  operation *and* its trace and span ids, so a bounded reservoir fed by the
+  segment sink fills `HistogramDataPoint.exemplars`, and `EXEMPLAR_SOURCES`
+  names which segment class supplies which histogram. A representative link is
+  what an exemplar is; that it is not a per-measurement one is recorded rather
+  than implied.
+- **The allowlist is checked against the code, in the crate that has it.** The
+  Kubernetes shape is contract-tested in `rakka-k8s` and the allowlist in
+  `rakka-agent`, because `rakka-k8s` sits below it in the DAG and can only
+  compare a list of strings to a copy of itself. That is the failure this entry
+  warned about — configuration that passes its own string-matching tests and
+  drops everything in production — and a same-crate test would have been
+  precisely it. The retention selectors are checked the same way, in both
+  directions: a policy key no mapping function writes fails, and so does a key
+  the allowlist strips before the sampler runs.
+- **A gated arm runs the pinned distribution's own `validate`.** `kubectl`
+  validates Kubernetes objects and knows nothing about a ConfigMap's contents;
+  a string assertion knows only that a word appears. This arm found two of the
+  three defects below within a minute of first running.
+
+The three defects, each with the falsification that keeps its test honest:
+
+- **`InProcessRunResultDelivery` recorded no metrics.** It threaded a segment
+  sink and no `MetricsRecorder`, so `turn.duration`, `model.tokens`,
+  `effect.outcomes`, and `effect.outstanding.duration` were recorded by
+  **nobody** on the delivery path while the sharded entity beside it reported a
+  healthy surface. This is the "every driver of a run must share one wiring"
+  rule the segment sink states, one field over and unnoticed. Found because the
+  export walk's exported metric set was missing exactly the instruments that
+  path owns — four metrics where seven were expected.
+- **`container.name` is not a `k8sattributes` field** at a current
+  distribution. The metadata list was inherited from the workflow topology,
+  which pins a 2024 build; the Collector refuses to start on it. This is what
+  the 0.107.0-against-1.36.0 spread looks like in practice, and it is why the
+  agent topology took a current pin while the workflow one's stays where its
+  own plan put it.
+- **`loadbalancing` refuses `routing_key: traceID` for metrics.** Wiring the
+  metrics pipeline to the exporter traces need produces a Collector that fails
+  at startup — and a string assertion for `loadbalancing` calls it correct. The
+  metrics pipeline has its own `otlp/gateway` exporter; traces and logs keep
+  the trace-id router, over a **headless** service, because a `ClusterIP` there
+  would spread one trace's spans across gateway replicas and each would sample
+  a partial trace with nothing failing.
+
+Two things are recorded as inferred rather than claimed, in
+`docs/rakka-agent-telemetry-validation-matrix.md`: tail sampling is contract-
+tested and distribution-validated as configuration but is not exercised against
+a running two-replica gateway, and **an agent trace can outlive its own
+sampling decision** — a run parked on a human approval resumes long after
+`decision_wait`, and the segments it closes then are governed by a decision
+taken without them. That is inherent to tail sampling, and it is why the
+retention classes select on attributes that appear early in a trace wherever
+they can.
+
+Owed onward and named rather than left silent: 13 of the 24 segment classes
+still have no production call site, and `AgentSegmentIdentity::of_task` has no
+caller at all — so `rakka.agent.task.id`, `.goal.id`, and `.delegation.id` are
+allowlisted at both layers and written by nothing, which is 6.3a's own defect
+class still open for three attributes.
 
 ### Slice 6.4 — Documentation and compatibility
 
@@ -4295,8 +4866,85 @@ Spec: [20](spec.md#20-compatibility-and-migration).
   in `docs/rakka-api-boundary-inventory.md`, `CHANGELOG.md` entries, N/N+1
   compatibility notes, and the pinned A2A/Rig/GenAI revision matrix.
 
-Done when: all shipped-phase scenarios pass in the multi-process harness and
-the documentation set is current.
+Done when: every shipped-phase scenario passes under in-process fault
+injection; every scenario the fault-injection matrix names as requiring
+multi-pod fidelity passes there too; and the documentation set is current.
+
+Stated that way because it is checkable. "At the fidelity its claim requires"
+named no artifact that says, per scenario, what fidelity that is — and the
+matrix enumerates the multi-pod subset (currently scenarios 1's
+creation-deduplication half, 2, and 60) rather than all sixty-one. The matrix
+is the authority for that subset; a scenario added to it is added to this
+criterion.
+
+The multi-process harness carries the claims an in-process kill structurally
+cannot reach — a durable store outside the dying process, real shard movement
+after a downing decision, and an external commit that outlives its pod — and
+`docs/rakka-agent-fault-injection-matrix.md` records which scenarios are
+re-proven at that fidelity and which remain in-process. Porting all 61 scenarios
+into process-spawning form was considered and rejected: it would re-prove logic
+the in-process suite already covers, at a large cost in harness code and gated
+runtime, without adding a claim.
+
+**Landed (2026-09-01).** Five commits, each pairing a document with the test
+that holds it honest, on the rule this slice's own done-when was written under:
+a documentation claim the code can contradict is checked, not believed.
+
+- **The scenario roster is a parsed table, not a paragraph.** The appendix
+  below mapped scenario to slice and stopped at 5.5; eleven scenarios (12, 20,
+  30, 36, 46–51, 60) were cited only in a module-doc header, and the multi-pod
+  harness cited no number at all. `docs/rakka-agent-recovery-scenarios.md`
+  binds all sixty-one to their proving files, and
+  `tests/recovery_scenario_roster.rs` reads it: the numbers equal the
+  specification's list, each milestone is the one section 18 binds, every
+  cited file exists and cites the scenario (through a tokenizer that reads the
+  shapes the suites actually use — ranges, slashed pairs, wrapped doc
+  comments, possessives — and stops at a dotted section reference), the
+  multi-pod rows and only they cite the harness, and that set equals the fault
+  matrix's authority sentence. The reverse direction — a module doc that cites
+  a scenario must be in its row — earned its place on the first run by
+  crediting four files the hand-built roster had missed. The eleven header-only
+  scenarios were each read: every one is proven by its file's body, cited once.
+- **Thirty-four schema versions, one documented.** The compatibility policy
+  named the run state's version 2 and nothing else, filed under the A2A
+  adapter's heading beside every other agent commitment. The Agent Domain
+  section now carries the N/N+1 rule as `AgentSchemaPolicy` applies it, a
+  record table across the three crates, the pinned-dependency matrix, and the
+  exchange and extension versions; `tests/compatibility_currency.rs` holds the
+  two tables bijectively — record kinds and workflow constants imported, the
+  knowledge-graph constants read by source scan because the DAG forbids the
+  import, pins parsed from the manifests and both Collector topologies.
+- **The A2A protocol version was inherited, not pinned.** Specification 20
+  requires `rakka-a2a` to pin a reviewed A2A version; the SDK's constructor
+  supplied `1.0` and the card carried it silently, so an SDK upgrade that
+  moved the wire version would have re-labelled every served card unnoticed.
+  `A2A_PROTOCOL_VERSION` is held equal to `a2a::VERSION` by a test rather than
+  aliasing it — the point is that the upgrade *fails* at the review — and is
+  stamped on every interface the card builder and the fixture produce. The SDK
+  pins, copied in six manifests, are declared once in the workspace.
+- **Four crates missing from one inventory, six from the other**, every agent
+  crate among them, invisible to the hygiene test that checked only the four
+  tier words. Both tables now carry every `crates/` directory and the test
+  requires it; a relative-link checker over `README.md` and `docs/*.md` joins
+  it, because the agent doc set cross-links itself eleven ways and nothing
+  verified any of them. It found no broken link, and then found the one this
+  slice introduced a commit early.
+- **A product document, and the crate docs it replaces.**
+  `docs/rakka-agents.md` describes the surface as it behaves — crates and
+  features, the five entity classes and their choreography, a run from ingress
+  to terminal, goals, coordination, memory, the A2A surface, observability,
+  security, recovery, compatibility, examples — and points at the matrices for
+  what each claim rests on and what remains owed, rather than restating either.
+  `rakka-agent`'s crate doc said "only the module map exists today";
+  `rakka-agent-workflow`'s called itself "intentionally thin in the Phase 0.1
+  boundary slice"; the facade's never mentioned the agent surface. Corrected,
+  by hand.
+
+Owed onward, named: a registry-backed check that every agent error code is
+registered in the compatibility document — the codes live in per-error `code()`
+arms with no exported list, so the document's code families are held by review
+rather than by a test; and everything the three matrices' owed sections
+already carry, unchanged by this slice.
 
 ---
 
@@ -4335,3 +4983,5 @@ All scenario numbers refer to
 | 42 | M5 | 5.2 |
 | 43 | M5 | 5.3 |
 | 45 | M5 | 5.5 |
+| 1 (creation-deduplication half), 2, 60 | — | 6.1, re-proven at multi-pod fidelity (`examples/multi-pod-agent-fault-soak`) |
+| 1–61 | — | 6.4, rostered against their proving tests in `docs/rakka-agent-recovery-scenarios.md`, held by `cargo test -p rakka-agent --test recovery_scenario_roster` |

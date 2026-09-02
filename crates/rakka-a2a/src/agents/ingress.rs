@@ -571,7 +571,9 @@ pub fn normalize_agent_cancel(
 /// durable state — and the result is sanitized exactly as every durable
 /// telemetry write is, so an untraced or untrusted ingress yields the empty
 /// context and every segment it causes starts a root.
-fn extract_ingress_telemetry(metadata: &HashMap<String, Value>) -> AgentTelemetryContext {
+pub(crate) fn extract_ingress_telemetry(
+    metadata: &HashMap<String, Value>,
+) -> AgentTelemetryContext {
     let mut carrier = AgentAttributes::new();
     for key in [TRACEPARENT_HEADER, TRACESTATE_HEADER] {
         if let Some(value) = metadata
@@ -580,6 +582,38 @@ fn extract_ingress_telemetry(metadata: &HashMap<String, Value>) -> AgentTelemetr
             .and_then(|(_, value)| value.as_str())
         {
             carrier.insert(key.to_string(), value.to_string());
+        }
+    }
+    match extract_agent_trace_context(&carrier) {
+        Ok(Some(context)) => rakka_agent::sanitize_agent_telemetry_context(context),
+        Ok(None) | Err(_) => AgentTelemetryContext::default(),
+    }
+}
+
+/// Extracts the W3C trace context an ingress request carried in its **header**
+/// map.
+///
+/// [`ServiceParams`] is the lowercase HTTP header / gRPC metadata map, which is
+/// where W3C trace context canonically travels. The message metadata is the
+/// carrier the agent domain propagates through durable state, and it is the one
+/// [`extract_ingress_telemetry`] reads; this is the carrier a request that
+/// carries no payload metadata at all still has — every read method, and any
+/// send refused before its metadata could be merged. It is used for the ingress
+/// span and nothing else: a read writes no durable state, so this cannot change
+/// what any record carries.
+///
+/// Malformed context is dropped whole and sanitized, exactly as the metadata
+/// carrier is.
+#[must_use]
+pub(crate) fn extract_header_telemetry(params: &ServiceParams) -> AgentTelemetryContext {
+    let mut carrier = AgentAttributes::new();
+    for key in [TRACEPARENT_HEADER, TRACESTATE_HEADER] {
+        if let Some(value) = params
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .and_then(|(_, values)| values.first())
+        {
+            carrier.insert(key.to_string(), value.clone());
         }
     }
     match extract_agent_trace_context(&carrier) {

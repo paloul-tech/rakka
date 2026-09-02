@@ -84,9 +84,10 @@ use crate::effect::{
 };
 use crate::guardrails::{
     AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailDisposition,
-    AgentGuardrailReport, AgentGuardrailTransform,
+    AgentGuardrailError, AgentGuardrailReport, AgentGuardrailTransform,
 };
 use crate::identity::{AgentGoalId, AgentRunScope, AgentTaskId};
+use crate::memory::AgentRunMemory;
 use crate::model::{AgentToolCallRequest, AGENT_TOOL_ARGUMENTS_MAX_BYTES};
 use crate::task::{AgentContentDigest, AgentSchemaRef};
 
@@ -127,6 +128,23 @@ pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 3] = [
     AgentGuardrailBoundary::ModelRequest,
     AgentGuardrailBoundary::ToolRequest,
     AgentGuardrailBoundary::MemoryIngress,
+];
+
+/// The boundaries [`AgentToolAuthority`] evaluates *on its own*, before every
+/// attempt's durable `Started`.
+///
+/// This is the honest half of [`AGENT_EVALUATED_GUARDRAIL_BOUNDARIES`], which
+/// names every boundary the runtime has an evaluation point for *somewhere*.
+/// An authority may only count the memory-ingress boundary once a deployment
+/// has attested — through [`AgentToolAuthority::with_memory_ingress`] — that
+/// its retrieval bundle carries the same declared chain. Until then a
+/// mandatory memory-ingress-only stage fails closed as
+/// `guardrail-stage-unevaluated`, which is the correct answer: this authority
+/// cannot see a retrieval bundle, so it cannot vouch for one it was never
+/// shown.
+pub const AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 2] = [
+    AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ToolRequest,
 ];
 
 /// Result type for tool registry operations.
@@ -1012,7 +1030,15 @@ pub trait AgentExecutionPolicyRouter: Send + Sync {
 pub struct AgentToolAuthority {
     registry: AgentToolRegistry,
     guardrails: Option<AgentGuardrailChain>,
+    /// Whether a deployment attested that its retrieval bundle evaluates the
+    /// memory-ingress boundary under this authority's own declared chain.
+    memory_ingress_attested: bool,
     execution_router: Option<Arc<dyn AgentExecutionPolicyRouter>>,
+    /// The trust class every effect Rakka itself commits runs under, when the
+    /// deployment requires each intent to name one. `Some` *is* strict mode:
+    /// one declaration drives both the gate and the specs that satisfy it, so
+    /// the two cannot drift apart.
+    substrate_execution_policy: Option<AgentExecutionPolicyRef>,
     grant_ttl_ms: u64,
 }
 
@@ -1024,22 +1050,175 @@ impl AgentToolAuthority {
         Self {
             registry,
             guardrails: None,
+            memory_ingress_attested: false,
             execution_router: None,
+            substrate_execution_policy: None,
             grant_ttl_ms: AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
         }
     }
 
     /// Uses the deployment's guardrail chain.
+    ///
+    /// Replacing the chain clears any memory-ingress attestation: an
+    /// attestation is about a *particular* declared chain, and a new one has
+    /// not been checked against the retrieval bundle.
     #[must_use]
     pub fn with_guardrails(mut self, chain: AgentGuardrailChain) -> Self {
         self.guardrails = Some(chain);
+        self.memory_ingress_attested = false;
         self
+    }
+
+    /// Attests that the run memory this deployment assembles through
+    /// evaluates the memory-ingress boundary under the *same declared chain*
+    /// this authority carries.
+    ///
+    /// The two enforcement points are structurally separate — the authority
+    /// evaluates model and tool requests before dispatch, the run memory's
+    /// retrieval bundle evaluates retrieved memory during snapshot assembly —
+    /// and neither can see the other's chain at dispatch. So the deployment
+    /// that wires both says so here, and the claim is *checked* rather than
+    /// taken: the two [`AgentGuardrailChain::declaration_digest`]s must agree,
+    /// which catches a drifted revision and an empty bundle chain alike.
+    ///
+    /// It takes the [`AgentRunMemory`] rather than a bare
+    /// [`crate::retrieval::AgentMemoryRetrieval`], and that is the whole
+    /// point: the object attested must be the object the run assembles
+    /// through. Checking a bundle handed in for the occasion proves a
+    /// deployment *owns* a matching chain somewhere, not that the run will
+    /// ever evaluate it — a bundle attested and then not installed, or
+    /// installed alongside a different one, satisfied the check and ran no
+    /// ingress stage at all. Passing the memory narrows the mistake to one a
+    /// deployment has to work at: building a second `AgentRunMemory` for the
+    /// run entity. Since the type is `Clone` and cheap, the natural shape is
+    /// one value, attested here and handed to the run.
+    ///
+    /// A memory carrying no retrieval bundle is refused rather than treated as
+    /// an empty chain: nothing would evaluate the boundary, which is the
+    /// condition this attestation exists to rule out.
+    ///
+    /// Use [`Self::attests`] to re-check a memory assembled separately.
+    ///
+    /// Without this attestation the authority does not count `MemoryIngress`
+    /// among the boundaries it evaluates, so an envelope requiring a
+    /// memory-ingress-only stage refuses dispatch with the existing
+    /// `guardrail-stage-unevaluated`. A deployment that simply forgets to
+    /// attest therefore fails closed rather than silently losing the
+    /// protection ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentGuardrailError::ChainMismatch`] (`guardrail-chain-mismatch`)
+    /// when the two declarations differ, when this authority carries no chain
+    /// at all, or when the memory carries no retrieval bundle. The refusal
+    /// lands at wiring time, so a misconfigured deployment fails at startup
+    /// rather than at its first tool call.
+    pub fn with_memory_ingress(
+        mut self,
+        memory: &AgentRunMemory,
+    ) -> Result<Self, AgentGuardrailError> {
+        let installed = self.declared_by(memory);
+        let mine = self.declared_chain();
+        if installed.is_none() || installed != mine {
+            return Err(AgentGuardrailError::ChainMismatch {
+                authority: mine,
+                retrieval: installed,
+            });
+        }
+        self.memory_ingress_attested = true;
+        Ok(self)
+    }
+
+    /// Whether this authority's attestation holds for the given run memory.
+    ///
+    /// The attestation is checked once, at wiring time, against the memory it
+    /// was shown. A deployment that assembles its run memory somewhere else —
+    /// a second construction, a reload, a refactor — can re-check it here
+    /// rather than assume, and an assertion in a deployment's own startup
+    /// path is the cheapest place to catch a bundle that drifted from the
+    /// chain the dispatch gate enforces.
+    ///
+    /// `false` when this authority never attested, when it carries no chain,
+    /// when the memory carries no bundle, or when the two declarations differ.
+    #[must_use]
+    pub fn attests(&self, memory: &AgentRunMemory) -> bool {
+        if !self.memory_ingress_attested {
+            return false;
+        }
+        let installed = self.declared_by(memory);
+        installed.is_some() && installed == self.declared_chain()
+    }
+
+    /// This authority's own chain declaration, when it carries a chain.
+    fn declared_chain(&self) -> Option<AgentContentDigest> {
+        self.guardrails
+            .as_ref()
+            .map(AgentGuardrailChain::declaration_digest)
+    }
+
+    /// The chain declaration the run memory's retrieval bundle carries, when
+    /// it carries one.
+    fn declared_by(&self, memory: &AgentRunMemory) -> Option<AgentContentDigest> {
+        memory
+            .retrieval()
+            .map(|retrieval| retrieval.guardrails().declaration_digest())
+    }
+
+    /// The boundaries this authority's coverage check treats as evaluated.
+    ///
+    /// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] plus
+    /// [`AgentGuardrailBoundary::MemoryIngress`] once a deployment has
+    /// attested its retrieval bundle.
+    #[must_use]
+    pub fn evaluated_boundaries(&self) -> &'static [AgentGuardrailBoundary] {
+        if self.memory_ingress_attested {
+            &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES
+        } else {
+            &AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES
+        }
     }
 
     /// Routes execution-policy references through the given router.
     #[must_use]
     pub fn with_execution_router(mut self, router: Arc<dyn AgentExecutionPolicyRouter>) -> Self {
         self.execution_router = Some(router);
+        self
+    }
+
+    /// Refuses any intent that carries no execution-policy reference, and
+    /// names the class the substrate's own effects carry.
+    ///
+    /// Off by default, because
+    /// [specification 11.8](../../../docs/plans/rakka-agent/spec.md) says an
+    /// intent *SHOULD* carry one and most deployments have a single trust
+    /// class, for which unclassified is the honest description.
+    ///
+    /// A deployment that *claims* workload isolation cannot have unclassified
+    /// effects, though — an intent naming no class runs on whichever worker
+    /// claims it, which is exactly the shared universally-privileged worker
+    /// [specification 16](../../../docs/plans/rakka-agent/spec.md) forbids
+    /// claiming isolation from. This is the switch that makes the claim
+    /// checkable rather than asserted.
+    ///
+    /// The requirement is deliberately universal. A model call, a
+    /// compensation, an A2A send and a workflow start all reach a worker
+    /// exactly as a tool call does, so exempting them would relocate the hole
+    /// rather than close it — but only a *tool* intent carries a class of its
+    /// own, projected from its [`AgentToolBinding`] declaration. `substrate`
+    /// is therefore mandatory: it is the class stamped on every effect Rakka
+    /// itself commits, and [`Self::effect_policies`] applies it, so the gate
+    /// and the specs that satisfy it derive from this one declaration.
+    ///
+    /// A deployment that assembles [`crate::effect::AgentEffectPolicies`] by
+    /// hand must apply
+    /// [`crate::effect::AgentEffectPolicies::with_substrate_execution_policy`]
+    /// itself, or its very first model call is refused
+    /// `execution-policy-required` — the refusal names the knob. The
+    /// configured router must accept `substrate`, and some worker must serve
+    /// it, or the substrate has been classified onto a class nothing runs.
+    #[must_use]
+    pub fn with_required_execution_policy(mut self, substrate: AgentExecutionPolicyRef) -> Self {
+        self.substrate_execution_policy = Some(substrate);
         self
     }
 
@@ -1058,18 +1237,25 @@ impl AgentToolAuthority {
 
     /// The commit-time effect policies this authority's configuration
     /// projects: the registry's bindings, pinned to the configured guardrail
-    /// chain's revision.
+    /// chain's revision, and — under
+    /// [`Self::with_required_execution_policy`] — stamped with the trust
+    /// class the substrate's own effects run under.
     ///
     /// Wire the run entity with *this* projection rather than
-    /// [`AgentToolRegistry::effect_policies`] whenever a chain is configured:
-    /// the pin it stamps on every committed intent is what the dispatch
-    /// pipeline holds guardrail transforms deterministic against, so one
-    /// external idempotency key can never carry two differently transformed
-    /// payloads across a chain change.
+    /// [`AgentToolRegistry::effect_policies`] whenever a chain or a required
+    /// execution policy is configured. The guardrail pin it stamps on every
+    /// committed intent is what the dispatch pipeline holds guardrail
+    /// transforms deterministic against, so one external idempotency key can
+    /// never carry two differently transformed payloads across a chain
+    /// change; and the substrate class is what makes the requirement this
+    /// same authority enforces satisfiable at all.
     pub fn effect_policies(&self) -> AgentEffectResult<crate::effect::AgentEffectPolicies> {
         let mut policies = self.registry.effect_policies()?;
         if let Some(chain) = &self.guardrails {
             policies = policies.with_guardrail_revision(chain.revision());
+        }
+        if let Some(substrate) = &self.substrate_execution_policy {
+            policies = policies.with_substrate_execution_policy(substrate.clone());
         }
         Ok(policies)
     }
@@ -2307,6 +2493,20 @@ impl AgentToolAuthority {
         policy: Option<&AgentExecutionPolicyRef>,
     ) -> Result<(), AgentAuthorityRefusal> {
         let Some(policy) = policy else {
+            if self.substrate_execution_policy.is_some() {
+                // Definitive, not transient: no worker will ever accept a
+                // class that does not exist, and clearing the condition means
+                // re-declaring the tool.
+                return Err(AgentAuthorityRefusal::of(
+                    "execution-policy-required",
+                    "this deployment routes every effect by trust class and the intent names \
+                     none; it stays undispatchable rather than running with ambient authority. \
+                     A tool takes its class from its registered binding's declaration; every \
+                     effect Rakka itself commits takes it from \
+                     AgentEffectPolicies::with_substrate_execution_policy, which \
+                     AgentToolAuthority::effect_policies applies",
+                ));
+            }
             return Ok(());
         };
         let routable = self
@@ -2357,7 +2557,7 @@ impl AgentToolAuthority {
             ));
         };
         chain
-            .validate_covers(required, &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES)
+            .validate_covers(required, self.evaluated_boundaries())
             .map_err(|error| AgentAuthorityRefusal::of(error.code(), error.to_string()))
     }
 

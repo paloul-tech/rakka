@@ -8,8 +8,9 @@
 //! — never clobber the revision it never saw — after which the rejection
 //! drops the stale cache and the reloaded owner reconciles with the
 //! authoritative record. The transport half of movement — an exchange
-//! converging across a real 2-node ownership move — is scenario 60's proof
-//! in `choreography_cluster.rs`; together they cover the spec 15 clause. The
+//! converging across a real 2-node ownership move — is proven in
+//! `choreography_cluster.rs` (specification 18, item 60); together they cover
+//! the spec 15 clause. The
 //! agent entity's own variant of this fence is proven in `agent_entity.rs`.
 
 use rakka_agent::testkit::ScriptedDispatcher;

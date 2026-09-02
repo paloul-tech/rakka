@@ -25,7 +25,14 @@ The current repository state is a v1 release-candidate foundation: local typed a
 - `docs/rakka-akka-parity-phase-2-actor-facade.md` for the actor facade, context ergonomics, testkit probes, and async closure tradeoffs.
 - `docs/rakka-akka-parity-phase-5-cluster-receptionist-routers.md` for the Akka parity cluster extension, receptionist, router, and testkit guide.
 - `docs/rakka-akka-parity-phase-6-streams.md` for the Akka-shaped bounded stream facade, process IO migration, and stream testkit probes.
+- `docs/rakka-agents.md` for the durable agent domain: entities, runs, goals, coordination, memory, the A2A surface, and where each claim is proven.
+- `docs/rakka-agent-recovery-scenarios.md` for the sixty-one recovery scenarios, each bound to the test that proves it.
+- `docs/rakka-agent-fault-injection-matrix.md` for the durable boundaries killed in-process and across real pods.
+- `docs/rakka-agent-security-validation-matrix.md` for the agent security posture: enforced, delegated, or inferred, clause by clause.
+- `docs/rakka-agent-telemetry-validation-matrix.md` for the agent telemetry claims and the pinned SDK, convention, and Collector versions.
+- `docs/rakka-agent-observability-catalogue.md` for every agent metric and span class.
 - `docs/plans/agentic-workflow/` for the agent workflow spec, implementation plan, Kubernetes manifests, OpenTelemetry Collector topology, runbooks, dashboard guidance, and production-candidate support material.
+- `docs/plans/rakka-agent/` for the agent domain's specification, implementation plan, technical guidance, and Collector topology.
 
 Historical implementation plans live in `docs/plans/`.
 
@@ -40,9 +47,9 @@ Historical implementation plans live in `docs/plans/`.
 | `rakka-process`, `rakka-workflow`, `rakka-stream` | Child-process actors, durable inbox/outbox reliability, and bounded stream primitives. |
 | `rakka-agent-workflow` | Durable agent-workflow execution kernel: product-neutral compiled execution IR, durable graph run state, deterministic graph scheduler, and the durable outbox effect bridge. |
 | `rakka-agent`, `rakka-agent-postgres` | Durable agent domain: agent/task/run entities, choreography, the durable loop, model adapter trait (Rig behind the `rig` feature), effects and tool authority, budgets, checkpoints/HITL, session and private memory, retrieval, observability; plus the PostgreSQL memory stores and pgvector retrieval adapter. |
-| `rakka-agent-knowledge-graph` | Database-agnostic communal knowledge graph: provenance-bearing claims with the `Proposed`/`Verified`/`Disputed`/`Retracted` trust lattice, append-only transitions, the checkpoint-grant promotion gate, the portable store SPI, the in-memory reference store, and the backend conformance harness. |
+| `rakka-agent-knowledge-graph`, `rakka-agent-knowledge-graph-postgres` | Database-agnostic communal knowledge graph: provenance-bearing claims with the `Proposed`/`Verified`/`Disputed`/`Retracted` trust lattice, append-only transitions, the checkpoint-grant promotion gate, the portable store SPI, the in-memory reference store, and the backend conformance harness; plus its PostgreSQL binding. |
 | `rakka-http`, `rakka-grpc`, `rakka-k8s` | Edge adapters and Kubernetes operation surfaces. |
-| `rakka-a2a` | A2A protocol adapter for durable agent-workflow runs: durable request handler, task projection and streaming replay, push config persistence and dispatch boundary, sharded run owner host, and dynamic agent card. |
+| `rakka-a2a` | A2A protocol adapter for durable agent-workflow runs: durable request handler, task projection and streaming replay, push config persistence and dispatch boundary, sharded run owner host, and dynamic agent card; with the `agents` feature, the typed Rakka Agent surface, its management and collaboration extensions, replay, and the goal view. |
 | `rakka-testkit` | Cross-crate integration helpers and compatibility fixtures. |
 
 ## Validation Commands
@@ -81,7 +88,7 @@ Optional checks are gated because they need external services, child processes, 
 The optional multi-process compatibility check launches two loopback node processes:
 
 ```sh
-RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix optional_multi_process_compatibility_example_is_gated -- --nocapture
+RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
 ```
 
 The optional PostgreSQL persistence check expects a local PostgreSQL database:
@@ -398,6 +405,18 @@ Validate the manifest with `kubectl` against your active context:
 
 ```sh
 RAKKA_K8S_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s optional_kubectl_manifest_validation_is_gated -- --nocapture
+```
+
+Validate the agent-domain OpenTelemetry Collector topology — the Kubernetes
+objects with `kubectl`, and both Collector configurations against the pinned
+distribution itself, which is the only check that knows what a Collector
+configuration means:
+
+```sh
+RAKKA_AGENT_OTEL_VALIDATE_MANIFESTS=1 \
+  cargo test -p rakka-k8s --test agent_otel_collector_topology -- --nocapture
+RAKKA_AGENT_OTEL_VALIDATE_COLLECTOR_CONFIG=1 \
+  cargo test -p rakka-k8s --test agent_otel_collector_topology -- --nocapture
 ```
 
 Run the optional local-cluster scenario against your active kind/minikube context:

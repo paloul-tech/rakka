@@ -1,0 +1,716 @@
+# Agent-domain OpenTelemetry Collector topology.
+#
+# The workflow domain's topology lives beside this one at
+# `../agentic-workflow/kubernetes-otel-collector-topology.yaml` and is a
+# different artifact for a different vocabulary: its `transform/redact` is a
+# denylist of six content keys, none of which the GenAI vocabulary uses, and
+# its metric rules drop workflow identifiers. This one is keyed on `gen_ai.*`
+# and `rakka.agent.*` and is an **allowlist**, which is what specification
+# 17.14 asks for: a denylist is a guess about what content will be called next
+# time, and the adapter knows exactly which keys it writes.
+#
+# Contract-tested in two places, deliberately:
+#   crates/rakka-k8s/tests/agent_otel_collector_topology.rs   (Kubernetes shape)
+#   crates/rakka-agent/tests/collector_allowlist.rs           (allowlist bijection)
+# The second exists because a k8s-crate test cannot see
+# `AGENT_SPAN_ATTRIBUTE_KEYS`, and a configuration checked only against itself
+# is how a rule passes its own tests and drops everything in production.
+#
+# Pinned distribution: otel/opentelemetry-collector-contrib:0.159.0. See the companion
+# `kubernetes-agent-otel-collector-topology.md` for the revalidation procedure.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rakka-system
+  labels:
+    rakka.rs/topology: rakka-agent-otel
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rakka-agent-otel-collector
+  namespace: rakka-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rakka-agent-otel-collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rakka-agent-otel-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rakka-agent-otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: rakka-agent-otel-collector
+    namespace: rakka-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rakka-agent-otel-agent-config
+  namespace: rakka-system
+data:
+  collector.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 20
+      k8sattributes:
+        auth_type: serviceAccount
+        # Node-scoped, because this tier is a DaemonSet. Without the filter
+        # every replica list/watches every pod, namespace and node in the
+        # cluster: each of N nodes holds a full pod informer whose memory
+        # grows with the cluster's total pod count rather than its own node's,
+        # and the API server carries N full pod watches. The 512Mi limit below
+        # is sized for a node-local cache. `K8S_NODE_NAME` is projected from
+        # `spec.nodeName` in the DaemonSet's container spec.
+        filter:
+          node_from_env_var: K8S_NODE_NAME
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.node.name
+            - k8s.deployment.name
+            - k8s.container.name
+        pod_association:
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.ip
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.uid
+          - sources:
+              - from: connection
+      # `insert`, never `upsert`. Both keys are ones the application may
+      # already have declared — `AgentOtelResource` carries a service
+      # namespace and a deployment environment, and the export acceptance
+      # binary sets both — so `upsert` silently overwrites the emitter's own
+      # answer with this file's placeholder. A production binary declaring
+      # `deployment_environment("production")` would have every span, metric
+      # and log relabelled `local`, here and again at the gateway, merging
+      # production and staging into one series behind environment-scoped
+      # alerting that then covers the wrong fleet. These values are defaults
+      # for a signal that arrived without them.
+      resource/rakka:
+        attributes:
+          - key: service.namespace
+            value: rakka-system
+            action: insert
+          - key: deployment.environment.name
+            value: local
+            action: insert
+      batch:
+        timeout: 5s
+        send_batch_size: 1024
+
+    exporters:
+      # Trace-ID-aware routing, which specification 17.16 *requires* whenever
+      # tail sampling runs on more than one instance: every span of one trace
+      # MUST reach the same decision instance. The `k8s` resolver reads pod
+      # IPs from the headless gateway service below — a ClusterIP service
+      # would hand back one virtual address and defeat the routing entirely.
+      loadbalancing:
+        routing_key: traceID
+        protocol:
+          otlp:
+            tls:
+              insecure: true
+            sending_queue:
+              enabled: true
+              queue_size: 2048
+            retry_on_failure:
+              enabled: true
+              initial_interval: 1s
+              max_interval: 5s
+              max_elapsed_time: 30s
+        resolver:
+          k8s:
+            service: rakka-agent-otel-gateway-headless.rakka-system
+            ports:
+              - 4317
+      # Metrics do not travel by trace, and the `loadbalancing` exporter
+      # refuses `routing_key: traceID` for them outright — the pinned
+      # distribution rejects that configuration at startup, which is how this
+      # exporter came to exist. Metrics go to the gateway service and are
+      # spread by it; only traces and logs need instance affinity.
+      otlp/gateway:
+        endpoint: rakka-agent-otel-collector.rakka-system.svc.cluster.local:4317
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          queue_size: 2048
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 5s
+          max_elapsed_time: 30s
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    service:
+      extensions: [health_check]
+      # The Collector's own refusal, queue, drop, processing, and export
+      # failure counters (17.17). Absent from every manifest in this
+      # repository before slice 6.3b, which is why the export path's health
+      # was invisible on both sides of the boundary.
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          level: detailed
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resource/rakka, batch]
+          exporters: [loadbalancing]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resource/rakka, batch]
+          exporters: [otlp/gateway]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resource/rakka, batch]
+          exporters: [loadbalancing]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rakka-agent-otel-gateway-config
+  namespace: rakka-system
+data:
+  collector.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 20
+      k8sattributes:
+        auth_type: serviceAccount
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.node.name
+            - k8s.deployment.name
+            - k8s.container.name
+      # `insert`, never `upsert`. Both keys are ones the application may
+      # already have declared — `AgentOtelResource` carries a service
+      # namespace and a deployment environment, and the export acceptance
+      # binary sets both — so `upsert` silently overwrites the emitter's own
+      # answer with this file's placeholder. A production binary declaring
+      # `deployment_environment("production")` would have every span, metric
+      # and log relabelled `local`, here and again at the gateway, merging
+      # production and staging into one series behind environment-scoped
+      # alerting that then covers the wrong fleet. These values are defaults
+      # for a signal that arrived without them.
+      resource/rakka:
+        attributes:
+          - key: service.namespace
+            value: rakka-system
+            action: insert
+          - key: deployment.environment.name
+            value: local
+            action: insert
+      # Defence in depth, second (17.14): the application minimises before
+      # export, and this keeps only what the adapter is allowed to write. The
+      # three lists are `AGENT_SPAN_ATTRIBUTE_KEYS`, that set unioned with
+      # `AGENT_LOG_ATTRIBUTE_KEYS`, and the bounded metric label vocabulary —
+      # held to the code by `crates/rakka-agent/tests/collector_allowlist.rs`.
+      #
+      # **Two of the three rules are conditioned and one is not, and each of
+      # the three answers is deliberate.** A `keep_keys` with no `where`
+      # deletes every key it does not name from every record in the pipeline,
+      # and these lists are the *agent* vocabularies — while this gateway's
+      # receiver is a general OTLP listener fed by a DaemonSet that collects
+      # from every pod in the cluster, not an agent-only door.
+      #
+      # Metrics condition on the instrument name. The application's bridge
+      # exports the whole `MetricsSnapshot`, substrate instruments included,
+      # so the unconditioned rule was deleting `state` from
+      # `rakka.cluster.members`, `actor` from `rakka.actor.mailbox.depth`,
+      # `stream` from `rakka.stream.pressure` and so on — collapsing each into
+      # one attribute-less last-write-wins series. That is not redaction; it
+      # is silent destruction of a metric this list was never written for.
+      #
+      # **The prefix ends at `rakka\.agent` with no trailing dot, and that is
+      # deliberate — do not "correct" it.** The label list below is the union
+      # of the agent domain's `AGENT_METRIC_FIELDS` and the workflow kernel's
+      # `AGENT_WORKFLOW_BOUNDED_METRIC_ATTRIBUTES`, and every workflow
+      # instrument is named `rakka.agent_workflow.<x>`, which `^rakka\.agent\.`
+      # cannot match. With the dot, roughly two dozen of the keys below were
+      # inert: they sat in the allowlist proving nothing while the workflow
+      # half of the surface had no Collector-side bound at all, so a datapoint
+      # stamped `run_id` or `workflow_id` reached the backend untouched and
+      # became an unbounded hot label — while the validation matrix recorded
+      # 17.14 defence-in-depth as met. No substrate family begins `rakka.agent`
+      # (`rakka.cluster`, `rakka.actor`, `rakka.stream`, `rakka.remote`,
+      # `rakka.http`, `rakka.grpc`, `rakka.sharding`, …), so dropping the dot
+      # widens the rule to exactly the two agent families and nothing else.
+      # `collector_allowlist.rs` asserts both directions: every catalogued
+      # agent instrument matches, and no substrate family does.
+      #
+      # Spans condition on the emitting scope, for the same reason one context
+      # over. `rakka-http` writes `http.request` spans carrying `method` and
+      # `route`, `rakka-grpc` writes `grpc.request` carrying `service` and
+      # `rpc_kind`, `rakka-stream` writes `stream.pipeline` — none of those
+      # keys is in the list below, so the unconditioned rule delivered every
+      # substrate span stripped of every attribute it had: kept, and
+      # unreadable, with nothing anywhere reporting the loss. The agent
+      # adapter stamps `agent_instrumentation_scope()` on its own batch, so
+      # `rakka.agent` is a fact about the emitter that a substrate span does
+      # not carry — which is exactly the discriminator the metric rule gets
+      # from the instrument name.
+      #
+      # Logs stay unconditioned, and that is not the same oversight left
+      # standing. The log rule is the last guard over bridged `tracing`
+      # records, whose fields are arbitrary — and those records reach the
+      # Collector under a scope named for their *target* (`rakka_agent`,
+      # `rakka_http`) rather than the pinned one. A scope condition here would
+      # exempt precisely the records that most need the filter, so the rule's
+      # cost is paid deliberately: a `tracing` field this list does not name
+      # is dropped.
+      transform/allowlist:
+        error_mode: ignore
+        trace_statements:
+          - context: span
+            statements:
+              - keep_keys(attributes, ["error.type", "gen_ai.agent.id", "gen_ai.agent.name", "gen_ai.agent.version",
+                  "gen_ai.conversation.id", "gen_ai.operation.name", "gen_ai.provider.name",
+                  "gen_ai.request.model", "gen_ai.tool.name", "gen_ai.tool.type",
+                  "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens",
+                  "rakka.agent.a2a.operation", "rakka.agent.checkpoint.kind",
+                  "rakka.agent.decision.kind", "rakka.agent.decision.reason",
+                  "rakka.agent.decision.source", "rakka.agent.delegation.id",
+                  "rakka.agent.effect.attempt", "rakka.agent.effect.kind",
+                  "rakka.agent.effect.safety", "rakka.agent.effect.status", "rakka.agent.goal.id",
+                  "rakka.agent.loop.phase", "rakka.agent.loop.transitions",
+                  "rakka.agent.memory.tier", "rakka.agent.settings_revision",
+                  "rakka.agent.task.id", "rakka.agent.turn.index", "rakka.error.code"])
+                where instrumentation_scope.name == "rakka.agent"
+        log_statements:
+          - context: log
+            statements:
+              - keep_keys(attributes, ["audit_event_id", "audit_kind", "causation_id", "checkpoint_id", "command_id",
+                  "correlation_id", "definition_version", "effect_id", "error.type",
+                  "gen_ai.agent.id", "gen_ai.agent.name", "gen_ai.agent.version",
+                  "gen_ai.conversation.id", "gen_ai.operation.name", "gen_ai.provider.name",
+                  "gen_ai.request.model", "gen_ai.tool.name", "gen_ai.tool.type",
+                  "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens",
+                  "rakka.agent.a2a.operation", "rakka.agent.checkpoint.kind",
+                  "rakka.agent.decision.kind", "rakka.agent.decision.reason",
+                  "rakka.agent.decision.source", "rakka.agent.delegation.id",
+                  "rakka.agent.effect.attempt", "rakka.agent.effect.kind",
+                  "rakka.agent.effect.safety", "rakka.agent.effect.status", "rakka.agent.goal.id",
+                  "rakka.agent.loop.phase", "rakka.agent.loop.transitions",
+                  "rakka.agent.memory.tier", "rakka.agent.settings_revision",
+                  "rakka.agent.task.id", "rakka.agent.turn.index", "rakka.error.code", "redaction",
+                  "run_id", "step_id", "tenant_id", "workflow_id", "workflow_type"])
+        metric_statements:
+          - context: datapoint
+            statements:
+              - keep_keys(attributes, ["adapter_kind", "artifact_kind", "backend", "checkpoint_status", "command_type",
+                  "component", "database_operation", "decision_kind", "decision_source",
+                  "definition_version", "deployment_channel", "detail", "direction", "effect_kind",
+                  "entity_type", "error_code", "message_type", "operation", "outcome", "phase",
+                  "queue", "redaction", "retry_attempt_bucket", "safety_class", "signal",
+                  "state_schema_version", "status", "step_kind", "target_class", "tenant_tier",
+                  "timer_status", "transition", "trigger", "trigger_kind", "workflow_type"])
+                where IsMatch(metric.name, "^rakka\\.agent")
+      # All eight retention classes of specification 17.16, each selecting on
+      # an attribute a mapping function actually writes. Every policy below is
+      # a `string_attribute` or a `status_code`/`latency` policy and never a
+      # `numeric_attribute`: every agent-domain span attribute is a string,
+      # because `AgentAttributes` is a `BTreeMap<String, String>`, so a numeric
+      # policy would match nothing while passing its own test.
+      tail_sampling:
+        # Sized together, as 17.16 requires. At 200 new traces per second a
+        # 30-second decision wait leaves ~6,000 traces undecided at any moment;
+        # `num_traces` is the LRU of traces held, set an order of magnitude
+        # above that so late spans of an undecided trace still land in it. One
+        # full agent run produced 38 spans in the export walk, so 50,000 traces
+        # is ~1.9M spans worst case; the memory limiter at 80% of the 4Gi limit
+        # below is what bounds that, and the queue and retry settings on the
+        # backend exporter are sized to drain a decision burst rather than a
+        # steady rate.
+        decision_wait: 30s
+        num_traces: 50000
+        expected_new_traces_per_sec: 200
+        policies:
+          - name: error-status
+            type: status_code
+            status_code:
+              status_codes: [ERROR]
+          - name: stable-failure-code
+            type: string_attribute
+            string_attribute:
+              key: rakka.error.code
+              values: [".+"]
+              enabled_regex_matching: true
+          - name: security-denial-or-revocation
+            type: string_attribute
+            string_attribute:
+              key: error.type
+              values: ["rakka.agent.authority"]
+          - name: indeterminate-effect-or-reconciliation
+            type: string_attribute
+            string_attribute:
+              key: rakka.agent.effect.status
+              values: ["indeterminate", "compensated", "exhausted"]
+          - name: checkpoint-escalation-or-timeout
+            type: string_attribute
+            string_attribute:
+              key: rakka.agent.checkpoint.kind
+              values:
+                - "security-authorization"
+                - "indeterminate-effect-reconciliation"
+          - name: recovery-failure-or-stale-owner
+            type: string_attribute
+            string_attribute:
+              key: error.type
+              values: ["rakka.agent.recovery", "rakka.agent.outbox"]
+          - name: configured-high-latency
+            type: latency
+            latency:
+              threshold_ms: 5000
+          - name: excessive-retry
+            type: string_attribute
+            string_attribute:
+              key: rakka.agent.effect.attempt
+              # Attempt three and above. A regex rather than a
+              # `numeric_attribute` policy because the attribute is written as
+              # a string; see the note above the processor.
+              values: ["^[3-9]$", "^[1-9][0-9]+$"]
+              enabled_regex_matching: true
+          - name: version-under-investigation
+            type: string_attribute
+            string_attribute:
+              key: rakka.agent.settings_revision
+              values: ["${env:RAKKA_AGENT_SETTINGS_REVISION_UNDER_INVESTIGATION}"]
+          - name: routine-successful-turns
+            type: probabilistic
+            probabilistic:
+              sampling_percentage: 5
+      batch:
+        timeout: 5s
+        send_batch_size: 2048
+
+    exporters:
+      debug:
+        verbosity: basic
+      otlp/primary:
+        endpoint: ${env:RAKKA_AGENT_OTEL_BACKEND_OTLP_ENDPOINT}
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          queue_size: 4096
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 10s
+          max_elapsed_time: 60s
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    service:
+      extensions: [health_check]
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          level: detailed
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors:
+            - memory_limiter
+            - k8sattributes
+            - resource/rakka
+            - transform/allowlist
+            - tail_sampling
+            - batch
+          exporters: [debug, otlp/primary]
+        metrics:
+          receivers: [otlp]
+          processors:
+            - memory_limiter
+            - k8sattributes
+            - resource/rakka
+            - transform/allowlist
+            - batch
+          exporters: [debug, otlp/primary]
+        logs:
+          receivers: [otlp]
+          processors:
+            - memory_limiter
+            - k8sattributes
+            - resource/rakka
+            - transform/allowlist
+            - batch
+          exporters: [debug, otlp/primary]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-agent-otel-agent
+  namespace: rakka-system
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rakka-agent-otel-agent
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-agent-otel-gateway-headless
+  namespace: rakka-system
+spec:
+  # Headless on purpose. The agent tier's `loadbalancing` exporter resolves
+  # gateway **pod** addresses so every span of one trace reaches the same
+  # tail-sampling instance (17.16). A ClusterIP here would return one virtual
+  # address, all traffic would land wherever kube-proxy sent it, and the
+  # sampler would decide on partial traces while every string assertion about
+  # this file still passed.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: rakka-agent-otel-gateway
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-agent-otel-collector
+  namespace: rakka-system
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rakka-agent-otel-gateway
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rakka-agent-otel-agent
+  namespace: rakka-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-agent-otel-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rakka-agent-otel-agent
+    spec:
+      serviceAccountName: rakka-agent-otel-collector
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector-contrib:0.159.0
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/collector.yaml"]
+          env:
+            # Read by `k8sattributes`' `filter.node_from_env_var`. There was a
+            # `K8S_NODE_IP` beside it, carried over from the workflow
+            # topology where it feeds a `kubeletstats` receiver; this topology
+            # declines to run that receiver, so nothing referenced the
+            # variable and it is gone.
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              hostPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+              hostPort: 4318
+            - name: health
+              containerPort: 13133
+            - name: telemetry
+              containerPort: 8888
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+      volumes:
+        - name: config
+          configMap:
+            name: rakka-agent-otel-agent-config
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rakka-agent-otel-gateway
+  namespace: rakka-system
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-agent-otel-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rakka-agent-otel-gateway
+    spec:
+      serviceAccountName: rakka-agent-otel-collector
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector-contrib:0.159.0
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/collector.yaml"]
+          env:
+            - name: RAKKA_AGENT_OTEL_BACKEND_OTLP_ENDPOINT
+              value: otel-backend.rakka-system.svc.cluster.local:4317
+            # Empty by default: no release is under investigation, so the
+            # retention policy that selects on it matches nothing until an
+            # operator sets it to the settings revision being watched.
+            - name: RAKKA_AGENT_SETTINGS_REVISION_UNDER_INVESTIGATION
+              value: ""
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: health
+              containerPort: 13133
+            - name: telemetry
+              containerPort: 8888
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+      volumes:
+        - name: config
+          configMap:
+            name: rakka-agent-otel-gateway-config
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rakka-agent-otel-gateway
+  namespace: rakka-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-agent-otel-gateway

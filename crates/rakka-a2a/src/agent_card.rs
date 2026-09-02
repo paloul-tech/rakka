@@ -9,11 +9,12 @@
 use std::collections::HashMap;
 
 use a2a::{
-    AgentCapabilities, AgentCard, AgentExtension, AgentInterface, AgentProvider, AgentSkill,
-    SecurityScheme, TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC,
+    AgentCapabilities, AgentCard, AgentExtension, AgentProvider, AgentSkill, SecurityScheme,
+    TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC,
 };
 
 use crate::catalog::A2AWorkflowCatalog;
+use crate::protocol::pinned_interface;
 
 /// Which A2A transports the service exposes, relative to a public base URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,13 +204,13 @@ impl A2AAgentCardBuilder {
         let base = self.public_base_url.clone().unwrap_or_default();
         let mut supported_interfaces = Vec::new();
         if self.transports.rest {
-            supported_interfaces.push(AgentInterface::new(
+            supported_interfaces.push(pinned_interface(
                 format!("{base}{}", self.rest_path),
                 TRANSPORT_PROTOCOL_HTTP_JSON,
             ));
         }
         if self.transports.jsonrpc {
-            supported_interfaces.push(AgentInterface::new(
+            supported_interfaces.push(pinned_interface(
                 format!("{base}{}", self.jsonrpc_path),
                 TRANSPORT_PROTOCOL_JSONRPC,
             ));
@@ -269,7 +270,30 @@ impl A2AAgentCardBuilder {
 mod tests {
     use super::*;
     use crate::catalog::A2AStaticWorkflowCatalog;
+    use crate::protocol::A2A_PROTOCOL_VERSION;
     use crate::testing::fixture_workflow;
+
+    #[test]
+    fn every_interface_carries_the_pinned_protocol_version() {
+        let catalog = A2AStaticWorkflowCatalog::single(fixture_workflow());
+        let card = A2AAgentCardBuilder::new("Rakka A2A", "durable agent")
+            .transports(A2ATransports {
+                rest: true,
+                jsonrpc: true,
+            })
+            .build(&catalog);
+
+        assert_eq!(card.supported_interfaces.len(), 2);
+        for interface in &card.supported_interfaces {
+            assert_eq!(interface.protocol_version, A2A_PROTOCOL_VERSION);
+        }
+        let json = serde_json::to_value(&card).expect("card serializes");
+        assert_eq!(
+            json["supportedInterfaces"][0]["protocolVersion"],
+            serde_json::Value::String(A2A_PROTOCOL_VERSION.to_string()),
+            "the wire form must carry the pinned version under the A2A key"
+        );
+    }
 
     #[test]
     fn card_advertises_load_balanced_urls_and_configured_capabilities() {

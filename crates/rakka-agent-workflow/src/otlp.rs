@@ -11,14 +11,15 @@ use std::future::Future;
 use std::pin::Pin;
 
 use rakka_core::{
-    export_open_telemetry_metrics, MetricAttribute, MetricsSnapshot, OpenTelemetryMetricsExport,
+    export_open_telemetry_metrics_with_instruments, MetricAttribute, MetricsSnapshot,
+    OpenTelemetryInstrumentView, OpenTelemetryMetricsExport,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    validate_agent_log_event, AgentAttributes, AgentAuditError, AgentLogEvent,
-    AgentRedactionPolicy, AgentSpanLink, AgentTelemetryContext, AgentTimestampMillis,
-    AgentTraceContext, AgentTraceError,
+    agent_derived_span_id, validate_agent_log_event, validate_agent_span_link, AgentAttributes,
+    AgentAuditError, AgentLogEvent, AgentRedactionPolicy, AgentSpanLink, AgentTelemetryContext,
+    AgentTimestampMillis, AgentTraceContext, AgentTraceError,
 };
 
 /// OTLP gRPC default endpoint.
@@ -222,7 +223,15 @@ pub enum AgentOtlpSignal {
 }
 
 /// Application-owned OTLP exporter configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` and `Serialize` are **not** derived, because [`Self::headers`] is
+/// where a resolved credential lives — an OTLP endpoint is authenticated with
+/// an `authorization: Bearer …` header — and this type is reachable from
+/// [`AgentOtlpBridgeExport`], whose whole purpose is to be serialized and sent
+/// by application code. A derived pair meant one `tracing::debug!("{config:?}")`
+/// or one `serde_json::to_string(&export)` wrote the bearer token to a log file
+/// or to disk. See the two impls below.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct AgentOtlpExporterConfig {
     /// Base endpoint used when a signal-specific endpoint is not supplied.
     pub endpoint: String,
@@ -237,7 +246,69 @@ pub struct AgentOtlpExporterConfig {
     /// Export timeout budget in milliseconds.
     pub timeout_ms: Option<u64>,
     /// Headers to attach to outbound OTLP requests.
+    ///
+    /// Resolved credential material. It is read in memory to build an
+    /// exporter and travels no further: it is withheld from [`fmt::Debug`] and
+    /// omitted from `Serialize` entirely, so a serialized configuration always
+    /// decodes with this empty. That is deliberate rather than lossy — a
+    /// serialized configuration is a persisted one, and persisting a resolved
+    /// credential is what the agent kernel forbids outright. An application
+    /// that needs the header at the far end resolves it there, from its own
+    /// secret store, the way it resolved this one.
+    #[serde(default)]
     pub headers: AgentAttributes,
+}
+
+/// Header keys with their values withheld.
+///
+/// The keys are kept because "which header is set" is the question an operator
+/// debugging a rejected export actually has, and a key is not a secret; the
+/// values are the credential.
+struct RedactedHeaders<'a>(&'a AgentAttributes);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_map()
+            .entries(self.0.keys().map(|key| (key, "[redacted]")))
+            .finish()
+    }
+}
+
+impl fmt::Debug for AgentOtlpExporterConfig {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentOtlpExporterConfig")
+            .field("endpoint", &self.endpoint)
+            .field("traces_endpoint", &self.traces_endpoint)
+            .field("metrics_endpoint", &self.metrics_endpoint)
+            .field("logs_endpoint", &self.logs_endpoint)
+            .field("protocol", &self.protocol)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .finish()
+    }
+}
+
+// Serialization is hand-written for one reason: `headers` must never reach the
+// output. A `#[serde(skip_serializing)]` on the field would do it too, but it
+// fails open — a *new* field is serialized by default, so the next
+// credential-bearing field added to this struct would ship silently. Writing
+// the fields out explicitly fails closed instead: a new field is absent from
+// the output until someone adds it here, and the omission is visible.
+impl Serialize for AgentOtlpExporterConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("AgentOtlpExporterConfig", 6)?;
+        state.serialize_field("endpoint", &self.endpoint)?;
+        state.serialize_field("traces_endpoint", &self.traces_endpoint)?;
+        state.serialize_field("metrics_endpoint", &self.metrics_endpoint)?;
+        state.serialize_field("logs_endpoint", &self.logs_endpoint)?;
+        state.serialize_field("protocol", &self.protocol)?;
+        state.serialize_field("timeout_ms", &self.timeout_ms)?;
+        state.end()
+    }
 }
 
 impl AgentOtlpExporterConfig {
@@ -653,6 +724,88 @@ impl AgentOtelInstrumentationScope {
     }
 }
 
+/// The most bytes one exported span, event, or log attribute value may carry.
+pub const AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES: usize = 1024;
+
+/// The most attributes one exported span, event, link, or log record may
+/// carry.
+pub const AGENT_EXPORT_MAX_ATTRIBUTES: usize = 64;
+
+/// The most events one exported span may carry.
+pub const AGENT_EXPORT_MAX_SPAN_EVENTS: usize = 32;
+
+/// The most links one exported span may carry.
+pub const AGENT_EXPORT_MAX_SPAN_LINKS: usize = 32;
+
+/// Keeps only the attributes an exported record may carry, at most `max` of
+/// them.
+///
+/// The *filtering* counterpart of `validate_export_attributes`, and the
+/// reason both exist. Validation is the right answer for a record a caller
+/// hand-builds: it names what is wrong. It is the wrong answer for a record
+/// Rakka derives from something already durable — an audit event's attributes,
+/// a persisted context's span links — because the durable record cannot be
+/// changed after the fact, so refusing its projection makes an old write
+/// permanently unexportable, and telemetry becomes a thing that can fail.
+///
+/// So a writer that derives an export record from durable state bounds it here
+/// instead: what cannot be exported is dropped, the durable record keeps it,
+/// and the rest of the batch ships. Attributes are ordered, so which ones a
+/// `max` keeps is deterministic rather than whichever the iterator reached
+/// first.
+#[must_use]
+pub fn bounded_export_attributes(attributes: AgentAttributes, max: usize) -> AgentAttributes {
+    attributes
+        .into_iter()
+        .filter(|(key, value)| {
+            !is_blank(key)
+                && !value.is_empty()
+                && value.len() <= AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES
+                && !value.contains('\n')
+                && !value.contains('\r')
+        })
+        .take(max)
+        .collect()
+}
+
+/// Generic bounds every exported attribute set must satisfy.
+///
+/// Not a redaction policy: this refuses a malformed or unbounded attribute,
+/// never an inappropriate one. Deciding which keys may be exported at all is
+/// the emitting domain's job, and it happens before a record is built.
+pub(crate) fn validate_export_attributes(
+    field: &'static str,
+    attributes: &AgentAttributes,
+) -> AgentOtlpResult<()> {
+    if attributes.len() > AGENT_EXPORT_MAX_ATTRIBUTES {
+        return Err(AgentOtlpError::InvalidExporter {
+            field,
+            reason: "exceeds the bounded attribute count",
+        });
+    }
+    for (key, value) in attributes {
+        if is_blank(key) {
+            return Err(AgentOtlpError::InvalidExporter {
+                field,
+                reason: "attribute keys are required",
+            });
+        }
+        if value.len() > AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES {
+            return Err(AgentOtlpError::InvalidExporter {
+                field,
+                reason: "attribute value exceeds its bound",
+            });
+        }
+        if value.contains('\n') || value.contains('\r') {
+            return Err(AgentOtlpError::InvalidExporter {
+                field,
+                reason: "attribute values must be single-line",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// OpenTelemetry-oriented span bridge record for agent workflow traces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentOtelSpanExport {
@@ -690,7 +843,34 @@ pub struct AgentOtelSpanExport {
 }
 
 impl AgentOtelSpanExport {
-    /// Builds a span bridge record from a durable telemetry context.
+    /// Builds a span bridge record for a span that runs *inside* a durable
+    /// telemetry context.
+    ///
+    /// The context's span id is the record's **parent**, never its own id.
+    /// A `traceparent` names the span it was propagated from, so writing it
+    /// back as this record's id made every span a run closed collide on one
+    /// id — and on the *caller's* id, since that is where an ingress context
+    /// comes from. The child id is derived by [`agent_derived_span_id`] from
+    /// the little this constructor holds: the name and the time window. A
+    /// caller that goes on to populate the record calls
+    /// [`Self::with_derived_span_id`] afterwards, which re-derives over
+    /// everything that actually distinguishes one operation from its
+    /// siblings.
+    ///
+    /// The context supplies the trace identity and the span links, and
+    /// **nothing else**. It deliberately does not supply attributes: baggage
+    /// is a propagation context, not a span attribute set, and baggage
+    /// received from an external caller is untrusted
+    /// ([specification 17.15](../../docs/plans/rakka-agent/spec.md)). Copying
+    /// it verbatim — which this used to do — meant any key a caller's context
+    /// happened to carry reached the export record intact, past a `validate`
+    /// that inspected attributes not at all, and past the agent domain's own
+    /// baggage-clearing sanitizer, which runs on the *persist* path and so
+    /// never saw a span built from a context a caller was handed.
+    ///
+    /// A caller that wants an attribute sets it explicitly through
+    /// [`Self::attribute`], which is what makes the exported set exactly what
+    /// the adapter decided to export.
     pub fn from_telemetry_context(
         name: impl Into<String>,
         start_time: AgentTimestampMillis,
@@ -708,17 +888,25 @@ impl AgentOtelSpanExport {
             trace_parent,
             telemetry_context.trace_state.as_deref(),
         )?;
+        let name = name.into();
+        let start = start_time.as_millis().to_string();
+        let end = end_time.as_millis().to_string();
+        let span_id = agent_derived_span_id(
+            &trace_context.trace_id,
+            &trace_context.span_id,
+            &[name.as_str(), start.as_str(), end.as_str()],
+        );
         Ok(Self {
-            name: name.into(),
+            name,
             trace_id: trace_context.trace_id,
-            span_id: trace_context.span_id,
-            parent_span_id: None,
+            span_id,
+            parent_span_id: Some(trace_context.span_id),
             trace_flags: trace_context.trace_flags,
             trace_state: trace_context.trace_state,
             start_time,
             end_time,
             links: telemetry_context.span_links.clone(),
-            attributes: telemetry_context.baggage.clone(),
+            attributes: AgentAttributes::new(),
             kind: AgentOtelSpanKind::default(),
             status: AgentOtelSpanStatus::default(),
             events: Vec::new(),
@@ -729,6 +917,59 @@ impl AgentOtelSpanExport {
     #[must_use]
     pub fn parent_span_id(mut self, parent_span_id: impl Into<String>) -> Self {
         self.parent_span_id = Some(parent_span_id.into());
+        self
+    }
+
+    /// Re-derives the span id over everything the record now carries, plus
+    /// whatever `distinguishing` material the caller holds and the record
+    /// does not.
+    ///
+    /// [`Self::from_telemetry_context`] derives from the name and the time
+    /// window, which separates two spans of different operations and does not
+    /// separate two spans of the *same* operation in the same millisecond. A
+    /// caller that has finished populating a record calls this, and the id
+    /// then covers the attributes, events, and links that tell the record
+    /// apart from its siblings — its attempt, its effect kind, its decisions.
+    ///
+    /// Content still does not always separate two records. A run closes two
+    /// `rakka.agent.effect.schedule` operations for two different effects with
+    /// the same name, the same attributes and the same millisecond, and
+    /// nothing on either record differs — the effect's identity is not a span
+    /// attribute, by [17.3](../../docs/plans/rakka-agent/spec.md). Merging
+    /// them would lose one, so an emitter that can produce such a pair passes
+    /// something that separates them: `AgentGenAiSpanExporter` passes its own
+    /// emission ordinal. Pass an empty slice when the record is all there is.
+    ///
+    /// The parent, the trace, and the derivation rule are unchanged; only the
+    /// material grows.
+    #[must_use]
+    pub fn with_derived_span_id(mut self, distinguishing: &[&str]) -> Self {
+        let mut material = vec![
+            self.name.clone(),
+            self.start_time.as_millis().to_string(),
+            self.end_time.as_millis().to_string(),
+            self.kind.as_label().to_string(),
+            self.status.as_label().to_string(),
+        ];
+        for (key, value) in &self.attributes {
+            material.push(format!("{key}={value}"));
+        }
+        for event in &self.events {
+            material.push(format!("{}@{}", event.name, event.time.as_millis()));
+            for (key, value) in &event.attributes {
+                material.push(format!("{key}={value}"));
+            }
+        }
+        for link in &self.links {
+            material.push(format!("{}-{}", link.trace_id, link.span_id));
+        }
+        let mut material = material.iter().map(String::as_str).collect::<Vec<_>>();
+        material.extend_from_slice(distinguishing);
+        self.span_id = agent_derived_span_id(
+            &self.trace_id,
+            self.parent_span_id.as_deref().unwrap_or_default(),
+            &material,
+        );
         self
     }
 
@@ -761,11 +1002,46 @@ impl AgentOtelSpanExport {
     }
 
     /// Validates the span export record.
+    ///
+    /// The attribute, event, and link guards are the counterpart of the metric
+    /// vocabulary's bounded-label validator, which had no equivalent on this
+    /// side: a span record used to be checked for its name and its trace
+    /// context and for nothing that rides on it. These are *generic* bounds —
+    /// non-blank keys, single-line values, and counts — and they are not a
+    /// redaction policy: which keys are allowed is a domain decision, made by
+    /// the adapter's allowlist before a record is built. Bounding is not
+    /// sanitizing, and neither substitutes for the other.
     pub fn validate(&self) -> AgentOtlpResult<()> {
         if is_blank(&self.name) {
             return Err(AgentOtlpError::InvalidExporter {
                 field: "span.name",
                 reason: "required",
+            });
+        }
+        // A name is refused for surrounding whitespace as well as for being
+        // blank. The convention builds several span names by joining an
+        // operation to an embedded class — `{operation} {model}`,
+        // `retrieval {data_source}` — and an emitter that had no value to join
+        // produced a name differing from the bare operation by an invisible
+        // character. Backends group by span name, so that is a silent second
+        // class, and `is_blank` alone let every one of them through.
+        if self.name.trim() != self.name {
+            return Err(AgentOtlpError::InvalidExporter {
+                field: "span.name",
+                reason: "must not begin or end with whitespace",
+            });
+        }
+        if self.end_time.as_millis() < self.start_time.as_millis() {
+            return Err(AgentOtlpError::InvalidExporter {
+                field: "span.end_time",
+                reason: "must not precede the start time",
+            });
+        }
+        validate_export_attributes("span.attributes", &self.attributes)?;
+        if self.events.len() > AGENT_EXPORT_MAX_SPAN_EVENTS {
+            return Err(AgentOtlpError::InvalidExporter {
+                field: "span.events",
+                reason: "exceeds the bounded event count",
             });
         }
         for event in &self.events {
@@ -775,6 +1051,17 @@ impl AgentOtelSpanExport {
                     reason: "required",
                 });
             }
+            validate_export_attributes("span.event.attributes", &event.attributes)?;
+        }
+        if self.links.len() > AGENT_EXPORT_MAX_SPAN_LINKS {
+            return Err(AgentOtlpError::InvalidExporter {
+                field: "span.links",
+                reason: "exceeds the bounded link count",
+            });
+        }
+        for link in &self.links {
+            validate_agent_span_link(link)?;
+            validate_export_attributes("span.link.attributes", &link.attributes)?;
         }
         AgentTraceContext::new(
             self.trace_id.clone(),
@@ -808,10 +1095,35 @@ pub struct AgentOtlpBridgeExport {
 
 impl AgentOtlpBridgeExport {
     /// Builds an OTLP bridge export from a metrics snapshot, spans, and logs.
+    ///
+    /// The exported metrics carry no unit and no bucket boundaries, because a
+    /// snapshot alone does not know them. A caller holding an instrument
+    /// catalogue should use [`Self::from_signals_with_instruments`], which is
+    /// what preserves the unit and bucket semantics
+    /// ([specification 17.17](../../docs/plans/rakka-agent/spec.md)).
     pub fn from_signals(
         exporter: AgentOtlpExporterConfig,
         resource: AgentOtelResource,
         metrics_snapshot: &MetricsSnapshot,
+        spans: Vec<AgentOtelSpanExport>,
+        logs: Vec<AgentLogEvent>,
+    ) -> AgentOtlpResult<Self> {
+        Self::from_signals_with_instruments(exporter, resource, metrics_snapshot, &[], spans, logs)
+    }
+
+    /// Builds an OTLP bridge export whose metrics carry the units and bucket
+    /// boundaries the caller's instrument catalogue declares.
+    ///
+    /// The bridge cannot invent them: the recorder stores raw observations and
+    /// knows nothing about instruments, so the domain that declared the
+    /// instrument supplies the view. Dropping the fields instead is what
+    /// [17.17](../../docs/plans/rakka-agent/spec.md) forbids while claiming
+    /// semantic-convention compliance.
+    pub fn from_signals_with_instruments(
+        exporter: AgentOtlpExporterConfig,
+        resource: AgentOtelResource,
+        metrics_snapshot: &MetricsSnapshot,
+        instruments: &[OpenTelemetryInstrumentView<'_>],
         spans: Vec<AgentOtelSpanExport>,
         logs: Vec<AgentLogEvent>,
     ) -> AgentOtlpResult<Self> {
@@ -829,7 +1141,11 @@ impl AgentOtlpBridgeExport {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect::<Vec<_>>();
-        let metrics = export_open_telemetry_metrics(metrics_snapshot, &resource_pairs);
+        let metrics = export_open_telemetry_metrics_with_instruments(
+            metrics_snapshot,
+            &resource_pairs,
+            instruments,
+        );
         Ok(Self {
             exporter,
             resource,

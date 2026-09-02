@@ -23,6 +23,7 @@ members = [
     "crates/rakka-grpc",
     "crates/rakka-k8s",
     "crates/rakka-testkit",
+    "examples/agent-otlp-export-acceptance",
     "examples/continuous-goal-acceptance",
     "examples/coordination-capability-acceptance",
     "examples/durable-counter",
@@ -43,6 +44,7 @@ members = [
     "examples/clustered-counter-http",
     "examples/coordinated-shutdown",
     "examples/multi-agent-goal-acceptance",
+    "examples/multi-pod-agent-fault-soak",
     "examples/multi-node-sharding",
     "examples/sharded-cart-persistence",
     "examples/streams",
@@ -59,10 +61,62 @@ readme = "README.md"
 license-file = "LICENSE"
 
 [workspace.dependencies]
+# The A2A SDK crates, imported under the short names `a2a` and `a2a-server`.
+# `package = "a2a-lf"` lives here because a member inherits the rename and
+# cannot re-specify it; likewise `default-features = false` must sit on the
+# workspace entry, since a member's own is ignored. One declaration keeps
+# `rakka-a2a` and its five example consumers on one SDK generation. The pin
+# policy (minor-level, unlike the exact OpenTelemetry pins below) is stated
+# once, in `rakka-a2a`'s crate doc under "A2A SDK version policy", and both
+# pins are recorded in `docs/rakka-compatibility.md`; tests hold the crate doc
+# and the document to the versions on the two lines below.
+a2a = { package = "a2a-lf", version = "0.3.0" }
+a2a-server = { package = "a2a-server-lf", version = "0.4.0", default-features = false }
 axum = { version = "0.8", features = ["ws"] }
 etcd-client = { version = "0.19", default-features = false }
 futures-util = "0.3"
 http-body-util = "0.1"
+# OpenTelemetry SDK, exporter, and `tracing` bridge. Used only by the
+# `publish = false` telemetry example: specification 17.17 places the SDK, the
+# `tracing` subscriber and layer, the OTLP exporter, exporter credentials, and
+# shutdown/flush at the application binary, and the core crates stay
+# SDK/version neutral. Pinned exactly, and the 0.29 generation is chosen by two
+# independent constraints that happen to agree:
+#
+#   1. `opentelemetry-otlp` 0.29 is the highest release built on this
+#      workspace's `tonic 0.12` / `prost 0.13` generation. 0.30 moves to tonic
+#      0.13 and 0.31 to tonic 0.14.
+#   2. `opentelemetry_sdk` 0.30 sealed `metrics::data`: `ResourceMetrics`,
+#      `Histogram`, and `HistogramDataPoint` lost their public fields. 0.29 is
+#      the last release in which an application can *construct* them, which is
+#      what lets the example hand Rakka's already-aggregated
+#      `AgentOtlpBridgeExport` to the exporter with the metric catalogue's
+#      declared units and bucket boundaries intact — rather than re-recording
+#      every measurement through the Meter API and re-declaring the buckets.
+#
+# Upgrading past 0.29 is therefore a design change, not a version bump: it
+# needs a decision about how units, buckets, and exemplars survive, and a
+# review under specification 17.20. See
+# `docs/rakka-agent-telemetry-validation-matrix.md`.
+opentelemetry = "=0.29.0"
+opentelemetry-appender-tracing = "=0.29.0"
+opentelemetry-otlp = { version = "=0.29.0", default-features = false, features = [
+    "grpc-tonic",
+    "logs",
+    "metrics",
+    "trace",
+] }
+opentelemetry_sdk = { version = "=0.29.0", features = ["rt-tokio"] }
+# The generated OTLP service definitions, used by the telemetry example to
+# stand up an in-process OTLP receiver. That is what lets the export claim be
+# proven over a real gRPC socket in a test that always runs, rather than only
+# behind an environment gate that needs a Collector container.
+opentelemetry-proto = { version = "=0.29.0", default-features = false, features = [
+    "gen-tonic",
+    "logs",
+    "metrics",
+    "trace",
+] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 prost = "0.13"
 serde = { version = "1", features = ["derive"] }
@@ -83,6 +137,7 @@ tonic = { version = "0.12", features = ["transport"] }
 tonic-build = "0.12"
 tower = "0.5"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

@@ -137,6 +137,97 @@ fn exporter_config_accepts_otel_env_style_values() {
     );
 }
 
+/// A resolved exporter credential survives neither `Debug` nor `Serialize`.
+///
+/// `AgentOtlpExporterConfig::headers` is where an OTLP bearer token lives, and
+/// the config is a field of `AgentOtlpBridgeExport` — a record whose entire
+/// purpose is to be serialized and sent by application code. With both traits
+/// derived, one `tracing::debug!("{export:?}")` or one
+/// `serde_json::to_string(&export)` in a deploying binary wrote the token to a
+/// log file or to disk, which is the one thing the agent kernel forbids
+/// outright. The header *key* is deliberately still visible: "which header is
+/// set" is the question a rejected export raises, and a key is not a secret.
+#[test]
+fn a_resolved_exporter_credential_reaches_neither_debug_nor_serialization() {
+    const TOKEN: &str = "RAKKA-BEARER-SENTINEL";
+
+    let mut headers = AgentAttributes::new();
+    headers.insert("authorization".to_string(), format!("Bearer {TOKEN}"));
+    let config = AgentOtlpExporterConfig {
+        headers,
+        ..AgentOtlpExporterConfig::grpc("http://collector:4317")
+    };
+
+    // In memory it is intact — this is a redaction at the boundary, not a
+    // configuration that has lost the credential it needs to authenticate.
+    assert_eq!(
+        config.headers.get("authorization").map(String::as_str),
+        Some(format!("Bearer {TOKEN}").as_str()),
+        "the credential must still be readable to build an exporter"
+    );
+
+    let formatted = format!("{config:?}");
+    assert!(
+        !formatted.contains(TOKEN),
+        "the credential survives the config's Debug: {formatted}"
+    );
+    assert!(
+        formatted.contains("authorization"),
+        "the header key is withheld too, leaving no way to see which header is \
+         set: {formatted}"
+    );
+
+    let encoded = serde_json::to_string(&config).expect("the config serializes");
+    assert!(
+        !encoded.contains(TOKEN),
+        "the credential survives serializing the config: {encoded}"
+    );
+
+    // And through the record that actually travels, which is the path that
+    // made this reachable from an application at all.
+    let export = AgentOtlpBridgeExport::from_signals(
+        config,
+        resource(),
+        &InMemoryMetricsRecorder::new().snapshot(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("the bridge export builds");
+    assert!(
+        !format!("{export:?}").contains(TOKEN),
+        "the credential survives the bridge record's Debug"
+    );
+    let encoded = serde_json::to_string(&export).expect("the bridge record serializes");
+    assert!(
+        !encoded.contains(TOKEN),
+        "the credential survives serializing the bridge record: {encoded}"
+    );
+
+    // A serialized configuration decodes with no headers at all, rather than
+    // with a plausible-looking placeholder a caller would send as a token.
+    let credentialed = AgentOtlpExporterConfig {
+        headers: config_headers(),
+        ..AgentOtlpExporterConfig::grpc("http://collector:4317")
+    };
+    let encoded = serde_json::to_string(&credentialed).expect("the config serializes");
+    let decoded: AgentOtlpExporterConfig =
+        serde_json::from_str(&encoded).expect("a serialized config decodes");
+    assert!(
+        decoded.headers.is_empty(),
+        "a decoded config carries headers it was never allowed to persist"
+    );
+}
+
+/// One authorization header, for the round-trip half of the test above.
+fn config_headers() -> AgentAttributes {
+    let mut headers = AgentAttributes::new();
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer RAKKA-BEARER-SENTINEL".to_string(),
+    );
+    headers
+}
+
 #[tokio::test]
 async fn bridge_export_routes_metrics_spans_and_logs_to_deterministic_receiver() {
     let metrics = InMemoryMetricsRecorder::new();
@@ -381,4 +472,218 @@ fn a_pre_extension_span_record_decodes_with_default_kind_status_and_events() {
         serde_json::from_value(serde_json::to_value(&stamped).expect("the record serializes"))
             .expect("the record round-trips");
     assert_eq!(round_tripped, stamped);
+}
+
+/// A span record built from a durable context carries the trace identity and
+/// the links, and **no attributes at all**.
+///
+/// It used to copy the context's baggage verbatim into span attributes, past
+/// a `validate` that inspected attributes not at all. Baggage is a
+/// propagation context rather than a span attribute set, and baggage received
+/// from an external caller is untrusted (specification 17.15), so a caller
+/// that wants an attribute now sets it explicitly — which is what makes an
+/// exported set exactly what its emitter decided to export.
+#[test]
+fn a_span_built_from_a_context_copies_no_baggage_into_its_attributes() {
+    let context = telemetry_context();
+    assert!(
+        !context.baggage.is_empty(),
+        "the fixture must carry baggage, or this proves nothing"
+    );
+
+    let span = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds");
+
+    assert!(
+        span.attributes.is_empty(),
+        "baggage reached the span attributes: {:?}",
+        span.attributes
+    );
+    // The trace identity and the links are what a context does supply.
+    assert_eq!(span.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(span.links.len(), context.span_links.len());
+    span.validate().expect("the record is valid");
+
+    // An explicitly-set attribute is kept, so the change removes a copy and
+    // not the ability to carry attributes.
+    let span = span.attribute("step.kind", "tool");
+    assert_eq!(
+        span.attributes.get("step.kind").map(String::as_str),
+        Some("tool")
+    );
+}
+
+/// The export records now carry the generic bounds the metric vocabulary
+/// always had and this side never did: a blank key, an unbounded value, a
+/// multi-line value, and an inverted time range are each refused.
+#[test]
+fn an_unbounded_or_malformed_span_attribute_is_refused() {
+    let base = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(10),
+        AgentTimestampMillis::new(20),
+        &telemetry_context(),
+    )
+    .expect("the span builds");
+
+    base.clone().validate().expect("the base record is valid");
+
+    let blank_key = base.clone().attribute("   ", "value");
+    assert!(blank_key.validate().is_err(), "a blank key is refused");
+
+    let overlong = base.clone().attribute("step.kind", "x".repeat(4096));
+    assert!(
+        overlong.validate().is_err(),
+        "an unbounded value is refused"
+    );
+
+    let multiline = base.clone().attribute("step.kind", "tool\nmore");
+    assert!(
+        multiline.validate().is_err(),
+        "a multi-line value is refused"
+    );
+
+    let mut inverted = base;
+    inverted.start_time = AgentTimestampMillis::new(30);
+    assert!(
+        inverted.validate().is_err(),
+        "an end before its start is refused"
+    );
+}
+
+/// A span built from a durable context is that context's **child**, not a
+/// second record claiming to be it.
+///
+/// The `traceparent` a context carries names the span it was propagated from
+/// — an ingress caller's, or the run's own parked span. Writing it back as
+/// the new record's span id made every span built from one context collide on
+/// a single id, and on an id that already belonged to somebody else's span.
+#[test]
+fn a_span_built_from_a_context_is_its_child_rather_than_a_copy_of_it() {
+    let context = telemetry_context();
+    let span = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds");
+
+    assert_eq!(
+        span.parent_span_id.as_deref(),
+        Some("00f067aa0ba902b7"),
+        "the context's span id is the parent"
+    );
+    assert_ne!(
+        span.span_id, "00f067aa0ba902b7",
+        "and never the record's own id"
+    );
+    span.validate().expect("the derived id is a valid span id");
+
+    // Same context, different operation: two records, two ids.
+    let sibling = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.checkpoint",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the sibling builds");
+    assert_ne!(span.span_id, sibling.span_id);
+    assert_eq!(span.parent_span_id, sibling.parent_span_id);
+
+    // The derivation is a function of its inputs, so it is reproducible
+    // rather than drawn from a random source there is none of on this path.
+    let again = AgentOtelSpanExport::from_telemetry_context(
+        "agent.workflow.step",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds again");
+    assert_eq!(span.span_id, again.span_id);
+}
+
+/// The name and the time window do not separate two spans of the *same*
+/// operation, so a populated record re-derives over what does.
+#[test]
+fn a_populated_record_re_derives_its_id_over_what_distinguishes_it() {
+    let context = telemetry_context();
+    let base = AgentOtelSpanExport::from_telemetry_context(
+        "rakka.agent.effect.dispatch",
+        AgentTimestampMillis::new(10),
+        AgentTimestampMillis::new(20),
+        &context,
+    )
+    .expect("the span builds");
+
+    let first = base
+        .clone()
+        .attribute("rakka.agent.effect.attempt", "1")
+        .with_derived_span_id(&[]);
+    let second = base
+        .clone()
+        .attribute("rakka.agent.effect.attempt", "2")
+        .with_derived_span_id(&[]);
+
+    assert_ne!(
+        first.span_id, second.span_id,
+        "two attempts of one effect are two spans"
+    );
+    assert_ne!(
+        first.span_id, base.span_id,
+        "re-deriving over the attributes moves the id"
+    );
+    assert_eq!(
+        first.parent_span_id, base.parent_span_id,
+        "and leaves the parent alone"
+    );
+    first.validate().expect("the re-derived id is valid");
+    second.validate().expect("the re-derived id is valid");
+
+    // Two records that content cannot separate — same operation, same
+    // attributes, same millisecond — are separated by the material their
+    // emitter holds and they do not.
+    let twin = first.clone().with_derived_span_id(&[]);
+    assert_eq!(twin.span_id, first.span_id, "content alone merges them");
+    let distinguished = first.clone().with_derived_span_id(&["7"]);
+    assert_ne!(
+        distinguished.span_id, first.span_id,
+        "an emitter that knows they are two says so"
+    );
+    distinguished
+        .validate()
+        .expect("the distinguished id is valid");
+}
+
+/// A span name is refused for surrounding whitespace, not only for being blank.
+///
+/// The convention builds several names by joining an operation to an embedded
+/// class — `{operation} {model}`, `retrieval {data_source}` — and an emitter
+/// with no value to join produced a name differing from the bare operation by
+/// an invisible character. `is_blank` let every one of those through, and
+/// backends group by span name, so it was a silent second class.
+#[test]
+fn a_span_name_with_surrounding_whitespace_is_refused() {
+    let base = AgentOtelSpanExport::from_telemetry_context(
+        "chat",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &telemetry_context(),
+    )
+    .expect("the span builds");
+    base.clone().validate().expect("the bare name is valid");
+
+    for name in ["chat ", " chat", "chat\t"] {
+        let mut span = base.clone();
+        span.name = name.to_string();
+        assert!(
+            span.validate().is_err(),
+            "`{name:?}` must not export as a second span class"
+        );
+    }
 }

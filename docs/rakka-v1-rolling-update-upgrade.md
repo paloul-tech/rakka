@@ -26,6 +26,7 @@ Before rollout:
 5. Confirm the manifest version and generated API version are correct.
 6. Confirm readiness, liveness, drain, metrics, snapshots, public HTTP/gRPC, and internal remoting routes are exposed by the application image.
 7. Confirm the PodDisruptionBudget allows only safe disruption for the workload.
+8. For an agent-domain deployment, confirm the two releases agree on every pin and version in `docs/rakka-compatibility.md`'s Agent Domain section: the durable record schema versions (an N binary fails closed on an N+1 record, so a release that bumps one may only be rolled forward, never mixed with a release two windows back), the exchange codec version, the A2A extension versions, and `A2A_PROTOCOL_VERSION`.
 
 Required local checks:
 
@@ -44,7 +45,7 @@ cargo test -p rakka-k8s --test kubernetes_manifests
 Optional gated checks:
 
 ```sh
-RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix optional_multi_process_compatibility_example_is_gated -- --nocapture
+RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
 RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image-n> RAKKA_K8S_NEXT_IMAGE=<image-n-plus-one> examples/kubernetes/local-cluster-scenario.sh
 ```
 
@@ -63,6 +64,8 @@ RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image-n> RAKKA_K8S_NEXT_IMAGE=<im
 11. Complete the rollout only after every pod is on N+1 and routing remains healthy.
 
 After all pods are on N+1, the next release may advance the compatibility window to N+1/N+2.
+
+An agent-domain release that ships a one-time record repair — today, `AgentRunTerminalStampBackfill` for runs that were terminal before the run state moved to version 2 — runs it only after every pod is on N+1. A repaired record carries the new version, which an N pod still serving traffic fails closed on; a migration is complete when a pass over the same scopes reports nothing stamped and nothing conflicted.
 
 ## Rollback Sequence
 

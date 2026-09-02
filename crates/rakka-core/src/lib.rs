@@ -36,17 +36,18 @@ pub use coordinated_shutdown::{
 pub use dead_letter::{DeadLetter, DeadLetterReason};
 pub use error::{RakkaError, RakkaResult, Subsystem};
 pub use metrics::{
-    export_open_telemetry_metrics, export_prometheus_text, export_prometheus_text_with_config,
-    prometheus_label_name, prometheus_metric_name, InMemoryMetricsRecorder, MetricAttribute,
-    MetricAttributes, MetricKind, MetricObservation, MetricsRecorder, MetricsSnapshot,
-    NoopMetricsRecorder, OpenTelemetryDataPoint, OpenTelemetryInstrumentKind, OpenTelemetryMetric,
-    OpenTelemetryMetricsExport, OpenTelemetryTemporality, PrometheusTextConfig, METRIC_ACTOR_COUNT,
-    METRIC_ACTOR_MAILBOX_DEPTH, METRIC_CLUSTER_MEMBERS, METRIC_GRPC_REQUEST_LATENCY_MS,
-    METRIC_HTTP_REQUEST_LATENCY_MS, METRIC_K8S_COMPATIBILITY, METRIC_K8S_READINESS,
-    METRIC_PERSISTENCE_LATENCY_MS, METRIC_PROCESS_EXITS, METRIC_REMOTE_FAILURES,
-    METRIC_SHARD_OWNERSHIP_COUNT, METRIC_SHUTDOWN_PHASE_DURATION_MS, METRIC_SHUTDOWN_RUNNING,
-    METRIC_SHUTDOWN_TASK_DURATION_MS, METRIC_SHUTDOWN_TASK_FAILURES, METRIC_SHUTDOWN_TIMEOUTS,
-    METRIC_STREAM_CANCELLATIONS, METRIC_STREAM_PRESSURE,
+    export_open_telemetry_metrics, export_open_telemetry_metrics_with_instruments,
+    export_prometheus_text, export_prometheus_text_with_config, prometheus_label_name,
+    prometheus_metric_name, InMemoryMetricsRecorder, MetricAttribute, MetricAttributes, MetricKind,
+    MetricObservation, MetricsRecorder, MetricsSnapshot, NoopMetricsRecorder,
+    OpenTelemetryDataPoint, OpenTelemetryInstrumentKind, OpenTelemetryInstrumentView,
+    OpenTelemetryMetric, OpenTelemetryMetricsExport, OpenTelemetryTemporality,
+    PrometheusTextConfig, METRIC_ACTOR_COUNT, METRIC_ACTOR_MAILBOX_DEPTH, METRIC_CLUSTER_MEMBERS,
+    METRIC_GRPC_REQUEST_LATENCY_MS, METRIC_HTTP_REQUEST_LATENCY_MS, METRIC_K8S_COMPATIBILITY,
+    METRIC_K8S_READINESS, METRIC_PERSISTENCE_LATENCY_MS, METRIC_PROCESS_EXITS,
+    METRIC_REMOTE_FAILURES, METRIC_SHARD_OWNERSHIP_COUNT, METRIC_SHUTDOWN_PHASE_DURATION_MS,
+    METRIC_SHUTDOWN_RUNNING, METRIC_SHUTDOWN_TASK_DURATION_MS, METRIC_SHUTDOWN_TASK_FAILURES,
+    METRIC_SHUTDOWN_TIMEOUTS, METRIC_STREAM_CANCELLATIONS, METRIC_STREAM_PRESSURE,
 };
 pub use operational::{
     DeploymentProfile, OperationalTimeoutDefaults, SecurityDefaults, DEFAULT_ACTOR_ASK_TIMEOUT,

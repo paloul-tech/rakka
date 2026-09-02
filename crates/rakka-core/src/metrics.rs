@@ -414,6 +414,11 @@ pub struct OpenTelemetryMetric {
     kind: OpenTelemetryInstrumentKind,
     temporality: OpenTelemetryTemporality,
     data_points: Vec<OpenTelemetryDataPoint>,
+    /// UCUM-compatible unit, when the caller supplied an instrument
+    /// definition for the metric. A record exported before the field existed
+    /// decodes without one, so the extension is additive.
+    #[serde(default)]
+    unit: Option<String>,
 }
 
 impl OpenTelemetryMetric {
@@ -430,7 +435,21 @@ impl OpenTelemetryMetric {
             kind,
             temporality,
             data_points,
+            unit: None,
         }
+    }
+
+    /// Sets the UCUM-compatible unit.
+    #[must_use]
+    pub fn with_unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = Some(unit.into());
+        self
+    }
+
+    /// UCUM-compatible unit, when one was supplied.
+    #[must_use]
+    pub fn unit(&self) -> Option<&str> {
+        self.unit.as_deref()
     }
 
     /// Canonical Rakka metric name.
@@ -465,6 +484,15 @@ pub struct OpenTelemetryDataPoint {
     value: Option<f64>,
     count: Option<u64>,
     sum: Option<f64>,
+    /// Explicit histogram bucket upper bounds, ascending. Empty when the
+    /// caller supplied no boundaries for the instrument. A record exported
+    /// before the field existed decodes empty.
+    #[serde(default)]
+    bucket_boundaries: Vec<f64>,
+    /// Counts per bucket, one longer than [`Self::bucket_boundaries`]: the
+    /// final entry is the `+Inf` overflow bucket, as OTLP requires.
+    #[serde(default)]
+    bucket_counts: Vec<u64>,
 }
 
 impl OpenTelemetryDataPoint {
@@ -476,6 +504,8 @@ impl OpenTelemetryDataPoint {
             value: Some(value),
             count: None,
             sum: None,
+            bucket_boundaries: Vec::new(),
+            bucket_counts: Vec::new(),
         }
     }
 
@@ -487,6 +517,43 @@ impl OpenTelemetryDataPoint {
             value: None,
             count: Some(count),
             sum: Some(sum),
+            bucket_boundaries: Vec::new(),
+            bucket_counts: Vec::new(),
+        }
+    }
+
+    /// Creates a histogram data point carrying explicit bucket boundaries.
+    ///
+    /// `bucket_counts` must be one longer than `bucket_boundaries`; the extra
+    /// entry is the `+Inf` overflow bucket. A mismatched pair is stored as a
+    /// bucketless point rather than as a malformed one, because a telemetry
+    /// record is never a correctness input and a wrong distribution is worse
+    /// than an absent one.
+    #[must_use]
+    pub fn histogram_with_buckets(
+        attributes: Vec<MetricAttribute>,
+        count: u64,
+        sum: f64,
+        bucket_boundaries: Vec<f64>,
+        bucket_counts: Vec<u64>,
+    ) -> Self {
+        let consistent =
+            !bucket_boundaries.is_empty() && bucket_counts.len() == bucket_boundaries.len() + 1;
+        Self {
+            attributes,
+            value: None,
+            count: Some(count),
+            sum: Some(sum),
+            bucket_boundaries: if consistent {
+                bucket_boundaries
+            } else {
+                Vec::new()
+            },
+            bucket_counts: if consistent {
+                bucket_counts
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -513,6 +580,75 @@ impl OpenTelemetryDataPoint {
     pub const fn sum(&self) -> Option<f64> {
         self.sum
     }
+
+    /// Explicit histogram bucket upper bounds, ascending.
+    #[must_use]
+    pub fn bucket_boundaries(&self) -> &[f64] {
+        &self.bucket_boundaries
+    }
+
+    /// Counts per bucket, one longer than [`Self::bucket_boundaries`].
+    #[must_use]
+    pub fn bucket_counts(&self) -> &[u64] {
+        &self.bucket_counts
+    }
+}
+
+/// What a caller's instrument catalogue tells the exporter about one metric.
+///
+/// The recorder stores raw observations and knows nothing about instruments,
+/// so unit and bucket semantics have to arrive from the domain that declared
+/// them. This borrowed view is the whole contract: `rakka-core` stays free of
+/// every domain's catalogue type while still emitting the unit and bucket
+/// fields the OpenTelemetry semantic conventions require rather than dropping
+/// them silently.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpenTelemetryInstrumentView<'a> {
+    /// Canonical Rakka metric name this view describes.
+    pub name: &'a str,
+    /// UCUM-compatible unit label, or the empty string when the instrument
+    /// declares none.
+    pub unit: &'a str,
+    /// Explicit histogram bucket upper bounds, ascending. Empty for counters,
+    /// gauges, and histograms whose distribution the caller does not bucket.
+    ///
+    /// A set that is not strictly ascending, or that carries a NaN or an
+    /// infinity, is *ignored* rather than trusted — see
+    /// [`Self::has_usable_buckets`].
+    pub bucket_boundaries: &'a [f64],
+}
+
+impl OpenTelemetryInstrumentView<'_> {
+    /// Whether [`Self::bucket_boundaries`] can be bucketed against.
+    ///
+    /// The bucketing walk takes the first boundary an observation does not
+    /// exceed, which is the right answer only for a strictly ascending set. A
+    /// declaration is caller-supplied — this is a public entry point, and the
+    /// only consistency check anywhere near it was that `bucket_counts` is one
+    /// longer than `bucket_boundaries`, which an unsorted or duplicated set
+    /// satisfies — so boundaries such as `[10.0, 5.0, 50.0]` placed every
+    /// observation in the first bound it did not exceed and produced a
+    /// non-monotonic cumulative histogram: a Collector rejects it, or renders
+    /// nonsense quantiles, while the unit and the bucket vector make it look
+    /// authoritative. A NaN boundary is never `>=` anything, so it silently
+    /// swallowed the ordering too.
+    ///
+    /// An unusable declaration degrades to the count/sum form, exactly as a
+    /// metric the catalogue does not name does, on the principle this module
+    /// already states for a mismatched bucket pair: a wrong distribution is
+    /// worse than an absent one.
+    #[must_use]
+    pub fn has_usable_buckets(&self) -> bool {
+        !self.bucket_boundaries.is_empty()
+            && self
+                .bucket_boundaries
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && self
+                .bucket_boundaries
+                .iter()
+                .all(|boundary| boundary.is_finite())
+    }
 }
 
 /// Converts a Rakka metrics snapshot into a serializable OpenTelemetry-oriented bridge model.
@@ -520,13 +656,33 @@ impl OpenTelemetryDataPoint {
 /// This helper intentionally does not depend on a concrete OpenTelemetry SDK.
 /// Applications can map the returned resource attributes, instrument kinds,
 /// temporality, and data points into the SDK/exporter stack they already use.
+///
+/// The exported metrics carry no unit and no bucket boundaries, because a
+/// snapshot alone does not know them. A caller that has an instrument
+/// catalogue should use [`export_open_telemetry_metrics_with_instruments`].
 #[must_use]
 pub fn export_open_telemetry_metrics(
     snapshot: &MetricsSnapshot,
     resource_attributes: MetricAttributes<'_>,
 ) -> OpenTelemetryMetricsExport {
+    export_open_telemetry_metrics_with_instruments(snapshot, resource_attributes, &[])
+}
+
+/// Converts a snapshot into the bridge model, carrying instrument units and
+/// bucketing histogram observations against declared boundaries.
+///
+/// An observation whose metric names no instrument in `instruments` is
+/// exported exactly as [`export_open_telemetry_metrics`] exports it, so a
+/// partial catalogue degrades to the count/sum form rather than dropping the
+/// series.
+#[must_use]
+pub fn export_open_telemetry_metrics_with_instruments(
+    snapshot: &MetricsSnapshot,
+    resource_attributes: MetricAttributes<'_>,
+    instruments: &[OpenTelemetryInstrumentView<'_>],
+) -> OpenTelemetryMetricsExport {
     let resource_attributes = owned_attributes(resource_attributes);
-    let metrics = aggregate_metrics(snapshot)
+    let metrics = aggregate_metrics_with_instruments(snapshot, instruments)
         .into_iter()
         .map(|metric| {
             let kind = match metric.kind {
@@ -549,16 +705,34 @@ pub fn export_open_telemetry_metrics(
                     .histograms
                     .into_iter()
                     .map(|(attributes, summary)| {
-                        OpenTelemetryDataPoint::histogram(attributes, summary.count, summary.sum)
+                        if summary.bucket_counts.is_empty() {
+                            OpenTelemetryDataPoint::histogram(
+                                attributes,
+                                summary.count,
+                                summary.sum,
+                            )
+                        } else {
+                            OpenTelemetryDataPoint::histogram_with_buckets(
+                                attributes,
+                                summary.count,
+                                summary.sum,
+                                metric.bucket_boundaries.clone(),
+                                summary.bucket_counts,
+                            )
+                        }
                     })
                     .collect(),
             };
-            OpenTelemetryMetric::new(
+            let exported = OpenTelemetryMetric::new(
                 metric.name,
                 kind,
                 OpenTelemetryTemporality::Cumulative,
                 data_points,
-            )
+            );
+            match metric.unit {
+                Some(unit) => exported.with_unit(unit),
+                None => exported,
+            }
         })
         .collect();
     OpenTelemetryMetricsExport::new(resource_attributes, metrics)
@@ -649,27 +823,59 @@ impl MetricsRecorder for NoopMetricsRecorder {
 struct AggregatedMetric {
     name: String,
     kind: MetricKind,
+    unit: Option<String>,
+    bucket_boundaries: Vec<f64>,
     counters: BTreeMap<Vec<MetricAttribute>, f64>,
     gauges: BTreeMap<Vec<MetricAttribute>, f64>,
     histograms: BTreeMap<Vec<MetricAttribute>, HistogramSummary>,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct HistogramSummary {
     count: u64,
     sum: f64,
+    bucket_counts: Vec<u64>,
 }
 
 fn aggregate_metrics(snapshot: &MetricsSnapshot) -> Vec<AggregatedMetric> {
+    aggregate_metrics_with_instruments(snapshot, &[])
+}
+
+/// The bucket an observation falls in: the first boundary it does not exceed,
+/// or the trailing `+Inf` bucket when it exceeds them all.
+fn histogram_bucket_index(boundaries: &[f64], value: f64) -> usize {
+    boundaries
+        .iter()
+        .position(|boundary| value <= *boundary)
+        .unwrap_or(boundaries.len())
+}
+
+fn aggregate_metrics_with_instruments(
+    snapshot: &MetricsSnapshot,
+    instruments: &[OpenTelemetryInstrumentView<'_>],
+) -> Vec<AggregatedMetric> {
     let mut metrics = BTreeMap::<(String, MetricKind), AggregatedMetric>::new();
     for observation in snapshot.observations() {
         let key = (observation.name().to_owned(), observation.kind());
-        let metric = metrics.entry(key).or_insert_with(|| AggregatedMetric {
-            name: observation.name().to_owned(),
-            kind: observation.kind(),
-            counters: BTreeMap::new(),
-            gauges: BTreeMap::new(),
-            histograms: BTreeMap::new(),
+        let metric = metrics.entry(key).or_insert_with(|| {
+            let instrument = instruments
+                .iter()
+                .find(|instrument| instrument.name == observation.name());
+            AggregatedMetric {
+                name: observation.name().to_owned(),
+                kind: observation.kind(),
+                unit: instrument
+                    .map(|instrument| instrument.unit)
+                    .filter(|unit| !unit.is_empty())
+                    .map(ToOwned::to_owned),
+                bucket_boundaries: instrument
+                    .filter(|instrument| instrument.has_usable_buckets())
+                    .map(|instrument| instrument.bucket_boundaries.to_vec())
+                    .unwrap_or_default(),
+                counters: BTreeMap::new(),
+                gauges: BTreeMap::new(),
+                histograms: BTreeMap::new(),
+            }
         });
         let attributes = sorted_owned_attributes(observation.attributes());
         match observation.kind() {
@@ -680,9 +886,25 @@ fn aggregate_metrics(snapshot: &MetricsSnapshot) -> Vec<AggregatedMetric> {
                 metric.gauges.insert(attributes, observation.value());
             }
             MetricKind::Histogram => {
+                // A non-finite observation is dropped rather than summed: one
+                // NaN makes the exported `sum` of the whole series NaN, and
+                // `value <= boundary` is false for every boundary, so it also
+                // lands in the `+Inf` bucket while claiming to be a sample.
+                // Losing one bad observation is the recoverable direction.
+                if !observation.value().is_finite() {
+                    continue;
+                }
+                let boundaries = metric.bucket_boundaries.clone();
                 let summary = metric.histograms.entry(attributes).or_default();
                 summary.count = summary.count.saturating_add(1);
                 summary.sum += observation.value();
+                if !boundaries.is_empty() {
+                    if summary.bucket_counts.len() != boundaries.len() + 1 {
+                        summary.bucket_counts = vec![0; boundaries.len() + 1];
+                    }
+                    let index = histogram_bucket_index(&boundaries, observation.value());
+                    summary.bucket_counts[index] = summary.bucket_counts[index].saturating_add(1);
+                }
             }
         }
     }

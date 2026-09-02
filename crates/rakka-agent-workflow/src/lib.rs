@@ -1,15 +1,18 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Agentic workflow orchestration facade.
+//! The durable agent-workflow execution kernel.
 //!
-//! This crate is intentionally thin in the Phase 0.1 boundary slice. It gives
-//! agent workflow work a home without changing the lower-level reliability
-//! semantics already implemented by `rakka-workflow`.
-//!
-//! The crate owns future first-class agent concepts such as runs, steps,
-//! effects, human checkpoints, telemetry context, audit events, model/tool
-//! adapters, and Kubernetes-scale orchestration helpers.
+//! This crate is the substrate the agent domain (`rakka-agent`) and the A2A
+//! adapter run on: durable inbox and outbox acceptance for agent commands and
+//! effects, the dispatcher fleet with its claim filters and bounded failure
+//! records, timers and triggers, runtime events, the product-neutral compiled
+//! execution IR with its deterministic graph scheduler and durable graph run
+//! state, telemetry context and audit events, and the OTLP bridge that carries
+//! the agent domain's already-aggregated metrics and spans to an application's
+//! exporter. It does not own the visual editor, compiler, auth, billing,
+//! tenant policy, trigger registration, or credential storage, and it never
+//! persists resolved credentials.
 //!
 //! `rakka-workflow` remains the durable inbox/outbox substrate. Core actor,
 //! remote, and sharded delivery remain at-most-once; stronger agent workflow
@@ -127,17 +130,19 @@ pub use definition::{
 pub use dispatcher::{
     agent_dispatch_id, agent_dispatch_timestamp_from_workflow_timestamp,
     agent_dispatch_timestamp_to_workflow_timestamp, agent_dispatcher_fleet_persistence_id,
-    AgentA2APeerEffectDispatcher, AgentDispatchClaim, AgentDispatchClaimBatch,
-    AgentDispatchCompletion, AgentDispatchConcurrencyLimits, AgentDispatchEntry, AgentDispatchJob,
-    AgentDispatchLease, AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherCancellation,
+    bounded_dispatch_detail, AgentA2APeerEffectDispatcher, AgentDispatchClaim,
+    AgentDispatchClaimBatch, AgentDispatchClaimFilter, AgentDispatchCompletion,
+    AgentDispatchConcurrencyLimits, AgentDispatchEntry, AgentDispatchJob, AgentDispatchLease,
+    AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherCancellation,
     AgentDispatcherCycle, AgentDispatcherEntrySnapshot, AgentDispatcherError, AgentDispatcherFleet,
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherRegistration,
     AgentDispatcherResult, AgentDispatcherSnapshot, AgentDispatcherStatusCount,
     AgentDispatcherTargetClassCount, AgentDispatcherWorker, AgentEffectDispatchFuture,
     AgentEffectDispatcher, AgentEffectDispatcherRegistry, AgentModelEffectDispatcher,
     AgentToolEffectDispatcher, AGENT_DISPATCHER_FLEET_PERSISTENCE_PREFIX,
-    DEFAULT_AGENT_DISPATCHER_FLEET_ID, METRIC_AGENT_DISPATCHER_BACKLOG,
-    METRIC_AGENT_DISPATCHER_FLEET, METRIC_AGENT_DISPATCHER_IN_FLIGHT,
+    AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH, DEFAULT_AGENT_DISPATCHER_FLEET_ID,
+    METRIC_AGENT_DISPATCHER_BACKLOG, METRIC_AGENT_DISPATCHER_FLEET,
+    METRIC_AGENT_DISPATCHER_IN_FLIGHT,
 };
 pub use domain::{
     AgentAttributes, AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCancellation,
@@ -227,18 +232,19 @@ pub use migration::{
     CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
 };
 pub use otlp::{
-    AgentOtelInstrumentationScope, AgentOtelResource, AgentOtelSpanEvent, AgentOtelSpanExport,
-    AgentOtelSpanKind, AgentOtelSpanStatus, AgentOtlpBridgeExport, AgentOtlpBridgeReceiver,
-    AgentOtlpError, AgentOtlpExporterConfig, AgentOtlpProtocol, AgentOtlpReceiverFuture,
-    AgentOtlpResult, AgentOtlpSignal, InMemoryAgentOtlpReceiver, DEFAULT_AGENT_OTLP_GRPC_ENDPOINT,
-    DEFAULT_AGENT_OTLP_HTTP_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS,
-    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
-    OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_TIMEOUT, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-    OTEL_RESOURCE_CONTAINER_NAME, OTEL_RESOURCE_DEPLOYMENT_ENVIRONMENT_NAME,
-    OTEL_RESOURCE_K8S_DEPLOYMENT_NAME, OTEL_RESOURCE_K8S_NAMESPACE_NAME,
-    OTEL_RESOURCE_K8S_NODE_NAME, OTEL_RESOURCE_K8S_POD_NAME, OTEL_RESOURCE_K8S_POD_UID,
-    OTEL_RESOURCE_RAKKA_NODE_ID, OTEL_RESOURCE_SERVICE_INSTANCE_ID, OTEL_RESOURCE_SERVICE_NAME,
-    OTEL_RESOURCE_SERVICE_NAMESPACE, OTEL_RESOURCE_SERVICE_VERSION,
+    bounded_export_attributes, AgentOtelInstrumentationScope, AgentOtelResource,
+    AgentOtelSpanEvent, AgentOtelSpanExport, AgentOtelSpanKind, AgentOtelSpanStatus,
+    AgentOtlpBridgeExport, AgentOtlpBridgeReceiver, AgentOtlpError, AgentOtlpExporterConfig,
+    AgentOtlpProtocol, AgentOtlpReceiverFuture, AgentOtlpResult, AgentOtlpSignal,
+    InMemoryAgentOtlpReceiver, AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES, AGENT_EXPORT_MAX_ATTRIBUTES,
+    DEFAULT_AGENT_OTLP_GRPC_ENDPOINT, DEFAULT_AGENT_OTLP_HTTP_ENDPOINT,
+    OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
+    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_TIMEOUT,
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_RESOURCE_CONTAINER_NAME,
+    OTEL_RESOURCE_DEPLOYMENT_ENVIRONMENT_NAME, OTEL_RESOURCE_K8S_DEPLOYMENT_NAME,
+    OTEL_RESOURCE_K8S_NAMESPACE_NAME, OTEL_RESOURCE_K8S_NODE_NAME, OTEL_RESOURCE_K8S_POD_NAME,
+    OTEL_RESOURCE_K8S_POD_UID, OTEL_RESOURCE_RAKKA_NODE_ID, OTEL_RESOURCE_SERVICE_INSTANCE_ID,
+    OTEL_RESOURCE_SERVICE_NAME, OTEL_RESOURCE_SERVICE_NAMESPACE, OTEL_RESOURCE_SERVICE_VERSION,
 };
 pub use outbox::{
     agent_effect_outbox_target, agent_effect_to_outbox_command,
@@ -313,7 +319,7 @@ pub use timers::{
     AGENT_TIMER_PERSISTENCE_PREFIX, DEFAULT_AGENT_TIMER_STORE_ID, METRIC_AGENT_TIMERS,
 };
 pub use trace_context::{
-    agent_child_telemetry_context, agent_durable_resume_telemetry_context,
+    agent_child_telemetry_context, agent_derived_span_id, agent_durable_resume_telemetry_context,
     extract_agent_trace_context, inject_agent_trace_context, parse_agent_trace_context,
     require_agent_trace_context, validate_agent_span_link, validate_agent_telemetry_context,
     AgentTraceContext, AgentTraceError, AgentTraceResult, TRACEPARENT_HEADER, TRACESTATE_HEADER,
@@ -385,9 +391,9 @@ pub mod prelude {
         AgentAutonomyUsage, AgentAutoscalingSignal, AgentAutoscalingSignalRole, AgentCausationId,
         AgentCommand, AgentCommandId, AgentCommandKind, AgentCommandMetadata, AgentCorrelationId,
         AgentDeduplicationKey, AgentDispatchClaim, AgentDispatchClaimBatch,
-        AgentDispatchCompletion, AgentDispatchConcurrencyLimits, AgentDispatchEntry,
-        AgentDispatchId, AgentDispatchIndexEntry, AgentDispatchJob, AgentDispatchLease,
-        AgentDispatchQuery, AgentDispatchStatus, AgentDispatchTargetClass,
+        AgentDispatchClaimFilter, AgentDispatchCompletion, AgentDispatchConcurrencyLimits,
+        AgentDispatchEntry, AgentDispatchId, AgentDispatchIndexEntry, AgentDispatchJob,
+        AgentDispatchLease, AgentDispatchQuery, AgentDispatchStatus, AgentDispatchTargetClass,
         AgentDispatcherCancellation, AgentDispatcherCycle, AgentDispatcherEntrySnapshot,
         AgentDispatcherError, AgentDispatcherFleet, AgentDispatcherFleetSettings,
         AgentDispatcherFleetState, AgentDispatcherRegistration, AgentDispatcherResult,

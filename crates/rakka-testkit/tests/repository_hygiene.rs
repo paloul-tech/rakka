@@ -227,7 +227,36 @@ fn facade_prelude_is_curated() {
         );
     }
 
+    // The agent domain stays out of the prelude; the A2A adapter's service
+    // types are its one feature-gated exception, and the inventory names them.
+    for agent_crate in [
+        "rakka_agent::",
+        "rakka_agent_workflow::",
+        "rakka_a2a::agents",
+    ] {
+        assert!(
+            !prelude.contains(agent_crate),
+            "prelude should not expose the agent domain: {agent_crate}"
+        );
+    }
     let api_inventory = read("docs/rakka-api-boundary-inventory.md");
+    for a2a in [
+        "RakkaA2AHandlerError",
+        "RakkaA2ABuildError",
+        "RakkaA2ARequestHandler",
+        "RakkaA2AService",
+        "RakkaA2AServiceBuilder",
+        "RakkaA2ASettings",
+    ] {
+        assert!(
+            prelude.contains(a2a),
+            "the prelude no longer re-exports {a2a}; update docs/rakka-api-boundary-inventory.md"
+        );
+        assert!(
+            api_inventory.contains(a2a),
+            "docs/rakka-api-boundary-inventory.md does not list the prelude's {a2a}"
+        );
+    }
     assert!(api_inventory.contains("Facade"));
     assert!(api_inventory.contains("Foundation"));
     assert!(api_inventory.contains("Adapter"));
@@ -330,4 +359,154 @@ fn implementation_plans_are_separated_from_product_docs() {
 
     let review = read("docs/rakka-v1-release-candidate-review.md");
     assert!(review.contains("Historical and active implementation plans live under `docs/plans/`"));
+}
+
+/// Every `crates/*` directory, which must also be the workspace's crate member
+/// set.
+fn workspace_crates() -> Vec<String> {
+    let mut crates: Vec<String> = fs::read_dir(repo_root().join("crates"))
+        .expect("crates/ is readable")
+        .map(|entry| entry.expect("a directory entry is readable"))
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    crates.sort();
+    let mut members: Vec<String> = read("Cargo.toml")
+        .lines()
+        .filter_map(|line| {
+            // The last member of a TOML array may omit its trailing comma.
+            let member = line.trim().trim_end_matches(',');
+            member
+                .strip_prefix("\"crates/")
+                .and_then(|rest| rest.strip_suffix('"'))
+                .map(str::to_string)
+        })
+        .collect();
+    members.sort();
+    assert_eq!(
+        crates, members,
+        "every crates/ directory must be a workspace member, and vice versa"
+    );
+    crates
+}
+
+#[test]
+fn crate_inventories_name_every_workspace_crate() {
+    let crates = workspace_crates();
+    assert!(
+        crates.len() > 1,
+        "the crate scan found nothing, so nothing is checked"
+    );
+    for (document, start, end) in [
+        (
+            "docs/rakka-api-boundary-inventory.md",
+            "## Crate Inventory",
+            "## Prelude Inventory",
+        ),
+        (
+            "docs/rakka-v1-api-review.md",
+            "## Crate Map",
+            "## Feature Boundaries",
+        ),
+    ] {
+        let contents = read(document);
+        let table = section_between(&contents, start, end);
+        for name in &crates {
+            assert!(
+                table.contains(&format!("| `{name}` |")),
+                "{document} has no crate row for `{name}`"
+            );
+        }
+        for row in table.lines().filter(|line| line.starts_with("| `")) {
+            let name = row
+                .split('`')
+                .nth(1)
+                .expect("a crate row names its crate in backticks");
+            assert!(
+                crates.iter().any(|known| known == name),
+                "{document} lists `{name}`, which is not a crate in crates/"
+            );
+        }
+    }
+}
+
+/// Every relative link in a Markdown file, as `(link, resolved path)`.
+fn relative_links(relative: &str) -> Vec<(String, PathBuf)> {
+    let contents = read(relative);
+    let directory = repo_root()
+        .join(relative)
+        .parent()
+        .expect("a document has a parent directory")
+        .to_path_buf();
+    let mut links = Vec::new();
+    for chunk in contents.split("](").skip(1) {
+        let Some((target, _)) = chunk.split_once(')') else {
+            continue;
+        };
+        let target = target.split_whitespace().next().unwrap_or("");
+        let (path, _anchor) = target.split_once('#').unwrap_or((target, ""));
+        if path.is_empty() || path.contains("://") || path.starts_with("mailto:") {
+            continue;
+        }
+        links.push((target.to_string(), directory.join(path)));
+    }
+    links
+}
+
+#[test]
+fn documentation_relative_links_resolve() {
+    let mut documents = vec!["README.md".to_string()];
+    let mut docs: Vec<String> = fs::read_dir(repo_root().join("docs"))
+        .expect("docs/ is readable")
+        .map(|entry| entry.expect("a directory entry is readable").path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("md"))
+        .map(|path| format!("docs/{}", path.file_name().unwrap().to_string_lossy()))
+        .collect();
+    docs.sort();
+    documents.extend(docs);
+
+    let mut broken = Vec::new();
+    let mut checked = 0;
+    for document in &documents {
+        for (link, resolved) in relative_links(document) {
+            checked += 1;
+            if !resolved.exists() {
+                broken.push(format!("{document} -> {link}"));
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "no relative link was found, so nothing was checked"
+    );
+    assert!(
+        broken.is_empty(),
+        "relative links that resolve to nothing:\n{}",
+        broken.join("\n")
+    );
+}
+
+#[test]
+fn readme_links_the_agent_documentation_set() {
+    let readme = read("README.md");
+    for document in [
+        "docs/rakka-agents.md",
+        "docs/rakka-agent-recovery-scenarios.md",
+        "docs/rakka-agent-fault-injection-matrix.md",
+        "docs/rakka-agent-security-validation-matrix.md",
+        "docs/rakka-agent-telemetry-validation-matrix.md",
+        "docs/rakka-agent-observability-catalogue.md",
+        "docs/plans/rakka-agent/",
+    ] {
+        assert!(
+            readme.contains(document),
+            "README should point at {document}"
+        );
+        if let Some(file) = document.strip_suffix(".md") {
+            assert!(
+                repo_root().join(format!("{file}.md")).is_file(),
+                "{document} does not exist"
+            );
+        }
+    }
 }

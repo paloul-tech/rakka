@@ -19,6 +19,15 @@ This document records the important limits of the v1 release candidate and the m
 - The repository does not declare a license yet; release packaging must not claim one.
 - Packaging checks are validation-only and offline-only. They do not publish crates or upload artifacts.
 
+## Agent Domain
+
+The agent domain (`docs/rakka-agents.md`) ships outside the publishable crate set, and its open items are recorded where they are checkable rather than repeated here:
+
+- `docs/rakka-agent-security-validation-matrix.md`, "Owed": the guardrail boundaries with no evaluation point, communal retrieval, and the knowledge graph's absent retention, tombstone, and deletion path.
+- `docs/rakka-agent-telemetry-validation-matrix.md`, "Owed" and "Inferred": the segment classes with no production call site, and tail sampling untested against a running two-replica gateway.
+- `docs/rakka-agent-fault-injection-matrix.md`: under "Multi-pod matrix", the team and conversation entities the multi-pod workload registers but does not exercise; under "Production interpretation", a PostgreSQL arm for the shared substrate and detected rather than announced departure.
+- `docs/rakka-agent-recovery-scenarios.md`, "What the roster does not claim".
+
 ## Post-V1 Roadmap
 
 Likely post-v1 work:

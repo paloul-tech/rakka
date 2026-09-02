@@ -151,7 +151,8 @@ async fn ingress_world(chain: AgentGuardrailChain, memories: &[(&str, &str)]) ->
         AgentRunMemory::new(session, snapshots.clone())
             .with_private_store(private.clone())
             .with_retrieval(AgentMemoryRetrieval::new(
-                Arc::new(InMemoryPrivateMemoryRetriever::new(private)),
+                Arc::new(InMemoryPrivateMemoryRetriever::new(private.clone())),
+                private,
                 chain,
             )),
     );
@@ -359,6 +360,17 @@ async fn an_oversized_or_artifact_transform_is_a_deterministic_drop() {
 
     let session = Arc::new(InMemorySessionMemoryStore::new());
     let snapshots = Arc::new(InMemoryContextSnapshotStore::new());
+    // The ranking names an identity; the authoritative store answers it, so
+    // the artifact-backed record has to actually be in the store.
+    let private = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    private
+        .upsert(
+            &scope,
+            &behind_artifact,
+            rakka_agent::PrivateMemoryExpectation::Absent,
+        )
+        .await
+        .expect("the artifact-backed memory seeds");
     let scripted = ScriptedPrivateMemoryRetriever::new().with_outcome(MemoryRetrievalOutcome {
         memories: vec![RetrievedPrivateMemory {
             memory: behind_artifact,
@@ -375,6 +387,7 @@ async fn an_oversized_or_artifact_transform_is_a_deterministic_drop() {
     let fx = Fixture::new(dispatcher).with_memory(
         AgentRunMemory::new(session, snapshots.clone()).with_retrieval(AgentMemoryRetrieval::new(
             Arc::new(scripted),
+            private,
             ingress_chain(Arc::new(ScriptedRule(AgentGuardrailOutcome::Transform {
                 content: serde_json::json!("rewritten reference"),
                 reason_code: "rewrite".to_string(),
@@ -399,12 +412,19 @@ async fn an_oversized_or_artifact_transform_is_a_deterministic_drop() {
     );
 }
 
-/// The slice 2.1 deferral flip: a mandatory stage bound only to the
-/// memory-ingress boundary now satisfies dispatch coverage, because the
-/// boundary has a live evaluation point (the retrieval flow) and
-/// `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` says so.
+/// The slice 2.1 deferral flip: the memory-ingress boundary has a live
+/// evaluation point (the retrieval flow), so
+/// `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` names it and a mandatory
+/// memory-ingress-only stage *can* satisfy coverage.
+///
+/// Whether it does at any particular deployment is a separate question, and
+/// no longer this file's: an authority counts the boundary only once the
+/// deployment attests that its retrieval bundle carries the same declared
+/// chain, which `memory_guardrail_chain_consistency.rs` owns. What is
+/// asserted here is the runtime-wide claim — that an evaluation point exists
+/// at all.
 #[tokio::test]
-async fn a_memory_ingress_only_mandatory_stage_now_satisfies_coverage() {
+async fn a_memory_ingress_only_mandatory_stage_can_satisfy_coverage() {
     assert!(
         AGENT_EVALUATED_GUARDRAIL_BOUNDARIES.contains(&AgentGuardrailBoundary::MemoryIngress),
         "slice 2.2 declares the memory-ingress evaluation point"
@@ -426,7 +446,7 @@ async fn a_memory_ingress_only_mandatory_stage_now_satisfies_coverage() {
     chain
         .validate_covers(&required, &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES)
         .expect(
-            "a memory-ingress-only mandatory stage satisfies coverage now that \
+            "a memory-ingress-only mandatory stage can satisfy coverage now that \
              the retrieval flow evaluates the boundary — the slice 2.1 refusal flipped",
         );
 }

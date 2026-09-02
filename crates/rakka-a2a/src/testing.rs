@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use a2a::{AgentCapabilities, AgentCard, AgentInterface, TRANSPORT_PROTOCOL_HTTP_JSON};
+use a2a::{AgentCapabilities, AgentCard, TRANSPORT_PROTOCOL_HTTP_JSON};
 use rakka_agent_workflow::{
     AgentCommandKind, AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus,
     AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentTenantId, AgentTimestampMillis,
@@ -71,7 +71,7 @@ pub fn fixture_agent_card() -> AgentCard {
         name: "Rakka A2A fixture agent".to_string(),
         description: "In-memory A2A adapter fixture for tests.".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        supported_interfaces: vec![AgentInterface::new(
+        supported_interfaces: vec![crate::protocol::pinned_interface(
             "http://127.0.0.1:0/a2a",
             TRANSPORT_PROTOCOL_HTTP_JSON,
         )],

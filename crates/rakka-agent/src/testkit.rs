@@ -1542,10 +1542,12 @@ where
     policies: AgentEffectPolicies,
     memory: Arc<Mutex<Option<AgentRunMemory>>>,
     decisions: Arc<Mutex<Option<Arc<dyn AgentDecisionEventSink>>>>,
+    segments: Arc<Mutex<Option<Arc<dyn crate::observability::AgentSegmentSink>>>>,
     metrics: Arc<Mutex<Option<Arc<dyn MetricsRecorder>>>>,
     delegation: Arc<Mutex<Option<crate::delegation::AgentRunDelegationConfig>>>,
     workflow_tools: Arc<Mutex<Option<crate::workflow_tool::AgentRunWorkflowConfig>>>,
     faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    deliveries: Arc<AtomicUsize>,
     acceptances: Arc<AtomicUsize>,
 }
 
@@ -1563,10 +1565,12 @@ where
             policies: self.policies.clone(),
             memory: self.memory.clone(),
             decisions: self.decisions.clone(),
+            segments: self.segments.clone(),
             metrics: self.metrics.clone(),
             delegation: self.delegation.clone(),
             workflow_tools: self.workflow_tools.clone(),
             faults: self.faults.clone(),
+            deliveries: self.deliveries.clone(),
             acceptances: self.acceptances.clone(),
         }
     }
@@ -1593,12 +1597,25 @@ where
             policies: AgentEffectPolicies::default(),
             memory: Arc::new(Mutex::new(None)),
             decisions: Arc::new(Mutex::new(None)),
+            segments: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(None)),
             delegation: Arc::new(Mutex::new(None)),
             workflow_tools: Arc::new(Mutex::new(None)),
             faults: Arc::new(Mutex::new(VecDeque::new())),
+            deliveries: Arc::new(AtomicUsize::new(0)),
             acceptances: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// How many deliveries this transport was asked to make.
+    ///
+    /// Counted before an injected fault can swallow the envelope, so a test can
+    /// tell a fault that fired from one queued on a transport the envelope
+    /// never travelled — a delivery driven around this transport increments
+    /// nothing here, however much durable state it changes.
+    #[must_use]
+    pub fn deliveries(&self) -> usize {
+        self.deliveries.load(Ordering::SeqCst)
     }
 
     /// Wires every run entity this transport builds with a session-memory
@@ -1626,6 +1643,15 @@ where
             .decisions
             .lock()
             .expect("the decision slot should not be poisoned") = Some(sink);
+    }
+
+    /// Wires every run entity this transport builds with a bounded-segment
+    /// sink, under the same shared-slot rule as [`Self::install_memory`].
+    pub fn install_segments(&self, sink: Arc<dyn crate::observability::AgentSegmentSink>) {
+        *self
+            .segments
+            .lock()
+            .expect("the segment slot should not be poisoned") = Some(sink);
     }
 
     /// Wires every run entity this transport builds with a metrics recorder,
@@ -1705,6 +1731,9 @@ where
         envelope: &'a AgentExchangeEnvelope,
     ) -> AgentExchangeDeliveryFuture<'a> {
         let fault = self.take_fault();
+        // Counted before the fault can swallow the envelope, so a test can tell
+        // "the fault fired" from "nothing was ever delivered here".
+        self.deliveries.fetch_add(1, Ordering::SeqCst);
 
         Box::pin(async move {
             if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
@@ -1739,6 +1768,14 @@ where
                 .clone();
             if let Some(decisions) = decisions {
                 entity = entity.with_decision_events(decisions);
+            }
+            let segments = self
+                .segments
+                .lock()
+                .expect("the segment slot should not be poisoned")
+                .clone();
+            if let Some(segments) = segments {
+                entity = entity.with_segments(segments);
             }
             let metrics = self
                 .metrics
@@ -2965,6 +3002,9 @@ where
     policies: AgentEffectPolicies,
     workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
+    segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
+    metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
+    decisions: Option<Arc<dyn crate::observability::AgentDecisionEventSink>>,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -2988,6 +3028,9 @@ where
             policies: AgentEffectPolicies::default(),
             workflow_tools: None,
             delegation: None,
+            segments: None,
+            metrics: None,
+            decisions: None,
         }
     }
 
@@ -3007,6 +3050,56 @@ where
         config: crate::workflow_tool::AgentRunWorkflowConfig,
     ) -> Self {
         self.workflow_tools = Some(config);
+        self
+    }
+
+    /// Wires the entity this delivery drives with a bounded-segment sink.
+    ///
+    /// Delivering a durable result *advances the loop* — it is what discharges
+    /// a wait, folds a turn, and opens the next checkpoint — so this driver
+    /// closes segments as much as the entity a caller drives directly. Every
+    /// driver of a run must share one wiring, the same rule session memory and
+    /// decision events already follow: an unwired driver silently closes
+    /// nothing for every transition it commits.
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn crate::observability::AgentSegmentSink>) -> Self {
+        self.segments = Some(sink);
+        self
+    }
+
+    /// Wires the entity this delivery drives with a metrics recorder.
+    ///
+    /// The same rule as [`Self::with_segments`], one field over, and it was
+    /// missed: delivering a durable result folds the turn and settles the
+    /// effect, so this driver is where `rakka.agent.turn.duration`,
+    /// `rakka.agent.model.tokens`, `rakka.agent.effect.outcomes`, and
+    /// `rakka.agent.effect.outstanding.duration` are recorded. An unwired
+    /// delivery records **none** of them while the sharded entity beside it
+    /// reports a healthy metric surface — which is exactly how a 17.12 clause
+    /// can read "implemented" and publish nothing. Found by the telemetry
+    /// export walk, whose exported metric set was missing every instrument
+    /// this path owns.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn rakka_core::MetricsRecorder>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Wires the entity this delivery drives with a decision-event sink.
+    ///
+    /// The third field to need this and the third to have been missed. The
+    /// delivered model result *is* the deciding transition of a model turn —
+    /// it is the only place the turn's decision is recorded — so a sharded
+    /// registration wired with `with_decision_events` while the delivery
+    /// beside it is not writes no specification-17.7 record for exactly the
+    /// turns a model answered, and counts no `rakka.agent.decisions`. Both
+    /// halves read as wired; neither reports the gap.
+    #[must_use]
+    pub fn with_decision_events(
+        mut self,
+        sink: Arc<dyn crate::observability::AgentDecisionEventSink>,
+    ) -> Self {
+        self.decisions = Some(sink);
         self
     }
 
@@ -3040,6 +3133,15 @@ where
             }
             if let Some(config) = &self.delegation {
                 entity = entity.with_delegation(config.clone());
+            }
+            if let Some(segments) = &self.segments {
+                entity = entity.with_segments(segments.clone());
+            }
+            if let Some(metrics) = &self.metrics {
+                entity = entity.with_metrics(metrics.clone());
+            }
+            if let Some(decisions) = &self.decisions {
+                entity = entity.with_decision_events(decisions.clone());
             }
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity
@@ -3261,6 +3363,7 @@ impl AgentEffectReconciler for ScriptedReconciler {
 #[derive(Clone)]
 pub struct ScriptedCredentialResolver {
     token: String,
+    failure: Option<(String, String)>,
     resolutions: Arc<AtomicUsize>,
 }
 
@@ -3270,11 +3373,29 @@ impl ScriptedCredentialResolver {
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
+            failure: None,
             resolutions: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// How many bindings have been resolved.
+    /// A resolver that always fails with `code` and `message`.
+    ///
+    /// The message stands in for what a real resolver quotes back from a
+    /// secret store, which is why it exists: the failure path — not the happy
+    /// path — is where an application-supplied string reaches a durable
+    /// record, so proving the runtime does not persist it needs a resolver
+    /// that fails.
+    #[must_use]
+    pub fn failing(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            token: String::new(),
+            failure: Some((code.into(), message.into())),
+            resolutions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// How many bindings have been resolved — attempted, whether the
+    /// resolution succeeded or failed.
     #[must_use]
     pub fn resolutions(&self) -> usize {
         self.resolutions.load(Ordering::SeqCst)
@@ -3299,9 +3420,145 @@ impl AgentEffectCredentialResolver for ScriptedCredentialResolver {
     ) -> AgentDispatchFuture<'a, AgentEphemeralCredential> {
         Box::pin(async move {
             self.resolutions.fetch_add(1, Ordering::SeqCst);
+            if let Some((code, message)) = self.failure.as_ref() {
+                return Err(crate::dispatch::AgentDispatchError::collaborator(
+                    code.clone(),
+                    message.clone(),
+                ));
+            }
             Ok(AgentEphemeralCredential::bearer_token(self.token.clone()))
         })
     }
+}
+
+/// Captures every `tracing` event this process emits, so a test can assert
+/// what a structured log carries.
+///
+/// Structured logs are the one observability surface with no in-process reader
+/// of its own: metrics have a recorder, decision events have a sink, and spans
+/// are persisted context — but a `tracing::warn!` goes nowhere a test can see.
+/// A secret-exclusion sweep that skipped them would be asserting about every
+/// surface except the one a developer reaches for first.
+///
+/// Implemented directly against the `tracing` facade rather than through
+/// `tracing-subscriber`, which the workspace does not depend on: `tracing`
+/// re-exports [`tracing::Subscriber`], [`tracing::Event`],
+/// [`tracing::Metadata`], and [`tracing::field::Visit`], which is everything a
+/// capture needs. Adding a dependency for a two-line log surface would not pay
+/// for itself.
+///
+/// The subscriber installs *globally* and once per process
+/// ([`Self::install_global`]). A thread-local default would be tidier, but its
+/// guard is `!Send` and would have to be held across `.await` points inside a
+/// `#[tokio::test]` — which happens to work on the current-thread runtime and
+/// is a trap for whoever changes the runtime next. One global buffer shared by
+/// the binary's tests is the honest trade: each test drains what it needs.
+#[derive(Clone, Default)]
+pub struct CapturingSubscriber {
+    events: Arc<Mutex<Vec<String>>>,
+    next_span: Arc<AtomicU64>,
+}
+
+impl CapturingSubscriber {
+    /// Installs the capture as this process's global subscriber, returning a
+    /// handle onto its buffer.
+    ///
+    /// Idempotent: a second call returns a handle onto the buffer the first
+    /// installed, because a process may set a global default only once.
+    #[must_use]
+    pub fn install_global() -> Self {
+        static INSTALLED: std::sync::OnceLock<CapturingSubscriber> = std::sync::OnceLock::new();
+        INSTALLED
+            .get_or_init(|| {
+                let subscriber = Self::default();
+                // A prior global default is not an error here: it means
+                // something else in this binary already installed one, and
+                // the buffer simply stays empty rather than the test aborting.
+                let _ = tracing::subscriber::set_global_default(subscriber.clone());
+                subscriber
+            })
+            .clone()
+    }
+
+    /// Every event captured so far, rendered as
+    /// `target|level|message|field=value,...`.
+    #[must_use]
+    pub fn events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .expect("the capture buffer should not be poisoned")
+            .clone()
+    }
+
+    /// Drops everything captured so far.
+    pub fn clear(&self) {
+        self.events
+            .lock()
+            .expect("the capture buffer should not be poisoned")
+            .clear();
+    }
+}
+
+impl Debug for CapturingSubscriber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapturingSubscriber")
+            .field("events", &self.events().len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Renders one event's fields into `key=value` pairs.
+#[derive(Default)]
+struct CapturedFields {
+    message: String,
+    fields: Vec<String>,
+}
+
+impl tracing::field::Visit for CapturedFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+    }
+}
+
+impl tracing::Subscriber for CapturingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        // Ids are opaque and must be non-zero; the capture holds no span
+        // state, so a monotonic counter is the whole implementation.
+        tracing::span::Id::from_u64(self.next_span.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = CapturedFields::default();
+        event.record(&mut visitor);
+        let metadata = event.metadata();
+        let rendered = format!(
+            "{}|{}|{}|{}",
+            metadata.target(),
+            metadata.level(),
+            visitor.message,
+            visitor.fields.join(",")
+        );
+        self.events
+            .lock()
+            .expect("the capture buffer should not be poisoned")
+            .push(rendered);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 /// A workflow clock over a shared atomic counter, so a test can advance time

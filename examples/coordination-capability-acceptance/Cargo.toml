@@ -21,8 +21,8 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-a2a = { package = "a2a-lf", version = "0.3.0" }
-a2a-server = { package = "a2a-server-lf", version = "0.4.0", default-features = false }
+a2a.workspace = true
+a2a-server.workspace = true
 rakka-a2a = { path = "../../crates/rakka-a2a", features = ["agents"] }
 rakka-agent = { path = "../../crates/rakka-agent" }
 rakka-agent-workflow = { path = "../../crates/rakka-agent-workflow" }

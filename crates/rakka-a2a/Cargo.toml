@@ -29,7 +29,18 @@ http = ["server", "dep:rakka-http"]
 # Kubernetes drain/readiness integration helpers.
 k8s = ["dep:rakka-k8s"]
 # Trace-context propagation and OpenTelemetry-compatible attribute helpers.
-otel = []
+# The OpenTelemetry GenAI convention mapping for the A2A edge: the ingress
+# `SERVER` span the agent domain's adapter defers to the protocol adapter, and
+# the attribute helpers that go with it. Trace-context propagation is *not*
+# gated — it is unconditional on every ingress and egress path, because gating
+# it would remove trace continuity from a default build.
+#
+# It implies `agents`, and must. The non-`?` form `rakka-agent/otel` activates
+# the optional dependency without activating `agents`, so the whole agent
+# domain compiled in while `pub mod agents` stayed off and
+# `RakkaAgentA2AService` — the only producer of an ingress segment — did not
+# exist: the feature compiled a mapping module for spans nothing could emit.
+otel = ["agents", "rakka-agent/otel"]
 # In-memory stores, fixtures, and compatibility probes for application tests.
 testkit = ["server"]
 # Typed Rakka Agent surface over `rakka-agent` entities: `AgentTaskId` task
@@ -38,8 +49,8 @@ testkit = ["server"]
 agents = ["server", "dep:rakka-agent"]
 
 [dependencies]
-a2a = { package = "a2a-lf", version = "0.3.0" }
-a2a-server = { package = "a2a-server-lf", version = "0.4.0", default-features = false }
+a2a.workspace = true
+a2a-server.workspace = true
 async-trait = "0.1"
 axum = { workspace = true, optional = true }
 chrono = "0.4"
