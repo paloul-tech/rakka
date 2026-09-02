@@ -23,8 +23,8 @@ default = []
 postgres = ["dep:rakka-persistence-postgres", "dep:tokio-postgres", "rakka/postgres"]
 
 [dependencies]
-a2a = { package = "a2a-lf", version = "0.3.0" }
-a2a-server = { package = "a2a-server-lf", version = "0.4.0", default-features = false }
+a2a.workspace = true
+a2a-server.workspace = true
 axum.workspace = true
 rakka = { path = "../../crates/rakka", default-features = false, features = [
     "agent-workflow",

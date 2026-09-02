@@ -88,6 +88,25 @@ Rakka does not automatically diff Protobuf descriptors in v1. Schema compatibili
 - **Runs that were already terminal when version 2 shipped need a one-time repair.** The stamp is written under the already-terminal guard that makes it once-only, so a run that had already reached a terminal status never re-enters the transition that would give it one: its retention is refused (`terminal-time-unknown`) permanently, and its session rows and context snapshots are never purged. `AgentRunTerminalStampBackfill` (`rakka-agent`) stamps those records from their own `updated_at`, which for a terminal run is never earlier than the true terminal time, so a repaired deadline falls at or after the real one — retained longer than required, never purged early. It is opt-in, idempotent, and compare-and-set against the revision it read, so a raced record reports `conflicted` instead of being clobbered. **Run it once the fleet is fully on version-2 binaries, not during the rolling update:** a repaired record carries version 2, which a version-1 peer fails closed on. A migration is complete when a pass over the same scopes reports `conflicted: 0` and `stamped: 0`.
 - The PostgreSQL A2A schema evolves additively within a release: new tables, new nullable/defaulted columns, and new indexes only, applied by an idempotent, advisory-lock-guarded migration so N and N+1 pods share the schema during rolling updates.
 
+## Agent Domain
+
+The agent domain — `rakka-agent-workflow`, `rakka-agent`, `rakka-agent-postgres`, `rakka-agent-knowledge-graph`, `rakka-agent-knowledge-graph-postgres`, and the `rakka-a2a` `agents` feature — adds compatibility commitments of its own on top of the A2A adapter's above. The tables in this section are held to the code by `cargo test -p rakka-agent --features otel --test compatibility_currency` and, for the A2A protocol row, by `rakka-a2a`'s own unit tests: a row that disagrees with a constant or a manifest fails validation, in either direction.
+
+### Pinned dependencies
+
+The reviewed pins behind the agent surface. A bump in any of them is a reviewed decision under the specification section named in the last column, never a side effect of a dependency refresh.
+
+| Dependency | Pin | Declared in | Bump policy |
+| --- | --- | --- | --- |
+| `A2A protocol` | `1.0` | `rakka_a2a::protocol::A2A_PROTOCOL_VERSION`, stamped on every interface of the agent card | Held equal to the SDK's `a2a::VERSION` by a unit test. A wire-version move is the specification 20 review: a bridged or retained older surface needs a documented state/operation mapping and explicit negotiation. |
+| `a2a-lf` | `0.3.0` | `Cargo.toml` `[workspace.dependencies]`, imported as `a2a` | Minor-level pin. An SDK minor bump is a semver-visible change of `rakka-a2a`, because SDK request/response types appear in its public API; a patch bump is not. |
+| `a2a-server-lf` | `0.4.0` | `Cargo.toml` `[workspace.dependencies]`, imported as `a2a-server` without default features | Same policy as `a2a-lf`; no TLS provider is forced on applications. |
+| `rig-core` | `=0.37.0` | `crates/rakka-agent/Cargo.toml`, behind the `rig` feature | Exact pin. An upgrade that changes request, tool-call, message, or serialized-run semantics is an adapter compatibility review and a serialized-artifact review (specification 20); the adapter's own semantics version is `CURRENT_AGENT_LOOP_ADAPTER_VERSION`, and moving it is an explicit migration. |
+| `opentelemetry` | `=0.29.0` | `Cargo.toml` `[workspace.dependencies]`, used only by the `publish = false` export example | Exact pin, chosen by an API boundary: 0.29 is the last generation whose `metrics::data` types an application can construct. Upgrading is a design change under specification 17.17 and 17.20. |
+| `GenAI semantic conventions` | `1.36.0` | `rakka_agent::AGENT_GENAI_CONVENTION_REVISION`, stamped into every exported batch's instrumentation scope | Specification 17.20 review; never a durable agent-state migration. |
+| `opentelemetry-collector-contrib (agent)` | `0.159.0` | `docs/plans/rakka-agent/kubernetes-agent-otel-collector-topology.yaml` | Revalidation procedure in [`rakka-agent-telemetry-validation-matrix.md`](rakka-agent-telemetry-validation-matrix.md). |
+| `opentelemetry-collector-contrib (workflow)` | `0.107.0` | `docs/plans/agentic-workflow/kubernetes-otel-collector-topology.yaml` | Deliberately not advanced with the agent tier; its own plan owns it. |
+
 ## Kubernetes Rolling Updates
 
 Recommended sequence:
