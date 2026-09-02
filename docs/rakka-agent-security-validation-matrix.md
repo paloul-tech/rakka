@@ -192,6 +192,18 @@ inside the mutator, and is what that arrangement was verified for.
   scrubbed embedded content would make the immutable tier mutable — and bounded
   by the retention window, 30 days by default. Both the exposure and its bound
   are proven in `memory_retention.rs` rather than left as a footnote.
+- **The generic workflow outbox still persists an unbounded failure
+  message.** The 512-byte bound this slice put on every persisted attempt
+  detail lives in the agent substrate
+  (`rakka_agent_workflow::AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH`, which
+  `AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH` aliases) and covers the fleet
+  index and every agent-domain outbox row. `rakka-workflow`'s own
+  `record_outbox_failure`, reached by `dispatch_due_outbox` on the non-agent
+  path, still stores the application's message as `last_error` unchanged.
+  Left deliberately: that path is a v1 compatibility surface shared by every
+  workflow consumer, and bounding it is a substrate decision with its own
+  compatibility note, not an agent-domain fix. Until it is taken, a non-agent
+  workflow's outbox row carries whatever its dispatcher chose to say.
 
 ## One contract, every backend
 
