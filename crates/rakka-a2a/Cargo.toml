@@ -49,8 +49,8 @@ testkit = ["server"]
 agents = ["server", "dep:rakka-agent"]
 
 [dependencies]
-a2a = { package = "a2a-lf", version = "0.3.0" }
-a2a-server = { package = "a2a-server-lf", version = "0.4.0", default-features = false }
+a2a.workspace = true
+a2a-server.workspace = true
 async-trait = "0.1"
 axum = { workspace = true, optional = true }
 chrono = "0.4"

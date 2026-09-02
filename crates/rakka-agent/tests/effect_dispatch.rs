@@ -2,7 +2,9 @@
 //! injected at every durable boundary.
 //!
 //! Specification: sections 11.3 through 11.6; scenarios 5 through 9 of
-//! section 18, and the dispatch invariants of 11.4. The run's effects travel
+//! section 18, the generation half of scenario 10, the dispatcher-restart
+//! half of scenario 23, the effect half of scenario 57, and the dispatch
+//! invariants of 11.4. The run's effects travel
 //! the production path here: committed into the run's durable state, flushed
 //! as dispatch tickets into the agent-workflow outbox, leased and fenced by
 //! the dispatcher fleet, invoked through the model adapter and tool executor,

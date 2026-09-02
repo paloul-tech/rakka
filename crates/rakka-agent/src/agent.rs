@@ -661,6 +661,9 @@ fn validate_loaded_state(
     policy.check_record(state)?;
     policy.check_record(&state.definition)?;
     policy.check_record(&state.settings)?;
+    if let Some(admission) = &state.admission {
+        policy.check_record(admission)?;
+    }
     Ok(())
 }
 

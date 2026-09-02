@@ -71,6 +71,13 @@ recorded with the falsification that proves its test is load-bearing.
 | Collector distribution (workflow domain) | `otel/opentelemetry-collector-contrib:0.107.0` | `plans/agentic-workflow/kubernetes-otel-collector-topology.yaml` |
 | GenAI semantic conventions | `1.36.0` | `AGENT_GENAI_CONVENTION_REVISION` |
 
+These four rows are the telemetry half of the agent domain's pinned-dependency
+matrix. The whole matrix — these beside the A2A protocol, the A2A SDK, and Rig
+— is the `Pinned dependencies` table of
+[`rakka-compatibility.md`](rakka-compatibility.md), which a test holds to the
+manifests and constants; this table is kept here for the rationale that
+follows it.
+
 **The SDK pin is chosen by two constraints that agree**, and it is worth
 recording because the obvious reading — "take the newest" — is wrong here:
 

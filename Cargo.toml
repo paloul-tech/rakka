@@ -61,6 +61,17 @@ readme = "README.md"
 license-file = "LICENSE"
 
 [workspace.dependencies]
+# The A2A SDK crates, imported under the short names `a2a` and `a2a-server`.
+# `package = "a2a-lf"` lives here because a member inherits the rename and
+# cannot re-specify it; likewise `default-features = false` must sit on the
+# workspace entry, since a member's own is ignored. One declaration keeps
+# `rakka-a2a` and its five example consumers on one SDK generation. The pin
+# policy (minor-level, unlike the exact OpenTelemetry pins below) is stated
+# once, in `rakka-a2a`'s crate doc under "A2A SDK version policy", and both
+# pins are recorded in `docs/rakka-compatibility.md`; tests hold the crate doc
+# and the document to the versions on the two lines below.
+a2a = { package = "a2a-lf", version = "0.3.0" }
+a2a-server = { package = "a2a-server-lf", version = "0.4.0", default-features = false }
 axum = { version = "0.8", features = ["ws"] }
 etcd-client = { version = "0.19", default-features = false }
 futures-util = "0.3"

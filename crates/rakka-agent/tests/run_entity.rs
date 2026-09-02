@@ -1,6 +1,7 @@
 //! The run entity and its durable loop.
 //!
-//! Specification: sections 6.5, 9.3, 9.4, 9.5, and 15; scenario 2 of section 18.
+//! Specification: sections 6.5, 9.3, 9.4, 9.5, and 15; scenarios 2 and 10 of
+//! section 18.
 //! A run must survive an actor restart after *every* loop transition and resume
 //! from what it durably persisted — never by replaying a model call it already
 //! made, and never by waiting forever on an effect it forgot to dispatch.

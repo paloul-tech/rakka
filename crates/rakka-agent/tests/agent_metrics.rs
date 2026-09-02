@@ -1,7 +1,7 @@
 //! Bounded `rakka.agent.*` metrics, driven through the run entity.
 //!
 //! Specification: section 17.12 and the slice 1.13 metric-vocabulary
-//! resolution. The agent domain measures its own durable transitions —
+//! resolution; the metric half of scenario 25 of section 18. The agent domain measures its own durable transitions —
 //! decisions, loop transitions, effect outcomes, recoveries — and the
 //! substrate keeps measuring the substrate under `rakka.agent_workflow.*`.
 //! Every label key comes from a bounded vocabulary and every value from a

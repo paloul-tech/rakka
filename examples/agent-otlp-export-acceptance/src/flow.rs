@@ -1,5 +1,6 @@
 //! The export walk: one real sharded run, exported over OTLP, asserted on the
-//! decoded protobuf an OTLP receiver was handed.
+//! decoded protobuf an OTLP receiver was handed — scenario 25 of section 18
+//! re-proven on the wire.
 
 use std::collections::{BTreeSet, HashMap};
 

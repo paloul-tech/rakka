@@ -604,3 +604,64 @@ fn the_kind_vocabulary_is_injective_across_the_scopes_that_share_a_label() {
         "team/team-task-closed"
     );
 }
+
+/// The replay is the load path of the coordination logs: an entry whose schema
+/// version the policy refuses is not handed to a reader with guessed
+/// semantics, whichever store held it.
+#[tokio::test]
+async fn an_entry_from_a_newer_binary_fails_the_replay_closed() {
+    let fx = coordinated_world().await;
+    let scope = AgentEntityAddress::Conversation(conversation_scope());
+
+    // The same log, re-appended into a fresh store with its first entry
+    // stamped one schema version ahead of what this binary writes.
+    let doctored_store = InMemoryAgentConversationHistoryStore::new();
+    let current = rakka_agent::AgentRecordKind::ConversationHistoryEntry
+        .current_schema_version()
+        .get();
+    let mut doctored_one = false;
+    for entry in rakka_agent::AgentConversationHistoryStore::read(
+        &fx.conversation_history,
+        &conversation_scope(),
+        rakka_agent::AgentConversationHistoryCursor::start().with_limit(64),
+    )
+    .await
+    .expect("the source log reads")
+    .entries
+    {
+        let entry = if doctored_one {
+            entry
+        } else {
+            doctored_one = true;
+            let mut value = serde_json::to_value(&entry).expect("the entry serializes");
+            assert_eq!(
+                value["schema_version"],
+                serde_json::json!(current),
+                "the doctored path must reach the entry's schema version"
+            );
+            value["schema_version"] = serde_json::json!(current + 1);
+            serde_json::from_value(value).expect("the doctored entry deserializes")
+        };
+        rakka_agent::AgentConversationHistoryStore::append(
+            &doctored_store,
+            &conversation_scope(),
+            &entry,
+        )
+        .await
+        .expect("the store accepts the append");
+    }
+    assert!(doctored_one, "the fixture's log has an entry to doctor");
+
+    let sources = AgentCoordinationSources::new(&fx.history, &fx.team_history, &doctored_store);
+    let error = sources
+        .replay(&tenant(), &scope, None, 64)
+        .await
+        .expect_err("an entry from a newer binary must not be replayed");
+    assert_eq!(error.code(), "schema-version-ahead");
+
+    // The untouched logs still replay through the same sources.
+    sources
+        .replay(&tenant(), &AgentEntityAddress::Team(team_scope()), None, 64)
+        .await
+        .expect("the team log is unaffected");
+}

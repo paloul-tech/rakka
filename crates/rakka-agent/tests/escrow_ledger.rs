@@ -1,6 +1,6 @@
 //! The escrow budget ledger, end to end across the task and run entities.
 //!
-//! Specification: section 9.7, and scenario 61 of section 18. A task debits a
+//! Specification: section 9.7, and scenarios 52 and 61 of section 18. A task debits a
 //! run's allocation from its own ledger inside the assignment transition; the
 //! run charges only its own ledger; and when the run reaches a terminal outcome
 //! it settles what it consumed and returns what it did not, both as deduplicated

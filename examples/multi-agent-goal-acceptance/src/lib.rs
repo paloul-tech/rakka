@@ -13,9 +13,9 @@
 //! asserts the transcript verbatim plus the typed facts behind it, so the
 //! README's documented stdout cannot rot.
 //!
-//! Cancellation propagation is deliberately not a walk beat: scenarios 29,
-//! 31, and 33 prove it in `rakka-agent`'s own suite, and the goal view's
-//! cancellation surface is pinned by `tests/goal_view.rs` there.
+//! Cancellation propagation is deliberately not a walk beat: `rakka-agent`'s
+//! own suite proves it (specification 18, items 29, 31, and 33), and the goal
+//! view's cancellation surface is pinned by `tests/goal_view.rs` there.
 
 #![forbid(unsafe_code)]
 

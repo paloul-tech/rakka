@@ -65,7 +65,13 @@
 //! applications; enable one through your own `a2a-server-lf` dependency if
 //! you serve TLS in-process. The crate follows the workspace MSRV
 //! (Rust 1.85, pinned by `rust-toolchain.toml`); SDK upgrades that raise the
-//! MSRV are deferred until the workspace MSRV moves.
+//! MSRV are deferred until the workspace MSRV moves. Both pins are declared
+//! once, in the workspace manifest's `[workspace.dependencies]`, and every
+//! consumer inherits them. The A2A wire protocol version the SDK implements is
+//! pinned separately as [`protocol::A2A_PROTOCOL_VERSION`], stamped on every
+//! interface of the card the adapter builds (a card handed to the service
+//! builder is stamped by whoever built it), and held equal to the SDK's own
+//! constant by a test; `docs/rakka-compatibility.md` records all three.
 
 pub mod auth;
 pub mod catalog;

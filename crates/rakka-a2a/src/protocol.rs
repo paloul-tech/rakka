@@ -10,12 +10,41 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use a2a::{Message, TaskPushNotificationConfig};
+use a2a::{AgentInterface, Message, TaskPushNotificationConfig};
 use rakka_agent_workflow::{AgentTimestampMillis, ArtifactRef};
 use serde::{Deserialize, Serialize};
 
 use crate::mapping::{A2ACommandDraft, A2ATaskIntent};
 use crate::task::{A2ATaskEvent, A2ATaskProjection};
+
+/// The A2A wire protocol version this adapter advertises and is reviewed
+/// against.
+///
+/// It is stamped explicitly on every `AgentInterface` of the card the adapter
+/// builds, so the version a client reads is the one Rakka pinned rather than
+/// whatever the SDK's constructor defaulted to. It is distinct from
+/// [`A2A_RUN_PROTOCOL_VERSION`], which versions Rakka's own owner protocol
+/// between ingress nodes and sharded owners and never leaves the cluster.
+///
+/// Held equal to the SDK's `a2a::VERSION` by a unit test rather than aliasing
+/// it: an SDK upgrade that moves the wire version fails that test, which is
+/// the specification 20 review point — a bridged or retained older surface
+/// needs a documented compatibility matrix and explicit negotiation, never
+/// accidental mixed-version behavior. The pin is recorded in
+/// `docs/rakka-compatibility.md`.
+pub const A2A_PROTOCOL_VERSION: &str = "1.0";
+
+/// An agent-card interface carrying [`A2A_PROTOCOL_VERSION`] rather than the
+/// version the SDK's constructor defaults to. The two agree today and a test
+/// holds them equal; stamping it explicitly is what makes the card advertise
+/// Rakka's reviewed version rather than inherit one. Every interface the
+/// adapter's card builder produces, and the test fixture card, go through it.
+#[must_use]
+pub fn pinned_interface(url: impl Into<String>, transport: impl Into<String>) -> AgentInterface {
+    let mut interface = AgentInterface::new(url, transport);
+    interface.protocol_version = A2A_PROTOCOL_VERSION.to_string();
+    interface
+}
 
 /// Current adapter-owned inter-node protocol version.
 pub const A2A_RUN_PROTOCOL_VERSION: u32 = 1;
@@ -421,5 +450,90 @@ impl A2ARunFailure {
             A2ARunFailureKind::Unsupported,
             false,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::A2A_PROTOCOL_VERSION;
+
+    #[test]
+    fn the_advertised_protocol_version_is_the_sdk_s() {
+        assert_eq!(
+            A2A_PROTOCOL_VERSION,
+            a2a::VERSION,
+            "the SDK implements a different A2A wire version than the one this adapter \
+             pins; this is the specification 20 review, not a constant to update"
+        );
+    }
+
+    /// A repository file read at runtime rather than `include_str!`: this
+    /// crate is in the publishable set, and a packaged crate carries no
+    /// `docs/` or workspace manifest.
+    fn repository_file(relative: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
+
+    /// The backticked tokens of one Markdown table cell, in order.
+    fn backticked(cell: &str) -> Vec<&str> {
+        cell.split('`').skip(1).step_by(2).collect()
+    }
+
+    #[test]
+    fn the_compatibility_document_pins_the_advertised_protocol_version() {
+        // Parsed the way rakka-agent's compatibility_currency parses the same
+        // table — cells trimmed — rather than matched as one exact substring,
+        // so a table reformat cannot fail one test and pass the other.
+        let document = repository_file("../../docs/rakka-compatibility.md");
+        let row = document
+            .lines()
+            .find(|line| {
+                line.split('|')
+                    .nth(1)
+                    .is_some_and(|cell| backticked(cell) == ["A2A protocol"])
+            })
+            .expect("docs/rakka-compatibility.md carries the `A2A protocol` pinned-dependency row");
+        let pin = row.split('|').nth(2).map(backticked).unwrap_or_default();
+        assert_eq!(
+            pin,
+            [A2A_PROTOCOL_VERSION],
+            "the `A2A protocol` row pins a different version than the adapter advertises"
+        );
+    }
+
+    /// The crate doc states the SDK pin policy with the pinned minors spelled
+    /// out (`a2a-lf 0.3.x`, `a2a-server-lf 0.4.x`); those two spellings are
+    /// held to the workspace manifest, which is the one place the pins live.
+    #[test]
+    fn the_crate_doc_names_the_pinned_sdk_minors() {
+        let manifest = repository_file("../../Cargo.toml");
+        let crate_doc = include_str!("lib.rs");
+        for (dependency, package) in [("a2a", "a2a-lf"), ("a2a-server", "a2a-server-lf")] {
+            let line = manifest
+                .lines()
+                .find(|line| line.starts_with(&format!("{dependency} = {{")))
+                .unwrap_or_else(|| panic!("the workspace manifest declares {dependency}"));
+            let version = line
+                .split_once("version = \"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(version, _)| version)
+                .unwrap_or_else(|| panic!("{dependency} carries a quoted version"));
+            let (major, rest) = version
+                .split_once('.')
+                .expect("a version has a major component");
+            let minor = rest
+                .split('.')
+                .next()
+                .expect("a version has a minor component");
+            let spelled = format!("`{package} {major}.{minor}.x`");
+            assert!(
+                crate_doc.contains(&spelled),
+                "the crate doc's SDK version policy must name {spelled}, the minor the manifest pins"
+            );
+        }
     }
 }

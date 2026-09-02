@@ -1406,6 +1406,54 @@ async fn a_wake_policy_revision_from_a_newer_binary_fails_closed_on_load() {
     assert_eq!(error.code(), "schema-version-ahead");
 }
 
+#[tokio::test]
+async fn an_escrow_ledger_from_a_newer_binary_fails_closed_on_load() {
+    // The escrow ledger is a component of the task record with its own schema
+    // version, and every assignment, settlement, and return rewrites it. A
+    // ledger written by a newer binary must therefore be refused at load,
+    // not read with this binary's semantics and rewritten without the field
+    // it could not see.
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(creation(Vec::new())),
+        })
+        .await,
+    );
+
+    let persistence_id = task_scope().persistence_id();
+    let record = fx
+        .tasks
+        .load(&persistence_id)
+        .await
+        .expect("the task record loads")
+        .expect("the task record exists");
+    let current = rakka_agent::AgentRecordKind::EscrowLedger
+        .current_schema_version()
+        .get();
+    let mut value = serde_json::to_value(&record.state).expect("the state serializes");
+    let stored = &mut value["task"]["escrow"]["schema_version"];
+    assert_eq!(
+        *stored,
+        serde_json::json!(current),
+        "the doctored path must reach the ledger's schema version"
+    );
+    *stored = serde_json::json!(current + 1);
+    let doctored: AgentTaskState =
+        serde_json::from_value(value).expect("the doctored state deserializes");
+    fx.tasks
+        .compare_and_set(&persistence_id, record.revision, doctored)
+        .await
+        .expect("the doctored state persists");
+
+    let error = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect_err("an escrow ledger from a newer binary must fail closed");
+    assert_eq!(error.code(), "schema-version-ahead");
+}
+
 #[test]
 fn a_record_persisted_before_the_goal_mode_field_loads_as_finite() {
     let mut value = serde_json::to_value(creation(Vec::new())).expect("the creation serializes");
