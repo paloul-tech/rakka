@@ -1,7 +1,7 @@
 //! The authoritative operational snapshot and the session view.
 //!
-//! Specification: section 17.18; scenarios 21 and 56 of section 18. The
-//! snapshot is derived from the durable run record alone and returns the
+//! Specification: section 17.18; scenarios 21 and 56 of section 18, and the
+//! projection clause of scenario 57. The snapshot is derived from the durable run record alone and returns the
 //! durable state revision it read, so it stays correct — lifecycle, waits,
 //! budget, effects, cancellation — when telemetry is sampled, delayed,
 //! dropped, or entirely unavailable, and when the entity is passivated
@@ -571,6 +571,60 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
         "every retained decision is shown; only the hole is absent"
     );
     assert_eq!(gapped.snapshot, view.snapshot);
+
+    // An event whose schema version this binary does not read is never
+    // interpreted with guessed semantics: the view treats the sink as
+    // unavailable and the authoritative half is untouched, while the replay
+    // entry point — the same load path — refuses it outright.
+    let current = rakka_agent::AgentRecordKind::DecisionEvent
+        .current_schema_version()
+        .get();
+    let ahead = Arc::new(InMemoryAgentDecisionEventSink::new());
+    for (index, event) in sink.events(&run_scope()).iter().enumerate() {
+        let event = if index == 1 {
+            let mut value = serde_json::to_value(event).expect("the event serializes");
+            assert_eq!(
+                value["schema_version"],
+                serde_json::json!(current),
+                "the doctored path must reach the event's schema version"
+            );
+            value["schema_version"] = serde_json::json!(current + 1);
+            serde_json::from_value(value).expect("the doctored event deserializes")
+        } else {
+            event.clone()
+        };
+        ahead
+            .append(&run_scope(), &event)
+            .await
+            .expect("the sink accepts the append");
+    }
+    let refused = assemble_agent_session_view(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        Some(ahead.as_ref()),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the view assembles")
+    .expect("the run exists");
+    assert!(
+        !refused.decisions_available,
+        "an event from a newer binary makes the projection unavailable"
+    );
+    assert!(refused.decisions.is_empty());
+    assert_eq!(refused.snapshot, view.snapshot);
+    let error = rakka_agent::replay_run_coordination_events(
+        Some(ahead.as_ref()),
+        &rakka_agent::AgentEntityAddress::Run(run_scope()),
+        None,
+        16,
+        0,
+        &AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect_err("the replay refuses an event from a newer binary");
+    assert_eq!(error.code(), "schema-version-ahead");
 }
 
 fn cancel_operation_id(label: &str) -> rakka_agent::AgentOperationId {

@@ -1,7 +1,9 @@
 //! The tool authority layers over the real dispatch pipeline.
 //!
 //! Specification: sections 11.7, 11.8, and 16; scenarios 44 and 54 of
-//! section 18. Every test drives the production path: the run commits the
+//! section 18, with scenario 13's revocation swept under owner loss and
+//! scenario 7's idempotency-key contract re-proven under run-owner loss.
+//! Every test drives the production path: the run commits the
 //! effect intent, the ticket reaches the durable outbox, the dispatcher
 //! fleet leases it — and the [`rakka_agent::AgentDispatchAuthority`] decides,
 //! before durable `Started`, whether the attempt may invoke anything.

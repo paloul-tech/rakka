@@ -59,8 +59,13 @@ fn backticked(cell: &str) -> Vec<String> {
 }
 
 /// Table rows whose first cell is backticked: `(key, remaining cells)`.
+///
+/// A key may appear once. The callers collect rows into a map, which would
+/// keep the last row for a key and silently pass a table carrying a stale row
+/// above a current one — the shape a version bump or a merge leaves behind —
+/// so duplicates fail here, where every row is still visible.
 fn table_rows(section: &str) -> Vec<(String, Vec<String>)> {
-    let mut rows = Vec::new();
+    let mut rows: Vec<(String, Vec<String>)> = Vec::new();
     for line in section.lines() {
         let Some(body) = line.strip_prefix("| `") else {
             continue;
@@ -73,6 +78,10 @@ fn table_rows(section: &str) -> Vec<(String, Vec<String>)> {
             .into_iter()
             .next()
             .expect("a row's first cell is backticked");
+        assert!(
+            rows.iter().all(|(held, _)| held != &key),
+            "the table carries more than one row for `{key}`"
+        );
         rows.push((key, cells[1..].to_vec()));
     }
     assert!(
@@ -94,7 +103,8 @@ fn manifest_section(manifest: &str, table: &str) -> String {
 }
 
 /// `dependency = "x"` or `dependency = { …, key = "x", … }` inside a manifest
-/// section, read as the value of `key`.
+/// section, read as the value of `key`. A quoted value is returned without its
+/// quotes; a bare one (`default-features = false`) as written.
 fn manifest_value(manifest: &str, dependency: &str, key: &str) -> String {
     let line = manifest
         .lines()
@@ -103,7 +113,7 @@ fn manifest_value(manifest: &str, dependency: &str, key: &str) -> String {
     let (_, value) = line
         .split_once(" = ")
         .expect("a dependency line has a value");
-    let quoted = if value.trim_start().starts_with('{') {
+    let raw = if value.trim_start().starts_with('{') {
         let (_, after_key) = value
             .split_once(&format!("{key} = "))
             .unwrap_or_else(|| panic!("`{dependency}` declares no `{key}`"));
@@ -115,11 +125,20 @@ fn manifest_value(manifest: &str, dependency: &str, key: &str) -> String {
         );
         value
     };
-    quoted
-        .split_once('"')
-        .and_then(|(_, rest)| rest.split_once('"'))
-        .map(|(inner, _)| inner.to_string())
-        .unwrap_or_else(|| panic!("`{dependency}`'s `{key}` is not a quoted string"))
+    let raw = raw.trim_start();
+    if let Some(rest) = raw.strip_prefix('"') {
+        return rest
+            .split_once('"')
+            .map(|(inner, _)| inner.to_string())
+            .unwrap_or_else(|| panic!("`{dependency}`'s `{key}` has an unterminated string"));
+    }
+    let bare = raw
+        .split([',', '}'])
+        .next()
+        .map(str::trim)
+        .filter(|bare| !bare.is_empty())
+        .unwrap_or_else(|| panic!("`{dependency}`'s `{key}` has no value"));
+    bare.to_string()
 }
 
 /// The one Collector image tag a topology pins, asserting every occurrence agrees.
@@ -137,27 +156,14 @@ fn collector_tag(relative: &str) -> String {
     tags[0].clone()
 }
 
-/// A knowledge-graph schema constant, read from its source because the crate
-/// DAG forbids `rakka-agent` from depending on the graph crate.
-fn knowledge_graph_schema_version(relative: &str, constant: &str) -> u32 {
-    let source = read(relative);
-    let (_, rest) = source
-        .split_once(&format!("pub const {constant}:"))
-        .unwrap_or_else(|| panic!("{relative} declares no {constant}"));
-    let statement = rest
-        .split_once(';')
-        .map(|(statement, _)| statement)
-        .unwrap_or(rest);
-    let (_, after_new) = statement
-        .split_once("new(")
-        .unwrap_or_else(|| panic!("{constant} is not built with `new(`"));
-    after_new
-        .split_once(')')
-        .and_then(|(digits, _)| digits.trim().parse().ok())
-        .unwrap_or_else(|| panic!("{constant} does not wrap an integer literal"))
-}
+/// The crate whose rows this test cannot see: the DAG forbids `rakka-agent`
+/// from depending on the graph crate, so `rakka-agent-knowledge-graph`'s own
+/// `compatibility_currency` test holds its rows to its constants and labels.
+/// Here they are required to exist and to belong to that crate, nothing more.
+const KNOWLEDGE_GRAPH_CRATE: &str = "rakka-agent-knowledge-graph";
 
-/// Every schema version the code declares, keyed the way the document keys it.
+/// Every schema version this test can see the code declare, keyed the way the
+/// document keys it.
 fn declared_schema_versions() -> BTreeMap<String, (String, u32)> {
     let mut declared = BTreeMap::new();
     for kind in AgentRecordKind::ALL {
@@ -188,26 +194,6 @@ fn declared_schema_versions() -> BTreeMap<String, (String, u32)> {
             ("rakka-agent-workflow".to_string(), version),
         );
     }
-    declared.insert(
-        "claim".to_string(),
-        (
-            "rakka-agent-knowledge-graph".to_string(),
-            knowledge_graph_schema_version(
-                "crates/rakka-agent-knowledge-graph/src/claim.rs",
-                "CURRENT_CLAIM_SCHEMA_VERSION",
-            ),
-        ),
-    );
-    declared.insert(
-        "claim-trust-transition".to_string(),
-        (
-            "rakka-agent-knowledge-graph".to_string(),
-            knowledge_graph_schema_version(
-                "crates/rakka-agent-knowledge-graph/src/transition.rs",
-                "CURRENT_CLAIM_TRUST_TRANSITION_SCHEMA_VERSION",
-            ),
-        ),
-    );
     declared
 }
 
@@ -223,6 +209,14 @@ fn declared_pins() -> BTreeMap<String, String> {
     assert_eq!(
         manifest_value(&workspace, "a2a-server", "package"),
         "a2a-server-lf"
+    );
+    // The `a2a-server-lf` row promises that no TLS provider is forced on
+    // applications; that promise is the one `default-features = false` on
+    // the workspace line, which every member inherits, so it is held here.
+    assert_eq!(
+        manifest_value(&workspace, "a2a-server", "default-features"),
+        "false",
+        "a2a-server must be imported without default features"
     );
     let opentelemetry = manifest_value(&workspace, "opentelemetry", "version");
     for sibling in [
@@ -294,16 +288,25 @@ fn every_durable_record_schema_version_is_documented_and_current() {
             "record {key} is documented as {documented:?} but the code declares {expected:?}"
         );
     }
-    for key in documented.keys() {
+    let mut knowledge_graph_rows = 0;
+    for (key, (crate_name, _)) in &documented {
+        if crate_name == KNOWLEDGE_GRAPH_CRATE {
+            knowledge_graph_rows += 1;
+            continue;
+        }
         assert!(
             declared.contains_key(key),
             "the document lists record {key}, which the code does not declare"
         );
     }
+    assert!(
+        knowledge_graph_rows > 0,
+        "the knowledge graph's rows are missing; its own compatibility_currency test holds their values"
+    );
     assert_eq!(
-        documented.len(),
-        AgentRecordKind::ALL.len() + 3 + 2,
-        "the row count must equal every record kind the three crates declare"
+        documented.len() - knowledge_graph_rows,
+        AgentRecordKind::ALL.len() + 3,
+        "the row count must equal every record kind the two crates declare"
     );
 }
 
@@ -347,6 +350,7 @@ fn the_tests_section_names_the_commands_that_hold_the_tables() {
     let tests = section(COMPATIBILITY, "## Tests");
     for command in [
         "cargo test -p rakka-agent --features otel --test compatibility_currency",
+        "cargo test -p rakka-agent-knowledge-graph --test compatibility_currency",
         "cargo test -p rakka-agent --test recovery_scenario_roster",
         "cargo test -p rakka-testkit --test repository_hygiene",
     ] {

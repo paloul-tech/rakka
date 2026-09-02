@@ -13,13 +13,17 @@ too" — stated as a table so that it can be checked rather than believed.
 The table is held to the tree by
 `cargo test -p rakka-agent --test recovery_scenario_roster`: the rows number
 exactly the scenarios the specification lists, each row's milestone is the one
-the specification binds, every cited file exists and cites the scenario it is
-rostered for, the multi-pod rows and only they cite the multi-pod harness, and
+the specification binds, every cited file exists and its module doc cites the
+scenario it is rostered for, the multi-pod rows and only they cite the multi-pod harness, and
 the multi-pod set agrees with the
 [fault-injection matrix](rakka-agent-fault-injection-matrix.md), which remains
 the authority for *why* a scenario needs that fidelity. In the other direction,
-a test file whose module doc cites a scenario must appear in that scenario's
-row, so a proof cannot exist unrostered.
+a file whose module doc cites a scenario must appear in that scenario's row —
+the scan reads every agent-domain crate's tests, every example's sources and
+tests, and every directory the roster cites — so a proof cannot exist
+unrostered. Both directions read the module doc and nothing else: the roster
+test does not read test bodies, where a passing remark about a scenario is not
+a claim to prove it.
 
 ## Reading the table
 
@@ -48,7 +52,7 @@ row, so a proof cannot exist unrostered.
 | 6 | M1 | in-process | `crates/rakka-agent/tests/effect_dispatch.rs` | Dispatcher loss after `Started` retries a read-only effect under policy. |
 | 7 | M1 | in-process | `crates/rakka-agent/tests/effect_dispatch.rs`, `crates/rakka-agent/tests/tool_authority.rs` | Dispatcher loss after `Started` reuses the same idempotency key for an idempotent effect. |
 | 8 | M1 | in-process | `crates/rakka-agent/tests/effect_dispatch.rs` | Dispatcher loss after `Started` reconciles a reconcileable effect before any retry. |
-| 9 | M1 | in-process | `crates/rakka-agent/tests/effect_dispatch.rs`, `crates/rakka-agent/tests/tool_authority.rs` | Dispatcher loss in the ambiguous non-idempotent window produces exactly one durable `Indeterminate` outcome and no automatic re-invocation. |
+| 9 | M1 | in-process | `crates/rakka-agent/tests/effect_dispatch.rs` | Dispatcher loss in the ambiguous non-idempotent window produces exactly one durable `Indeterminate` outcome and no automatic re-invocation. |
 | 10 | M1 | in-process | `crates/rakka-agent/tests/effect_dispatch.rs`, `crates/rakka-agent/tests/run_entity.rs` | Duplicate or stale tool/model completions do not advance twice. |
 | 11 | M1 | in-process | `crates/rakka-agent/tests/checkpoints.rs`, `crates/rakka-agent/tests/checkpoint_run.rs`, `crates/rakka-agent/tests/checkpoint_reconciliation.rs` | Duplicate human/authorization decisions do not resume twice. |
 | 12 | M1 | in-process | `crates/rakka-agent/tests/checkpoints.rs` | A changed effect digest invalidates an old approval: a grant is bound to the exact intent's digest. |
@@ -56,8 +60,8 @@ row, so a proof cannot exist unrostered.
 | 14 | M1 | in-process | `crates/rakka-agent/tests/memory_store_contract.rs`, `crates/rakka-agent/tests/session_memory.rs`, `crates/rakka-agent-postgres/tests/memory_conformance.rs` | Short-term memory is isolated by both `AgentId` and `AgentRunId`, on every backend through one conformance suite. |
 | 15 | M2 | in-process | `crates/rakka-agent/tests/private_memory_promotion.rs`, `crates/rakka-agent/tests/memory_store_contract.rs`, `crates/rakka-agent-postgres/tests/memory_conformance.rs` | Concurrent runs append private memory without stale overwrite. |
 | 16 | M2 | in-process | `crates/rakka-agent/tests/private_memory_promotion.rs`, `crates/rakka-agent/tests/session_memory.rs`, `crates/rakka-agent/tests/memory_store_contract.rs`, `crates/rakka-agent-postgres/tests/memory_conformance.rs`, `crates/rakka-agent-knowledge-graph/tests/knowledge_graph_conformance.rs` | Replayed memory and graph writes are idempotent. |
-| 17 | M1 | in-process | `crates/rakka-agent/tests/session_memory.rs`, `crates/rakka-agent/tests/private_memory_retrieval.rs`, `crates/rakka-agent/tests/memory_retention.rs` | A model-effect retry uses the original memory context snapshot. |
-| 18 | M2 | in-process | `crates/rakka-agent/tests/private_memory_promotion.rs`, `crates/rakka-agent/tests/memory_store_contract.rs`, `crates/rakka-agent/tests/memory_scope_fence.rs`, `crates/rakka-agent/tests/tenant_isolation.rs`, `crates/rakka-agent/tests/private_memory_retrieval.rs`, `crates/rakka-agent-knowledge-graph/tests/knowledge_graph_conformance.rs` | Unauthorized graph/private-memory reads do not reveal existence. |
+| 17 | M1 | in-process | `crates/rakka-agent/tests/session_memory.rs`, `crates/rakka-agent/tests/private_memory_retrieval.rs` | A model-effect retry uses the original memory context snapshot. |
+| 18 | M2 | in-process | `crates/rakka-agent/tests/private_memory_promotion.rs`, `crates/rakka-agent/tests/memory_store_contract.rs`, `crates/rakka-agent/tests/memory_scope_fence.rs`, `crates/rakka-agent/tests/tenant_isolation.rs`, `crates/rakka-agent/tests/private_memory_retrieval.rs`, `crates/rakka-agent-knowledge-graph/tests/knowledge_graph_conformance.rs`, `crates/rakka-agent-postgres/tests/memory_conformance.rs` | Unauthorized graph/private-memory reads do not reveal existence. |
 | 19 | M1 | in-process | `crates/rakka-agent/tests/terminal_run_recovery.rs` | Terminal run recovery does not reschedule completed effects. |
 | 20 | M2 | in-process | `crates/rakka-agent-knowledge-graph/tests/knowledge_graph_conformance.rs`, `crates/rakka-agent-knowledge-graph-postgres/tests/postgres_conformance.rs` | Every communal graph backend passes the same conformance suite without changing agent-domain code. The PostgreSQL arm is gated on `RAKKA_POSTGRES_TEST_DSN`. |
 | 21 | M1 | in-process | `crates/rakka-agent/tests/operational_query.rs`, `crates/rakka-agent/tests/decision_events.rs` | Ingress, decisions, model calls, effect scheduling, dispatcher attempts, tool calls, waits, recovery, and terminal outcomes are reconstructable as one authorized session view by `AgentRunId`. |
@@ -68,7 +72,7 @@ row, so a proof cannot exist unrostered.
 | 26 | M1 | in-process | `crates/rakka-agent/tests/trace_scenarios.rs`, `examples/agent-otlp-export-acceptance/tests/exporter_failure.rs` | An unavailable Collector/exporter path blocks no correctness and produces bounded queue/drop/failure visibility — proven against a real exporter and a socket nothing answers. |
 | 27 | M4 | in-process | `crates/rakka-agent/tests/fan_out_fan_in.rs`, `crates/rakka-agent/tests/fan_in_recovery.rs` | A root run durably fans out to specialists, passivates, and deterministically resumes and fans in after restart or shard movement. |
 | 28 | M4 | in-process | `crates/rakka-a2a/tests/collaboration_surface.rs`, `crates/rakka-agent/tests/delegation_record.rs`, `crates/rakka-agent/tests/fan_in_recovery.rs` | Replaying a delegation command or A2A send creates exactly one logical child task/run or an explicit conflict. |
-| 29 | M4 | in-process | `crates/rakka-agent/tests/cancellation_propagation.rs`, `crates/rakka-agent/tests/cancellation_recovery.rs`, `examples/multi-agent-goal-acceptance/src/lib.rs` | Root, parent, or dispatcher crashes do not replay a child's opaque non-idempotent effect; ambiguity stays indeterminate in the child. |
+| 29 | M4 | in-process | `crates/rakka-agent/tests/cancellation_propagation.rs`, `crates/rakka-agent/tests/cancellation_recovery.rs` | Root, parent, or dispatcher crashes do not replay a child's opaque non-idempotent effect; ambiguity stays indeterminate in the child. |
 | 30 | M4 | in-process | `crates/rakka-agent/tests/goal_evaluation.rs` | A root goal becomes `Satisfied` only after the current success-criteria revision is evaluated against durable evidence. |
 | 31 | M4 | in-process | `crates/rakka-agent/tests/cancellation_propagation.rs`, `crates/rakka-agent/tests/cancellation_recovery.rs` | Cancellation, deadline, and immediate revocation propagate durably to children without falsely claiming their started effects stopped. |
 | 32 | M4 | in-process | `crates/rakka-agent/tests/workflow_tool.rs` | Replaying a workflow-tool invocation creates or adopts one durable child workflow run and duplicates none of its internal effects. |
@@ -92,14 +96,14 @@ row, so a proof cannot exist unrostered.
 | 50 | M3 | in-process | `crates/rakka-agent/tests/wake_coalescing.rs` | The default overlap policy coalesces concurrent triggers while exactly one epoch owns execution; the default downtime policy admits at most one coalesced epoch. |
 | 51 | M3 | in-process | `crates/rakka-agent/tests/epoch_memory.rs` | Continuous epochs use distinct finite task/run short-term-memory scopes and recover cross-epoch continuity only from authorized shared state. |
 | 52 | M1 | in-process | `crates/rakka-agent/tests/escrow_ledger.rs`, `crates/rakka-agent/tests/goal_budget.rs` | Budget allocation/reservation/settlement survives restart and concurrency without oversubscription; a `Started` attempt that becomes `Indeterminate` still consumes its attempt budget. |
-| 53 | M1 | in-process | `crates/rakka-agent/tests/autonomy_admission.rs`, `crates/rakka-agent/tests/wait_invalidation.rs`, `crates/rakka-agent/tests/tool_authority.rs` | Unattended execution fails closed when admission is missing or expired, or a settings update widens an unadmitted scope. |
+| 53 | M1 | in-process | `crates/rakka-agent/tests/autonomy_admission.rs`, `crates/rakka-agent/tests/wait_invalidation.rs` | Unattended execution fails closed when admission is missing or expired, or a settings update widens an unadmitted scope. |
 | 54 | M1 | in-process | `crates/rakka-agent/tests/tool_authority.rs`, `crates/rakka-agent/tests/executor_isolation.rs` | A model-visible tool call stays undispatchable when its binding, grant, credential, checkpoint, execution-policy, or immediate safety check fails. |
 | 55 | M1 | in-process | `crates/rakka-agent/tests/task_bounded_state.rs` | Bounded task materialized state stays within configured limits; older history and content are reachable only through authorized cursors or artifact references. |
 | 56 | M1 | in-process | `crates/rakka-agent/tests/operational_query.rs` | Authoritative lifecycle/wait/wake/budget/effect/cancellation queries stay correct when telemetry is sampled, delayed, dropped, or unavailable. |
 | 57 | M1 | in-process | `crates/rakka-agent/tests/effect_dispatch.rs`, `crates/rakka-agent/tests/checkpoints.rs`, `crates/rakka-agent/tests/checkpoint_reconciliation.rs`, `crates/rakka-agent/tests/operational_query.rs` | Cancellation with an ambiguous consequential effect fences all new work, stays nonterminal in reconciliation, and projects terminal cancellation only after the outcome is explicitly resolved. |
 | 58 | M1 | in-process | `crates/rakka-agent/tests/choreography.rs` | Replaying any section 9.8 inter-entity exchange produces one logical transition per operation id on both entities. |
-| 59 | M1 | in-process | `crates/rakka-agent/tests/run_result_exchange.rs`, `crates/rakka-agent/tests/task_results.rs`, `crates/rakka-agent/tests/choreography.rs` | Loss of the run or task at any point in the result exchange converges without a second validation, a duplicate completion, or a lost rejection. |
-| 60 | M1 | in-process + multi-pod | `crates/rakka-agent/tests/choreography_cluster.rs`, `crates/rakka-agent/tests/stale_owner_fencing.rs`, `examples/multi-pod-agent-fault-soak/src/lib.rs` | Cross-entity commands between colocated entities traverse durable outbox/inbox acceptance and stay correct after the entities move to different nodes. The in-process arm needs a loopback bind and skips itself where the sandbox refuses one; the multi-pod arm is where the movement is a real pod loss. |
+| 59 | M1 | in-process | `crates/rakka-agent/tests/run_result_exchange.rs`, `crates/rakka-agent/tests/choreography.rs` | Loss of the run or task at any point in the result exchange converges without a second validation, a duplicate completion, or a lost rejection. |
+| 60 | M1 | in-process + multi-pod | `crates/rakka-agent/tests/choreography_cluster.rs`, `examples/multi-pod-agent-fault-soak/src/lib.rs` | Cross-entity commands between colocated entities traverse durable outbox/inbox acceptance and stay correct after the entities move to different nodes. The in-process arm needs a loopback bind and skips itself where the sandbox refuses one; the multi-pod arm is where the movement is a real pod loss. |
 | 61 | M1 | in-process | `crates/rakka-agent/tests/escrow_ledger.rs`, `crates/rakka-agent/tests/choreography.rs` | Dispatch-time budget reservation touches only the run's own ledger; replaying an allocation, settlement, or return never double-debits or double-credits a parent scope. |
 
 ## What the roster does not claim

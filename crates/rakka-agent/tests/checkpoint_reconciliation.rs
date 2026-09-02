@@ -1,10 +1,10 @@
 //! Run-side reconciliation checkpoints: the durable wait on an ambiguous
 //! effect, and the full specification 12.5 decision set applied through it.
 //!
-//! Specification: sections 12.1, 12.2, and 12.5; scenarios 3 (the
-//! reconciliation wait passivates and resumes), 11 (duplicate decisions do not
-//! resume twice), and 57 (terminal cancellation only after the outcome is
-//! resolved) of section 18. An effect whose outcome cannot be established
+//! Specification: sections 12.1, 12.2, and 12.5; scenarios 3, 11, and 57 of
+//! section 18 — the reconciliation wait passivates and resumes (3), duplicate
+//! decisions do not resume twice (11), and terminal cancellation comes only
+//! after the outcome is resolved (57). An effect whose outcome cannot be established
 //! parks the run behind an `IndeterminateEffectReconciliation` checkpoint in
 //! the same transition that recorded the ambiguity; every decision of the
 //! specification 12.5 set — and only that set — resolves it.

@@ -4729,6 +4729,10 @@ impl AgentExchangeState for AgentTaskState {
         policy.check_record(self)?;
         if let Some(task) = &self.task {
             policy.check_record(&task.definition)?;
+            // The ledger is rewritten by every assignment, settlement, and
+            // return; a version this binary cannot see is a field the next
+            // compare-and-set would erase.
+            policy.check_record(&task.escrow)?;
             if let Some(spec) = task.goal_mode.continuous() {
                 policy.check_record(&spec.wake_policy)?;
             }

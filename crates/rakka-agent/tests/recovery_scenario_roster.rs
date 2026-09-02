@@ -120,15 +120,58 @@ fn roster_rows(markdown: &str) -> Vec<Row> {
     rows
 }
 
-/// The milestone specification 18's opening paragraph binds a scenario to.
-fn milestone_for(scenario: u32) -> &'static str {
-    match scenario {
-        15 | 16 | 18 | 20 => "M2",
-        36 | 47..=51 => "M3",
-        27..=34 | 39 => "M4",
-        38 | 41..=43 | 45 => "M5",
-        _ => "M1",
+/// The milestones specification 18's opening paragraph binds scenarios to,
+/// read from the paragraph itself rather than copied out of it: every
+/// `scenarios … bind at M<n>` clause names its scenarios, and the
+/// `All other scenarios … bind at M<n>` clause supplies the default returned
+/// beside the map.
+fn milestone_bindings(spec: &str) -> (BTreeMap<u32, String>, String) {
+    let section = spec
+        .split_once("## 18. Required Recovery Scenarios")
+        .map(|(_, rest)| rest)
+        .expect("the specification has section 18");
+    let paragraph = section
+        .split("\n\n")
+        .find(|paragraph| paragraph.contains("bind at M"))
+        .expect("section 18 opens with the paragraph binding scenarios to milestones");
+    let paragraph = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut bound: BTreeMap<u32, String> = BTreeMap::new();
+    let mut default = None;
+    for clause in paragraph.split([';', '.']) {
+        let Some((scenarios, rest)) = clause.split_once("bind at M") else {
+            continue;
+        };
+        let number: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        assert!(
+            !number.is_empty(),
+            "a binding clause names no milestone number: {clause:?}"
+        );
+        let milestone = format!("M{number}");
+        if scenarios.contains("All other scenarios") {
+            assert!(
+                default.replace(milestone).is_none(),
+                "the paragraph has two default clauses"
+            );
+            continue;
+        }
+        let cited = cited_scenarios(scenarios);
+        assert!(
+            !cited.is_empty(),
+            "a binding clause names no scenario: {clause:?}"
+        );
+        for scenario in cited {
+            assert!(
+                bound.insert(scenario, milestone.clone()).is_none(),
+                "the paragraph binds scenario {scenario} twice"
+            );
+        }
     }
+    assert!(
+        !bound.is_empty(),
+        "the paragraph binds no scenario to a later milestone"
+    );
+    let default = default.expect("the paragraph binds all other scenarios to a milestone");
+    (bound, default)
 }
 
 /// How many numbered items specification 18 lists.
@@ -151,25 +194,12 @@ fn spec_scenario_count(spec: &str) -> usize {
         .count()
 }
 
-/// Source text with comment markers stripped and lines joined, so a citation
-/// that wraps across doc-comment lines reads as one sentence.
-fn normalise(source: &str) -> String {
-    source
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            trimmed
-                .strip_prefix("//!")
-                .or_else(|| trimmed.strip_prefix("///"))
-                .or_else(|| trimmed.strip_prefix("//"))
-                .unwrap_or(trimmed)
-                .trim()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Only the leading `//!` block of a test file.
+/// Only the leading `//!` block of a test file, joined so a citation that
+/// wraps across doc-comment lines reads as one sentence.
+///
+/// This is the one place a proof declares what it proves, and both directions
+/// of the roster check read it — never the body, where `// unlike scenario 12`
+/// in a comment would otherwise stand in for a citation.
 fn module_doc(source: &str) -> String {
     source
         .lines()
@@ -292,6 +322,43 @@ fn fault_matrix_multi_pod_subset(matrix: &str) -> BTreeSet<u32> {
     subset
 }
 
+/// Every directory the reverse check reads: the agent-domain crates' test
+/// directories, every example's sources and tests, and every directory the
+/// roster itself cites — so a file the roster can reach for is a file whose
+/// module doc is read back, and a proof cannot cite a scenario unrostered.
+fn scanned_directories(rows: &[Row]) -> BTreeSet<String> {
+    let mut directories: BTreeSet<String> = [
+        "crates/rakka-agent/tests/",
+        "crates/rakka-a2a/tests/",
+        "crates/rakka-agent-postgres/tests/",
+        "crates/rakka-agent-knowledge-graph/tests/",
+        "crates/rakka-agent-knowledge-graph-postgres/tests/",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let examples = repo_root().join("examples");
+    for entry in fs::read_dir(&examples).expect("the examples directory is readable") {
+        let path = entry.expect("an example entry is readable").path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        for subdirectory in ["src", "tests"] {
+            if path.join(subdirectory).is_dir() {
+                directories.insert(format!("examples/{name}/{subdirectory}/"));
+            }
+        }
+    }
+    for row in rows {
+        for proof in &row.proofs {
+            if let Some((directory, _)) = proof.path.rsplit_once('/') {
+                directories.insert(format!("{directory}/"));
+            }
+        }
+    }
+    directories
+}
+
 fn test_files(relative_dir: &str) -> Vec<(String, String)> {
     let dir = repo_root().join(relative_dir);
     let mut files = Vec::new();
@@ -329,14 +396,26 @@ fn the_roster_numbers_every_specification_18_scenario_once() {
 
 #[test]
 fn every_row_carries_the_milestone_the_specification_binds() {
+    let (bound, default) = milestone_bindings(SPEC);
     for row in roster_rows(ROSTER) {
+        let expected = bound.get(&row.number).unwrap_or(&default);
         assert_eq!(
-            row.milestone,
-            milestone_for(row.number),
+            &row.milestone, expected,
             "scenario {} is bound to the wrong milestone",
             row.number
         );
     }
+}
+
+#[test]
+fn the_milestone_paragraph_binds_every_later_milestone() {
+    // A misparse that lost a clause would bind its scenarios to the default
+    // and fail the roster loudly; this pins the other direction, so a clause
+    // the reader cannot see at all is noticed even if no row depends on it.
+    let (bound, default) = milestone_bindings(SPEC);
+    assert_eq!(default, "M1");
+    let milestones: BTreeSet<&str> = bound.values().map(String::as_str).collect();
+    assert_eq!(milestones, BTreeSet::from(["M2", "M3", "M4", "M5"]));
 }
 
 #[test]
@@ -367,21 +446,25 @@ fn every_cited_proof_exists() {
 #[test]
 fn every_cited_file_cites_its_scenario() {
     let mut sources: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    let mut uncited = Vec::new();
     for row in roster_rows(ROSTER) {
         for proof in &row.proofs {
             let cited = sources
                 .entry(proof.path.clone())
-                .or_insert_with(|| cited_scenarios(&normalise(&read(&proof.path))));
-            assert!(
-                cited.contains(&row.number),
-                "scenario {} cites {}, whose text names scenarios {:?} and not {}",
-                row.number,
-                proof.path,
-                cited,
-                row.number
-            );
+                .or_insert_with(|| cited_scenarios(&module_doc(&read(&proof.path))));
+            if !cited.contains(&row.number) {
+                uncited.push(format!(
+                    "scenario {} <- {} (module doc names {:?})",
+                    row.number, proof.path, cited
+                ));
+            }
         }
     }
+    assert!(
+        uncited.is_empty(),
+        "roster rows cite files whose module docs do not name the scenario:\n{}",
+        uncited.join("\n")
+    );
 }
 
 #[test]
@@ -427,8 +510,8 @@ fn every_module_doc_citation_is_rostered() {
     }
     let mut checked = 0;
     let mut unrostered = Vec::new();
-    for dir in ["crates/rakka-agent/tests/", "crates/rakka-a2a/tests/"] {
-        for (relative, source) in test_files(dir) {
+    for dir in scanned_directories(&rows) {
+        for (relative, source) in test_files(&dir) {
             for scenario in cited_scenarios(&module_doc(&source)) {
                 checked += 1;
                 let rostered = rostered_files

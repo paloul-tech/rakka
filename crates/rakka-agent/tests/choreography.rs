@@ -1,7 +1,8 @@
 //! Inter-entity choreography: one logical transition per operation id.
 //!
-//! Specification: sections 9.8 and 6.10; scenario 58 of section 18. Every
-//! exchange this phase implements is driven across each of the four failure
+//! Specification: sections 9.8 and 6.10; scenario 58 of section 18, with
+//! scenario 59's rejection clause and scenario 61's replay clause driven
+//! through the same failure windows. Every exchange this phase implements is driven across each of the four failure
 //! windows the specification names — initiator loss before send, receiver loss
 //! after acceptance, reply loss, and duplicate delivery — and each one must
 //! converge on exactly one transition per side.

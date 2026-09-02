@@ -1,8 +1,8 @@
 //! The durable checkpoint substrate: the three kinds, digest-bound grants, the
 //! reconciliation decision set, decision deduplication, and timers.
 //!
-//! Specification: section 12. Scenarios 3, 11, 12, and the reconciliation half
-//! of 57 exercise this substrate. A checkpoint is plain durable state: it
+//! Specification: section 12. Scenarios 3, 11, 12, and 57 (its reconciliation
+//! half) exercise this substrate. A checkpoint is plain durable state: it
 //! round-trips through serialization, so a run passivates behind it and resumes
 //! on the next decision with no live execution task. Duplicate decisions never
 //! resolve it twice, a timer never auto-approves, and a changed argument digest

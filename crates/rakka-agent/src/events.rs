@@ -57,6 +57,7 @@ use crate::identity::{AgentGoalId, AgentId, AgentOperationId, AgentRunId, AgentT
 use crate::observability::{
     AgentDecisionEvent, AgentDecisionEventSink, AgentDecisionKind, AgentObservabilityError,
 };
+use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
 use crate::task::{
     AgentContentDigest, AgentTaskError, AgentTaskHistoryCursor, AgentTaskHistoryEntry,
     AgentTaskHistoryKind, AgentTaskHistorySequence, AgentTaskHistoryStore, AgentTaskStatus,
@@ -159,6 +160,13 @@ pub enum AgentCoordinationReplayError {
     /// [`Self::code`], because a backend vocabulary is not this surface's
     /// stable one.
     RunEvents(AgentObservabilityError),
+    /// A log entry carries a schema version this binary does not read.
+    ///
+    /// The replay is the load path of the four coordination logs, and a
+    /// record from a newer or older generation is refused there rather than
+    /// handed to a reader with guessed semantics — the same `schema-version-*`
+    /// codes the entity load paths answer.
+    Schema(AgentSchemaError),
 }
 
 impl AgentCoordinationReplayError {
@@ -178,6 +186,7 @@ impl AgentCoordinationReplayError {
             Self::Task(error) => error.code(),
             Self::Team(error) => error.code(),
             Self::Conversation(error) => error.code(),
+            Self::Schema(error) => error.code(),
             Self::RunEvents(_) => "coordination-run-events-failed",
         }
     }
@@ -212,6 +221,7 @@ impl Display for AgentCoordinationReplayError {
             Self::RunEvents(error) => {
                 write!(f, "the run's decision-event sink failed: {error}")
             }
+            Self::Schema(error) => Display::fmt(error, f),
         }
     }
 }
@@ -239,6 +249,12 @@ impl From<AgentConversationError> for AgentCoordinationReplayError {
 impl From<AgentObservabilityError> for AgentCoordinationReplayError {
     fn from(error: AgentObservabilityError) -> Self {
         Self::RunEvents(error)
+    }
+}
+
+impl From<AgentSchemaError> for AgentCoordinationReplayError {
+    fn from(error: AgentSchemaError) -> Self {
+        Self::Schema(error)
     }
 }
 
@@ -720,14 +736,16 @@ fn page_from(
 ///
 /// # Errors
 ///
-/// Fails on a malformed cursor, a cursor naming another scope, or a history
-/// backend fault. A cursor preceding the retained window is not an error: it
-/// resolves to [`AgentCoordinationReplay::WindowExpired`].
+/// Fails on a malformed cursor, a cursor naming another scope, a history
+/// backend fault, or an entry whose schema version `policy` refuses. A cursor
+/// preceding the retained window is not an error: it resolves to
+/// [`AgentCoordinationReplay::WindowExpired`].
 pub async fn replay_task_coordination_events<History>(
     history: &History,
     scope: &AgentEntityAddress,
     cursor: Option<&str>,
     limit: usize,
+    policy: &AgentSchemaPolicy,
 ) -> AgentCoordinationReplayResult<AgentCoordinationReplay>
 where
     History: AgentTaskHistoryStore,
@@ -750,6 +768,9 @@ where
         }
         Err(error) => Err(error.into()),
         Ok(page) => {
+            for entry in &page.entries {
+                policy.check_record(entry)?;
+            }
             let has_more = page.next.is_some();
             let events = page
                 .entries
@@ -773,6 +794,7 @@ pub async fn replay_team_coordination_events<History>(
     scope: &AgentEntityAddress,
     cursor: Option<&str>,
     limit: usize,
+    policy: &AgentSchemaPolicy,
 ) -> AgentCoordinationReplayResult<AgentCoordinationReplay>
 where
     History: AgentTeamHistoryStore,
@@ -795,6 +817,9 @@ where
         }
         Err(error) => Err(error.into()),
         Ok(page) => {
+            for entry in &page.entries {
+                policy.check_record(entry)?;
+            }
             let has_more = page.next.is_some();
             let events = page
                 .entries
@@ -818,6 +843,7 @@ pub async fn replay_conversation_coordination_events<History>(
     scope: &AgentEntityAddress,
     cursor: Option<&str>,
     limit: usize,
+    policy: &AgentSchemaPolicy,
 ) -> AgentCoordinationReplayResult<AgentCoordinationReplay>
 where
     History: AgentConversationHistoryStore,
@@ -842,6 +868,9 @@ where
         }
         Err(error) => Err(error.into()),
         Ok(page) => {
+            for entry in &page.entries {
+                policy.check_record(entry)?;
+            }
             let has_more = page.next.is_some();
             let events = page
                 .entries
@@ -871,6 +900,7 @@ pub async fn replay_run_coordination_events(
     cursor: Option<&str>,
     limit: usize,
     losses: u64,
+    policy: &AgentSchemaPolicy,
 ) -> AgentCoordinationReplayResult<AgentCoordinationReplay> {
     let AgentEntityAddress::Run(run_scope) = scope else {
         return Err(AgentCoordinationReplayError::ScopeNotReplayable {
@@ -892,6 +922,9 @@ pub async fn replay_run_coordination_events(
         }
         Err(error) => Err(error.into()),
         Ok(page) => {
+            for event in &page.events {
+                policy.check_record(event)?;
+            }
             let events = page
                 .events
                 .iter()
@@ -919,6 +952,7 @@ pub struct AgentCoordinationSources<'a, Tasks, Teams, Conversations> {
     conversations: &'a Conversations,
     runs: Option<&'a dyn AgentDecisionEventSink>,
     run_losses: u64,
+    policy: AgentSchemaPolicy,
 }
 
 impl<'a, Tasks, Teams, Conversations> AgentCoordinationSources<'a, Tasks, Teams, Conversations>
@@ -937,7 +971,16 @@ where
             conversations,
             runs: None,
             run_losses: 0,
+            policy: AgentSchemaPolicy::n_plus_one(),
         }
+    }
+
+    /// Replaces the default N/N+1 schema policy every log entry is checked
+    /// against before it is handed to a reader.
+    #[must_use]
+    pub const fn with_schema_policy(mut self, policy: AgentSchemaPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Wires the run scope's decision-event sink.
@@ -988,18 +1031,33 @@ where
         }
         match scope {
             AgentEntityAddress::Task(_) => {
-                replay_task_coordination_events(self.tasks, scope, cursor, limit).await
+                replay_task_coordination_events(self.tasks, scope, cursor, limit, &self.policy)
+                    .await
             }
             AgentEntityAddress::Team(_) => {
-                replay_team_coordination_events(self.teams, scope, cursor, limit).await
+                replay_team_coordination_events(self.teams, scope, cursor, limit, &self.policy)
+                    .await
             }
             AgentEntityAddress::Conversation(_) => {
-                replay_conversation_coordination_events(self.conversations, scope, cursor, limit)
-                    .await
+                replay_conversation_coordination_events(
+                    self.conversations,
+                    scope,
+                    cursor,
+                    limit,
+                    &self.policy,
+                )
+                .await
             }
             AgentEntityAddress::Run(_) => {
-                replay_run_coordination_events(self.runs, scope, cursor, limit, self.run_losses)
-                    .await
+                replay_run_coordination_events(
+                    self.runs,
+                    scope,
+                    cursor,
+                    limit,
+                    self.run_losses,
+                    &self.policy,
+                )
+                .await
             }
             // The agent entity records its lifecycle in settings revisions and
             // audit, not in a sequenced log. An empty page would read as "this

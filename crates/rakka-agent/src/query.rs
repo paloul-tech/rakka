@@ -1094,7 +1094,7 @@ where
 
     let (events, decisions_available) = match decisions {
         None => (Vec::new(), false),
-        Some(sink) => read_retained_decisions(sink, scope).await,
+        Some(sink) => read_retained_decisions(sink, scope, policy).await,
     };
     let projected = events.iter().map(|event| event.sequence).max().unwrap_or(0);
     let decision_lag = snapshot.decision_cursor.saturating_sub(projected);
@@ -1120,10 +1120,13 @@ where
 /// sink is down. The loss itself stays visible through
 /// [`AgentOperationalSnapshot::decision_drops`] and
 /// [`AgentSessionView::decision_lag`]. Only a sink *fault* degrades the view
-/// to unavailable.
+/// to unavailable — and an event whose schema version `policy` refuses is
+/// treated as one: it is not interpreted with guessed semantics, and the
+/// authoritative half is not degraded by it either.
 async fn read_retained_decisions(
     sink: &dyn AgentDecisionEventSink,
     scope: &AgentRunScope,
+    policy: &AgentSchemaPolicy,
 ) -> (Vec<AgentDecisionEvent>, bool) {
     let mut collected: Vec<AgentDecisionEvent> = Vec::new();
     let mut after = 0_u64;
@@ -1137,6 +1140,13 @@ async fn read_retained_decisions(
         }
         match sink.read(scope, after, remaining).await {
             Ok(page) => {
+                if page
+                    .events
+                    .iter()
+                    .any(|event| policy.check_record(event).is_err())
+                {
+                    return (Vec::new(), false);
+                }
                 let advanced = page.events.last().map(|event| event.sequence);
                 collected.extend(page.events);
                 match advanced {
