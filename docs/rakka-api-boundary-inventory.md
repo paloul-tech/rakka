@@ -107,7 +107,8 @@ the prelude: `rakka::agent_workflow` (default feature `agent-workflow`),
 `rakka::agent` (`agent`, with `agent-rig` and `agent-otel` passthroughs), and
 `rakka::a2a` (`a2a`, with `a2a-server`, `a2a-sharding`, `a2a-postgres`,
 `a2a-http`, `a2a-k8s`, `a2a-otel`, `a2a-testkit`, and `a2a-agents`). No agent
-type enters `rakka::prelude`.
+type enters `rakka::prelude`; the surface is documented in
+[`rakka-agents.md`](rakka-agents.md).
 
 ## Compatibility Rules During Facade Migration
 

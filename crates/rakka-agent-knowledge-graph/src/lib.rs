@@ -46,16 +46,17 @@
 //! ([specification 19](../../docs/plans/rakka-agent/spec.md)); production
 //! durability claims are never based on the in-memory implementation.
 //!
-//! # Non-goals of this slice
+//! # Non-goals, still
 //!
-//! No retrieval/context-snapshot path (the `MemoryContextSnapshot` communal
-//! selection stays empty until communal retrieval lands), no run-entity
-//! claim-append effect (scenario 33 binds at M4; the promotion binding is
-//! derived so that effect adopts it unchanged), no metrics counters, no
-//! sharded knowledge-space entity, no deletion path (`Retracted` is the
-//! auditable withdrawal), no per-claim capability enforcement at read (the
-//! access set is carried, queryable data; its enforcement point is the
-//! communal retrieval and policy layer), and no cross-tenant federation.
+//! No communal retrieval/context-snapshot path (the `MemoryContextSnapshot`
+//! communal selection stays empty until it lands), no metrics counters, no
+//! sharded knowledge-space entity, no deletion, tombstone, or retention path
+//! (`Retracted` is the auditable withdrawal; the gap is recorded as owed in
+//! `docs/rakka-agent-security-validation-matrix.md`), no per-claim capability
+//! enforcement at read (the access set is carried, queryable data; its
+//! enforcement point is the communal retrieval and policy layer), and no
+//! cross-tenant federation. The run-entity claim-append effect this crate once
+//! deferred landed with scenario 33 ([`append_executor`]).
 
 pub mod append_executor;
 pub mod claim;

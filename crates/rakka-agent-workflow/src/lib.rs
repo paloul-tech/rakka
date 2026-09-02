@@ -1,15 +1,18 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Agentic workflow orchestration facade.
+//! The durable agent-workflow execution kernel.
 //!
-//! This crate is intentionally thin in the Phase 0.1 boundary slice. It gives
-//! agent workflow work a home without changing the lower-level reliability
-//! semantics already implemented by `rakka-workflow`.
-//!
-//! The crate owns future first-class agent concepts such as runs, steps,
-//! effects, human checkpoints, telemetry context, audit events, model/tool
-//! adapters, and Kubernetes-scale orchestration helpers.
+//! This crate is the substrate the agent domain (`rakka-agent`) and the A2A
+//! adapter run on: durable inbox and outbox acceptance for agent commands and
+//! effects, the dispatcher fleet with its claim filters and bounded failure
+//! records, timers and triggers, runtime events, the product-neutral compiled
+//! execution IR with its deterministic graph scheduler and durable graph run
+//! state, telemetry context and audit events, and the OTLP bridge that carries
+//! the agent domain's already-aggregated metrics and spans to an application's
+//! exporter. It does not own the visual editor, compiler, auth, billing,
+//! tenant policy, trigger registration, or credential storage, and it never
+//! persists resolved credentials.
 //!
 //! `rakka-workflow` remains the durable inbox/outbox substrate. Core actor,
 //! remote, and sharded delivery remain at-most-once; stronger agent workflow

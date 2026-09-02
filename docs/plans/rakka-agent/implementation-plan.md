@@ -72,7 +72,7 @@ These are restated here because every slice touches them:
 | 3 | M3 | Continuous goals: wake identity/policy, controller, epochs, fencing | [Continuous Goal Milestone](spec.md#continuous-goal-milestone-m3) |
 | 4 | M4 | Multi-agent goals: goal contract, evaluation, delegation, fan-in, workflow tools, cancellation propagation | [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4) |
 | 5 | M5 | Coordination: handoff, teams, moderation, human-owned tasks, replayable events | [Coordination Capability Milestone](spec.md#coordination-capability-milestone-m5) |
-| 6 | — | Production fault, security, and telemetry validation; docs | Phase 6 exit criteria below |
+| 6 | — | Production fault, security, and telemetry validation; docs | Phase 6 exit criteria below (met 2026-09-01) |
 
 Sequencing: Phase 1 is the base for everything. Phases 2-5 may be re-ordered
 per [spec 2.1](spec.md#21-milestone-binding), with these practical
@@ -4259,6 +4259,15 @@ fault injection.
 No new milestone; this hardens whatever phases have shipped
 (guidance [Slice 7](technical-guidance.md#slice-7-production-fault-and-security-validation)).
 
+Phase 6 exit criteria (stated here because the phase map promised them and no
+slice had): slices 6.1 through 6.4 landed; the fault-injection, security, and
+telemetry matrices, the observability catalogue, and the recovery scenario
+roster are current and each is held to the tree by a test; every in-process
+suite is green under `scripts/validate.sh`; the multi-pod harness passes behind
+its gate; and the documentation set — product doc, compatibility policy,
+inventories, changelog — describes what shipped. **Met 2026-09-01** with slice
+6.4.
+
 ### Slice 6.1 — Multi-pod fault and soak validation
 
 Spec: [15](spec.md#15-passivation-recovery-and-shard-movement),
@@ -4876,6 +4885,66 @@ re-proven at that fidelity and which remain in-process. Porting all 61 scenarios
 into process-spawning form was considered and rejected: it would re-prove logic
 the in-process suite already covers, at a large cost in harness code and gated
 runtime, without adding a claim.
+
+**Landed (2026-09-01).** Five commits, each pairing a document with the test
+that holds it honest, on the rule this slice's own done-when was written under:
+a documentation claim the code can contradict is checked, not believed.
+
+- **The scenario roster is a parsed table, not a paragraph.** The appendix
+  below mapped scenario to slice and stopped at 5.5; eleven scenarios (12, 20,
+  30, 36, 46–51, 60) were cited only in a module-doc header, and the multi-pod
+  harness cited no number at all. `docs/rakka-agent-recovery-scenarios.md`
+  binds all sixty-one to their proving files, and
+  `tests/recovery_scenario_roster.rs` reads it: the numbers equal the
+  specification's list, each milestone is the one section 18 binds, every
+  cited file exists and cites the scenario (through a tokenizer that reads the
+  shapes the suites actually use — ranges, slashed pairs, wrapped doc
+  comments, possessives — and stops at a dotted section reference), the
+  multi-pod rows and only they cite the harness, and that set equals the fault
+  matrix's authority sentence. The reverse direction — a module doc that cites
+  a scenario must be in its row — earned its place on the first run by
+  crediting four files the hand-built roster had missed. The eleven header-only
+  scenarios were each read: every one is proven by its file's body, cited once.
+- **Thirty-four schema versions, one documented.** The compatibility policy
+  named the run state's version 2 and nothing else, filed under the A2A
+  adapter's heading beside every other agent commitment. The Agent Domain
+  section now carries the N/N+1 rule as `AgentSchemaPolicy` applies it, a
+  record table across the three crates, the pinned-dependency matrix, and the
+  exchange and extension versions; `tests/compatibility_currency.rs` holds the
+  two tables bijectively — record kinds and workflow constants imported, the
+  knowledge-graph constants read by source scan because the DAG forbids the
+  import, pins parsed from the manifests and both Collector topologies.
+- **The A2A protocol version was inherited, not pinned.** Specification 20
+  requires `rakka-a2a` to pin a reviewed A2A version; the SDK's constructor
+  supplied `1.0` and the card carried it silently, so an SDK upgrade that
+  moved the wire version would have re-labelled every served card unnoticed.
+  `A2A_PROTOCOL_VERSION` is held equal to `a2a::VERSION` by a test rather than
+  aliasing it — the point is that the upgrade *fails* at the review — and is
+  stamped on every interface the card builder and the fixture produce. The SDK
+  pins, copied in six manifests, are declared once in the workspace.
+- **Four crates missing from one inventory, six from the other**, every agent
+  crate among them, invisible to the hygiene test that checked only the four
+  tier words. Both tables now carry every `crates/` directory and the test
+  requires it; a relative-link checker over `README.md` and `docs/*.md` joins
+  it, because the agent doc set cross-links itself eleven ways and nothing
+  verified any of them. It found no broken link, and then found the one this
+  slice introduced a commit early.
+- **A product document, and the crate docs it replaces.**
+  `docs/rakka-agents.md` describes the surface as it behaves — crates and
+  features, the five entity classes and their choreography, a run from ingress
+  to terminal, goals, coordination, memory, the A2A surface, observability,
+  security, recovery, compatibility, examples — and points at the matrices for
+  what each claim rests on and what remains owed, rather than restating either.
+  `rakka-agent`'s crate doc said "only the module map exists today";
+  `rakka-agent-workflow`'s called itself "intentionally thin in the Phase 0.1
+  boundary slice"; the facade's never mentioned the agent surface. Corrected,
+  by hand.
+
+Owed onward, named: a registry-backed check that every agent error code is
+registered in the compatibility document — the codes live in per-error `code()`
+arms with no exported list, so the document's code families are held by review
+rather than by a test; and everything the three matrices' owed sections
+already carry, unchanged by this slice.
 
 ---
 

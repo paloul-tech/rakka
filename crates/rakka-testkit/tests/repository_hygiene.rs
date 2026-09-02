@@ -454,3 +454,28 @@ fn documentation_relative_links_resolve() {
         broken.join("\n")
     );
 }
+
+#[test]
+fn readme_links_the_agent_documentation_set() {
+    let readme = read("README.md");
+    for document in [
+        "docs/rakka-agents.md",
+        "docs/rakka-agent-recovery-scenarios.md",
+        "docs/rakka-agent-fault-injection-matrix.md",
+        "docs/rakka-agent-security-validation-matrix.md",
+        "docs/rakka-agent-telemetry-validation-matrix.md",
+        "docs/rakka-agent-observability-catalogue.md",
+        "docs/plans/rakka-agent/",
+    ] {
+        assert!(
+            readme.contains(document),
+            "README should point at {document}"
+        );
+        if let Some(file) = document.strip_suffix(".md") {
+            assert!(
+                repo_root().join(format!("{file}.md")).is_file(),
+                "{document} does not exist"
+            );
+        }
+    }
+}

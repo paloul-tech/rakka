@@ -3,17 +3,16 @@
 
 //! Durable agent domain, loop runtime, and provider-neutral model adapter.
 //!
-//! This crate is the M1 home for the Rakka agent surface: the goal, typed-task,
-//! run, evaluation, handoff, delegation, team, moderation, and workflow-tool
+//! This crate is the Rakka agent surface: the goal, typed-task, run,
+//! evaluation, handoff, delegation, team, moderation, and workflow-tool
 //! domain, the typed client, the durable loop runtime, the model adapter trait,
 //! the continuous wake controller, the escrow budget ledger, autonomy
 //! admission, guardrails, gates, tool binding and dispatch grants, execution
-//! policy references, bounded operational queries, memory traits, structured
-//! telemetry, and deterministic test support.
-//!
-//! Only the module map exists today. Each module documents the specification
-//! section it implements and the implementation slice that fills it, so the
-//! crate shape is reviewable before any behavior lands.
+//! policy references, bounded operational queries, memory traits and
+//! retrieval, structured telemetry, the schema policy, and deterministic test
+//! support. Each module documents the specification section it implements
+//! and the slice that filled it; the surface as a whole, and where each claim
+//! is proven, is described in `docs/rakka-agents.md`.
 //!
 //! # Boundaries
 //!
