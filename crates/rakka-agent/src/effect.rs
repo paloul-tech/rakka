@@ -79,7 +79,7 @@ use crate::identity::{
 };
 use crate::memory::{
     AgentContextSnapshotRef, AgentPrivateMemoryId, AgentPrivateMemoryKind, AgentPromotedMemoryRef,
-    MemoryClassification, MemorySequence, AGENT_SESSION_WINDOW_MAX_ENTRIES,
+    MemoryClassification, MemoryEntryRole, MemorySequence, AGENT_SESSION_WINDOW_MAX_ENTRIES,
 };
 use crate::model::{AgentModelTurn, AgentToolCallId, AgentToolCallRequest};
 use crate::schema::{
@@ -1207,9 +1207,29 @@ pub struct AgentMemoryPromotionRequest {
     pub confidence_bps: u16,
     /// Who asked for the promotion. Provenance and audit, never authority.
     pub requested_by: PrincipalRef,
+    /// The roles the window promotes: `None` promotes every entry in the
+    /// window, `Some(set)` only the entries whose role is in the set. The
+    /// window's `1..=64` bound is checked at commit as before; the executor
+    /// applies the filter to the durably read window and refuses a window
+    /// that selects nothing (`memory-promotion-selection-empty`) rather than
+    /// succeeding silently. Identity is per entry, so a filtered promotion
+    /// converges on the same records an unfiltered one would have written.
+    /// An empty set is refused at commit (`run-memory-roles-empty`); a
+    /// request persisted before the field decodes to `None`.
+    #[serde(default)]
+    pub roles: Option<Vec<MemoryEntryRole>>,
 }
 
 impl AgentMemoryPromotionRequest {
+    /// Whether an entry of `role` is in the selection: every role when no
+    /// filter is set, else exactly the listed ones.
+    #[must_use]
+    pub fn selects_role(&self, role: MemoryEntryRole) -> bool {
+        self.roles
+            .as_ref()
+            .is_none_or(|roles| roles.contains(&role))
+    }
+
     /// How many session entries the selection spans, when it is well-formed.
     #[must_use]
     pub const fn selected_entries(&self) -> Option<u64> {

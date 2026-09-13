@@ -2152,6 +2152,7 @@ async fn a_promotion_survives_dispatcher_loss_mid_pass() {
                     principal_id: "memory-curator".to_string(),
                     display_name: None,
                 },
+                roles: None,
             }),
         },
         &fx.fx.router,

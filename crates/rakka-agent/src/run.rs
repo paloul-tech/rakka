@@ -5369,6 +5369,12 @@ fn promote_memory(
         // entry, so the merged content stays bounded and deterministic.
         return Err(AgentRunError::MemoryConsolidationInvalid);
     }
+    if promotion.roles.as_ref().is_some_and(Vec::is_empty) {
+        // An empty role set can select nothing whatever the window holds, so
+        // it is refused here rather than reserving attempts for an effect the
+        // executor would only ever refuse ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+        return Err(AgentRunError::MemoryRolesEmpty);
+    }
 
     let request = AgentRunEffectRequest::MemoryPromotion {
         promotion: Box::new(promotion),
@@ -9258,6 +9264,8 @@ pub enum AgentRunError {
     /// A consolidation selected more than one source entry; it updates exactly
     /// one memory from exactly one entry.
     MemoryConsolidationInvalid,
+    /// A promotion named an empty role set, which can select nothing.
+    MemoryRolesEmpty,
     /// A promotion could not reserve its attempt bound from the run's budget.
     MemoryPromotionUnaffordable {
         /// The ceiling the reservation would cross.
@@ -9359,6 +9367,7 @@ impl AgentRunError {
             Self::MemorySelectionInvalid { .. } => "run-memory-selection-invalid",
             Self::MemorySelectionOutOfRange { .. } => "run-memory-selection-out-of-range",
             Self::MemoryConsolidationInvalid => "run-memory-consolidation-invalid",
+            Self::MemoryRolesEmpty => "run-memory-roles-empty",
             Self::MemoryPromotionUnaffordable { .. } => "run-memory-promotion-unaffordable",
             Self::GoalEvaluationFenced { .. } => "run-goal-evaluation-fenced",
             Self::HandoffPending { .. } => "run-handoff-pending",
@@ -9460,6 +9469,10 @@ impl Display for AgentRunError {
             Self::MemoryConsolidationInvalid => write!(
                 f,
                 "a consolidation updates exactly one memory from exactly one source entry"
+            ),
+            Self::MemoryRolesEmpty => write!(
+                f,
+                "the promotion names an empty role set, which can select no session entry"
             ),
             Self::MemoryPromotionUnaffordable { exhaustion } => write!(
                 f,

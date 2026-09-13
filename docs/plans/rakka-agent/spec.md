@@ -1419,6 +1419,14 @@ Promotion, consolidation, or demotion from short-term memory MUST be an
 idempotent durable effect. Embeddings are rebuildable derived projections, not
 the only copy of memory content.
 
+A promotion MAY select by role within its sequence window: a request that
+names a role set promotes only the window's entries of those roles, and one
+that names none promotes every entry. The window's size bound applies at
+commit; the executor applies the filter to the durably read window and MUST
+refuse a window that selects nothing rather than succeed with an empty
+receipt. Identity is per source entry, so a filtered promotion and an
+unfiltered one converge on the same records.
+
 ### 13.4 Communal Knowledge Graph
 
 The graph MUST be scoped by `(TenantId, KnowledgeSpaceId)`. All authorized

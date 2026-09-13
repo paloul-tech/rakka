@@ -16,12 +16,12 @@ use rakka_agent::testkit::{sweep_crash_points, DeterministicModelAdapter, Script
 use rakka_agent::{
     promotion_operation_id, AgentMemoryConsolidationTarget, AgentMemoryPromotionRequest,
     AgentModelTurn, AgentModelUsage, AgentPrivateMemoryId, AgentPrivateMemoryKind,
-    AgentPrivateMemoryStore, AgentRunEffect, AgentRunEffectKind, AgentRunEntityCommand,
-    AgentRunEntityReply, AgentRunMemory, AgentRunStatus, AgentScope, AgentTaskContent,
-    AgentTaskEntityStore, InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore,
-    InMemorySessionMemoryStore, MemorySequence, PrivateMemoryCursor, SessionMemoryCursor,
-    SessionMemoryPage, SessionMemoryPromotionExecutor, SessionMemoryStore,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentPrivateMemoryStore, AgentRunEffect, AgentRunEffectKind, AgentRunEffectStatus,
+    AgentRunEntityCommand, AgentRunEntityReply, AgentRunMemory, AgentRunStatus, AgentScope,
+    AgentTaskContent, AgentTaskEntityStore, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
+    MemoryEntryRole, MemorySequence, PrivateMemoryCursor, SessionMemoryCursor, SessionMemoryPage,
+    SessionMemoryPromotionExecutor, SessionMemoryStore, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 
@@ -83,6 +83,7 @@ fn promotion(from: u64, to: u64) -> AgentMemoryPromotionRequest {
         target: None,
         confidence_bps: 9_000,
         requested_by: requested_by(),
+        roles: None,
     }
 }
 
@@ -91,6 +92,50 @@ fn promote_command(request: AgentMemoryPromotionRequest, disc: &str) -> AgentRun
         operation_id: promotion_operation_id(&run_scope(), disc).expect("operation id"),
         promotion: Box::new(request),
     }
+}
+
+fn tool_calling_turn(tool: &str) -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Let me look that up.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("call-1").expect("call id"),
+                AgentToolId::new(tool).expect("tool id"),
+                serde_json::json!({ "query": "ticket" }),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_usage(AgentModelUsage {
+            input_tokens: 8,
+            output_tokens: 4,
+            cost_micros: 2,
+        })
+}
+
+/// A world whose first turn calls a tool, so the session holds one entry of
+/// each of the three recorded roles — the task input, the assistant text, the
+/// tool result — before turn two's model wait.
+fn tool_promoting_world() -> (Fixture, Stores) {
+    let stores = stores();
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, proposing_turn("resolved")),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    )
+    .with_memory_promotion_executor(Arc::new(SessionMemoryPromotionExecutor::new(
+        stores.session.clone(),
+        stores.private.clone(),
+    )));
+    let fx = Fixture::new(dispatcher).with_memory(
+        AgentRunMemory::new(stores.session.clone(), stores.snapshots.clone())
+            .with_private_store(stores.private.clone()),
+    );
+    (fx, stores)
 }
 
 /// A two-turn scripted world with the promotion executor wired over the
@@ -894,4 +939,255 @@ async fn memory_promotion_survives_any_owner_loss() {
         assert_eq!(receipts[0].promoted.len(), 1);
     })
     .await;
+}
+
+/// Answers every dispatched effect except an outstanding promotion, so a test
+/// can crank a tool-calling turn to rest while keeping the run live.
+async fn drive_turn(fx: &Fixture) {
+    let mut run = fx.run();
+    let now = fx.now();
+    run.recover(now).await.expect("recover");
+    fx.dispatcher
+        .drive(&mut run, &fx.router, fx.now())
+        .await
+        .expect("answer the dispatched effects");
+}
+
+/// The promoted memory identity one session entry derives to.
+fn promoted_id(entry: &rakka_agent::SessionMemoryEntry) -> AgentPrivateMemoryId {
+    AgentPrivateMemoryId::derive_promoted(
+        &agent_scope(),
+        &entry.entry_id,
+        AgentPrivateMemoryKind::Semantic,
+    )
+    .expect("derive")
+}
+
+/// The native role filter (specification 13.3): over a window holding one
+/// entry of each recorded role, `roles = Some([ToolResult])` promotes exactly
+/// the tool-result entry; `None` promotes every entry and converges on the
+/// one already promoted; a filter that selects nothing is a definitive
+/// refusal under `memory-promotion-selection-empty` that writes nothing and
+/// leaves the run live; a second filtered promotion converges on the same
+/// record; and an empty role set is refused at the door.
+#[tokio::test]
+async fn a_role_filter_promotes_only_the_selected_roles() {
+    let (fx, stores) = tool_promoting_world();
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    // Turn one: the model call, then its tool call, then the turn rests and
+    // its entries flush; turn two's model call is the live wait.
+    crank(&fx).await;
+    drive_turn(&fx).await;
+    crank(&fx).await;
+    drive_turn(&fx).await;
+    crank(&fx).await;
+
+    let page = session_page(&stores.session).await;
+    let roles: Vec<MemoryEntryRole> = page.entries.iter().map(|entry| entry.role).collect();
+    assert_eq!(
+        roles,
+        vec![
+            MemoryEntryRole::User,
+            MemoryEntryRole::Assistant,
+            MemoryEntryRole::ToolResult
+        ],
+        "the window holds one entry of each recorded role"
+    );
+    let tool_entry = &page.entries[2];
+    let owner = agent_scope();
+    let now = AgentTimestampMillis::new(10_000);
+
+    // `Some([ToolResult])` over the whole window promotes the tool entry only.
+    let mut filtered = promotion(1, 3);
+    filtered.roles = Some(vec![MemoryEntryRole::ToolResult]);
+    let reply = apply_ok(&fx, promote_command(filtered, "tools-1")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let effect = promotion_effect(&fx).await;
+    answer_promotion(&fx, &effect).await;
+    assert_eq!(
+        stores.private.len(&owner),
+        1,
+        "only the tool-result entry promoted"
+    );
+    let promoted = stores
+        .private
+        .get(&owner, &promoted_id(tool_entry), now)
+        .await
+        .expect("get")
+        .expect("the tool-result entry's memory exists");
+    assert_eq!(promoted.content, tool_entry.content);
+    assert_eq!(promoted.source.entry.as_ref(), Some(&tool_entry.entry_id));
+
+    // `None` over the same window promotes the rest and converges on the
+    // tool entry's existing record: three memories, none churned.
+    let reply = apply_ok(&fx, promote_command(promotion(1, 3), "all-1")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let effect = promotion_effect(&fx).await;
+    answer_promotion(&fx, &effect).await;
+    assert_eq!(stores.private.len(&owner), 3, "every role promoted once");
+    let converged = stores
+        .private
+        .get(&owner, &promoted_id(tool_entry), now)
+        .await
+        .expect("get")
+        .expect("the tool-result memory still exists");
+    assert_eq!(
+        converged.revision.get(),
+        1,
+        "convergence bumped no revision"
+    );
+
+    // A filter that selects nothing is refused definitively — on the effect
+    // record, under the stable code, with nothing written and the run live.
+    let mut empty = promotion(1, 3);
+    empty.roles = Some(vec![MemoryEntryRole::Summary]);
+    let reply = apply_ok(&fx, promote_command(empty, "summaries-1")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let effect = promotion_effect(&fx).await;
+    answer_promotion(&fx, &effect).await;
+    let refused = {
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .effects()
+            .iter()
+            .find(|held| held.effect_id == effect.effect_id)
+            .cloned()
+            .expect("the refused effect record survives")
+    };
+    assert_eq!(refused.status, AgentRunEffectStatus::Failed);
+    assert_eq!(
+        refused.last_error_code.as_deref(),
+        Some("memory-promotion-selection-empty")
+    );
+    assert_eq!(
+        stores.private.len(&owner),
+        3,
+        "the refused window wrote nothing"
+    );
+    let live = fx.run_snapshot().await.expect("the run exists");
+    assert!(
+        !live.status.is_terminal(),
+        "the run stays live: {:?}",
+        live.status
+    );
+    assert_eq!(live.terminal_reason, None);
+
+    // A second filtered promotion under a new operation id converges on the
+    // same record: the identity is per entry, and the filter changes nothing
+    // about it.
+    let mut again = promotion(1, 3);
+    again.roles = Some(vec![MemoryEntryRole::ToolResult]);
+    let reply = apply_ok(&fx, promote_command(again, "tools-2")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let effect = promotion_effect(&fx).await;
+    answer_promotion(&fx, &effect).await;
+    assert_eq!(stores.private.len(&owner), 3, "the replay created nothing");
+    let receipts = {
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .memory_promotions()
+            .to_vec()
+    };
+    let last = receipts
+        .last()
+        .expect("the converged promotion left a receipt");
+    assert_eq!(last.promoted.len(), 1);
+    assert_eq!(last.promoted[0].memory_id, promoted_id(tool_entry));
+    assert_eq!(last.promoted[0].revision.get(), 1);
+
+    // An empty role set is refused at the door, before any effect commits.
+    let mut none = promotion(1, 3);
+    none.roles = Some(Vec::new());
+    let error = apply(&fx, promote_command(none, "none-1"))
+        .await
+        .expect_err("an empty role set is refused");
+    assert_eq!(error.code(), "run-memory-roles-empty");
+
+    fx.pump().await.expect("the loop runs to completion");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+/// A consolidation still needs exactly one selected entry: a one-entry window
+/// whose entry the role filter excludes is refused under the empty-selection
+/// code, and the target is not touched.
+#[tokio::test]
+async fn a_filtered_consolidation_with_no_selected_entry_is_refused() {
+    let (fx, stores) = tool_promoting_world();
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    crank(&fx).await;
+    drive_turn(&fx).await;
+    crank(&fx).await;
+    drive_turn(&fx).await;
+    crank(&fx).await;
+
+    // Promote the task input into a fresh memory to consolidate into.
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "p1")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let effect = promotion_effect(&fx).await;
+    answer_promotion(&fx, &effect).await;
+    let owner = agent_scope();
+    let now = AgentTimestampMillis::new(10_000);
+    let page = session_page(&stores.session).await;
+    let target_id = promoted_id(&page.entries[0]);
+    let created = stores
+        .private
+        .get(&owner, &target_id, now)
+        .await
+        .expect("get")
+        .expect("the memory exists");
+
+    // Consolidate sequence 3 (the tool result) into it, but filter to a role
+    // the entry does not have.
+    let mut consolidate = promotion(3, 3);
+    consolidate.target = Some(AgentMemoryConsolidationTarget {
+        memory_id: target_id.clone(),
+        expected_revision: created.revision,
+    });
+    consolidate.roles = Some(vec![MemoryEntryRole::Assistant]);
+    let reply = apply_ok(&fx, promote_command(consolidate, "c1")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let effect = promotion_effect(&fx).await;
+    answer_promotion(&fx, &effect).await;
+    let unmoved = stores
+        .private
+        .get(&owner, &target_id, now)
+        .await
+        .expect("get")
+        .expect("the memory exists");
+    assert_eq!(
+        unmoved.revision, created.revision,
+        "the target was not touched"
+    );
+    let refused = {
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .effects()
+            .iter()
+            .find(|held| held.effect_id == effect.effect_id)
+            .cloned()
+            .expect("the refused effect record survives")
+    };
+    assert_eq!(
+        refused.last_error_code.as_deref(),
+        Some("memory-promotion-selection-empty")
+    );
+
+    fx.pump().await.expect("the loop runs to completion");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
 }

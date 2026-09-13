@@ -119,7 +119,8 @@ use crate::definition::{
 use crate::effect::{
     compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentMemoryPromotionRequest,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
-    AgentRunEffectSink, AgentRunEffectStatus, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
+    AgentRunEffectSink, AgentRunEffectStatus, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
+    ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
 };
 use crate::identity::{AgentIdentityError, AgentRunScope, AgentScope};
 use crate::memory::{
@@ -1054,7 +1055,36 @@ impl AgentMemoryPromotionExecutor for SessionMemoryPromotionExecutor {
         now: AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentMemoryPromotionFinding> {
         Box::pin(async move {
-            let entries = self.read_selection(scope, promotion).await?;
+            let window = self.read_selection(scope, promotion).await?;
+            // The role filter applies to the durably read window. A window
+            // that selects nothing is refused definitively rather than
+            // succeeding silently with an empty receipt, and the selected
+            // set is held to the same bound the window met at commit — it
+            // cannot exceed it, and saying so here is what keeps that a
+            // checked invariant rather than an inferred one.
+            let entries: Vec<SessionMemoryEntry> = window
+                .into_iter()
+                .filter(|entry| promotion.selects_role(entry.role))
+                .collect();
+            if entries.is_empty() {
+                return Ok(AgentMemoryPromotionFinding::Refused {
+                    code: "memory-promotion-selection-empty".to_string(),
+                    message: format!(
+                        "the selection {}..={} holds no entry of the requested roles",
+                        promotion.from_sequence, promotion.to_sequence
+                    ),
+                });
+            }
+            if entries.len() > AGENT_MEMORY_PROMOTION_MAX_ENTRIES {
+                return Ok(AgentMemoryPromotionFinding::Refused {
+                    code: "memory-promotion-selection-invalid".to_string(),
+                    message: format!(
+                        "the selection names {} entries; at most {} may be promoted at once",
+                        entries.len(),
+                        AGENT_MEMORY_PROMOTION_MAX_ENTRIES
+                    ),
+                });
+            }
             let agent_scope = scope.agent_scope();
             let mut promoted = Vec::with_capacity(entries.len());
 
