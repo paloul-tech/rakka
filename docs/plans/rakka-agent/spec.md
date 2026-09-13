@@ -1387,6 +1387,14 @@ Entries SHOULD be ordered by a monotonic sequence and include:
 An append replay with the same operation ID MUST return the original logical
 result without creating another entry.
 
+A tool-result entry SHOULD additionally name the tool that produced it and the
+effect whose outcome it records, so that a reader deriving claims or
+promotions from tool output can select by tool without a second durable
+record. Both are provenance, never authority: they are outside the entry's
+content hash and every derived identity, nothing resolves or infers from
+them, and an entry persisted without them MUST decode as one that names
+neither.
+
 Short-term memory MAY retain a bounded recent window plus rolling summaries.
 Terminal-run retention is controlled by tenant policy.
 

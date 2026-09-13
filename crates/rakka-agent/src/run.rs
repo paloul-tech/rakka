@@ -1434,6 +1434,8 @@ fn try_resolve_fan_in(run: &mut AgentRun, now: AgentTimestampMillis) -> bool {
                 call_id,
                 content,
                 recorded_at: now,
+                tool: None,
+                effect_id: None,
             }),
             Err(error) => {
                 // Bounded by construction: at most sixteen rows of identities
@@ -1848,10 +1850,16 @@ fn accept_handoff_result(
                     "status": "accepted",
                 }))
                 .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                let effect_id = run
+                    .loop_state
+                    .handoff()
+                    .map(|cell| cell.record.effect.clone());
                 run.loop_state.record_tool_result(AgentToolResult {
                     call_id,
                     content,
                     recorded_at: now,
+                    tool: None,
+                    effect_id,
                 });
                 // Responsibility durably moved, so `HandedOff` wins over any
                 // standing wind-down reason: recording `Cancelled` — or a
@@ -1874,10 +1882,16 @@ fn accept_handoff_result(
                     "message": "the handoff was refused; the run continues to own its task",
                 }))
                 .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                let effect_id = run
+                    .loop_state
+                    .handoff()
+                    .map(|cell| cell.record.effect.clone());
                 run.loop_state.record_tool_result(AgentToolResult {
                     call_id,
                     content,
                     recorded_at: now,
+                    tool: None,
+                    effect_id,
                 });
                 if !winding_down && !run.loop_state.awaits_effect() {
                     // The fence released, so the turn rests where any other
@@ -3723,6 +3737,8 @@ fn evaluate_model_output(
                     call_id,
                     content,
                     recorded_at: now,
+                    tool: None,
+                    effect_id: None,
                 });
             }
             PlannedCall::Refused {
@@ -3747,6 +3763,8 @@ fn evaluate_model_output(
                         call_id,
                         content,
                         recorded_at: now,
+                        tool: None,
+                        effect_id: None,
                     });
             }
         }
@@ -4132,10 +4150,22 @@ fn apply_effect_outcome(
         }
         AgentRunEffectOutcome::Tool { call_id, content } => {
             effect.status = AgentRunEffectStatus::Succeeded;
+            // The effect record is the last place the tool is known: it
+            // leaves the loop with the turn, so the tool and effect identity
+            // ride the result onto the session entry the turn records
+            // ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+            // A compensation resolves through this same arm and names no
+            // tool.
+            let tool = match &effect.request {
+                AgentRunEffectRequest::Tool { call } => Some(call.tool.clone()),
+                _ => None,
+            };
             let result = AgentToolResult {
                 call_id: call_id.clone(),
                 content: content.clone(),
                 recorded_at: now,
+                tool,
+                effect_id: Some(effect_id.clone()),
             };
             run.loop_state.record_tool_result(result);
             if !winding_down && !run.loop_state.awaits_effect() {
@@ -4197,6 +4227,8 @@ fn apply_effect_outcome(
                 call_id,
                 content,
                 recorded_at: now,
+                tool: None,
+                effect_id: Some(effect_id.clone()),
             });
             if !winding_down && !run.loop_state.awaits_effect() {
                 // The last effect of the turn came back, so the turn rests:
@@ -4268,6 +4300,8 @@ fn apply_effect_outcome(
                     call_id,
                     content,
                     recorded_at: now,
+                    tool: None,
+                    effect_id: Some(effect_id.clone()),
                 });
             } else {
                 if let Some(cell) = run.loop_state.workflow_invocation_mut(&receipt.invocation) {
@@ -4283,6 +4317,8 @@ fn apply_effect_outcome(
                     call_id,
                     content,
                     recorded_at: now,
+                    tool: None,
+                    effect_id: Some(effect_id.clone()),
                 });
             }
             // There is no early window for a workflow result, so the child's
@@ -4370,6 +4406,8 @@ fn apply_effect_outcome(
                             call_id,
                             content,
                             recorded_at: now,
+                            tool: None,
+                            effect_id: Some(effect_id.clone()),
                         });
                     }
                     if !winding_down && !run.loop_state.awaits_effect() {
@@ -4475,6 +4513,8 @@ fn apply_effect_outcome(
                                 call_id,
                                 content,
                                 recorded_at: now,
+                                tool: None,
+                                effect_id: Some(effect_id.clone()),
                             });
                         }
                         // The settled failure may resolve a closed group —
@@ -4536,6 +4576,8 @@ fn apply_effect_outcome(
                                 call_id,
                                 content,
                                 recorded_at: now,
+                                tool: None,
+                                effect_id: Some(effect_id.clone()),
                             });
                         }
                         try_resolve_fan_in(run, now);
@@ -9910,6 +9952,8 @@ mod tests {
                 content: AgentTaskContent::inline(serde_json::json!("c".repeat(1900)))
                     .expect("the result is inline-bounded"),
                 recorded_at: now,
+                tool: None,
+                effect_id: None,
             });
         }
 
@@ -10072,6 +10116,8 @@ mod tests {
             call_id: AgentToolCallId::new("await-children").expect("the call id is valid"),
             content: AgentTaskContent::inline(table).expect("the table is inline-bounded"),
             recorded_at: now,
+            tool: None,
+            effect_id: None,
         });
 
         let delegation_growth = run

@@ -81,7 +81,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::{AgentBudgetExhaustion, AgentRunBudget};
 use crate::checkpoints::{AgentCheckpoint, AgentCheckpointGrant};
-use crate::definition::{AgentRevisionNumber, AgentTaskDefinitionId};
+use crate::definition::{AgentRevisionNumber, AgentTaskDefinitionId, AgentToolId};
 use crate::delegation::{AgentDelegationCell, AgentDelegationStatus, AgentRunDelegationEnvelope};
 use crate::effect::{
     AgentEffectError, AgentRunEffect, AgentToolResult, AGENT_RUN_MAX_PENDING_EFFECTS,
@@ -1664,6 +1664,7 @@ impl AgentLoopState {
                 "assistant",
                 content,
                 None,
+                (None, None),
                 now,
             )? {
                 recorded += 1;
@@ -1672,6 +1673,10 @@ impl AgentLoopState {
 
         for result in self.tool_results.clone() {
             let discriminator = format!("tool-{}", result.call_id);
+            // The tool and effect ride the entry as provenance beside the call
+            // id: this is the last transition that knows them, since the
+            // effect record leaves the loop with the turn
+            // ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
             if self.push_session_entry(
                 scope,
                 turn,
@@ -1679,6 +1684,7 @@ impl AgentLoopState {
                 &discriminator,
                 result.content,
                 Some(result.call_id.to_string()),
+                (result.tool, result.effect_id),
                 now,
             )? {
                 recorded += 1;
@@ -1713,6 +1719,7 @@ impl AgentLoopState {
             "input",
             input.clone(),
             None,
+            (None, None),
             now,
         )
     }
@@ -1720,6 +1727,10 @@ impl AgentLoopState {
     /// Builds one session entry and pushes it to the outbox, returning whether it
     /// was new. A slot whose derived operation id is already owed is a replay and
     /// adds nothing; a full outbox fails closed.
+    ///
+    /// `provenance` is the tool and effect a [`MemoryEntryRole::ToolResult`]
+    /// entry records; every other role passes `(None, None)`. It is stamped
+    /// after construction because it is outside every derived identity.
     #[allow(clippy::too_many_arguments)]
     fn push_session_entry(
         &mut self,
@@ -1729,6 +1740,7 @@ impl AgentLoopState {
         slot: &str,
         content: AgentTaskContent,
         source: Option<String>,
+        provenance: (Option<AgentToolId>, Option<AgentEffectId>),
         now: AgentTimestampMillis,
     ) -> Result<bool, MemoryError> {
         let discriminator = format!("turn-{turn}-{slot}");
@@ -1765,7 +1777,8 @@ impl AgentLoopState {
             source,
             MemoryClassification::Unclassified,
             now,
-        )?;
+        )?
+        .with_tool_provenance(provenance.0, provenance.1);
         self.session_sequence = sequence.get();
         self.session_outbox.push(entry);
         Ok(true)

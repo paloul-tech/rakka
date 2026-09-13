@@ -53,10 +53,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use rakka_agent_workflow::{AgentTimestampMillis, StateSchemaVersion};
+use rakka_agent_workflow::{AgentEffectId, AgentTimestampMillis, StateSchemaVersion};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::definition::{AgentGuardrailStageId, AgentRevisionNumber};
+use crate::definition::{AgentGuardrailStageId, AgentRevisionNumber, AgentToolId};
 use crate::identity::{validated_id, AgentIdentityResult, AgentRunScope, AgentScope};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -386,6 +386,21 @@ pub struct SessionMemoryEntry {
     /// The record revision, so a later compaction can supersede an entry in
     /// place rather than losing its provenance.
     pub revision: AgentRevisionNumber,
+    /// The tool that produced a [`MemoryEntryRole::ToolResult`] entry, when
+    /// the run knew it at recording time; `None` for every other role, and for
+    /// a tool-result entry the loop synthesized without a tool effect. Like
+    /// [`Self::source`] (which keeps the model's call id) it is provenance for
+    /// a reader deriving claims or promotions from tool output — never
+    /// authority, never read by resolution or inference, and outside the
+    /// content digest and every derived identity, so an entry persisted
+    /// before the field decodes with `None` and identical identities
+    /// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+    pub tool: Option<AgentToolId>,
+    /// The effect whose outcome a [`MemoryEntryRole::ToolResult`] entry
+    /// records, under the same contract as [`Self::tool`]: the effect record
+    /// leaves the loop with its turn, and this is what ties the durable entry
+    /// back to it.
+    pub effect_id: Option<AgentEffectId>,
 }
 
 impl SessionMemoryEntry {
@@ -416,9 +431,27 @@ impl SessionMemoryEntry {
             classification,
             recorded_at,
             revision: AgentRevisionNumber::INITIAL,
+            tool: None,
+            effect_id: None,
         };
         entry.validate()?;
         Ok(entry)
+    }
+
+    /// Stamps the tool and effect that produced a tool-result entry.
+    ///
+    /// Provenance only: neither field enters the content digest, the entry
+    /// id, or the operation id, so a stamped entry deduplicates exactly as an
+    /// unstamped one.
+    #[must_use]
+    pub fn with_tool_provenance(
+        mut self,
+        tool: Option<AgentToolId>,
+        effect_id: Option<AgentEffectId>,
+    ) -> Self {
+        self.tool = tool;
+        self.effect_id = effect_id;
+        self
     }
 
     /// Serialized size of the entry, in bytes.
@@ -473,6 +506,10 @@ struct SessionMemoryEntryRecord {
     classification: MemoryClassification,
     recorded_at: AgentTimestampMillis,
     revision: AgentRevisionNumber,
+    #[serde(default)]
+    tool: Option<AgentToolId>,
+    #[serde(default)]
+    effect_id: Option<AgentEffectId>,
 }
 
 impl<'de> Deserialize<'de> for SessionMemoryEntry {
@@ -494,6 +531,8 @@ impl<'de> Deserialize<'de> for SessionMemoryEntry {
             classification: record.classification,
             recorded_at: record.recorded_at,
             revision: record.revision,
+            tool: record.tool,
+            effect_id: record.effect_id,
         };
         entry.validate().map_err(serde::de::Error::custom)?;
         Ok(entry)
@@ -3027,6 +3066,36 @@ mod tests {
             AgentTimestampMillis::new(sequence),
         )
         .expect("the entry is bounded")
+    }
+
+    /// A session entry persisted before the tool and effect provenance
+    /// fields existed decodes with both `None`, and a stamped entry
+    /// round-trips with its identities, digest, and operation id unchanged.
+    #[test]
+    fn a_pre_provenance_session_entry_decodes_with_no_tool_and_no_effect() {
+        let scope = scope("acme", "support", "run-1");
+        let plain = entry(&scope, 1, "tool-call-1", 2);
+        let mut value = serde_json::to_value(&plain).expect("serializes");
+        let object = value.as_object_mut().expect("an entry is an object");
+        assert!(object.remove("tool").is_some());
+        assert!(object.remove("effect_id").is_some());
+        let loaded: SessionMemoryEntry =
+            serde_json::from_value(value).expect("the pre-field record loads");
+        assert_eq!(loaded.tool, None);
+        assert_eq!(loaded.effect_id, None);
+        assert_eq!(loaded, plain);
+
+        let stamped = entry(&scope, 1, "tool-call-1", 2).with_tool_provenance(
+            Some(AgentToolId::new("lookup").expect("the tool id is valid")),
+            Some(AgentEffectId::new("effect-1")),
+        );
+        assert_eq!(stamped.entry_id, plain.entry_id);
+        assert_eq!(stamped.operation_id, plain.operation_id);
+        assert_eq!(stamped.content_digest, plain.content_digest);
+        let round_tripped: SessionMemoryEntry =
+            serde_json::from_value(serde_json::to_value(&stamped).expect("serializes"))
+                .expect("the stamped record loads");
+        assert_eq!(round_tripped, stamped);
     }
 
     #[test]

@@ -246,7 +246,7 @@ run rather than reporting a silent `ok`, and
 what a CI or release run should set, since a suite that quietly stops covering
 what its name claims is the failure mode this whole document exists to refuse.
 
-Verified against PostgreSQL 16 with pgvector 0.8.5: all twelve clauses pass
+Verified against PostgreSQL 16 with pgvector 0.8.5: all thirteen clauses pass
 under `RAKKA_POSTGRES_PGVECTOR_REQUIRED=1` with no skips, so the shared suite
 holds on both backends unchanged — the acceptance shape slice 2.4 established
 for the knowledge graph.

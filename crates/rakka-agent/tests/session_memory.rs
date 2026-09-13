@@ -18,11 +18,11 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    AgentContextSnapshotRef, AgentModelTurn, AgentModelUsage, AgentRunId, AgentRunMemory,
-    AgentRunScope, AgentRunStatus, AgentTaskContent, AgentToolCallId, AgentToolCallRequest,
-    AgentToolId, ContextSnapshotStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
-    MemoryClassification, MemoryEntryId, MemoryEntryRole, MemoryOperationId, MemorySequence,
-    SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
+    effect_id_for, AgentContextSnapshotRef, AgentModelTurn, AgentModelUsage, AgentRunId,
+    AgentRunMemory, AgentRunScope, AgentRunStatus, AgentTaskContent, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, ContextSnapshotStore, InMemoryContextSnapshotStore,
+    InMemorySessionMemoryStore, MemoryClassification, MemoryEntryId, MemoryEntryRole,
+    MemoryOperationId, MemorySequence, SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
@@ -132,6 +132,29 @@ async fn a_run_records_its_turns_to_isolated_session_memory() {
         AgentTaskContent::inline(serde_json::json!({ "ticket": 1 })).expect("the fixture input"),
         "the session opens with the task's bounded input"
     );
+    // The tool-result entry names the tool that produced it and the effect
+    // whose outcome it records, beside the call id it always carried; the
+    // entries of every other role name neither (specification 13.2). Turn
+    // one's model call took slot zero, so its one tool call is slot one.
+    let tool_entry = &page.entries[2];
+    assert_eq!(tool_entry.source.as_deref(), Some("call-1"));
+    assert_eq!(
+        tool_entry.tool,
+        Some(AgentToolId::new("lookup").expect("tool id")),
+        "the tool-result entry carries the tool"
+    );
+    assert_eq!(
+        tool_entry.effect_id,
+        Some(effect_id_for(&scope, 1, 1).expect("the effect id derives")),
+        "the tool-result entry carries the effect"
+    );
+    for (index, other) in page.entries.iter().enumerate() {
+        if index == 2 {
+            continue;
+        }
+        assert_eq!(other.tool, None, "entry {index} names no tool");
+        assert_eq!(other.effect_id, None, "entry {index} names no effect");
+    }
     // The sequence is monotonic and dense.
     let sequences: Vec<u64> = page
         .entries

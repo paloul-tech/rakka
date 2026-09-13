@@ -2450,6 +2450,24 @@ pub struct AgentToolResult {
     pub content: AgentTaskContent,
     /// When the run recorded it.
     pub recorded_at: AgentTimestampMillis,
+    /// The tool that produced the result, when the run knew it at recording
+    /// time: a tool effect's outcome is applied from the effect record that
+    /// still names the model's call, and the tool id travels from there onto
+    /// the [`MemoryEntryRole::ToolResult`](crate::memory::MemoryEntryRole)
+    /// session entry the turn records. A result the loop synthesizes — a
+    /// delegation receipt, a planning-time refusal, a fan-in table — names
+    /// none. Provenance for a reader deriving claims or promotions from tool
+    /// output, never authority: nothing resolves or infers from it, and a
+    /// record persisted before the field decodes to `None`
+    /// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+    #[serde(default)]
+    pub tool: Option<AgentToolId>,
+    /// The effect whose outcome this result records, when one exists; same
+    /// contract as [`Self::tool`]. Together with the call id in `source`, it
+    /// lets a durable session entry be tied back to the effect record that
+    /// produced it after the loop has dropped that record with the turn.
+    #[serde(default)]
+    pub effect_id: Option<AgentEffectId>,
 }
 
 /// The durable sink that dispatches a run's effects
@@ -2683,6 +2701,40 @@ impl From<AgentTaskError> for AgentEffectError {
 
 #[cfg(test)]
 mod tests {
+    /// A tool result persisted before the tool and effect provenance fields
+    /// existed decodes with both absent, and one carrying them round-trips.
+    #[test]
+    fn a_pre_provenance_tool_result_decodes_with_no_tool_and_no_effect() {
+        let content =
+            AgentTaskContent::inline(serde_json::json!({ "found": true })).expect("bounded");
+        let mut value = serde_json::to_value(AgentToolResult {
+            call_id: AgentToolCallId::new("call-1").expect("the call id is valid"),
+            content: content.clone(),
+            recorded_at: AgentTimestampMillis::new(7),
+            tool: None,
+            effect_id: None,
+        })
+        .expect("serializes");
+        let object = value.as_object_mut().expect("an object");
+        object.remove("tool");
+        object.remove("effect_id");
+        let decoded: AgentToolResult = serde_json::from_value(value).expect("decodes");
+        assert_eq!(decoded.tool, None);
+        assert_eq!(decoded.effect_id, None);
+
+        let stamped = AgentToolResult {
+            call_id: AgentToolCallId::new("call-1").expect("the call id is valid"),
+            content,
+            recorded_at: AgentTimestampMillis::new(7),
+            tool: Some(AgentToolId::new("lookup").expect("the tool id is valid")),
+            effect_id: Some(AgentEffectId::new("effect-1")),
+        };
+        let round_tripped: AgentToolResult =
+            serde_json::from_value(serde_json::to_value(&stamped).expect("serializes"))
+                .expect("decodes");
+        assert_eq!(round_tripped, stamped);
+    }
+
     /// Every structural bound a claim append can violate is refused at the
     /// door, so a request that reaches dispatch is one the store can accept.
     /// A bound checked only store-side would have already reserved the run's
