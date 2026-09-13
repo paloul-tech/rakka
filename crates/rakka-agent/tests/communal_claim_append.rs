@@ -14,12 +14,14 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use common::{goal_spec, goal_spec_draft, goal_task_creation_command, task_definition, task_scope};
-use rakka_agent::testkit::ScriptedDispatcher;
+use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     claim_append_operation_id, AgentClaimAppendExecutor, AgentClaimAppendFinding,
     AgentClaimAppendProvenance, AgentClaimAppendRequest, AgentClaimObjectRequest,
-    AgentCommunalClaimId, AgentDispatchFuture, AgentRunEffect, AgentRunEffectKind,
-    AgentRunEntityCommand, AgentRunEntityReply, AgentRunScope, AgentTaskContent, KnowledgeSpaceId,
+    AgentCommunalClaimId, AgentDispatchFuture, AgentModelTurn, AgentModelUsage, AgentRunEffect,
+    AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand,
+    AgentRunEntityReply, AgentRunScope, AgentRunStatus, AgentTaskContent, KnowledgeSpaceId,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 use serde_json::json;
@@ -298,4 +300,207 @@ async fn a_delegated_specialist_appends_under_its_grant_with_its_delegation_stam
     let refused = apply_append(&fx, "specialist-2", append_request("space-alpha")).await;
     let error = refused.expect_err("the ungranted space refuses");
     assert_eq!(error.code(), "run-claim-space-not-delegated");
+}
+
+/// An executor double that refuses every append definitively, under a code of
+/// the test's choosing, so the run-side failure semantics can be observed.
+struct RefusingClaimAppendExecutor {
+    code: &'static str,
+}
+
+impl AgentClaimAppendExecutor for RefusingClaimAppendExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _append: &'a AgentClaimAppendRequest,
+        _provenance: &'a AgentClaimAppendProvenance,
+        _now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentClaimAppendFinding> {
+        let code = self.code.to_string();
+        Box::pin(async move {
+            Ok(AgentClaimAppendFinding::Refused {
+                code,
+                message: "the claim store refused the append".to_string(),
+            })
+        })
+    }
+}
+
+fn text_turn(text: &str) -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text(text)
+        .with_usage(AgentModelUsage {
+            input_tokens: 8,
+            output_tokens: 4,
+            cost_micros: 2,
+        })
+}
+
+/// A goal fixture over a scripted two-turn model, so the run holds a live
+/// model wait while the append is driven and completes afterwards.
+async fn scripted_goal_fixture(executor: Arc<dyn AgentClaimAppendExecutor>) -> Fixture {
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, text_turn("thinking"))
+            .with_turn_for(2, common::proposing_turn()),
+    )
+    .with_claim_append_executor(executor);
+    let fx = Fixture::new(dispatcher);
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec();
+    spec.knowledge_spaces.insert(space("space-alpha"));
+    fx.apply_task_command(goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(spec, true),
+    ))
+    .await
+    .expect("the goal task creates");
+    fx
+}
+
+/// Settles the run so its committed effects are dispatchable, then records
+/// `outcome` against its one outstanding claim-append effect without driving
+/// anything else — the model wait the run holds is left exactly as it was.
+async fn resolve_claim_append(fx: &Fixture, outcome: AgentRunEffectOutcome) -> AgentRunEffect {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.settle_side_effects(&fx.router, fx.now())
+        .await
+        .expect("settle");
+    let effect = committed_append(run.state().expect("state"))
+        .into_iter()
+        .find(AgentRunEffect::is_outstanding)
+        .expect("one claim-append effect is outstanding");
+    let scope = common::run_scope();
+    run.apply(
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect
+                .result_operation_id(&scope)
+                .expect("the result operation id derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: effect.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(outcome),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the result applies");
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    committed_append(run.state().expect("state"))
+        .into_iter()
+        .find(|held| held.effect_id == effect.effect_id)
+        .expect("the effect record survives its resolution")
+}
+
+/// The wind-down exemption, the claim half: a claim is a record *about* the
+/// run's work, not the work, so a claim-store refusal — definitive or
+/// exhausted — stays on the effect record and never fences the live run
+/// (specification 13.1 and 13.4). The run keeps the wait it held, its status
+/// does not move, no terminal reason is recorded, and it completes afterwards
+/// exactly as it would have without the append.
+#[tokio::test]
+async fn a_failed_claim_append_does_not_wind_the_run_down() {
+    let fx = scripted_goal_fixture(Arc::new(RefusingClaimAppendExecutor {
+        code: "claim-store-refused",
+    }))
+    .await;
+    // Crank the run to its first durable wait: the model call of turn one.
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.settle_side_effects(&fx.router, fx.now())
+        .await
+        .expect("settle");
+    let before = fx.run_snapshot().await.expect("the run exists");
+    assert!(
+        !before.status.is_terminal(),
+        "the run holds a live wait, got {:?}",
+        before.status
+    );
+
+    // A definitive refusal from the executor.
+    let reply = apply_append(&fx, "append-refused", append_request("space-alpha"))
+        .await
+        .expect("the append applies");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let scope = common::run_scope();
+    let (effect, request, provenance) = {
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        let effect = committed_append(run.state().expect("state"))
+            .into_iter()
+            .next()
+            .expect("the append committed");
+        let rakka_agent::AgentRunEffectRequest::ClaimAppend { append, provenance } =
+            &effect.request
+        else {
+            panic!("the effect carries the append request");
+        };
+        (effect.clone(), (**append).clone(), (**provenance).clone())
+    };
+    let outcome = fx
+        .dispatcher
+        .claim_append_outcome(&scope, &effect, &request, &provenance, fx.now())
+        .await;
+    assert!(
+        matches!(&outcome, AgentRunEffectOutcome::Failed { code, .. } if code == "claim-store-refused"),
+        "the executor's refusal is the effect's definitive failure, got {outcome:?}"
+    );
+    let failed = resolve_claim_append(&fx, outcome).await;
+    assert_eq!(failed.status, AgentRunEffectStatus::Failed);
+    assert_eq!(
+        failed.last_error_code.as_deref(),
+        Some("claim-store-refused"),
+        "the failure is on the effect record"
+    );
+    let after = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status, "the run's status did not move");
+    assert_eq!(
+        after.terminal_reason, None,
+        "a failed append records no terminal reason"
+    );
+
+    // An exhausted retry budget, likewise.
+    let reply = apply_append(&fx, "append-exhausted", append_request("space-alpha"))
+        .await
+        .expect("the second append applies");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let exhausted = resolve_claim_append(
+        &fx,
+        AgentRunEffectOutcome::Exhausted {
+            code: "claim-store-unavailable".to_string(),
+            message: "every attempt failed".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(exhausted.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(
+        exhausted.last_error_code.as_deref(),
+        Some("claim-store-unavailable")
+    );
+    let after = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status, "the run's status did not move");
+    assert_eq!(after.terminal_reason, None);
+
+    // The run completes on its own terms afterwards: neither failure fenced
+    // the model wait it held.
+    fx.pump().await.expect("the loop runs to completion");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(
+        run.status,
+        AgentRunStatus::Completed,
+        "a failed append never killed the live run, got {:?}",
+        run.terminal_reason
+    );
+    assert!(
+        !matches!(
+            run.terminal_reason,
+            Some(rakka_agent::AgentRunTerminalReason::EffectFailed { .. })
+        ),
+        "the terminal reason is the run's own, not the append's"
+    );
 }

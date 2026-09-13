@@ -4400,9 +4400,21 @@ fn apply_effect_outcome(
             // ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)),
             // so a memory-store outage must not kill a live run. The failure
             // stays on the effect record, and the initiator may re-issue the
-            // promotion under a new operation id. A failed goal evaluation is
-            // the other: the coordinator run must outlive a refused or
-            // unwired evaluation so the goal stays decidable — the failure
+            // promotion under a new operation id. A failed communal claim
+            // append is exempt for the same reason, one tier over: a claim is
+            // a record *about* the run's work, not the work
+            // ([specification 13.4](../../../docs/plans/rakka-agent/spec.md)),
+            // so a claim-store outage must not kill a live run either — the
+            // failure stays on the effect record and the initiator re-issues
+            // the append under a new operation id. That a claim may later be
+            // read as *evidence* by a goal evaluation
+            // ([specification 8.3](../../../docs/plans/rakka-agent/spec.md))
+            // does not make a failed append correctness-bearing: an
+            // evaluation reads whatever the graph holds when it runs, and a
+            // claim that never landed is evidence the evaluator does not see,
+            // never evidence it sees wrongly. A failed goal evaluation is
+            // the third exception: the coordinator run must outlive a refused
+            // or unwired evaluation so the goal stays decidable — the failure
             // stays on the effect record and the caller re-evaluates
             // ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
             // A definitively failed send settles its delegation cell in this
@@ -4538,6 +4550,7 @@ fn apply_effect_outcome(
             }
             if failed_kind != AgentRunEffectKind::MemoryPromotionCall
                 && failed_kind != AgentRunEffectKind::GoalEvaluationCall
+                && failed_kind != AgentRunEffectKind::ClaimAppendCall
                 && !group_member_send
             {
                 let run = state.run_mut()?;

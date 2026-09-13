@@ -1438,6 +1438,15 @@ Policy MAY require HITL or a verifier service before a claim becomes
 `Verified`, especially when it can authorize or materially influence a
 high-impact effect.
 
+A claim append is an idempotent durable effect of the run that requests it,
+and a definitively failed or exhausted append MUST NOT terminate that run. A
+claim is a record about the run's work, not the work: the failure stays on the
+effect record, and the initiator MAY re-issue the append under a new operation
+id. That a claim may later be read as evidence (Section 8.3) does not make a
+failed append correctness-bearing — an evaluation reads whatever the graph
+holds when it runs, and a claim that never landed is evidence the evaluator
+does not see, never evidence it sees wrongly.
+
 ### 13.5 Memory Context Snapshot
 
 Before every model effect, the run MUST persist an immutable
