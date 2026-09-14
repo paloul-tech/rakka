@@ -1412,6 +1412,37 @@ pub enum AgentDispatchDecision {
 /// because a dispatcher that skips the check is exactly the universally
 /// privileged worker [specification 16](../../../docs/plans/rakka-agent/spec.md)
 /// forbids claiming isolation from.
+///
+/// Both methods are required. A wrapping authority that forgot to forward
+/// [`Self::review_tool_response`] would silently drop the `ToolResponse`
+/// evaluation point, so every implementation states what it does at that
+/// boundary; [`accept_tool_response_unchanged`] is the one-line body for an
+/// authority that evaluates no response chain, and a wrapper forwards to the
+/// authority it wraps. An implementation without it does not build:
+///
+/// ```compile_fail,E0046
+/// use rakka_agent::{
+///     AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentRunEffect,
+///     AgentRunScope, AgentRunState,
+/// };
+/// use rakka_agent_workflow::AgentTimestampMillis;
+///
+/// struct Gate;
+///
+/// impl AgentDispatchAuthority for Gate {
+///     fn authorize<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _run: &'a AgentRunState,
+///         _intent: &'a AgentRunEffect,
+///         _attempt: u32,
+///         _now: AgentTimestampMillis,
+///     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+///         unimplemented!()
+///     }
+///     // `review_tool_response` is missing: the impl is incomplete.
+/// }
+/// ```
 pub trait AgentDispatchAuthority: Send + Sync {
     /// Authorizes one dispatch attempt of one effect intent, or refuses it.
     ///
@@ -1432,23 +1463,70 @@ pub trait AgentDispatchAuthority: Send + Sync {
     /// before the pipeline delivers it
     /// ([`AgentToolAuthority::review_tool_response`]).
     ///
-    /// The default accepts the result unchanged, for an authority that
-    /// evaluates no response chain; [`AgentEntityAuthority`] delegates to the
-    /// tool authority it wraps.
+    /// Required, not defaulted: an authority that evaluates no response chain
+    /// says so with [`accept_tool_response_unchanged`], and one that wraps
+    /// another forwards to it — [`AgentEntityAuthority`] delegates to the tool
+    /// authority it wraps. A defaulted accept would let a wrapper drop the
+    /// boundary by omission.
     fn review_tool_response<'a>(
         &'a self,
         scope: &'a AgentRunScope,
         intent: &'a AgentRunEffect,
         tool: Option<&'a AgentToolId>,
         content: AgentTaskContent,
-    ) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
-        let _ = (scope, intent, tool);
-        Box::pin(async move {
-            Ok(AgentToolResponseDecision::Accepted(Box::new(
-                AgentToolResponseReview::unchanged(content),
-            )))
-        })
-    }
+    ) -> AgentDispatchFuture<'a, AgentToolResponseDecision>;
+}
+
+/// The accept-unchanged body of
+/// [`AgentDispatchAuthority::review_tool_response`]: the result is delivered
+/// exactly as the tool produced it, with no transform and no report.
+///
+/// For an authority that evaluates no `ToolResponse` chain. A wrapping
+/// authority does not use it — it forwards to the authority it wraps, or the
+/// wrapped chain is silently dropped.
+///
+/// ```
+/// use rakka_agent::{
+///     accept_tool_response_unchanged, AgentDispatchAuthority, AgentDispatchDecision,
+///     AgentDispatchFuture, AgentRunEffect, AgentRunScope, AgentRunState, AgentTaskContent,
+///     AgentToolId, AgentToolResponseDecision,
+/// };
+/// use rakka_agent_workflow::AgentTimestampMillis;
+///
+/// struct Gate;
+///
+/// impl AgentDispatchAuthority for Gate {
+///     fn authorize<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _run: &'a AgentRunState,
+///         _intent: &'a AgentRunEffect,
+///         _attempt: u32,
+///         _now: AgentTimestampMillis,
+///     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+///         unimplemented!()
+///     }
+///
+///     fn review_tool_response<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _intent: &'a AgentRunEffect,
+///         _tool: Option<&'a AgentToolId>,
+///         content: AgentTaskContent,
+///     ) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
+///         accept_tool_response_unchanged(content)
+///     }
+/// }
+/// ```
+#[must_use]
+pub fn accept_tool_response_unchanged<'a>(
+    content: AgentTaskContent,
+) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
+    Box::pin(async move {
+        Ok(AgentToolResponseDecision::Accepted(Box::new(
+            AgentToolResponseReview::unchanged(content),
+        )))
+    })
 }
 
 /// What the `ToolResponse` boundary decided about an executed tool's result.

@@ -2533,6 +2533,18 @@ impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAutho
             }
         })
     }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a rakka_agent::AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentToolResponseDecision> {
+        // A wrapper forwards the boundary: the chain it wraps is the one that
+        // must run.
+        self.0.review_tool_response(scope, intent, tool, content)
+    }
 }
 
 /// A gate that answers one fixed refusal for every intent.
@@ -2554,6 +2566,19 @@ impl AgentDispatchAuthority for FixedRefusalAuthority {
     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
         let refusal = self.0.clone();
         Box::pin(async move { Ok(AgentDispatchDecision::Refused(refusal)) })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _tool: Option<&'a rakka_agent::AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentToolResponseDecision> {
+        // Every dispatch is refused before a tool can run, so no response
+        // ever reaches this gate; the decision is stated rather than
+        // inherited.
+        rakka_agent::accept_tool_response_unchanged(content)
     }
 }
 
