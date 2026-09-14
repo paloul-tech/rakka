@@ -72,16 +72,18 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install MSRV Rust
-        uses: dtolnay/rust-toolchain@1.85.0
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Install Protobuf compiler
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@v2
-
+      # Deliberately uncached: a restored build cache let this job stay green
+      # for two months while rig-core 0.37.0 and the lockfile's tonic and icu
+      # pins no longer built on the declared MSRV, because cargo never
+      # recompiled the restored units. A cold check is the only one that can
+      # fail for the reason it exists (issue #73).
       - name: Check workspace on MSRV
         run: cargo check --workspace --all-targets
 

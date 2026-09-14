@@ -59,11 +59,11 @@ pub fn hex_encode(value: &str) -> String {
 }
 
 pub fn hex_decode(value: &str) -> Option<String> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
-    for chunk in value.as_bytes().chunks_exact(2) {
+    for chunk in value.as_bytes().as_chunks::<2>().0 {
         let text = std::str::from_utf8(chunk).ok()?;
         let byte = u8::from_str_radix(text, 16).ok()?;
         bytes.push(byte);
