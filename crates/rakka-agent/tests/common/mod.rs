@@ -1666,6 +1666,44 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         Err("the loop did not quiesce".to_string())
     }
 
+    /// Drives a run that has already ended until it holds no outstanding
+    /// effect of `kind`. [`Self::pump`] stops at terminal; this is what an
+    /// application that keeps pumping a terminal run's outbox does for the
+    /// promotion or claim append it accepted inside the post-terminal window.
+    pub async fn pump_post_terminal(
+        &self,
+        kind: rakka_agent::AgentRunEffectKind,
+    ) -> Result<(), String> {
+        for _round in 0..16 {
+            let now = self.now();
+            let mut run = self.run();
+            run.recover(now)
+                .await
+                .map_err(|error| error.code().to_string())?;
+            run.settle_side_effects(&self.router, now)
+                .await
+                .map_err(|error| error.code().to_string())?;
+            self.dispatcher
+                .drive(&mut run, &self.router, self.now())
+                .await
+                .map_err(|error| error.code().to_string())?;
+            let outstanding = run
+                .state()
+                .map_err(|error| error.code().to_string())?
+                .loop_state()
+                .is_some_and(|loop_state| {
+                    loop_state
+                        .effects()
+                        .iter()
+                        .any(|effect| effect.kind() == kind && effect.is_outstanding())
+                });
+            if !outstanding {
+                return Ok(());
+            }
+        }
+        Err("the post-terminal effect did not settle".to_string())
+    }
+
     pub async fn run_snapshot(&self) -> Option<AgentRunSnapshot> {
         let mut run = self.run();
         let now = self.now();

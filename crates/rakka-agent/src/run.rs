@@ -4058,15 +4058,28 @@ fn record_effect_result(
     outcome.check_schema(policy)?;
 
     let run = state.run_mut()?;
-    if run.status.is_terminal() {
-        return Err(AgentRunError::Terminal { status: run.status });
-    }
-
+    // A terminal run answers `Terminal` for every result but one it can still
+    // owe: the outcome of a promotion or claim append accepted inside the
+    // post-terminal window, which lands on the terminal record without moving
+    // it. The lookup precedes the guard only so the kind can be read; a
+    // result naming no held effect is answered exactly as before.
+    let terminal = run.status.is_terminal();
+    let terminal_status = run.status;
     let Some(effect) = run.loop_state.effect_mut(effect_id) else {
+        if terminal {
+            return Err(AgentRunError::Terminal {
+                status: terminal_status,
+            });
+        }
         return Err(AgentRunError::UnknownEffect {
             effect_id: effect_id.clone(),
         });
     };
+    if terminal && !effect.kind().exempt_from_wind_down_fence() {
+        return Err(AgentRunError::Terminal {
+            status: terminal_status,
+        });
+    }
     if effect.generation != generation {
         // A result for a superseded — or fabricated future — generation must
         // not resolve the current one: the reconciliation that minted the
@@ -4093,7 +4106,17 @@ fn record_effect_result(
     // roles — a bare indeterminate effect could not
     // ([specification 12.1](../../../docs/plans/rakka-agent/spec.md),
     // [12.2](../../../docs/plans/rakka-agent/spec.md)).
-    if matches!(outcome, AgentRunEffectOutcome::Indeterminate { .. }) {
+    //
+    // Not on a run that has already ended: there is no run to park, and the
+    // only effect a terminal run can owe a result for is a promotion or claim
+    // append, whose ambiguous attempt the dispatcher retries under its
+    // idempotency key rather than parking. The one path that can still park
+    // one — a possibly-executed attempt whose recovery retry the authority
+    // refused — leaves the generation `Indeterminate` on the effect record,
+    // resolvable by `ResolveIndeterminateEffect`, and the terminal status
+    // untouched ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+    let live = state.run().is_some_and(|run| !run.status.is_terminal());
+    if live && matches!(outcome, AgentRunEffectOutcome::Indeterminate { .. }) {
         open_effect_checkpoint(
             state,
             policies,
@@ -4179,8 +4202,9 @@ fn apply_effect_outcome(
         AgentRunEffectOutcome::MemoryPromotion { promoted } => {
             // A promotion is not part of the turn: the bounded receipt is
             // recorded and nothing else moves — no phase, no status, no
-            // resumption. Whatever wait the run held, it still holds, and a
-            // winding-down run records the receipt and keeps quiescing.
+            // resumption. Whatever wait the run held, it still holds, a
+            // winding-down run records the receipt and keeps quiescing, and
+            // a run that has ended records it and stays ended.
             effect.status = AgentRunEffectStatus::Succeeded;
             run.loop_state
                 .record_memory_promotion(effect_id.clone(), promoted.clone(), now);
@@ -5305,6 +5329,86 @@ fn schedule_compensation(
     Ok(())
 }
 
+/// The first slot at or after `slot` of `turn` under which this run has not
+/// already resolved an effect's result.
+///
+/// The loop's slot counter keeps a turn's slots unique across
+/// `clear_turn`. This floor covers a loop state persisted before the counter
+/// existed and decoded with it at zero: its allocator counted only the
+/// effects still held, so a turn whose effects had been dropped — a run
+/// resting on its result proposal, or a run that has ended — re-derived the
+/// identity of an effect the run had already resolved, and a promotion or
+/// claim append committed under it would have been answered `Duplicate` from
+/// the operation log forever. An effect resolved by a result leaves that
+/// result's operation id in the log; skipping every slot the log knows makes
+/// the allocation fresh. The log is bounded, so a pre-counter record whose
+/// terminal turn's results have since been evicted by sixty-four later
+/// operations is the one shape this cannot see; the counter closes it for
+/// every record written from here on.
+fn unresolved_effect_slot(state: &AgentRunState, turn: u64, slot: usize) -> AgentRunResult<usize> {
+    let mut candidate = slot;
+    loop {
+        let resolved = crate::effect::effect_result_operation_id(
+            &state.scope,
+            turn,
+            candidate,
+            AgentEffectGeneration::FIRST,
+        )?;
+        if state.applied_operations().outcome(&resolved).is_none() {
+            return Ok(candidate);
+        }
+        candidate = candidate.saturating_add(1);
+    }
+}
+
+/// The door a memory promotion or claim append passes on a run that has
+/// ended ([specification 13.3 and 13.4](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// A live run passes whatever its wind-down state: both effect kinds are
+/// exempt from the wind-down fence, since each copies work the run has
+/// already recorded rather than doing new work, so a promotion committed on
+/// a `Cancelling` run dispatches and lands exactly as one committed after
+/// `Cancelled`. A run that ended `Completed`, `Failed`, or `Cancelled` passes
+/// for [`AgentEffectPolicies::post_terminal_memory_window_ms`] after its
+/// terminal stamp, so a run that started and ended inside one application
+/// sweep interval is still promoted and claimed; a zero window restores the
+/// plain terminal refusal. `HandedOff` and `Superseded` are refused as
+/// terminal whatever the window: the task's responsibility moved, and the
+/// successor run promotes. A terminal record with no stamp — persisted before
+/// the stamp existed and never repaired — is outside every window rather
+/// than measured from `updated_at`, which every accepted post-terminal
+/// command moves and would therefore be a sliding clock; retention takes the
+/// same posture for such a record, and the backfill repair gives it a stamp.
+fn check_post_terminal_memory_window(
+    run: &AgentRun,
+    policies: &AgentEffectPolicies,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    if !run.status.is_terminal() {
+        return Ok(());
+    }
+    let window_ms = policies.post_terminal_memory_window_ms();
+    let windowed = matches!(
+        run.status,
+        AgentRunStatus::Completed | AgentRunStatus::Failed | AgentRunStatus::Cancelled
+    );
+    if window_ms == 0 || !windowed {
+        return Err(AgentRunError::Terminal { status: run.status });
+    }
+    let closed = match run.terminal_at {
+        Some(terminal_at) => now.as_millis().saturating_sub(terminal_at.as_millis()) > window_ms,
+        None => true,
+    };
+    if closed {
+        return Err(AgentRunError::MemoryWindowClosed {
+            status: run.status,
+            terminal_at: run.terminal_at,
+            window_ms,
+        });
+    }
+    Ok(())
+}
+
 /// Commits one memory-promotion effect from a deduplicated command
 /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -5317,6 +5421,15 @@ fn schedule_compensation(
 /// turn, and whatever wait the run held, it still holds; the settle pass
 /// flushes owed session entries before dispatching effects, so the selection
 /// is durably in the store before the executor reads it.
+///
+/// A promotion is not new work but a copy of work already recorded, so the
+/// wind-down does not fence it and a run that has ended still accepts it for
+/// the post-terminal window ([`check_post_terminal_memory_window`]); the
+/// effect is exempt from the wind-down fence and rides the ordinary outbox,
+/// and its outcome lands on the terminal record without moving it. The
+/// attempt reservation is charged to the run's own budget as for any
+/// generation; the task's escrow settlement, folded at the terminal
+/// transition, is not re-taken for it.
 fn promote_memory(
     state: &mut AgentRunState,
     promotion: AgentMemoryPromotionRequest,
@@ -5326,19 +5439,12 @@ fn promote_memory(
 ) -> AgentRunResult<()> {
     let scope = state.scope.clone();
     let run = state.run_mut()?;
-    if run.status.is_terminal() {
-        return Err(AgentRunError::Terminal { status: run.status });
-    }
-    if run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling {
-        // A promotion is new work, which the wind-down fence forbids —
-        // contrast with compensation, the one effect an explicit decision
-        // authorizes past the fence.
-        return Err(AgentRunError::MemoryPromotionFenced { status: run.status });
-    }
-    if run.loop_state.handoff_fenced() {
-        // New work is equally fenced by an unresolved handoff: the run's
+    check_post_terminal_memory_window(run, policies, now)?;
+    if !run.status.is_terminal() && run.loop_state.handoff_fenced() {
+        // New work on a live run is fenced by an unresolved handoff: the run's
         // responsibility is committed to move
-        // ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+        // ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)). A
+        // terminal run's handoff cell is settled by construction.
         return Err(AgentRunError::HandoffPending { status: run.status });
     }
     if !session_wired {
@@ -5391,6 +5497,8 @@ fn promote_memory(
     let turn = run.loop_state.turn();
     let slot = run.loop_state.next_effect_slot();
     let settings_revision = run.loop_state.agent_settings_revision();
+    let slot = unresolved_effect_slot(state, turn, slot)?;
+    let run = state.run_mut()?;
     let effect = AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
     run.loop_state.record_effect(effect)?;
     state.updated_at = now;
@@ -5408,6 +5516,11 @@ fn promote_memory(
 /// reserves the append's attempt budget, and records the effect. The
 /// dispatcher-side executor performs the store append inside its bounded
 /// attempt.
+///
+/// Like a promotion, an append is a record *about* the run's work rather than
+/// the work, so the wind-down does not fence it and a run that has ended
+/// still accepts it for the post-terminal window
+/// ([`check_post_terminal_memory_window`]).
 fn append_claim(
     state: &mut AgentRunState,
     append: crate::effect::AgentClaimAppendRequest,
@@ -5416,15 +5529,9 @@ fn append_claim(
 ) -> AgentRunResult<()> {
     let scope = state.scope.clone();
     let run = state.run_mut()?;
-    if run.status.is_terminal() {
-        return Err(AgentRunError::Terminal { status: run.status });
-    }
-    if run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling {
-        // An append is new work, which the wind-down fence forbids.
-        return Err(AgentRunError::ClaimAppendFenced { status: run.status });
-    }
-    if run.loop_state.handoff_fenced() {
-        // New work is equally fenced by an unresolved handoff
+    check_post_terminal_memory_window(run, policies, now)?;
+    if !run.status.is_terminal() && run.loop_state.handoff_fenced() {
+        // New work on a live run is fenced by an unresolved handoff
         // ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
         return Err(AgentRunError::HandoffPending { status: run.status });
     }
@@ -5469,6 +5576,8 @@ fn append_claim(
     let turn = run.loop_state.turn();
     let slot = run.loop_state.next_effect_slot();
     let settings_revision = run.loop_state.agent_settings_revision();
+    let slot = unresolved_effect_slot(state, turn, slot)?;
+    let run = state.run_mut()?;
     let effect = AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
     run.loop_state.record_effect(effect)?;
     state.updated_at = now;
@@ -7863,32 +7972,34 @@ where
     /// ([specification 15](../../../docs/plans/rakka-agent/spec.md)).
     ///
     /// A run that is winding down — cancelled, or stopped by a failed effect —
-    /// flushes nothing: handing a fenced run's effect to the outbox would be
-    /// exactly the new dispatch the fence forbids. Work that already reached
-    /// the dispatch layer settles truthfully there.
+    /// flushes only the kinds exempt from the fence
+    /// ([`AgentRunEffectKind::exempt_from_wind_down_fence`]): handing any
+    /// other fenced effect to the outbox would be exactly the new dispatch the
+    /// fence forbids. Work that already reached the dispatch layer settles
+    /// truthfully there. A run that has *ended* is the far end of the same
+    /// wind-down and flushes the same exempt kinds — a promotion or claim
+    /// accepted inside the post-terminal window rides this path — and nothing
+    /// else, since everything else was fenced at the terminal transition.
     async fn dispatch_effects(&mut self, now: AgentTimestampMillis) -> AgentRunResult<usize> {
-        let (terminal, winding_down) = {
+        let winding_down = {
             let state = self.state()?;
-            (
-                state.status().is_none_or(AgentRunStatus::is_terminal),
-                state.run().is_some_and(|run| run.terminal_reason.is_some())
-                    || state.status() == Some(AgentRunStatus::Cancelling),
-            )
+            state.status().is_none_or(AgentRunStatus::is_terminal)
+                || state.run().is_some_and(|run| run.terminal_reason.is_some())
+                || state.status() == Some(AgentRunStatus::Cancelling)
         };
-        if terminal {
-            return Ok(0);
-        }
 
         // Only a *dispatchable* pending effect is made ready: a checkpoint-gated
         // effect with no grant stays `Pending`, parked behind its approval
         // checkpoint, and never reaches the sink until a resolution stores the
         // grant ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
         //
-        // A run that is winding down flushes only a compensation effect: handing
-        // any other fenced work to the outbox would be exactly the new dispatch
-        // the fence forbids, while the compensation is the one piece of new work
-        // an operator's `Compensate` decision explicitly authorized after the
-        // fence ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
+        // A run that is winding down, or has ended, flushes only the exempt
+        // kinds: handing any other fenced work to the outbox would be exactly
+        // the new dispatch the fence forbids, while a compensation is the
+        // piece of new work an operator's `Compensate` decision explicitly
+        // authorized after the fence
+        // ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)) and
+        // a promotion or claim append is a copy of work already recorded.
         let dispatchable: Vec<AgentEffectId> = self
             .state()?
             .loop_state()
@@ -9238,11 +9349,26 @@ pub enum AgentRunError {
     /// A promotion was requested of a run with no session-memory backend: it
     /// has nothing to promote and no store the executor could read.
     SessionMemoryUnwired,
-    /// A promotion was requested of a run that is winding down; a promotion is
-    /// new work, which the wind-down fence forbids.
+    /// A promotion was requested of a run that is winding down.
+    ///
+    /// No longer answered: a promotion is exempt from the wind-down fence and
+    /// is accepted while a run winds down and, for the post-terminal window,
+    /// after it ends. The variant and its registered code are retained so a
+    /// matcher naming it still builds.
     MemoryPromotionFenced {
         /// The status the run held.
         status: AgentRunStatus,
+    },
+    /// A promotion or claim append reached a run that ended longer ago than
+    /// the post-terminal window allows — or whose terminal record carries no
+    /// stamp to measure the window from.
+    MemoryWindowClosed {
+        /// The terminal status the run holds.
+        status: AgentRunStatus,
+        /// When the run ended, as its record says.
+        terminal_at: Option<AgentTimestampMillis>,
+        /// The window the deployment configured, in milliseconds.
+        window_ms: u64,
     },
     /// A promotion selection was empty, inverted, or wider than its bound.
     MemorySelectionInvalid {
@@ -9309,8 +9435,11 @@ pub enum AgentRunError {
         /// The ceiling the reservation would cross.
         exhaustion: AgentBudgetExhaustion,
     },
-    /// A claim append was requested of a run that is winding down; an append
-    /// is new work, which the wind-down fence forbids.
+    /// A claim append was requested of a run that is winding down.
+    ///
+    /// No longer answered, for the same reason as
+    /// [`Self::MemoryPromotionFenced`]; retained so a matcher naming it still
+    /// builds.
     ClaimAppendFenced {
         /// The status the run held.
         status: AgentRunStatus,
@@ -9364,6 +9493,7 @@ impl AgentRunError {
             Self::Memory(error) => error.code(),
             Self::SessionMemoryUnwired => "run-session-memory-unwired",
             Self::MemoryPromotionFenced { .. } => "run-memory-promotion-fenced",
+            Self::MemoryWindowClosed { .. } => "run-memory-window-closed",
             Self::MemorySelectionInvalid { .. } => "run-memory-selection-invalid",
             Self::MemorySelectionOutOfRange { .. } => "run-memory-selection-out-of-range",
             Self::MemoryConsolidationInvalid => "run-memory-consolidation-invalid",
@@ -9457,6 +9587,23 @@ impl Display for AgentRunError {
                 f,
                 "the run is {status} and winding down; a promotion is new work the fence forbids"
             ),
+            Self::MemoryWindowClosed {
+                status,
+                terminal_at,
+                window_ms,
+            } => match terminal_at {
+                Some(terminal_at) => write!(
+                    f,
+                    "the run ended {status} at {} ms and its {window_ms} ms window for a memory \
+                     promotion or claim append has closed",
+                    terminal_at.as_millis()
+                ),
+                None => write!(
+                    f,
+                    "the run ended {status} with no terminal stamp, so its {window_ms} ms window \
+                     for a memory promotion or claim append cannot be measured and is closed"
+                ),
+            },
             Self::MemorySelectionInvalid { from, to, maximum } => write!(
                 f,
                 "the promotion selection {from}..={to} is empty, inverted, or wider than the \

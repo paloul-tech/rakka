@@ -2291,7 +2291,9 @@ where
             // its intent settled, never dispatched after the cancellation. A
             // compensation or workflow-cancel is exempt — it is exactly the
             // work the wind-down authorized after the fence, and cancelling
-            // its ticket here would strand the wind-down on it forever.
+            // its ticket here would strand the wind-down on it forever — and
+            // so is a promotion or claim append, which copies work already
+            // recorded and may be accepted after the run has ended.
             self.settle_ticket_cancelled(scope, &claim, "run-cancelled", pass)
                 .await?;
             self.deliver_outcome(
@@ -3838,8 +3840,11 @@ where
         for intent in loop_state.ready_effects() {
             if intent.kind().exempt_from_wind_down_fence() {
                 // The compensation and workflow-cancel the wind-down itself
-                // authorized stay dispatchable; the ordinary flush and claim
-                // paths own them.
+                // authorized, and the promotion or claim append that copies
+                // work already recorded — including one accepted after the
+                // run ended — stay dispatchable; the ordinary flush and claim
+                // paths own them, and this sweep neither reads nor re-fences
+                // them on any later pass.
                 continue;
             }
             let ticket_id = intent.dispatch_ticket_id();

@@ -629,6 +629,7 @@ pub struct AgentEffectPolicies {
     workflow_cancel: AgentEffectSpec,
     claim_append: AgentEffectSpec,
     checkpoint_sla: crate::checkpoints::AgentCheckpointSla,
+    post_terminal_memory_window_ms: u64,
 }
 
 impl AgentEffectPolicies {
@@ -732,6 +733,7 @@ impl AgentEffectPolicies {
                 authorization_required: false,
             },
             checkpoint_sla: crate::checkpoints::AgentCheckpointSla::default(),
+            post_terminal_memory_window_ms: AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS,
         }
     }
 
@@ -747,6 +749,27 @@ impl AgentEffectPolicies {
     #[must_use]
     pub const fn checkpoint_sla(&self) -> &crate::checkpoints::AgentCheckpointSla {
         &self.checkpoint_sla
+    }
+
+    /// Sets how long after a run ends `Completed`, `Failed`, or `Cancelled` it
+    /// still accepts a `PromoteMemory` or `AppendClaim` command
+    /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)),
+    /// measured from the run's terminal stamp. The default is
+    /// [`AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS`]; `0` closes the window
+    /// and restores the plain terminal refusal. The window is not a durable
+    /// field: it is deployment configuration read at each command, like the
+    /// rest of these policies.
+    #[must_use]
+    pub const fn with_post_terminal_memory_window_ms(mut self, window_ms: u64) -> Self {
+        self.post_terminal_memory_window_ms = window_ms;
+        self
+    }
+
+    /// The post-terminal memory window, in milliseconds; see
+    /// [`Self::with_post_terminal_memory_window_ms`].
+    #[must_use]
+    pub const fn post_terminal_memory_window_ms(&self) -> u64 {
+        self.post_terminal_memory_window_ms
     }
 
     /// Sets the spec model calls dispatch under.
@@ -1031,18 +1054,32 @@ impl AgentRunEffectKind {
     }
 
     /// Whether an effect of this kind may still be handed to the outbox and
-    /// dispatched while its run winds down.
+    /// dispatched while its run winds down — or after it has ended.
     ///
     /// The wind-down fence forbids new dispatch
     /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)), with
-    /// exactly two exemptions, each a piece of work the wind-down itself
-    /// authorizes: the compensation an operator's `Compensate` decision
-    /// schedules after the fence
-    /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)), and
-    /// the workflow-cancel the wind-down owes its started child workflows.
+    /// exactly four exemptions. Two are work the wind-down itself authorizes:
+    /// the compensation an operator's `Compensate` decision schedules after
+    /// the fence ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)),
+    /// and the workflow-cancel the wind-down owes its started child
+    /// workflows. Two are not new work at all: a memory promotion and a claim
+    /// append each copy work the run has already recorded into a longer-lived
+    /// tier ([specification 13.3 and 13.4](../../../docs/plans/rakka-agent/spec.md)),
+    /// so the fence has nothing to protect from them — a promotion or claim
+    /// committed on a live run that then winds down still dispatches, and one
+    /// accepted inside the post-terminal window rides the same path. The
+    /// predicate is the single source for the terminal transition's fence,
+    /// the settle pass's flush, the dispatcher's claim path, and its
+    /// wind-down sweep.
     #[must_use]
     pub const fn exempt_from_wind_down_fence(self) -> bool {
-        matches!(self, Self::CompensationCall | Self::WorkflowCancelCall)
+        matches!(
+            self,
+            Self::CompensationCall
+                | Self::WorkflowCancelCall
+                | Self::MemoryPromotionCall
+                | Self::ClaimAppendCall
+        )
     }
 }
 
@@ -1179,6 +1216,12 @@ impl Display for AgentRunEffectStatus {
 /// turn's working set could have seen, and the executor reads the selection in
 /// one bounded page.
 pub const AGENT_MEMORY_PROMOTION_MAX_ENTRIES: usize = AGENT_SESSION_WINDOW_MAX_ENTRIES;
+
+/// The default window, in milliseconds, during which a run that has ended
+/// still accepts a memory promotion or a claim append
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)): ten
+/// minutes, which a sweep interval of any sensible length fits inside.
+pub const AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS: u64 = 600_000;
 
 /// The default attempt bound of a memory-promotion effect.
 pub const AGENT_MEMORY_PROMOTION_DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -1953,18 +1996,7 @@ impl AgentRunEffect {
         &self,
         scope: &AgentRunScope,
     ) -> Result<AgentOperationId, AgentIdentityError> {
-        AgentOperationId::new(
-            AgentOperationKind::Command,
-            [
-                scope.tenant().as_str(),
-                scope.agent().as_str(),
-                scope.run().as_str(),
-                "effect-result",
-                &self.turn.to_string(),
-                &self.slot.to_string(),
-                &self.generation.to_string(),
-            ],
-        )
+        effect_result_operation_id(scope, self.turn, self.slot, self.generation)
     }
 
     /// The identity of the outbox row that dispatches the current generation.
@@ -2157,6 +2189,30 @@ pub fn effect_id_for(
         ],
     )?;
     Ok(AgentEffectId::new(operation.into_string()))
+}
+
+/// Derives the operation id under which one effect generation's result is
+/// recorded — [`AgentRunEffect::result_operation_id`] as a pure function of
+/// the coordinates, so a caller holding no effect record can name the result
+/// a slot of the current turn would answer to.
+pub fn effect_result_operation_id(
+    scope: &AgentRunScope,
+    turn: u64,
+    slot: usize,
+    generation: AgentEffectGeneration,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::Command,
+        [
+            scope.tenant().as_str(),
+            scope.agent().as_str(),
+            scope.run().as_str(),
+            "effect-result",
+            &turn.to_string(),
+            &slot.to_string(),
+            &generation.to_string(),
+        ],
+    )
 }
 
 /// What a dispatcher returned for one effect generation — always final for

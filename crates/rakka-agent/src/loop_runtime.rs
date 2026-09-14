@@ -324,6 +324,17 @@ pub struct AgentLoopState {
     task_definition_version: AgentRevisionNumber,
     context_snapshot: Option<AgentContextSnapshotRef>,
     effects: Vec<AgentRunEffect>,
+    /// The slot the next effect of the current turn takes: monotonic within
+    /// the turn, reset by [`Self::begin_turn`], and *not* reset by
+    /// [`Self::clear_turn`]. Counting only the effects still held — the
+    /// derivation before this field — restarted at zero once a turn's
+    /// resolved effects were dropped, so an effect committed while the run
+    /// rested on its result proposal, or after it had ended, re-derived the
+    /// identity of the turn's resolved model call. Serde-defaulted to zero
+    /// for a record persisted before it; [`Self::next_effect_slot`] keeps the
+    /// held count as a floor so such a record allocates exactly as before.
+    #[serde(default)]
+    next_slot: usize,
     pending_turn: Option<Box<AgentModelTurn>>,
     tool_results: Vec<AgentToolResult>,
     proposal: Option<AgentRunProposal>,
@@ -496,6 +507,7 @@ impl AgentLoopState {
             task_definition_version,
             context_snapshot: None,
             effects: Vec::new(),
+            next_slot: 0,
             pending_turn: None,
             tool_results: Vec::new(),
             proposal: None,
@@ -849,9 +861,10 @@ impl AgentLoopState {
     /// else would leave a `Pending` cell under a cancelled effect — exactly
     /// the disagreement the cell's commit discipline forbids.
     ///
-    /// The two kinds the wind-down itself authorizes — a scheduled
-    /// compensation and a chased workflow-cancel — are exempt
-    /// ([`crate::effect::AgentRunEffectKind::exempt_from_wind_down_fence`]),
+    /// The four exempt kinds — the scheduled compensation and chased
+    /// workflow-cancel the wind-down itself authorizes, and the memory
+    /// promotion and claim append that copy work already recorded — are left
+    /// alone ([`crate::effect::AgentRunEffectKind::exempt_from_wind_down_fence`]),
     /// the same exemption the flush and the dispatcher's claim path apply.
     /// Without it a *re-entered* wind-down (a duplicate run-cancel past the
     /// journal's bounded window, or a second cancel command) would fence the
@@ -1150,12 +1163,19 @@ impl AgentLoopState {
     /// The slot the next effect of the current turn takes.
     ///
     /// Slots are counted per turn, so the effect id a re-driven transition
-    /// derives is the same value it derived the first time.
+    /// derives is the same value it derived the first time — and they are
+    /// never reused within a turn, whatever the turn has dropped: the durable
+    /// counter outlives [`Self::clear_turn`]. The held effects supply a floor
+    /// for a record persisted before the counter, which decodes it as zero.
     pub(crate) fn next_effect_slot(&self) -> usize {
-        self.effects
+        let held = self
+            .effects
             .iter()
             .filter(|effect| effect.turn == self.turn)
-            .count()
+            .map(|effect| effect.slot.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        self.next_slot.max(held)
     }
 
     /// Commits one effect a transition decided.
@@ -1186,6 +1206,7 @@ impl AgentLoopState {
         // ticket; a replayed transition returned above, so the stamp is
         // first-commit-only and a re-drive cannot re-stamp a newer segment.
         effect.telemetry = self.telemetry.clone();
+        self.next_slot = self.next_slot.max(effect.slot.saturating_add(1));
         self.effects.push(effect);
         Ok(())
     }
@@ -1821,6 +1842,7 @@ impl AgentLoopState {
 
     pub(crate) fn begin_turn(&mut self, feedback: Option<String>) {
         self.turn = self.turn.saturating_add(1);
+        self.next_slot = 0;
         self.phase = AgentLoopPhase::PreparingContext;
         self.context_snapshot = None;
         self.proposal = None;

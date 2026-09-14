@@ -15,15 +15,18 @@ use std::sync::Arc;
 use rakka_agent::testkit::{sweep_crash_points, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     promotion_operation_id, AgentMemoryConsolidationTarget, AgentMemoryPromotionRequest,
-    AgentModelTurn, AgentModelUsage, AgentPrivateMemoryId, AgentPrivateMemoryKind,
-    AgentPrivateMemoryStore, AgentRunEffect, AgentRunEffectKind, AgentRunEffectStatus,
-    AgentRunEntityCommand, AgentRunEntityReply, AgentRunMemory, AgentRunStatus, AgentScope,
-    AgentTaskContent, AgentTaskEntityStore, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
-    MemoryEntryRole, MemorySequence, PrivateMemoryCursor, SessionMemoryCursor, SessionMemoryPage,
-    SessionMemoryPromotionExecutor, SessionMemoryStore, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentModelTurn, AgentModelUsage, AgentOperationId, AgentOperationKind, AgentPrivateMemoryId,
+    AgentPrivateMemoryKind, AgentPrivateMemoryStore, AgentRunEffect, AgentRunEffectKind,
+    AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunEntityReply,
+    AgentRunMemory, AgentRunStatus, AgentScope, AgentTaskContent, AgentTaskEntityStore,
+    AgentToolCallId, AgentToolCallRequest, AgentToolId, InMemoryAgentPrivateMemoryStore,
+    InMemoryContextSnapshotStore, InMemorySessionMemoryStore, MemoryEntryRole, MemorySequence,
+    PrivateMemoryCursor, SessionMemoryCursor, SessionMemoryPage, SessionMemoryPromotionExecutor,
+    SessionMemoryStore, AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
+use rakka_persistence::DurableStateStore;
 
 mod common;
 
@@ -1190,4 +1193,649 @@ async fn a_filtered_consolidation_with_no_selected_entry_is_refused() {
     fx.pump().await.expect("the loop runs to completion");
     let run = fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+// ===========================================================================
+// The post-terminal window: a run that has ended still accepts a promotion
+// for a bounded window, its effect rides the ordinary outbox, and the outcome
+// lands on the terminal record without moving it (specification 13.3;
+// scenario 16's private half, after the run's end).
+// ===========================================================================
+
+/// How the world's run ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl Ending {
+    const ALL: [Self; 3] = [Self::Completed, Self::Failed, Self::Cancelled];
+
+    fn status(self) -> AgentRunStatus {
+        match self {
+            Self::Completed => AgentRunStatus::Completed,
+            Self::Failed => AgentRunStatus::Failed,
+            Self::Cancelled => AgentRunStatus::Cancelled,
+        }
+    }
+}
+
+/// A promoting world driven to its terminal status. However the run ended,
+/// the session durably holds the task input at sequence one.
+async fn ended_world(ending: Ending) -> (Fixture, Stores) {
+    let stores = stores();
+    let adapter = match ending {
+        Ending::Failed => {
+            DeterministicModelAdapter::new().with_turn_for(1, tool_calling_turn("flaky-tool"))
+        }
+        Ending::Completed | Ending::Cancelled => DeterministicModelAdapter::new()
+            .with_turn_for(1, text_turn("thinking"))
+            .with_turn_for(2, proposing_turn("resolved")),
+    };
+    let mut dispatcher =
+        ScriptedDispatcher::with_adapter(adapter).with_memory_promotion_executor(Arc::new(
+            SessionMemoryPromotionExecutor::new(stores.session.clone(), stores.private.clone()),
+        ));
+    if ending == Ending::Failed {
+        dispatcher =
+            dispatcher.with_tool_failure("flaky-tool", "tool-unavailable", "the tool is down");
+    }
+    let fx = Fixture::new(dispatcher).with_memory(
+        AgentRunMemory::new(stores.session.clone(), stores.snapshots.clone())
+            .with_private_store(stores.private.clone()),
+    );
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    if ending == Ending::Cancelled {
+        crank(&fx).await;
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        run.apply(
+            AgentRunEntityCommand::Cancel {
+                operation_id: AgentOperationId::new(
+                    AgentOperationKind::Cancellation,
+                    [common::TENANT, common::AGENT, "1"],
+                )
+                .expect("derivable"),
+                reason: "operator stopped the work".to_string(),
+            },
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .expect("the cancel applies");
+    }
+    fx.pump().await.expect("the loop runs to its end");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, ending.status(), "the world ended as scripted");
+    assert!(
+        run.terminal_at.is_some(),
+        "the terminal transition stamped the run"
+    );
+    (fx, stores)
+}
+
+/// The one promotion effect the run holds under `effect_id`, re-read from
+/// durable state.
+async fn promotion_record(fx: &Fixture, effect: &AgentRunEffect) -> AgentRunEffect {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .effects()
+        .iter()
+        .find(|held| held.effect_id == effect.effect_id)
+        .cloned()
+        .expect("the effect record survives")
+}
+
+/// Records `outcome` against the run's one outstanding promotion, after the
+/// settle pass has made it dispatchable, without driving anything else.
+async fn resolve_promotion(fx: &Fixture, outcome: AgentRunEffectOutcome) -> AgentRunEffect {
+    crank(fx).await;
+    let effect = promotion_effect(fx).await;
+    let scope = run_scope();
+    apply_ok(
+        fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect
+                .result_operation_id(&scope)
+                .expect("result operation id"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: effect.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(outcome),
+        },
+    )
+    .await;
+    promotion_record(fx, &effect).await
+}
+
+/// Inside the window, a run that ended `Completed`, `Failed`, or `Cancelled`
+/// accepts a promotion: the effect is committed, rides the ordinary outbox,
+/// is dispatched by the ordinary pump, and its receipt lands on the terminal
+/// record — whose status, phase, terminal reason, and terminal stamp do not
+/// move.
+#[tokio::test]
+async fn a_promotion_is_accepted_inside_the_post_terminal_window() {
+    for ending in Ending::ALL {
+        let (fx, stores) = ended_world(ending).await;
+        let before = fx.run_snapshot().await.expect("the run exists");
+
+        let reply = apply_ok(&fx, promote_command(promotion(1, 1), "post-terminal")).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{ending:?}: the post-terminal promotion applies, got {reply:?}"
+        );
+        fx.pump_post_terminal(AgentRunEffectKind::MemoryPromotionCall)
+            .await
+            .unwrap_or_else(|error| panic!("{ending:?}: {error}"));
+
+        let owner = agent_scope();
+        assert_eq!(
+            stores.private.len(&owner),
+            1,
+            "{ending:?}: the task input was promoted after the run ended"
+        );
+        let mut entity = fx.run();
+        entity.recover(fx.now()).await.expect("recover");
+        let state = entity.state().expect("state");
+        let loop_state = state.loop_state().expect("the loop is started");
+        assert_eq!(
+            loop_state.memory_promotions().len(),
+            1,
+            "{ending:?}: one receipt"
+        );
+        assert!(
+            loop_state.effects().iter().any(|effect| effect.kind()
+                == AgentRunEffectKind::MemoryPromotionCall
+                && effect.status == AgentRunEffectStatus::Succeeded),
+            "{ending:?}: the promotion effect succeeded"
+        );
+
+        let after = fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(
+            after.status, before.status,
+            "{ending:?}: the status did not move"
+        );
+        assert_eq!(
+            after.phase, before.phase,
+            "{ending:?}: the phase did not move"
+        );
+        assert_eq!(
+            after.terminal_reason, before.terminal_reason,
+            "{ending:?}: the terminal reason did not move"
+        );
+        assert_eq!(
+            after.terminal_at, before.terminal_at,
+            "{ending:?}: the terminal stamp did not move"
+        );
+    }
+}
+
+/// The window is inclusive of its last millisecond and closed one past it:
+/// a promotion at exactly `terminal_at + window` is accepted, one at
+/// `terminal_at + window + 1` is refused under `run-memory-window-closed`
+/// with nothing committed and nothing written.
+#[tokio::test]
+async fn a_promotion_past_the_window_is_refused_and_commits_nothing() {
+    let (fx, stores) = ended_world(Ending::Completed).await;
+    let terminal_at = fx
+        .run_snapshot()
+        .await
+        .expect("the run exists")
+        .terminal_at
+        .expect("stamped")
+        .as_millis();
+    let window = AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS;
+
+    // `apply` reads the clock once, so storing the boundary is what the
+    // transition sees.
+    fx.clock
+        .store(terminal_at + window, std::sync::atomic::Ordering::SeqCst);
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "boundary")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    fx.pump_post_terminal(AgentRunEffectKind::MemoryPromotionCall)
+        .await
+        .expect("the boundary promotion settles");
+    assert_eq!(stores.private.len(&agent_scope()), 1);
+
+    fx.clock.store(
+        terminal_at + window + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let error = apply(&fx, promote_command(promotion(1, 1), "late"))
+        .await
+        .expect_err("a promotion past the window is refused");
+    assert_eq!(error.code(), "run-memory-window-closed");
+    let mut entity = fx.run();
+    entity.recover(fx.now()).await.expect("recover");
+    let promotions = entity
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .effects()
+        .iter()
+        .filter(|effect| effect.kind() == AgentRunEffectKind::MemoryPromotionCall)
+        .count();
+    assert_eq!(promotions, 1, "the refused promotion committed no effect");
+    assert_eq!(stores.private.len(&agent_scope()), 1, "and wrote nothing");
+}
+
+/// A zero window closes the door entirely, under the plain terminal refusal
+/// a run answered before the window existed.
+#[tokio::test]
+async fn a_zero_window_restores_the_terminal_refusal() {
+    let (mut fx, stores) = ended_world(Ending::Completed).await;
+    fx.policies = fx.policies.clone().with_post_terminal_memory_window_ms(0);
+    let error = apply(&fx, promote_command(promotion(1, 1), "closed"))
+        .await
+        .expect_err("a zero window refuses");
+    assert_eq!(error.code(), "run-terminal");
+    assert!(stores.private.is_empty(&agent_scope()));
+}
+
+/// A terminal record with no terminal stamp — persisted before the stamp
+/// existed and never repaired — is outside every window: `updated_at` would
+/// be a sliding clock, since every accepted post-terminal command moves it.
+#[tokio::test]
+async fn a_terminal_record_without_a_stamp_is_outside_the_window() {
+    let (fx, stores) = ended_world(Ending::Completed).await;
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    assert!(
+        !value["run"]["terminal_at"].is_null(),
+        "the terminal transition stamped the record"
+    );
+    value["run"]["terminal_at"] = serde_json::Value::Null;
+    let unstamped = serde_json::from_value(value).expect("the unstamped record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, unstamped)
+        .await
+        .expect("the unstamped record persists");
+
+    let error = apply(&fx, promote_command(promotion(1, 1), "unstamped"))
+        .await
+        .expect_err("an unstamped terminal record refuses");
+    assert_eq!(error.code(), "run-memory-window-closed");
+    assert!(stores.private.is_empty(&agent_scope()));
+}
+
+/// Replay after the run's end writes once: the command replay answers from
+/// the operation log with one effect, and the result replay records one
+/// receipt and moves no revision.
+#[tokio::test]
+async fn a_post_terminal_promotion_replays_once() {
+    let (fx, stores) = ended_world(Ending::Completed).await;
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "post-1")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let replay = apply_ok(&fx, promote_command(promotion(1, 1), "post-1")).await;
+    assert!(
+        matches!(replay, AgentRunEntityReply::Duplicate { .. }),
+        "the replayed command deduplicates: {replay:?}"
+    );
+    crank(&fx).await;
+    let effect = promotion_effect(&fx).await;
+    let first = answer_promotion(&fx, &effect).await;
+    assert!(matches!(first, AgentRunEntityReply::Applied { .. }));
+    let second = answer_promotion(&fx, &effect).await;
+    assert!(
+        matches!(second, AgentRunEntityReply::Duplicate { .. }),
+        "the replayed result deduplicates: {second:?}"
+    );
+
+    let owner = agent_scope();
+    assert_eq!(stores.private.len(&owner), 1);
+    let listed = stores
+        .private
+        .list(
+            &owner,
+            PrivateMemoryCursor::start(),
+            AgentTimestampMillis::new(1_000_000),
+        )
+        .await
+        .expect("list");
+    assert_eq!(
+        listed.memories[0].revision.get(),
+        1,
+        "no replay bumped the revision"
+    );
+    let mut entity = fx.run();
+    entity.recover(fx.now()).await.expect("recover");
+    let receipts = entity
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .memory_promotions()
+        .len();
+    assert_eq!(receipts, 1, "one receipt however often it replayed");
+    assert_eq!(
+        fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::Completed
+    );
+}
+
+/// Once the run's session memory is gone the executor's retryable
+/// source-missing failure exhausts the attempt budget; the exhausted effect,
+/// being exempt from the wind-down, ends nothing — the terminal record is
+/// untouched.
+#[tokio::test]
+async fn an_exhausted_post_terminal_promotion_leaves_the_terminal_record_untouched() {
+    let (fx, stores) = ended_world(Ending::Failed).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "exhausted")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let exhausted = resolve_promotion(
+        &fx,
+        AgentRunEffectOutcome::Exhausted {
+            code: "memory-promotion-source-missing".to_string(),
+            message: "the session rows were purged".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(exhausted.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(
+        exhausted.last_error_code.as_deref(),
+        Some("memory-promotion-source-missing")
+    );
+    let after = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.terminal_reason, before.terminal_reason);
+    assert_eq!(after.terminal_at, before.terminal_at);
+    assert!(stores.private.is_empty(&agent_scope()));
+}
+
+/// An ambiguous outcome delivered to a run that has ended is recorded on the
+/// effect and opens no reconciliation checkpoint: there is no run to park,
+/// and the terminal status does not move.
+#[tokio::test]
+async fn an_indeterminate_post_terminal_outcome_opens_no_checkpoint() {
+    let (fx, _stores) = ended_world(Ending::Cancelled).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "ambiguous")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let parked = resolve_promotion(
+        &fx,
+        AgentRunEffectOutcome::Indeterminate {
+            code: "dispatcher-lost-after-started".to_string(),
+            message: "the recovery retry was refused".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    let mut entity = fx.run();
+    entity.recover(fx.now()).await.expect("recover");
+    let state = entity.state().expect("state");
+    assert!(
+        state
+            .loop_state()
+            .expect("the loop is started")
+            .open_checkpoints()
+            .is_empty(),
+        "no reconciliation checkpoint opens on a run that has ended"
+    );
+    let after = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(
+        after.status,
+        AgentRunStatus::Cancelled,
+        "the status did not move"
+    );
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.terminal_at, before.terminal_at);
+}
+
+/// The owner-kill sweep over the post-terminal promotion flow: complete the
+/// run uncrashed, then kill its owner at every durable write of the
+/// promotion, recover, and retry under the same operation id. However the
+/// owner died, the private store holds exactly the promoted memory at its
+/// initial revision, the loop holds exactly one receipt, and the run is still
+/// `Completed` with its stamp untouched.
+#[tokio::test]
+async fn a_post_terminal_promotion_survives_any_owner_loss() {
+    /// Applies the promotion and drives it to rest, reporting whether it
+    /// durably applied; a doomed pass reports `false` rather than panicking.
+    async fn try_promote(fx: &Fixture) -> bool {
+        for _round in 0..16 {
+            let mut run = fx.run();
+            if run.recover(fx.now()).await.is_err() {
+                continue;
+            }
+            match run
+                .apply(
+                    promote_command(promotion(1, 1), "sweep"),
+                    &fx.router,
+                    fx.now(),
+                )
+                .await
+            {
+                Ok(AgentRunEntityReply::Applied { .. })
+                | Ok(AgentRunEntityReply::Duplicate { .. }) => {}
+                Ok(_) | Err(_) => continue,
+            }
+            if run.settle_side_effects(&fx.router, fx.now()).await.is_err() {
+                continue;
+            }
+            let Ok(state) = run.state() else { continue };
+            let outstanding = state.loop_state().and_then(|loop_state| {
+                loop_state
+                    .effects()
+                    .iter()
+                    .find(|effect| {
+                        effect.kind() == AgentRunEffectKind::MemoryPromotionCall
+                            && effect.is_outstanding()
+                    })
+                    .cloned()
+            });
+            let Some(effect) = outstanding else {
+                return true;
+            };
+            let request = match &effect.request {
+                rakka_agent::AgentRunEffectRequest::MemoryPromotion { promotion } => {
+                    (**promotion).clone()
+                }
+                other => panic!("not a promotion effect: {other:?}"),
+            };
+            let scope = run_scope();
+            let outcome = fx
+                .dispatcher
+                .promotion_outcome(&scope, &effect, &request, fx.now())
+                .await;
+            let result = AgentRunEntityCommand::RecordEffectResult {
+                operation_id: effect
+                    .result_operation_id(&scope)
+                    .expect("result operation id"),
+                effect_id: effect.effect_id.clone(),
+                generation: effect.generation,
+                attempt: effect.attempts.saturating_add(1),
+                fence: 0,
+                outcome: Box::new(outcome),
+            };
+            match run.apply(result, &fx.router, fx.now()).await {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+        false
+    }
+
+    // The reference flow, uncrashed, counts the writes of the post-terminal
+    // promotion alone: the run's own life is not what this sweeps.
+    let (reference, reference_stores) = ended_world(Ending::Completed).await;
+    reference.runs.reset_writes();
+    assert!(try_promote(&reference).await, "the reference flow promotes");
+    let writes = reference.runs.writes();
+    assert!(
+        writes >= 3,
+        "the post-terminal promotion should make several durable writes, saw {writes}"
+    );
+    assert_eq!(reference_stores.private.len(&agent_scope()), 1);
+
+    sweep_crash_points(writes, |nth, point| async move {
+        let (fx, stores) = ended_world(Ending::Completed).await;
+        let stamp = fx.run_snapshot().await.expect("the run exists").terminal_at;
+
+        fx.runs.crash_at(nth, point);
+        let _ = try_promote(&fx).await;
+        fx.runs.assert_crash_fired(nth, point);
+        fx.runs.survive();
+
+        assert!(
+            try_promote(&fx).await,
+            "crash {point:?} at write {nth} left the promotion inapplicable"
+        );
+
+        let run = fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Completed,
+            "crash {point:?} at write {nth} moved the terminal status"
+        );
+        assert_eq!(
+            run.terminal_at, stamp,
+            "crash {point:?} at write {nth} moved the terminal stamp"
+        );
+        let owner = agent_scope();
+        assert_eq!(
+            stores.private.len(&owner),
+            1,
+            "crash {point:?} at write {nth} duplicated or lost the promotion"
+        );
+        let listed = stores
+            .private
+            .list(
+                &owner,
+                PrivateMemoryCursor::start(),
+                AgentTimestampMillis::new(1_000_000),
+            )
+            .await
+            .expect("list");
+        assert_eq!(listed.memories[0].revision.get(), 1);
+        let mut entity = fx.run();
+        entity.recover(fx.now()).await.expect("recover");
+        let receipts = entity
+            .state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .memory_promotions()
+            .len();
+        assert_eq!(
+            receipts, 1,
+            "crash {point:?} at write {nth} duplicated or lost the receipt"
+        );
+    })
+    .await;
+}
+
+/// A live run resting on its result proposal has dropped the turn's resolved
+/// effects but not begun another turn. A promotion committed there must take
+/// a fresh slot rather than re-derive the resolved model call's identity —
+/// which the pre-counter allocator did, and which the operation log then
+/// answered `Duplicate` forever.
+#[tokio::test]
+async fn a_promotion_while_the_proposal_is_pending_derives_a_fresh_identity() {
+    use rakka_agent::testkit::ExchangeFault;
+
+    let (fx, stores) = promoting_world();
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    crank(&fx).await;
+    drive_turn(&fx).await;
+    crank(&fx).await;
+    // Turn two proposes. Every delivery of the proposal is lost, so the
+    // task's decision never comes back and the run rests on its proposal
+    // with the turn cleared and no next turn begun — the recipe
+    // `run_entity.rs` uses to hold a run there.
+    for _ in 0..6 {
+        fx.task_transport.inject(ExchangeFault::LoseEnvelope);
+    }
+    drive_turn(&fx).await;
+    crank(&fx).await;
+    let resting = fx.run_snapshot().await.expect("the run exists");
+    assert!(resting.proposal.is_some(), "the run rests on its proposal");
+    assert!(
+        !resting.status.is_terminal(),
+        "the decision has not come back: {:?}",
+        resting.status
+    );
+
+    let reply = apply_ok(&fx, promote_command(promotion(1, 2), "while-proposed")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let effect = promotion_effect(&fx).await;
+    assert_ne!(
+        effect.effect_id,
+        rakka_agent::effect_id_for(&run_scope(), 2, 0).expect("derives"),
+        "the promotion did not reuse the resolved model call's identity"
+    );
+    crank(&fx).await;
+    let answered = answer_promotion(&fx, &effect).await;
+    assert!(
+        matches!(answered, AgentRunEntityReply::Applied { .. }),
+        "the promotion's result is its own, not a replay of the model's: {answered:?}"
+    );
+    fx.pump().await.expect("the loop runs to completion");
+    assert_eq!(
+        fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::Completed
+    );
+    assert_eq!(stores.private.len(&agent_scope()), 2);
+}
+
+/// A loop state persisted before the slot counter decodes it as zero; the
+/// operation-log floor still allocates a post-terminal promotion a slot the
+/// run has not already resolved, so the effect settles instead of answering
+/// `Duplicate` from the finished turn's model result.
+#[tokio::test]
+async fn a_loop_state_persisted_before_the_slot_counter_still_allocates_a_fresh_slot() {
+    let (fx, stores) = ended_world(Ending::Completed).await;
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    let loop_state = value["run"]["loop_state"]
+        .as_object_mut()
+        .expect("the loop state is an object");
+    assert!(
+        loop_state.remove("next_slot").is_some(),
+        "the record carried the counter"
+    );
+    let legacy = serde_json::from_value(value).expect("the pre-counter record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, legacy)
+        .await
+        .expect("the pre-counter record persists");
+
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "legacy")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let effect = promotion_effect(&fx).await;
+    assert_ne!(
+        effect.effect_id,
+        rakka_agent::effect_id_for(&run_scope(), effect.turn, 0).expect("derives"),
+        "the floor skipped the resolved model call's slot"
+    );
+    fx.pump_post_terminal(AgentRunEffectKind::MemoryPromotionCall)
+        .await
+        .expect("the legacy-record promotion settles");
+    assert_eq!(stores.private.len(&agent_scope()), 1);
+    assert_eq!(
+        fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::Completed
+    );
 }
