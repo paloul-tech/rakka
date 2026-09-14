@@ -1966,6 +1966,13 @@ logical GenAI span with retry events. Durable Rakka effect attempts MUST remain
 individually correlatable because they govern fencing, idempotency, and
 indeterminate outcomes.
 
+The bounded model request the adapter receives carries the run's durable trace
+context (Section 17.5) — the context the model effect was committed under —
+so the adapter MAY parent its provider span on the run's trace rather than
+root one of its own. The context is observability only: the adapter MUST NOT
+read it for inference, and a request built or encoded without it decodes to
+the empty context.
+
 ### 17.9 Tool and Effect Observability
 
 Every scheduled tool effect and dispatcher attempt MUST be traceable from

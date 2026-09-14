@@ -39,7 +39,7 @@ use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 
-use rakka_agent_workflow::StateSchemaVersion;
+use rakka_agent_workflow::{AgentTelemetryContext, StateSchemaVersion};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -402,6 +402,16 @@ pub struct AgentModelRequest {
     pub settings_revision: AgentRevisionNumber,
     /// The turn this request serves, counting from one.
     pub turn: u64,
+    /// The run's durable trace context — the context the model effect was
+    /// committed under, which the dispatcher receives verbatim on the intent
+    /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)) — so
+    /// an adapter may parent its provider span on the run's trace rather than
+    /// rooting one of its own. Observability only, never correctness: an
+    /// adapter must not read it for inference, no dispatch decision reads it,
+    /// and a request built or encoded before the field decodes to the empty
+    /// context.
+    #[serde(default)]
+    pub telemetry: AgentTelemetryContext,
 }
 
 impl AgentModelRequest {
@@ -409,7 +419,8 @@ impl AgentModelRequest {
     ///
     /// The profile and sampling default to unset; the interim loop prepares a
     /// model effect with neither, and slice 1.8 fills them from the settings
-    /// resolved at dispatch.
+    /// resolved at dispatch. The trace context defaults to empty; a driver
+    /// stamps the effect's context through [`Self::with_telemetry`].
     #[must_use]
     pub fn new(context: AgentContextSnapshotRef, turn: u64) -> Self {
         Self {
@@ -418,7 +429,15 @@ impl AgentModelRequest {
             sampling: AgentSamplingSettings::default(),
             settings_revision: AgentRevisionNumber::INITIAL,
             turn,
+            telemetry: AgentTelemetryContext::default(),
         }
+    }
+
+    /// Stamps the run's durable trace context onto the request.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: AgentTelemetryContext) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     /// Selects the model profile the request resolves against.

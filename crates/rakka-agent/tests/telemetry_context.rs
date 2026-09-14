@@ -9,13 +9,15 @@
 //! scenario 23). The write side is strict where the read side is permissive:
 //! malformed context is dropped at the boundary, never persisted.
 
+use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    AgentCheckpoint, AgentCheckpointKind, AgentEffectSpec, AgentEntityAddress,
-    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentId, AgentLoopState,
-    AgentOperationId, AgentOperationKind, AgentRecordKind, AgentRevisionNumber, AgentRunEffect,
-    AgentRunEffectRequest, AgentRunId, AgentRunScope, AgentSchemaPolicy, AgentTaskId,
-    AgentTaskScope, AgentToolCallId, AgentToolCallRequest, AgentToolId, TenantId,
-    ATTR_AGENT_TELEMETRY_LINK_KIND, LINK_KIND_SUPERSEDED_GENERATION,
+    AgentCheckpoint, AgentCheckpointKind, AgentContextSnapshotRef, AgentEffectSpec,
+    AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentId,
+    AgentLoopState, AgentModelRequest, AgentOperationId, AgentOperationKind, AgentRecordKind,
+    AgentRevisionNumber, AgentRunEffect, AgentRunEffectRequest, AgentRunId, AgentRunScope,
+    AgentRunStatus, AgentSchemaPolicy, AgentTaskId, AgentTaskScope, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, TenantId, ATTR_AGENT_TELEMETRY_LINK_KIND,
+    LINK_KIND_SUPERSEDED_GENERATION,
 };
 use rakka_agent_workflow::{
     AgentAttributes, AgentCorrelationId, AgentSpanLink, AgentTelemetryContext,
@@ -23,6 +25,8 @@ use rakka_agent_workflow::{
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+
+mod common;
 
 const TENANT: &str = "acme";
 const TRACE_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
@@ -467,4 +471,63 @@ fn every_link_kind_is_catalogued_and_written() {
             "`{value}` is catalogued but no LINK_KIND_ constant defines it"
         );
     }
+}
+
+/// A model request encoded before it carried the run's trace context decodes
+/// to the empty context, inside the request's unchanged shape; one that
+/// carries it round-trips.
+#[test]
+fn a_pre_field_model_request_decodes_to_the_empty_context() {
+    let context = AgentContextSnapshotRef::for_turn(&scope(), 1).expect("the reference derives");
+    let plain = AgentModelRequest::new(context.clone(), 1);
+    assert_eq!(plain.telemetry, AgentTelemetryContext::default());
+
+    let stamped = AgentModelRequest::new(context, 1).with_telemetry(stamped_context());
+    let decoded = decode_pre_retrofit(&stamped);
+    assert_eq!(decoded, plain, "absent context reads as none recorded");
+    let round_tripped: AgentModelRequest =
+        serde_json::from_value(serde_json::to_value(&stamped).expect("serializes"))
+            .expect("decodes");
+    assert_eq!(round_tripped, stamped);
+}
+
+/// The bounded request the adapter receives carries the run's own trace
+/// context — the context the model effect was committed under, which is the
+/// run's — so an adapter can parent its provider span on the run's trace.
+/// Observability only: the scripted turn is produced exactly as before.
+#[tokio::test]
+async fn the_model_request_carries_the_runs_trace_context() {
+    let adapter = DeterministicModelAdapter::new().with_turn(common::proposing_turn());
+    let fx = common::Fixture::new(ScriptedDispatcher::with_adapter(adapter.clone()));
+    fx.instantiate_agent().await;
+    fx.create_task_traced(stamped_context()).await;
+    fx.pump().await.expect("the loop runs to completion");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+
+    let state = rakka_agent::load_agent_run_state(
+        &fx.runs,
+        &common::run_scope(),
+        &AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    let run_context = state
+        .loop_state()
+        .expect("the loop is started")
+        .telemetry()
+        .clone();
+    assert_eq!(
+        run_context.trace_parent.as_deref(),
+        Some(TRACE_PARENT),
+        "the run holds the ingress trace context"
+    );
+
+    let requests = adapter.requests();
+    assert_eq!(requests.len(), 1, "one model call");
+    assert_eq!(
+        requests[0].telemetry, run_context,
+        "the request's context is the run's"
+    );
 }

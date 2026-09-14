@@ -3299,7 +3299,8 @@ where
         match &intent.request {
             AgentRunEffectRequest::Model { context, profile } => {
                 let mut request = AgentModelRequest::new(context.clone(), intent.turn)
-                    .with_settings_revision(granted.grant.settings_revision);
+                    .with_settings_revision(granted.grant.settings_revision)
+                    .with_telemetry(intent.telemetry.clone());
                 if let Some(sampling) = granted.sampling {
                     request = request.with_sampling(sampling);
                 }
