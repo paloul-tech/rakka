@@ -64,7 +64,7 @@
 //! with `default-features = false`, so no TLS provider is forced on
 //! applications; enable one through your own `a2a-server-lf` dependency if
 //! you serve TLS in-process. The crate follows the workspace MSRV
-//! (Rust 1.85, pinned by `rust-toolchain.toml`); SDK upgrades that raise the
+//! (Rust 1.88, pinned by `rust-toolchain.toml`); SDK upgrades that raise the
 //! MSRV are deferred until the workspace MSRV moves. Both pins are declared
 //! once, in the workspace manifest's `[workspace.dependencies]`, and every
 //! consumer inherits them. The A2A wire protocol version the SDK implements is

@@ -583,7 +583,7 @@ impl AgentConversation {
         match self.mode {
             AgentConversationMode::RoundRobin => self.participants.get(self.turn_in_round as usize),
             AgentConversationMode::ModeratorDirected => {
-                if self.turn_in_round % 2 == 0 {
+                if self.turn_in_round.is_multiple_of(2) {
                     Some(&self.moderator)
                 } else {
                     self.designated.as_ref()
@@ -2906,7 +2906,7 @@ fn admit_turn(
     // Direction rules: a moderator-directed moderator turn must direct
     // what follows; every other turn must not.
     let moderator_turn = conversation.mode == AgentConversationMode::ModeratorDirected
-        && conversation.turn_in_round % 2 == 0;
+        && conversation.turn_in_round.is_multiple_of(2);
     let speaker = match conversation.mode {
         AgentConversationMode::RoundRobin => AgentConversationSpeaker::Participant(
             u8::try_from(conversation.turn_in_round)

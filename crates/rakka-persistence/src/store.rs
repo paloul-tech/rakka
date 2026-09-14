@@ -548,7 +548,9 @@ impl RetentionCriteria {
     #[must_use]
     pub const fn should_snapshot(self, sequence_nr: SequenceNr) -> bool {
         match self.snapshot_every {
-            Some(every) if every > 0 => sequence_nr.get() > 0 && sequence_nr.get() % every == 0,
+            Some(every) if every > 0 => {
+                sequence_nr.get() > 0 && sequence_nr.get().is_multiple_of(every)
+            }
             _ => false,
         }
     }

@@ -1077,7 +1077,7 @@ pub async fn transition_legality_and_replay(
         .await
         .expect("the claim appends");
     for step in 0..CLAIM_MAX_TRUST_TRANSITIONS {
-        let to = if step % 2 == 0 {
+        let to = if step.is_multiple_of(2) {
             ClaimTrustStatus::Disputed
         } else {
             ClaimTrustStatus::Verified
