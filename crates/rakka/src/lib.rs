@@ -187,7 +187,10 @@ pub mod agent_workflow {
 ///
 /// Enable with the `a2a` facade feature (plus `a2a-server`, `a2a-sharding`,
 /// `a2a-postgres`, `a2a-http`, `a2a-k8s`, `a2a-otel`, or `a2a-testkit` for the
-/// corresponding adapter surfaces).
+/// corresponding adapter surfaces). Under `a2a-server` or `a2a-agents` this
+/// also re-exports the SDK's `ServiceParams`, the one constructor input a
+/// request-observer callback needs, so an application names it here rather
+/// than through the SDK crate.
 pub mod a2a {
     pub use rakka_a2a::*;
 }
