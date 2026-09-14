@@ -645,7 +645,12 @@ Acceptance of a cancellation request MUST immediately fence new model, tool,
 workflow, and delegation dispatch for the affected scope. Cancellation MUST
 track durable progress through request, propagation, quiescence, optional
 reconciliation, and terminal completion. It MUST NOT be represented only by a
-single in-memory flag or best-effort broadcast.
+single in-memory flag or best-effort broadcast. A memory promotion or a
+communal claim append is not new work in this sense — each copies work the run
+has already recorded into a longer-lived tier — so the fence does not apply to
+it: one committed on a live run that then winds down still dispatches, one MAY
+be accepted while the run winds down, and one MAY be accepted for a bounded
+window after the run ends (Sections 13.3 and 13.4).
 
 If any started consequential effect has an unknowable outcome, the task MUST
 remain nonterminal in `WaitingForReconciliation` with cancellation requested.
@@ -1387,6 +1392,14 @@ Entries SHOULD be ordered by a monotonic sequence and include:
 An append replay with the same operation ID MUST return the original logical
 result without creating another entry.
 
+A tool-result entry SHOULD additionally name the tool that produced it and the
+effect whose outcome it records, so that a reader deriving claims or
+promotions from tool output can select by tool without a second durable
+record. Both are provenance, never authority: they are outside the entry's
+content hash and every derived identity, nothing resolves or infers from
+them, and an entry persisted without them MUST decode as one that names
+neither.
+
 Short-term memory MAY retain a bounded recent window plus rolling summaries.
 Terminal-run retention is controlled by tenant policy.
 
@@ -1410,6 +1423,33 @@ A private memory SHOULD contain:
 Promotion, consolidation, or demotion from short-term memory MUST be an
 idempotent durable effect. Embeddings are rebuildable derived projections, not
 the only copy of memory content.
+
+A promotion MAY select by role within its sequence window: a request that
+names a role set promotes only the window's entries of those roles, and one
+that names none promotes every entry. The window's size bound applies at
+commit; the executor applies the filter to the durably read window and MUST
+refuse a window that selects nothing rather than succeed with an empty
+receipt. Identity is per source entry, so a filtered promotion and an
+unfiltered one converge on the same records.
+
+A run that has ended `Completed`, `Failed`, or `Cancelled` MUST still accept a
+promotion for a deployment-configured window after its terminal stamp, so
+that a run which started and ended inside one application sweep interval is
+promoted at all. The promotion is exempt from the wind-down fence (Section
+8.7), rides the run's ordinary outbox, and its outcome lands on the terminal
+record without moving the status, phase, terminal reason, or terminal stamp;
+the application keeps pumping the terminal run's outbox until it drains. Past
+the window, or when the terminal record carries no stamp, the request is
+refused with a stable code; a zero window restores the plain terminal
+refusal. A run that ended `HandedOff` or `Superseded` is refused as terminal
+whatever the window: responsibility moved, and the successor run promotes. An
+ambiguous post-terminal attempt is retried under the effect's idempotency key,
+and a run that has ended opens no reconciliation checkpoint — an ambiguous
+outcome that cannot be retried stays on the effect record, resolvable by an
+explicit decision, and the terminal status does not move. Effect identities
+are never reused within a turn, whatever the turn has since dropped, so a
+promotion committed after a turn's effects cleared cannot collide with one of
+them.
 
 ### 13.4 Communal Knowledge Graph
 
@@ -1437,6 +1477,21 @@ claim.
 Policy MAY require HITL or a verifier service before a claim becomes
 `Verified`, especially when it can authorize or materially influence a
 high-impact effect.
+
+A claim append is an idempotent durable effect of the run that requests it,
+and a definitively failed or exhausted append MUST NOT terminate that run. A
+claim is a record about the run's work, not the work: the failure stays on the
+effect record, and the initiator MAY re-issue the append under a new operation
+id. That a claim may later be read as evidence (Section 8.3) does not make a
+failed append correctness-bearing — an evaluation reads whatever the graph
+holds when it runs, and a claim that never landed is evidence the evaluator
+does not see, never evidence it sees wrongly.
+
+A claim append shares the promotion's post-terminal window (Section 13.3)
+under the same rules: exempt from the wind-down fence, accepted while the run
+winds down and for the window after it ends `Completed`, `Failed`, or
+`Cancelled`, refused past the window or on an unstamped terminal record, and
+retried rather than parked when an attempt is ambiguous.
 
 ### 13.5 Memory Context Snapshot
 
@@ -1910,6 +1965,13 @@ An automatic provider retry within one logical request MAY remain inside one
 logical GenAI span with retry events. Durable Rakka effect attempts MUST remain
 individually correlatable because they govern fencing, idempotency, and
 indeterminate outcomes.
+
+The bounded model request the adapter receives carries the run's durable trace
+context (Section 17.5) — the context the model effect was committed under —
+so the adapter MAY parent its provider span on the run's trace rather than
+root one of its own. The context is observability only: the adapter MUST NOT
+read it for inference, and a request built or encoded without it decodes to
+the empty context.
 
 ### 17.9 Tool and Effect Observability
 

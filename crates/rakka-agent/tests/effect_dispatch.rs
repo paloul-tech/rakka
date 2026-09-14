@@ -92,6 +92,7 @@ struct DispatchFixture {
     credentials: ScriptedCredentialResolver,
     probe: KillSwitchProbe,
     promotions: Option<Arc<dyn rakka_agent::AgentMemoryPromotionExecutor>>,
+    claim_appends: Option<Arc<dyn rakka_agent::AgentClaimAppendExecutor>>,
     segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
 }
 
@@ -137,6 +138,7 @@ impl DispatchFixture {
             credentials: ScriptedCredentialResolver::new("live-secret-token"),
             probe: KillSwitchProbe::new(),
             promotions: None,
+            claim_appends: None,
             segments: None,
         }
     }
@@ -161,6 +163,15 @@ impl DispatchFixture {
     ) -> Self {
         self.fx = self.fx.with_memory(memory);
         self.promotions = Some(executor);
+        self
+    }
+
+    /// Wires the pipeline with a claim-append executor.
+    fn with_claim_appends(
+        mut self,
+        executor: Arc<dyn rakka_agent::AgentClaimAppendExecutor>,
+    ) -> Self {
+        self.claim_appends = Some(executor);
         self
     }
 
@@ -222,6 +233,9 @@ impl DispatchFixture {
         .with_credential_resolver(Arc::new(self.credentials.clone()));
         if let Some(promotions) = &self.promotions {
             pipeline = pipeline.with_memory_promotion_executor(promotions.clone());
+        }
+        if let Some(claim_appends) = &self.claim_appends {
+            pipeline = pipeline.with_claim_append_executor(claim_appends.clone());
         }
         if let Some(segments) = &self.segments {
             pipeline = pipeline.with_segments(segments.clone());
@@ -2152,6 +2166,7 @@ async fn a_promotion_survives_dispatcher_loss_mid_pass() {
                     principal_id: "memory-curator".to_string(),
                     display_name: None,
                 },
+                roles: None,
             }),
         },
         &fx.fx.router,
@@ -2200,4 +2215,315 @@ async fn a_promotion_survives_dispatcher_loss_mid_pass() {
         "the run settled despite the dispatcher loss: {:?}",
         snapshot.status
     );
+}
+
+// ---------------------------------------------------------------------------
+// The post-terminal window through the real pipeline: a promotion or claim
+// append accepted after the run ended is exempt from the dispatcher's
+// wind-down sweep, is claimed and executed by the ordinary pass, and an
+// ambiguous attempt on it retries under its idempotency key and converges
+// without a reconciliation checkpoint (specification 13.3 and 13.4).
+// ---------------------------------------------------------------------------
+
+/// A claim-append executor that counts its invocations and answers a derived
+/// claim id.
+struct CountingClaimAppendExecutor {
+    invocations: std::sync::atomic::AtomicUsize,
+}
+
+impl rakka_agent::AgentClaimAppendExecutor for CountingClaimAppendExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a rakka_agent::AgentRunScope,
+        _intent: &'a rakka_agent::AgentRunEffect,
+        _append: &'a rakka_agent::AgentClaimAppendRequest,
+        _provenance: &'a rakka_agent::AgentClaimAppendProvenance,
+        _now: rakka_agent_workflow::AgentTimestampMillis,
+    ) -> rakka_agent::AgentDispatchFuture<'a, rakka_agent::AgentClaimAppendFinding> {
+        let nth = self
+            .invocations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        Box::pin(async move {
+            Ok(rakka_agent::AgentClaimAppendFinding::Appended {
+                claim: rakka_agent::AgentCommunalClaimId::new(format!("claim-{nth}"))
+                    .expect("the claim id is valid"),
+            })
+        })
+    }
+}
+
+/// The post-terminal promotion request over the task input at sequence one.
+fn post_terminal_promotion_command(discriminator: &str) -> AgentRunEntityCommand {
+    use rakka_agent::{
+        promotion_operation_id, AgentMemoryPromotionRequest, AgentPrivateMemoryKind, MemorySequence,
+    };
+    use rakka_agent_workflow::PrincipalRef;
+
+    AgentRunEntityCommand::PromoteMemory {
+        operation_id: promotion_operation_id(&run_scope(), discriminator).expect("operation id"),
+        promotion: Box::new(AgentMemoryPromotionRequest {
+            from_sequence: MemorySequence::new(1),
+            to_sequence: MemorySequence::new(1),
+            kind: AgentPrivateMemoryKind::Semantic,
+            target: None,
+            confidence_bps: 9_000,
+            requested_by: PrincipalRef {
+                principal_type: "service".to_string(),
+                principal_id: "memory-curator".to_string(),
+                display_name: None,
+            },
+            roles: None,
+        }),
+    }
+}
+
+/// A dispatch fixture with session memory and the promotion executor wired,
+/// driven to `Completed`.
+async fn completed_promoting_fixture() -> (
+    DispatchFixture,
+    Arc<rakka_agent::InMemoryAgentPrivateMemoryStore>,
+) {
+    use rakka_agent::{
+        AgentRunMemory, InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore,
+        InMemorySessionMemoryStore, SessionMemoryPromotionExecutor,
+    };
+
+    let session = Arc::new(InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(InMemoryContextSnapshotStore::new());
+    let private = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_promotions(
+        AgentRunMemory::new(session.clone(), snapshots).with_private_store(private.clone()),
+        Arc::new(SessionMemoryPromotionExecutor::new(
+            session.clone(),
+            private.clone(),
+        )),
+    );
+    fx.start().await;
+    fx.pump().await;
+    let snapshot = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(snapshot.status, AgentRunStatus::Completed);
+    (fx, private)
+}
+
+/// Applies one command to the fixture's run entity.
+async fn apply_to_run(fx: &DispatchFixture, command: AgentRunEntityCommand) {
+    let mut run = fx.fx.run();
+    let now = fx.fx.now();
+    run.recover(now).await.expect("the run recovers");
+    run.apply(command, &fx.fx.router, now)
+        .await
+        .expect("the command applies inside the window");
+}
+
+/// The run's durable loop state, freshly loaded.
+async fn loop_state(fx: &DispatchFixture) -> rakka_agent::AgentLoopState {
+    rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists")
+    .loop_state()
+    .expect("the loop is started")
+    .clone()
+}
+
+/// A promotion committed after the run ended is exempt from the wind-down
+/// sweep the pipeline runs on every terminal run: the first pass claims,
+/// executes, and delivers it rather than cancelling its ticket, and the next
+/// pass neither cancels nor re-reads it. The memory lands and the terminal
+/// record does not move.
+#[tokio::test]
+async fn a_post_terminal_promotion_survives_the_wind_down_fence() {
+    let (fx, private) = completed_promoting_fixture().await;
+    let before = fx.fx.run_snapshot().await.expect("the run exists");
+    apply_to_run(&fx, post_terminal_promotion_command("post-1")).await;
+
+    fx.settle().await;
+    let first = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the first pass runs");
+    assert_eq!(first.cancelled, 0, "the sweep did not cancel the promotion");
+    assert_eq!(first.claimed, 1, "the pass claimed the promotion's ticket");
+    assert_eq!(first.delivered, 1, "and delivered its outcome");
+
+    fx.settle().await;
+    let second = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the second pass runs");
+    assert_eq!(second.cancelled, 0, "the next pass did not re-fence it");
+    assert_eq!(second.claimed, 0, "nothing was left to claim");
+
+    assert_eq!(private.len(&agent_scope()), 1, "the promotion landed");
+    let state = loop_state(&fx).await;
+    assert_eq!(state.memory_promotions().len(), 1, "one receipt");
+    let after = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.terminal_at, before.terminal_at);
+}
+
+/// A worker dying after the promotion's durable `Started` leaves an
+/// ambiguous attempt on a run that has ended. The promotion is idempotent,
+/// so the recovered worker retries it under the same generation's key and
+/// converges on one memory at its initial revision; the terminal run opens
+/// no reconciliation checkpoint and its status does not move.
+#[tokio::test]
+async fn an_ambiguous_post_terminal_promotion_retries_and_converges_without_a_checkpoint() {
+    let (fx, private) = completed_promoting_fixture().await;
+    apply_to_run(&fx, post_terminal_promotion_command("post-1")).await;
+    fx.settle().await;
+
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    let _ = fx.pipeline().pump_run(&run_scope()).await;
+    assert_eq!(fx.probe.deaths(), 1, "the armed window fired");
+
+    let mut converged = false;
+    for _round in 0..8 {
+        fx.expire_lease();
+        fx.settle().await;
+        let _pass = fx
+            .pipeline()
+            .pump_run(&run_scope())
+            .await
+            .expect("the recovery pass runs");
+        if private.len(&agent_scope()) == 1 {
+            converged = true;
+            break;
+        }
+    }
+    assert!(converged, "the ambiguous promotion never converged");
+    use rakka_agent::AgentPrivateMemoryStore as _;
+    let listed = private
+        .list(
+            &agent_scope(),
+            rakka_agent::PrivateMemoryCursor::start(),
+            rakka_agent_workflow::AgentTimestampMillis::new(1_000_000),
+        )
+        .await
+        .expect("list");
+    assert_eq!(listed.memories.len(), 1);
+    assert_eq!(
+        listed.memories[0].revision,
+        rakka_agent::AgentRevisionNumber::INITIAL,
+        "the retry replayed rather than re-wrote"
+    );
+    let state = loop_state(&fx).await;
+    assert!(
+        state.open_checkpoints().is_empty(),
+        "no reconciliation checkpoint opened on the terminal run"
+    );
+    assert!(
+        state.indeterminate_effects().next().is_none(),
+        "nothing parked indeterminate"
+    );
+    let after = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, AgentRunStatus::Completed);
+}
+
+/// The claim half of the same exemption: an append committed after the run
+/// ended reaches the executor through the ordinary pass, is never cancelled
+/// by the sweep, and leaves the terminal record untouched.
+#[tokio::test]
+async fn a_post_terminal_claim_append_survives_the_wind_down_fence() {
+    use rakka_agent::{
+        claim_append_operation_id, AgentClaimAppendRequest, AgentClaimObjectRequest,
+        KnowledgeSpaceId, MemoryClassification,
+    };
+    use rakka_agent_workflow::PrincipalRef;
+
+    let executor = Arc::new(CountingClaimAppendExecutor {
+        invocations: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_claim_appends(executor.clone());
+    // The dispatch authority re-checks the space against the agent's
+    // definition envelope on every attempt, so the envelope grants it.
+    let mut envelope = envelope_for_registry(&fx.registry);
+    envelope
+        .knowledge_spaces
+        .insert(KnowledgeSpaceId::new("space-alpha").expect("the space id is valid"));
+    fx.fx.instantiate_agent_with_envelope(envelope).await;
+    fx.fx.create_task().await;
+    fx.pump().await;
+    let before = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(before.status, AgentRunStatus::Completed);
+
+    apply_to_run(
+        &fx,
+        AgentRunEntityCommand::AppendClaim {
+            operation_id: claim_append_operation_id(&run_scope(), "post-1")
+                .expect("the operation id derives"),
+            append: Box::new(AgentClaimAppendRequest {
+                space: KnowledgeSpaceId::new("space-alpha").expect("the space id is valid"),
+                subject: "finding".to_string(),
+                predicate: "links".to_string(),
+                object: AgentClaimObjectRequest::Value(
+                    AgentTaskContent::inline(serde_json::json!({ "note": "observed" }))
+                        .expect("the object is inline-bounded"),
+                ),
+                confidence_bps: 5_000,
+                classification: MemoryClassification::Unclassified,
+                evidence: Vec::new(),
+                requested_by: PrincipalRef {
+                    principal_type: "service".to_string(),
+                    principal_id: "researcher".to_string(),
+                    display_name: None,
+                },
+            }),
+        },
+    )
+    .await;
+
+    fx.settle().await;
+    let first = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the first pass runs");
+    assert_eq!(first.cancelled, 0, "the sweep did not cancel the append");
+    assert_eq!(first.delivered, 1, "the pass delivered its outcome");
+    fx.settle().await;
+    let second = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the second pass runs");
+    assert_eq!(second.cancelled, 0);
+    assert_eq!(second.claimed, 0);
+
+    assert_eq!(
+        executor
+            .invocations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the append reached the store bridge once"
+    );
+    let state = loop_state(&fx).await;
+    assert!(state.effects().iter().any(|effect| {
+        effect.kind() == rakka_agent::AgentRunEffectKind::ClaimAppendCall
+            && effect.status == AgentRunEffectStatus::Succeeded
+    }));
+    let after = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.terminal_at, before.terminal_at);
 }

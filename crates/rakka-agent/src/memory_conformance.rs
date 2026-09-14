@@ -48,9 +48,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rakka_agent_workflow::AgentTimestampMillis;
+use rakka_agent_workflow::{AgentEffectId, AgentTimestampMillis};
 
-use crate::definition::AgentRevisionNumber;
+use crate::definition::{AgentRevisionNumber, AgentToolId};
 use crate::identity::{AgentId, AgentRunId, AgentRunScope, AgentScope, TenantId};
 use crate::memory::{
     AgentContextSnapshotRef, AgentPrivateMemory, AgentPrivateMemoryId, AgentPrivateMemoryKind,
@@ -402,6 +402,52 @@ pub async fn session_idempotent_append(store: &dyn SessionMemoryStore) {
         .await
         .expect("the read succeeds");
     assert_eq!(page.entries.len(), 1, "the replay created a second entry");
+}
+
+/// A tool-result entry's tool and effect provenance survive the store, and an
+/// entry that carries none reads back with none (specification 13.2).
+///
+/// The fields are outside every derived identity, so the stamped entry
+/// deduplicates on the same operation id as an unstamped one would; what a
+/// backend must not do is drop or reorder them on the way through its record
+/// encoding.
+///
+/// # Panics
+///
+/// On any violation.
+pub async fn session_tool_provenance_round_trip(store: &dyn SessionMemoryStore) {
+    let scopes = MemoryConformanceScopes::unique("session-tool-provenance");
+    let tool = AgentToolId::new("lookup").expect("the tool id is valid");
+    let effect_id = AgentEffectId::new("effect-lookup-1");
+    let mut stamped = conformance_session_entry(&scopes.primary, 1, "tool output")
+        .with_tool_provenance(Some(tool.clone()), Some(effect_id.clone()));
+    stamped.role = MemoryEntryRole::ToolResult;
+    stamped.source = Some("call-1".to_string());
+    let plain = conformance_session_entry(&scopes.primary, 2, "assistant text");
+
+    store
+        .append(&scopes.primary, &stamped)
+        .await
+        .expect("the stamped append lands");
+    store
+        .append(&scopes.primary, &plain)
+        .await
+        .expect("the plain append lands");
+
+    let page = store
+        .read(&scopes.primary, SessionMemoryCursor::start())
+        .await
+        .expect("the read succeeds");
+    assert_eq!(page.entries.len(), 2, "both entries read back");
+    assert_eq!(
+        page.entries[0], stamped,
+        "the stamped entry round-trips whole"
+    );
+    assert_eq!(page.entries[0].tool, Some(tool));
+    assert_eq!(page.entries[0].effect_id, Some(effect_id));
+    assert_eq!(page.entries[1], plain, "the plain entry round-trips whole");
+    assert_eq!(page.entries[1].tool, None);
+    assert_eq!(page.entries[1].effect_id, None);
 }
 
 /// Every scope-addressed session operation isolates (scenarios 14 and 18).
@@ -1251,6 +1297,7 @@ pub async fn retriever_answers_authoritative_records(
 /// On any violation.
 pub async fn check_session_memory_store_contract(store: &dyn SessionMemoryStore) {
     session_idempotent_append(store).await;
+    session_tool_provenance_round_trip(store).await;
     session_scope_isolation(store).await;
     session_retention_purge(store).await;
 }

@@ -132,3 +132,20 @@ pub use crate::handler::{
     RakkaA2ABuildError, RakkaA2ARequestHandler, RakkaA2AService, RakkaA2AServiceBuilder,
     RakkaA2ASettings,
 };
+
+/// The A2A SDK's per-request service parameters, re-exported so an
+/// application can name the one constructor input a
+/// [`RakkaA2AServiceBuilder::request_observer`] callback receives without
+/// depending on the SDK crate itself. Reachable as `rakka::a2a::ServiceParams`
+/// through the facade under its `a2a-agents` feature.
+///
+/// ```
+/// use rakka_a2a::ServiceParams;
+///
+/// fn observer(params: &ServiceParams) {
+///     let _ = params;
+/// }
+/// observer(&ServiceParams::new());
+/// ```
+#[cfg(feature = "server")]
+pub use a2a_server::ServiceParams;

@@ -162,14 +162,18 @@ inside the mutator, and is what that arrangement was verified for.
   already exists). The model-response point is the same shape and the same
   durable-semantics answer; the A2A points belong to the protocol adapter's
   ingress and egress. The coverage gate fails closed meanwhile
-  (`guardrail-stage-unevaluated`).
+  (`guardrail-stage-unevaluated`). Tracked as
+  [#70](https://github.com/paloul-tech/rakka/issues/70).
 - **Communal retrieval into a model context**, `SnapshotCommunalClaim`, and
   per-claim read-capability enforcement. Deferred by slice 4.6;
   `MemoryContextSnapshot::communal_claims` is a permanently empty placeholder.
-  Until it exists there is no communal poisoning surface to defend.
+  Until it exists there is no communal poisoning surface to defend. Tracked as
+  [#69](https://github.com/paloul-tech/rakka/issues/69).
 - **Knowledge-graph retention, tombstone, and deletion** — an absolute
   specification 13.1 requirement with no implementation on any backend.
-  `Retracted` is a trust transition that preserves content.
+  `Retracted` is a trust transition that preserves content. Operational the
+  moment a consumer writes claims, which gap slice 2 made practical; tracked
+  as [#68](https://github.com/paloul-tech/rakka/issues/68).
 - **The model-visible descriptor rung.** `AgentToolRegistry::model_visible` has
   no production call site and `AgentModelRequest` carries no tool list, so "the
   descriptor grants nothing" is vacuous rather than enforced.
@@ -246,7 +250,7 @@ run rather than reporting a silent `ok`, and
 what a CI or release run should set, since a suite that quietly stops covering
 what its name claims is the failure mode this whole document exists to refuse.
 
-Verified against PostgreSQL 16 with pgvector 0.8.5: all twelve clauses pass
+Verified against PostgreSQL 16 with pgvector 0.8.5: all thirteen clauses pass
 under `RAKKA_POSTGRES_PGVECTOR_REQUIRED=1` with no skips, so the shared suite
 holds on both backends unchanged — the acceptance shape slice 2.4 established
 for the knowledge graph.

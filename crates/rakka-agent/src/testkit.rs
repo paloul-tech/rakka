@@ -51,7 +51,7 @@ use std::fmt::{self, Debug};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
+use rakka_agent_workflow::{AgentCorrelationId, AgentTelemetryContext, AgentTimestampMillis};
 use rakka_core::MetricsRecorder;
 use rakka_persistence::DurableStateStore;
 use serde::{Deserialize, Serialize};
@@ -1859,6 +1859,7 @@ pub struct DeterministicModelAdapter {
     turns: Arc<Mutex<VecDeque<AgentModelTurn>>>,
     by_turn: Arc<Mutex<BTreeMap<u64, AgentModelTurn>>>,
     calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<AgentModelRequest>>>,
 }
 
 impl DeterministicModelAdapter {
@@ -1871,7 +1872,18 @@ impl DeterministicModelAdapter {
             turns: Arc::new(Mutex::new(VecDeque::new())),
             by_turn: Arc::new(Mutex::new(BTreeMap::new())),
             calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Every request this adapter has produced a turn for, in call order —
+    /// what a test reads to see the bounded request a driver actually built.
+    #[must_use]
+    pub fn requests(&self) -> Vec<AgentModelRequest> {
+        self.requests
+            .lock()
+            .expect("the request log should not be poisoned")
+            .clone()
     }
 
     /// Scripts the turn the next unconditioned model call returns.
@@ -1927,6 +1939,10 @@ impl DeterministicModelAdapter {
     #[must_use]
     pub fn produce(&self, request: &AgentModelRequest) -> AgentModelTurn {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests
+            .lock()
+            .expect("the request log should not be poisoned")
+            .push(request.clone());
         if let Some(turn) = self
             .by_turn
             .lock()
@@ -1967,13 +1983,17 @@ impl AgentModelAdapter for DeterministicModelAdapter {
     }
 }
 
-/// Builds the bounded model request one model effect resolves to.
+/// Builds the bounded model request one model effect resolves to, under the
+/// effect's trace context — the every-driver rule: the real pipeline stamps
+/// it, so this driver does too.
 fn model_request(
     context: &AgentContextSnapshotRef,
     profile: Option<&AgentModelProfileId>,
     turn: u64,
+    telemetry: &AgentTelemetryContext,
 ) -> AgentModelRequest {
-    let mut request = AgentModelRequest::new(context.clone(), turn);
+    let mut request =
+        AgentModelRequest::new(context.clone(), turn).with_telemetry(telemetry.clone());
     if let Some(profile) = profile {
         request = request.with_profile(profile.clone());
     }
@@ -2368,7 +2388,8 @@ where
                 if let Some(outcome) = self.cached(effect) {
                     return outcome;
                 }
-                let request = model_request(context, profile.as_ref(), effect.turn);
+                let request =
+                    model_request(context, profile.as_ref(), effect.turn, &effect.telemetry);
                 // A provider failure or an unboundable turn is a failed effect,
                 // exactly as a real dispatcher surfaces one; the interim loop
                 // stops the run on it, and slice 1.7's retry policy governs

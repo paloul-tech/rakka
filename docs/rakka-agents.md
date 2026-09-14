@@ -1,6 +1,6 @@
 # Rakka Agents
 
-Status: current through Phase 6 (slice 6.4) of
+Status: current through gap slice 2 (post-Phase-6) of
 [the agent implementation plan](plans/rakka-agent/implementation-plan.md).
 
 Rakka Agents are durable, goal-driven agents built as sharded entities on the
@@ -222,13 +222,22 @@ unavailable store degrades a turn's context and cannot make a run resume
 incorrectly.
 
 - **Session memory** is scoped `(TenantId, AgentId, AgentRunId)`, append-only
-  with idempotent operation ids, and isolated by both agent and run.
+  with idempotent operation ids, and isolated by both agent and run. A
+  tool-result entry names the tool that produced it and the effect whose
+  outcome it records — provenance, never authority — so claims and
+  promotions can be derived from durable session memory by tool.
 - **Context snapshots** are immutable and persisted before every model effect;
   a retry reuses the snapshot, so drift in a store or an index cannot change a
   retried model input.
 - **Agent-private long-term memory** is scoped `(TenantId, AgentId)`,
-  promoted from session memory through a checkpoint-gated executor, and ranked
-  for retrieval by a retriever (pgvector in `rakka-agent-postgres`). The
+  promoted from session memory through a checkpoint-gated executor — by
+  sequence window and, optionally, by role — and ranked for retrieval by a
+  retriever (pgvector in `rakka-agent-postgres`). A promotion or a communal
+  claim append is not new work but a copy of work already recorded: neither
+  is fenced by a wind-down, a failure of either stays on the effect record
+  rather than ending the run, and a run that has ended still accepts both
+  for a deployment-configured window after its terminal stamp, its effects
+  riding the ordinary outbox the application keeps pumping. The
   retriever supplies a ranking and nothing else: every ranked identity is
   resolved through the authoritative store before it is admitted, so a foreign
   or forged record is dropped and counted, and an unauthorized read reveals
@@ -345,4 +354,6 @@ absent retention in the security matrix; the segment classes with no
 production call site and the untested two-replica tail-sampling gateway in the
 telemetry matrix; the coordination workload across pods, the PostgreSQL arm
 for the shared substrate, and detected rather than announced departure in the
-fault-injection matrix.
+fault-injection matrix. The items a consumer reported and the gap slices
+carry forward are tracked as GitHub issues, cited from the implementation
+plan's "Owed onward" lines.

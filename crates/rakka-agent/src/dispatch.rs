@@ -119,7 +119,8 @@ use crate::definition::{
 use crate::effect::{
     compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentMemoryPromotionRequest,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
-    AgentRunEffectSink, AgentRunEffectStatus, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
+    AgentRunEffectSink, AgentRunEffectStatus, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
+    ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
 };
 use crate::identity::{AgentIdentityError, AgentRunScope, AgentScope};
 use crate::memory::{
@@ -1054,7 +1055,36 @@ impl AgentMemoryPromotionExecutor for SessionMemoryPromotionExecutor {
         now: AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentMemoryPromotionFinding> {
         Box::pin(async move {
-            let entries = self.read_selection(scope, promotion).await?;
+            let window = self.read_selection(scope, promotion).await?;
+            // The role filter applies to the durably read window. A window
+            // that selects nothing is refused definitively rather than
+            // succeeding silently with an empty receipt, and the selected
+            // set is held to the same bound the window met at commit — it
+            // cannot exceed it, and saying so here is what keeps that a
+            // checked invariant rather than an inferred one.
+            let entries: Vec<SessionMemoryEntry> = window
+                .into_iter()
+                .filter(|entry| promotion.selects_role(entry.role))
+                .collect();
+            if entries.is_empty() {
+                return Ok(AgentMemoryPromotionFinding::Refused {
+                    code: "memory-promotion-selection-empty".to_string(),
+                    message: format!(
+                        "the selection {}..={} holds no entry of the requested roles",
+                        promotion.from_sequence, promotion.to_sequence
+                    ),
+                });
+            }
+            if entries.len() > AGENT_MEMORY_PROMOTION_MAX_ENTRIES {
+                return Ok(AgentMemoryPromotionFinding::Refused {
+                    code: "memory-promotion-selection-invalid".to_string(),
+                    message: format!(
+                        "the selection names {} entries; at most {} may be promoted at once",
+                        entries.len(),
+                        AGENT_MEMORY_PROMOTION_MAX_ENTRIES
+                    ),
+                });
+            }
             let agent_scope = scope.agent_scope();
             let mut promoted = Vec::with_capacity(entries.len());
 
@@ -1382,6 +1412,37 @@ pub enum AgentDispatchDecision {
 /// because a dispatcher that skips the check is exactly the universally
 /// privileged worker [specification 16](../../../docs/plans/rakka-agent/spec.md)
 /// forbids claiming isolation from.
+///
+/// Both methods are required. A wrapping authority that forgot to forward
+/// [`Self::review_tool_response`] would silently drop the `ToolResponse`
+/// evaluation point, so every implementation states what it does at that
+/// boundary; [`accept_tool_response_unchanged`] is the one-line body for an
+/// authority that evaluates no response chain, and a wrapper forwards to the
+/// authority it wraps. An implementation without it does not build:
+///
+/// ```compile_fail,E0046
+/// use rakka_agent::{
+///     AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentRunEffect,
+///     AgentRunScope, AgentRunState,
+/// };
+/// use rakka_agent_workflow::AgentTimestampMillis;
+///
+/// struct Gate;
+///
+/// impl AgentDispatchAuthority for Gate {
+///     fn authorize<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _run: &'a AgentRunState,
+///         _intent: &'a AgentRunEffect,
+///         _attempt: u32,
+///         _now: AgentTimestampMillis,
+///     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+///         unimplemented!()
+///     }
+///     // `review_tool_response` is missing: the impl is incomplete.
+/// }
+/// ```
 pub trait AgentDispatchAuthority: Send + Sync {
     /// Authorizes one dispatch attempt of one effect intent, or refuses it.
     ///
@@ -1402,23 +1463,70 @@ pub trait AgentDispatchAuthority: Send + Sync {
     /// before the pipeline delivers it
     /// ([`AgentToolAuthority::review_tool_response`]).
     ///
-    /// The default accepts the result unchanged, for an authority that
-    /// evaluates no response chain; [`AgentEntityAuthority`] delegates to the
-    /// tool authority it wraps.
+    /// Required, not defaulted: an authority that evaluates no response chain
+    /// says so with [`accept_tool_response_unchanged`], and one that wraps
+    /// another forwards to it — [`AgentEntityAuthority`] delegates to the tool
+    /// authority it wraps. A defaulted accept would let a wrapper drop the
+    /// boundary by omission.
     fn review_tool_response<'a>(
         &'a self,
         scope: &'a AgentRunScope,
         intent: &'a AgentRunEffect,
         tool: Option<&'a AgentToolId>,
         content: AgentTaskContent,
-    ) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
-        let _ = (scope, intent, tool);
-        Box::pin(async move {
-            Ok(AgentToolResponseDecision::Accepted(Box::new(
-                AgentToolResponseReview::unchanged(content),
-            )))
-        })
-    }
+    ) -> AgentDispatchFuture<'a, AgentToolResponseDecision>;
+}
+
+/// The accept-unchanged body of
+/// [`AgentDispatchAuthority::review_tool_response`]: the result is delivered
+/// exactly as the tool produced it, with no transform and no report.
+///
+/// For an authority that evaluates no `ToolResponse` chain. A wrapping
+/// authority does not use it — it forwards to the authority it wraps, or the
+/// wrapped chain is silently dropped.
+///
+/// ```
+/// use rakka_agent::{
+///     accept_tool_response_unchanged, AgentDispatchAuthority, AgentDispatchDecision,
+///     AgentDispatchFuture, AgentRunEffect, AgentRunScope, AgentRunState, AgentTaskContent,
+///     AgentToolId, AgentToolResponseDecision,
+/// };
+/// use rakka_agent_workflow::AgentTimestampMillis;
+///
+/// struct Gate;
+///
+/// impl AgentDispatchAuthority for Gate {
+///     fn authorize<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _run: &'a AgentRunState,
+///         _intent: &'a AgentRunEffect,
+///         _attempt: u32,
+///         _now: AgentTimestampMillis,
+///     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+///         unimplemented!()
+///     }
+///
+///     fn review_tool_response<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _intent: &'a AgentRunEffect,
+///         _tool: Option<&'a AgentToolId>,
+///         content: AgentTaskContent,
+///     ) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
+///         accept_tool_response_unchanged(content)
+///     }
+/// }
+/// ```
+#[must_use]
+pub fn accept_tool_response_unchanged<'a>(
+    content: AgentTaskContent,
+) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
+    Box::pin(async move {
+        Ok(AgentToolResponseDecision::Accepted(Box::new(
+            AgentToolResponseReview::unchanged(content),
+        )))
+    })
 }
 
 /// What the `ToolResponse` boundary decided about an executed tool's result.
@@ -2261,7 +2369,9 @@ where
             // its intent settled, never dispatched after the cancellation. A
             // compensation or workflow-cancel is exempt — it is exactly the
             // work the wind-down authorized after the fence, and cancelling
-            // its ticket here would strand the wind-down on it forever.
+            // its ticket here would strand the wind-down on it forever — and
+            // so is a promotion or claim append, which copies work already
+            // recorded and may be accepted after the run has ended.
             self.settle_ticket_cancelled(scope, &claim, "run-cancelled", pass)
                 .await?;
             self.deliver_outcome(
@@ -3267,7 +3377,8 @@ where
         match &intent.request {
             AgentRunEffectRequest::Model { context, profile } => {
                 let mut request = AgentModelRequest::new(context.clone(), intent.turn)
-                    .with_settings_revision(granted.grant.settings_revision);
+                    .with_settings_revision(granted.grant.settings_revision)
+                    .with_telemetry(intent.telemetry.clone());
                 if let Some(sampling) = granted.sampling {
                     request = request.with_sampling(sampling);
                 }
@@ -3808,8 +3919,11 @@ where
         for intent in loop_state.ready_effects() {
             if intent.kind().exempt_from_wind_down_fence() {
                 // The compensation and workflow-cancel the wind-down itself
-                // authorized stay dispatchable; the ordinary flush and claim
-                // paths own them.
+                // authorized, and the promotion or claim append that copies
+                // work already recorded — including one accepted after the
+                // run ended — stay dispatchable; the ordinary flush and claim
+                // paths own them, and this sweep neither reads nor re-fences
+                // them on any later pass.
                 continue;
             }
             let ticket_id = intent.dispatch_ticket_id();

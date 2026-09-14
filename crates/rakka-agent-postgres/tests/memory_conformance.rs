@@ -153,6 +153,17 @@ async fn a_replayed_session_append_creates_no_second_entry_when_dsn_is_set() {
 }
 
 #[tokio::test]
+async fn a_tool_result_entry_keeps_its_tool_and_effect_provenance_when_dsn_is_set() {
+    // The entry is JSON-encoded whole into `entry BYTEA`, so the two
+    // provenance fields ride the existing column with no DDL; what this holds
+    // is that the encoding neither drops nor reorders them.
+    let Some(store) = session().await else {
+        return;
+    };
+    memory_conformance::session_tool_provenance_round_trip(&store).await;
+}
+
+#[tokio::test]
 async fn every_session_operation_isolates_when_dsn_is_set() {
     let Some(store) = session().await else {
         return;

@@ -5013,6 +5013,127 @@ Status: implemented (2026-09-02, branch `rakka-agents-phase-gap1`). Design in
   exists to link), the `ModelResponse` and A2A guardrail points, and
   everything else the matrices' owed sections carry, unchanged.
 
+### Gap slice 2 — The memory and claims write side
+
+Spec: [8.7](spec.md#87-cancellation-failure-and-waiting),
+[13.2](spec.md#132-short-term-session-memory),
+[13.3](spec.md#133-agent-private-long-term-memory),
+[13.4](spec.md#134-communal-knowledge-graph),
+[17.8](spec.md#178-model-and-provider-observability).
+
+Status: implemented (2026-09-13, branch `rakka-agents-phase-gap2`), from a
+consumer's brief: the first application to issue `PromoteMemory` and
+`AppendClaim` found four upstream facts that had never been exercised, each
+forcing a workaround, plus three cheap reports. Design for the one deliverable
+with design weight in
+`docs/superpowers/specs/2026-09-13-phase-gap2-post-terminal-memory-window-design.md`.
+
+- **A failed claim append no longer winds the run down.** The
+  definitive-failure arm exempted a memory promotion and a goal evaluation
+  but not a claim append, so a claim-store refusal killed a live run. A claim
+  is a record *about* the run's work, not the work (13.4 now says so): the
+  failure stays on the effect record and the initiator re-issues under a new
+  operation id. That a claim may later be read as evidence (8.3) does not
+  make a failed append correctness-bearing — an evaluation reads whatever the
+  graph holds when it runs. (The brief's `AgentGoalClaimSource` does not
+  exist at the pin; the comment argues from 8.3 instead.)
+- **Tool identity on a tool result and its session entry.** `AgentToolResult`
+  and `SessionMemoryEntry` gain `tool` and `effect_id`, serde-defaulted and
+  outside every derived identity, stamped where the tool outcome is applied
+  from the effect record — the last transition that knows either, since the
+  record leaves the loop with the turn — and carried onto the `ToolResult`
+  entry only. A reader deriving claims from tool output selects by tool from
+  durable session memory instead of staging tool identity elsewhere. No DDL:
+  the PostgreSQL store JSON-encodes the whole entry; the conformance suite
+  gained a round-trip clause every backend runs.
+- **A native role filter on `PromoteMemory`.**
+  `AgentMemoryPromotionRequest::roles` (`None` = every role, as before). The
+  executor filters the durably read window, refuses a window that selects
+  nothing definitively under `memory-promotion-selection-empty` rather than
+  succeeding with an empty receipt, and holds the selected count to the
+  window's bound; an empty set is refused at the door under
+  `run-memory-roles-empty`. Identity is per entry, so a filtered promotion
+  converges on the records an unfiltered one wrote.
+- **Both commands accepted after a run ends, for a bounded window.** A run
+  that ended `Completed`, `Failed`, or `Cancelled` accepts both for
+  `AgentEffectPolicies::post_terminal_memory_window_ms` (default ten minutes,
+  `0` restores the old refusal) after its terminal stamp; past it, or on an
+  unstamped terminal record, `run-memory-window-closed`; `HandedOff` and
+  `Superseded` stay `run-terminal`. Both effect kinds join
+  `exempt_from_wind_down_fence`, so one committed on a live run that then
+  winds down still dispatches (intended, stated), both commands are also
+  accepted *during* wind-down, the terminal run's settle pass flushes exempt
+  kinds instead of nothing, the dispatcher's wind-down sweep skips them and
+  never re-fences them, and `RecordEffectResult` on a terminal run accepts a
+  result for an exempt effect while answering `run-terminal` for every other.
+  The outcome lands without moving status, phase, reason, or stamp; an
+  ambiguous attempt is retried under the generation's key and a terminal run
+  opens no reconciliation checkpoint. The application keeps pumping the
+  terminal run's outbox; nothing upstream drives it. `AgentEffectPolicies` is
+  not a serde type, so the brief's `#[serde(default)]` has no site — the
+  default lives in `new()`.
+- **Found by the proof: effect identity did not survive `clear_turn`.**
+  `next_effect_slot` counted the effects still held for the turn, so an
+  effect committed after the turn's resolved model call was dropped — a run
+  resting on its result proposal, or a run that had ended — re-derived that
+  call's identity and its result answered `Duplicate` from the operation log
+  forever. Latent at the pin for any promotion or claim committed during the
+  proposal wait. `AgentLoopState::next_slot` (serde-defaulted, `clear_turn`
+  leaves it, `begin_turn` resets it) with the held effects as a floor, and an
+  operation-log floor in the two handlers for records persisted before the
+  counter; the residual (a pre-counter record whose terminal results were
+  evicted by sixty-four later operations) is recorded in the compatibility
+  bullet.
+- **Trace context on `AgentModelRequest`.** `telemetry`, serde-defaulted,
+  the run's own context stamped by both drivers from the intent, so an
+  adapter can parent its provider span on the run's trace; 17.8 says it is
+  observability only. `DeterministicModelAdapter::requests` records what a
+  driver built.
+- **`rakka-a2a` re-exports `ServiceParams`** under `server`
+  (`rakka::a2a::ServiceParams` through the facade).
+- **`review_tool_response` is required.** A wrapping authority that forgot to
+  forward it silently dropped the `ToolResponse` point gap slice 1 wired;
+  `accept_tool_response_unchanged` is the documented one-line body, a
+  compile-fail doc-test holds the omission.
+- **Held by:** `communal_claim_append.rs` (the non-fencing mirror, the
+  post-terminal set for claims), `session_memory.rs` and
+  `memory_store_contract.rs::a_tool_result_entry_keeps_its_tool_and_effect_provenance`
+  (tool provenance; the PostgreSQL twin in `rakka-agent-postgres`),
+  `private_memory_promotion.rs` (the role filter, the post-terminal set,
+  `a_post_terminal_promotion_survives_any_owner_loss`, the two identity
+  proofs), `effect_dispatch.rs` (the wind-down sweep and the ambiguous
+  post-terminal retry through the real pipeline),
+  `telemetry_context.rs::the_model_request_carries_the_runs_trace_context`,
+  the `rakka-a2a` doc-test, and the two `AgentDispatchAuthority` doc-tests.
+  Documentation: specification 8.7, 13.2, 13.3, 13.4, 17.8;
+  `docs/rakka-compatibility.md`; the security matrix's clause count;
+  `docs/rakka-agents.md`.
+- **Owed onward,** in the consumer's order of value, each now tracked:
+  knowledge-graph retention, tombstone, and deletion
+  ([#68](https://github.com/paloul-tech/rakka/issues/68)) — operational the
+  moment a consumer writes claims; the per-settle-pass write amplification
+  ([#25](https://github.com/paloul-tech/rakka/issues/25)), re-dated rather
+  than measured here, and widened by the terminal-run flush this slice adds;
+  the communal read path into a model context
+  ([#69](https://github.com/paloul-tech/rakka/issues/69)) — without it a
+  consumer's claims are write-only; the `ModelResponse`, `A2aIngress`, and
+  `A2aEgress` evaluation points and the wait segments for timer and child
+  waits ([#70](https://github.com/paloul-tech/rakka/issues/70)); the workflow
+  substrate's six items — three `AgentRunActorCommand` arms, a native
+  `Iterator`, `AgentGraphNodeStatus::Indeterminate` with a graph-level
+  reconciliation decision, `cancel_graph_run` and the actor's `Cancel`
+  clearing and narrating nodes, a writer for `AgentGraphNodeState.input_ref`,
+  expected revision and provenance on `PublishDefinition` and `Admit`
+  ([#71](https://github.com/paloul-tech/rakka/issues/71)); the effect
+  bridge's O(nodes) callback resolution
+  ([#5](https://github.com/paloul-tech/rakka/issues/5)); and the hygiene the
+  consumer noticed — specification 21.3 decisions 6, 18, and 21 without a
+  disposition, `LICENSE` contradicting the roadmap, and a changelog that has
+  never cut a version ([#72](https://github.com/paloul-tech/rakka/issues/72)).
+  The three `#[non_exhaustive]` choices the consumer matches on
+  (`AgentEffectKind`, `AgentGraphNodeStatus`, `AgentRunActorCommand` are
+  exhaustive; five `rakka-agent` enums are not) are deliberate and unchanged.
+
 ## Appendix — Scenario-to-Slice Coverage
 
 All scenario numbers refer to

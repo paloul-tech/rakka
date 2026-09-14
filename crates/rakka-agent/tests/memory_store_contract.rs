@@ -33,8 +33,8 @@ use rakka_agent::memory_conformance::{
     private_tombstone_and_delete_erasure, private_write_preconditions,
     retriever_answers_authoritative_records, retriever_filters_before_ranking,
     retriever_scope_isolation, session_idempotent_append, session_retention_purge,
-    session_scope_isolation, snapshot_immutability, snapshot_scope_isolation,
-    MemoryConformanceScopes, StoreOnlySeeder, MEMORY_UNSCOPED_METHODS,
+    session_scope_isolation, session_tool_provenance_round_trip, snapshot_immutability,
+    snapshot_scope_isolation, MemoryConformanceScopes, StoreOnlySeeder, MEMORY_UNSCOPED_METHODS,
 };
 use rakka_agent::{
     InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore, InMemoryPrivateMemoryRetriever,
@@ -60,6 +60,11 @@ fn private() -> Arc<InMemoryAgentPrivateMemoryStore> {
 #[tokio::test]
 async fn a_replayed_session_append_creates_no_second_entry() {
     session_idempotent_append(&session()).await;
+}
+
+#[tokio::test]
+async fn a_tool_result_entry_keeps_its_tool_and_effect_provenance() {
+    session_tool_provenance_round_trip(&session()).await;
 }
 
 #[tokio::test]
