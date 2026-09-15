@@ -1,6 +1,6 @@
 # Rakka Agents
 
-Status: current through gap slice 2 (post-Phase-6) of
+Status: current through gap slice 3 (post-Phase-6) of
 [the agent implementation plan](plans/rakka-agent/implementation-plan.md).
 
 Rakka Agents are durable, goal-driven agents built as sharded entities on the
@@ -234,10 +234,12 @@ incorrectly.
   sequence window and, optionally, by role — and ranked for retrieval by a
   retriever (pgvector in `rakka-agent-postgres`). A promotion or a communal
   claim append is not new work but a copy of work already recorded: neither
-  is fenced by a wind-down, a failure of either stays on the effect record
-  rather than ending the run, and a run that has ended still accepts both
-  for a deployment-configured window after its terminal stamp, its effects
-  riding the ordinary outbox the application keeps pumping. The
+  is fenced by a wind-down, neither is among the effects a turn waits on —
+  one committed beside a turn's in-flight tool never holds the turn open,
+  and its outcome never rests one — a failure of either stays on the effect
+  record rather than ending the run, and a run that has ended still accepts
+  both for a deployment-configured window after its terminal stamp, its
+  effects riding the ordinary outbox the application keeps pumping. The
   retriever supplies a ranking and nothing else: every ranked identity is
   resolved through the authoritative store before it is admitted, so a foreign
   or forged record is dropped and counted, and an unauthorized read reveals
