@@ -1893,7 +1893,7 @@ fn accept_handoff_result(
                     tool: None,
                     effect_id,
                 });
-                if !winding_down && !run.loop_state.awaits_effect() {
+                if !winding_down && !run.loop_state.awaits_turn_effect() {
                     // The fence released, so the turn rests where any other
                     // resolved call leaves it and the model corrects course.
                     let (phase, status) = turn_rest(&run.loop_state);
@@ -3846,13 +3846,21 @@ fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
 /// effect wait, the fan-in wait, or completion — the one decision every
 /// turn-completing site shares.
 ///
+/// The effect wait is decided on the *turn's* effects
+/// ([`AgentLoopState::awaits_turn_effect`]), never on everything the run
+/// holds: a memory promotion or a claim append committed beside the turn's
+/// in-flight work is outside the turn, and counting it here — as the
+/// kind-blind predicate once did — rested the turn `AwaitingTools` on an
+/// effect whose own outcome would never rest it
+/// ([specification 9.4](../../../docs/plans/rakka-agent/spec.md)).
+///
 /// An awaiting fan-in rests `Running`, not a wait status: the run is waiting
 /// for peer entities' durable decisions, which the choreography re-drives,
 /// and `Running` is the honest non-residency status for that
 /// ([specification 9.3](../../../docs/plans/rakka-agent/spec.md)) — the
 /// entity passivates here like anywhere else.
 fn turn_rest(loop_state: &AgentLoopState) -> (AgentLoopPhase, AgentRunStatus) {
-    if loop_state.awaits_effect() {
+    if loop_state.awaits_turn_effect() {
         (
             AgentLoopPhase::AwaitingTools,
             checkpoint_wait_status(loop_state),
@@ -4191,7 +4199,7 @@ fn apply_effect_outcome(
                 effect_id: Some(effect_id.clone()),
             };
             run.loop_state.record_tool_result(result);
-            if !winding_down && !run.loop_state.awaits_effect() {
+            if !winding_down && !run.loop_state.awaits_turn_effect() {
                 // The last tool of the turn came back, so the turn rests:
                 // complete, or awaiting a closed fan-in group's children.
                 let (phase, status) = turn_rest(&run.loop_state);
@@ -4254,7 +4262,7 @@ fn apply_effect_outcome(
                 tool: None,
                 effect_id: Some(effect_id.clone()),
             });
-            if !winding_down && !run.loop_state.awaits_effect() {
+            if !winding_down && !run.loop_state.awaits_turn_effect() {
                 // The last effect of the turn came back, so the turn rests:
                 // complete, or awaiting a closed fan-in group's children.
                 let (phase, status) = turn_rest(&run.loop_state);
@@ -4285,7 +4293,7 @@ fn apply_effect_outcome(
             if let Some(cell) = run.loop_state.handoff_mut() {
                 cell.mark_sent(receipt.target_generation);
             }
-            if !winding_down && !run.loop_state.awaits_effect() {
+            if !winding_down && !run.loop_state.awaits_turn_effect() {
                 let (phase, status) = turn_rest(&run.loop_state);
                 run.loop_state.set_phase(phase);
                 run.status = status;
@@ -4353,7 +4361,7 @@ fn apply_effect_outcome(
             // is refused, so its dispositions only change through paths that
             // already run the fan-in step.
             try_resolve_fan_in(run, now);
-            if !winding_down && !run.loop_state.awaits_effect() {
+            if !winding_down && !run.loop_state.awaits_turn_effect() {
                 // The last effect of the turn came back, so the turn rests:
                 // complete, or awaiting a closed fan-in group's children.
                 let (phase, status) = turn_rest(&run.loop_state);
@@ -4434,7 +4442,7 @@ fn apply_effect_outcome(
                             effect_id: Some(effect_id.clone()),
                         });
                     }
-                    if !winding_down && !run.loop_state.awaits_effect() {
+                    if !winding_down && !run.loop_state.awaits_turn_effect() {
                         let (phase, status) = turn_rest(&run.loop_state);
                         run.loop_state.set_phase(phase);
                         run.status = status;
@@ -4545,7 +4553,7 @@ fn apply_effect_outcome(
                         // an `Any` with nothing left to succeed, a quorum no
                         // longer reachable — in this same compare-and-set.
                         try_resolve_fan_in(run, now);
-                        if !run.loop_state.awaits_effect() {
+                        if !run.loop_state.awaits_turn_effect() {
                             let (phase, status) = turn_rest(&run.loop_state);
                             run.loop_state.set_phase(phase);
                             run.status = status;
@@ -4605,7 +4613,7 @@ fn apply_effect_outcome(
                             });
                         }
                         try_resolve_fan_in(run, now);
-                        if !run.loop_state.awaits_effect() {
+                        if !run.loop_state.awaits_turn_effect() {
                             let (phase, status) = turn_rest(&run.loop_state);
                             run.loop_state.set_phase(phase);
                             run.status = status;
