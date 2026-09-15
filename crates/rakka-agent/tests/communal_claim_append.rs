@@ -814,3 +814,211 @@ async fn an_exhausted_post_terminal_claim_append_leaves_the_terminal_record_unto
     assert_eq!(after.terminal_at, before.terminal_at);
     assert!(executor.invocations().is_empty());
 }
+
+// ===========================================================================
+// A turn rests on the turn's own effects (gap slice 3), the claim half: an
+// append outstanding when the turn's last effect result lands never holds
+// the turn open, and its own outcome never rests one.
+// ===========================================================================
+
+/// Where the run durably rests: phase, status, turn, and how many effects of
+/// any kind are outstanding.
+async fn resting_at(fx: &Fixture) -> (rakka_agent::AgentLoopPhase, AgentRunStatus, u64, usize) {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let loop_state = state.loop_state().expect("the loop is started");
+    (
+        loop_state.phase(),
+        state.status().expect("the run exists"),
+        loop_state.turn(),
+        loop_state.outstanding_effects().count(),
+    )
+}
+
+/// The one dispatched, still-outstanding effect of `kind` the run holds.
+async fn dispatched_effect(fx: &Fixture, kind: AgentRunEffectKind) -> AgentRunEffect {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let effects: Vec<AgentRunEffect> = state
+        .loop_state()
+        .expect("the loop is started")
+        .effects()
+        .iter()
+        .filter(|effect| effect.kind() == kind && effect.status == AgentRunEffectStatus::Ready)
+        .cloned()
+        .collect();
+    assert_eq!(effects.len(), 1, "exactly one dispatched {kind} effect");
+    effects[0].clone()
+}
+
+/// Records the dispatcher's scripted answer to exactly one effect and nothing
+/// else, so a test chooses which result lands first.
+async fn answer_effect(fx: &Fixture, effect: &AgentRunEffect) -> AgentRunEntityReply {
+    let outcome = fx.dispatcher.answer(effect).await;
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.apply(
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect
+                .result_operation_id(&common::run_scope())
+                .expect("the result operation id derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: effect.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(outcome),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the result applies")
+}
+
+/// Answers every dispatched effect — here, the turn-one model call.
+async fn drive(fx: &Fixture) {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    fx.dispatcher
+        .drive(&mut run, &fx.router, fx.now())
+        .await
+        .expect("answer the dispatched effects");
+}
+
+/// Settles the run so its committed effects are dispatchable.
+async fn settle(fx: &Fixture) {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.settle_side_effects(&fx.router, fx.now())
+        .await
+        .expect("settle");
+}
+
+/// A goal world whose first turn calls a tool that answers, cranked to that
+/// tool's wait with an append committed beside it, both dispatched: the
+/// exact state a sweep that claims into live runs produces. Returns the tool
+/// effect and the append effect.
+async fn mid_turn_appending_world() -> (
+    Fixture,
+    Arc<RecordingClaimAppendExecutor>,
+    AgentRunEffect,
+    AgentRunEffect,
+) {
+    let executor = RecordingClaimAppendExecutor::new();
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, common::proposing_turn()),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    )
+    .with_claim_append_executor(executor.clone());
+    let fx = Fixture::new(dispatcher);
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec();
+    spec.knowledge_spaces.insert(space("space-alpha"));
+    fx.apply_task_command(goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(spec, true),
+    ))
+    .await
+    .expect("the goal task creates");
+    settle(&fx).await;
+    drive(&fx).await;
+    settle(&fx).await;
+    let (phase, _, turn, _) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, turn),
+        (rakka_agent::AgentLoopPhase::AwaitingTools, 1),
+        "the tool is in flight"
+    );
+
+    let reply = apply_append(&fx, "mid-turn", append_request("space-alpha"))
+        .await
+        .expect("the append applies to the live run");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    settle(&fx).await;
+    let tool = dispatched_effect(&fx, AgentRunEffectKind::ToolCall).await;
+    let append = dispatched_effect(&fx, AgentRunEffectKind::ClaimAppendCall).await;
+    (fx, executor, tool, append)
+}
+
+/// The executor's answer to the append, applied against the effect record.
+async fn answer_append(fx: &Fixture, append: &AgentRunEffect) -> AgentRunEffect {
+    let rakka_agent::AgentRunEffectRequest::ClaimAppend {
+        append: request,
+        provenance,
+    } = &append.request
+    else {
+        panic!("the effect carries the append request");
+    };
+    let outcome = fx
+        .dispatcher
+        .claim_append_outcome(&common::run_scope(), append, request, provenance, fx.now())
+        .await;
+    resolve_claim_append(fx, outcome).await
+}
+
+/// Proof 3, the claim half of the wedge: an append committed while the
+/// turn's tool is in flight, and the tool result lands first. The turn rests
+/// on the turn's own effects, so the run goes on to its next model call with
+/// the append still outstanding; the append then resolves on its own and the
+/// run completes.
+#[tokio::test]
+async fn a_claim_append_outstanding_when_the_tool_result_lands_does_not_hold_the_turn_open() {
+    let (fx, executor, tool, append) = mid_turn_appending_world().await;
+
+    let reply = answer_effect(&fx, &tool).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let (phase, status, turn, outstanding) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, turn),
+        (rakka_agent::AgentLoopPhase::AwaitingModel, 2),
+        "the tool result rested the turn and the run went on to its next model call \
+         (status {status:?}, {outstanding} effect(s) outstanding)"
+    );
+
+    let resolved = answer_append(&fx, &append).await;
+    assert_eq!(resolved.status, AgentRunEffectStatus::Succeeded);
+    assert_eq!(
+        executor.invocations().len(),
+        1,
+        "the append reached the store once"
+    );
+    fx.pump().await.expect("the loop runs to completion");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+/// Proof 3, the control: the append resolves first. Its outcome rests
+/// nothing — the turn is still waiting on its tool — and the tool result
+/// then rests the turn exactly as it always did.
+#[tokio::test]
+async fn a_claim_append_resolving_before_the_tool_result_rests_nothing() {
+    let (fx, executor, tool, append) = mid_turn_appending_world().await;
+
+    let resolved = answer_append(&fx, &append).await;
+    assert_eq!(resolved.status, AgentRunEffectStatus::Succeeded);
+    assert_eq!(executor.invocations().len(), 1);
+    let (phase, _, turn, outstanding) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, turn, outstanding),
+        (rakka_agent::AgentLoopPhase::AwaitingTools, 1, 1),
+        "the append's outcome moved nothing: the turn still waits on its tool"
+    );
+
+    answer_effect(&fx, &tool).await;
+    let (phase, _, turn, _) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, turn),
+        (rakka_agent::AgentLoopPhase::AwaitingModel, 2)
+    );
+    fx.pump().await.expect("the loop runs to completion");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+}
