@@ -5134,6 +5134,93 @@ with design weight in
   (`AgentEffectKind`, `AgentGraphNodeStatus`, `AgentRunActorCommand` are
   exhaustive; five `rakka-agent` enums are not) are deliberate and unchanged.
 
+### Gap slice 3 — The turn rest
+
+Spec: [9.4](spec.md#94-loop-phase),
+[13.3](spec.md#133-agent-private-long-term-memory),
+[13.4](spec.md#134-communal-knowledge-graph).
+
+Status: implemented (2026-09-15, branch `rakka-agents-phase-gap3`), from a
+consumer's brief: the first application to issue `PromoteMemory` and
+`AppendClaim` into *live* runs — a memory sweep ticking every few seconds —
+found that either command, outstanding when a turn's last effect result
+landed, parked the run `AwaitingTools` forever (two wedges in six runs of a
+two-tool run under a one-second sweep), and worked around it by promoting
+only runs that had ended, the window gap slice 2 built.
+
+- **The defect.** Every site that decides a turn is over consulted
+  `AgentLoopState::awaits_effect`, `outstanding_effects().next().is_some()`
+  over every effect whatever its kind. A promotion or a claim append
+  committed beside the turn's in-flight tool therefore counted; the tool
+  result that found it outstanding declined to rest the turn; the
+  promotion's own outcome arm, which by design moves no phase and no status,
+  rested nothing; and `AgentRun::can_advance` is false for `AwaitingTools`,
+  so the wedge was permanent — no wake timer, no terminal reason, nothing to
+  alert on. The same gate sat on the `A2aSend`, `A2aHandoff`, and
+  `WorkflowStart` arms, the handoff-refusal exchange, and the failure arms:
+  every effect kind a turn awaits, not tools alone.
+- **The turn rests on the turn's own effects.**
+  `AgentRunEffectKind::outside_the_turn` names the two kinds, and only those
+  two: a memory promotion and a claim append each copy work the turn has
+  already recorded into a longer-lived tier — the reason both are exempt
+  from the wind-down fence — and each resolves through an arm that rests
+  nothing. The set is deliberately not `exempt_from_wind_down_fence`: a
+  compensation and a workflow cancel are wind-down work a turn may genuinely
+  await (a compensation resolves through the tool arm). `AgentLoopState::awaits_turn_effect`
+  is `awaits_effect` filtered on that set, and every turn-rest site consults
+  it, each read and confirmed a turn-rest decision: the `Tool`, `A2aSend`,
+  `A2aHandoff`, and `WorkflowStart` outcome arms, the handoff-refusal
+  exchange, the definitively-failed handoff send, the two group-member
+  failure arms, and `turn_rest` itself — nine sites plus the definition,
+  where the brief counted eleven. `awaits_effect` keeps its kind-blind
+  meaning: the quiesce condition (`awaits_settlement`), the handoff planning
+  fence, the budget's concurrency reservations, and the pending-effect bound
+  count every kind on purpose and are unchanged.
+- **Repair of a record already wedged.** `AgentRun::needs_turn_rest` names
+  the shape — `AwaitingTools`, no effect of the turn outstanding or
+  ambiguous, the run neither winding down nor parked on a checkpoint,
+  reconciliation, suspension, or top-up wait — and the settle pass rests it
+  on the first pass that touches it, exactly as the tool arm would have, then
+  folds the turn. The settle pass rather than the promotion and claim arms,
+  because the arms would heal only a record whose promotion was still
+  unresolved at the upgrade, while the pass is what every command's apply and
+  every sweep drives: the operation log that reported the defect ends with
+  the promotion already resolved, and that record heals on its next settle
+  with no operator action. Under the fixed transitions the shape is
+  unreachable. The guard narrows the tool arm's once: an ambiguous effect of
+  the turn is left to its reconciliation decision, whose resolution runs the
+  arm itself.
+- **Held by:** `private_memory_promotion.rs` —
+  `a_promotion_outstanding_when_the_tool_result_lands_does_not_hold_the_turn_open`
+  (the wedge's exact sequence; at the pin `left: (AwaitingTools, 1)`,
+  `right: (AwaitingModel, 2)`, one effect outstanding), its control
+  `a_promotion_resolving_before_the_tool_result_rests_nothing`,
+  `a_promotion_outstanding_when_the_last_delegation_send_lands_does_not_hold_the_turn_open`
+  (the `A2aSend` arm; at the pin `(AwaitingTools, WaitingForEffect, 1)` where
+  `(AwaitingChildren, Running, 1)` was owed),
+  `a_record_wedged_before_the_fix_is_rested_by_its_next_settle_pass` (the
+  wedged record written through the state store; at the pin, and with the
+  predicate alone, the pump returned quietly with the run still
+  `WaitingForEffect`), and
+  `a_promotion_committed_mid_turn_still_dispatches_when_the_run_winds_down`;
+  `communal_claim_append.rs` —
+  `a_claim_append_outstanding_when_the_tool_result_lands_does_not_hold_the_turn_open`
+  and `a_claim_append_resolving_before_the_tool_result_rests_nothing`. Gap
+  slice 2's dispatcher-side wind-down proofs
+  (`effect_dispatch.rs::a_post_terminal_promotion_survives_the_wind_down_fence`
+  and its claim twin) still pass. Documentation: specification 9.4, 13.3,
+  13.4; `docs/rakka-compatibility.md`; `docs/rakka-agents.md`.
+- **Owed onward:** a goal evaluation has the shape of the same exposure —
+  its outcome arm rests nothing, and `EvaluateGoal` carries no fence against
+  a turn in flight — but stays inside the turn's count, because it is new
+  work the wind-down fences rather than a copy of recorded work and the
+  brief's exempt set was exactly the two memory kinds. An evaluation
+  outstanding when a turn's last result lands therefore still holds the turn
+  open until it resolves; since this slice the record is then rested by its
+  next settle pass rather than parked forever. Recorded here for the owner's
+  decision; no issue filed. Everything gap slice 2 carries forward is
+  unchanged.
+
 ## Appendix — Scenario-to-Slice Coverage
 
 All scenario numbers refer to

@@ -14,16 +14,16 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{sweep_crash_points, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    promotion_operation_id, AgentMemoryConsolidationTarget, AgentMemoryPromotionRequest,
-    AgentModelTurn, AgentModelUsage, AgentOperationId, AgentOperationKind, AgentPrivateMemoryId,
-    AgentPrivateMemoryKind, AgentPrivateMemoryStore, AgentRunEffect, AgentRunEffectKind,
-    AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunEntityReply,
-    AgentRunMemory, AgentRunStatus, AgentScope, AgentTaskContent, AgentTaskEntityStore,
-    AgentToolCallId, AgentToolCallRequest, AgentToolId, InMemoryAgentPrivateMemoryStore,
-    InMemoryContextSnapshotStore, InMemorySessionMemoryStore, MemoryEntryRole, MemorySequence,
-    PrivateMemoryCursor, SessionMemoryCursor, SessionMemoryPage, SessionMemoryPromotionExecutor,
-    SessionMemoryStore, AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    promotion_operation_id, AgentLoopPhase, AgentMemoryConsolidationTarget,
+    AgentMemoryPromotionRequest, AgentModelTurn, AgentModelUsage, AgentOperationId,
+    AgentOperationKind, AgentPrivateMemoryId, AgentPrivateMemoryKind, AgentPrivateMemoryStore,
+    AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectStatus,
+    AgentRunEntityCommand, AgentRunEntityReply, AgentRunMemory, AgentRunStatus, AgentScope,
+    AgentTaskContent, AgentTaskEntityStore, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest,
+    AgentToolId, AgentToolResult, InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore,
+    InMemorySessionMemoryStore, MemoryEntryRole, MemorySequence, PrivateMemoryCursor,
+    SessionMemoryCursor, SessionMemoryPage, SessionMemoryPromotionExecutor, SessionMemoryStore,
+    AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 use rakka_persistence::DurableStateStore;
@@ -1838,4 +1838,391 @@ async fn a_loop_state_persisted_before_the_slot_counter_still_allocates_a_fresh_
         fx.run_snapshot().await.expect("the run exists").status,
         AgentRunStatus::Completed
     );
+}
+
+// ===========================================================================
+// A turn rests on the turn's own effects (gap slice 3): a promotion
+// outstanding when the turn's last effect result lands never holds the turn
+// open, and its own outcome never rests one. The exposure a consumer's
+// sweep found — a promotion committed into a live run whose turn had a tool
+// in flight parked the run `AwaitingTools` with nothing outstanding and
+// nothing left to rest it.
+// ===========================================================================
+
+/// Where the run durably rests: phase, status, turn, and how many effects of
+/// any kind are outstanding.
+async fn resting_at(fx: &Fixture) -> (AgentLoopPhase, AgentRunStatus, u64, usize) {
+    let mut run = fx.run();
+    let now = fx.now();
+    run.recover(now).await.expect("recover");
+    let state = run.state().expect("state");
+    let loop_state = state.loop_state().expect("the loop is started");
+    (
+        loop_state.phase(),
+        state.status().expect("the run exists"),
+        loop_state.turn(),
+        loop_state.outstanding_effects().count(),
+    )
+}
+
+/// Every dispatched, still-outstanding effect of `kind` the run holds, in
+/// slot order.
+async fn dispatched_effects_of(fx: &Fixture, kind: AgentRunEffectKind) -> Vec<AgentRunEffect> {
+    let mut run = fx.run();
+    let now = fx.now();
+    run.recover(now).await.expect("recover");
+    let state = run.state().expect("state");
+    state
+        .loop_state()
+        .expect("the loop is started")
+        .effects()
+        .iter()
+        .filter(|effect| effect.kind() == kind && effect.status == AgentRunEffectStatus::Ready)
+        .cloned()
+        .collect()
+}
+
+/// The one dispatched, still-outstanding effect of `kind` the run holds.
+async fn dispatched_effect(fx: &Fixture, kind: AgentRunEffectKind) -> AgentRunEffect {
+    let effects = dispatched_effects_of(fx, kind).await;
+    assert_eq!(effects.len(), 1, "exactly one dispatched {kind} effect");
+    effects[0].clone()
+}
+
+/// Records the dispatcher's scripted answer to exactly one effect — a tool
+/// call, a delegation send — and nothing else, so a test chooses which
+/// result lands first.
+async fn answer_effect(fx: &Fixture, effect: &AgentRunEffect) -> AgentRunEntityReply {
+    let outcome = fx.dispatcher.answer(effect).await;
+    apply_ok(
+        fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect
+                .result_operation_id(&run_scope())
+                .expect("result operation id"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: effect.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(outcome),
+        },
+    )
+    .await
+}
+
+/// A tool-calling world cranked to turn one's tool wait with a promotion
+/// committed beside the in-flight tool, both dispatched: the exact state a
+/// sweep that promotes live runs produces. Returns the tool effect and the
+/// promotion effect.
+async fn mid_turn_promoting_world() -> (Fixture, Stores, AgentRunEffect, AgentRunEffect) {
+    let (fx, stores) = tool_promoting_world();
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    crank(&fx).await;
+    // The turn-one model call answers with the tool call; the applying
+    // transition commits and dispatches the tool effect.
+    drive_turn(&fx).await;
+    crank(&fx).await;
+    let (phase, _, turn, _) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, turn),
+        (AgentLoopPhase::AwaitingTools, 1),
+        "the tool is in flight"
+    );
+
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "mid-turn")).await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "the promotion applies to the live run: {reply:?}"
+    );
+    crank(&fx).await;
+    let tool = dispatched_effect(&fx, AgentRunEffectKind::ToolCall).await;
+    let promotion = dispatched_effect(&fx, AgentRunEffectKind::MemoryPromotionCall).await;
+    (fx, stores, tool, promotion)
+}
+
+/// Proof 1, the wedge a consumer's sweep found: a promotion committed while
+/// the turn's tool is in flight, and the tool result lands first. The turn
+/// rests on the turn's own effects, so the run goes on to its next model
+/// call with the promotion still outstanding; the promotion then resolves on
+/// its own and the run completes. Before the fix the tool arm counted the
+/// promotion among the effects the turn awaited, declined to rest, and the
+/// promotion's own outcome rested nothing: the run parked `AwaitingTools`
+/// with zero outstanding effects, permanently.
+#[tokio::test]
+async fn a_promotion_outstanding_when_the_tool_result_lands_does_not_hold_the_turn_open() {
+    let (fx, stores, tool, promotion) = mid_turn_promoting_world().await;
+
+    let reply = answer_effect(&fx, &tool).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let (phase, status, turn, outstanding) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, turn),
+        (AgentLoopPhase::AwaitingModel, 2),
+        "the tool result rested the turn and the run went on to its next model call \
+         (status {status:?}, {outstanding} effect(s) outstanding)"
+    );
+
+    let reply = answer_promotion(&fx, &promotion).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    fx.pump().await.expect("the loop runs to completion");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(
+        stores.private.len(&agent_scope()),
+        1,
+        "the promotion landed"
+    );
+}
+
+/// Proof 2, the control: the promotion resolves first. Its outcome rests
+/// nothing — the turn is still waiting on its tool — and the tool result then
+/// rests the turn exactly as it always did.
+#[tokio::test]
+async fn a_promotion_resolving_before_the_tool_result_rests_nothing() {
+    let (fx, stores, tool, promotion) = mid_turn_promoting_world().await;
+
+    let reply = answer_promotion(&fx, &promotion).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let (phase, _, turn, outstanding) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, turn, outstanding),
+        (AgentLoopPhase::AwaitingTools, 1, 1),
+        "the promotion's outcome moved nothing: the turn still waits on its tool"
+    );
+
+    answer_effect(&fx, &tool).await;
+    let (phase, _, turn, _) = resting_at(&fx).await;
+    assert_eq!((phase, turn), (AgentLoopPhase::AwaitingModel, 2));
+    fx.pump().await.expect("the loop runs to completion");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(stores.private.len(&agent_scope()), 1);
+}
+
+/// Delivers one child's result exchange to the parent run.
+async fn deliver(fx: &Fixture, envelope: &rakka_agent::AgentExchangeEnvelope) {
+    let mut run = fx.run();
+    let now = fx.now();
+    run.recover(now).await.expect("recover");
+    let reply = run
+        .accept(envelope, &fx.router, now)
+        .await
+        .expect("the delivery succeeds");
+    assert!(reply.result().is_accepted(), "the child result is accepted");
+}
+
+/// Proof 4, the same exposure at another gated arm: a promotion committed
+/// while a fan-out's delegation sends are in flight, and the last send's
+/// receipt lands first. The turn rests on the closed group — `AwaitingChildren`
+/// — with the promotion still outstanding; the children's results then
+/// resume the run and it completes.
+#[tokio::test]
+async fn a_promotion_outstanding_when_the_last_delegation_send_lands_does_not_hold_the_turn_open() {
+    let stores = stores();
+    let executor = SkillNamedExecutor::new();
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, fan_out_turn())
+            .with_turn_for(2, common::proposing_turn()),
+    )
+    .with_a2a_send_executor(executor)
+    .with_memory_promotion_executor(Arc::new(SessionMemoryPromotionExecutor::new(
+        stores.session.clone(),
+        stores.private.clone(),
+    )));
+    let fx = Fixture::new(dispatcher)
+        .with_delegation(delegation_config_with_fan_in())
+        .with_memory(
+            AgentRunMemory::new(stores.session.clone(), stores.snapshots.clone())
+                .with_private_store(stores.private.clone()),
+        );
+    create_fan_out_task(&fx, None).await;
+    crank(&fx).await;
+    // The fan-out turn: two sends commit, the await verb closes the group.
+    drive_turn(&fx).await;
+    crank(&fx).await;
+    let sends = dispatched_effects_of(&fx, AgentRunEffectKind::A2aSendCall).await;
+    assert_eq!(sends.len(), 2, "both sends are in flight");
+
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "mid-fan-out")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    crank(&fx).await;
+    let promotion = dispatched_effect(&fx, AgentRunEffectKind::MemoryPromotionCall).await;
+
+    answer_effect(&fx, &sends[0]).await;
+    let (phase, _, turn, _) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, turn),
+        (AgentLoopPhase::AwaitingTools, 1),
+        "the second send is still in flight"
+    );
+    answer_effect(&fx, &sends[1]).await;
+    let (phase, status, turn, outstanding) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, status, turn),
+        (AgentLoopPhase::AwaitingChildren, AgentRunStatus::Running, 1),
+        "the last receipt rested the turn on the closed group \
+         ({outstanding} effect(s) outstanding)"
+    );
+
+    let reply = answer_promotion(&fx, &promotion).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let children = committed_children(&fx).await;
+    assert_eq!(children.len(), 2);
+    for (delegation, child_task) in &children {
+        let envelope =
+            child_result_envelope(&fx, delegation, child_task, AgentTaskStatus::Completed);
+        deliver(&fx, &envelope).await;
+    }
+    fx.pump().await.expect("the loop runs to completion");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(
+        stores.private.len(&agent_scope()),
+        1,
+        "the promotion landed"
+    );
+}
+
+/// Proof 5, the repair: a record a binary without this fix left wedged —
+/// `AwaitingTools`, the tool's result recorded, the promotion resolved,
+/// nothing outstanding — is rested by its next settle pass, whether or not
+/// any further effect outcome ever arrives. The fixed code can no longer
+/// produce the record, so it is written through the state store exactly as
+/// the old tool arm and promotion arm left it.
+#[tokio::test]
+async fn a_record_wedged_before_the_fix_is_rested_by_its_next_settle_pass() {
+    let (fx, _stores, tool, _promotion) = mid_turn_promoting_world().await;
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    let run = value["run"].as_object_mut().expect("the run is an object");
+    assert_eq!(run["status"], serde_json::json!("waiting-for-effect"));
+    let loop_state = run["loop_state"]
+        .as_object_mut()
+        .expect("the loop state is an object");
+    assert_eq!(loop_state["phase"], serde_json::json!("awaiting-tools"));
+    // Both dispatched effects resolved, as the old arms recorded them...
+    let mut resolved = 0;
+    for effect in loop_state["effects"]
+        .as_array_mut()
+        .expect("the effects are an array")
+    {
+        if effect["status"] == serde_json::json!("ready") {
+            effect["status"] = serde_json::json!("succeeded");
+            resolved += 1;
+        }
+    }
+    assert_eq!(resolved, 2, "the tool and the promotion");
+    // ...with the tool's result recorded for the turn, exactly as the old
+    // tool arm recorded it before declining to rest the turn.
+    let result = AgentToolResult {
+        call_id: AgentToolCallId::new("call-1").expect("call id"),
+        content: AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+        recorded_at: fx.now(),
+        tool: Some(AgentToolId::new("lookup").expect("tool id")),
+        effect_id: Some(tool.effect_id.clone()),
+    };
+    loop_state["tool_results"]
+        .as_array_mut()
+        .expect("the tool results are an array")
+        .push(serde_json::to_value(&result).expect("the tool result serializes"));
+    let wedged = serde_json::from_value(value).expect("the wedged record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, wedged)
+        .await
+        .expect("the wedged record persists");
+
+    let (phase, status, turn, outstanding) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, status, turn, outstanding),
+        (
+            AgentLoopPhase::AwaitingTools,
+            AgentRunStatus::WaitingForEffect,
+            1,
+            0
+        ),
+        "the record is wedged: nothing outstanding and nothing left to rest it"
+    );
+
+    fx.pump()
+        .await
+        .expect("the settle pass rests the turn and the loop runs on");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(
+        run.status,
+        AgentRunStatus::Completed,
+        "the wedged run completed after the repair (phase {:?})",
+        run.phase
+    );
+    assert_eq!(fx.dispatcher.model_calls(), 2, "turn two's model call ran");
+}
+
+/// Proof 6, the wind-down fence is unchanged: a promotion committed on a
+/// live run whose turn has a tool in flight, when the run then winds down,
+/// still dispatches. The tool result lands on the winding-down run and rests
+/// nothing — a result never resumes a run that is quiescing — the promotion
+/// resolves through the fence, and the run ends `Cancelled` with the memory
+/// landed. (The dispatcher-side halves — the sweep never cancels an exempt
+/// ticket — are `effect_dispatch.rs`'s two `..._survives_the_wind_down_fence`
+/// proofs.)
+#[tokio::test]
+async fn a_promotion_committed_mid_turn_still_dispatches_when_the_run_winds_down() {
+    let (fx, stores, tool, promotion) = mid_turn_promoting_world().await;
+    apply_ok(
+        &fx,
+        AgentRunEntityCommand::Cancel {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::Cancellation,
+                [TENANT, AGENT, "1"],
+            )
+            .expect("derivable"),
+            reason: "operator stopped the work".to_string(),
+        },
+    )
+    .await;
+    let (_, status, _, _) = resting_at(&fx).await;
+    assert_eq!(status, AgentRunStatus::Cancelling);
+
+    answer_effect(&fx, &tool).await;
+    let (phase, status, turn, outstanding) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, status, turn, outstanding),
+        (
+            AgentLoopPhase::AwaitingTools,
+            AgentRunStatus::Cancelling,
+            1,
+            1
+        ),
+        "a winding-down run records the result and rests nothing; the promotion is still owed"
+    );
+
+    let reply = answer_promotion(&fx, &promotion).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    fx.pump().await.expect("the wind-down settles");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Cancelled);
+    assert_eq!(
+        stores.private.len(&agent_scope()),
+        1,
+        "the promotion landed through the fence"
+    );
+    let mut entity = fx.run();
+    let recover_at = fx.now();
+    entity.recover(recover_at).await.expect("recover");
+    let receipts = entity
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .memory_promotions()
+        .len();
+    assert_eq!(receipts, 1, "one bounded receipt on the terminal record");
 }

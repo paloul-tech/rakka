@@ -884,6 +884,18 @@ enum AgentLoopPhase {
 }
 ```
 
+A turn rests on the turn's own effects. `AwaitingTools` holds exactly while an
+effect of the turn is outstanding — every outstanding effect except a memory
+promotion or a communal claim append (Sections 13.3 and 13.4) — and the last
+such result rests the turn whatever else the run holds: complete, or awaiting
+a closed fan-in group's children. A promotion or a claim append is outside
+the turn: committed by a command beside the turn's in-flight work, it is
+never among the effects a turn waits on, it never holds a turn open, and its
+own outcome never rests one. An implementation MUST NOT leave a run parked in
+`AwaitingTools` with no effect of the turn outstanding or ambiguous; a record
+in that shape is rested by the next settle pass that touches it, exactly as
+the last result would have rested it.
+
 The durable loop state MUST include at least:
 
 - `AgentGoalId`, `AgentTaskId`, root/parent task/run, handoff/delegation/team/
@@ -1422,7 +1434,9 @@ A private memory SHOULD contain:
 
 Promotion, consolidation, or demotion from short-term memory MUST be an
 idempotent durable effect. Embeddings are rebuildable derived projections, not
-the only copy of memory content.
+the only copy of memory content. A promotion is outside the run's turn
+(Section 9.4): committed while a turn's effects are in flight, it never holds
+the turn open, and its outcome never rests one.
 
 A promotion MAY select by role within its sequence window: a request that
 names a role set promotes only the window's entries of those roles, and one
@@ -1485,7 +1499,9 @@ effect record, and the initiator MAY re-issue the append under a new operation
 id. That a claim may later be read as evidence (Section 8.3) does not make a
 failed append correctness-bearing — an evaluation reads whatever the graph
 holds when it runs, and a claim that never landed is evidence the evaluator
-does not see, never evidence it sees wrongly.
+does not see, never evidence it sees wrongly. An append is outside the run's
+turn exactly as a promotion is (Section 9.4): it never holds a turn open, and
+its outcome never rests one.
 
 A claim append shares the promotion's post-terminal window (Section 13.3)
 under the same rules: exempt from the wind-down fence, accepted while the run

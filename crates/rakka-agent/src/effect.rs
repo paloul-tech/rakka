@@ -1081,6 +1081,36 @@ impl AgentRunEffectKind {
                 | Self::ClaimAppendCall
         )
     }
+
+    /// Whether an effect of this kind is outside the run's turn: never one of
+    /// the effects a turn waits on, and never what rests one.
+    ///
+    /// Exactly two kinds, and only these two. A memory promotion and a claim
+    /// append are committed by a command rather than by the model's tool
+    /// selection, and each copies work the turn has already recorded into a
+    /// longer-lived tier
+    /// ([specification 13.3 and 13.4](../../../docs/plans/rakka-agent/spec.md))
+    /// — which is why both are exempt from the wind-down fence — and each
+    /// resolves through an outcome arm that moves no phase and no status.
+    /// Counting one among the effects a turn awaits can therefore only hold
+    /// the turn open with nothing left to rest it: a tool result that found
+    /// a promotion outstanding declined to rest the turn, the promotion's
+    /// own outcome rested nothing, and the run parked `AwaitingTools` with
+    /// zero outstanding effects and no wake. Every turn-completing site
+    /// decides the rest through [`crate::AgentLoopState::awaits_turn_effect`],
+    /// which excludes exactly this set.
+    ///
+    /// The set is deliberately *not* [`Self::exempt_from_wind_down_fence`].
+    /// A compensation and a workflow cancel are exempt because the wind-down
+    /// itself authorizes them, and a turn may genuinely await them — a
+    /// compensation resolves through the tool arm and rests the turn as a
+    /// tool does. A goal evaluation, whose arm also rests nothing, is new
+    /// work the wind-down fences rather than a copy of recorded work, so it
+    /// stays inside the turn's count as well.
+    #[must_use]
+    pub const fn outside_the_turn(self) -> bool {
+        matches!(self, Self::MemoryPromotionCall | Self::ClaimAppendCall)
+    }
 }
 
 impl Display for AgentRunEffectKind {

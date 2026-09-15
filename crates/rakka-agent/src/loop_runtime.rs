@@ -748,10 +748,33 @@ impl AgentLoopState {
         self.indeterminate_effects().next().is_some()
     }
 
-    /// Whether the run is waiting on any effect.
+    /// Whether the run is waiting on any effect, of any kind — a memory
+    /// promotion or a claim append included.
+    ///
+    /// Kind-blind by design, for a caller that needs "anything at all is
+    /// outstanding". It is *not* the turn's rest condition: a turn rests on
+    /// the turn's own effects, which [`Self::awaits_turn_effect`] answers.
     #[must_use]
     pub fn awaits_effect(&self) -> bool {
         self.outstanding_effects().next().is_some()
+    }
+
+    /// Whether the turn is waiting on any effect: an outstanding effect of a
+    /// kind inside the turn — a model or tool call, a compensation, a
+    /// delegation or handoff send, a workflow start or cancel, a goal
+    /// evaluation — with a memory promotion and a claim append excluded
+    /// ([`AgentRunEffectKind::outside_the_turn`](crate::AgentRunEffectKind::outside_the_turn)).
+    ///
+    /// This is the one predicate every turn-completing site consults: the
+    /// last of the turn's effects to resolve rests the turn whatever else
+    /// the run holds, and an effect outside the turn — committed by a
+    /// command beside the turn's in-flight work — can neither hold the turn
+    /// open nor, when its own outcome lands, rest one
+    /// ([specification 9.4](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub fn awaits_turn_effect(&self) -> bool {
+        self.outstanding_effects()
+            .any(|effect| !effect.kind().outside_the_turn())
     }
 
     /// Whether the run still has work in flight whose outcome must settle
