@@ -687,6 +687,41 @@ impl AgentRun {
         }
     }
 
+    /// Whether the record holds a turn that is over but was never rested:
+    /// the phase says `AwaitingTools`, yet no effect of the turn is
+    /// outstanding or ambiguous, and the run is neither winding down nor
+    /// parked on a wait that must resolve first.
+    ///
+    /// A binary before gap slice 3 counted a memory promotion or a claim
+    /// append among the effects a turn awaited, so a run whose last tool
+    /// result landed while one was outstanding was left exactly here — with
+    /// [`Self::can_advance`] false and nothing that would ever rest it
+    /// ([`AgentLoopState::awaits_turn_effect`]). The settle pass repairs
+    /// such a record on the first pass that touches it, resting the turn
+    /// exactly as the tool arm would have, so a record wedged under the old
+    /// binary heals on its next settle whether or not any further effect
+    /// outcome arrives. Under the fixed transitions the shape is
+    /// unreachable: every turn-rest site rests the turn the moment its last
+    /// effect resolves.
+    ///
+    /// The guard mirrors the tool arm's own and narrows it once: an
+    /// ambiguous effect of the turn is left to its reconciliation decision,
+    /// whose resolution runs the arm itself — resting the turn early and
+    /// then authorizing a new generation would leave a resting turn with an
+    /// effect in flight.
+    #[must_use]
+    pub fn needs_turn_rest(&self) -> bool {
+        self.status.permits_progress()
+            && self.terminal_reason.is_none()
+            && self.loop_state.pending_top_up().is_none()
+            && self.loop_state.phase() == AgentLoopPhase::AwaitingTools
+            && !self.loop_state.awaits_turn_effect()
+            && !self
+                .loop_state
+                .indeterminate_effects()
+                .any(|effect| !effect.kind().outside_the_turn())
+    }
+
     /// Serialized size of the materialized record, in bytes.
     #[must_use]
     pub fn materialized_size_bytes(&self) -> usize {
@@ -2445,6 +2480,14 @@ fn advance_once(
     let Some(run) = state.run.as_ref() else {
         return Ok(Vec::new());
     };
+    if run.needs_turn_rest() {
+        // A record a binary before gap slice 3 left wedged: its turn is
+        // over and nothing will ever rest it. Rest it here, as the tool arm
+        // would have, and let the next step fold the turn
+        // ([`AgentRun::needs_turn_rest`]).
+        rest_unrested_turn(state, now)?;
+        return Ok(Vec::new());
+    }
     if !run.can_advance() {
         return Ok(Vec::new());
     }
@@ -3828,6 +3871,19 @@ fn evaluate_model_output(
     run.loop_state.set_phase(phase);
     run.status = status;
     run.check_bounds(0)?;
+    state.updated_at = now;
+    Ok(())
+}
+
+/// Rests a turn a record holds open with nothing left to rest it — the
+/// repair of [`AgentRun::needs_turn_rest`], and exactly the transition the
+/// tool arm makes when the turn's last effect resolves: the phase and status
+/// move to where [`turn_rest`] puts them, and nothing else.
+fn rest_unrested_turn(state: &mut AgentRunState, now: AgentTimestampMillis) -> AgentRunResult<()> {
+    let run = state.run_mut()?;
+    let (phase, status) = turn_rest(&run.loop_state);
+    run.loop_state.set_phase(phase);
+    run.status = status;
     state.updated_at = now;
     Ok(())
 }
@@ -7459,7 +7515,13 @@ where
             .is_some()
             .then(|| AgentSegmentTimer::start(now));
         for _step in 0..AGENT_RUN_MAX_LOOP_STEPS_PER_PASS {
-            let can_advance = self.state()?.run().is_some_and(AgentRun::can_advance);
+            // A record wedged by a binary before gap slice 3 cannot advance,
+            // but one step rests its turn and it can thereafter
+            // ([`AgentRun::needs_turn_rest`]).
+            let can_advance = self
+                .state()?
+                .run()
+                .is_some_and(|run| run.can_advance() || run.needs_turn_rest());
             if !can_advance {
                 break;
             }
