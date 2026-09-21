@@ -3177,4 +3177,20 @@ BODY
 
 - **Spec coverage.** 6.1 → Tasks 3 and 4 (types, required method, authority review, dispatcher arm, constants). 6.2 → Task 2. 6.3 ingress → Tasks 1, 5, 7 (subject, attestation, service leaves); egress → Tasks 5 and 8. 6.4 → Task 6. 6.5 tests → Tasks 3, 4, 7, 8; the security matrix row → Task 9. 11.1 codes, trait, field, and constants notes → Task 9. 11.3 spec amendments (14.1, 16), product doc, matrices, changelog → Task 9. 12 row 7.2 → the whole plan. 13 step 6 (the acceptance walk's two model-response outcomes and the in-process ingress case) is proven here at test level; the acceptance example itself is slice 7.10.
 - **Known gap, stated on purpose.** The ingress helper covers the team and conversation leaves by construction (Task 7, sites 4 and 5), and this plan proves ingress over `send` and `send_message` only; a dedicated team-command and conversation-command ingress proof needs those surfaces' larger fixtures and is left to slice 7.10's acceptance walk. Say so in the PR.
+- **Known gap, found by the final review (2026-09-20).** Spec 6.5 named one
+  test this plan never scheduled and the self-review never flagged: "a chain
+  upgraded while parked is honoured on the next attempt (the
+  `wait_invalidation.rs` pattern)." The property holds by construction, so the
+  ruling was to record it rather than test it. `review_model_response`
+  evaluates whatever chain the authority currently holds — nothing reads a
+  pinned revision on the response path — and the `guardrail-revision-mismatch`
+  check in `dispatch.rs` applies only to `Tool` requests, even though
+  `AgentEffectPolicies::with_guardrail_revision` pins the Model spec too. That
+  asymmetry is deliberate: the pin keeps a transformed *request* payload
+  identical across attempts of one generation, so one external idempotency key
+  cannot carry two payloads; a response review transforms nothing the outside
+  world has already seen, so it has nothing to hold still. A chain upgraded
+  while a run is parked therefore reviews the next model response under the new
+  chain with no dedicated proof. Spec 6.5 and the rustdoc of
+  `reviewed_model_outcome` now say so.
 - **Type consistency.** `AgentModelResponseReview { turn, transformed, transforms, reports }` (Task 3) is what `reviewed_model_outcome` reads (Task 4). `AgentGuardrailSubject::{Run, Task { scope, agent }, Team, Conversation}` (Task 1) is what Tasks 7 and 8 construct. `evaluate_a2a_content(chain, boundary, subject, parts, text) -> Result<A2aContentReview, AgentAuthorityRefusal>` (Task 7) is what Task 8 calls, with `A2aContentReview { parts, text, transforms, reports }`. `with_a2a_guardrails(AgentContentDigest)` (Task 5) takes what `ingress_guardrail_declaration()` (Task 7) returns. The four constants' lengths (4, 5, 6, 7) match Task 5's test and Task 9's prose.

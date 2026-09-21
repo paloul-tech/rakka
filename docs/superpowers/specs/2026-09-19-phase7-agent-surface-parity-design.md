@@ -922,8 +922,8 @@ constructing `AgentRunEffectOutcome::Model`, mirroring `reviewed_tool_outcome`:
 | Outcome | Effect |
 | --- | --- |
 | Allow | unchanged turn |
-| Transform | the reviewed turn replaces the original; it is re-validated (`AgentModelTurn::validate`) and refused if a transform pushed it over a bound (`guardrail-transform-invalid`); transforms and reports are logged and attached to the `model-inference` segment; the durable turn is the transformed one, which satisfies spec 16's "a retry MUST reuse the accepted transformed input" because the turn is committed exactly once by `RecordEffectResult` |
-| ReportOnly | reports logged and attached; turn unchanged |
+| Transform | the reviewed turn replaces the original; it is re-validated (`AgentModelTurn::validate`) and refused if a transform pushed it over a bound (`guardrail-transform-invalid`); transforms and reports are logged; the durable turn is the transformed one, which satisfies spec 16's "a retry MUST reuse the accepted transformed input" because the turn is committed exactly once by `RecordEffectResult` |
+| ReportOnly | reports logged; turn unchanged |
 | Block | `AgentRunEffectOutcome::Failed { code: "guardrail-blocked", message }`, the stage id and its reason code in the message, through the `ToolResponse` mapping (`refuse_guardrail_disposition`) unchanged (plan refinement 2026-09-20: the first draft said the stage's reason code; the precedent and the host's terminal-code classification say `guardrail-blocked`); the run winds down as `EffectFailed`, delivered once, never retried, exactly as a refused tool response |
 | RequireCheckpoint | fails closed under `checkpoint-required`, exactly the `ToolResponse` precedent (plan refinement 2026-09-20: no new code); gating an already-produced answer behind a human is a follow-up |
 
@@ -1011,9 +1011,9 @@ seven declared boundaries have evaluation points.
 
 A `guardrails::builtin` module with deterministic, dependency-free rules:
 `MaxTextLength`, `DenySubstrings` (case-folded literal list, bounded),
-`RequireResultTool` (a model response at `DecidingContinuation` must call the
-result tool or a declared tool), and `ReportOnly<R>` wrapper. No regex (not a
-workspace dependency) and no model-backed classifier: a stage that needs a
+`RequireResultTool` (a model response may call only the result tool or a
+declared tool; a call-less turn is allowed), and `ReportOnly<R>` wrapper. No
+regex (not a workspace dependency) and no model-backed classifier: a stage that needs a
 model is itself an external effect and belongs in a follow-up that runs it
 through the outbox. Welcome but not required by any consumer: a deployment's
 own stages stay where they are.
@@ -1025,8 +1025,14 @@ own stages stay where they are.
 dispatcher; the transformed turn is what the run records and what session
 memory holds; a blocked turn ends the run `EffectFailed` with the stage's code
 after exactly one invocation and is never retried; coverage now admits a
-`ModelResponse`-only mandatory stage; a chain upgraded while parked is
-honoured on the next attempt (the `wait_invalidation.rs` pattern).
+`ModelResponse`-only mandatory stage. (revised 2026-09-20, final review) A
+response is always reviewed under the chain the authority currently holds: the
+effect's `guardrail_revision` pin is enforced for tool requests only, since the
+pin exists to keep a transformed *request* payload identical across attempts of
+one generation, which a response review never needs. A chain upgraded while a
+run is parked therefore reviews the next model response by construction, and
+this slice records that rather than proving it — the first draft named a
+`wait_invalidation.rs`-pattern test here, and no such proof is owed.
 `crates/rakka-a2a/tests/ingress_egress_guardrails.rs` for 6.3: (revised
 2026-09-20) the ingress stage fires for a message entering through each of
 the four public entries, exactly once for a routed `send`, and for a
