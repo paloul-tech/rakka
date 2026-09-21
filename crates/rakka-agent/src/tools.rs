@@ -93,6 +93,7 @@ use crate::model::{
     AgentModelTurn, AgentToolCallRequest, AGENT_MODEL_TURN_MAX_BYTES,
     AGENT_TOOL_ARGUMENTS_MAX_BYTES,
 };
+use crate::model_profile::AgentModelProfileCatalog;
 use crate::task::{AgentContentDigest, AgentSchemaRef, AgentTaskContent};
 
 /// Largest model-visible tool description, in bytes.
@@ -936,6 +937,13 @@ pub struct AgentDispatchGrant {
     pub credential_binding: Option<AgentCredentialBindingRef>,
     /// The execution policy the dispatch is routed through.
     pub execution_policy: Option<AgentExecutionPolicyRef>,
+    /// The revision of the model profile record that authorized a model
+    /// call, when a catalog resolved one.
+    #[serde(default)]
+    pub model_profile_revision: Option<AgentRevisionNumber>,
+    /// The digest of that record, for the attempt's audit trail.
+    #[serde(default)]
+    pub model_profile_digest: Option<AgentContentDigest>,
     /// When the grant was issued.
     pub issued_at: AgentTimestampMillis,
     /// When the grant expires.
@@ -1008,6 +1016,14 @@ pub struct AgentGrantedDispatch {
     pub model_profile: Option<AgentModelProfileId>,
     /// The sampling parameters the current settings resolve for the turn.
     pub sampling: Option<AgentSamplingSettings>,
+    /// The credential binding the selected model profile names, when the
+    /// authority resolved one; the dispatcher resolves it when the intent
+    /// itself carries none.
+    pub model_credential_binding: Option<AgentCredentialBindingRef>,
+    /// The descriptors the model may be shown for this call: registered,
+    /// declared by the envelope, not revoked by the current settings, and
+    /// narrowed by the run's setup when one exists.
+    pub tools: Vec<AgentToolDescriptor>,
     /// Every guardrail transform applied to the call, with its reason. The
     /// dispatch pipeline surfaces these through its tracing span so an applied
     /// transform is observable, not silent.
@@ -1111,6 +1127,9 @@ pub struct AgentToolAuthority {
     /// one declaration drives both the gate and the specs that satisfy it, so
     /// the two cannot drift apart.
     substrate_execution_policy: Option<AgentExecutionPolicyRef>,
+    /// The deployment's model profile catalog, when one is installed; without
+    /// it a profile is an opaque approved id, as before.
+    model_profiles: Option<Arc<dyn AgentModelProfileCatalog>>,
     grant_ttl_ms: u64,
 }
 
@@ -1412,6 +1431,7 @@ impl AgentToolAuthority {
             a2a_attested: false,
             execution_router: None,
             substrate_execution_policy: None,
+            model_profiles: None,
             grant_ttl_ms: AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
         }
     }
@@ -1538,6 +1558,24 @@ impl AgentToolAuthority {
         }
         self.a2a_attested = true;
         Ok(self)
+    }
+
+    /// Installs the deployment's model profile catalog.
+    ///
+    /// With a catalog, [`Self::authorize`] resolves the selected profile's
+    /// record for a model call: an unknown id refuses `model-profile-unknown`;
+    /// the record's credential binding passes the same envelope and revocation
+    /// checks a tool's binding does and is put on the grant, so the dispatcher
+    /// resolves it inside the attempt with no new path; the record's revision
+    /// and digest are recorded on the grant; and a credential-bearing model
+    /// call whose intent carries no `timeout_ms` is refused
+    /// `model-timeout-unset`, because the resolver's only deadline input is
+    /// the effect's own timeout
+    /// ([Phase 7 design 4.2](../../../docs/superpowers/specs/2026-09-19-phase7-agent-surface-parity-design.md)).
+    #[must_use]
+    pub fn with_model_profiles(mut self, catalog: Arc<dyn AgentModelProfileCatalog>) -> Self {
+        self.model_profiles = Some(catalog);
+        self
     }
 
     /// Whether this authority has attested an A2A surface whose chain
@@ -2183,6 +2221,8 @@ impl AgentToolAuthority {
             tool_call,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms,
             reports,
             checkpoint: None,
@@ -2249,6 +2289,38 @@ impl AgentToolAuthority {
             }
         }
 
+        // The profile record, when a catalog is installed: its binding is
+        // checked exactly as a tool's, its revision and digest ride the
+        // grant, and a credential-bearing call must carry the attempt bound
+        // the resolver derives its deadline from.
+        let mut model_credential_binding = None;
+        let mut model_profile_revision = None;
+        let mut model_profile_digest = None;
+        if let (Some(catalog), Some(profile_id)) = (&self.model_profiles, &profile) {
+            let Some(record) = catalog.profile(profile_id) else {
+                return Err(AgentAuthorityRefusal::of(
+                    "model-profile-unknown",
+                    format!("the deployment's model profile catalog knows no profile {profile_id}"),
+                ));
+            };
+            if let Some(binding) = &record.credential_binding {
+                self.check_credential(context, binding)?;
+                if intent.timeout_ms.is_none() {
+                    return Err(AgentAuthorityRefusal::of(
+                        "model-timeout-unset",
+                        format!(
+                            "the model profile {profile_id} names the credential binding \
+                             {binding}, and the model effect's spec carries no timeout_ms; a \
+                             resolver's only deadline input is the effect's own timeout"
+                        ),
+                    ));
+                }
+                model_credential_binding = Some(binding.clone());
+            }
+            model_profile_revision = Some(record.revision);
+            model_profile_digest = Some(record.digest());
+        }
+
         if let Some(credential) = &intent.credential_binding {
             self.check_credential(context, credential)?;
         }
@@ -2296,20 +2368,44 @@ impl AgentToolAuthority {
             reports = decision.reports;
         }
 
+        // Visibility is not authority: the model is shown only what this
+        // agent could actually dispatch under the current envelopes and
+        // settings, narrowed by the run's setup exactly as `authorize_tool`
+        // consults it.
+        let mut tools: Vec<AgentToolDescriptor> = self
+            .registry
+            .model_visible(context.definition.envelope(), settings)
+            .into_iter()
+            .cloned()
+            .collect();
+        if let Some(setup) = context.setup {
+            tools.retain(|descriptor| setup.envelope().tools.contains_key(&descriptor.tool));
+        }
+
         Ok(AgentGrantedDispatch {
-            grant: self.grant(
-                context,
-                scope,
-                task,
-                goal,
-                intent,
-                None,
-                BTreeSet::new(),
-                now,
-            ),
+            grant: {
+                let mut grant = self.grant(
+                    context,
+                    scope,
+                    task,
+                    goal,
+                    intent,
+                    None,
+                    BTreeSet::new(),
+                    now,
+                );
+                if grant.credential_binding.is_none() {
+                    grant.credential_binding = model_credential_binding.clone();
+                }
+                grant.model_profile_revision = model_profile_revision;
+                grant.model_profile_digest = model_profile_digest;
+                grant
+            },
             tool_call: None,
             model_profile: profile,
             sampling: Some(settings.sampling),
+            model_credential_binding,
+            tools,
             transforms: Vec::new(),
             reports,
             checkpoint: None,
@@ -2351,6 +2447,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2394,6 +2492,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2438,6 +2538,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2504,6 +2606,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2585,6 +2689,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2631,6 +2737,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2715,6 +2823,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2818,6 +2928,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: profile,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint,
@@ -2994,6 +3106,8 @@ impl AgentToolAuthority {
             capabilities,
             credential_binding: intent.credential_binding.clone(),
             execution_policy: intent.execution_policy.clone(),
+            model_profile_revision: None,
+            model_profile_digest: None,
             issued_at: now,
             expires_at: AgentTimestampMillis::new(
                 now.as_millis().saturating_add(self.grant_ttl_ms),
