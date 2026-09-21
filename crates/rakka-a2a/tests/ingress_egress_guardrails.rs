@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use rakka_a2a::agents::{
-    A2AAgentTarget, A2AStaticAgentCatalog, RakkaAgentA2AError, RakkaAgentA2AService, META_AGENT_ID,
+    A2AAgentDelegationSendExecutor, A2AAgentHandoffSendExecutor, A2AAgentTarget,
+    A2AStaticAgentCatalog, RakkaAgentA2AError, RakkaAgentA2AService, META_AGENT_ID,
 };
 use rakka_a2a::auth::{
     A2AAuthorizationDecision, A2AAuthorizationRequest, A2AAuthorizer, AllowAllAuthorizer,
@@ -26,16 +27,23 @@ use rakka_agent::testkit::{
     InProcessTaskEntityTransport,
 };
 use rakka_agent::{
-    AgentAuthorityEnvelope, AgentDefinition, AgentDefinitionId, AgentEntityClass,
-    AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentExchangeRouter, AgentGuardrail,
-    AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailOutcome,
-    AgentGuardrailStage, AgentGuardrailStageId, AgentId, AgentOperationId, AgentOperationKind,
-    AgentRevisionNumber, AgentRevisionProvenance, AgentRunState, AgentSchemaId, AgentSchemaRef,
-    AgentScope, AgentSettings, AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskId,
-    AgentTaskScope, AgentTaskState, InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore,
+    delegation_id_for, effect_id_for, handoff_id_for, AgentA2aHandoffFinding,
+    AgentA2aHandoffSendExecutor as _, AgentA2aSendExecutor as _, AgentA2aSendFinding,
+    AgentAssignmentGeneration, AgentAuthorityEnvelope, AgentCapabilityId, AgentDefinition,
+    AgentDefinitionId, AgentDelegationRecord, AgentDelegationTarget, AgentEffectPolicies,
+    AgentEffectSpec, AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore,
+    AgentExchangeRouter, AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain,
+    AgentGuardrailContext, AgentGuardrailOutcome, AgentGuardrailStage, AgentGuardrailStageId,
+    AgentHandoffRecord, AgentId, AgentOperationId, AgentOperationKind, AgentRevisionNumber,
+    AgentRevisionProvenance, AgentRunEffect, AgentRunEffectRequest, AgentRunId, AgentRunScope,
+    AgentRunState, AgentSchemaId, AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent,
+    AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskId, AgentTaskScope, AgentTaskState,
+    AgentToolCallId, InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore,
     InMemoryAgentTeamHistoryStore, TenantId,
 };
-use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
+use rakka_agent_workflow::{
+    AgentEffectId, AgentTelemetryContext, AgentTimestampMillis, PrincipalRef,
+};
 use rakka_persistence::{DurableStateStore, InMemoryDurableStateStore};
 
 type TaskStore = CrashingStateStore<AgentTaskState>;
@@ -482,4 +490,230 @@ async fn a_service_without_a_chain_declares_none_and_admits_as_before() {
         .send(&params(), &send_request(&task_message("m-1", MARKER)))
         .await
         .expect("nothing evaluates, nothing refuses");
+}
+
+// ---------------------------------------------------------------------------
+// Egress, and ingress as an in-process executor sees it
+// ---------------------------------------------------------------------------
+
+fn parent_run() -> AgentRunScope {
+    AgentRunScope::new(
+        tenant(),
+        agent(COORDINATOR),
+        AgentRunId::new("parent-run-1").expect("run id should be valid"),
+    )
+    .expect("run scope should be valid")
+}
+
+fn delegation_record(input: Value) -> AgentDelegationRecord {
+    let parent_run = parent_run();
+    let delegation = delegation_id_for(&parent_run, 9, 0).expect("the delegation id derives");
+    AgentDelegationRecord {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
+        a2a_message_id: delegation.as_str().to_string(),
+        deduplication_key: delegation.as_str().to_string(),
+        delegation,
+        goal: None,
+        parent_task: AgentTaskId::new("parent-task").expect("task id should be valid"),
+        parent_run: parent_run.clone(),
+        lineage: Vec::new(),
+        ancestors: Vec::new(),
+        depth: 1,
+        requested_skill: AgentCapabilityId::new("translate")
+            .expect("capability id should be valid"),
+        resolved: AgentDelegationTarget::new(agent(SPECIALIST), task_definition_id()),
+        turn: 9,
+        slot: 0,
+        effect: effect_id_for(&parent_run, 9, 0).expect("the effect id derives"),
+        call_id: AgentToolCallId::new("call-1").expect("call id should be valid"),
+        input: AgentTaskContent::inline(input).expect("the input is inline-bounded"),
+        result_schema: None,
+        budget: None,
+        granted_descendants: None,
+        deadline: None,
+        definition_revision: AgentRevisionNumber::new(1),
+        settings_revision: AgentRevisionNumber::new(1),
+        telemetry: AgentTelemetryContext::default(),
+        created_at: AgentTimestampMillis::new(1),
+    }
+}
+
+fn delegation_intent(record: &AgentDelegationRecord) -> AgentRunEffect {
+    AgentRunEffect::new(
+        &parent_run(),
+        record.turn,
+        record.slot,
+        AgentRunEffectRequest::A2aSend {
+            delegation: Box::new(record.clone()),
+        },
+        &AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+        AgentRevisionNumber::new(1),
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the intent builds")
+}
+
+fn handoff_record(reason: &str) -> AgentHandoffRecord {
+    let scope = parent_run();
+    let handoff = handoff_id_for(&scope, 7, 0).expect("the handoff id derives");
+    AgentHandoffRecord {
+        handoff: handoff.clone(),
+        goal: None,
+        task: AgentTaskId::new("parent-task").expect("task id should be valid"),
+        source_run: scope,
+        source_generation: AgentAssignmentGeneration::new(1),
+        requested_skill: AgentCapabilityId::new("translate")
+            .expect("capability id should be valid"),
+        resolved: AgentDelegationTarget::new(agent(SPECIALIST), task_definition_id()),
+        reason: reason.to_string(),
+        policy_revision: AgentRevisionNumber::INITIAL,
+        definition_revision: AgentRevisionNumber::INITIAL,
+        settings_revision: AgentRevisionNumber::INITIAL,
+        context: Vec::new(),
+        a2a_message_id: handoff.as_str().to_string(),
+        deduplication_key: handoff.as_str().to_string(),
+        turn: 7,
+        slot: 0,
+        effect: AgentEffectId::new("effect-1"),
+        call_id: AgentToolCallId::new("call-1").expect("call id should be valid"),
+        telemetry: Default::default(),
+        created_at: AgentTimestampMillis::new(1),
+    }
+}
+
+fn handoff_intent(record: &AgentHandoffRecord) -> AgentRunEffect {
+    let request: AgentRunEffectRequest =
+        serde_json::from_value(json!({ "a2a-handoff": { "handoff": record } }))
+            .expect("the request round-trips");
+    let spec = AgentEffectPolicies::default().spec_for(&request).clone();
+    AgentRunEffect::new(
+        &parent_run(),
+        7,
+        0,
+        request,
+        &spec,
+        AgentRevisionNumber::INITIAL,
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the intent builds")
+}
+
+/// The host's case: no handler is mounted, the delegation executor delivers
+/// in-process through `send_message`, and the service's ingress chain still
+/// refuses — as a determinate `Refused` finding under `guardrail-blocked`.
+#[tokio::test]
+async fn an_ingress_block_reaches_an_in_process_executor_as_a_refused_finding() {
+    let fixture = Fixture::new(
+        Some(chain_at(
+            AgentGuardrailBoundary::A2aIngress,
+            Arc::new(BlockMarker),
+        )),
+        Arc::new(AllowAllAuthorizer),
+    );
+    fixture.instantiate(COORDINATOR).await;
+    fixture.instantiate(SPECIALIST).await;
+    let executor = A2AAgentDelegationSendExecutor::new(fixture.service.clone());
+
+    let record = delegation_record(json!({ "text": MARKER }));
+    let finding = executor
+        .execute(&parent_run(), &delegation_intent(&record), &record, None)
+        .await
+        .expect("a block is a finding, not a transport error");
+    assert!(
+        matches!(&finding, AgentA2aSendFinding::Refused { code, .. } if code == "guardrail-blocked"),
+        "got {finding:?}"
+    );
+}
+
+/// An egress block refuses the delegation before the service sees the message.
+#[tokio::test]
+async fn an_egress_block_refuses_the_delegation_send_before_the_service_sees_it() {
+    let recording = Arc::new(Recording::default());
+    let fixture = Fixture::new(
+        Some(chain_at(
+            AgentGuardrailBoundary::A2aIngress,
+            recording.clone(),
+        )),
+        Arc::new(AllowAllAuthorizer),
+    );
+    fixture.instantiate(COORDINATOR).await;
+    fixture.instantiate(SPECIALIST).await;
+    let executor = A2AAgentDelegationSendExecutor::new(fixture.service.clone())
+        .with_egress_guardrails(Arc::new(chain_at(
+            AgentGuardrailBoundary::A2aEgress,
+            Arc::new(BlockMarker),
+        )));
+
+    let record = delegation_record(json!({ "text": MARKER }));
+    let finding = executor
+        .execute(&parent_run(), &delegation_intent(&record), &record, None)
+        .await
+        .expect("a block is a finding");
+    assert!(
+        matches!(&finding, AgentA2aSendFinding::Refused { code, .. } if code == "guardrail-blocked"),
+        "got {finding:?}"
+    );
+    assert_eq!(
+        recording.seen.load(Ordering::SeqCst),
+        0,
+        "the service never saw the message"
+    );
+}
+
+/// An egress transform is what the service receives: the child task's durable
+/// state holds the redacted input and never the original.
+#[tokio::test]
+async fn an_egress_transform_is_what_the_service_receives() {
+    let fixture = Fixture::new(None, Arc::new(AllowAllAuthorizer));
+    fixture.instantiate(COORDINATOR).await;
+    fixture.instantiate(SPECIALIST).await;
+    let executor = A2AAgentDelegationSendExecutor::new(fixture.service.clone())
+        .with_egress_guardrails(Arc::new(chain_at(
+            AgentGuardrailBoundary::A2aEgress,
+            Arc::new(RedactParts),
+        )));
+
+    let record = delegation_record(json!({ "text": MARKER }));
+    let finding = executor
+        .execute(&parent_run(), &delegation_intent(&record), &record, None)
+        .await
+        .expect("the transformed send executes");
+    let AgentA2aSendFinding::Sent { child_task, .. } = finding else {
+        panic!("the send creates the child, got {finding:?}");
+    };
+    let state = fixture.task_state_json(child_task.as_str()).await;
+    assert!(state.contains("[redacted]"), "{state}");
+    assert!(!state.contains(MARKER), "{state}");
+}
+
+/// The handoff executor evaluates the cluster's free text too: a reason
+/// carrying the marker is blocked before any send.
+#[tokio::test]
+async fn an_egress_block_refuses_the_handoff_send() {
+    let recording = Arc::new(Recording::default());
+    let fixture = Fixture::new(
+        Some(chain_at(
+            AgentGuardrailBoundary::A2aIngress,
+            recording.clone(),
+        )),
+        Arc::new(AllowAllAuthorizer),
+    );
+    fixture.instantiate(COORDINATOR).await;
+    fixture.instantiate(SPECIALIST).await;
+    let executor =
+        A2AAgentHandoffSendExecutor::new(fixture.service.clone()).with_egress_guardrails(Arc::new(
+            chain_at(AgentGuardrailBoundary::A2aEgress, Arc::new(BlockMarker)),
+        ));
+
+    let record = handoff_record(MARKER);
+    let finding = executor
+        .execute(&parent_run(), &handoff_intent(&record), &record, None)
+        .await
+        .expect("a block is a finding");
+    assert!(
+        matches!(&finding, AgentA2aHandoffFinding::Refused { code, .. } if code == "guardrail-blocked"),
+        "got {finding:?}"
+    );
+    assert_eq!(recording.seen.load(Ordering::SeqCst), 0);
 }

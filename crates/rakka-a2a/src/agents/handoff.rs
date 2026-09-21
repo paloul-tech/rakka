@@ -27,6 +27,8 @@
 //! fresh. When the attempt budget spends out, the source run parks
 //! indeterminate rather than resuming beside a possibly-live transfer.
 
+use std::sync::Arc;
+
 use a2a::{Message, Part, PartContent, Role, SendMessageRequest, Task, TaskState};
 use a2a_server::ServiceParams;
 use rakka_agent::{
@@ -80,6 +82,9 @@ pub struct A2AAgentHandoffSendExecutor<
         ConversationHistory,
     >,
     principal: Option<PrincipalRef>,
+    /// The chain the `A2aEgress` boundary evaluates over the outbound
+    /// message, when a deployment installed one.
+    egress_guardrails: Option<Arc<rakka_agent::AgentGuardrailChain>>,
 }
 
 impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
@@ -120,6 +125,7 @@ where
         Self {
             service,
             principal: None,
+            egress_guardrails: None,
         }
     }
 
@@ -127,6 +133,17 @@ where
     #[must_use]
     pub fn with_principal(mut self, principal: PrincipalRef) -> Self {
         self.principal = Some(principal);
+        self
+    }
+
+    /// Installs the guardrail chain the `A2aEgress` boundary evaluates over
+    /// every outbound handoff message, including the cluster's `reason` and
+    /// `context` text, before the service sees it. A block is a determinate
+    /// `Refused` finding under `guardrail-blocked`; a transform is what is
+    /// sent.
+    #[must_use]
+    pub fn with_egress_guardrails(mut self, chain: Arc<rakka_agent::AgentGuardrailChain>) -> Self {
+        self.egress_guardrails = Some(chain);
         self
     }
 
@@ -413,13 +430,51 @@ where
 {
     fn execute<'a>(
         &'a self,
-        _scope: &'a AgentRunScope,
+        scope: &'a AgentRunScope,
         _intent: &'a AgentRunEffect,
         handoff: &'a AgentHandoffRecord,
         _credential: Option<&'a rakka_agent_workflow::AgentEphemeralCredential>,
     ) -> AgentDispatchFuture<'a, AgentA2aHandoffFinding> {
         Box::pin(async move {
-            let send = self.request_for(handoff);
+            let mut send = self.request_for(handoff);
+            if let Some(chain) = self.egress_guardrails.as_ref() {
+                let text = super::guardrails::A2aCollaborationText {
+                    body: None,
+                    reason: Some(handoff.reason.clone()),
+                    context: handoff.context.clone(),
+                };
+                match super::guardrails::evaluate_a2a_content(
+                    chain,
+                    rakka_agent::AgentGuardrailBoundary::A2aEgress,
+                    rakka_agent::AgentGuardrailSubject::Run(scope),
+                    &send.message.parts,
+                    Some(&text),
+                ) {
+                    Ok(review) => {
+                        super::guardrails::log_review(&review, "the outbound handoff message");
+                        if let Some(text) = review.text {
+                            // The cluster is built from the record, so a
+                            // rewritten reason or context is carried by
+                            // rebuilding the message from a rewritten record.
+                            let mut rewritten = handoff.clone();
+                            if let Some(reason) = text.reason {
+                                rewritten.reason = reason;
+                            }
+                            rewritten.context = text.context;
+                            send = self.request_for(&rewritten);
+                        }
+                        if let Some(parts) = review.parts {
+                            send.message.parts = parts;
+                        }
+                    }
+                    Err(refusal) => {
+                        return Ok(AgentA2aHandoffFinding::Refused {
+                            code: refusal.code,
+                            message: refusal.message,
+                        });
+                    }
+                }
+            }
             let task = match self
                 .service
                 .send_message(&ServiceParams::new(), &send)
