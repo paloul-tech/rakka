@@ -6,6 +6,8 @@
 //! the two in-process send executors before the service sees the message.
 //! Specification 16 (spec section 6.3 of the Phase 7 design).
 
+#![cfg(feature = "agents")]
+
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -298,6 +300,16 @@ impl Fixture {
             .expect("the agent should instantiate");
     }
 
+    /// Whether a durable task record exists under the given id.
+    async fn task_exists(&self, task: &AgentTaskId) -> bool {
+        let scope = AgentTaskScope::new(tenant(), task.clone()).expect("task scope");
+        self.tasks
+            .load(&scope.persistence_id())
+            .await
+            .expect("the task state loads")
+            .is_some()
+    }
+
     /// The durable task record, JSON-encoded, for content assertions.
     async fn task_state_json(&self, task_id: &str) -> String {
         let scope = AgentTaskScope::new(tenant(), AgentTaskId::new(task_id).expect("task id"))
@@ -345,6 +357,30 @@ fn params() -> a2a_server::ServiceParams {
     a2a_server::ServiceParams::new()
 }
 
+/// The task id a send *would* create, derived the way the service derives it:
+/// the same normalization over the same inputs, so an assertion that no task
+/// exists names the identity the blocked send would have used.
+fn derived_task_id(message: &Message) -> AgentTaskId {
+    let request = send_request(message);
+    // The service merges request- and message-level metadata before
+    // normalizing; these messages carry none of their own, so the merge is
+    // the request map verbatim.
+    assert!(
+        request.message.metadata.is_none(),
+        "the merged metadata is the request's alone"
+    );
+    rakka_a2a::agents::ingress::normalize_agent_send(
+        &A2AHeaderTenantResolver,
+        Some(TENANT),
+        &params(),
+        request.tenant.as_deref(),
+        &request.message,
+        &request.metadata.clone().unwrap_or_default(),
+    )
+    .expect("the send normalizes")
+    .task
+}
+
 fn task_id_of(response: &SendMessageResponse) -> String {
     match response {
         SendMessageResponse::Task(task) => task.id.clone(),
@@ -371,6 +407,7 @@ async fn an_ingress_block_refuses_the_send_and_creates_nothing() {
     fixture.instantiate(COORDINATOR).await;
 
     let poisoned = task_message("m-1", MARKER);
+    let poisoned_task = derived_task_id(&poisoned);
     for _ in 0..2 {
         let error = fixture
             .service
@@ -382,13 +419,30 @@ async fn an_ingress_block_refuses_the_send_and_creates_nothing() {
             "got {error:?}"
         );
     }
+    // The second refusal alone proves nothing — the block precedes dedup, so
+    // it would answer the same way over a task the first send had created.
+    // What the claim needs is the store: nothing exists under the identity
+    // the send would have used.
+    assert!(
+        !fixture.task_exists(&poisoned_task).await,
+        "a blocked send creates no task under {poisoned_task}"
+    );
 
+    let clean_message = task_message("m-2", "hello");
+    let clean_task = derived_task_id(&clean_message);
     let clean = fixture
         .service
-        .send(&params(), &send_request(&task_message("m-2", "hello")))
+        .send(&params(), &send_request(&clean_message))
         .await
         .expect("a clean message creates a task");
-    assert!(!task_id_of(&clean).is_empty());
+    // The derivation is the service's own: an admitted send lands under the
+    // id it produces, so the absence asserted above is an absence at the
+    // right address and not at an invented one.
+    assert_eq!(task_id_of(&clean), clean_task.as_str());
+    assert!(
+        fixture.task_exists(&clean_task).await,
+        "an admitted send does create the task"
+    );
 }
 
 /// A transformed message is what the task records: the durable task state

@@ -3444,6 +3444,15 @@ where
     /// memory. A refusal becomes a determinate `Failed` outcome under the
     /// refusal's stable code: the model answered, its answer is not
     /// admissible, and the effect fails once, never retried.
+    ///
+    /// A response is always reviewed under the chain the authority *currently*
+    /// holds, never one pinned at commit time: the intent's
+    /// `guardrail_revision` pin is enforced for `Tool` requests only, because
+    /// the pin exists to keep a transformed *request* payload identical across
+    /// attempts of one generation — something a response review, which
+    /// transforms nothing the outside world has already seen, never needs. So
+    /// a chain upgraded while a run was parked reviews the next model response
+    /// under the new chain by construction, with no dedicated proof.
     async fn reviewed_model_outcome(
         &self,
         scope: &AgentRunScope,

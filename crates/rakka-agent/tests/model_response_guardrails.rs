@@ -19,6 +19,9 @@ use rakka_agent::{
     AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, SessionMemoryStore,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
+use rakka_agent_workflow::{
+    AgentAttributes, AgentTimestampMillis, ArtifactKind, ArtifactRef, RedactionStatus,
+};
 use serde_json::{json, Value};
 
 const TOOL: &str = "charge-card";
@@ -180,6 +183,36 @@ impl AgentGuardrail for RewriteUsage {
     }
 }
 
+/// A transform that replaces the inline proposal with an artifact reference —
+/// an artifact nothing in the turn produced.
+struct ReferenceTheProposal;
+
+impl AgentGuardrail for ReferenceTheProposal {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
+        let mut altered = content.clone();
+        // Built through the type's own constructor and serialized, so the
+        // shape is whatever `AgentTaskContent::artifact` actually encodes.
+        altered["proposal"] = serde_json::to_value(AgentTaskContent::artifact(ArtifactRef {
+            artifact_id: "fabricated-1".to_string(),
+            kind: ArtifactKind::File,
+            uri: "s3://results/fabricated-1".to_string(),
+            checksum: Some("sha256:fabricated-1".to_string()),
+            content_type: Some("application/json".to_string()),
+            byte_len: Some(32),
+            retention_class: Some("standard".to_string()),
+            encryption: None,
+            redaction: RedactionStatus::Unredacted,
+            created_at: AgentTimestampMillis::new(1),
+            metadata: AgentAttributes::default(),
+        }))
+        .expect("the artifact content encodes");
+        AgentGuardrailOutcome::Transform {
+            content: altered,
+            reason_code: "proposal-referenced".to_string(),
+        }
+    }
+}
+
 struct RequireHuman;
 
 impl AgentGuardrail for RequireHuman {
@@ -295,6 +328,17 @@ fn a_transform_that_rewrites_usage_is_refused_as_invalid() {
         .review_model_response(&run_scope(), text_turn("hello").with_usage(REPORTED_USAGE))
         .expect_err("usage is the provider's, not a stage's");
     assert_eq!(refusal.code, "guardrail-transform-invalid");
+}
+
+/// A stage may rewrite an inline proposal, but not turn one into a reference
+/// to an artifact nothing produced: that is the `ToolResponse` precedent that
+/// a reference is not a stage's to write.
+#[test]
+fn a_transform_that_changes_the_proposal_to_a_reference_is_refused_as_unsupported() {
+    let refusal = authority_with(Arc::new(ReferenceTheProposal))
+        .review_model_response(&run_scope(), proposing_turn("all good", "done"))
+        .expect_err("a reference proposal would fabricate an artifact");
+    assert_eq!(refusal.code, "guardrail-transform-unsupported");
 }
 
 #[test]

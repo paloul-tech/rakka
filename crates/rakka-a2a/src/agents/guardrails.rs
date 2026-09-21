@@ -99,6 +99,10 @@ pub(crate) fn apply_collaboration_text(
 
 /// Evaluates the chain over one message at an A2A boundary.
 ///
+/// In a transformed view, a collaboration key the stage omitted leaves that
+/// field unchanged and an explicit `null` clears it; a field the original did
+/// not carry may not be added.
+///
 /// # Errors
 ///
 /// `guardrail-blocked` for a block, `checkpoint-required` for a checkpoint
@@ -189,26 +193,37 @@ pub(crate) fn evaluate_a2a_content(
         let collaboration = object
             .get("collaboration")
             .ok_or_else(|| invalid("it dropped the collaboration text"))?;
-        let field = |name: &str| {
-            collaboration
-                .get(name)
-                .and_then(Value::as_str)
-                .map(str::to_string)
+        // An omitted key means *unchanged*, never cleared: a stage that
+        // rewrites the parts and returns the collaboration object without a
+        // key it did not care about must not silently erase that field —
+        // which for a required one would surface downstream as a missing
+        // field and blame the caller. Clearing stays available, spelled as an
+        // explicit `null`.
+        let field = |name: &str, original: Option<&String>| match collaboration.get(name) {
+            None => Ok(original.cloned()),
+            Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(_) => Err(invalid(&format!(
+                "the collaboration field {name} is neither a string nor null"
+            ))),
         };
         let new_text = A2aCollaborationText {
-            body: field("body"),
-            reason: field("reason"),
-            context: collaboration
-                .get("context")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            body: field("body", text.body.as_ref())?,
+            reason: field("reason", text.reason.as_ref())?,
+            context: match collaboration.get("context") {
+                None => text.context.clone(),
+                Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                Some(_) => {
+                    return Err(invalid(
+                        "the collaboration context is neither an array nor null",
+                    ))
+                }
+            },
         };
         if (text.body.is_none() && new_text.body.is_some())
             || (text.reason.is_none() && new_text.reason.is_some())
@@ -240,6 +255,172 @@ pub(crate) fn log_review(review: &A2aContentReview, what: &str) {
             reason_code = %report.reason_code,
             what = what,
             "guardrail report-only finding"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use a2a::PartContent;
+    use rakka_agent::{
+        AgentGuardrail, AgentGuardrailOutcome, AgentGuardrailStage, AgentGuardrailStageId,
+        AgentRevisionNumber, AgentTaskId, AgentTaskScope, TenantId,
+    };
+
+    use super::*;
+
+    /// Replaces the parts and writes the scripted collaboration object back
+    /// verbatim, so a test says exactly which keys a stage returned.
+    struct ScriptedCollaboration(Value);
+
+    impl AgentGuardrail for ScriptedCollaboration {
+        fn evaluate(
+            &self,
+            _: &AgentGuardrailContext<'_>,
+            content: &Value,
+        ) -> AgentGuardrailOutcome {
+            let mut transformed = content.clone();
+            transformed["parts"] = json!([{ "kind": "text", "text": "[redacted]" }]);
+            transformed["collaboration"] = self.0.clone();
+            AgentGuardrailOutcome::Transform {
+                content: transformed,
+                reason_code: "scripted".to_string(),
+            }
+        }
+    }
+
+    fn chain(collaboration: Value) -> AgentGuardrailChain {
+        AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+            .with_stage(
+                AgentGuardrailStage::new(
+                    AgentGuardrailStageId::new("scripted").expect("the stage id is valid"),
+                    AgentRevisionNumber::INITIAL,
+                    Arc::new(ScriptedCollaboration(collaboration)),
+                )
+                .at_boundary(AgentGuardrailBoundary::A2aIngress),
+            )
+            .expect("the stage registers")
+    }
+
+    fn original() -> A2aCollaborationText {
+        A2aCollaborationText {
+            body: Some("the body".to_string()),
+            reason: Some("the reason".to_string()),
+            context: vec!["line one".to_string(), "line two".to_string()],
+        }
+    }
+
+    fn parts() -> Vec<Part> {
+        vec![Part {
+            content: PartContent::Text("the ticket".to_string()),
+            filename: None,
+            media_type: None,
+            metadata: None,
+        }]
+    }
+
+    fn review(collaboration: Value) -> Result<A2aContentReview, AgentAuthorityRefusal> {
+        let scope = AgentTaskScope::new(
+            TenantId::new("acme"),
+            AgentTaskId::new("task-1").expect("the task id is valid"),
+        )
+        .expect("the task scope is valid");
+        let text = original();
+        evaluate_a2a_content(
+            &chain(collaboration),
+            AgentGuardrailBoundary::A2aIngress,
+            AgentGuardrailSubject::Task {
+                scope: &scope,
+                agent: None,
+            },
+            &parts(),
+            Some(&text),
+        )
+    }
+
+    fn admitted(collaboration: Value) -> A2aCollaborationText {
+        review(collaboration)
+            .expect("the transform is admissible")
+            .text
+            .expect("the review carries the cluster text")
+    }
+
+    #[test]
+    fn an_omitted_collaboration_key_keeps_the_original_value() {
+        // The stage rewrote only the body; it named neither `reason` nor
+        // `context`, so both survive unchanged.
+        let text = admitted(json!({ "body": "[redacted]" }));
+        assert_eq!(text.body.as_deref(), Some("[redacted]"));
+        assert_eq!(text.reason, original().reason);
+        assert_eq!(text.context, original().context);
+    }
+
+    #[test]
+    fn an_explicit_null_clears_the_field_an_omitted_key_would_have_kept() {
+        let text = admitted(json!({ "body": null, "reason": null }));
+        assert_eq!(text.body, None);
+        assert_eq!(text.reason, None);
+        assert_eq!(
+            text.context,
+            original().context,
+            "the omitted key is still unchanged"
+        );
+    }
+
+    #[test]
+    fn an_explicit_null_or_empty_context_clears_the_lines() {
+        assert!(admitted(json!({ "context": null })).context.is_empty());
+        assert!(admitted(json!({ "context": [] })).context.is_empty());
+    }
+
+    #[test]
+    fn a_rewritten_context_replaces_the_lines() {
+        assert_eq!(
+            admitted(json!({ "context": ["only line"] })).context,
+            vec!["only line".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_field_the_original_did_not_carry_may_not_be_added() {
+        let scope = AgentTaskScope::new(
+            TenantId::new("acme"),
+            AgentTaskId::new("task-1").expect("the task id is valid"),
+        )
+        .expect("the task scope is valid");
+        let text = A2aCollaborationText {
+            body: None,
+            ..original()
+        };
+        let refusal = evaluate_a2a_content(
+            &chain(json!({ "body": "invented" })),
+            AgentGuardrailBoundary::A2aIngress,
+            AgentGuardrailSubject::Task {
+                scope: &scope,
+                agent: None,
+            },
+            &parts(),
+            Some(&text),
+        )
+        .expect_err("a stage may not add a field the message did not carry");
+        assert_eq!(refusal.code, "guardrail-transform-invalid");
+    }
+
+    #[test]
+    fn a_collaboration_field_of_the_wrong_shape_is_refused_rather_than_erased() {
+        assert_eq!(
+            review(json!({ "body": 7 }))
+                .expect_err("a number is neither a string nor null")
+                .code,
+            "guardrail-transform-invalid"
+        );
+        assert_eq!(
+            review(json!({ "context": "line" }))
+                .expect_err("a string is neither an array nor null")
+                .code,
+            "guardrail-transform-invalid"
         );
     }
 }
