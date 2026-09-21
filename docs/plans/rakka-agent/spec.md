@@ -1571,6 +1571,13 @@ Incoming task messages, cancellations, settings commands, gate resolutions,
 and other state-changing operations MUST be durably accepted and deduplicated
 before successful acknowledgement.
 
+An inbound message MUST pass the deployment's `A2aIngress` guardrail chain,
+where one is installed, after the operation's authorization and before the
+command it carries is durably accepted; a blocked message is refused with
+`guardrail-blocked` and creates nothing, and a transformed message is what is
+accepted and projected. The chain is installed on the service
+(`with_ingress_guardrails`) and attested on the dispatch authority.
+
 ### 14.2 Task Identity and Projection
 
 - A2A `Task.id` SHOULD equal or map immutably to `AgentTaskId`.
@@ -1718,6 +1725,19 @@ hold a thread or agent actor while waiting.
 - The runtime MUST apply versioned ordered guardrail stages, as configured, to
   A2A ingress/egress, retrieval/memory ingress, model request/response, and tool
   request/response boundaries.
+- Every one of those seven boundaries has an evaluation point: model request,
+  tool request, and model response at the dispatch authority (the model
+  response in the dispatcher's Model arm after the turn validates and before
+  its outcome exists; a blocked turn fails the effect once under
+  `guardrail-blocked` and a transformed turn is what the run records); tool
+  response in the dispatcher after execution; memory ingress on the retrieval
+  path; A2A ingress at the agents surface's authorized leaves, once per
+  request, directly after authorization and before any entity command; A2A
+  egress in the in-process delegation and handoff send executors before the
+  message reaches the surface. A deployment attests the memory and the A2A
+  chains on its authority (`with_memory_ingress`, `with_a2a_guardrails`);
+  unattested, the authority does not count those boundaries, so a mandatory
+  stage bound only there refuses dispatch `guardrail-stage-unevaluated`.
 - A guardrail outcome MUST be one of an explicit bounded set such as `allow`,
   `block`, `transform`, `report-only`, or `require-checkpoint`, with a stable
   reason code and protected evidence reference when required.
