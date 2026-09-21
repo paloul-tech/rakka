@@ -98,7 +98,16 @@ pub const AGENT_GUARDRAIL_REASON_MAX_LENGTH: usize = 128;
 /// call larger than that could never be executed anyway. A transform that
 /// exceeds the effective bound is treated as a block with the stable reason
 /// code `guardrail-transform-oversized` — fail closed, deterministically.
-pub const AGENT_GUARDRAIL_CONTENT_MAX_BYTES: usize = 8 * 1024;
+///
+/// Equal to [`crate::model::AGENT_MODEL_TURN_MAX_BYTES`], so a whole model
+/// turn is evaluated at the `ModelResponse` boundary and may be transformed
+/// without truncation; the assertion below holds the two constants together.
+pub const AGENT_GUARDRAIL_CONTENT_MAX_BYTES: usize = 16 * 1024;
+
+const _: () = assert!(
+    AGENT_GUARDRAIL_CONTENT_MAX_BYTES == crate::model::AGENT_MODEL_TURN_MAX_BYTES,
+    "the guardrail content bound must equal the model turn bound"
+);
 
 /// Result type for guardrail chain construction.
 pub type AgentGuardrailResult<T> = Result<T, AgentGuardrailError>;
@@ -1438,5 +1447,50 @@ mod tests {
             assert_eq!(context.subject.agent(), None);
             assert_eq!(context.scope(), None);
         }
+    }
+
+    struct InflateTo(usize);
+
+    impl AgentGuardrail for InflateTo {
+        fn evaluate(&self, _: &AgentGuardrailContext<'_>, _: &Value) -> AgentGuardrailOutcome {
+            AgentGuardrailOutcome::Transform {
+                content: Value::String("x".repeat(self.0)),
+                reason_code: "inflate".to_string(),
+            }
+        }
+    }
+
+    fn one_stage_chain(rule: Arc<dyn AgentGuardrail>) -> AgentGuardrailChain {
+        AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+            .with_stage(
+                AgentGuardrailStage::new(stage_id("inflate"), AgentRevisionNumber::INITIAL, rule)
+                    .at_boundary(AgentGuardrailBoundary::ModelResponse),
+            )
+            .expect("the stage registers")
+    }
+
+    #[test]
+    fn a_twelve_kib_transform_fits_the_default_content_bound() {
+        let scope = scope();
+        let context = AgentGuardrailContext::new(AgentGuardrailBoundary::ModelResponse, &scope);
+        let decision = one_stage_chain(Arc::new(InflateTo(12 * 1024)))
+            .evaluate(&context, &serde_json::json!({ "text": "hi" }));
+        assert_eq!(decision.disposition, AgentGuardrailDisposition::Allowed);
+        assert!(decision.transformed);
+    }
+
+    #[test]
+    fn a_seventeen_kib_transform_is_blocked_even_under_a_wider_caller_bound() {
+        let scope = scope();
+        let context = AgentGuardrailContext::new(AgentGuardrailBoundary::ModelResponse, &scope);
+        let decision = one_stage_chain(Arc::new(InflateTo(17 * 1024))).evaluate_bounded(
+            &context,
+            &serde_json::json!({ "text": "hi" }),
+            32 * 1024,
+        );
+        assert!(matches!(
+            decision.disposition,
+            AgentGuardrailDisposition::Blocked { ref reason_code, .. } if reason_code == "guardrail-transform-oversized"
+        ));
     }
 }
