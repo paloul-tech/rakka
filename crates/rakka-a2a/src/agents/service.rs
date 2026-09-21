@@ -146,6 +146,10 @@ pub struct RakkaAgentA2AService<
     decision_events: Option<Arc<dyn AgentDecisionEventSink>>,
     segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
     goal_claims: Option<Arc<dyn AgentGoalClaimSource>>,
+    /// The chain the ingress boundary evaluates, when a deployment installed
+    /// one; attested on the authority through
+    /// [`RakkaAgentA2AService::ingress_guardrail_declaration`].
+    ingress_guardrails: Option<Arc<rakka_agent::AgentGuardrailChain>>,
 }
 
 impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
@@ -209,6 +213,7 @@ where
             decision_events: None,
             segments: None,
             goal_claims: None,
+            ingress_guardrails: None,
         }
     }
 
@@ -404,6 +409,71 @@ where
         self
     }
 
+    /// Installs the guardrail chain the `A2aIngress` boundary evaluates.
+    ///
+    /// Evaluation runs at every authorized leaf a content entry reaches —
+    /// `send`, `send_message`, `team_command`, and `conversation_command` all
+    /// end in one — once per request, directly after that leaf's
+    /// authorization and before any entity command. A deployment attests the
+    /// chain on its dispatch authority with
+    /// `AgentToolAuthority::with_a2a_guardrails(service.ingress_guardrail_declaration())`,
+    /// so coverage counts the two A2A boundaries only for the same declared
+    /// chain. Without a chain the surface admits as before.
+    #[must_use]
+    pub fn with_ingress_guardrails(mut self, chain: Arc<rakka_agent::AgentGuardrailChain>) -> Self {
+        self.ingress_guardrails = Some(chain);
+        self
+    }
+
+    /// The declaration digest of the installed ingress chain, for attestation.
+    #[must_use]
+    pub fn ingress_guardrail_declaration(&self) -> Option<rakka_agent::AgentContentDigest> {
+        self.ingress_guardrails
+            .as_ref()
+            .map(|chain| chain.declaration_digest())
+    }
+
+    /// Evaluates the ingress boundary over one authorized request.
+    ///
+    /// Answers `None` when no chain is installed or nothing was transformed,
+    /// and the admitted request and command when a stage rewrote the parts or
+    /// the cluster text. A block is a `Refused` error under `guardrail-blocked`.
+    fn admit_ingress(
+        &self,
+        subject: rakka_agent::AgentGuardrailSubject<'_>,
+        request: &SendMessageRequest,
+        normalized: &NormalizedAgentCommand,
+    ) -> RakkaAgentA2AResult<Option<(SendMessageRequest, NormalizedAgentCommand)>> {
+        let Some(chain) = self.ingress_guardrails.as_ref() else {
+            return Ok(None);
+        };
+        let text = super::guardrails::collaboration_text(normalized.collaboration.as_ref());
+        let review = super::guardrails::evaluate_a2a_content(
+            chain,
+            rakka_agent::AgentGuardrailBoundary::A2aIngress,
+            subject,
+            &request.message.parts,
+            text.as_ref(),
+        )
+        .map_err(|refusal| RakkaAgentA2AError::Refused {
+            code: refusal.code,
+            message: refusal.message,
+        })?;
+        super::guardrails::log_review(&review, "the inbound A2A message");
+        if review.parts.is_none() && review.text.is_none() {
+            return Ok(None);
+        }
+        let mut admitted = request.clone();
+        if let Some(parts) = review.parts {
+            admitted.message.parts = parts;
+        }
+        let mut normalized = normalized.clone();
+        if let Some(text) = review.text {
+            super::guardrails::apply_collaboration_text(&mut normalized, text);
+        }
+        Ok(Some((admitted, normalized)))
+    }
+
     /// Serves one `message/send`, dispatching on the message's declared
     /// extensions: a message tagged with the agent-management extension
     /// answers with an immediate management message (resolved open decision
@@ -582,6 +652,24 @@ where
 
         let board_task = cluster.task.clone();
         let (scope, command) = agent_team_command(normalized, now)?;
+        // The ingress boundary evaluates here: directly after this leaf's own
+        // authorization and before the durable command reaches the board. The
+        // scope the evaluation names is the one the command already derived,
+        // so the subject cannot disagree with what is about to be applied.
+        let admitted = self.admit_ingress(
+            rakka_agent::AgentGuardrailSubject::Team(&scope),
+            request,
+            normalized,
+        )?;
+        let (request, normalized) = match admitted.as_ref() {
+            Some((request, normalized)) => (request, normalized),
+            None => (request, normalized),
+        };
+        let (scope, command) = if admitted.is_some() {
+            agent_team_command(normalized, now)?
+        } else {
+            (scope, command)
+        };
         let mut store = self.team_store(scope.clone());
         let reply = match store.apply(command, &self.router, now).await {
             Ok(reply) => reply,
@@ -691,6 +779,25 @@ where
         }
 
         let (scope, command) = agent_conversation_command(normalized, now)?;
+        // The ingress boundary evaluates here: directly after this leaf's own
+        // authorization and before the durable turn reaches the conversation.
+        // A moderated turn's text rides the cluster rather than the parts, so
+        // the evaluated view carries both and a transform of either is what
+        // the re-derived command records.
+        let admitted = self.admit_ingress(
+            rakka_agent::AgentGuardrailSubject::Conversation(&scope),
+            request,
+            normalized,
+        )?;
+        let (request, normalized) = match admitted.as_ref() {
+            Some((request, normalized)) => (request, normalized),
+            None => (request, normalized),
+        };
+        let (scope, command) = if admitted.is_some() {
+            agent_conversation_command(normalized, now)?
+        } else {
+            (scope, command)
+        };
         let mut store = self.conversation_store(scope);
         let reply = match store.apply(command, &self.router, now).await {
             Ok(reply) => reply,
@@ -1025,7 +1132,23 @@ where
                 // target must be an agent this surface serves, checked before
                 // the state-mutating command can commit — or spend one of the
                 // task's bounded handoffs on an unserved target.
-                resolve_handoff_target(self.catalog.as_ref(), cluster)?;
+                let target = resolve_handoff_target(self.catalog.as_ref(), cluster)?;
+                // The ingress boundary evaluates here: directly after this
+                // branch's own authorization and before the transfer can
+                // commit. The addressed agent is the resolved target, so a
+                // stage sees who the message is being handed to.
+                let task_scope =
+                    AgentTaskScope::new(normalized.tenant.clone(), normalized.task.clone())
+                        .map_err(RakkaAgentA2AError::Identity)?;
+                let subject = rakka_agent::AgentGuardrailSubject::Task {
+                    scope: &task_scope,
+                    agent: Some(&target.agent),
+                };
+                let admitted = self.admit_ingress(subject, request, normalized)?;
+                let (request, normalized) = match admitted.as_ref() {
+                    Some((request, normalized)) => (request, normalized),
+                    None => (request, normalized),
+                };
                 let command = agent_task_handoff_command(normalized)?;
                 let snapshot = self.apply_task_command(normalized, command, now).await?;
                 let run = self.current_run_status(normalized, &snapshot).await?;
@@ -1077,6 +1200,26 @@ where
                 }),
             )
             .await?;
+            // The ingress boundary evaluates here: directly after this
+            // branch's own authorization and before the submitted result
+            // becomes the task's durable record. No agent is named — the
+            // submission addresses the task, and ownership is the entity's
+            // decision, not the wire's.
+            let task_scope =
+                AgentTaskScope::new(normalized.tenant.clone(), normalized.task.clone())
+                    .map_err(RakkaAgentA2AError::Identity)?;
+            let admitted = self.admit_ingress(
+                rakka_agent::AgentGuardrailSubject::Task {
+                    scope: &task_scope,
+                    agent: None,
+                },
+                request,
+                normalized,
+            )?;
+            let (request, normalized) = match admitted.as_ref() {
+                Some((request, normalized)) => (request, normalized),
+                None => (request, normalized),
+            };
             let input = agent_task_input(&request.message)?;
             let command =
                 agent_task_result_command(normalized, input, &request.message.message_id, now)?;
@@ -1120,8 +1263,27 @@ where
         }
         self.authorize(A2AOperation::SendMessage, normalized)
             .await?;
-        let input = agent_task_input(&request.message)?;
+        // The ingress boundary evaluates here: directly after the creation
+        // path's own authorization and before the task exists. The target is
+        // resolved first so a stage sees the addressed agent, and the input
+        // is read from the admitted message, so a transform is what the task
+        // records rather than something the guardrail never saw.
         let target = resolve_agent_target(self.catalog.as_ref(), normalized)?;
+        let task_scope = AgentTaskScope::new(normalized.tenant.clone(), normalized.task.clone())
+            .map_err(RakkaAgentA2AError::Identity)?;
+        let admitted = self.admit_ingress(
+            rakka_agent::AgentGuardrailSubject::Task {
+                scope: &task_scope,
+                agent: Some(&target.agent),
+            },
+            request,
+            normalized,
+        )?;
+        let (request, normalized) = match admitted.as_ref() {
+            Some((request, normalized)) => (request, normalized),
+            None => (request, normalized),
+        };
+        let input = agent_task_input(&request.message)?;
         let command = agent_task_create_command(normalized, &target, input)?;
 
         let snapshot = self.apply_task_command(normalized, command, now).await?;
