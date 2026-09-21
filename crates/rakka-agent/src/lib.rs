@@ -541,12 +541,13 @@ pub use team::{
     AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES, DEFAULT_AGENT_TEAM_ENTITY_TYPE,
 };
 pub use tools::{
-    AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant,
+    refuse_guardrail_disposition, AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant,
     AgentEnvironmentConcurrencyProtocol, AgentExecutionPolicyRouter, AgentGrantDescriptor,
     AgentGrantedDispatch, AgentModelResponseReview, AgentToolAuthority, AgentToolBinding,
     AgentToolDescriptor, AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResponseReview,
-    AgentToolResultBehavior, AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES,
-    AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
+    AgentToolResultBehavior, AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES,
+    AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
+    AGENT_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES,
     AGENT_TOOL_DESCRIPTION_MAX_LENGTH, AGENT_TOOL_PARAMETERS_MAX_BYTES,
     AGENT_TOOL_REGISTRY_MAX_TOOLS,
 };

@@ -118,20 +118,78 @@ pub const AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS: u64 = 60_000;
 /// evaluation point, and doing so is what makes the stages bound to that
 /// boundary start satisfying coverage.
 ///
-/// [`AgentToolAuthority`] evaluates the model-request and tool-request
-/// boundaries before every attempt's durable `Started` (slice 1.8).
-/// `ModelResponse` is evaluated by [`AgentToolAuthority::review_model_response`]
-/// in the dispatcher's Model arm, after the turn validates and before its
-/// outcome exists. The memory-ingress boundary is evaluated by the
-/// snapshot-assembly retrieval path
+/// Each boundary's evaluation point: [`AgentToolAuthority`] evaluates the
+/// model-request and tool-request boundaries before every attempt's durable
+/// `Started` (slice 1.8), and the tool-response and model-response boundaries
+/// in the dispatcher after the call returns —
+/// [`AgentToolAuthority::review_tool_response`] and
+/// [`AgentToolAuthority::review_model_response`] respectively, the latter in
+/// the dispatcher's Model arm, before the outcome exists. All four run
+/// against this authority's own chain, unconditionally. The memory-ingress
+/// boundary is evaluated by the snapshot-assembly retrieval path
+/// ([`crate::retrieval::assemble_context`], slice 2.2). The A2A-ingress
+/// boundary is evaluated at the agents surface's authorized leaves, and
+/// A2A-egress in the two in-process send executors that carry an outbound
+/// A2A message. None of these last three shares the authority's own
+/// evaluation point, which is why a deployment must wire the *same* chain
+/// into whichever it owns and attest it —
+/// [`AgentToolAuthority::with_memory_ingress`] for the retrieval bundle,
+/// [`AgentToolAuthority::with_a2a_guardrails`] for the A2A surface — before
+/// this authority's coverage check counts it: the check cannot see either
+/// chain directly. A deployment with no retrieval or no A2A surface wired is
+/// not fail-open — no memory or message ever crosses that boundary, so there
+/// is nothing a stage there could have protected.
+pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 7] = [
+    AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ModelResponse,
+    AgentGuardrailBoundary::ToolRequest,
+    AgentGuardrailBoundary::ToolResponse,
+    AgentGuardrailBoundary::MemoryIngress,
+    AgentGuardrailBoundary::A2aIngress,
+    AgentGuardrailBoundary::A2aEgress,
+];
+
+/// The boundaries [`AgentToolAuthority`] evaluates *on its own*, needing no
+/// attestation from anywhere else.
+///
+/// This is the honest core of [`AGENT_EVALUATED_GUARDRAIL_BOUNDARIES`], which
+/// names every boundary the runtime has an evaluation point for *somewhere*.
+/// The model-request and tool-request boundaries run before every attempt's
+/// durable `Started` (slice 1.8); the tool-response and model-response
+/// boundaries run in the dispatcher after the call returns —
+/// [`AgentToolAuthority::review_tool_response`] and
+/// [`AgentToolAuthority::review_model_response`], the latter in the
+/// dispatcher's Model arm, before the outcome exists. All four run against
+/// this authority's own chain, so none needs a deployment to attest
+/// anything: there is only the one object to be the same as.
+///
+/// An authority may only count the memory-ingress or A2A boundaries once a
+/// deployment has attested — through
+/// [`AgentToolAuthority::with_memory_ingress`] or
+/// [`AgentToolAuthority::with_a2a_guardrails`] — that the retrieval bundle or
+/// A2A surface carries the same declared chain. Until then a mandatory stage
+/// bound only to one of those boundaries fails closed as
+/// `guardrail-stage-unevaluated`, which is the correct answer: this authority
+/// cannot see a retrieval bundle or an A2A surface, so it cannot vouch for
+/// one it was never shown.
+pub const AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 4] = [
+    AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ModelResponse,
+    AgentGuardrailBoundary::ToolRequest,
+    AgentGuardrailBoundary::ToolResponse,
+];
+
+/// The boundaries an authority counts once a deployment has attested its
+/// retrieval bundle ([`AgentToolAuthority::with_memory_ingress`]) and nothing
+/// else.
+///
+/// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] plus the memory-ingress
+/// boundary, which is evaluated by the snapshot-assembly retrieval path
 /// ([`crate::retrieval::assemble_context`], slice 2.2) — a different
-/// evaluation point than the authority's, which is why a deployment must wire
-/// the *same* chain into both its [`AgentToolAuthority`] and its
-/// [`crate::retrieval::AgentMemoryRetrieval`]: this coverage check cannot see
-/// the retrieval bundle's chain. A deployment with no retrieval wired is not
-/// fail-open — no memory ever crosses the boundary, so there is nothing an
-/// ingress stage could have protected.
-pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 5] = [
+/// evaluation point than the authority's own four, which is why the
+/// attestation exists at all: this coverage check cannot see the retrieval
+/// bundle's chain directly.
+pub const AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 5] = [
     AgentGuardrailBoundary::ModelRequest,
     AgentGuardrailBoundary::ModelResponse,
     AgentGuardrailBoundary::ToolRequest,
@@ -139,27 +197,22 @@ pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 5] = [
     AgentGuardrailBoundary::MemoryIngress,
 ];
 
-/// The boundaries [`AgentToolAuthority`] evaluates *on its own*, before every
-/// attempt's durable `Started`.
+/// The boundaries an authority counts once a deployment has attested its A2A
+/// surface ([`AgentToolAuthority::with_a2a_guardrails`]) and nothing else.
 ///
-/// This is the honest half of [`AGENT_EVALUATED_GUARDRAIL_BOUNDARIES`], which
-/// names every boundary the runtime has an evaluation point for *somewhere*.
-/// `ModelResponse` is evaluated by [`AgentToolAuthority::review_model_response`]
-/// in the dispatcher's Model arm, after the turn validates and before its
-/// outcome exists — the authority's own chain does the evaluating, so it
-/// counts here too.
-/// An authority may only count the memory-ingress boundary once a deployment
-/// has attested — through [`AgentToolAuthority::with_memory_ingress`] — that
-/// its retrieval bundle carries the same declared chain. Until then a
-/// mandatory memory-ingress-only stage fails closed as
-/// `guardrail-stage-unevaluated`, which is the correct answer: this authority
-/// cannot see a retrieval bundle, so it cannot vouch for one it was never
-/// shown.
-pub const AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 4] = [
+/// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] plus the two A2A
+/// boundaries: A2A-ingress, evaluated at the agents surface's authorized
+/// leaves, and A2A-egress, evaluated in the two in-process send executors
+/// that carry an outbound A2A message — neither one the authority's own
+/// evaluation point, which is why the attestation exists at all: this
+/// coverage check cannot see the A2A surface's chain directly.
+pub const AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 6] = [
     AgentGuardrailBoundary::ModelRequest,
     AgentGuardrailBoundary::ModelResponse,
     AgentGuardrailBoundary::ToolRequest,
     AgentGuardrailBoundary::ToolResponse,
+    AgentGuardrailBoundary::A2aIngress,
+    AgentGuardrailBoundary::A2aEgress,
 ];
 
 /// Result type for tool registry operations.
@@ -1048,6 +1101,10 @@ pub struct AgentToolAuthority {
     /// Whether a deployment attested that its retrieval bundle evaluates the
     /// memory-ingress boundary under this authority's own declared chain.
     memory_ingress_attested: bool,
+    /// Whether a deployment attested that its A2A surface evaluates the
+    /// ingress and egress boundaries under this authority's own declared
+    /// chain.
+    a2a_attested: bool,
     execution_router: Option<Arc<dyn AgentExecutionPolicyRouter>>,
     /// The trust class every effect Rakka itself commits runs under, when the
     /// deployment requires each intent to name one. `Some` *is* strict mode:
@@ -1326,6 +1383,7 @@ impl AgentToolAuthority {
             registry,
             guardrails: None,
             memory_ingress_attested: false,
+            a2a_attested: false,
             execution_router: None,
             substrate_execution_policy: None,
             grant_ttl_ms: AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
@@ -1334,13 +1392,14 @@ impl AgentToolAuthority {
 
     /// Uses the deployment's guardrail chain.
     ///
-    /// Replacing the chain clears any memory-ingress attestation: an
+    /// Replacing the chain clears any memory-ingress and A2A attestation: an
     /// attestation is about a *particular* declared chain, and a new one has
-    /// not been checked against the retrieval bundle.
+    /// not been checked against the retrieval bundle or the A2A surface.
     #[must_use]
     pub fn with_guardrails(mut self, chain: AgentGuardrailChain) -> Self {
         self.guardrails = Some(chain);
         self.memory_ingress_attested = false;
+        self.a2a_attested = false;
         self
     }
 
@@ -1424,6 +1483,44 @@ impl AgentToolAuthority {
         installed.is_some() && installed == self.declared_chain()
     }
 
+    /// Attests that the A2A surface this deployment serves evaluates the
+    /// ingress and egress boundaries under the *same declared chain* this
+    /// authority carries.
+    ///
+    /// The surface hands over its chain's declaration digest
+    /// (`RakkaAgentA2AService::ingress_guardrail_declaration` in
+    /// `rakka-a2a`); the comparison is the same declaration comparison
+    /// [`Self::with_memory_ingress`] makes, for the same reason. Unattested,
+    /// the authority does not count either A2A boundary, so an envelope
+    /// requiring a stage bound only there refuses dispatch with
+    /// `guardrail-stage-unevaluated`.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentGuardrailError::A2aChainMismatch`] (`guardrail-chain-mismatch`)
+    /// when the declarations differ or this authority carries no chain.
+    pub fn with_a2a_guardrails(
+        mut self,
+        declaration: AgentContentDigest,
+    ) -> Result<Self, AgentGuardrailError> {
+        let mine = self.declared_chain();
+        if mine.as_ref() != Some(&declaration) {
+            return Err(AgentGuardrailError::A2aChainMismatch {
+                authority: mine,
+                surface: declaration,
+            });
+        }
+        self.a2a_attested = true;
+        Ok(self)
+    }
+
+    /// Whether this authority has attested an A2A surface whose chain
+    /// declaration is `declaration`.
+    #[must_use]
+    pub fn attests_a2a(&self, declaration: &AgentContentDigest) -> bool {
+        self.a2a_attested && self.declared_chain().as_ref() == Some(declaration)
+    }
+
     /// This authority's own chain declaration, when it carries a chain.
     fn declared_chain(&self) -> Option<AgentContentDigest> {
         self.guardrails
@@ -1441,18 +1538,19 @@ impl AgentToolAuthority {
 
     /// The boundaries this authority's coverage check treats as evaluated.
     ///
-    /// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] — the two request
-    /// boundaries before every attempt and
-    /// [`AgentGuardrailBoundary::ToolResponse`] after every tool execution
-    /// ([`Self::review_tool_response`]) — plus
-    /// [`AgentGuardrailBoundary::MemoryIngress`] once a deployment has
-    /// attested its retrieval bundle.
+    /// One of four sets, depending on what this authority has attested:
+    /// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] with neither
+    /// attestation, [`AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES`] with only
+    /// [`Self::with_memory_ingress`], [`AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES`]
+    /// with only [`Self::with_a2a_guardrails`], and
+    /// [`AGENT_EVALUATED_GUARDRAIL_BOUNDARIES`] with both.
     #[must_use]
     pub fn evaluated_boundaries(&self) -> &'static [AgentGuardrailBoundary] {
-        if self.memory_ingress_attested {
-            &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES
-        } else {
-            &AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES
+        match (self.memory_ingress_attested, self.a2a_attested) {
+            (false, false) => &AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES,
+            (true, false) => &AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES,
+            (false, true) => &AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES,
+            (true, true) => &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
         }
     }
 
@@ -2897,7 +2995,16 @@ impl Debug for AgentToolAuthority {
 /// exactly as a `checkpoint_required` binding is: `checkpoint_satisfied` is the
 /// verdict of [`AgentToolAuthority::evaluate_checkpoint_grant`] against the same
 /// intent. Without a grant the disposition still fails closed.
-fn refuse_guardrail_disposition(
+///
+/// Public so `rakka-a2a`'s A2A-ingress and A2A-egress evaluation points map a
+/// disposition onto a refusal identically to every boundary this crate
+/// evaluates itself, rather than reimplementing the mapping.
+///
+/// # Errors
+///
+/// The refusal the disposition maps to: `guardrail-blocked` for a block,
+/// `checkpoint-required` for an unsatisfied checkpoint requirement.
+pub fn refuse_guardrail_disposition(
     disposition: &AgentGuardrailDisposition,
     what: &str,
     checkpoint_satisfied: bool,

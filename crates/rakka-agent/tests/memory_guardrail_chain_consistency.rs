@@ -35,9 +35,9 @@ use rakka_agent::{
     AgentTaskContent, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
     InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore, InMemoryPrivateMemoryRetriever,
     InMemorySessionMemoryStore, MemoryClassification, MemoryOperationId, MemoryRetrievalOutcome,
-    PrivateMemoryExpectation, RetrievedPrivateMemory,
+    PrivateMemoryExpectation, RetrievedPrivateMemory, AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES,
     AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -165,7 +165,7 @@ fn an_attested_bundle_carrying_the_same_chain_satisfies_memory_ingress_coverage(
     );
     assert_eq!(
         authority.evaluated_boundaries(),
-        AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
+        AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES,
     );
 }
 
@@ -577,4 +577,108 @@ fn attests_re_checks_a_separately_assembled_memory() {
         !unattested.attests(&memory_with(deployment_chain(7))),
         "an authority that never attested vouches for nothing, matching chain or not"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The A2A attestation, alongside the memory-ingress one.
+// ---------------------------------------------------------------------------
+
+/// An authority attesting an A2A chain with the same declaration it carries
+/// counts both A2A boundaries and nothing it did not attest.
+#[test]
+fn an_a2a_attestation_with_the_same_declaration_counts_both_a2a_boundaries() {
+    let chain = deployment_chain(7);
+    let authority = AgentToolAuthority::new(tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::non_idempotent(),
+    ))
+    .with_guardrails(chain.clone())
+    .with_a2a_guardrails(chain.declaration_digest())
+    .expect("the same declaration attests");
+
+    assert_eq!(
+        authority.evaluated_boundaries(),
+        AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES
+    );
+    assert!(authority.attests_a2a(&chain.declaration_digest()));
+    assert!(!authority
+        .evaluated_boundaries()
+        .contains(&AgentGuardrailBoundary::MemoryIngress));
+}
+
+/// A different declaration — here an empty chain at the same revision, the
+/// case a revision comparison waves through — is refused at wiring time.
+#[test]
+fn an_a2a_attestation_with_a_different_declaration_is_refused_at_wiring() {
+    let other = AgentGuardrailChain::new(AgentRevisionNumber::new(7));
+    let error = AgentToolAuthority::new(tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::non_idempotent(),
+    ))
+    .with_guardrails(deployment_chain(7))
+    .with_a2a_guardrails(other.declaration_digest())
+    .expect_err("a different declaration cannot be attested");
+    assert_eq!(error.code(), "guardrail-chain-mismatch");
+}
+
+/// An authority with no chain cannot attest one.
+#[test]
+fn an_authority_without_a_chain_cannot_attest_an_a2a_chain() {
+    let error = AgentToolAuthority::new(tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::non_idempotent(),
+    ))
+    .with_a2a_guardrails(deployment_chain(7).declaration_digest())
+    .expect_err("two absences are not an agreement");
+    assert_eq!(error.code(), "guardrail-chain-mismatch");
+}
+
+/// Both attestations together yield the full evaluated set, and replacing
+/// the chain clears both.
+#[test]
+fn both_attestations_yield_the_full_set_and_a_new_chain_clears_them() {
+    let chain = deployment_chain(7);
+    let bundle = memory_with(chain.clone());
+    let authority = AgentToolAuthority::new(tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::non_idempotent(),
+    ))
+    .with_guardrails(chain.clone())
+    .with_memory_ingress(&bundle)
+    .expect("the memory attests")
+    .with_a2a_guardrails(chain.declaration_digest())
+    .expect("the surface attests");
+    assert_eq!(
+        authority.evaluated_boundaries(),
+        AGENT_EVALUATED_GUARDRAIL_BOUNDARIES
+    );
+
+    let replaced = authority.with_guardrails(deployment_chain(8));
+    assert_eq!(
+        replaced.evaluated_boundaries(),
+        AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES,
+        "a new chain has been attested by nobody"
+    );
+}
+
+/// The four sets nest strictly, so no attestation can be a no-op.
+#[test]
+fn the_four_evaluated_sets_nest_strictly() {
+    let sets: [&[AgentGuardrailBoundary]; 4] = [
+        &AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES,
+        &AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES,
+        &AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES,
+        &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
+    ];
+    assert_eq!(sets.map(<[_]>::len), [4, 5, 6, 7]);
+    for narrower in &sets[..3] {
+        for boundary in *narrower {
+            assert!(AGENT_EVALUATED_GUARDRAIL_BOUNDARIES.contains(boundary));
+        }
+    }
+    assert!(
+        AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES.contains(&AgentGuardrailBoundary::MemoryIngress)
+    );
+    assert!(AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES.contains(&AgentGuardrailBoundary::A2aIngress));
+    assert!(AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES.contains(&AgentGuardrailBoundary::A2aEgress));
 }

@@ -764,10 +764,12 @@ async fn a_mandatory_stage_bound_to_an_unevaluated_boundary_fails_closed() {
     let mut envelope = envelope_for_registry(&registry);
     envelope.mandatory_guardrails.insert(stage_id("pii-filter"));
 
-    // The stage is real, mandatory, and present — but bound only to the
-    // A2A-*egress* boundary, which nothing evaluates yet. (It used to be the
-    // tool-response boundary, and then the model-response boundary, until
-    // each gained its evaluation point.)
+    // The stage is real, mandatory, and present — but bound to the
+    // A2A-*egress* boundary, and this authority has not attested an A2A
+    // surface (`with_a2a_guardrails`), so it still fails closed. (It used to
+    // be the tool-response boundary, and then the model-response boundary,
+    // until each gained an evaluation point this authority runs
+    // unconditionally.)
     let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
         .with_stage(
             AgentGuardrailStage::new(

@@ -929,6 +929,15 @@ pub enum AgentGuardrailError {
         /// carries a bundle.
         retrieval: Option<AgentContentDigest>,
     },
+    /// A deployment attested that its A2A surface evaluates the ingress and
+    /// egress boundaries under this authority's chain, and the two
+    /// declarations differ (or the authority carries no chain).
+    A2aChainMismatch {
+        /// The authority's declaration digest, when it carries a chain.
+        authority: Option<AgentContentDigest>,
+        /// The surface's declaration digest.
+        surface: AgentContentDigest,
+    },
 }
 
 impl AgentGuardrailError {
@@ -944,6 +953,7 @@ impl AgentGuardrailError {
             Self::StageNotEvaluated { .. } => "guardrail-stage-unevaluated",
             Self::NarrowedRevisionNotDistinct { .. } => "guardrail-narrowed-revision-not-distinct",
             Self::ChainMismatch { .. } => "guardrail-chain-mismatch",
+            Self::A2aChainMismatch { .. } => "guardrail-chain-mismatch",
         }
     }
 }
@@ -999,6 +1009,19 @@ impl Display for AgentGuardrailError {
                     f,
                     "the run memory carries no retrieval bundle, so nothing evaluates the \
                      memory-ingress boundary and there is no chain to attest"
+                ),
+            },
+            Self::A2aChainMismatch { authority, surface } => match authority {
+                Some(authority) => write!(
+                    f,
+                    "the dispatch authority's guardrail chain ({authority}) and the A2A surface's \
+                     ({surface}) declare different evaluations, so a stage required at one would \
+                     not run at the other"
+                ),
+                None => write!(
+                    f,
+                    "the dispatch authority carries no guardrail chain, so it cannot attest that \
+                     the A2A surface's ({surface}) is the same one"
                 ),
             },
         }
