@@ -3435,6 +3435,70 @@ where
         }
     }
 
+    /// The outcome the run receives for a model call, once the
+    /// `ModelResponse` boundary has reviewed the turn.
+    ///
+    /// The review sits here — after the call, after `validate`, before the
+    /// outcome exists — for the reason [`Self::reviewed_tool_outcome`] sits
+    /// where it does: this is the last point at which the turn is only in
+    /// memory. A refusal becomes a determinate `Failed` outcome under the
+    /// refusal's stable code: the model answered, its answer is not
+    /// admissible, and the effect fails once, never retried.
+    async fn reviewed_model_outcome(
+        &self,
+        scope: &AgentRunScope,
+        intent: &AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchResult<AgentRunEffectOutcome> {
+        match self
+            .authority
+            .review_model_response(scope, intent, turn)
+            .await?
+        {
+            AgentModelResponseDecision::Accepted(review) => {
+                for transform in &review.transforms {
+                    tracing::info!(
+                        effect_id = intent.effect_id.as_str(),
+                        generation = %intent.generation,
+                        stage = %transform.stage,
+                        stage_revision = %transform.revision,
+                        reason_code = %transform.reason_code,
+                        "guardrail transform applied to the model response"
+                    );
+                }
+                for report in &review.reports {
+                    tracing::info!(
+                        effect_id = intent.effect_id.as_str(),
+                        generation = %intent.generation,
+                        stage = %report.stage,
+                        stage_revision = %report.revision,
+                        reason_code = %report.reason_code,
+                        evidence = report
+                            .evidence
+                            .as_ref()
+                            .map(|artifact| artifact.artifact_id.as_str()),
+                        "guardrail report-only finding on the model response"
+                    );
+                }
+                Ok(AgentRunEffectOutcome::Model {
+                    turn: Box::new(review.turn),
+                })
+            }
+            AgentModelResponseDecision::Refused(refusal) => {
+                tracing::warn!(
+                    effect_id = intent.effect_id.as_str(),
+                    generation = %intent.generation,
+                    code = %refusal.code,
+                    "guardrail refused the model response; the effect fails"
+                );
+                Ok(AgentRunEffectOutcome::Failed {
+                    code: bounded_failure_code(&refusal.code),
+                    message: bounded_failure_detail(&refusal.message),
+                })
+            }
+        }
+    }
+
     async fn invoke(
         &self,
         scope: &AgentRunScope,
@@ -3480,9 +3544,7 @@ where
                         code: error.code(),
                         message: error.to_string(),
                     })?;
-                Ok(AgentRunEffectOutcome::Model {
-                    turn: Box::new(turn),
-                })
+                self.reviewed_model_outcome(scope, intent, turn).await
             }
             AgentRunEffectRequest::Tool { call } => {
                 let call: &AgentToolCallRequest = granted.tool_call.as_deref().unwrap_or(call);

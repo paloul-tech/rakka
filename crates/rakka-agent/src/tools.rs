@@ -119,17 +119,21 @@ pub const AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS: u64 = 60_000;
 /// boundary start satisfying coverage.
 ///
 /// [`AgentToolAuthority`] evaluates the model-request and tool-request
-/// boundaries before every attempt's durable `Started` (slice 1.8). The
-/// memory-ingress boundary is evaluated by the snapshot-assembly retrieval
-/// path ([`crate::retrieval::assemble_context`], slice 2.2) — a different
+/// boundaries before every attempt's durable `Started` (slice 1.8).
+/// `ModelResponse` is evaluated by [`AgentToolAuthority::review_model_response`]
+/// in the dispatcher's Model arm, after the turn validates and before its
+/// outcome exists. The memory-ingress boundary is evaluated by the
+/// snapshot-assembly retrieval path
+/// ([`crate::retrieval::assemble_context`], slice 2.2) — a different
 /// evaluation point than the authority's, which is why a deployment must wire
 /// the *same* chain into both its [`AgentToolAuthority`] and its
 /// [`crate::retrieval::AgentMemoryRetrieval`]: this coverage check cannot see
 /// the retrieval bundle's chain. A deployment with no retrieval wired is not
 /// fail-open — no memory ever crosses the boundary, so there is nothing an
 /// ingress stage could have protected.
-pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 4] = [
+pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 5] = [
     AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ModelResponse,
     AgentGuardrailBoundary::ToolRequest,
     AgentGuardrailBoundary::ToolResponse,
     AgentGuardrailBoundary::MemoryIngress,
@@ -140,6 +144,10 @@ pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 4] = [
 ///
 /// This is the honest half of [`AGENT_EVALUATED_GUARDRAIL_BOUNDARIES`], which
 /// names every boundary the runtime has an evaluation point for *somewhere*.
+/// `ModelResponse` is evaluated by [`AgentToolAuthority::review_model_response`]
+/// in the dispatcher's Model arm, after the turn validates and before its
+/// outcome exists — the authority's own chain does the evaluating, so it
+/// counts here too.
 /// An authority may only count the memory-ingress boundary once a deployment
 /// has attested — through [`AgentToolAuthority::with_memory_ingress`] — that
 /// its retrieval bundle carries the same declared chain. Until then a
@@ -147,8 +155,9 @@ pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 4] = [
 /// `guardrail-stage-unevaluated`, which is the correct answer: this authority
 /// cannot see a retrieval bundle, so it cannot vouch for one it was never
 /// shown.
-pub const AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 3] = [
+pub const AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 4] = [
     AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ModelResponse,
     AgentGuardrailBoundary::ToolRequest,
     AgentGuardrailBoundary::ToolResponse,
 ];

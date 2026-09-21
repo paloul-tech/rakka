@@ -11,11 +11,13 @@ mod common;
 use std::sync::Arc;
 
 use common::*;
+use rakka_agent::testkit::DeterministicModelAdapter;
 use rakka_agent::{
     AgentEffectSpec, AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain,
     AgentGuardrailContext, AgentGuardrailOutcome, AgentGuardrailStage, AgentGuardrailStageId,
-    AgentModelTurn, AgentModelUsage, AgentRevisionNumber, AgentTaskContent, AgentToolAuthority,
-    AgentToolCallId, AgentToolCallRequest, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentModelTurn, AgentModelUsage, AgentRevisionNumber, AgentRunStatus, AgentTaskContent,
+    AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, SessionMemoryStore,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -301,4 +303,136 @@ fn a_checkpoint_requiring_stage_fails_closed_under_checkpoint_required() {
         .review_model_response(&run_scope(), text_turn("hello"))
         .expect_err("no checkpoint can gate a response that exists");
     assert_eq!(refusal.code, "checkpoint-required");
+}
+
+// ---------------------------------------------------------------------------
+// End to end: the dispatcher's Model arm, a real run, durable state.
+// ---------------------------------------------------------------------------
+
+fn session_texts(page: &rakka_agent::SessionMemoryPage) -> Vec<String> {
+    page.entries
+        .iter()
+        .filter(|entry| entry.role == rakka_agent::MemoryEntryRole::Assistant)
+        .map(|entry| serde_json::to_string(&entry.content).expect("the content encodes"))
+        .collect()
+}
+
+/// A blocked model response fails the effect under `guardrail-blocked` after
+/// exactly one model call, and the blocked text reaches neither the run's
+/// terminal record nor its session memory.
+#[tokio::test]
+async fn a_blocked_model_response_ends_the_run_once_and_never_reaches_memory() {
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let fx = AuthorityFixture::new(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn(MARKER, "done")),
+        authority_with(Arc::new(BlockMarker)),
+        None,
+    )
+    .with_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots));
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(fx.terminal_failure_code().await, "guardrail-blocked");
+    assert_eq!(
+        fx.adapter.calls(),
+        1,
+        "the model answered once; a blocked answer is never re-asked"
+    );
+
+    let page = session
+        .read(&run_scope(), rakka_agent::SessionMemoryCursor::start())
+        .await
+        .expect("the session reads");
+    assert!(
+        session_texts(&page)
+            .iter()
+            .all(|text| !text.contains(MARKER)),
+        "the blocked text never entered session memory: {:?}",
+        page.entries
+    );
+}
+
+/// A transformed model response is what the run records: the assistant entry
+/// session memory holds is the transformed text, and the run completes.
+#[tokio::test]
+async fn a_transformed_model_response_is_what_the_run_records() {
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let fx = AuthorityFixture::new(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn(MARKER, "done")),
+        authority_with(Arc::new(RedactText)),
+        None,
+    )
+    .with_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots));
+    fx.start().await;
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+
+    let page = session
+        .read(&run_scope(), rakka_agent::SessionMemoryCursor::start())
+        .await
+        .expect("the session reads");
+    let texts = session_texts(&page);
+    assert!(
+        texts.iter().any(|text| text.contains("[redacted]")),
+        "{texts:?}"
+    );
+    assert!(texts.iter().all(|text| !text.contains(MARKER)), "{texts:?}");
+}
+
+/// A mandatory stage bound only to the model-response boundary is coverage,
+/// because the boundary now has an evaluation point.
+#[tokio::test]
+async fn a_model_response_only_mandatory_stage_satisfies_coverage() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let mut envelope = envelope_for_registry(&registry);
+    envelope
+        .mandatory_guardrails
+        .insert(stage_id("response-filter"));
+    let fx = AuthorityFixture::new(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn("fine", "done")),
+        AgentToolAuthority::new(registry).with_guardrails(response_chain(Arc::new(BlockMarker))),
+        None,
+    )
+    .with_envelope(envelope);
+    fx.start().await;
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+/// A checkpoint-requiring stage on a model response fails the effect closed.
+#[tokio::test]
+async fn a_checkpoint_requiring_model_response_stage_fails_closed() {
+    let fx = AuthorityFixture::new(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn("fine", "done")),
+        authority_with(Arc::new(RequireHuman)),
+        None,
+    );
+    fx.start().await;
+    fx.pump().await;
+    assert_eq!(fx.terminal_failure_code().await, "checkpoint-required");
+}
+
+/// The review runs on every turn: a second turn blocked after an allowed
+/// tool-calling first turn ends the run with the tool having run once.
+#[tokio::test]
+async fn a_later_turn_is_reviewed_after_a_tool_turn() {
+    let fx = AuthorityFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn())
+            .with_turn_for(2, proposing_turn(MARKER, "done")),
+        authority_with(Arc::new(BlockMarker)),
+        None,
+    );
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(fx.terminal_failure_code().await, "guardrail-blocked");
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+    assert_eq!(fx.adapter.calls(), 2);
 }

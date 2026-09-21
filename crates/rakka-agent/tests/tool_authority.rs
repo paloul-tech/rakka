@@ -765,8 +765,9 @@ async fn a_mandatory_stage_bound_to_an_unevaluated_boundary_fails_closed() {
     envelope.mandatory_guardrails.insert(stage_id("pii-filter"));
 
     // The stage is real, mandatory, and present — but bound only to the
-    // model-*response* boundary, which nothing evaluates yet. (It used to be
-    // the tool-response boundary, until that gained its evaluation point.)
+    // A2A-*egress* boundary, which nothing evaluates yet. (It used to be the
+    // tool-response boundary, and then the model-response boundary, until
+    // each gained its evaluation point.)
     let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
         .with_stage(
             AgentGuardrailStage::new(
@@ -774,7 +775,7 @@ async fn a_mandatory_stage_bound_to_an_unevaluated_boundary_fails_closed() {
                 AgentRevisionNumber::INITIAL,
                 Arc::new(AllowAll),
             )
-            .at_boundary(AgentGuardrailBoundary::ModelResponse)
+            .at_boundary(AgentGuardrailBoundary::A2aEgress)
             .mandatory(),
         )
         .expect("the stage registers");
