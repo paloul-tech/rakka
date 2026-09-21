@@ -19,6 +19,8 @@
 //! identity is reported as the explicit conflict of specification 6.6, never
 //! adopted.
 
+use std::sync::Arc;
+
 use a2a::{Message, Part, PartContent, Role, SendMessageRequest, Task, TaskState};
 use a2a_server::ServiceParams;
 use rakka_agent::{
@@ -70,6 +72,9 @@ pub struct A2AAgentDelegationSendExecutor<
         ConversationHistory,
     >,
     principal: Option<PrincipalRef>,
+    /// The chain the `A2aEgress` boundary evaluates over the outbound
+    /// message, when a deployment installed one.
+    egress_guardrails: Option<Arc<rakka_agent::AgentGuardrailChain>>,
 }
 
 impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
@@ -110,6 +115,7 @@ where
         Self {
             service,
             principal: None,
+            egress_guardrails: None,
         }
     }
 
@@ -117,6 +123,16 @@ where
     #[must_use]
     pub fn with_principal(mut self, principal: PrincipalRef) -> Self {
         self.principal = Some(principal);
+        self
+    }
+
+    /// Installs the guardrail chain the `A2aEgress` boundary evaluates over
+    /// every outbound delegation message, before the service sees it. A
+    /// block is a determinate `Refused` finding under `guardrail-blocked`; a
+    /// transform is what is sent.
+    #[must_use]
+    pub fn with_egress_guardrails(mut self, chain: Arc<rakka_agent::AgentGuardrailChain>) -> Self {
+        self.egress_guardrails = Some(chain);
         self
     }
 
@@ -261,6 +277,14 @@ fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, A
                 })
             }
         }
+        // The entity's own stable refusal code survives onto the finding,
+        // as it does on the handoff executor: the enclosing variant's
+        // `code()` is the flat `refused`, which would erase which rule
+        // refused — an ingress guardrail block, say, reaching an in-process
+        // send as `guardrail-blocked`.
+        RakkaAgentA2AError::Refused { code, message } => {
+            Ok(AgentA2aSendFinding::Refused { code, message })
+        }
         RakkaAgentA2AError::Entity(_)
         | RakkaAgentA2AError::Run(_)
         | RakkaAgentA2AError::Projection(_) => Err(AgentDispatchError::Invocation {
@@ -298,13 +322,13 @@ where
 {
     fn execute<'a>(
         &'a self,
-        _scope: &'a AgentRunScope,
+        scope: &'a AgentRunScope,
         _intent: &'a AgentRunEffect,
         delegation: &'a AgentDelegationRecord,
         _credential: Option<&'a rakka_agent_workflow::AgentEphemeralCredential>,
     ) -> AgentDispatchFuture<'a, AgentA2aSendFinding> {
         Box::pin(async move {
-            let send = match self.request_for(delegation) {
+            let mut send = match self.request_for(delegation) {
                 Ok(send) => send,
                 Err(message) => {
                     return Ok(AgentA2aSendFinding::Refused {
@@ -313,6 +337,28 @@ where
                     });
                 }
             };
+            if let Some(chain) = self.egress_guardrails.as_ref() {
+                match super::guardrails::evaluate_a2a_content(
+                    chain,
+                    rakka_agent::AgentGuardrailBoundary::A2aEgress,
+                    rakka_agent::AgentGuardrailSubject::Run(scope),
+                    &send.message.parts,
+                    None,
+                ) {
+                    Ok(review) => {
+                        super::guardrails::log_review(&review, "the outbound delegation message");
+                        if let Some(parts) = review.parts {
+                            send.message.parts = parts;
+                        }
+                    }
+                    Err(refusal) => {
+                        return Ok(AgentA2aSendFinding::Refused {
+                            code: refusal.code,
+                            message: refusal.message,
+                        });
+                    }
+                }
+            }
             let task = match self
                 .service
                 .send_message(&ServiceParams::new(), &send)

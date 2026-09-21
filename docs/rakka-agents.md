@@ -252,8 +252,13 @@ incorrectly.
   task, run, and delegation provenance under stable idempotency.
 - **Retention** discharges a terminal run's session rows and snapshots after a
   per-tenant policy, snapshots first; agent-private memory outlives every run.
-  Guardrails evaluate memory ingress, and a deployment attests that the chain
-  its retrieval bundle evaluates is the chain its dispatch authority declares.
+  Guardrails evaluate all seven boundaries — model and tool request, model
+  and tool response, memory ingress, A2A ingress and egress — and a
+  deployment attests that the chain its retrieval bundle and its A2A surface
+  evaluate is the chain its dispatch authority declares
+  (`with_memory_ingress`, `with_a2a_guardrails`). A blocked model response
+  fails the effect once under `guardrail-blocked`; a transformed one is what
+  the run records. Four dependency-free stages ship in `guardrails::builtin`.
 
 ## The A2A surface
 
@@ -351,11 +356,10 @@ with fixtures only.
 
 Every matrix ends with an "Owed" section, and the roster says what it does not
 claim. The open items as of this document are recorded there rather than here:
-the guardrail boundaries with no evaluation point and the knowledge graph's
-absent retention in the security matrix; the segment classes with no
-production call site and the untested two-replica tail-sampling gateway in the
-telemetry matrix; the coordination workload across pods, the PostgreSQL arm
-for the shared substrate, and detected rather than announced departure in the
-fault-injection matrix. The items a consumer reported and the gap slices
-carry forward are tracked as GitHub issues, cited from the implementation
-plan's "Owed onward" lines.
+the knowledge graph's absent retention in the security matrix; the segment
+classes with no production call site and the untested two-replica
+tail-sampling gateway in the telemetry matrix; the coordination workload
+across pods, the PostgreSQL arm for the shared substrate, and detected rather
+than announced departure in the fault-injection matrix. The items a consumer
+reported and the gap slices carry forward are tracked as GitHub issues, cited
+from the implementation plan's "Owed onward" lines.

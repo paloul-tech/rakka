@@ -2545,6 +2545,17 @@ impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAutho
         // must run.
         self.0.review_tool_response(scope, intent, tool, content)
     }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: rakka_agent::AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentModelResponseDecision> {
+        // A wrapper forwards the boundary: the chain it wraps is the one that
+        // must run.
+        self.0.review_model_response(scope, intent, turn)
+    }
 }
 
 /// A gate that answers one fixed refusal for every intent.
@@ -2579,6 +2590,17 @@ impl AgentDispatchAuthority for FixedRefusalAuthority {
         // ever reaches this gate; the decision is stated rather than
         // inherited.
         rakka_agent::accept_tool_response_unchanged(content)
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        turn: rakka_agent::AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentModelResponseDecision> {
+        // Every dispatch is refused before a model can answer, so no turn ever
+        // reaches this gate; the decision is stated rather than inherited.
+        rakka_agent::accept_model_response_unchanged(turn)
     }
 }
 

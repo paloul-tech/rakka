@@ -111,7 +111,7 @@ inside the mutator, and is what that arrangement was verified for.
 | Tool capabilities declared outside model output, enforced before scheduling and dispatch | `AgentToolRegistry` + `AgentToolAuthority` | `tool_authority.rs` | Met |
 | Descriptor ≠ dispatch authority; five layers each validated at its boundary | `tools.rs` authorize ladder | `tool_authority.rs` | 4 of 5 — the model-visible descriptor rung is unwired (below) |
 | A dispatcher lacks ambient authority beyond its declared trust/tool/tenant class | Claim-time `AgentDispatchClaimFilter` + the authority's `execution-policy-unroutable` gate, as two independent layers | `executor_isolation.rs` | Met for routing; the worker's *actual* isolation is the platform's |
-| Versioned ordered guardrail stages at all seven boundaries | `AgentGuardrailChain`, evaluated at model-request, tool-request, tool-response, memory-ingress. The tool-response point (`AgentToolAuthority::review_tool_response`) runs in the dispatcher after execution and before delivery — the last point at which the result is in memory and nothing durable has recorded it — so a blocked result reaches neither the run, its session memory, nor a later context snapshot; it fails the effect as a determinate `guardrail-blocked` outcome of a tool that did run, delivered once and never retried, and a transformed result is what is delivered, so a redelivery carries the same content | `tool_authority.rs` (`a_blocked_tool_response_never_reaches_the_run`, `a_transformed_tool_response_is_what_the_run_records`, `a_checkpoint_requiring_tool_response_stage_fails_closed`, `a_tool_response_only_mandatory_stage_satisfies_coverage`), `memory_ingress_guardrails.rs` | **4 of 7** — see "Owed" |
+| Versioned ordered guardrail stages at all seven boundaries | `AgentGuardrailChain`, evaluated at model-request, tool-request, tool-response, model-response, memory-ingress, A2A ingress, and A2A egress. The two response points (`AgentToolAuthority::review_tool_response`, `review_model_response`) run in the dispatcher after the call and before the outcome exists — the last point at which the result is only in memory — so a blocked result or turn reaches neither the run, its session memory, nor a later context snapshot; each fails the effect as a determinate `guardrail-blocked` outcome of a call that did run, delivered once and never retried, and a transformed result or turn is what is delivered. A2A ingress runs at the agents surface's authorized leaves once per request; A2A egress runs in the two in-process send executors before the surface sees the message. The memory and A2A chains are attested on the authority (`with_memory_ingress`, `with_a2a_guardrails`) against a declaration digest, and count toward coverage only once attested | `tool_authority.rs`, `model_response_guardrails.rs` (`a_blocked_model_response_ends_the_run_once_and_never_reaches_memory`, `a_transformed_model_response_is_what_the_run_records`, `a_checkpoint_requiring_model_response_stage_fails_closed`, `a_model_response_only_mandatory_stage_satisfies_coverage`), `memory_ingress_guardrails.rs`, `memory_guardrail_chain_consistency.rs`, `rakka-a2a/tests/ingress_egress_guardrails.rs` (`an_ingress_block_refuses_the_send_and_creates_nothing`, `an_ingress_transform_is_what_the_task_records`, `an_ingress_block_reaches_an_in_process_executor_as_a_refused_finding`, `an_egress_block_refuses_the_delegation_send_before_the_service_sees_it`, `an_egress_transform_is_what_the_service_receives`) | **Met, 7 of 7** |
 | Bounded outcome set, stable reason code, protected evidence | `AgentGuardrailOutcome` | `guardrails.rs` unit tests | Met |
 | Deployment/tenant policy adds mandatory guardrails a definition cannot weaken | Deployment chain `mandatory()`; envelope `mandatory_guardrails` | `tool_authority.rs`, `definition_setup_envelope.rs` | Deployment-level met; **tenant-level does not exist** |
 | A transform is deterministic under a recorded revision; a retry reuses the accepted input | Synchronous rule trait + per-stage revision + the intent's chain-revision pin | `tool_authority.rs` | Met |
@@ -154,16 +154,6 @@ inside the mutator, and is what that arrangement was verified for.
 
 ## Owed, and why
 
-- **Guardrail evaluation points for `ModelResponse`, `A2aIngress`, and
-  `A2aEgress`** — 3 of 7 declared boundaries have no evaluation point.
-  `ToolResponse`, the poisoning-relevant one, was closed after Phase 6 (a tool
-  result now crosses the boundary before it is delivered; the `RequireCheckpoint`
-  outcome fails closed there, since no checkpoint can gate a response that
-  already exists). The model-response point is the same shape and the same
-  durable-semantics answer; the A2A points belong to the protocol adapter's
-  ingress and egress. The coverage gate fails closed meanwhile
-  (`guardrail-stage-unevaluated`). Tracked as
-  [#70](https://github.com/paloul-tech/rakka/issues/70).
 - **Communal retrieval into a model context**, `SnapshotCommunalClaim`, and
   per-claim read-capability enforcement. Deferred by slice 4.6;
   `MemoryContextSnapshot::communal_claims` is a permanently empty placeholder.

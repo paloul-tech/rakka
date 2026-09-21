@@ -145,19 +145,19 @@ pub use client::{
     AgentClientTaskView, AgentClientTransport, RakkaAgentClient,
 };
 pub use dispatch::{
-    accept_tool_response_unchanged, workflow_run_id, AgentA2aHandoffFinding,
-    AgentA2aHandoffSendExecutor, AgentA2aSendExecutor, AgentA2aSendFinding,
+    accept_model_response_unchanged, accept_tool_response_unchanged, workflow_run_id,
+    AgentA2aHandoffFinding, AgentA2aHandoffSendExecutor, AgentA2aSendExecutor, AgentA2aSendFinding,
     AgentClaimAppendExecutor, AgentClaimAppendFinding, AgentCompensationExecutor,
     AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchError, AgentDispatchFuture,
     AgentDispatchPass, AgentDispatchProbe, AgentDispatchResult, AgentDispatchToolExecutor,
     AgentDispatchWindow, AgentEffectCredentialResolver, AgentEffectReconciler,
     AgentEntityAuthority, AgentGoalEvaluationExecutor, AgentGoalEvaluationFinding,
-    AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentReconciliationFinding,
-    AgentRunEffectDispatcher, AgentRunResultDelivery, AgentRunSetupResolver,
-    AgentToolResponseDecision, AgentWorkflowCancelExecutor, AgentWorkflowCancelFinding,
-    AgentWorkflowStartExecutor, AgentWorkflowStartFinding, SessionMemoryPromotionExecutor,
-    WorkflowAgentRunEffectSink, AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH,
-    AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH,
+    AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentModelResponseDecision,
+    AgentReconciliationFinding, AgentRunEffectDispatcher, AgentRunResultDelivery,
+    AgentRunSetupResolver, AgentToolResponseDecision, AgentWorkflowCancelExecutor,
+    AgentWorkflowCancelFinding, AgentWorkflowStartExecutor, AgentWorkflowStartFinding,
+    SessionMemoryPromotionExecutor, WorkflowAgentRunEffectSink,
+    AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH, AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH,
 };
 pub use effect::{
     compensation_call_id, effect_id_for, effect_result_operation_id, external_idempotency_key_for,
@@ -193,11 +193,15 @@ pub use events::{
     AgentCoordinationReplayResult, AgentCoordinationSources, AGENT_COORDINATION_CURSOR_SEPARATOR,
     AGENT_COORDINATION_DEFAULT_PAGE_SIZE, AGENT_COORDINATION_MAX_PAGE_SIZE,
 };
+pub use guardrails::builtin::{
+    DenySubstrings, MaxTextLength, ReportOnly, RequireResultTool, AGENT_BUILTIN_DENY_MAX_ENTRIES,
+    AGENT_BUILTIN_DENY_MAX_ENTRY_BYTES,
+};
 pub use guardrails::{
     AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
     AgentGuardrailDecision, AgentGuardrailDisposition, AgentGuardrailError, AgentGuardrailOutcome,
-    AgentGuardrailReport, AgentGuardrailResult, AgentGuardrailStage, AgentGuardrailTransform,
-    AGENT_GUARDRAIL_CONTENT_MAX_BYTES, AGENT_GUARDRAIL_MAX_STAGES,
+    AgentGuardrailReport, AgentGuardrailResult, AgentGuardrailStage, AgentGuardrailSubject,
+    AgentGuardrailTransform, AGENT_GUARDRAIL_CONTENT_MAX_BYTES, AGENT_GUARDRAIL_MAX_STAGES,
     AGENT_GUARDRAIL_REASON_MAX_LENGTH,
 };
 pub use loop_runtime::{
@@ -541,12 +545,13 @@ pub use team::{
     AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES, DEFAULT_AGENT_TEAM_ENTITY_TYPE,
 };
 pub use tools::{
-    AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant,
+    refuse_guardrail_disposition, AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant,
     AgentEnvironmentConcurrencyProtocol, AgentExecutionPolicyRouter, AgentGrantDescriptor,
-    AgentGrantedDispatch, AgentToolAuthority, AgentToolBinding, AgentToolDescriptor,
-    AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResponseReview,
-    AgentToolResultBehavior, AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES,
-    AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
+    AgentGrantedDispatch, AgentModelResponseReview, AgentToolAuthority, AgentToolBinding,
+    AgentToolDescriptor, AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResponseReview,
+    AgentToolResultBehavior, AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES,
+    AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
+    AGENT_EVALUATED_GUARDRAIL_BOUNDARIES, AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES,
     AGENT_TOOL_DESCRIPTION_MAX_LENGTH, AGENT_TOOL_PARAMETERS_MAX_BYTES,
     AGENT_TOOL_REGISTRY_MAX_TOOLS,
 };
