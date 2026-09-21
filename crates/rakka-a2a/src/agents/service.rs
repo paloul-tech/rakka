@@ -438,12 +438,19 @@ where
     /// Answers `None` when no chain is installed or nothing was transformed,
     /// and the admitted request and command when a stage rewrote the parts or
     /// the cluster text. A block is a `Refused` error under `guardrail-blocked`.
+    ///
+    /// The pair is boxed because every call site holds the answer across its
+    /// awaits, and the send leaves are one flattened async state machine: an
+    /// owned `SendMessageRequest` plus an owned `NormalizedAgentCommand`, in
+    /// each of the five branches, is reserved in `send`'s future whether or
+    /// not that branch runs. Unboxed it grew the future by a quarter and
+    /// overflowed a test thread's 2 MiB stack in a debug build.
     fn admit_ingress(
         &self,
         subject: rakka_agent::AgentGuardrailSubject<'_>,
         request: &SendMessageRequest,
         normalized: &NormalizedAgentCommand,
-    ) -> RakkaAgentA2AResult<Option<(SendMessageRequest, NormalizedAgentCommand)>> {
+    ) -> RakkaAgentA2AResult<Option<Box<(SendMessageRequest, NormalizedAgentCommand)>>> {
         let Some(chain) = self.ingress_guardrails.as_ref() else {
             return Ok(None);
         };
@@ -471,7 +478,7 @@ where
         if let Some(text) = review.text {
             super::guardrails::apply_collaboration_text(&mut normalized, text);
         }
-        Ok(Some((admitted, normalized)))
+        Ok(Some(Box::new((admitted, normalized))))
     }
 
     /// Serves one `message/send`, dispatching on the message's declared
@@ -661,7 +668,7 @@ where
             request,
             normalized,
         )?;
-        let (request, normalized) = match admitted.as_ref() {
+        let (request, normalized) = match admitted.as_deref() {
             Some((request, normalized)) => (request, normalized),
             None => (request, normalized),
         };
@@ -789,7 +796,7 @@ where
             request,
             normalized,
         )?;
-        let (request, normalized) = match admitted.as_ref() {
+        let (request, normalized) = match admitted.as_deref() {
             Some((request, normalized)) => (request, normalized),
             None => (request, normalized),
         };
@@ -1145,7 +1152,7 @@ where
                     agent: Some(&target.agent),
                 };
                 let admitted = self.admit_ingress(subject, request, normalized)?;
-                let (request, normalized) = match admitted.as_ref() {
+                let (request, normalized) = match admitted.as_deref() {
                     Some((request, normalized)) => (request, normalized),
                     None => (request, normalized),
                 };
@@ -1216,7 +1223,7 @@ where
                 request,
                 normalized,
             )?;
-            let (request, normalized) = match admitted.as_ref() {
+            let (request, normalized) = match admitted.as_deref() {
                 Some((request, normalized)) => (request, normalized),
                 None => (request, normalized),
             };
@@ -1279,7 +1286,7 @@ where
             request,
             normalized,
         )?;
-        let (request, normalized) = match admitted.as_ref() {
+        let (request, normalized) = match admitted.as_deref() {
             Some((request, normalized)) => (request, normalized),
             None => (request, normalized),
         };
