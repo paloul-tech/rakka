@@ -193,6 +193,10 @@ pub use events::{
     AgentCoordinationReplayResult, AgentCoordinationSources, AGENT_COORDINATION_CURSOR_SEPARATOR,
     AGENT_COORDINATION_DEFAULT_PAGE_SIZE, AGENT_COORDINATION_MAX_PAGE_SIZE,
 };
+pub use guardrails::builtin::{
+    DenySubstrings, MaxTextLength, ReportOnly, RequireResultTool, AGENT_BUILTIN_DENY_MAX_ENTRIES,
+    AGENT_BUILTIN_DENY_MAX_ENTRY_BYTES,
+};
 pub use guardrails::{
     AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
     AgentGuardrailDecision, AgentGuardrailDisposition, AgentGuardrailError, AgentGuardrailOutcome,

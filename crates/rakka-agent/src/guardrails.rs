@@ -77,6 +77,8 @@ use crate::identity::{
 use crate::task::AgentContentDigest;
 use crate::TenantId;
 
+pub mod builtin;
+
 /// Most stages one guardrail chain may hold.
 pub const AGENT_GUARDRAIL_MAX_STAGES: usize = 32;
 
@@ -938,6 +940,14 @@ pub enum AgentGuardrailError {
         /// The surface's declaration digest.
         surface: AgentContentDigest,
     },
+    /// A built-in rule was constructed with an empty, blank, or oversized
+    /// configuration.
+    InvalidRule {
+        /// The rule's stable name.
+        rule: &'static str,
+        /// Why the configuration is refused.
+        reason: String,
+    },
 }
 
 impl AgentGuardrailError {
@@ -954,6 +964,7 @@ impl AgentGuardrailError {
             Self::NarrowedRevisionNotDistinct { .. } => "guardrail-narrowed-revision-not-distinct",
             Self::ChainMismatch { .. } => "guardrail-chain-mismatch",
             Self::A2aChainMismatch { .. } => "guardrail-chain-mismatch",
+            Self::InvalidRule { .. } => "guardrail-rule-invalid",
         }
     }
 }
@@ -1024,6 +1035,10 @@ impl Display for AgentGuardrailError {
                      the A2A surface's ({surface}) is the same one"
                 ),
             },
+            Self::InvalidRule { rule, reason } => write!(
+                f,
+                "the built-in guardrail rule {rule} is misconfigured: {reason}"
+            ),
         }
     }
 }
