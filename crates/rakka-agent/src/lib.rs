@@ -74,6 +74,7 @@ pub mod memory;
 pub mod memory_conformance;
 pub mod memory_retention;
 pub mod model;
+pub mod model_profile;
 pub mod observability;
 #[cfg(feature = "otel")]
 pub mod otel;
@@ -237,6 +238,12 @@ pub use model::{
     AgentModelRetryPolicy, AgentModelTurn, AgentModelUsage, AgentToolCallId, AgentToolCallRequest,
     AGENT_MODEL_MAX_TOOL_CALLS, AGENT_MODEL_TEXT_MAX_LENGTH, AGENT_MODEL_TURN_MAX_BYTES,
     AGENT_TOOL_ARGUMENTS_MAX_BYTES,
+};
+pub use model_profile::{
+    AgentModelCapabilities, AgentModelProfile, AgentModelProfileCatalog, AgentModelProfileError,
+    AgentModelProviderKind, AgentModelRouter, StaticAgentModelProfileCatalog,
+    AGENT_MODEL_PROFILE_ATTRIBUTE_MAX_BYTES, AGENT_MODEL_PROFILE_FORBIDDEN_ATTRIBUTE_KEYS,
+    AGENT_MODEL_PROFILE_MODEL_MAX_BYTES,
 };
 pub use observability::{
     agent_domain_instrument_views, agent_domain_metric_instrument, agent_durable_span_identity,

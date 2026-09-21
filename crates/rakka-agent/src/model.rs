@@ -39,7 +39,7 @@ use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 
-use rakka_agent_workflow::{AgentTelemetryContext, StateSchemaVersion};
+use rakka_agent_workflow::{AgentEphemeralCredential, AgentTelemetryContext, StateSchemaVersion};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -623,6 +623,26 @@ pub trait AgentModelAdapter: Send + Sync {
     /// so an adapter that assembles an out-of-bounds turn is refused where the
     /// outcome enters rather than after the run has recorded it.
     fn call<'a>(&'a self, request: &'a AgentModelRequest) -> AgentModelFuture<'a>;
+
+    /// Performs one bounded model call with the credential the dispatcher
+    /// resolved for this attempt, when the effect's grant named a binding.
+    ///
+    /// The dispatcher calls this and only this. The default forwards to
+    /// [`Self::call`], so an adapter that takes its credentials at
+    /// construction keeps working unchanged; an adapter that builds a
+    /// provider client per attempt overrides it, reads the material for the
+    /// duration of the call, and holds nothing afterwards. The credential is
+    /// the one [`crate::dispatch::AgentEffectCredentialResolver::resolve`]
+    /// produced inside the attempt, under the effect's own deadline; an
+    /// adapter never resolves a credential itself and never holds a resolver.
+    fn call_with<'a>(
+        &'a self,
+        request: &'a AgentModelRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentModelFuture<'a> {
+        let _ = credential;
+        self.call(request)
+    }
 }
 
 /// A model call that could not produce a bounded, interpretable turn.
@@ -686,6 +706,15 @@ pub enum AgentModelError {
         /// The provider or mapping failure detail.
         message: String,
     },
+    /// The adapter refused the call under a stable code of its own, before
+    /// or instead of asking a provider — an invalid profile, unsupported
+    /// credential material, or a route that does not exist.
+    Refused {
+        /// The stable code the refusal is answered under.
+        code: &'static str,
+        /// Bounded human-readable detail.
+        message: String,
+    },
 }
 
 impl AgentModelError {
@@ -702,6 +731,7 @@ impl AgentModelError {
             Self::Encoding { .. } => "model-encoding-failed",
             Self::InvalidRetryPolicy { .. } => "model-retry-policy-invalid",
             Self::Provider { .. } => "model-provider-failed",
+            Self::Refused { code, .. } => code,
         }
     }
 }
@@ -741,6 +771,9 @@ impl Display for AgentModelError {
             }
             Self::Provider { message } => {
                 write!(f, "the model provider call failed: {message}")
+            }
+            Self::Refused { code, message } => {
+                write!(f, "the model adapter refused the call ({code}): {message}")
             }
         }
     }
