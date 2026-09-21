@@ -2993,8 +2993,9 @@ impl Debug for AgentToolAuthority {
 ///
 /// A `CheckpointRequired` disposition is satisfied by a valid checkpoint grant
 /// exactly as a `checkpoint_required` binding is: `checkpoint_satisfied` is the
-/// verdict of [`AgentToolAuthority::evaluate_checkpoint_grant`] against the same
-/// intent. Without a grant the disposition still fails closed.
+/// verdict of `AgentToolAuthority::evaluate_checkpoint_grant` (private to
+/// this module) against the same intent. Without a grant the disposition
+/// still fails closed.
 ///
 /// Public so `rakka-a2a`'s A2A-ingress and A2A-egress evaluation points map a
 /// disposition onto a refusal identically to every boundary this crate
