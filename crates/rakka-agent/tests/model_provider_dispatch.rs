@@ -163,6 +163,36 @@ async fn a_credential_bearing_model_call_without_a_timeout_is_refused() {
     );
 }
 
+/// The same gate covers a binding the *intent* names. A deployment can put a
+/// credential binding on the model effect spec with no profile binding at
+/// all, and that secret reaches the dispatcher's resolver just the same, so
+/// an unbounded attempt is refused for the identical reason.
+#[tokio::test]
+async fn an_intent_named_model_binding_without_a_timeout_is_refused() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let mut envelope = envelope_for_registry(&registry);
+    envelope.model_profiles.insert(profile_id());
+    envelope.credential_bindings.insert(binding());
+    let fx = AuthorityFixture::new(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn()),
+        AgentToolAuthority::new(registry).with_model_profiles(catalog(false)),
+        // The model spec names the binding; the profile names none.
+        Some(AgentEffectSpec::read_only().with_credential_binding(binding())),
+    )
+    .with_envelope(envelope)
+    .with_credential_resolver("sk-live-sentinel");
+    fx.start().await;
+    select_profile(&fx).await;
+    fx.pump().await;
+    assert_eq!(fx.terminal_failure_code().await, "model-timeout-unset");
+    assert_eq!(fx.adapter.calls(), 0);
+    assert_eq!(
+        fx.credentials.as_ref().expect("resolver").resolutions(),
+        0,
+        "the refusal precedes any resolver call"
+    );
+}
+
 /// A profile without a binding needs no timeout and no resolver.
 #[tokio::test]
 async fn a_credential_free_profile_dispatches_without_a_timeout() {
