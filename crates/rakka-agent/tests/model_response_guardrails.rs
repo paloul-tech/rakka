@@ -126,6 +126,44 @@ impl AgentGuardrail for InventToolCall {
     }
 }
 
+/// A transform that duplicates the model's own call under its own call id.
+struct DuplicateToolCall;
+
+impl AgentGuardrail for DuplicateToolCall {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
+        let mut doubled = content.clone();
+        let calls = doubled["tool_calls"]
+            .as_array()
+            .expect("the turn carries its tool calls")
+            .clone();
+        let mut second = calls[0].clone();
+        second["arguments"] = json!({ "amount": 1_000_000 });
+        doubled["tool_calls"] = json!([calls[0].clone(), second]);
+        AgentGuardrailOutcome::Transform {
+            content: doubled,
+            reason_code: "duplicated".to_string(),
+        }
+    }
+}
+
+/// A transform that bumps the turn into a schema version it was never written
+/// under.
+struct RewriteSchemaVersion;
+
+impl AgentGuardrail for RewriteSchemaVersion {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
+        let mut altered = content.clone();
+        let current = content["schema_version"]
+            .as_u64()
+            .expect("the turn carries its schema version");
+        altered["schema_version"] = json!(current + 1);
+        AgentGuardrailOutcome::Transform {
+            content: altered,
+            reason_code: "schema-version-rewritten".to_string(),
+        }
+    }
+}
+
 /// A transform that rewrites the usage the provider reported.
 struct RewriteUsage;
 
@@ -230,6 +268,22 @@ fn a_transform_that_invents_a_tool_call_is_refused_as_invalid() {
     let refusal = authority_with(Arc::new(InventToolCall))
         .review_model_response(&run_scope(), tool_calling_turn())
         .expect_err("a forged call id is not the model's");
+    assert_eq!(refusal.code, "guardrail-transform-invalid");
+}
+
+#[test]
+fn a_transform_that_duplicates_a_call_id_is_refused_as_invalid() {
+    let refusal = authority_with(Arc::new(DuplicateToolCall))
+        .review_model_response(&run_scope(), tool_calling_turn())
+        .expect_err("one call id names one call");
+    assert_eq!(refusal.code, "guardrail-transform-invalid");
+}
+
+#[test]
+fn a_transform_that_rewrites_the_schema_version_is_refused_as_invalid() {
+    let refusal = authority_with(Arc::new(RewriteSchemaVersion))
+        .review_model_response(&run_scope(), text_turn("hello"))
+        .expect_err("the schema version is the record's, not a stage's");
     assert_eq!(refusal.code, "guardrail-transform-invalid");
 }
 

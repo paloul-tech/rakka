@@ -1207,11 +1207,12 @@ impl AgentToolAuthority {
     /// The content evaluated is the turn's own serialization, bounded at
     /// [`AGENT_MODEL_TURN_MAX_BYTES`]. A transform is decoded through the
     /// turn's validating deserializer and refused (`guardrail-transform-invalid`)
-    /// when it does not form a bounded turn, when it rewrites the adapter
-    /// version, model profile, or usage the provider reported, or when it
-    /// carries a tool call under a call id the model did not produce; a stage
-    /// may rewrite text, drop or rewrite the model's own tool calls, and
-    /// rewrite the proposal. `RequireCheckpoint` fails closed
+    /// when it does not form a bounded turn, when it rewrites the schema
+    /// version, adapter version, model profile, or usage the provider
+    /// reported, when it carries a tool call under a call id the model did not
+    /// produce, or when it carries two tool calls under one call id; a stage
+    /// may rewrite text, drop, reorder, or rewrite the model's own tool calls,
+    /// and rewrite the proposal. `RequireCheckpoint` fails closed
     /// (`checkpoint-required`): no checkpoint can gate a response that
     /// already exists.
     ///
@@ -1254,14 +1255,23 @@ impl AgentToolAuthority {
                     format!("the transformed model turn is out of bounds: {error}"),
                 )
             })?;
-            if transformed.adapter_version != review.turn.adapter_version
+            // The schema version is provenance a stage can reach: it is a
+            // private field, so nothing but `AgentModelTurn::new` sets it in
+            // Rust, but it round-trips through the shadow record as a required
+            // field and `validate` does not check it — so a stage editing JSON
+            // could bump the turn into a version it was never written under,
+            // which the N+1 acceptance window would admit.
+            if crate::schema::VersionedAgentRecord::schema_version(&transformed)
+                != crate::schema::VersionedAgentRecord::schema_version(&review.turn)
+                || transformed.adapter_version != review.turn.adapter_version
                 || transformed.model_profile != review.turn.model_profile
                 || transformed.usage != review.turn.usage
             {
                 return Err(AgentAuthorityRefusal::of(
                     "guardrail-transform-invalid",
                     "a guardrail transform may rewrite a turn's text, tool calls, and proposal; \
-                     it may not rewrite its adapter version, model profile, or usage",
+                     it may not rewrite its schema version, adapter version, model profile, or \
+                     usage",
                 ));
             }
             let invented = transformed.tool_calls.iter().any(|call| {
@@ -1276,6 +1286,21 @@ impl AgentToolAuthority {
                     "guardrail-transform-invalid",
                     "a guardrail transform may drop or rewrite a tool call the model made; it \
                      may not add one under a call id the model did not produce",
+                ));
+            }
+            // A call id is the dispatch identity of the call it names, so two
+            // calls sharing one is not a rewrite of the model's call but a
+            // second call smuggled under its name. Dropping and reordering
+            // calls stay permitted.
+            let mut seen = BTreeSet::new();
+            if transformed
+                .tool_calls
+                .iter()
+                .any(|call| !seen.insert(&call.call_id))
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    "guardrail-transform-invalid",
+                    "a guardrail transform may not carry two tool calls under one call id",
                 ));
             }
             review.turn = transformed;
