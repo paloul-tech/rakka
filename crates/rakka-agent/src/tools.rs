@@ -89,7 +89,10 @@ use crate::guardrails::{
 };
 use crate::identity::{AgentGoalId, AgentRunScope, AgentTaskId};
 use crate::memory::AgentRunMemory;
-use crate::model::{AgentToolCallRequest, AGENT_TOOL_ARGUMENTS_MAX_BYTES};
+use crate::model::{
+    AgentModelTurn, AgentToolCallRequest, AGENT_MODEL_TURN_MAX_BYTES,
+    AGENT_TOOL_ARGUMENTS_MAX_BYTES,
+};
 use crate::task::{AgentContentDigest, AgentSchemaRef, AgentTaskContent};
 
 /// Largest model-visible tool description, in bytes.
@@ -1074,6 +1077,35 @@ impl AgentToolResponseReview {
     }
 }
 
+/// What the `ModelResponse` boundary decided about one model turn.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct AgentModelResponseReview {
+    /// The turn the run records: the model's unchanged, or the chain's
+    /// deterministic transform of it.
+    pub turn: AgentModelTurn,
+    /// Whether a stage replaced the turn.
+    pub transformed: bool,
+    /// Every transform applied, with its reason, for the dispatch trace.
+    pub transforms: Vec<AgentGuardrailTransform>,
+    /// Every report-only finding, for the dispatch trace.
+    pub reports: Vec<AgentGuardrailReport>,
+}
+
+impl AgentModelResponseReview {
+    /// A review that changed nothing: no chain is configured, or every stage
+    /// allowed the turn.
+    #[must_use]
+    pub fn unchanged(turn: AgentModelTurn) -> Self {
+        Self {
+            turn,
+            transformed: false,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+        }
+    }
+}
+
 impl AgentToolAuthority {
     /// Evaluates one executed tool's result at
     /// [`AgentGuardrailBoundary::ToolResponse`], before the result becomes
@@ -1155,6 +1187,98 @@ impl AgentToolAuthority {
                     format!("the transformed tool result is not a bounded inline result: {error}"),
                 )
             })?;
+            review.transformed = true;
+        }
+        Ok(review)
+    }
+
+    /// Evaluates one model turn at [`AgentGuardrailBoundary::ModelResponse`],
+    /// before the turn becomes durable anywhere.
+    ///
+    /// The model already answered, so the boundary decides what the *run*
+    /// records, never whether the model is called: a blocked turn is a
+    /// determinate failure of an effect that did run (`guardrail-blocked`),
+    /// delivered once and never retried, and a transformed turn is what the
+    /// run commits — so its session-memory entry and every later context
+    /// snapshot hold the transformed text. This is the `ToolResponse`
+    /// precedent ([`Self::review_tool_response`]) applied to the other
+    /// response boundary.
+    ///
+    /// The content evaluated is the turn's own serialization, bounded at
+    /// [`AGENT_MODEL_TURN_MAX_BYTES`]. A transform is decoded through the
+    /// turn's validating deserializer and refused (`guardrail-transform-invalid`)
+    /// when it does not form a bounded turn, when it rewrites the adapter
+    /// version, model profile, or usage the provider reported, or when it
+    /// carries a tool call under a call id the model did not produce; a stage
+    /// may rewrite text, drop or rewrite the model's own tool calls, and
+    /// rewrite the proposal. `RequireCheckpoint` fails closed
+    /// (`checkpoint-required`): no checkpoint can gate a response that
+    /// already exists.
+    ///
+    /// # Errors
+    ///
+    /// The refusal the disposition maps to, with the stable code.
+    pub fn review_model_response(
+        &self,
+        scope: &AgentRunScope,
+        turn: AgentModelTurn,
+    ) -> Result<AgentModelResponseReview, AgentAuthorityRefusal> {
+        let Some(chain) = &self.guardrails else {
+            return Ok(AgentModelResponseReview::unchanged(turn));
+        };
+        let value = serde_json::to_value(&turn).map_err(|error| {
+            AgentAuthorityRefusal::of(
+                "guardrail-content-unencodable",
+                format!("the model turn does not encode: {error}"),
+            )
+        })?;
+        let guardrail_context =
+            AgentGuardrailContext::new(AgentGuardrailBoundary::ModelResponse, scope);
+        let decision =
+            chain.evaluate_bounded(&guardrail_context, &value, AGENT_MODEL_TURN_MAX_BYTES);
+        refuse_guardrail_disposition(&decision.disposition, "the model response", false)?;
+        let mut review = AgentModelResponseReview::unchanged(turn);
+        review.transforms = decision.transforms;
+        review.reports = decision.reports;
+        if decision.transformed {
+            let transformed: AgentModelTurn =
+                serde_json::from_value(decision.content).map_err(|error| {
+                    AgentAuthorityRefusal::of(
+                        "guardrail-transform-invalid",
+                        format!("the transformed model turn is not a bounded turn: {error}"),
+                    )
+                })?;
+            transformed.validate().map_err(|error| {
+                AgentAuthorityRefusal::of(
+                    "guardrail-transform-invalid",
+                    format!("the transformed model turn is out of bounds: {error}"),
+                )
+            })?;
+            if transformed.adapter_version != review.turn.adapter_version
+                || transformed.model_profile != review.turn.model_profile
+                || transformed.usage != review.turn.usage
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    "guardrail-transform-invalid",
+                    "a guardrail transform may rewrite a turn's text, tool calls, and proposal; \
+                     it may not rewrite its adapter version, model profile, or usage",
+                ));
+            }
+            let invented = transformed.tool_calls.iter().any(|call| {
+                !review
+                    .turn
+                    .tool_calls
+                    .iter()
+                    .any(|original| original.call_id == call.call_id)
+            });
+            if invented {
+                return Err(AgentAuthorityRefusal::of(
+                    "guardrail-transform-invalid",
+                    "a guardrail transform may drop or rewrite a tool call the model made; it \
+                     may not add one under a call id the model did not produce",
+                ));
+            }
+            review.turn = transformed;
             review.transformed = true;
         }
         Ok(review)

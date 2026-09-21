@@ -128,7 +128,9 @@ use crate::memory::{
     AgentPromotedMemoryRef, MemoryError, MemoryOperationId, MemorySequence,
     PrivateMemoryExpectation, SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
 };
-use crate::model::{AgentModelAdapter, AgentModelRequest, AgentToolCallId, AgentToolCallRequest};
+use crate::model::{
+    AgentModelAdapter, AgentModelRequest, AgentModelTurn, AgentToolCallId, AgentToolCallRequest,
+};
 use crate::observability::{
     agent_linked_telemetry_context, agent_span_link, AgentSegmentOperation, AgentSegmentTimer,
     LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_RECONCILIATION_DECISION, SEGMENT_ATTR_EFFECT_ATTEMPT,
@@ -141,8 +143,8 @@ use crate::run::{
 use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
 use crate::task::AgentTaskContent;
 use crate::tools::{
-    AgentAuthorityContext, AgentAuthorityRefusal, AgentGrantedDispatch, AgentToolAuthority,
-    AgentToolResponseReview,
+    AgentAuthorityContext, AgentAuthorityRefusal, AgentGrantedDispatch, AgentModelResponseReview,
+    AgentToolAuthority, AgentToolResponseReview,
 };
 
 /// Result type for dispatch pipeline operations.
@@ -1413,7 +1415,7 @@ pub enum AgentDispatchDecision {
 /// privileged worker [specification 16](../../../docs/plans/rakka-agent/spec.md)
 /// forbids claiming isolation from.
 ///
-/// Both methods are required. A wrapping authority that forgot to forward
+/// All three methods are required. A wrapping authority that forgot to forward
 /// [`Self::review_tool_response`] would silently drop the `ToolResponse`
 /// evaluation point, so every implementation states what it does at that
 /// boundary; [`accept_tool_response_unchanged`] is the one-line body for an
@@ -1440,7 +1442,7 @@ pub enum AgentDispatchDecision {
 ///     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
 ///         unimplemented!()
 ///     }
-///     // `review_tool_response` is missing: the impl is incomplete.
+///     // `review_tool_response` and `review_model_response` are missing: the impl is incomplete.
 /// }
 /// ```
 pub trait AgentDispatchAuthority: Send + Sync {
@@ -1475,6 +1477,21 @@ pub trait AgentDispatchAuthority: Send + Sync {
         tool: Option<&'a AgentToolId>,
         content: AgentTaskContent,
     ) -> AgentDispatchFuture<'a, AgentToolResponseDecision>;
+
+    /// Reviews one model turn at the `ModelResponse` boundary, before the
+    /// pipeline records it ([`AgentToolAuthority::review_model_response`]).
+    ///
+    /// Required, not defaulted, for the reason [`Self::review_tool_response`]
+    /// is: an authority that evaluates no response chain says so with
+    /// [`accept_model_response_unchanged`], and a wrapper forwards to the
+    /// authority it wraps. A defaulted accept would let a wrapper drop the
+    /// boundary by omission.
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, AgentModelResponseDecision>;
 }
 
 /// The accept-unchanged body of
@@ -1487,9 +1504,10 @@ pub trait AgentDispatchAuthority: Send + Sync {
 ///
 /// ```
 /// use rakka_agent::{
-///     accept_tool_response_unchanged, AgentDispatchAuthority, AgentDispatchDecision,
-///     AgentDispatchFuture, AgentRunEffect, AgentRunScope, AgentRunState, AgentTaskContent,
-///     AgentToolId, AgentToolResponseDecision,
+///     accept_model_response_unchanged, accept_tool_response_unchanged, AgentDispatchAuthority,
+///     AgentDispatchDecision, AgentDispatchFuture, AgentModelResponseDecision, AgentModelTurn,
+///     AgentRunEffect, AgentRunScope, AgentRunState, AgentTaskContent, AgentToolId,
+///     AgentToolResponseDecision,
 /// };
 /// use rakka_agent_workflow::AgentTimestampMillis;
 ///
@@ -1516,6 +1534,15 @@ pub trait AgentDispatchAuthority: Send + Sync {
 ///     ) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
 ///         accept_tool_response_unchanged(content)
 ///     }
+///
+///     fn review_model_response<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _intent: &'a AgentRunEffect,
+///         turn: AgentModelTurn,
+///     ) -> AgentDispatchFuture<'a, AgentModelResponseDecision> {
+///         accept_model_response_unchanged(turn)
+///     }
 /// }
 /// ```
 #[must_use]
@@ -1537,6 +1564,33 @@ pub enum AgentToolResponseDecision {
     Accepted(Box<AgentToolResponseReview>),
     /// The result is refused: the effect fails under the refusal's code.
     Refused(AgentAuthorityRefusal),
+}
+
+/// What the `ModelResponse` boundary decided about a model turn.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentModelResponseDecision {
+    /// The run records the reviewed turn.
+    Accepted(Box<AgentModelResponseReview>),
+    /// The turn is refused: the effect fails under the refusal's code.
+    Refused(AgentAuthorityRefusal),
+}
+
+/// The accept-unchanged body of
+/// [`AgentDispatchAuthority::review_model_response`]: the turn is recorded
+/// exactly as the model produced it, with no transform and no report.
+///
+/// For an authority that evaluates no `ModelResponse` chain. A wrapping
+/// authority does not use it — it forwards to the authority it wraps.
+#[must_use]
+pub fn accept_model_response_unchanged<'a>(
+    turn: AgentModelTurn,
+) -> AgentDispatchFuture<'a, AgentModelResponseDecision> {
+    Box::pin(async move {
+        Ok(AgentModelResponseDecision::Accepted(Box::new(
+            AgentModelResponseReview::unchanged(turn),
+        )))
+    })
 }
 
 /// Resolves the setup revision one run was created under, so the dispatch
@@ -1725,6 +1779,20 @@ where
                     Err(refusal) => AgentToolResponseDecision::Refused(refusal),
                 },
             )
+        })
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, AgentModelResponseDecision> {
+        Box::pin(async move {
+            Ok(match self.authority.review_model_response(scope, turn) {
+                Ok(review) => AgentModelResponseDecision::Accepted(Box::new(review)),
+                Err(refusal) => AgentModelResponseDecision::Refused(refusal),
+            })
         })
     }
 }

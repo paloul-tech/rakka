@@ -145,19 +145,19 @@ pub use client::{
     AgentClientTaskView, AgentClientTransport, RakkaAgentClient,
 };
 pub use dispatch::{
-    accept_tool_response_unchanged, workflow_run_id, AgentA2aHandoffFinding,
-    AgentA2aHandoffSendExecutor, AgentA2aSendExecutor, AgentA2aSendFinding,
+    accept_model_response_unchanged, accept_tool_response_unchanged, workflow_run_id,
+    AgentA2aHandoffFinding, AgentA2aHandoffSendExecutor, AgentA2aSendExecutor, AgentA2aSendFinding,
     AgentClaimAppendExecutor, AgentClaimAppendFinding, AgentCompensationExecutor,
     AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchError, AgentDispatchFuture,
     AgentDispatchPass, AgentDispatchProbe, AgentDispatchResult, AgentDispatchToolExecutor,
     AgentDispatchWindow, AgentEffectCredentialResolver, AgentEffectReconciler,
     AgentEntityAuthority, AgentGoalEvaluationExecutor, AgentGoalEvaluationFinding,
-    AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentReconciliationFinding,
-    AgentRunEffectDispatcher, AgentRunResultDelivery, AgentRunSetupResolver,
-    AgentToolResponseDecision, AgentWorkflowCancelExecutor, AgentWorkflowCancelFinding,
-    AgentWorkflowStartExecutor, AgentWorkflowStartFinding, SessionMemoryPromotionExecutor,
-    WorkflowAgentRunEffectSink, AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH,
-    AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH,
+    AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentModelResponseDecision,
+    AgentReconciliationFinding, AgentRunEffectDispatcher, AgentRunResultDelivery,
+    AgentRunSetupResolver, AgentToolResponseDecision, AgentWorkflowCancelExecutor,
+    AgentWorkflowCancelFinding, AgentWorkflowStartExecutor, AgentWorkflowStartFinding,
+    SessionMemoryPromotionExecutor, WorkflowAgentRunEffectSink,
+    AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH, AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH,
 };
 pub use effect::{
     compensation_call_id, effect_id_for, effect_result_operation_id, external_idempotency_key_for,
@@ -543,8 +543,8 @@ pub use team::{
 pub use tools::{
     AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant,
     AgentEnvironmentConcurrencyProtocol, AgentExecutionPolicyRouter, AgentGrantDescriptor,
-    AgentGrantedDispatch, AgentToolAuthority, AgentToolBinding, AgentToolDescriptor,
-    AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResponseReview,
+    AgentGrantedDispatch, AgentModelResponseReview, AgentToolAuthority, AgentToolBinding,
+    AgentToolDescriptor, AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResponseReview,
     AgentToolResultBehavior, AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES,
     AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
     AGENT_TOOL_DESCRIPTION_MAX_LENGTH, AGENT_TOOL_PARAMETERS_MAX_BYTES,
