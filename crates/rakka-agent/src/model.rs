@@ -376,7 +376,11 @@ impl<'de> Deserialize<'de> for AgentModelTurn {
 /// model call may need is named by the agent's definition and resolved inside
 /// the dispatcher's bounded attempt, never here
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: the request carries tool descriptors, whose inline parameter
+// schemas are `serde_json::Value` — which is `PartialEq` and not `Eq`. The
+// authority's own [`crate::tools::AgentGrantedDispatch`], which carries the
+// same descriptors, draws the line in the same place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentModelRequest {
     /// The immutable context the call is prepared against.
     ///
@@ -412,6 +416,14 @@ pub struct AgentModelRequest {
     /// context.
     #[serde(default)]
     pub telemetry: AgentTelemetryContext,
+    /// The descriptors the model may be shown for this call: the registered
+    /// tools the envelope declares, minus those the current settings revoke,
+    /// narrowed by the run's setup — the authority's `model_visible`
+    /// derivation, carried here so the adapter declares each beside the
+    /// result tool. Visibility is not authority: a call the model makes still
+    /// needs a grant to dispatch.
+    #[serde(default)]
+    pub tools: Vec<crate::tools::AgentToolDescriptor>,
 }
 
 impl AgentModelRequest {
@@ -430,6 +442,7 @@ impl AgentModelRequest {
             settings_revision: AgentRevisionNumber::INITIAL,
             turn,
             telemetry: AgentTelemetryContext::default(),
+            tools: Vec::new(),
         }
     }
 
@@ -458,6 +471,13 @@ impl AgentModelRequest {
     #[must_use]
     pub const fn with_settings_revision(mut self, revision: AgentRevisionNumber) -> Self {
         self.settings_revision = revision;
+        self
+    }
+
+    /// Carries the model-visible tool list.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<crate::tools::AgentToolDescriptor>) -> Self {
+        self.tools = tools;
         self
     }
 }

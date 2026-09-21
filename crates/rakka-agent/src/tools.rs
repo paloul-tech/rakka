@@ -221,7 +221,7 @@ pub type AgentToolResult<T> = Result<T, AgentToolError>;
 
 /// The kind of component behind a tool
 /// ([specification 11.7](../../../docs/plans/rakka-agent/spec.md)).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AgentToolKind {
@@ -269,7 +269,7 @@ impl Display for AgentToolKind {
 /// How a tool's result is bounded
 /// ([specification 11.7](../../../docs/plans/rakka-agent/spec.md): every
 /// descriptor declares bounded result/artifact behavior).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AgentToolResultBehavior {
@@ -305,7 +305,7 @@ impl Display for AgentToolResultBehavior {
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)): showing it
 /// to a model lets the model *ask*, and everything that decides whether the
 /// ask executes lives in the binding, the intent, and the grant.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentToolDescriptor {
     /// Stable tool name.
     pub tool: AgentToolId,
