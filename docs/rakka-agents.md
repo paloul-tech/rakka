@@ -119,8 +119,13 @@ leaves behind is the same either way.
    task stays assignable rather than failing.
 3. **The loop.** The run persists an immutable memory context snapshot, then
    schedules a model call as a durable effect. The model adapter (Rig behind
-   the `rig` feature; a deterministic adapter in the testkit) returns a bounded
-   turn: text, tool-call *requests*, or a typed result proposal. Turns are
+   the `rig` feature — `RigModelAdapter` over any Rig completion model, and
+   `RigProviderAdapter` over a model profile and an injected HTTP backend
+   (`rakka_agent::rig::ReqwestClient`, rig's own `reqwest::Client`, is the
+   plain backend a deployment wires without taking a direct `reqwest`
+   dependency), building the provider client per attempt from the credential
+   the dispatcher resolved; a deterministic adapter in the testkit) returns a
+   bounded turn: text, tool-call *requests*, or a typed result proposal. Turns are
    recorded to session memory and dropped, so a run that iterates a hundred
    times persists no more state of its own than one that iterates once.
 4. **Effects.** Each model call, tool call, A2A send, workflow start, and

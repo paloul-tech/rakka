@@ -1082,6 +1082,12 @@ model request and converts the provider response into a bounded Rakka
 result/artifact. The durable loop, effect model, and testkit MUST depend only
 on this trait.
 
+The trait's `call_with(request, credential)` is the per-attempt entry the
+dispatcher uses: the ephemeral credential it resolved for the model
+profile's binding is handed to the adapter for that attempt only and is
+dropped with it; `call(request)` remains for adapters that need none, and
+`call_with` defaults to it. (Phase 7 slice 7.1, 2026-09-21.)
+
 The Rig-backed implementation of the trait MUST live behind a `rig` cargo
 feature of `rakka-agent`. The feature SHOULD be enabled by default, but the
 crate MUST compile and pass its tests with `--no-default-features`, and the
