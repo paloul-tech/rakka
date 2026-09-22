@@ -426,8 +426,9 @@ async fn a_resolved_credential_reaches_no_durable_record_of_a_completed_run() {
 }
 
 /// A model call whose credential comes from a profile's binding leaves the
-/// credential on no durable record, log, or metric — the same sweep the
-/// tool-credential scenarios run, over a profiled run.
+/// credential on no durable record — the same durable sweep the tool-credential
+/// scenarios run ([`assert_no_secret_anywhere`]), over a profiled run. The
+/// telemetry surfaces are a separate scenario, below.
 #[tokio::test]
 async fn a_profile_resolved_model_credential_reaches_no_durable_record() {
     use rakka_agent::{
