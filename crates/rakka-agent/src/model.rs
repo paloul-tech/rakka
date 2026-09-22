@@ -117,14 +117,18 @@ fn truncate_at_boundary(mut value: String, max_bytes: usize) -> String {
 impl AgentModelResponseMetadata {
     /// Metadata with each field truncated to [`AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES`]
     /// at a character boundary, so provider text can never produce an
-    /// unbounded turn.
+    /// unbounded turn. An empty string is folded to `None`: an adapter must
+    /// never export `gen_ai.response.model = ""` or an equally empty finish
+    /// reason.
     #[must_use]
     pub fn bounded(model: Option<String>, finish_reason: Option<String>) -> Self {
         Self {
             model: model
-                .map(|value| truncate_at_boundary(value, AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES)),
+                .map(|value| truncate_at_boundary(value, AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES))
+                .filter(|value| !value.is_empty()),
             finish_reason: finish_reason
-                .map(|value| truncate_at_boundary(value, AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES)),
+                .map(|value| truncate_at_boundary(value, AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES))
+                .filter(|value| !value.is_empty()),
         }
     }
 }
@@ -755,6 +759,16 @@ pub trait AgentModelAdapter: Send + Sync {
     /// the one [`crate::dispatch::AgentEffectCredentialResolver::resolve`]
     /// produced inside the attempt, under the effect's own deadline; an
     /// adapter never resolves a credential itself and never holds a resolver.
+    ///
+    /// # The error text this returns becomes durable state
+    ///
+    /// A failing call's error text is persisted — bounded to
+    /// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`](crate::dispatch::AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH)
+    /// — on the run's durable outbox row and echoed onto the dispatcher
+    /// fleet's index entry, where every worker in the fleet can read it. An
+    /// adapter must never place credential material, request content, or a
+    /// provider's verbatim response body in the error it returns — a stable
+    /// code and a short reason are the contract.
     fn call_with<'a>(
         &'a self,
         request: &'a AgentModelRequest,
@@ -1037,5 +1051,10 @@ mod tests {
         let decoded: AgentModelTurn =
             serde_json::from_str(&encoded).expect("a pre-field record decodes");
         assert!(decoded.response_model.is_none() && decoded.usage.cached_input_tokens.is_none());
+        assert_eq!(
+            AgentModelResponseMetadata::bounded(Some(String::new()), Some(String::new())),
+            AgentModelResponseMetadata::default(),
+            "an empty string is not a report"
+        );
     }
 }

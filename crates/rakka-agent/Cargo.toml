@@ -37,11 +37,13 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-# Pinned, reviewed Rig version for the `rig` feature. Default features are off:
-# Rakka needs only Rig's provider-neutral completion contract, and the deploying
-# application supplies the concrete provider client and its transport
-# ([specification 10.2](../../docs/plans/rakka-agent/spec.md)).
-rig-core = { version = "=0.37.0", default-features = false, optional = true }
+# Pinned, reviewed Rig version for the `rig` feature. Default features are off,
+# with `rustls` alone: it selects a TLS backend for rig's non-optional
+# `reqwest` 0.13 and nothing else. Rig's `reqwest` feature is never enabled —
+# it turns on `reqwest/system-proxy`, an environment-proxy egress bypass, and
+# Cargo feature unification would switch it on for every crate in a consumer's
+# dependency graph. `crate_shape.rs` holds this.
+rig-core = { version = "=0.37.0", default-features = false, features = ["rustls"], optional = true }
 
 [dev-dependencies]
 # Property tests for the derived wake identity: same occurrence from any

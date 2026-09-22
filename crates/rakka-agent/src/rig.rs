@@ -16,7 +16,13 @@
 //! changes request, tool-call, message, or serialized run semantics receives an
 //! adapter compatibility review, and it never changes the Rakka-owned adapter
 //! trait, the core domain types, or the persisted loop representation
-//! ([specification 10.2](../../../docs/plans/rakka-agent/spec.md)).
+//! ([specification 10.2](../../../docs/plans/rakka-agent/spec.md)). The
+//! review's checklist: the provider client builders this module composes with
+//! (`Client::builder`, `http_client`, `base_url`, `build`), the two raw
+//! response types the response-metadata extractors read
+//! (`providers::anthropic::completion::CompletionResponse`,
+//! `providers::openai::completion::CompletionResponse`), and `Usage`'s cached
+//! and reasoning fields.
 //!
 //! # What the adapter maps
 //!
@@ -38,8 +44,10 @@
 //! registry and slice 1.11's context snapshot formalize the surrounding
 //! machinery without changing this adapter's contract. The adapter declares the
 //! result tool on every completion request it builds — a provider can only call
-//! a tool it was offered — while external tools are declared by slice 1.8's
-//! registry.
+//! a tool it was offered — and declares each model-visible descriptor the
+//! request carries beside it; slice 1.8's registry and the dispatch
+//! authority's `model_visible` derivation decide which descriptors a request
+//! carries, never this adapter.
 //!
 //! A provider client, stream, open request, or credential value is never durable
 //! state ([specification 10.1](../../../docs/plans/rakka-agent/spec.md)): the
@@ -58,8 +66,9 @@ use rig_core::OneOrMany;
 use crate::definition::{AgentRevisionNumber, AgentToolId};
 use crate::loop_runtime::CURRENT_AGENT_LOOP_ADAPTER_VERSION;
 use crate::model::{
-    AgentModelAdapter, AgentModelError, AgentModelFuture, AgentModelRequest, AgentModelResult,
-    AgentModelRetryPolicy, AgentModelTurn, AgentModelUsage, AgentToolCallId, AgentToolCallRequest,
+    AgentModelAdapter, AgentModelError, AgentModelFuture, AgentModelRequest,
+    AgentModelResponseMetadata, AgentModelResult, AgentModelRetryPolicy, AgentModelTurn,
+    AgentModelUsage, AgentToolCallId, AgentToolCallRequest,
 };
 use crate::task::AgentTaskContent;
 
@@ -85,11 +94,15 @@ fn provider_error<E: Display>(error: E) -> AgentModelError {
 /// nor persists them. The turn it produces is the only durable format for what
 /// the model returned — no Rig type crosses this boundary.
 #[derive(Debug, Clone)]
-pub struct RigModelAdapter<M> {
+pub struct RigModelAdapter<M>
+where
+    M: CompletionModel,
+{
     model: M,
     adapter_version: AgentRevisionNumber,
     retry_policy: AgentModelRetryPolicy,
     result_tool: String,
+    response_metadata: Option<fn(&M::Response) -> AgentModelResponseMetadata>,
 }
 
 impl<M> RigModelAdapter<M>
@@ -105,6 +118,7 @@ where
             adapter_version: CURRENT_AGENT_LOOP_ADAPTER_VERSION,
             retry_policy: AgentModelRetryPolicy::DEFAULT,
             result_tool: AGENT_RESULT_TOOL_DEFAULT.to_string(),
+            response_metadata: None,
         }
     }
 
@@ -134,6 +148,22 @@ where
         self
     }
 
+    /// Installs an extractor that reads the provider's response model and
+    /// finish reason from the raw response, for the turn's provenance slots.
+    ///
+    /// Rig's `CompletionResponse<T>` carries those only inside the provider's
+    /// own `T`, so the adapter cannot read them generically; a provider
+    /// adapter installs the extractor for the response type it knows
+    /// ([`anthropic_response_metadata`], [`openai_completions_response_metadata`]).
+    #[must_use]
+    pub fn with_response_metadata(
+        mut self,
+        extractor: fn(&M::Response) -> AgentModelResponseMetadata,
+    ) -> Self {
+        self.response_metadata = Some(extractor);
+        self
+    }
+
     /// Builds the Rig completion request one model request resolves to.
     ///
     /// The context snapshot is opaque in the interim, so the prompt only names
@@ -146,8 +176,11 @@ where
     /// express "I am done, here is the result" and no Rig-backed run could
     /// complete. Its argument schema is permissive in the interim — the task's
     /// result schema is judged by the task entity's rules where the proposal is
-    /// decided, not trusted to the provider. External tools are declared by the
-    /// tool registry of slice 1.8, not here.
+    /// decided, not trusted to the provider. Every descriptor the request
+    /// carries as model-visible is declared beside it: visibility is decided
+    /// upstream, by the tool registry and the authority's `model_visible`
+    /// derivation — this only turns what the request already names into the
+    /// provider's own tool-declaration shape.
     fn build_request(&self, request: &AgentModelRequest) -> CompletionRequest {
         let mut builder = self
             .model
@@ -168,6 +201,15 @@ where
                     "additionalProperties": true,
                 }),
             });
+        for descriptor in &request.tools {
+            builder = builder.tool(ToolDefinition {
+                name: descriptor.tool.as_str().to_string(),
+                description: descriptor.description.clone(),
+                parameters: descriptor.parameters.clone().unwrap_or_else(
+                    || serde_json::json!({ "type": "object", "additionalProperties": true }),
+                ),
+            });
+        }
         // Rig's builder has no first-class nucleus-sampling parameter, so the
         // resolved cutoff rides the provider-parameter escape hatch rather than
         // being silently dropped.
@@ -180,9 +222,9 @@ where
     }
 
     /// Maps a provider response onto a bounded Rakka turn.
-    fn turn_from_response<R>(
+    fn turn_from_response(
         &self,
-        response: CompletionResponse<R>,
+        response: CompletionResponse<M::Response>,
         request: &AgentModelRequest,
     ) -> AgentModelResult<AgentModelTurn> {
         let mut turn =
@@ -193,6 +235,15 @@ where
 
         let mut text = String::new();
         let mut unmapped_content = false;
+        if let Some(extract) = self.response_metadata {
+            let metadata = extract(&response.raw_response);
+            if let Some(model) = metadata.model {
+                turn = turn.with_response_model(model);
+            }
+            if let Some(reason) = metadata.finish_reason {
+                turn = turn.with_finish_reason(reason);
+            }
+        }
         for content in response.choice {
             match content {
                 AssistantContent::Text(part) => {
@@ -291,8 +342,33 @@ fn model_usage(usage: &Usage) -> AgentModelUsage {
         input_tokens,
         output_tokens: usage.output_tokens,
         cost_micros: 0,
-        ..Default::default()
+        cached_input_tokens: (usage.cached_input_tokens > 0).then_some(usage.cached_input_tokens),
+        reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),
     }
+}
+
+/// Reads the response model and stop reason from an Anthropic Messages response.
+#[must_use]
+pub fn anthropic_response_metadata(
+    response: &rig_core::providers::anthropic::completion::CompletionResponse,
+) -> AgentModelResponseMetadata {
+    AgentModelResponseMetadata::bounded(Some(response.model.clone()), response.stop_reason.clone())
+}
+
+/// Reads the response model and the first choice's finish reason from an
+/// OpenAI Chat Completions response (also the shape OpenAI-compatible
+/// endpoints answer).
+#[must_use]
+pub fn openai_completions_response_metadata(
+    response: &rig_core::providers::openai::completion::CompletionResponse,
+) -> AgentModelResponseMetadata {
+    AgentModelResponseMetadata::bounded(
+        Some(response.model.clone()),
+        response
+            .choices
+            .first()
+            .map(|choice| choice.finish_reason.clone()),
+    )
 }
 
 /// Disambiguates a provider call id that collides with one already mapped.
@@ -565,6 +641,85 @@ mod tests {
         // Nucleus sampling rides the provider-parameter escape hatch.
         let params = built.additional_params.expect("top_p is forwarded");
         assert_eq!(params.get("top_p"), Some(&serde_json::json!(0.9)));
+    }
+
+    #[test]
+    fn the_model_visible_tools_are_declared_beside_the_result_tool() {
+        use crate::task::{AgentSchemaId, AgentSchemaRef};
+        use crate::tools::{AgentToolDescriptor, AgentToolKind};
+
+        let descriptor = AgentToolDescriptor::new(
+            AgentToolId::new("search_kb").expect("tool id"),
+            AgentToolKind::Function,
+            "Searches the knowledge base.",
+            AgentSchemaRef::new(
+                AgentSchemaId::new("kb-input").expect("schema id"),
+                AgentRevisionNumber::INITIAL,
+            ),
+            AgentSchemaRef::new(
+                AgentSchemaId::new("kb-output").expect("schema id"),
+                AgentRevisionNumber::INITIAL,
+            ),
+        )
+        .expect("descriptor")
+        .with_parameters(
+            serde_json::json!({ "type": "object", "properties": { "q": { "type": "string" } } }),
+        )
+        .expect("parameters");
+        let adapter = RigModelAdapter::new(ScriptedCompletionModel::new());
+        let built = adapter.build_request(&request().with_tools(vec![descriptor]));
+        let names: Vec<&str> = built.tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(names.contains(&AGENT_RESULT_TOOL_DEFAULT));
+        assert!(names.contains(&"search_kb"));
+        let declared = built
+            .tools
+            .iter()
+            .find(|tool| tool.name == "search_kb")
+            .expect("declared");
+        assert_eq!(declared.description, "Searches the knowledge base.");
+        assert_eq!(declared.parameters["properties"]["q"]["type"], "string");
+    }
+
+    #[test]
+    fn cached_and_reasoning_tokens_ride_the_usage_when_reported() {
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            cached_input_tokens: 3,
+            cache_creation_input_tokens: 0,
+            reasoning_tokens: 2,
+        };
+        let mapped = model_usage(&usage);
+        assert_eq!(mapped.cached_input_tokens, Some(3));
+        assert_eq!(mapped.reasoning_tokens, Some(2));
+        let silent = model_usage(&Usage {
+            cached_input_tokens: 0,
+            reasoning_tokens: 0,
+            ..usage
+        });
+        assert_eq!(silent.cached_input_tokens, None, "a zero is not a report");
+        assert_eq!(silent.reasoning_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn an_installed_extractor_fills_the_turns_response_metadata() {
+        fn extract(
+            _: &<ScriptedCompletionModel as CompletionModel>::Response,
+        ) -> AgentModelResponseMetadata {
+            AgentModelResponseMetadata::bounded(
+                Some("scripted-model".to_string()),
+                Some("stop".to_string()),
+            )
+        }
+        let adapter = RigModelAdapter::new(ScriptedCompletionModel::new().returning_text("hi"))
+            .with_response_metadata(extract);
+        let turn = adapter.call(&request()).await.expect("answers");
+        assert_eq!(turn.response_model.as_deref(), Some("scripted-model"));
+        assert_eq!(turn.finish_reason.as_deref(), Some("stop"));
+        let plain = RigModelAdapter::new(ScriptedCompletionModel::new().returning_text("hi"));
+        let turn = plain.call(&request()).await.expect("answers");
+        assert!(turn.response_model.is_none() && turn.finish_reason.is_none());
     }
 
     #[tokio::test]
