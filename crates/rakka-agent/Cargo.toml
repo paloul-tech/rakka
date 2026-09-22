@@ -51,14 +51,15 @@ rig-core = { version = "=0.37.0", default-features = false, features = ["rustls"
 # never enters the publishable dependency tree.
 proptest.workspace = true
 rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
-# The in-process fake providers `rig_provider_fake_endpoint.rs` serves, and
-# the plain-HTTP backend it injects into the provider adapter. Dev-only: the
-# publishable tree keeps rig's own reqwest, with `rustls` alone. `bytes` is
-# named only because rig's `HttpClientExt` signatures do — the counting
-# backend in that test must spell the trait's own bounds.
+# The in-process fake providers `rig_provider_fake_endpoint.rs` serves. The
+# HTTP backend it injects is rig's own re-exported client
+# (`rig_core::http_client::ReqwestClient`), never a direct `reqwest`
+# dev-dependency: `HttpClientExt` is implemented only for the exact `reqwest`
+# rig links, so a second edge free to resolve elsewhere would be a silent
+# version-skew trap. `bytes` is named only because rig's `HttpClientExt`
+# signatures are, and an impl must spell the trait's own bounds.
 axum.workspace = true
 bytes = "1"
-reqwest = { version = "0.13", default-features = false }
 
 [lints]
 workspace = true

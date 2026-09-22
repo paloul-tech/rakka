@@ -2047,7 +2047,6 @@ dependencies = [
  "rakka-persistence",
  "rakka-remote",
  "rakka-sharding",
- "reqwest",
  "rig-core",
  "serde",
  "serde_json",

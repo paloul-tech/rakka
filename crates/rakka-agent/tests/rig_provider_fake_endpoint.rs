@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -25,7 +25,9 @@ use rakka_agent::{
     AgentToolId, AgentToolKind,
 };
 use rakka_agent_workflow::AgentEphemeralCredential;
-use rig_core::http_client::{self, HttpClientExt, LazyBody, MultipartForm, StreamingResponse};
+use rig_core::http_client::{
+    self, HttpClientExt, LazyBody, MultipartForm, ReqwestClient, StreamingResponse,
+};
 use rig_core::wasm_compat::WasmCompatSend;
 
 /// The marker a request's context reference carries when the fake completions
@@ -88,10 +90,33 @@ async fn openai_chat_completions(
     }))
 }
 
+/// The sentinel a refusing provider echoes back inside its 400 body, standing
+/// for the request content a real provider's 4xx quotes at you.
+const LEAKED_PROMPT_SENTINEL: &str = "leaked-prompt-sentinel";
+
+/// A provider that rejects the call and quotes the request back in the body —
+/// exactly what an OpenAI 400 does with `invalid_request_error`.
+async fn refusing_chat_completions(State(seen): State<Seen>) -> (StatusCode, Json<Value>) {
+    seen.hits.fetch_add(1, Ordering::SeqCst);
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "type": "invalid_request_error",
+                "message": format!("your request was rejected: {LEAKED_PROMPT_SENTINEL}"),
+            }
+        })),
+    )
+}
+
 async fn serve(seen: Seen) -> SocketAddr {
     let app = Router::new()
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/chat/completions", post(openai_chat_completions))
+        .route(
+            "/refuse/v1/chat/completions",
+            post(refusing_chat_completions),
+        )
         .with_state(seen);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -106,6 +131,15 @@ fn profile(
     model: &str,
     base_url: Option<String>,
 ) -> AgentModelProfile {
+    profile_with_attributes(kind, model, base_url, BTreeMap::new())
+}
+
+fn profile_with_attributes(
+    kind: AgentModelProviderKind,
+    model: &str,
+    base_url: Option<String>,
+    attributes: BTreeMap<String, String>,
+) -> AgentModelProfile {
     AgentModelProfile {
         profile_id: AgentModelProfileId::new("fake").expect("id"),
         revision: AgentRevisionNumber::INITIAL,
@@ -115,7 +149,7 @@ fn profile(
         credential_binding: None,
         default_sampling: AgentSamplingSettings::default(),
         capabilities: AgentModelCapabilities { tool_calls: true },
-        attributes: BTreeMap::new(),
+        attributes,
     }
 }
 
@@ -162,7 +196,7 @@ async fn the_anthropic_round_trip_carries_the_key_the_tools_and_the_provenance()
             "claude-sonnet-5",
             Some(format!("http://{addr}")),
         ),
-        reqwest::Client::new(),
+        ReqwestClient::new(),
     )
     .expect("valid");
     let credential = AgentEphemeralCredential::api_key("x-api-key", "sk-ant-fake-sentinel");
@@ -212,7 +246,7 @@ async fn the_openai_completions_round_trip_carries_the_bearer_and_maps_a_tool_ca
             "gpt-fake-1",
             Some(format!("http://{addr}/v1")),
         ),
-        reqwest::Client::new(),
+        ReqwestClient::new(),
     )
     .expect("valid");
     let credential = AgentEphemeralCredential::bearer_token("sk-openai-fake-sentinel");
@@ -233,6 +267,23 @@ async fn the_openai_completions_round_trip_carries_the_bearer_and_maps_a_tool_ca
     // `:1077-1082`), so a provider that reports reasoning tokens on that
     // endpoint cannot reach the durable ledger through this adapter.
     assert_eq!(turn.usage.reasoning_tokens, None);
+
+    // The fake answers a tool call on the marker alone, so the mapping above
+    // proves nothing about the declaration. This does: the wire body carries
+    // both tools, under the Chat Completions `{type, function: {name}}` shape
+    // (`rig-core-0.37.0/src/providers/openai/completion/mod.rs:390-402`).
+    let body = &seen.bodies.lock().expect("not poisoned")[0];
+    let tools: Vec<&str> = body["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    assert!(
+        tools.contains(&"search_kb") && tools.contains(&"submit_result"),
+        "{tools:?}"
+    );
+
     let headers = seen.headers.lock().expect("not poisoned");
     assert_eq!(
         headers[0]
@@ -252,7 +303,7 @@ async fn a_custom_provider_is_the_completions_shape_at_the_profiles_base_url() {
             "llama-3",
             Some(format!("http://{addr}/v1")),
         ),
-        reqwest::Client::new(),
+        ReqwestClient::new(),
     )
     .expect("valid");
     let turn = adapter
@@ -264,6 +315,90 @@ async fn a_custom_provider_is_the_completions_shape_at_the_profiles_base_url() {
         .expect("answers");
     assert_eq!(turn.text.as_deref(), Some("hello from the fake"));
     assert_eq!(seen.hits.load(Ordering::SeqCst), 1);
+
+    // A custom label routes to the Chat Completions shape, not Anthropic's:
+    // the body is a `messages` array with no top-level `system`, and the
+    // request reached `/v1/chat/completions` (the only route that answered).
+    let body = &seen.bodies.lock().expect("not poisoned")[0];
+    assert!(body["messages"].is_array(), "{body}");
+    assert!(
+        body.get("system").is_none(),
+        "the Anthropic-shaped `system` field must not appear: {body}"
+    );
+    assert_eq!(body["model"], "llama-3");
+}
+
+#[tokio::test]
+async fn a_providers_refusal_body_never_reaches_the_durable_error() {
+    let seen = Seen::default();
+    let addr = serve(seen.clone()).await;
+    let adapter = RigProviderAdapter::new(
+        profile(
+            AgentModelProviderKind::OpenAiCompletions,
+            "gpt-fake-1",
+            Some(format!("http://{addr}/refuse/v1")),
+        ),
+        ReqwestClient::new(),
+    )
+    .expect("valid");
+
+    let error = adapter
+        .call_with(
+            &request("say-hello"),
+            Some(&AgentEphemeralCredential::bearer_token("t")),
+        )
+        .await
+        .expect_err("the provider refused");
+
+    // Rig's own backend reads the whole 400 body into
+    // `InvalidStatusCodeWithMessage` and its `Display` quotes it verbatim; a
+    // real provider's 400 quotes the prompt back, and this error is persisted
+    // on the outbox row and echoed onto the dispatcher fleet's index.
+    let message = error.to_string();
+    assert!(
+        !message.contains(LEAKED_PROMPT_SENTINEL),
+        "the provider's response body reached a durable error: {message}"
+    );
+    assert!(
+        message.contains("400"),
+        "the status is what the reason keeps: {message}"
+    );
+    assert_eq!(error.code(), "model-provider-failed");
+    assert_eq!(seen.hits.load(Ordering::SeqCst), 1, "the fake did refuse");
+}
+
+#[tokio::test]
+async fn a_profile_attribute_reaches_the_providers_own_header() {
+    let seen = Seen::default();
+    let addr = serve(seen.clone()).await;
+    let attributes = BTreeMap::from([("anthropic_version".to_string(), "2023-06-01".to_string())]);
+    let adapter = RigProviderAdapter::new(
+        profile_with_attributes(
+            AgentModelProviderKind::Anthropic,
+            "claude-sonnet-5",
+            Some(format!("http://{addr}")),
+            attributes,
+        ),
+        ReqwestClient::new(),
+    )
+    .expect("valid");
+
+    adapter
+        .call_with(
+            &request("say-hello"),
+            Some(&AgentEphemeralCredential::api_key("x-api-key", "k")),
+        )
+        .await
+        .expect("answers");
+
+    let headers = seen.headers.lock().expect("not poisoned");
+    assert_eq!(
+        headers[0]
+            .get("anthropic-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01"),
+        "the profile's non-secret attribute is what the provider was told"
+    );
 }
 
 #[tokio::test]
@@ -274,13 +409,13 @@ async fn an_invalid_or_missing_base_url_is_refused_before_any_request() {
             "m",
             Some("https://u:p@host/v1".to_string()),
         ),
-        reqwest::Client::new(),
+        ReqwestClient::new(),
     )
     .expect_err("refused at construction");
     assert_eq!(error.code(), "model-profile-invalid-base-url");
     let error = RigProviderAdapter::new(
         profile(AgentModelProviderKind::Custom("x".to_string()), "m", None),
-        reqwest::Client::new(),
+        ReqwestClient::new(),
     )
     .expect_err("a custom provider needs a base url");
     assert_eq!(error.code(), "model-profile-invalid-base-url");
@@ -296,7 +431,7 @@ async fn unsupported_or_missing_credential_material_is_refused_before_any_reques
             "m",
             Some(format!("http://{addr}")),
         ),
-        reqwest::Client::new(),
+        ReqwestClient::new(),
     )
     .expect("valid");
     let basic = AgentEphemeralCredential::basic("user", "pw");
@@ -325,10 +460,14 @@ async fn unsupported_or_missing_credential_material_is_refused_before_any_reques
 }
 
 /// Every send goes through the injected backend: a counting wrapper around
-/// `reqwest::Client` that implements rig's `HttpClientExt` by delegation.
+/// rig's own re-exported `reqwest` client, implementing `HttpClientExt` by
+/// delegation. Naming it through `rig_core` rather than a direct `reqwest`
+/// dev-dependency is what keeps this compiling: the blanket impl exists only
+/// for the exact `reqwest` rig links, and a dev-dependency free to resolve to
+/// a different one would silently stop satisfying the bound.
 #[derive(Clone, Default, Debug)]
 struct Counting {
-    inner: reqwest::Client,
+    inner: ReqwestClient,
     sends: Arc<AtomicUsize>,
 }
 

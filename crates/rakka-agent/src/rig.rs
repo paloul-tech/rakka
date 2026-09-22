@@ -84,11 +84,104 @@ use crate::task::AgentTaskContent;
 /// [`RigModelAdapter::with_result_tool`].
 pub const AGENT_RESULT_TOOL_DEFAULT: &str = "submit_result";
 
-/// Maps a provider or mapping failure onto the model error the adapter returns.
-fn provider_error<E: Display>(error: E) -> AgentModelError {
+/// Maps a Rakka-side mapping failure onto the model error the adapter returns.
+///
+/// Reserved for errors this crate's own types raise while interpreting a
+/// response — a provider-supplied call id or tool name that cannot be a bounded
+/// Rakka identifier. Those errors name a field, a length, or an offending
+/// character, never a whole value, so their text is safe to persist. A failure
+/// that came *from* the provider goes through [`completion_error`] instead.
+fn mapping_error<E: Display>(error: E) -> AgentModelError {
     AgentModelError::Provider {
         message: error.to_string(),
     }
+}
+
+/// A short, body-free reason for one rig HTTP-client failure.
+///
+/// Rig's own `reqwest` backend reads the provider's **entire response body**
+/// into `Error::InvalidStatusCodeWithMessage` on any non-2xx
+/// (`rig-core-0.37.0/src/http_client/mod.rs:50-57`, `:152-155`), and a
+/// provider's 4xx body routinely quotes the offending request back — the
+/// prompt included. An adapter error becomes durable state on the run's outbox
+/// row and the dispatcher fleet's index, so the status is the whole of what
+/// this records: enough to tell "the provider rejected us" from "we could not
+/// reach it", with nothing of what was sent or answered.
+///
+/// [`http_client::Error::Instance`] is the one variant whose inner text is
+/// kept. It carries no response body — rig's backend boxes only a transport
+/// failure there — and it is the error type the *deployment's own* injected
+/// backend chose, which is where a deployment shapes provider error text (the
+/// host runtime boxes a bounded code precisely so it survives this far).
+fn http_client_reason(error: &rig_core::http_client::Error) -> String {
+    use rig_core::http_client::Error;
+    match error {
+        Error::InvalidStatusCode(status) | Error::InvalidStatusCodeWithMessage(status, _) => {
+            format!("the provider answered HTTP {status}")
+        }
+        Error::Protocol(_) => "the request or response was not valid HTTP".to_string(),
+        Error::InvalidHeaderValue(_) => "a header value was outside the legal range".to_string(),
+        Error::NoHeaders => "the request was in an error state and carried no headers".to_string(),
+        Error::StreamEnded => "the response stream ended before the body was read".to_string(),
+        Error::InvalidContentType(_) => {
+            "the provider answered an unsupported content type".to_string()
+        }
+        Error::Instance(inner) => format!("the HTTP backend failed: {inner}"),
+    }
+}
+
+/// Maps a provider-client construction failure onto the model error the
+/// adapter returns.
+///
+/// Building a client never talks to the provider, so nothing here can carry a
+/// response body; it goes through [`http_client_reason`] anyway so that one
+/// rule covers every rig error this module turns into durable text.
+fn client_build_error(error: rig_core::http_client::Error) -> AgentModelError {
+    AgentModelError::Provider {
+        message: format!(
+            "the provider client could not be built: {}",
+            http_client_reason(&error)
+        ),
+    }
+}
+
+/// Maps one rig completion failure onto the model error the adapter returns,
+/// variant by variant, carrying no provider response body.
+///
+/// Every arm is written out rather than deferring to rig's `Display`, because
+/// three of rig's variants relay provider text verbatim —
+/// `HttpError(InvalidStatusCodeWithMessage)` the whole response body,
+/// `ProviderError` the provider's own error message (or, on an
+/// OpenAI-compatible endpoint, the raw non-2xx body:
+/// `providers/openai/completion/mod.rs:1478-1480`), and `JsonError` a quoted
+/// fragment of the payload it choked on. The adapter contract
+/// ([`AgentModelAdapter::call_with`]) forbids all three from reaching durable
+/// state, so this keeps a stable reason and drops the rest. What survives a
+/// decode failure is *where* it failed, never what was there.
+fn completion_error(error: CompletionError) -> AgentModelError {
+    let message = match &error {
+        CompletionError::HttpError(inner) => http_client_reason(inner),
+        CompletionError::JsonError(inner) => format!(
+            "the provider response could not be decoded ({} at line {}, column {})",
+            match inner.classify() {
+                serde_json::error::Category::Io => "i/o",
+                serde_json::error::Category::Syntax => "malformed JSON",
+                serde_json::error::Category::Data => "unexpected shape",
+                serde_json::error::Category::Eof => "ended early",
+            },
+            inner.line(),
+            inner.column()
+        ),
+        CompletionError::UrlError(inner) => format!("the provider endpoint is not a URL: {inner}"),
+        CompletionError::RequestError(_) => {
+            "the completion request could not be built or sent".to_string()
+        }
+        CompletionError::ResponseError(_) => {
+            "the provider response could not be interpreted as a completion".to_string()
+        }
+        CompletionError::ProviderError(_) => "the provider refused the request".to_string(),
+    };
+    AgentModelError::Provider { message }
 }
 
 /// The Rig-backed implementation of the Rakka-owned [`AgentModelAdapter`].
@@ -311,8 +404,8 @@ where
                             &turn.tool_calls,
                         );
                         let requested = AgentToolCallRequest::new(
-                            AgentToolCallId::new(call_id).map_err(provider_error)?,
-                            AgentToolId::new(call.function.name).map_err(provider_error)?,
+                            AgentToolCallId::new(call_id).map_err(mapping_error)?,
+                            AgentToolId::new(call.function.name).map_err(mapping_error)?,
                             call.function.arguments,
                         )?;
                         turn = turn.with_tool_call(requested);
@@ -446,7 +539,7 @@ where
                 .model
                 .completion(rig_request)
                 .await
-                .map_err(provider_error)?;
+                .map_err(completion_error)?;
             self.turn_from_response(response, request)
         })
     }
@@ -469,6 +562,29 @@ where
 /// The profile's base URL is validated once, at construction, rather than per
 /// attempt — a profile record is immutable, so a second check inside the call
 /// could only reach the same answer more slowly.
+///
+/// # What a turn carries back
+///
+/// The response model and finish reason are read only where this adapter knows
+/// the provider's raw response type: [`AgentModelProviderKind::Anthropic`],
+/// [`AgentModelProviderKind::OpenAiCompletions`], and
+/// [`AgentModelProviderKind::Custom`] (which is the Chat Completions shape).
+/// A turn from the Responses, OpenRouter, Gemini, Azure, or Ollama route
+/// carries no `response_model` and no `finish_reason` — rig's generic
+/// `CompletionResponse<T>` keeps both inside the provider's own `T`, and no
+/// extractor is installed for those. Cached and reasoning token counts
+/// likewise ride the turn only where rig's own `Usage` conversion surfaces
+/// them; rig 0.37's Chat Completions conversion always reports zero reasoning
+/// tokens, so a reasoning model behind that endpoint reports none.
+///
+/// # Provider error text
+///
+/// A failing call's error is durable, so this adapter records a stable reason
+/// and a status, never the provider's response body.
+/// The injected backend is the other half of that: it is where a deployment
+/// shapes what a transport failure says, and a backend that puts a response
+/// body into [`rig_core::http_client::Error::Instance`] would put it back into
+/// durable state. Rig's own `reqwest` backend does not.
 ///
 /// [`HttpClientExt`]: rig_core::http_client::HttpClientExt
 pub struct RigProviderAdapter<H> {
@@ -635,7 +751,7 @@ where
                 if let Some(version) = profile.attributes.get("anthropic_version") {
                     builder = builder.anthropic_version(version);
                 }
-                let client = builder.build().map_err(provider_error)?;
+                let client = builder.build().map_err(client_build_error)?;
                 self.inner(
                     client.completion_model(&profile.model),
                     Some(anthropic_response_metadata),
@@ -650,7 +766,7 @@ where
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
                 }
-                let client = builder.build().map_err(provider_error)?;
+                let client = builder.build().map_err(client_build_error)?;
                 self.inner(client.completion_model(&profile.model), None)?
                     .call(request)
                     .await
@@ -662,7 +778,10 @@ where
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
                 }
-                let client = builder.build().map_err(provider_error)?.completions_api();
+                let client = builder
+                    .build()
+                    .map_err(client_build_error)?
+                    .completions_api();
                 self.inner(
                     client.completion_model(&profile.model),
                     Some(openai_completions_response_metadata),
@@ -677,7 +796,7 @@ where
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
                 }
-                let client = builder.build().map_err(provider_error)?;
+                let client = builder.build().map_err(client_build_error)?;
                 self.inner(client.completion_model(&profile.model), None)?
                     .call(request)
                     .await
@@ -689,7 +808,7 @@ where
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
                 }
-                let client = builder.build().map_err(provider_error)?;
+                let client = builder.build().map_err(client_build_error)?;
                 self.inner(client.completion_model(&profile.model), None)?
                     .call(request)
                     .await
@@ -708,7 +827,7 @@ where
                 if let Some(version) = profile.attributes.get("api_version") {
                     builder = builder.api_version(version);
                 }
-                let client = builder.build().map_err(provider_error)?;
+                let client = builder.build().map_err(client_build_error)?;
                 self.inner(client.completion_model(&profile.model), None)?
                     .call(request)
                     .await
@@ -723,7 +842,7 @@ where
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
                 }
-                let client = builder.build().map_err(provider_error)?;
+                let client = builder.build().map_err(client_build_error)?;
                 self.inner(client.completion_model(&profile.model), None)?
                     .call(request)
                     .await
