@@ -33,11 +33,11 @@ use rakka_agent::{
     AgentBudgetDimension, AgentContinuousGoalSpec, AgentDefinition, AgentDefinitionId,
     AgentDelegationId, AgentDelegationRecord, AgentDelegationReport, AgentDelegationStatus,
     AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentDispatchPass,
-    AgentEffectPolicies, AgentEffectSpec, AgentEntityAddress, AgentEntityAuthority,
-    AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentEpochSpec,
-    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter,
-    AgentFanInPolicy, AgentGoalId, AgentGoalMode, AgentId, AgentModelAdapter, AgentModelTurn,
-    AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentRevisionNumber,
+    AgentDispatchToolExecutor, AgentEffectPolicies, AgentEffectSpec, AgentEntityAddress,
+    AgentEntityAuthority, AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore,
+    AgentEpochSpec, AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload,
+    AgentExchangeRouter, AgentFanInPolicy, AgentGoalId, AgentGoalMode, AgentId, AgentModelAdapter,
+    AgentModelTurn, AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentRevisionNumber,
     AgentRevisionProvenance, AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectSink,
     AgentRunEffectStatus, AgentRunEntityStore, AgentRunMemory, AgentRunScope, AgentRunSnapshot,
     AgentRunState, AgentRunStatus, AgentRunTerminalReason, AgentSchemaId, AgentSchemaRef,
@@ -711,6 +711,29 @@ pub fn tool_descriptor(tool: &str) -> AgentToolDescriptor {
         schema("tool-output"),
     )
     .expect("the descriptor should be valid")
+}
+
+/// The tool intent one call dispatches under: one non-idempotent attempt of
+/// the named tool, exactly as the run commits it.
+pub fn tool_intent(tool: &str) -> AgentRunEffect {
+    let call = AgentToolCallRequest::new(
+        AgentToolCallId::new("call-1").expect("call id should be valid"),
+        rakka_agent::AgentToolId::new(tool).expect("tool id should be valid"),
+        serde_json::json!({}),
+    )
+    .expect("the call should be bounded");
+    AgentRunEffect::new(
+        &run_scope(),
+        1,
+        0,
+        rakka_agent::AgentRunEffectRequest::Tool {
+            call: Box::new(call),
+        },
+        &AgentEffectSpec::non_idempotent(),
+        AgentRevisionNumber::INITIAL,
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the effect should derive")
 }
 
 /// Binds one test tool exactly as an effect spec classifies it, so the
@@ -2619,6 +2642,10 @@ pub struct AuthorityFixture {
     pub fleet_store: FleetStore,
     pub wf_clock: SharedAtomicWorkflowClock,
     pub tools: RecordingToolExecutor,
+    /// The executor the pipeline calls, when a test wants it to be something
+    /// other than the recording one — see
+    /// [`AuthorityFixture::with_tool_executor`].
+    pub tool_executor: Option<Arc<dyn AgentDispatchToolExecutor>>,
     pub probe: KillSwitchProbe,
     pub credentials: Option<Arc<ScriptedCredentialResolver>>,
     /// The adapter the pipeline asks, when a test wants it to be something
@@ -2670,6 +2697,7 @@ impl AuthorityFixture {
             fleet_store,
             wf_clock,
             tools: RecordingToolExecutor::new(),
+            tool_executor: None,
             probe: KillSwitchProbe::new(),
             credentials: None,
             model_adapter: None,
@@ -2692,6 +2720,51 @@ impl AuthorityFixture {
     /// guardrail-revision pin must catch.
     pub fn with_gate_authority(mut self, authority: AgentToolAuthority) -> Self {
         self.authority = authority;
+        self
+    }
+
+    /// Puts an executor other than the recording one in the pipeline's tool
+    /// slot, for the proofs whose subject is what the *executor* does with a
+    /// call — a router composing several, say. It replaces the executor for
+    /// every worker this fixture builds, [`Self::worker`] included.
+    pub fn with_tool_executor(mut self, executor: Arc<dyn AgentDispatchToolExecutor>) -> Self {
+        self.tool_executor = Some(executor);
+        self
+    }
+
+    /// Registers deployment tool bindings after the fixture was built: into
+    /// its registry, into the authority behind the dispatch gate, into the
+    /// commit-time effect policies, and into the envelope the agent is
+    /// instantiated under — the four places a tool must appear to be
+    /// dispatchable through the real pipeline.
+    ///
+    /// Call it before [`Self::start`], which is what instantiates the agent
+    /// under that envelope. It widens rather than replaces, so it composes
+    /// with a fixture whose authority already carries a guardrail chain and
+    /// with an envelope a test narrowed by hand.
+    pub fn with_registered_bindings(mut self, bindings: Vec<AgentToolBinding>) -> Self {
+        for binding in bindings {
+            let tool = binding.descriptor().tool.clone();
+            let declaration = binding.declaration().clone();
+            let spec = binding
+                .effect_spec()
+                .expect("the binding should project a valid effect spec");
+            self.registry = self
+                .registry
+                .register(binding)
+                .expect("the binding should register");
+            self.fx.policies = self
+                .fx
+                .policies
+                .clone()
+                .with_tool_spec(tool.clone(), spec)
+                .expect("the tool spec should be valid");
+            if let Some(credential) = &declaration.credential_binding {
+                self.envelope.credential_bindings.insert(credential.clone());
+            }
+            self.envelope.tools.insert(tool, declaration);
+        }
+        self.authority = self.authority.with_registry(self.registry.clone());
         self
     }
 
@@ -2866,7 +2939,9 @@ impl AuthorityFixture {
             self.model_adapter
                 .clone()
                 .unwrap_or_else(|| Arc::new(self.adapter.clone())),
-            Arc::new(tools),
+            self.tool_executor
+                .clone()
+                .unwrap_or_else(|| Arc::new(tools) as Arc<dyn AgentDispatchToolExecutor>),
             gate,
             Arc::new(delivery),
         )

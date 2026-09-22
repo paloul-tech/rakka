@@ -87,6 +87,7 @@ pub mod schema;
 pub mod task;
 pub mod team;
 pub mod testkit;
+pub mod tool_router;
 pub mod tools;
 pub mod wake;
 pub mod wake_scanner;
@@ -554,6 +555,7 @@ pub use team::{
     AGENT_TEAM_OPERATION_LOG_CAPACITY, AGENT_TEAM_PENDING_HISTORY_CAPACITY,
     AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES, DEFAULT_AGENT_TEAM_ENTITY_TYPE,
 };
+pub use tool_router::AgentToolExecutorRouter;
 pub use tools::{
     refuse_guardrail_disposition, AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant,
     AgentEnvironmentConcurrencyProtocol, AgentExecutionPolicyRouter, AgentGrantDescriptor,
