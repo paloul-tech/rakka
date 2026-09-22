@@ -143,6 +143,28 @@ pub fn tool_registry() -> AgentToolRegistry {
         .expect("the tool registers")
 }
 
+/// The registry's effect policies, with the model spec bounded when the walk
+/// asked for a bound.
+///
+/// [`AgentEffectPolicies::new`] already gives the model spec `read_only()`;
+/// only the per-attempt timeout is added here.
+///
+/// [`AgentEffectPolicies::new`]: rakka_agent::AgentEffectPolicies::new
+fn model_effect_policies(
+    registry: &AgentToolRegistry,
+    model_timeout_ms: Option<u64>,
+) -> rakka_agent::AgentEffectPolicies {
+    let policies = registry
+        .effect_policies()
+        .expect("the registry projects valid policies");
+    match model_timeout_ms {
+        Some(timeout_ms) => policies
+            .with_model_spec(AgentEffectSpec::read_only().with_timeout_ms(timeout_ms))
+            .expect("a read-only model spec with a timeout is valid"),
+        None => policies,
+    }
+}
+
 /// The whole in-process world the acceptance walk drives.
 pub struct World {
     /// The actor system hosting the sharded entities.
@@ -165,8 +187,22 @@ pub struct World {
     pub wf_clock: SharedAtomicWorkflowClock,
     /// The shared tick counter behind every timestamp.
     pub clock: Arc<AtomicU64>,
-    /// The deterministic model adapter the dispatcher invokes.
+    /// The deterministic model adapter the acceptance walk reads its turn
+    /// facts from. It is the adapter the dispatcher invokes only when the
+    /// world was built with [`World::new`]; the gated provider walk leaves it
+    /// unscripted and invokes [`World::model`] instead.
     pub adapter: DeterministicModelAdapter,
+    /// The adapter the dispatcher fleet invokes: the deterministic one in the
+    /// acceptance walk, a live provider adapter in the gated walk.
+    pub model: Arc<dyn rakka_agent::AgentModelAdapter>,
+    /// The model profile catalog the authority resolves, when the walk has one.
+    pub profiles: Option<Arc<dyn rakka_agent::AgentModelProfileCatalog>>,
+    /// The credential resolver the dispatcher consults, when the walk has one.
+    pub credentials: Option<Arc<dyn rakka_agent::AgentEffectCredentialResolver>>,
+    /// A timeout for model effects, when the walk needs one: a
+    /// credential-bearing model call with no `timeout_ms` is refused
+    /// `model-timeout-unset`.
+    pub model_timeout_ms: Option<u64>,
     /// The recording tool executor — the external system.
     pub tools: RecordingToolExecutor,
     /// The dispatcher kill switch.
@@ -193,11 +229,42 @@ pub struct World {
 }
 
 impl World {
-    /// Builds the world: stores, sharded entity types, router, service.
+    /// Builds the world the acceptance walk drives: the deterministic adapter
+    /// is both the fleet's model and the walk's source of turn facts.
     ///
     /// `adapter` scripts the model; the walk passes one scripted for its
     /// two-turn flow.
+    #[must_use]
     pub fn new(adapter: DeterministicModelAdapter, catalog_target: A2AAgentTarget) -> Self {
+        let mut world =
+            Self::with_model(Arc::new(adapter.clone()), None, None, None, catalog_target);
+        world.adapter = adapter;
+        world
+    }
+
+    /// Builds the world over any model adapter: stores, sharded entity types,
+    /// router, service.
+    ///
+    /// `profiles` installs the deployment's model profile catalog at the tool
+    /// authority, `credentials` the resolver the dispatcher consults inside a
+    /// bounded attempt, and `model_timeout_ms` the per-attempt bound a
+    /// credential-bearing model call must carry. The bound is applied to both
+    /// sets of effect policies in the world — the sharded run entity's, which
+    /// tickets a run's first model effect, and the result delivery's, which
+    /// tickets every later one — because an intent missing it is refused
+    /// `model-timeout-unset` wherever it was created.
+    ///
+    /// [`Self::adapter`] is left unscripted here: a walk that reads turn facts
+    /// from it builds its world with [`Self::new`].
+    #[must_use]
+    pub fn with_model(
+        model: Arc<dyn rakka_agent::AgentModelAdapter>,
+        profiles: Option<Arc<dyn rakka_agent::AgentModelProfileCatalog>>,
+        credentials: Option<Arc<dyn rakka_agent::AgentEffectCredentialResolver>>,
+        model_timeout_ms: Option<u64>,
+        catalog_target: A2AAgentTarget,
+    ) -> Self {
+        let adapter = DeterministicModelAdapter::new();
         let system = ActorSystem::new("DurableAgentAcceptance");
         let sharding = ClusterSharding::get(&system);
         let tasks = InMemoryDurableStateStore::<AgentTaskState>::new();
@@ -218,9 +285,7 @@ impl World {
         let session = Arc::new(InMemorySessionMemoryStore::new());
         let snapshots = Arc::new(InMemoryContextSnapshotStore::new());
 
-        let policies = registry
-            .effect_policies()
-            .expect("the registry projects valid policies");
+        let policies = model_effect_policies(&registry, model_timeout_ms);
         let sink = WorkflowAgentRunEffectSink::new(workflow_store.clone(), wf_clock.clone());
 
         let deferred = DeferredExchangeRouter::new();
@@ -317,6 +382,10 @@ impl World {
             wf_clock,
             clock,
             adapter,
+            model,
+            profiles,
+            credentials,
+            model_timeout_ms,
             tools,
             probe: KillSwitchProbe::new(),
             registry,
@@ -335,18 +404,21 @@ impl World {
     /// building one anew is exactly what recovery after a dispatcher death
     /// looks like.
     pub fn pipeline(&self) -> Pipeline {
-        rakka_agent::AgentRunEffectDispatcher::new(
+        let dispatcher = rakka_agent::AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new("worker-1"),
             self.workflow_store.clone(),
             self.fleet_store.clone(),
             self.runs.clone(),
             self.wf_clock.clone(),
-            Arc::new(self.adapter.clone()),
+            self.model.clone(),
             Arc::new(self.tools.clone()),
-            Arc::new(AgentEntityAuthority::new(
-                self.agents.clone(),
-                AgentToolAuthority::new(self.registry.clone()),
-            )),
+            Arc::new(AgentEntityAuthority::new(self.agents.clone(), {
+                let authority = AgentToolAuthority::new(self.registry.clone());
+                match &self.profiles {
+                    Some(catalog) => authority.with_model_profiles(catalog.clone()),
+                    None => authority,
+                }
+            })),
             Arc::new(
                 InProcessRunResultDelivery::new(
                     self.runs.clone(),
@@ -357,17 +429,17 @@ impl World {
                     self.router.clone(),
                     self.clock.clone(),
                 )
-                .with_effect_policies(
-                    self.registry
-                        .effect_policies()
-                        .expect("the registry projects valid policies"),
-                )
+                .with_effect_policies(model_effect_policies(&self.registry, self.model_timeout_ms))
                 .with_metrics(self.metrics.clone()),
             ),
         )
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
         .with_probe(Arc::new(self.probe.clone()))
-        .with_reconciler(Arc::new(ScriptedReconciler::new()))
+        .with_reconciler(Arc::new(ScriptedReconciler::new()));
+        match &self.credentials {
+            Some(resolver) => dispatcher.with_credential_resolver(resolver.clone()),
+            None => dispatcher,
+        }
     }
 
     /// Advances the shared clock past the fleet lease.

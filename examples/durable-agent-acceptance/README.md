@@ -105,3 +105,23 @@ cargo test -p rakka-agent --release --test effect_dispatch \
 
 A deliberate pipeline change that moves a count must re-derive the budget —
 update the test's constants and this table together.
+
+## Live provider walk (gated)
+
+The same world, task, tool, and envelope, driven through the real Rig
+provider adapter over an env-backed credential resolver that lives in this
+example. Skipped unless `RAKKA_MODEL_PROFILE` is set:
+
+```sh
+RAKKA_MODEL_PROFILE=live RAKKA_MODEL_PROVIDER=anthropic RAKKA_MODEL_NAME=claude-sonnet-5 \
+RAKKA_MODEL_API_KEY=... cargo run -p rakka-example-durable-agent-acceptance -- --provider
+RAKKA_MODEL_PROFILE=live RAKKA_MODEL_PROVIDER=openai-completions RAKKA_MODEL_NAME=gpt-5 \
+RAKKA_MODEL_API_KEY=... cargo test -p rakka-example-durable-agent-acceptance --test provider_walk -- --nocapture
+```
+
+`RAKKA_MODEL_PROVIDER` is one of `anthropic`, `openai-completions`,
+`openai-responses`, `openrouter`, `gemini`, `ollama`, `custom`;
+`RAKKA_MODEL_BASE_URL` overrides the provider's endpoint (required for
+`custom`); `ollama` needs no key. The walk asserts structure, not a
+transcript: the run terminates, the provider's response model is recorded on
+the turn, and the key appears in no durable record and no line of output.

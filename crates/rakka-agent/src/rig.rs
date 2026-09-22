@@ -84,6 +84,17 @@ use crate::task::AgentTaskContent;
 /// [`RigModelAdapter::with_result_tool`].
 pub const AGENT_RESULT_TOOL_DEFAULT: &str = "submit_result";
 
+/// The HTTP backend rig links, for callers that want the plain case without a
+/// direct `reqwest` edge; rig's `rustls` feature gives it TLS.
+///
+/// [`RigProviderAdapter`] is generic over rig's [`HttpClientExt`], and that
+/// trait is implemented only for the exact `reqwest` version rig itself
+/// links: a caller adding its own `reqwest` dependency to name the type would
+/// be one resolution away from a silent version skew. Re-exporting rig's own
+/// client is the plain path — the deployment that wants to inject its own
+/// backend still can.
+pub use rig_core::http_client::ReqwestClient;
+
 /// Maps a Rakka-side mapping failure onto the model error the adapter returns.
 ///
 /// Reserved for errors this crate's own types raise while interpreting a
