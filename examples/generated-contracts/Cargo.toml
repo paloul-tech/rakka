@@ -24,7 +24,7 @@ doc = false
 
 [dependencies]
 axum.workspace = true
-bytes = "1"
+bytes.workspace = true
 futures-util.workspace = true
 prost.workspace = true
 rakka-cluster = { path = "../../crates/rakka-cluster" }

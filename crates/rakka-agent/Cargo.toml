@@ -59,7 +59,7 @@ rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
 # version-skew trap. `bytes` is named only because rig's `HttpClientExt`
 # signatures are, and an impl must spell the trait's own bounds.
 axum.workspace = true
-bytes = "1"
+bytes.workspace = true
 
 [lints]
 workspace = true
