@@ -8,7 +8,9 @@
 //! type — Anthropic, OpenAI Chat Completions, and a custom endpoint of that
 //! shape — so the response model is asserted present for those kinds and
 //! absent for every other, which holds the *mapping* rather than the model.
-//! The terminal line and the secret exclusion hold for every kind.
+//! The terminal line, the recorded model turns, and the secret exclusion hold
+//! for every kind — the model-turn count being the one assertion a run that
+//! never reached the provider cannot pass.
 
 use rakka_example_durable_agent_acceptance::provider::provider_reports_its_model;
 use rakka_example_durable_agent_acceptance::run_provider_walk;
@@ -30,6 +32,16 @@ async fn the_provider_walk_is_gated_and_holds_its_facts_when_armed() {
                     .iter()
                     .any(|line| line.starts_with("ok  terminal:")),
                 "{:?}",
+                report.lines
+            );
+            // The fact no zero-contact run can fake: a wrong base URL, a dead
+            // endpoint, or a refused credential all end the run terminal with
+            // no response model and nothing to find in the stores, and every
+            // other assertion here would pass. A model turn is recorded only
+            // when a provider answered one.
+            assert!(
+                report.model_turns > 0,
+                "the walk reached the provider at least once: {:?}",
                 report.lines
             );
             if provider_reports_its_model(&report.provider) {

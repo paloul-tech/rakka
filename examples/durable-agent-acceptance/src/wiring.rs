@@ -202,7 +202,14 @@ pub struct World {
     /// A timeout for model effects, when the walk needs one: a
     /// credential-bearing model call with no `timeout_ms` is refused
     /// `model-timeout-unset`.
-    pub model_timeout_ms: Option<u64>,
+    ///
+    /// Deliberately not `pub`: [`World::with_model`] is the only way to set
+    /// it, because half of what it does happens at construction. The sharded
+    /// run entity's effect policies — which ticket a run's *first* model
+    /// effect — are frozen when the entity type is registered, and only the
+    /// result delivery's are rebuilt per [`World::pipeline`]. A field written
+    /// after construction would bound every model effect but the first.
+    model_timeout_ms: Option<u64>,
     /// The recording tool executor — the external system.
     pub tools: RecordingToolExecutor,
     /// The dispatcher kill switch.

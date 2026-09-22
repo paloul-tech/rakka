@@ -121,6 +121,12 @@ pub struct ProviderWalkReport {
     /// [`AgentModelProviderKind::Custom`] (the Chat Completions shape), and is
     /// absent for every other kind however well the call went.
     pub provider: AgentModelProviderKind,
+    /// How many model attempts came back with a turn.
+    ///
+    /// The one fact no zero-contact run can produce: a wrong base URL, a dead
+    /// endpoint, or a refused credential all end the run terminal with no
+    /// response model and no key to find, and this count stays at zero.
+    pub model_turns: usize,
     /// The response model the provider reported on the first recorded turn.
     pub response_model: Option<String>,
     /// How many times the recording tool executor was invoked.

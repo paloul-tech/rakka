@@ -25,11 +25,11 @@ use rakka_agent::{
     AgentOperationKind, AgentPolicyRef, AgentPolicyRefs, AgentReconciliationDecision,
     AgentRevisionProvenance, AgentRunEffectOutcome, AgentRunEntityCommand, AgentRunEntityMessage,
     AgentRunEntityRef, AgentRunEntityReply, AgentRunScope, AgentRunSettlementStatus,
-    AgentRunStatus, AgentSchemaPolicy, AgentScope, AgentSettings, AgentTaskContent,
-    AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand,
-    AgentTaskEntityMessage, AgentTaskEntityRef, AgentTaskEntityReply, AgentTaskId,
-    AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskStatus,
-    AgentToolCallId, AgentToolCallRequest, AgentToolId, AutonomyAdmissionDecision,
+    AgentRunStatus, AgentRunTerminalReason, AgentSchemaPolicy, AgentScope, AgentSettings,
+    AgentTaskContent, AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId,
+    AgentTaskEntityCommand, AgentTaskEntityMessage, AgentTaskEntityRef, AgentTaskEntityReply,
+    AgentTaskId, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope,
+    AgentTaskStatus, AgentToolCallId, AgentToolCallRequest, AgentToolId, AutonomyAdmissionDecision,
     SessionMemoryCursor, SessionMemoryStore, TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{
@@ -1030,7 +1030,12 @@ pub async fn run_acceptance() -> AcceptanceReport {
 // ---------------------------------------------------------------------------
 
 /// How many dispatch passes the gated walk drives before it gives up.
-const PROVIDER_WALK_MAX_PASSES: usize = 20;
+///
+/// Comfortably above what the run's *own* bounds allow — its rejection budget,
+/// its approvals, and the passes a live model spends being told its proposal
+/// does not satisfy the task's rule — so that reaching this cap means the walk
+/// is wedged, not that the model was chatty. A live run observed here took 18.
+const PROVIDER_WALK_MAX_PASSES: usize = 40;
 
 /// Every durable record the world holds for one run, serialized to JSON.
 ///
@@ -1336,9 +1341,28 @@ pub async fn drive_one_run_with_profile(
             .and_then(|snapshot| snapshot.terminal_reason)
             .map_or_else(
                 || "no reason recorded".to_string(),
-                |reason| reason.code().to_string(),
+                |reason| match &reason {
+                    // The effect's own stable failure code is the whole of
+                    // what a failed live call says here; the bounded detail
+                    // beside it in the durable record is provider text, and a
+                    // walk's summary line is not where that belongs.
+                    AgentRunTerminalReason::EffectFailed { code, .. } => {
+                        format!("{}: {code}", reason.code())
+                    }
+                    _ => reason.code().to_string(),
+                },
             );
 
+    // The dispatcher fills a segment's `model_response` on exactly one thing:
+    // a model attempt that came back with a turn. Counting those is what tells
+    // a run that reached the provider from one that never made contact — a
+    // dead endpoint, a wrong base URL, or a refused credential also ends
+    // terminal with no response model and no key to find.
+    let model_turns = segments
+        .segments()
+        .iter()
+        .filter(|segment| segment.model_response.is_some())
+        .count();
     let response_model = segments
         .segments()
         .into_iter()
@@ -1359,6 +1383,7 @@ pub async fn drive_one_run_with_profile(
             "ok  response model: {}",
             response_model.as_deref().unwrap_or("unreported")
         ),
+        format!("ok  model turns: {model_turns}"),
         format!("ok  tool invocations: {tool_invocations}"),
     ];
 
@@ -1375,13 +1400,19 @@ pub async fn drive_one_run_with_profile(
         }
     }
     lines.push(format!(
-        "ok  secret exclusion: {} durable records scanned, none carries the key",
-        records.len()
+        "ok  secret exclusion: {} durable records scanned, {}",
+        records.len(),
+        if key.is_empty() {
+            "no key to exclude"
+        } else {
+            "none carries the key"
+        }
     ));
 
     Ok(crate::provider::ProviderWalkReport {
         lines,
         provider: profile.provider.clone(),
+        model_turns,
         response_model,
         tool_invocations,
     })
