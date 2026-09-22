@@ -180,8 +180,22 @@ where
     /// carries as model-visible is declared beside it: visibility is decided
     /// upstream, by the tool registry and the authority's `model_visible`
     /// derivation — this only turns what the request already names into the
-    /// provider's own tool-declaration shape.
-    fn build_request(&self, request: &AgentModelRequest) -> CompletionRequest {
+    /// provider's own tool-declaration shape. A descriptor whose parameters are
+    /// present but not a JSON object is treated the same as no parameters at
+    /// all: rig's `ToolDefinition::parameters` is a bare, schema-unenforced
+    /// value, so a non-object would otherwise reach the wire verbatim.
+    ///
+    /// # Errors
+    ///
+    /// The registry that decides `request.tools` is upstream of this adapter
+    /// and cannot itself avoid this adapter's (renamable) result-tool name, so
+    /// a model-visible descriptor named like [`Self`]'s result tool is refused
+    /// (`model-result-tool-collision`) before any request is built: declaring
+    /// both would put two tool definitions under one name on the wire, and a
+    /// provider call under that name would be routed into the result-proposal
+    /// branch of [`Self::turn_from_response`], silently misinterpreting a
+    /// legitimate tool call as the run's typed result.
+    fn build_request(&self, request: &AgentModelRequest) -> AgentModelResult<CompletionRequest> {
         let mut builder = self
             .model
             .completion_request(Message::user(format!("context:{}", request.context)))
@@ -202,12 +216,27 @@ where
                 }),
             });
         for descriptor in &request.tools {
+            let name = descriptor.tool.as_str();
+            if name == self.result_tool {
+                return Err(AgentModelError::Refused {
+                    code: "model-result-tool-collision",
+                    message: format!(
+                        "the model-visible tool {name:?} collides with the adapter's result \
+                         tool {:?}",
+                        self.result_tool
+                    ),
+                });
+            }
             builder = builder.tool(ToolDefinition {
-                name: descriptor.tool.as_str().to_string(),
+                name: name.to_string(),
                 description: descriptor.description.clone(),
-                parameters: descriptor.parameters.clone().unwrap_or_else(
-                    || serde_json::json!({ "type": "object", "additionalProperties": true }),
-                ),
+                parameters: descriptor
+                    .parameters
+                    .clone()
+                    .filter(serde_json::Value::is_object)
+                    .unwrap_or_else(
+                        || serde_json::json!({ "type": "object", "additionalProperties": true }),
+                    ),
             });
         }
         // Rig's builder has no first-class nucleus-sampling parameter, so the
@@ -218,7 +247,7 @@ where
                 "top_p": f64::from(top_p_milli) / 1000.0,
             }));
         }
-        builder.build()
+        Ok(builder.build())
     }
 
     /// Maps a provider response onto a bounded Rakka turn.
@@ -408,7 +437,7 @@ where
 
     fn call<'a>(&'a self, request: &'a AgentModelRequest) -> AgentModelFuture<'a> {
         Box::pin(async move {
-            let rig_request = self.build_request(request);
+            let rig_request = self.build_request(request)?;
             let response = self
                 .model
                 .completion(rig_request)
@@ -625,7 +654,7 @@ mod tests {
             top_p_milli: Some(900),
             max_output_tokens: Some(64),
         });
-        let built = adapter.build_request(&request);
+        let built = adapter.build_request(&request).expect("no collision");
 
         // The provider is offered the result tool; without the declaration no
         // real model could ever call it, and no run could complete.
@@ -667,7 +696,9 @@ mod tests {
         )
         .expect("parameters");
         let adapter = RigModelAdapter::new(ScriptedCompletionModel::new());
-        let built = adapter.build_request(&request().with_tools(vec![descriptor]));
+        let built = adapter
+            .build_request(&request().with_tools(vec![descriptor]))
+            .expect("no collision");
         let names: Vec<&str> = built.tools.iter().map(|tool| tool.name.as_str()).collect();
         assert!(names.contains(&AGENT_RESULT_TOOL_DEFAULT));
         assert!(names.contains(&"search_kb"));
@@ -678,6 +709,82 @@ mod tests {
             .expect("declared");
         assert_eq!(declared.description, "Searches the knowledge base.");
         assert_eq!(declared.parameters["properties"]["q"]["type"], "string");
+    }
+
+    #[test]
+    fn a_non_object_parameters_value_falls_back_to_the_permissive_schema() {
+        use crate::task::{AgentSchemaId, AgentSchemaRef};
+        use crate::tools::{AgentToolDescriptor, AgentToolKind};
+
+        // `AgentToolDescriptor::validate` bounds only the encoded byte size,
+        // so `Value::Null` (or any non-object) passes construction; rig's
+        // `ToolDefinition::parameters` is a bare, schema-unenforced value, so
+        // without this fallback a null would reach the wire verbatim.
+        let descriptor = AgentToolDescriptor::new(
+            AgentToolId::new("search_kb").expect("tool id"),
+            AgentToolKind::Function,
+            "Searches the knowledge base.",
+            AgentSchemaRef::new(
+                AgentSchemaId::new("kb-input").expect("schema id"),
+                AgentRevisionNumber::INITIAL,
+            ),
+            AgentSchemaRef::new(
+                AgentSchemaId::new("kb-output").expect("schema id"),
+                AgentRevisionNumber::INITIAL,
+            ),
+        )
+        .expect("descriptor")
+        .with_parameters(serde_json::Value::Null)
+        .expect("a non-object value still validates");
+        let adapter = RigModelAdapter::new(ScriptedCompletionModel::new());
+        let built = adapter
+            .build_request(&request().with_tools(vec![descriptor]))
+            .expect("no collision");
+        let declared = built
+            .tools
+            .iter()
+            .find(|tool| tool.name == "search_kb")
+            .expect("declared");
+        assert_eq!(
+            declared.parameters,
+            serde_json::json!({ "type": "object", "additionalProperties": true }),
+            "a non-object parameters value is treated as no parameters at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_visible_tool_named_like_the_result_tool_is_refused() {
+        use crate::task::{AgentSchemaId, AgentSchemaRef};
+        use crate::tools::{AgentToolDescriptor, AgentToolKind};
+
+        // The registry that decides `request.tools` is upstream of this
+        // adapter and cannot itself avoid this adapter's (renamable) result
+        // tool name, so the collision is refused here rather than silently
+        // routing a real tool call into the result-proposal branch.
+        let descriptor = AgentToolDescriptor::new(
+            AgentToolId::new("finish").expect("tool id"),
+            AgentToolKind::Function,
+            "Collides with the renamed result tool.",
+            AgentSchemaRef::new(
+                AgentSchemaId::new("in").expect("schema id"),
+                AgentRevisionNumber::INITIAL,
+            ),
+            AgentSchemaRef::new(
+                AgentSchemaId::new("out").expect("schema id"),
+                AgentRevisionNumber::INITIAL,
+            ),
+        )
+        .expect("descriptor");
+        let adapter = RigModelAdapter::new(ScriptedCompletionModel::new().returning_text("hi"))
+            .with_result_tool("finish");
+        // `call` short-circuits on `build_request`'s `?` before the scripted
+        // model's `completion` is ever awaited, so the refusal below is also
+        // the proof that the model recorded no call.
+        let error = adapter
+            .call(&request().with_tools(vec![descriptor]))
+            .await
+            .expect_err("a colliding tool name is refused before any request is built");
+        assert_eq!(error.code(), "model-result-tool-collision");
     }
 
     #[test]
