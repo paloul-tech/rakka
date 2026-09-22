@@ -708,7 +708,8 @@ where
     ///
     /// The kind survives: most providers authenticate with one opaque secret
     /// whatever it is, but a provider that reads a bearer token and an API key
-    /// out of different places cannot be told them apart later. The API key's
+    /// out of different places needs them told apart, and collapsing the two
+    /// here is the one point after which nothing can. The API key's
     /// *name* is still deliberately not consulted — the header a secret rides
     /// in is the provider's own convention, not the credential's.
     fn provider_key(
