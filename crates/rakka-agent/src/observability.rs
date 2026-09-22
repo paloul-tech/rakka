@@ -1827,6 +1827,9 @@ pub struct AgentTelemetrySegment {
     /// ([17.8](../../../docs/plans/rakka-agent/spec.md): never invent token
     /// usage), and absent rather than zeroed when it reported none.
     pub usage: Option<crate::model::AgentModelUsage>,
+    /// What the provider reported about its answer, when the segment carried
+    /// it.
+    pub model_response: Option<crate::model::AgentModelResponseMetadata>,
     /// The durable trace context the operation belongs to.
     pub telemetry: AgentTelemetryContext,
     /// The operation's own span id, when it has a durable identity.
@@ -1859,6 +1862,7 @@ impl AgentTelemetrySegment {
             attributes: AgentAttributes::new(),
             decisions: Vec::new(),
             usage: None,
+            model_response: None,
             telemetry: AgentTelemetryContext::default(),
             span_id: None,
         }
@@ -1938,6 +1942,13 @@ impl AgentTelemetrySegment {
     #[must_use]
     pub fn usage(mut self, usage: crate::model::AgentModelUsage) -> Self {
         self.usage = (usage.total_tokens() > 0).then_some(usage);
+        self
+    }
+
+    /// Attaches the provider's response metadata.
+    #[must_use]
+    pub fn model_response(mut self, metadata: crate::model::AgentModelResponseMetadata) -> Self {
+        self.model_response = Some(metadata);
         self
     }
 

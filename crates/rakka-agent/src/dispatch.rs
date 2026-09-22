@@ -129,7 +129,8 @@ use crate::memory::{
     PrivateMemoryExpectation, SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
 };
 use crate::model::{
-    AgentModelAdapter, AgentModelRequest, AgentModelTurn, AgentToolCallId, AgentToolCallRequest,
+    AgentModelAdapter, AgentModelRequest, AgentModelResponseMetadata, AgentModelTurn,
+    AgentToolCallId, AgentToolCallRequest,
 };
 use crate::observability::{
     agent_linked_telemetry_context, agent_span_link, AgentSegmentOperation, AgentSegmentTimer,
@@ -2822,7 +2823,12 @@ where
         // Provider-reported usage rides the attempt that produced it, so a
         // token count and the latency that produced it are one record.
         let attempt_segment = match &invoked {
-            Ok(AgentRunEffectOutcome::Model { turn }) => attempt_segment.usage(turn.usage),
+            Ok(AgentRunEffectOutcome::Model { turn }) => attempt_segment
+                .usage(turn.usage)
+                .model_response(AgentModelResponseMetadata {
+                    model: turn.response_model.clone(),
+                    finish_reason: turn.finish_reason.clone(),
+                }),
             _ => attempt_segment,
         };
         self.close_segment(scope, &intent.telemetry, attempt_segment);

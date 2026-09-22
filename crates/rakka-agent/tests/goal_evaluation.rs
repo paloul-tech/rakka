@@ -37,6 +37,7 @@ fn text_turn(text: &str) -> AgentModelTurn {
             input_tokens: 8,
             output_tokens: 4,
             cost_micros: 2,
+            ..Default::default()
         })
 }
 

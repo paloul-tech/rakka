@@ -291,6 +291,7 @@ fn model_usage(usage: &Usage) -> AgentModelUsage {
         input_tokens,
         output_tokens: usage.output_tokens,
         cost_micros: 0,
+        ..Default::default()
     }
 }
 

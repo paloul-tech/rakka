@@ -85,6 +85,50 @@ validated_id! {
     pub AgentToolCallId, "agent_tool_call_id"
 }
 
+/// Longest provider-reported response model name or finish reason a turn
+/// carries, in bytes.
+pub const AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES: usize = 128;
+
+/// What a provider reported about its answer beyond the content: the model
+/// that actually answered and why it stopped. Observability only, never read
+/// for inference; bounded so a turn stays within its record limits.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AgentModelResponseMetadata {
+    /// The provider's response model name, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The provider's finish or stop reason, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+fn truncate_at_boundary(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
+impl AgentModelResponseMetadata {
+    /// Metadata with each field truncated to [`AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES`]
+    /// at a character boundary, so provider text can never produce an
+    /// unbounded turn.
+    #[must_use]
+    pub fn bounded(model: Option<String>, finish_reason: Option<String>) -> Self {
+        Self {
+            model: model
+                .map(|value| truncate_at_boundary(value, AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES)),
+            finish_reason: finish_reason
+                .map(|value| truncate_at_boundary(value, AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES)),
+        }
+    }
+}
+
 /// What one model turn consumed.
 ///
 /// The dimensions are the ones the run's ledger charges
@@ -109,6 +153,13 @@ pub struct AgentModelUsage {
     pub output_tokens: u64,
     /// Provider cost, in micro-units of currency.
     pub cost_micros: u64,
+    /// Input tokens the provider served from its cache, when it reported
+    /// them; observability, never billing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    /// Reasoning tokens the provider reported, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl AgentModelUsage {
@@ -209,6 +260,19 @@ pub struct AgentModelTurn {
     pub proposal: Option<AgentTaskContent>,
     /// What the turn consumed.
     pub usage: AgentModelUsage,
+    /// The provider's response model name, when it reported one.
+    ///
+    /// Provenance, never inference: nothing downstream reads it to decide
+    /// anything, and it is bounded at
+    /// [`AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_model: Option<String>,
+    /// The provider's finish or stop reason, when it reported one.
+    ///
+    /// Provenance, never inference; bounded at
+    /// [`AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 impl AgentModelTurn {
@@ -223,6 +287,8 @@ impl AgentModelTurn {
             tool_calls: Vec::new(),
             proposal: None,
             usage: AgentModelUsage::default(),
+            response_model: None,
+            finish_reason: None,
         }
     }
 
@@ -258,6 +324,20 @@ impl AgentModelTurn {
     #[must_use]
     pub const fn with_usage(mut self, usage: AgentModelUsage) -> Self {
         self.usage = usage;
+        self
+    }
+
+    /// Sets the provider's response model name.
+    #[must_use]
+    pub fn with_response_model(mut self, response_model: impl Into<String>) -> Self {
+        self.response_model = Some(response_model.into());
+        self
+    }
+
+    /// Sets the provider's finish or stop reason.
+    #[must_use]
+    pub fn with_finish_reason(mut self, finish_reason: impl Into<String>) -> Self {
+        self.finish_reason = Some(finish_reason.into());
         self
     }
 
@@ -301,6 +381,20 @@ impl AgentModelTurn {
                     message: error.to_string(),
                 })?;
         }
+        for (field, value) in [
+            ("response_model", &self.response_model),
+            ("finish_reason", &self.finish_reason),
+        ] {
+            if let Some(value) = value {
+                if value.len() > AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES {
+                    return Err(AgentModelError::ResponseMetadataTooLong {
+                        field,
+                        bytes: value.len(),
+                        maximum: AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES,
+                    });
+                }
+            }
+        }
 
         let bytes = self.size_bytes();
         if bytes > AGENT_MODEL_TURN_MAX_BYTES {
@@ -341,6 +435,10 @@ struct AgentModelTurnRecord {
     proposal: Option<AgentTaskContent>,
     #[serde(default)]
     usage: AgentModelUsage,
+    #[serde(default)]
+    response_model: Option<String>,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for AgentModelTurn {
@@ -357,6 +455,8 @@ impl<'de> Deserialize<'de> for AgentModelTurn {
             tool_calls: record.tool_calls,
             proposal: record.proposal,
             usage: record.usage,
+            response_model: record.response_model,
+            finish_reason: record.finish_reason,
         };
         turn.validate().map_err(serde::de::Error::custom)?;
         Ok(turn)
@@ -735,6 +835,16 @@ pub enum AgentModelError {
         /// Bounded human-readable detail.
         message: String,
     },
+    /// A provider-reported response model name or finish reason exceeded its
+    /// bound.
+    ResponseMetadataTooLong {
+        /// Which field was rejected: `"response_model"` or `"finish_reason"`.
+        field: &'static str,
+        /// Length of the rejected value, in bytes.
+        bytes: usize,
+        /// Maximum accepted length, in bytes.
+        maximum: usize,
+    },
 }
 
 impl AgentModelError {
@@ -752,6 +862,7 @@ impl AgentModelError {
             Self::InvalidRetryPolicy { .. } => "model-retry-policy-invalid",
             Self::Provider { .. } => "model-provider-failed",
             Self::Refused { code, .. } => code,
+            Self::ResponseMetadataTooLong { .. } => "model-response-metadata-too-long",
         }
     }
 }
@@ -795,6 +906,14 @@ impl Display for AgentModelError {
             Self::Refused { code, message } => {
                 write!(f, "the model adapter refused the call ({code}): {message}")
             }
+            Self::ResponseMetadataTooLong {
+                field,
+                bytes,
+                maximum,
+            } => write!(
+                f,
+                "the model turn's {field} is {bytes} bytes, which exceeds the {maximum} byte limit"
+            ),
         }
     }
 }
@@ -890,5 +1009,33 @@ mod tests {
         .expect("the policy serializes");
         serde_json::from_value::<AgentModelRetryPolicy>(auto_retry)
             .expect_err("a non-idempotent auto-retry policy is refused on load");
+    }
+
+    #[test]
+    fn response_metadata_is_bounded_on_the_turn_and_truncated_by_the_helper() {
+        let turn = AgentModelTurn::new(AgentRevisionNumber::INITIAL)
+            .with_response_model("m".repeat(AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES + 1));
+        assert_eq!(
+            turn.validate().expect_err("too long").code(),
+            "model-response-metadata-too-long"
+        );
+        let bounded =
+            AgentModelResponseMetadata::bounded(Some("m".repeat(500)), Some("é".repeat(200)));
+        assert_eq!(
+            bounded.model.as_deref().map(str::len),
+            Some(AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES)
+        );
+        assert!(bounded.finish_reason.as_deref().is_some_and(|s| s.len()
+            <= AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES
+            && s.is_char_boundary(s.len())));
+        let encoded = serde_json::to_string(&AgentModelTurn::new(AgentRevisionNumber::INITIAL))
+            .expect("encodes");
+        assert!(
+            !encoded.contains("response_model"),
+            "absent fields are not serialized: {encoded}"
+        );
+        let decoded: AgentModelTurn =
+            serde_json::from_str(&encoded).expect("a pre-field record decodes");
+        assert!(decoded.response_model.is_none() && decoded.usage.cached_input_tokens.is_none());
     }
 }

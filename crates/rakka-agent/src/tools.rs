@@ -1293,9 +1293,10 @@ impl AgentToolAuthority {
     /// [`AGENT_MODEL_TURN_MAX_BYTES`]. A transform is decoded through the
     /// turn's validating deserializer and refused (`guardrail-transform-invalid`)
     /// when it does not form a bounded turn, when it rewrites the schema
-    /// version, adapter version, model profile, or usage the provider
-    /// reported, when it carries a tool call under a call id the model did not
-    /// produce, or when it carries two tool calls under one call id; a stage
+    /// version, adapter version, model profile, usage, response model, or
+    /// finish reason the provider reported, when it carries a tool call under
+    /// a call id the model did not produce, or when it carries two tool calls
+    /// under one call id; a stage
     /// may rewrite text, drop, reorder, or rewrite the model's own tool calls,
     /// and rewrite an inline proposal. A transform that changes the
     /// proposal's form — inline to artifact reference, reference to inline,
@@ -1355,12 +1356,14 @@ impl AgentToolAuthority {
                 || transformed.adapter_version != review.turn.adapter_version
                 || transformed.model_profile != review.turn.model_profile
                 || transformed.usage != review.turn.usage
+                || transformed.response_model != review.turn.response_model
+                || transformed.finish_reason != review.turn.finish_reason
             {
                 return Err(AgentAuthorityRefusal::of(
                     "guardrail-transform-invalid",
                     "a guardrail transform may rewrite a turn's text, tool calls, and proposal; \
-                     it may not rewrite its schema version, adapter version, model profile, or \
-                     usage",
+                     it may not rewrite its schema version, adapter version, model profile, \
+                     usage, response model, or finish reason",
                 ));
             }
             let invented = transformed.tool_calls.iter().any(|call| {

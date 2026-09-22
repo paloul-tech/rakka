@@ -33,6 +33,8 @@ const REPORTED_USAGE: AgentModelUsage = AgentModelUsage {
     input_tokens: 10,
     output_tokens: 5,
     cost_micros: 3,
+    cached_input_tokens: None,
+    reasoning_tokens: None,
 };
 
 fn stage_id(id: &str) -> AgentGuardrailStageId {
@@ -183,6 +185,20 @@ impl AgentGuardrail for RewriteUsage {
     }
 }
 
+/// Provider provenance on the turn is not a stage's to rewrite.
+struct RewriteResponseModel;
+
+impl AgentGuardrail for RewriteResponseModel {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
+        let mut altered = content.clone();
+        altered["response_model"] = json!("gpt-forged");
+        AgentGuardrailOutcome::Transform {
+            content: altered,
+            reason_code: "provenance-rewritten".to_string(),
+        }
+    }
+}
+
 /// A transform that replaces the inline proposal with an artifact reference —
 /// an artifact nothing in the turn produced.
 struct ReferenceTheProposal;
@@ -327,6 +343,15 @@ fn a_transform_that_rewrites_usage_is_refused_as_invalid() {
     let refusal = authority_with(Arc::new(RewriteUsage))
         .review_model_response(&run_scope(), text_turn("hello").with_usage(REPORTED_USAGE))
         .expect_err("usage is the provider's, not a stage's");
+    assert_eq!(refusal.code, "guardrail-transform-invalid");
+}
+
+#[test]
+fn a_transform_that_rewrites_the_response_model_is_refused_as_invalid() {
+    let turn = text_turn("hello").with_response_model("claude-sonnet-5");
+    let refusal = authority_with(Arc::new(RewriteResponseModel))
+        .review_model_response(&run_scope(), turn)
+        .expect_err("provider provenance is immutable");
     assert_eq!(refusal.code, "guardrail-transform-invalid");
 }
 
