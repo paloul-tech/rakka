@@ -191,17 +191,6 @@ pub enum McpSyncError {
         /// The contradicted hint.
         hint: &'static str,
     },
-    /// The host's egress rule refused the server's URL, so no connection was
-    /// opened and no credential left the process.
-    Egress {
-        /// The server whose URL was refused.
-        server: String,
-        /// The host's own stable refusal code.
-        code: String,
-        /// The host's own message. Never a credential: the check is given the
-        /// URL and the server id, and nothing else.
-        message: String,
-    },
     /// The binding itself is not dispatchable.
     Registration(McpRegistrationError),
     /// The server's tool could not become a Rakka descriptor.
@@ -218,9 +207,10 @@ pub enum McpSyncError {
 impl McpSyncError {
     /// Stable, machine-readable error code.
     ///
-    /// Borrowed rather than `&'static str`: an [`Self::Egress`] refusal
-    /// carries the *host's* own code through unchanged, so an operator reads
-    /// back the rule that fired rather than a code this crate invented for it.
+    /// Borrowed rather than `&'static str`: a
+    /// [`McpClientError::Egress`] refusal carries the *host's* own code
+    /// through unchanged, so an operator reads back the rule that fired
+    /// rather than a code this crate invented for it.
     #[must_use]
     pub fn code(&self) -> &str {
         match self {
@@ -234,7 +224,6 @@ impl McpSyncError {
                 }
                 _ => error.code(),
             },
-            Self::Egress { code, .. } => code,
             Self::SchemaTooLarge { .. } => "mcp-descriptor-schema-too-large",
             Self::HintContradictsDeclaration { .. } => "mcp-hint-contradicts-declaration",
             Self::Registration(error) => error.code(),
@@ -259,14 +248,6 @@ impl Display for McpSyncError {
             Self::HintContradictsDeclaration { server, tool, hint } => write!(
                 f,
                 "the MCP server {server}'s tool {tool} hint {hint:?} contradicts its declaration"
-            ),
-            Self::Egress {
-                server,
-                code,
-                message,
-            } => write!(
-                f,
-                "the egress rule refused the MCP server {server} ({code}): {message}"
             ),
             Self::Registration(error) => Display::fmt(error, f),
             Self::Descriptor {
@@ -326,16 +307,10 @@ where
     // adapter would not dial anyway.
     binding.validate()?;
     let server = binding.server_id.to_string();
-    if let Some(url) = binding.url() {
-        egress
-            .check(&binding.server_id, url)
-            .map_err(|refusal| McpSyncError::Egress {
-                server: server.clone(),
-                code: refusal.code,
-                message: refusal.message,
-            })?;
-    }
-    let session = connect(http, binding, credential).await?;
+    // The egress rule fires inside `connect`, before a client exists and
+    // before the credential is read; a refusal arrives here as
+    // `McpClientError::Egress`, whose code is the host's own.
+    let session = connect(http, binding, credential, egress).await?;
     let listed = session.peer().list_all_tools().await;
     let protocol_version = session.negotiated_version().as_str().to_string();
     let server_name = session.server_name().to_string();

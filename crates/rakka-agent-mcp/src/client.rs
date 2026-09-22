@@ -15,8 +15,12 @@
 //!   first, and an unknown version is refused rather than sent.
 //! - A server that identifies as a Rakka agent is refused after the session is
 //!   closed ([specification 14.4]): MCP is never an agent-to-agent channel.
-//! - Every outbound connection passes the host's [`McpEgressCheck`] before a
-//!   client exists — at publish time as much as at dispatch time.
+//! - Every outbound connection passes the host's [`McpEgressCheck`] here, in
+//!   this module's own `connect`, before a client exists and before the
+//!   credential is read — at publish time as much as at dispatch time. The
+//!   check lives in this module rather than in each caller so that *being
+//!   connected* and *having passed the rule* are the same event: a new caller
+//!   cannot reach a server by forgetting to ask.
 //!
 //! [`StreamableHttpError::UnexpectedServerResponse`]: rmcp::transport::streamable_http_client::StreamableHttpError::UnexpectedServerResponse
 //! [specification 14.4]: ../../../docs/plans/rakka-agent/spec.md
@@ -87,16 +91,35 @@ pub enum McpClientError {
         /// An rmcp error variant name, and a JSON-RPC code where one exists.
         reason: String,
     },
+    /// The host's egress rule refused the server's URL, so no connection was
+    /// opened and no credential left the process.
+    Egress {
+        /// The server whose URL was refused.
+        server: String,
+        /// The host's own stable refusal code.
+        code: String,
+        /// The host's own message. Never a credential: the check is given the
+        /// URL and the server id, and nothing else.
+        message: String,
+        /// Whether the refusing condition may clear without a new
+        /// configuration, as the host declared it.
+        retryable: bool,
+    },
 }
 
 impl McpClientError {
     /// Stable, machine-readable error code.
+    ///
+    /// Borrowed rather than `&'static str`: an [`Self::Egress`] refusal
+    /// carries the *host's* own code through unchanged, so an operator reads
+    /// back the rule that fired rather than a code this crate invented for it.
     #[must_use]
-    pub const fn code(&self) -> &'static str {
+    pub fn code(&self) -> &str {
         match self {
             Self::ProtocolUnsupported { .. } => "mcp-protocol-unsupported",
             Self::PeerAgentChannel { .. } => "mcp-peer-agent-channel-refused",
             Self::CredentialMaterialUnsupported { .. } => "mcp-credential-material-unsupported",
+            Self::Egress { code, .. } => code,
             // One code, not two: `mcp-transport-failed` is the
             // `AgentDispatchError::Invocation` code the executor raises for a
             // failed call, and an operator acting on "the server did not
@@ -139,6 +162,15 @@ impl Display for McpClientError {
             Self::Protocol { server, reason } => {
                 write!(f, "the MCP server {server} broke the protocol: {reason}")
             }
+            Self::Egress {
+                server,
+                code,
+                message,
+                ..
+            } => write!(
+                f,
+                "the egress rule refused the MCP server {server} ({code}): {message}"
+            ),
         }
     }
 }
@@ -232,7 +264,12 @@ pub fn client_info() -> ClientConfig {
 }
 
 /// Opens a Streamable HTTP session to the binding's server over the injected
-/// client.
+/// client, once `egress` has admitted the destination.
+///
+/// The order is the property: the egress check runs before the credential is
+/// read, so a refused destination never resolves material into a header at
+/// all, and before a transport exists, so a refused destination is never
+/// dialed.
 ///
 /// The credential — when one is supplied — becomes an `Authorization` header
 /// or one custom header, and nothing else.
@@ -244,6 +281,7 @@ pub(crate) async fn connect<C>(
     http: &C,
     binding: &McpServerBinding,
     credential: Option<&AgentEphemeralCredential>,
+    egress: &dyn McpEgressCheck,
 ) -> Result<McpClientSession, McpClientError>
 where
     C: StreamableHttpClient + Sync,
@@ -255,6 +293,16 @@ where
             reason: "the binding names no HTTP endpoint".to_string(),
         });
     };
+    egress
+        .check(&binding.server_id, url)
+        .map_err(|refusal| McpClientError::Egress {
+            server,
+            code: refusal.code,
+            message: refusal.message,
+            retryable: refusal.retryable,
+        })?;
+    // Below this line only: the credential is read once the destination is
+    // admitted, and never above it.
     let (auth_header, custom_headers) = credential_headers(binding, credential)?;
     let mut config = StreamableHttpClientTransportConfig::with_uri(url.as_str());
     config.allow_stateless = true;

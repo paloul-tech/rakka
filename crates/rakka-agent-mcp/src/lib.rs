@@ -9,11 +9,13 @@
 //! - `binding`: server ids, transports, tool policies, the binding record, and
 //!   its refusals.
 //! - `client`: per-attempt rmcp client construction shared by the sync and the
-//!   executor — credential to header, protocol negotiation, the peer-agent
-//!   rule, error mapping.
+//!   executor — the egress seam and the check every outbound connection
+//!   passes, credential to header, protocol negotiation, the peer-agent rule,
+//!   error mapping.
 //! - `sync`: `sync_mcp_descriptors`, the stored descriptor set, hint
 //!   narrowing, staleness.
-//! - `executor`: `McpDispatchToolExecutor`, the egress check, result mapping.
+//! - `executor`: `McpDispatchToolExecutor`, the schema recheck, result
+//!   mapping.
 //! - `launcher`: the child-process seam and (feature `child-process`) the
 //!   unsandboxed reference launcher.
 //! - `testkit` (feature `testkit`): the in-process fake server and counting
@@ -42,6 +44,8 @@ pub use binding::{
     MCP_TOOL_ERROR_DETAIL_MAX_BYTES, MCP_TOOL_ID_PREFIX,
 };
 pub use client::{McpAllowAllEgress, McpClientError, McpClientSession, McpEgressCheck};
+pub use executor::{mcp_artifact_store, McpArtifactStore, McpDispatchToolExecutor};
+pub use launcher::{McpChildProcessLauncher, McpChildTransport, McpLaunchError, McpLaunchFuture};
 pub use sync::{
     mcp_descriptor_staleness, sync_mcp_descriptors, McpDescriptorSet, McpDescriptorStaleness,
     McpSyncError, McpSyncedDescriptor,

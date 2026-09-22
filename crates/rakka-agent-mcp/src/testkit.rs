@@ -162,7 +162,8 @@ pub struct SeenCall {
     pub name: String,
     /// The call's arguments.
     pub arguments: Value,
-    /// The call's `_meta`, or [`Value::Null`] when it carried none.
+    /// The call's `_meta`, as the server received it: the request-level map
+    /// rmcp merged on the wire, which is where a client's own keys arrive.
     pub meta: Value,
     /// The `Authorization` header on the request that carried the call.
     pub authorization: Option<String>,
@@ -320,13 +321,18 @@ impl ServerHandler for FakeMcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let arguments = Value::Object(request.arguments.unwrap_or_default());
-        let meta = request
-            .meta
-            .map_or(Value::Null, |meta| Value::Object(meta.0 .0));
+        // From the context, not from `request.meta`: rmcp merges a request's
+        // params-level and extension-level `_meta` on the way out
+        // (`rmcp-3.4.0/src/model/serde_impl.rs:41`) and hands the whole map to
+        // the handler through the request context
+        // (`rmcp-3.4.0/src/service/server.rs:640`), leaving the params' own
+        // field empty on this side. A proof that reads `request.meta` would
+        // see nothing a client sent.
+        let meta = Value::Object(context.meta.0 .0.clone());
         // Read the behaviour and record the call under one lock, then drop it:
         // `Sleep` awaits, and a std guard must never cross an await point.
         let behaviour = {
