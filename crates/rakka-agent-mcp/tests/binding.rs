@@ -1,0 +1,128 @@
+//! A binding names a server, its transport, a logical credential, and an
+//! allow-list of tools with operator-declared safety; every refusal has a
+//! stable code and nothing in a binding is a secret.
+
+use rakka_agent::{AgentEffectSafetyClass, AgentToolDeclaration};
+use rakka_agent_mcp::{
+    McpDescriptorRefresh, McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
+    MCP_DEFAULT_PROTOCOL_VERSIONS,
+};
+
+fn server(id: &str) -> McpServerId {
+    McpServerId::new(id).expect("server id")
+}
+
+fn policy() -> McpToolPolicy {
+    McpToolPolicy::new(AgentToolDeclaration::new(
+        AgentEffectSafetyClass::Idempotent,
+    ))
+}
+
+#[test]
+fn a_server_id_is_a_validated_identity_segment_without_dots() {
+    assert_eq!(server("crm").as_str(), "crm");
+    assert_eq!(
+        McpServerId::new("").expect_err("empty").code(),
+        "mcp-binding-invalid"
+    );
+    assert_eq!(
+        McpServerId::new("a/b").expect_err("separator").code(),
+        "mcp-binding-invalid"
+    );
+    assert_eq!(
+        McpServerId::new("a.b").expect_err("dot").code(),
+        "mcp-binding-invalid"
+    );
+    let decoded: Result<McpServerId, _> = serde_json::from_str("\"bad/id\"");
+    assert!(decoded.is_err(), "decoding validates too");
+}
+
+#[test]
+fn tool_ids_are_prefixed_and_validated() {
+    let binding = McpServerBinding::streamable_http(server("crm"), "https://mcp.example.test/mcp")
+        .with_tool("search_contacts", policy())
+        .expect("valid tool");
+    assert_eq!(
+        binding.tool_id("search_contacts").expect("id").as_str(),
+        "mcp.crm.search_contacts"
+    );
+    let error = McpServerBinding::streamable_http(server("crm"), "https://mcp.example.test/mcp")
+        .with_tool("bad|name", policy())
+        .expect_err("a persistence separator is refused");
+    assert_eq!(error.code(), "mcp-binding-invalid");
+}
+
+#[test]
+fn the_url_rule_accepts_http_and_https_and_refuses_userinfo_and_fragments() {
+    for ok in ["http://127.0.0.1:1/mcp", "https://h/mcp?x=1"] {
+        McpServerBinding::streamable_http(server("s"), ok)
+            .with_tool("t", policy())
+            .expect("tool")
+            .validate()
+            .expect(ok);
+    }
+    for bad in [
+        "ftp://h/mcp",
+        "https://u:p@h/mcp",
+        "https://h/mcp#f",
+        "not a url",
+        "https:///mcp",
+    ] {
+        let error = McpServerBinding::streamable_http(server("s"), bad)
+            .with_tool("t", policy())
+            .expect("tool")
+            .validate()
+            .expect_err(bad);
+        assert_eq!(error.code(), "mcp-binding-invalid", "{bad}");
+        assert!(
+            matches!(error, McpRegistrationError::InvalidUrl { .. }),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn defaults_are_manual_refresh_the_two_versions_and_one_inline_attempt() {
+    let binding = McpServerBinding::streamable_http(server("s"), "https://h/mcp")
+        .with_tool("t", policy())
+        .expect("tool");
+    assert_eq!(binding.refresh, McpDescriptorRefresh::Manual);
+    assert_eq!(
+        binding.protocol_versions,
+        MCP_DEFAULT_PROTOCOL_VERSIONS.map(str::to_string).to_vec()
+    );
+    let policy = &binding.tools["t"];
+    assert_eq!(
+        (policy.max_attempts, policy.timeout_ms, policy.honor_hints),
+        (1, None, false)
+    );
+    assert!(binding.credential_binding.is_none());
+    let empty = McpServerBinding::streamable_http(server("s"), "https://h/mcp");
+    assert!(matches!(
+        empty
+            .validate()
+            .expect_err("a binding lists at least one tool"),
+        McpRegistrationError::NoTools { .. }
+    ));
+    let no_versions = binding.clone().with_protocol_versions(vec![]);
+    assert!(matches!(
+        no_versions.validate().expect_err("versions"),
+        McpRegistrationError::ProtocolVersionsEmpty { .. }
+    ));
+}
+
+#[test]
+fn a_binding_round_trips_and_carries_no_secret_shaped_field() {
+    let binding = McpServerBinding::streamable_http(server("s"), "https://h/mcp")
+        .with_tool("t", policy())
+        .expect("tool");
+    let encoded = serde_json::to_string(&binding).expect("encodes");
+    let decoded: McpServerBinding = serde_json::from_str(&encoded).expect("decodes");
+    assert_eq!(decoded, binding);
+    for forbidden in ["token", "secret", "api_key", "password"] {
+        assert!(
+            !encoded.contains(forbidden),
+            "{forbidden} appears in a binding's encoding: {encoded}"
+        );
+    }
+}

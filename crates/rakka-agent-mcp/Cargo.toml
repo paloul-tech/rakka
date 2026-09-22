@@ -1,0 +1,55 @@
+[package]
+name = "rakka-agent-mcp"
+version = "0.1.0"
+description.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+license-file.workspace = true
+# Not yet in the release-candidate publishable set (scripts/package-check.sh,
+# docs/rakka-v1-release-packaging.md); remove this guard when it enters it.
+publish = false
+
+[lib]
+name = "rakka_agent_mcp"
+
+[features]
+default = []
+# rmcp's stdio child-process transport and the unsandboxed reference launcher
+# `TokioChildProcessLauncher`. Off by default: a deployment that runs tools
+# inside its own sandbox implements `McpChildProcessLauncher` over that
+# sandbox and never enables this.
+child-process = ["rmcp/transport-child-process"]
+# The in-process fake MCP server and counting client the crate's own tests and
+# `rakka-agent`'s dispatcher proofs drive. Pulls rmcp's server side and axum.
+testkit = ["rmcp/server", "rmcp/transport-streamable-http-server", "dep:axum"]
+
+[dependencies]
+# Exact pin (docs/rakka-compatibility.md). `client` + the Streamable HTTP
+# client over rmcp's own reqwest (`reqwest` = `reqwest?/rustls`, TLS only;
+# nothing here enables `reqwest/system-proxy`), and `transport-io` so a
+# launcher's AsyncRead/AsyncWrite pair is a transport. The server side and
+# the child-process transport are feature-gated above.
+rmcp = { version = "=3.4.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest", "transport-io"] }
+# The tool contracts this adapter fills: descriptors, bindings, declarations,
+# the dispatch executor trait, refusals, identity validation. Default features
+# off: an MCP executor never touches the model adapter.
+rakka-agent = { path = "../rakka-agent", version = "0.1.0", default-features = false }
+# `AgentEphemeralCredential`, `ArtifactRef`, the artifact store, timestamps.
+rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+axum = { workspace = true, optional = true }
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true
+rmcp = { version = "=3.4.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+
+[lints]
+workspace = true
