@@ -619,6 +619,10 @@ and settings, onto `AgentGrantedDispatch.tools`, and copied onto the
 request by the dispatcher, which holds no registry) (the security matrix's "descriptor rung" owed item), and the
 adapter declares each as a Rig `ToolDefinition` beside the result tool. This
 turns "the model is never told which tools exist" into a real surface.
+(plan refinement 2026-09-21: a model-visible descriptor named like the
+adapter's own result tool refuses `model-result-tool-collision` before any
+request is built, since declaring both would put two tool definitions under
+one name on the wire — see 11.1.)
 (revised 2026-09-20) The list is the *filtered* model-visible set:
 `model_visible` (`tools.rs:723–735`) keeps a descriptor only when the envelope
 declares the tool and the current settings have not revoked it
@@ -1506,7 +1510,9 @@ fingerprint survive `build()` unchanged).
   `model-response-metadata-too-long` (plan refinement 2026-09-21: the
   adapter and the router refuse through one `AgentModelError::Refused`
   variant; `model-profile-revision-mismatch` is deferred with 4.2 item 1),
-  `guardrail-rule-invalid` (a built-in stage constructed with an empty or
+  `model-result-tool-collision` (plan refinement 2026-09-21: the Rig
+  adapters refuse, before any request is built, a model-visible tool whose
+  name equals the adapter's result tool), `guardrail-rule-invalid` (a built-in stage constructed with an empty or
   oversized rule; `guardrail-transform-invalid` and `checkpoint-required` are
   already registered and reused, so the first draft's
   `guardrail-checkpoint-unsupported-at-response` is withdrawn — plan
