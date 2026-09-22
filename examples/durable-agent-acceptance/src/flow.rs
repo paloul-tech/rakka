@@ -1259,7 +1259,7 @@ async fn approve_open_checkpoints(
 ///
 /// # Errors
 ///
-/// A run that does not terminate within [`PROVIDER_WALK_MAX_PASSES`] passes, a
+/// A run that does not terminate within `PROVIDER_WALK_MAX_PASSES` passes, a
 /// refused approval, or a leaked key.
 pub async fn drive_one_run_with_profile(
     world: &World,
