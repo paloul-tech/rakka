@@ -2124,11 +2124,14 @@ version = "0.1.0"
 dependencies = [
  "axum 0.8.9",
  "futures-util",
+ "http",
  "rakka-agent",
  "rakka-agent-workflow",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",
+ "sse-stream",
  "tokio",
 ]
 

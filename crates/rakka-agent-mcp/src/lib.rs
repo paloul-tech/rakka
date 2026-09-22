@@ -41,3 +41,8 @@ pub use binding::{
     MCP_INLINE_RESULT_MAX_BYTES, MCP_META_IDEMPOTENCY_KEY, MCP_PEER_AGENT_SERVER_PREFIX,
     MCP_TOOL_ERROR_DETAIL_MAX_BYTES, MCP_TOOL_ID_PREFIX,
 };
+pub use client::{McpClientError, McpClientSession};
+pub use sync::{
+    mcp_descriptor_staleness, sync_mcp_descriptors, McpDescriptorSet, McpDescriptorStaleness,
+    McpSyncError, McpSyncedDescriptor,
+};

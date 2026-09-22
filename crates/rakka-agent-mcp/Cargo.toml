@@ -25,7 +25,7 @@ default = []
 child-process = ["rmcp/transport-child-process"]
 # The in-process fake MCP server and counting client the crate's own tests and
 # `rakka-agent`'s dispatcher proofs drive. Pulls rmcp's server side and axum.
-testkit = ["rmcp/server", "rmcp/transport-streamable-http-server", "dep:axum"]
+testkit = ["rmcp/server", "rmcp/transport-streamable-http-server", "dep:axum", "dep:reqwest", "dep:sse-stream"]
 
 [dependencies]
 # Exact pin (docs/rakka-compatibility.md). `client` + the Streamable HTTP
@@ -40,14 +40,30 @@ rmcp = { version = "=3.4.0", default-features = false, features = ["client", "tr
 rakka-agent = { path = "../rakka-agent", version = "0.1.0", default-features = false }
 # `AgentEphemeralCredential`, `ArtifactRef`, the artifact store, timestamps.
 rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
+# `HeaderName`/`HeaderValue`: the types rmcp's transport config names for a
+# custom header. rmcp does not re-export `http`, so the credential-to-header
+# step has to name the same crate rmcp links.
+http = "1"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 axum = { workspace = true, optional = true }
+# The testkit's `ReqwestClient` re-export only. rmcp does not re-export its own
+# `reqwest`, and the testkit has to name the concrete client type rmcp
+# implements `StreamableHttpClient` for; `default-features = false` keeps
+# `reqwest/system-proxy` (and every other default) off this graph, and cargo
+# unifies the result with the `reqwest?/rustls` rmcp itself enables.
+reqwest = { version = "0.13", default-features = false, optional = true }
+# The testkit's `CountingClient` has to spell `StreamableHttpClient::get_stream`'s
+# return type, and rmcp re-exports only `sse_stream::Error` (as `SseError`,
+# `rmcp-3.4.0/src/transport/streamable_http_client.rs:14`) — not `Sse` itself.
+sse-stream = { version = "0.2", optional = true }
 
 [dev-dependencies]
 axum.workspace = true
+reqwest = { version = "0.13", default-features = false }
+sse-stream = "0.2"
 tokio.workspace = true
 rmcp = { version = "=3.4.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
