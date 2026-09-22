@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -42,6 +42,9 @@ const ASK_FOR_A_TOOL_CALL: &str = "call-a-tool";
 struct Seen {
     bodies: Arc<Mutex<Vec<Value>>>,
     headers: Arc<Mutex<Vec<HeaderMap>>>,
+    /// The raw query string of each request, recorded by the routes whose
+    /// providers carry part of the call in the URL rather than the body.
+    queries: Arc<Mutex<Vec<String>>>,
     hits: Arc<AtomicUsize>,
 }
 
@@ -90,6 +93,23 @@ async fn openai_chat_completions(
     }))
 }
 
+/// Azure OpenAI's chat-completions route: the Chat Completions request and
+/// response shape (`rig-core-0.37.0/src/providers/azure.rs:688`), under Azure's
+/// own deployment path (`:251-262`), recording the query so a test can see the
+/// `api-version` the profile attribute chose.
+async fn azure_chat_completions(
+    State(seen): State<Seen>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: Json<Value>,
+) -> Json<Value> {
+    seen.queries
+        .lock()
+        .expect("not poisoned")
+        .push(query.unwrap_or_default());
+    openai_chat_completions(State(seen), headers, body).await
+}
+
 /// The sentinel a refusing provider echoes back inside its 400 body, standing
 /// for the request content a real provider's 4xx quotes at you.
 const LEAKED_PROMPT_SENTINEL: &str = "leaked-prompt-sentinel";
@@ -113,6 +133,10 @@ async fn serve(seen: Seen) -> SocketAddr {
     let app = Router::new()
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/chat/completions", post(openai_chat_completions))
+        .route(
+            "/openai/deployments/{deployment}/chat/completions",
+            post(azure_chat_completions),
+        )
         .route(
             "/refuse/v1/chat/completions",
             post(refusing_chat_completions),
@@ -326,6 +350,81 @@ async fn a_custom_provider_is_the_completions_shape_at_the_profiles_base_url() {
         "the Anthropic-shaped `system` field must not appear: {body}"
     );
     assert_eq!(body["model"], "llama-3");
+}
+
+/// Azure OpenAI is the one wired provider that reads the two credential kinds
+/// out of different places: an API key rides the `api-key` header and a minted
+/// Entra ID / managed-identity access token rides `Authorization: Bearer`
+/// (`rig-core-0.37.0/src/providers/azure.rs:143-160`). Collapsing them would
+/// put an access token in the key header and earn a 401 from every Azure
+/// deployment that authenticates the standard way.
+#[tokio::test]
+async fn azure_sends_a_bearer_token_as_a_bearer_and_an_api_key_in_the_key_header() {
+    let seen = Seen::default();
+    let addr = serve(seen.clone()).await;
+    let attributes = BTreeMap::from([("api_version".to_string(), "2024-10-21".to_string())]);
+    let adapter = RigProviderAdapter::new(
+        profile_with_attributes(
+            AgentModelProviderKind::AzureOpenAi,
+            "gpt-fake-1",
+            Some(format!("http://{addr}")),
+            attributes,
+        ),
+        ReqwestClient::new(),
+    )
+    .expect("valid");
+
+    let turn = adapter
+        .call_with(
+            &request("say-hello"),
+            Some(&AgentEphemeralCredential::bearer_token(
+                "entra-token-sentinel",
+            )),
+        )
+        .await
+        .expect("answers");
+    assert_eq!(turn.text.as_deref(), Some("hello from the fake"));
+    adapter
+        .call_with(
+            &request("say-hello"),
+            Some(&AgentEphemeralCredential::api_key(
+                "api-key",
+                "azure-key-sentinel",
+            )),
+        )
+        .await
+        .expect("answers");
+
+    let headers = seen.headers.lock().expect("not poisoned");
+    assert_eq!(
+        headers[0]
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer entra-token-sentinel"),
+        "a minted access token is a bearer, not a key"
+    );
+    assert!(
+        headers[0].get("api-key").is_none(),
+        "and it is not also the key header"
+    );
+    assert_eq!(
+        headers[1]
+            .get("api-key")
+            .and_then(|value| value.to_str().ok()),
+        Some("azure-key-sentinel"),
+        "an API key is the key header"
+    );
+    assert!(
+        headers[1].get("authorization").is_none(),
+        "and it is not also a bearer"
+    );
+
+    // Both calls reached Azure's deployment path — the only route registered
+    // under it — carrying the profile attribute's API version.
+    assert_eq!(seen.hits.load(Ordering::SeqCst), 2);
+    let queries = seen.queries.lock().expect("not poisoned");
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0], "api-version=2024-10-21");
 }
 
 #[tokio::test]

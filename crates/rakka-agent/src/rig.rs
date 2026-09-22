@@ -615,6 +615,32 @@ impl<H> fmt::Debug for RigProviderAdapter<H> {
     }
 }
 
+/// One attempt's provider secret, carrying the kind the credential declared.
+///
+/// Most providers take a single opaque key and put it where their convention
+/// says; those reach for [`ProviderKey::into_secret`] and never ask. Azure
+/// OpenAI is the exception that makes the kind load-bearing — it sends an API
+/// key and a bearer token in different headers — so the distinction the
+/// credential made must survive as far as the client builder.
+///
+/// It is deliberately not `Debug` or `Clone`: it holds an ephemeral secret and
+/// lives only for the duration of one call.
+enum ProviderKey {
+    /// A minted access token, for the `Authorization: Bearer` convention.
+    Bearer(String),
+    /// A long-lived API key, for whichever header the provider names.
+    ApiKey(String),
+}
+
+impl ProviderKey {
+    /// The bare secret, for a provider that takes one key whatever its kind.
+    fn into_secret(self) -> String {
+        match self {
+            Self::Bearer(secret) | Self::ApiKey(secret) => secret,
+        }
+    }
+}
+
 impl<H> RigProviderAdapter<H>
 where
     H: HttpClientExt + Clone + fmt::Debug + Default + Send + Sync + 'static,
@@ -680,18 +706,19 @@ where
     /// The provider key an ephemeral credential yields, when the material is a
     /// kind a provider accepts.
     ///
-    /// A provider authenticates with one opaque secret, so a bearer token and
-    /// an API key both reduce to it; the header the secret rides in is the
-    /// provider's own convention, not the credential's, so the API key's name
-    /// is deliberately not consulted.
+    /// The kind survives: most providers authenticate with one opaque secret
+    /// whatever it is, but a provider that reads a bearer token and an API key
+    /// out of different places cannot be told them apart later. The API key's
+    /// *name* is still deliberately not consulted — the header a secret rides
+    /// in is the provider's own convention, not the credential's.
     fn provider_key(
         credential: Option<&AgentEphemeralCredential>,
-    ) -> AgentModelResult<Option<String>> {
+    ) -> AgentModelResult<Option<ProviderKey>> {
         use rakka_agent_workflow::AgentEphemeralCredentialMaterial as Material;
         match credential.map(AgentEphemeralCredential::material) {
             None => Ok(None),
-            Some(Material::BearerToken { token }) => Ok(Some(token.clone())),
-            Some(Material::ApiKey { value, .. }) => Ok(Some(value.clone())),
+            Some(Material::BearerToken { token }) => Ok(Some(ProviderKey::Bearer(token.clone()))),
+            Some(Material::ApiKey { value, .. }) => Ok(Some(ProviderKey::ApiKey(value.clone()))),
             Some(other) => Err(AgentModelError::Refused {
                 code: "model-credential-material-unsupported",
                 message: format!(
@@ -704,9 +731,9 @@ where
 
     /// The key a provider that cannot call unauthenticated requires.
     fn required_key(
-        key: Option<String>,
+        key: Option<ProviderKey>,
         provider: &AgentModelProviderKind,
-    ) -> AgentModelResult<String> {
+    ) -> AgentModelResult<ProviderKey> {
         key.ok_or_else(|| AgentModelError::Refused {
             code: "model-credential-missing",
             message: format!(
@@ -754,7 +781,7 @@ where
         match &profile.provider {
             AgentModelProviderKind::Anthropic => {
                 let mut builder = anthropic::Client::builder()
-                    .api_key(Self::required_key(key, &profile.provider)?)
+                    .api_key(Self::required_key(key, &profile.provider)?.into_secret())
                     .http_client(http);
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
@@ -772,7 +799,7 @@ where
             }
             AgentModelProviderKind::OpenAiResponses => {
                 let mut builder = openai::Client::builder()
-                    .api_key(Self::required_key(key, &profile.provider)?)
+                    .api_key(Self::required_key(key, &profile.provider)?.into_secret())
                     .http_client(http);
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
@@ -784,7 +811,7 @@ where
             }
             AgentModelProviderKind::OpenAiCompletions | AgentModelProviderKind::Custom(_) => {
                 let mut builder = openai::Client::builder()
-                    .api_key(Self::required_key(key, &profile.provider)?)
+                    .api_key(Self::required_key(key, &profile.provider)?.into_secret())
                     .http_client(http);
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
@@ -802,7 +829,7 @@ where
             }
             AgentModelProviderKind::OpenRouter => {
                 let mut builder = openrouter::Client::builder()
-                    .api_key(Self::required_key(key, &profile.provider)?)
+                    .api_key(Self::required_key(key, &profile.provider)?.into_secret())
                     .http_client(http);
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
@@ -814,7 +841,7 @@ where
             }
             AgentModelProviderKind::Gemini => {
                 let mut builder = gemini::Client::builder()
-                    .api_key(Self::required_key(key, &profile.provider)?)
+                    .api_key(Self::required_key(key, &profile.provider)?.into_secret())
                     .http_client(http);
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
@@ -828,11 +855,17 @@ where
                 // `new` refuses an Azure profile with no `base_url`, so the
                 // endpoint below is always the profile's own.
                 let endpoint = profile.base_url.clone().unwrap_or_default();
+                // Azure is the one wired provider that reads the two kinds out
+                // of different places: an API key from the `api-key` header, a
+                // minted Entra ID / managed-identity access token from
+                // `Authorization: Bearer`
+                // (`rig-core-0.37.0/src/providers/azure.rs:143-160`).
+                let auth = match Self::required_key(key, &profile.provider)? {
+                    ProviderKey::Bearer(token) => azure::AzureOpenAIAuth::Token(token),
+                    ProviderKey::ApiKey(value) => azure::AzureOpenAIAuth::ApiKey(value),
+                };
                 let mut builder = azure::Client::builder()
-                    .api_key(azure::AzureOpenAIAuth::ApiKey(Self::required_key(
-                        key,
-                        &profile.provider,
-                    )?))
+                    .api_key(auth)
                     .http_client(http)
                     .azure_endpoint(endpoint);
                 if let Some(version) = profile.attributes.get("api_version") {
@@ -848,7 +881,9 @@ where
                 // rig maps an empty key to no header at all, so an attempt
                 // that resolved no credential is not refused here.
                 let mut builder = ollama::Client::builder()
-                    .api_key(ollama::OllamaApiKey::from(key.unwrap_or_default()))
+                    .api_key(ollama::OllamaApiKey::from(
+                        key.map(ProviderKey::into_secret).unwrap_or_default(),
+                    ))
                     .http_client(http);
                 if let Some(url) = &profile.base_url {
                     builder = builder.base_url(url);
