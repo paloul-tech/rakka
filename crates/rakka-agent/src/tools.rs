@@ -305,6 +305,14 @@ impl Display for AgentToolResultBehavior {
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)): showing it
 /// to a model lets the model *ask*, and everything that decides whether the
 /// ask executes lives in the binding, the intent, and the grant.
+///
+/// Decoding does **not** re-validate: `Deserialize` reconstructs the fields as
+/// written, while [`AgentToolDescriptor::new`] is what enforces the bounds. The
+/// descriptors a model is shown are validated where they enter — the registry
+/// builds them, and the dispatch authority validates the ones it puts on a
+/// grant — so a decoded descriptor from any other source is caller-checked
+/// input: call [`AgentToolDescriptor::validate`] on it before it is trusted,
+/// as the model-turn decode beside it does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentToolDescriptor {
     /// Stable tool name.
