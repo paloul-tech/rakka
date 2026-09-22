@@ -111,10 +111,35 @@ impl AgentEffectCredentialResolver for EnvCredentialResolver {
 pub struct ProviderWalkReport {
     /// One line per fact, `ok  …` when it held.
     pub lines: Vec<String>,
+    /// The provider kind the walk drove.
+    ///
+    /// Reported because it decides what a caller may hold the walk to: rig
+    /// 0.37 carries a provider's own response metadata only where the adapter
+    /// knows its raw response type, so [`Self::response_model`] is filled for
+    /// [`AgentModelProviderKind::Anthropic`],
+    /// [`AgentModelProviderKind::OpenAiCompletions`] and
+    /// [`AgentModelProviderKind::Custom`] (the Chat Completions shape), and is
+    /// absent for every other kind however well the call went.
+    pub provider: AgentModelProviderKind,
     /// The response model the provider reported on the first recorded turn.
     pub response_model: Option<String>,
     /// How many times the recording tool executor was invoked.
     pub tool_invocations: usize,
+}
+
+/// Whether rig 0.37 carries this provider's own response metadata back.
+///
+/// The adapter reads a response model and finish reason only where it knows
+/// the provider's raw response type; every other route keeps both inside
+/// rig's generic `CompletionResponse<T>`, with no extractor installed.
+#[must_use]
+pub const fn provider_reports_its_model(provider: &AgentModelProviderKind) -> bool {
+    matches!(
+        provider,
+        AgentModelProviderKind::Anthropic
+            | AgentModelProviderKind::OpenAiCompletions
+            | AgentModelProviderKind::Custom(_)
+    )
 }
 
 /// The provider kind one `RAKKA_MODEL_PROVIDER` label names.

@@ -1381,6 +1381,7 @@ pub async fn drive_one_run_with_profile(
 
     Ok(crate::provider::ProviderWalkReport {
         lines,
+        provider: profile.provider.clone(),
         response_model,
         tool_invocations,
     })

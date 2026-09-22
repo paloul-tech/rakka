@@ -124,4 +124,6 @@ RAKKA_MODEL_API_KEY=... cargo test -p rakka-example-durable-agent-acceptance --t
 `RAKKA_MODEL_BASE_URL` overrides the provider's endpoint (required for
 `custom`); `ollama` needs no key. The walk asserts structure, not a
 transcript: the run terminates, the provider's response model is recorded on
-the turn, and the key appears in no durable record and no line of output.
+the turn for Anthropic, OpenAI-compatible, and custom endpoints — the kinds
+whose raw response type the adapter knows, the rest reporting none by design —
+and the key appears in no durable record and no line of output.
