@@ -65,9 +65,22 @@ impl AgentToolExecutorRouter {
 
     /// Routes every tool whose id starts with `prefix`; the longest matching
     /// prefix wins.
+    ///
+    /// An empty prefix is ignored rather than installed: it matches every tool
+    /// id, so it would be a second catch-all sitting in front of the real
+    /// fallback — and one whose precedence against the fallback nothing in the
+    /// wiring makes visible. The fallback is the catch-all.
+    ///
+    /// Registering the same prefix twice keeps the first route: equal-length
+    /// prefixes hold their registration order, so the later one is
+    /// unreachable.
     #[must_use]
     pub fn with_prefix_route(mut self, prefix: impl Into<String>, executor: Executor) -> Self {
-        self.prefixes.push((prefix.into(), executor));
+        let prefix = prefix.into();
+        if prefix.is_empty() {
+            return self;
+        }
+        self.prefixes.push((prefix, executor));
         self.prefixes.sort_by(|left, right| {
             right
                 .0
@@ -79,6 +92,9 @@ impl AgentToolExecutorRouter {
     }
 
     /// Routes one tool id exactly; an exact route beats every prefix.
+    ///
+    /// Registering the same tool twice keeps the last route: one id has one
+    /// executor, and the later registration replaces the earlier.
     #[must_use]
     pub fn with_tool_route(mut self, tool: AgentToolId, executor: Executor) -> Self {
         self.exact.insert(tool, executor);

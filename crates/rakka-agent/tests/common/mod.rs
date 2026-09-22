@@ -703,9 +703,15 @@ pub fn task_definition() -> AgentTaskDefinition {
 
 /// A bounded model-visible descriptor for one test tool.
 pub fn tool_descriptor(tool: &str) -> AgentToolDescriptor {
+    tool_descriptor_of_kind(tool, AgentToolKind::Function)
+}
+
+/// The same descriptor under a chosen kind, for the tests whose subject is
+/// what the *kind* decides — routing by declared kind, say.
+pub fn tool_descriptor_of_kind(tool: &str, kind: AgentToolKind) -> AgentToolDescriptor {
     AgentToolDescriptor::new(
         rakka_agent::AgentToolId::new(tool).expect("tool id should be valid"),
-        AgentToolKind::Function,
+        kind,
         "A test tool.",
         schema("tool-input"),
         schema("tool-output"),
@@ -713,15 +719,20 @@ pub fn tool_descriptor(tool: &str) -> AgentToolDescriptor {
     .expect("the descriptor should be valid")
 }
 
-/// The tool intent one call dispatches under: one non-idempotent attempt of
-/// the named tool, exactly as the run commits it.
-pub fn tool_intent(tool: &str) -> AgentRunEffect {
-    let call = AgentToolCallRequest::new(
+/// The model's call for one tool, with empty arguments.
+pub fn tool_call(tool: &str) -> AgentToolCallRequest {
+    AgentToolCallRequest::new(
         AgentToolCallId::new("call-1").expect("call id should be valid"),
         rakka_agent::AgentToolId::new(tool).expect("tool id should be valid"),
         serde_json::json!({}),
     )
-    .expect("the call should be bounded");
+    .expect("the call should be bounded")
+}
+
+/// The tool intent one call dispatches under: one non-idempotent attempt of
+/// the named tool, exactly as the run commits it.
+pub fn tool_intent(tool: &str) -> AgentRunEffect {
+    let call = tool_call(tool);
     AgentRunEffect::new(
         &run_scope(),
         1,
