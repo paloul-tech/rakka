@@ -9,7 +9,12 @@
 //! operator takes with [`mcp_descriptor_staleness`], never one a dispatch
 //! makes for itself.
 //!
-//! Two bounds and one rule guard what crosses in:
+//! The connection itself passes the host's
+//! [`McpEgressCheck`] first: a sync is the same
+//! outbound request, to the same operator-supplied URL, carrying the same
+//! resolved credential as a dispatch.
+//!
+//! Two bounds and one rule then guard what crosses in:
 //!
 //! - A schema over [`MCP_DESCRIPTOR_SCHEMA_MAX_BYTES`] is refused outright.
 //! - A schema over [`AGENT_TOOL_PARAMETERS_MAX_BYTES`] is still synced, but
@@ -38,7 +43,7 @@ use crate::binding::{
     McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
     MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
 };
-use crate::client::{connect, service_error, McpClientError};
+use crate::client::{connect, service_error, McpClientError, McpEgressCheck};
 
 /// One tool as this adapter stored it at publish time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -50,9 +55,17 @@ pub struct McpSyncedDescriptor {
     pub binding: AgentToolBinding,
     /// The server's raw input schema, whether or not it rides the descriptor.
     pub input_schema: Value,
-    /// Fingerprint of [`Self::input_schema`], the staleness signal.
+    /// SHA-256 digest of [`Self::input_schema`], the staleness signal.
+    ///
+    /// Cryptographic, not the default FNV fingerprint: this digest is what
+    /// [`mcp_descriptor_staleness`] compares, and the value it is taken over
+    /// comes from the server being checked. A reshaping server must not be
+    /// able to hold `Fresh` by choosing a second schema that collides with the
+    /// stored one.
     pub schema_digest: AgentContentDigest,
-    /// Fingerprint of the server's output schema, when it declared one.
+    /// SHA-256 digest of the server's output schema, when it declared one.
+    ///
+    /// Cryptographic for the same reason as [`Self::schema_digest`].
     pub output_schema_digest: Option<AgentContentDigest>,
     /// Where the caller stored the raw input schema, when it stored one.
     ///
@@ -87,17 +100,28 @@ pub struct McpDescriptorSet {
     pub protocol_version: String,
     /// When the sync ran.
     pub synced_at: AgentTimestampMillis,
-    /// The allow-listed tools, in the binding's own order.
+    /// The allow-listed tools, in tool-name order.
+    ///
+    /// `McpServerBinding::tools` is a `BTreeMap`, so this is its iteration
+    /// order — which is what keeps [`Self::digest`] stable when an operator
+    /// rewrites the allow-list in a different sequence without changing a
+    /// single tool.
     pub descriptors: Vec<McpSyncedDescriptor>,
 }
 
 impl McpDescriptorSet {
-    /// Fingerprints the shapes this set pinned: every tool's name and its
+    /// SHA-256 digest of the shapes this set pinned: every tool's name and its
     /// schema digests, and nothing else.
     ///
     /// Deliberately not over the whole set — [`Self::synced_at`] and the
     /// server's reported name move without the tools moving, and this digest
     /// is what a release compares.
+    ///
+    /// Cryptographic, not the default FNV fingerprint: the tool names and
+    /// schemas underneath it come from the server being checked, and a
+    /// reshaping server must not be able to hold an unchanged release digest.
+    /// Its inputs are already SHA-256 and its tools are in tool-name order, so
+    /// the value is stable against an allow-list the operator reordered.
     #[must_use]
     pub fn digest(&self) -> AgentContentDigest {
         let triples: Vec<Value> = self
@@ -111,7 +135,7 @@ impl McpDescriptorSet {
                 ])
             })
             .collect();
-        AgentContentDigest::of_json(&Value::Array(triples))
+        AgentContentDigest::sha256_of_json(&Value::Array(triples))
     }
 
     /// The bindings a registry is built from, with no network call.
@@ -167,6 +191,17 @@ pub enum McpSyncError {
         /// The contradicted hint.
         hint: &'static str,
     },
+    /// The host's egress rule refused the server's URL, so no connection was
+    /// opened and no credential left the process.
+    Egress {
+        /// The server whose URL was refused.
+        server: String,
+        /// The host's own stable refusal code.
+        code: String,
+        /// The host's own message. Never a credential: the check is given the
+        /// URL and the server id, and nothing else.
+        message: String,
+    },
     /// The binding itself is not dispatchable.
     Registration(McpRegistrationError),
     /// The server's tool could not become a Rakka descriptor.
@@ -182,8 +217,12 @@ pub enum McpSyncError {
 
 impl McpSyncError {
     /// Stable, machine-readable error code.
+    ///
+    /// Borrowed rather than `&'static str`: an [`Self::Egress`] refusal
+    /// carries the *host's* own code through unchanged, so an operator reads
+    /// back the rule that fired rather than a code this crate invented for it.
     #[must_use]
-    pub const fn code(&self) -> &'static str {
+    pub fn code(&self) -> &str {
         match self {
             Self::Client(error) => match error {
                 // A transport or protocol failure *of the sync* is one fact to
@@ -195,6 +234,7 @@ impl McpSyncError {
                 }
                 _ => error.code(),
             },
+            Self::Egress { code, .. } => code,
             Self::SchemaTooLarge { .. } => "mcp-descriptor-schema-too-large",
             Self::HintContradictsDeclaration { .. } => "mcp-hint-contradicts-declaration",
             Self::Registration(error) => error.code(),
@@ -219,6 +259,14 @@ impl Display for McpSyncError {
             Self::HintContradictsDeclaration { server, tool, hint } => write!(
                 f,
                 "the MCP server {server}'s tool {tool} hint {hint:?} contradicts its declaration"
+            ),
+            Self::Egress {
+                server,
+                code,
+                message,
+            } => write!(
+                f,
+                "the egress rule refused the MCP server {server} ({code}): {message}"
             ),
             Self::Registration(error) => Display::fmt(error, f),
             Self::Descriptor {
@@ -252,6 +300,14 @@ impl From<McpRegistrationError> for McpSyncError {
 /// One session, one `tools/list`, then the session is closed — including on
 /// every refusal raised after it opened.
 ///
+/// `egress` is not optional and has no default. A publish-time sync opens the
+/// same outbound connection, to the same operator-supplied URL, carrying the
+/// same resolved credential as a dispatch, so the host's egress rule decides
+/// it on the same terms — and decides it *before* a client exists. A
+/// deployment that genuinely reaches anything passes
+/// [`McpAllowAllEgress`](crate::McpAllowAllEgress) and so records that the
+/// decision was taken.
+///
 /// # Errors
 ///
 /// [`McpSyncError`] with its stable code.
@@ -260,12 +316,25 @@ pub async fn sync_mcp_descriptors<C>(
     binding: &McpServerBinding,
     credential: Option<&AgentEphemeralCredential>,
     synced_at: AgentTimestampMillis,
+    egress: &dyn McpEgressCheck,
 ) -> Result<McpDescriptorSet, McpSyncError>
 where
     C: StreamableHttpClient + Sync,
 {
+    // Validation first: an endpoint URL that fails the URL rule is a binding
+    // refusal, and an egress rule should never be asked about a URL this
+    // adapter would not dial anyway.
     binding.validate()?;
     let server = binding.server_id.to_string();
+    if let Some(url) = binding.url() {
+        egress
+            .check(&binding.server_id, url)
+            .map_err(|refusal| McpSyncError::Egress {
+                server: server.clone(),
+                code: refusal.code,
+                message: refusal.message,
+            })?;
+    }
     let session = connect(http, binding, credential).await?;
     let listed = session.peer().list_all_tools().await;
     let protocol_version = session.negotiated_version().as_str().to_string();
@@ -327,8 +396,11 @@ fn shapes(
         .collect()
 }
 
-/// Turns the server's listing into the allow-listed descriptors, in the
-/// binding's own order.
+/// Turns the server's listing into the allow-listed descriptors.
+///
+/// `binding.tools` is a `BTreeMap`, so they come out in tool-name order rather
+/// than the order the operator wrote them in — which is what makes
+/// [`McpDescriptorSet::digest`] invariant under a reordered allow-list.
 fn synced_descriptors(
     binding: &McpServerBinding,
     server: &str,
@@ -412,11 +484,11 @@ fn synced_descriptor(
     let output_schema_digest = listed
         .output_schema
         .as_ref()
-        .map(|schema| AgentContentDigest::of_json(&Value::Object((**schema).clone())));
+        .map(|schema| AgentContentDigest::sha256_of_json(&Value::Object((**schema).clone())));
     Ok(McpSyncedDescriptor {
         tool: tool.to_string(),
         binding: derived,
-        schema_digest: AgentContentDigest::of_json(&input_schema),
+        schema_digest: AgentContentDigest::sha256_of_json(&input_schema),
         input_schema,
         output_schema_digest,
         input_schema_artifact: None,

@@ -127,6 +127,44 @@ fn defaults_are_manual_refresh_the_two_versions_and_one_inline_attempt() {
 }
 
 #[test]
+fn a_protocol_version_must_be_well_shaped_and_one_the_sdk_knows() {
+    let binding = McpServerBinding::streamable_http(server("s"), "https://h/mcp")
+        .with_tool("t", policy())
+        .expect("tool");
+    binding
+        .clone()
+        .with_protocol_versions(MCP_DEFAULT_PROTOCOL_VERSIONS.map(str::to_string).to_vec())
+        .validate()
+        .expect("the defaults are known versions");
+
+    // Malformed: refused on shape.
+    let malformed = binding
+        .clone()
+        .with_protocol_versions(vec!["2026-7-28".to_string()]);
+    let error = malformed.validate().expect_err("shape");
+    assert_eq!(error.code(), "mcp-binding-invalid");
+    assert!(
+        matches!(error, McpRegistrationError::ProtocolVersionInvalid { .. }),
+        "{error}"
+    );
+
+    // Well-shaped but unknown to the pinned SDK: still a binding refusal, and
+    // a distinct one, so the operator is not left reading it as a network
+    // failure at sync time.
+    let unknown = binding.with_protocol_versions(vec!["2099-01-01".to_string()]);
+    let error = unknown.validate().expect_err("unknown");
+    assert_eq!(error.code(), "mcp-binding-invalid");
+    assert!(
+        matches!(error, McpRegistrationError::ProtocolVersionUnknown { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("2099-01-01"),
+        "the refusal names the value: {error}"
+    );
+}
+
+#[test]
 fn with_max_attempts_no_longer_clamps_and_validate_is_the_gate() {
     // `with_max_attempts` stores the value as given; only `validate` refuses
     // a zero.

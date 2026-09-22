@@ -7,14 +7,16 @@
 //! exists under `testkit`.
 #![cfg(feature = "testkit")]
 
+use rakka_agent::AgentAuthorityRefusal;
 use rakka_agent::{
     AgentEffectSafetyClass, AgentToolDeclaration, AgentToolKind, AgentToolRegistry,
     AGENT_TOOL_PARAMETERS_MAX_BYTES,
 };
-use rakka_agent_mcp::testkit::{serve_fake, FakeMcpServer, FakeTool};
+use rakka_agent_mcp::testkit::{serve_fake, CountingClient, FakeMcpServer, FakeTool};
 use rakka_agent_mcp::{
-    mcp_descriptor_staleness, sync_mcp_descriptors, McpDescriptorSet, McpDescriptorStaleness,
-    McpServerBinding, McpServerId, McpToolPolicy, MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
+    mcp_descriptor_staleness, sync_mcp_descriptors, McpAllowAllEgress, McpDescriptorSet,
+    McpDescriptorStaleness, McpEgressCheck, McpServerBinding, McpServerId, McpToolPolicy,
+    MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
 use rmcp::model::ToolAnnotations;
@@ -65,6 +67,7 @@ async fn sync_returns_only_the_allow_listed_tools_as_prefixed_bindings_with_dige
         &binding(&endpoint.url),
         None,
         AgentTimestampMillis::new(7),
+        &McpAllowAllEgress,
     )
     .await
     .expect("syncs");
@@ -111,6 +114,7 @@ async fn a_registry_built_from_the_stored_set_makes_no_network_call() {
         &binding(&endpoint.url),
         None,
         AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
     )
     .await
     .expect("syncs");
@@ -145,6 +149,7 @@ async fn the_credential_reaches_the_wire_only_as_the_declared_header() {
         &binding(&endpoint.url),
         Some(&credential),
         AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
     )
     .await
     .expect("syncs");
@@ -161,6 +166,7 @@ async fn the_credential_reaches_the_wire_only_as_the_declared_header() {
         &binding(&endpoint.url),
         Some(&basic),
         AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
     )
     .await
     .expect_err("basic is not a header");
@@ -189,9 +195,15 @@ async fn the_schema_bounds_are_the_4kib_inline_and_64kib_refusal_lines() {
         McpServerBinding::streamable_http(McpServerId::new("crm").expect("id"), &endpoint.url)
             .with_tool("search", declared(AgentEffectSafetyClass::ReadOnly))
             .expect("tool");
-    let set = sync_mcp_descriptors(&client(), &only_search, None, AgentTimestampMillis::new(1))
-        .await
-        .expect("syncs");
+    let set = sync_mcp_descriptors(
+        &client(),
+        &only_search,
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("syncs");
     let search = set.descriptor("search").expect("present");
     assert!(
         !search.carries_inline_schema(),
@@ -206,6 +218,7 @@ async fn the_schema_bounds_are_the_4kib_inline_and_64kib_refusal_lines() {
         &binding(&endpoint.url),
         None,
         AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
     )
     .await
     .expect_err("64 KiB");
@@ -223,9 +236,15 @@ async fn a_contradicting_hint_refuses_only_when_hints_are_honored() {
     )
     .await;
     let ignoring = binding(&endpoint.url);
-    sync_mcp_descriptors(&client(), &ignoring, None, AgentTimestampMillis::new(1))
-        .await
-        .expect("hints ignored by default");
+    sync_mcp_descriptors(
+        &client(),
+        &ignoring,
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("hints ignored by default");
     let honoring =
         McpServerBinding::streamable_http(McpServerId::new("crm").expect("id"), &endpoint.url)
             .with_tool(
@@ -233,9 +252,15 @@ async fn a_contradicting_hint_refuses_only_when_hints_are_honored() {
                 declared(AgentEffectSafetyClass::Idempotent).with_honor_hints(true),
             )
             .expect("tool");
-    let error = sync_mcp_descriptors(&client(), &honoring, None, AgentTimestampMillis::new(1))
-        .await
-        .expect_err("contradiction");
+    let error = sync_mcp_descriptors(
+        &client(),
+        &honoring,
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("contradiction");
     assert_eq!(error.code(), "mcp-hint-contradicts-declaration");
     let honoring_non_idempotent =
         McpServerBinding::streamable_http(McpServerId::new("crm").expect("id"), &endpoint.url)
@@ -249,6 +274,7 @@ async fn a_contradicting_hint_refuses_only_when_hints_are_honored() {
         &honoring_non_idempotent,
         None,
         AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
     )
     .await
     .expect("no contradiction");
@@ -276,6 +302,7 @@ async fn a_server_that_identifies_as_a_rakka_agent_is_refused() {
         &binding(&endpoint.url),
         None,
         AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
     )
     .await
     .expect_err("peer channel");
@@ -296,6 +323,7 @@ async fn version_negotiation_falls_back_to_the_next_listed_version_or_refuses() 
         &binding(&older.url),
         None,
         AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
     )
     .await
     .expect("falls back");
@@ -312,6 +340,7 @@ async fn version_negotiation_falls_back_to_the_next_listed_version_or_refuses() 
         &binding(&ancient.url),
         None,
         AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
     )
     .await
     .expect_err("no common version");
@@ -326,9 +355,15 @@ async fn a_dead_endpoint_is_a_sync_failure_with_no_body_in_the_message() {
     )
     .with_tool("search", declared(AgentEffectSafetyClass::ReadOnly))
     .expect("tool");
-    let error = sync_mcp_descriptors(&client(), &closed, None, AgentTimestampMillis::new(1))
-        .await
-        .expect_err("dead");
+    let error = sync_mcp_descriptors(
+        &client(),
+        &closed,
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("dead");
     assert_eq!(error.code(), "mcp-descriptor-sync-failed");
     assert!(error.to_string().len() < 512);
 }
@@ -346,6 +381,7 @@ async fn staleness_reports_added_removed_and_changed_tools() {
         &binding(&endpoint.url),
         None,
         AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
     )
     .await
     .expect("syncs");
@@ -359,6 +395,7 @@ async fn staleness_reports_added_removed_and_changed_tools() {
         &binding(&endpoint.url),
         None,
         AgentTimestampMillis::new(2),
+        &McpAllowAllEgress,
     )
     .await
     .expect("syncs");
@@ -368,4 +405,73 @@ async fn staleness_reports_added_removed_and_changed_tools() {
             changed: vec!["update".to_string()]
         }
     );
+}
+
+/// An egress rule that refuses everything, checking what it was asked about.
+struct RefuseEveryDestination;
+
+impl McpEgressCheck for RefuseEveryDestination {
+    fn check(&self, server: &McpServerId, url: &str) -> Result<(), AgentAuthorityRefusal> {
+        assert!(
+            url.starts_with("http://127.0.0.1:"),
+            "the check is given the real endpoint URL: {url}"
+        );
+        Err(AgentAuthorityRefusal::of(
+            "egress-denied",
+            format!("{server} is not a reachable destination"),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn a_refusing_egress_rule_stops_the_sync_before_any_request_is_made() {
+    let endpoint = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(tool("search"))
+            .with_tool(tool("update")),
+    )
+    .await;
+    let counting = CountingClient::new();
+    let credential = AgentEphemeralCredential::bearer_token("never-sent-sentinel");
+    let error = sync_mcp_descriptors(
+        &counting,
+        &binding(&endpoint.url),
+        Some(&credential),
+        AgentTimestampMillis::new(1),
+        &RefuseEveryDestination,
+    )
+    .await
+    .expect_err("egress refuses");
+
+    assert_eq!(
+        error.code(),
+        "egress-denied",
+        "the host's own code, carried through unchanged"
+    );
+    assert!(
+        !error.to_string().contains("never-sent-sentinel"),
+        "{error}"
+    );
+    assert_eq!(
+        counting.sends(),
+        0,
+        "no transport method ran, so no credential left the process"
+    );
+    assert_eq!(endpoint.server.list_calls(), 0, "the server saw nothing");
+    assert_eq!(endpoint.server.seen_headers(), Vec::new());
+
+    // The same binding through the allow-all opt-out does reach the server, so
+    // the refusal above is the rule firing rather than the fixture being
+    // unreachable.
+    sync_mcp_descriptors(
+        &counting,
+        &binding(&endpoint.url),
+        Some(&credential),
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("the allow-all check admits it");
+    assert!(counting.sends() > 0);
+    assert_eq!(endpoint.server.list_calls(), 1);
 }

@@ -44,6 +44,24 @@ fn rmcp_is_pinned_exactly_with_the_client_features_and_nothing_proxying() {
 }
 
 #[test]
+fn the_testkit_reqwest_line_carries_no_default_and_no_proxy() {
+    // The crate names `reqwest` only because rmcp does not re-export it, and
+    // only for the testkit's `ReqwestClient`. Its defaults would put an
+    // environment-proxy egress bypass (and a second TLS stack) on this graph,
+    // so the same guard the rmcp line carries is held on this one.
+    let manifest = manifest();
+    let line = dependency_line(&manifest, "reqwest");
+    assert!(line.contains("default-features = false"), "{line}");
+    assert!(line.contains("optional = true"), "{line}");
+    for forbidden in ["\"native-tls\"", "system-proxy", "\"default\""] {
+        assert!(
+            !line.contains(forbidden),
+            "{forbidden} must not ride the reqwest dependency: {line}"
+        );
+    }
+}
+
+#[test]
 fn the_child_process_transport_is_a_non_default_feature() {
     let manifest = manifest();
     let features = manifest

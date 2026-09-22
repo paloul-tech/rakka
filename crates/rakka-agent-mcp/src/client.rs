@@ -15,6 +15,8 @@
 //!   first, and an unknown version is refused rather than sent.
 //! - A server that identifies as a Rakka agent is refused after the session is
 //!   closed ([specification 14.4]): MCP is never an agent-to-agent channel.
+//! - Every outbound connection passes the host's [`McpEgressCheck`] before a
+//!   client exists — at publish time as much as at dispatch time.
 //!
 //! [`StreamableHttpError::UnexpectedServerResponse`]: rmcp::transport::streamable_http_client::StreamableHttpError::UnexpectedServerResponse
 //! [specification 14.4]: ../../../docs/plans/rakka-agent/spec.md
@@ -24,6 +26,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use http::{HeaderName, HeaderValue};
+use rakka_agent::AgentAuthorityRefusal;
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentEphemeralCredentialMaterial};
 use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, ProtocolVersion};
 use rmcp::service::{
@@ -36,7 +39,7 @@ use rmcp::transport::streamable_http_client::{
 use rmcp::transport::IntoTransport;
 
 use crate::binding::{
-    McpServerBinding, McpTransport, MCP_CLIENT_NAME, MCP_PEER_AGENT_SERVER_PREFIX,
+    McpServerBinding, McpServerId, McpTransport, MCP_CLIENT_NAME, MCP_PEER_AGENT_SERVER_PREFIX,
 };
 
 /// Why a client session could not be established, or could not be trusted.
@@ -94,8 +97,13 @@ impl McpClientError {
             Self::ProtocolUnsupported { .. } => "mcp-protocol-unsupported",
             Self::PeerAgentChannel { .. } => "mcp-peer-agent-channel-refused",
             Self::CredentialMaterialUnsupported { .. } => "mcp-credential-material-unsupported",
-            Self::Transport { .. } => "mcp-transport-failed",
-            Self::Protocol { .. } => "mcp-protocol-failed",
+            // One code, not two: `mcp-transport-failed` is the
+            // `AgentDispatchError::Invocation` code the executor raises for a
+            // failed call, and an operator acting on "the server did not
+            // answer usefully" does the same thing either way. A second code
+            // no caller could branch on would only widen the compatibility
+            // surface.
+            Self::Transport { .. } | Self::Protocol { .. } => "mcp-transport-failed",
         }
     }
 }
@@ -174,6 +182,43 @@ impl McpClientSession {
     /// it is dropped rather than raised as a refusal of the caller's work.
     pub async fn close(self) {
         let _ = self.running.cancel().await;
+    }
+}
+
+/// The egress rule every outbound MCP connection passes before a client
+/// exists.
+///
+/// This adapter reaches a URL an operator supplied and, for a bound server,
+/// carries a resolved credential to it. Both an SSRF probe and a credential
+/// exfiltration are therefore one misconfigured URL away, so the host — not
+/// this crate — decides which destinations are reachable, and decides it
+/// *before* the connection is opened rather than after a response comes back.
+///
+/// The check applies at publish time as much as at dispatch time: a descriptor
+/// sync is the same outbound connection carrying the same credential.
+pub trait McpEgressCheck: Send + Sync + 'static {
+    /// Admits or refuses one outbound connection to `url` on `server`'s
+    /// behalf.
+    ///
+    /// # Errors
+    ///
+    /// An [`AgentAuthorityRefusal`] carrying the host's own stable code.
+    fn check(&self, server: &McpServerId, url: &str) -> Result<(), AgentAuthorityRefusal>;
+}
+
+/// The egress check that admits every destination.
+///
+/// The **explicit opt-out**, not a default: a deployment whose MCP servers are
+/// all in-cluster, and a test driving a loopback fake, name this type and so
+/// record that the decision was taken. Nothing constructs it implicitly, and
+/// no signature defaults to it — an unconsidered deployment cannot reach the
+/// network by omission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpAllowAllEgress;
+
+impl McpEgressCheck for McpAllowAllEgress {
+    fn check(&self, _server: &McpServerId, _url: &str) -> Result<(), AgentAuthorityRefusal> {
+        Ok(())
     }
 }
 
@@ -288,8 +333,14 @@ async fn finish(
 /// string-to-value path is its `Deserialize` impl
 /// (`rmcp-3.4.0/src/model.rs:241`), which silently admits an unknown value —
 /// so a declared version is matched against
-/// [`ProtocolVersion::KNOWN_VERSIONS`] and an unknown one is refused here
-/// rather than offered on the wire.
+/// [`ProtocolVersion::KNOWN_VERSIONS`] and an unknown one is never offered on
+/// the wire.
+///
+/// [`McpServerBinding::validate`] refuses an unknown version first, as
+/// `mcp-binding-invalid`, which is what an operator reading the refusal needs:
+/// the binding is misconfigured, not the network. This arm is the internal
+/// invariant behind that gate — unreachable for a validated binding, and a
+/// [`McpClientError::Protocol`] rather than a panic for one that skipped it.
 fn preferred_versions(binding: &McpServerBinding) -> Result<Vec<ProtocolVersion>, McpClientError> {
     binding
         .protocol_versions
@@ -474,7 +525,10 @@ mod tests {
     use rakka_agent::{AgentEffectSafetyClass, AgentToolDeclaration};
     use rakka_agent_workflow::AgentEphemeralCredential;
 
-    use super::{client_info, credential_headers, preferred_versions};
+    use super::{
+        client_info, credential_headers, preferred_versions, McpAllowAllEgress, McpClientError,
+        McpEgressCheck,
+    };
     use crate::binding::{McpServerBinding, McpServerId, McpToolPolicy, MCP_CLIENT_NAME};
 
     fn binding() -> McpServerBinding {
@@ -580,12 +634,42 @@ mod tests {
 
     #[test]
     fn an_unknown_declared_version_is_refused_rather_than_offered() {
+        // The operator-facing gate is `McpServerBinding::validate`
+        // (`mcp-binding-invalid`, proved in `tests/binding.rs`); this is the
+        // backstop for a binding that reached `connect` unvalidated.
         let binding = binding().with_protocol_versions(vec!["2099-01-01".to_string()]);
         let error = preferred_versions(&binding).expect_err("unknown");
-        assert_eq!(error.code(), "mcp-protocol-failed");
+        assert_eq!(error.code(), "mcp-transport-failed");
         assert!(
             error.to_string().contains("unknown protocol version"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn a_transport_and_a_protocol_refusal_share_one_code() {
+        let transport = McpClientError::Transport {
+            server: "crm".to_string(),
+            reason: "ConnectionClosed".to_string(),
+        };
+        let protocol = McpClientError::Protocol {
+            server: "crm".to_string(),
+            reason: "UnexpectedResponse".to_string(),
+        };
+        assert_eq!(transport.code(), "mcp-transport-failed");
+        assert_eq!(
+            protocol.code(),
+            transport.code(),
+            "a protocol failure is not its own registered code"
+        );
+    }
+
+    #[test]
+    fn the_allow_all_egress_check_is_the_explicit_opt_out() {
+        let server = McpServerId::new("crm").expect("the server id is valid");
+        assert_eq!(
+            McpAllowAllEgress.check(&server, "https://anywhere.test/mcp"),
+            Ok(())
         );
     }
 }

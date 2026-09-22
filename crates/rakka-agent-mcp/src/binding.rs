@@ -15,11 +15,15 @@ use rakka_agent::{
     AgentCredentialBindingRef, AgentToolDeclaration, AgentToolId, AgentToolResultBehavior,
 };
 use rakka_agent_workflow::ArtifactRef;
+use rmcp::model::ProtocolVersion;
 use serde::de::Error as DeserializeError;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// The protocol versions this adapter negotiates when a binding does not
 /// declare its own, newest first.
+///
+/// Every entry is one the pinned rmcp SDK knows; [`McpServerBinding::validate`]
+/// holds that property for an operator-supplied list too.
 pub const MCP_DEFAULT_PROTOCOL_VERSIONS: [&str; 2] = ["2026-07-28", "2025-11-25"];
 
 /// Largest a synced tool descriptor's JSON schema may be, in bytes.
@@ -379,6 +383,16 @@ impl McpServerBinding {
                     value: version.clone(),
                 });
             }
+            // Well-shaped is not enough: a version this SDK cannot name is one
+            // `connect` could never offer, so it is a misconfigured binding —
+            // named here, at the operator's own gate — rather than a sync that
+            // reads back as a network failure later.
+            if !is_known_protocol_version(version) {
+                return Err(McpRegistrationError::ProtocolVersionUnknown {
+                    server: self.server_id.to_string(),
+                    value: version.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -449,6 +463,14 @@ pub enum McpRegistrationError {
         /// The server with no declared protocol versions.
         server: String,
     },
+    /// A declared protocol version is well-shaped but is not one the pinned
+    /// rmcp SDK knows, so no session could ever negotiate it.
+    ProtocolVersionUnknown {
+        /// The server that declared the unknown version.
+        server: String,
+        /// The unknown value.
+        value: String,
+    },
     /// A declared protocol version is not a `YYYY-MM-DD` string of exactly
     /// ten ASCII bytes.
     ProtocolVersionInvalid {
@@ -492,6 +514,7 @@ impl McpRegistrationError {
             | Self::BindingMissing { .. }
             | Self::ProtocolVersionsEmpty { .. }
             | Self::ProtocolVersionInvalid { .. }
+            | Self::ProtocolVersionUnknown { .. }
             | Self::NoTools { .. }
             | Self::MaxAttemptsInvalid { .. }
             | Self::InvalidServerId { .. } => "mcp-binding-invalid",
@@ -541,6 +564,11 @@ impl Display for McpRegistrationError {
                 f,
                 "the MCP server {server} declares an invalid protocol version {value:?}"
             ),
+            Self::ProtocolVersionUnknown { server, value } => write!(
+                f,
+                "the MCP server {server} declares the protocol version {value:?}, \
+                 which this build's MCP SDK does not know"
+            ),
             Self::NoTools { server } => {
                 write!(f, "the MCP server {server} binding lists no tools")
             }
@@ -584,6 +612,18 @@ fn check_streamable_http_url(url: &str) -> Result<(), &'static str> {
         return Err("it carries whitespace");
     }
     Ok(())
+}
+
+/// Whether `value` names a protocol version the pinned rmcp SDK knows.
+///
+/// [`ProtocolVersion`] has no public constructor from a string, so membership
+/// in [`ProtocolVersion::KNOWN_VERSIONS`] (`rmcp-3.4.0/src/model.rs:174`) is
+/// what decides it; a version outside that list is one `client::connect` could
+/// never put on the wire.
+fn is_known_protocol_version(value: &str) -> bool {
+    ProtocolVersion::KNOWN_VERSIONS
+        .iter()
+        .any(|known| known.as_str() == value)
 }
 
 /// Whether `value` is exactly ten ASCII bytes shaped `YYYY-MM-DD`.
@@ -653,6 +693,17 @@ mod tests {
             check_streamable_http_url("https://h /mcp"),
             Err("it carries whitespace")
         );
+    }
+
+    #[test]
+    fn a_known_protocol_version_is_one_the_pinned_sdk_names() {
+        use super::{is_known_protocol_version, MCP_DEFAULT_PROTOCOL_VERSIONS};
+
+        for version in MCP_DEFAULT_PROTOCOL_VERSIONS {
+            assert!(is_known_protocol_version(version), "{version}");
+        }
+        assert!(!is_known_protocol_version("2099-01-01"));
+        assert!(!is_known_protocol_version(""));
     }
 
     #[test]
