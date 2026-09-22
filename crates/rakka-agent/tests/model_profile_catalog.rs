@@ -14,8 +14,8 @@ use rakka_agent::testkit::DeterministicModelAdapter;
 use rakka_agent::{
     AgentContextSnapshotRef, AgentCredentialBindingRef, AgentId, AgentModelCapabilities,
     AgentModelProfile, AgentModelProfileCatalog, AgentModelProfileId, AgentModelProviderKind,
-    AgentModelRouter, AgentModelTurn, AgentRevisionNumber, AgentRunId, AgentRunScope,
-    AgentSamplingSettings, StaticAgentModelProfileCatalog, TenantId,
+    AgentModelRetryPolicy, AgentModelRouter, AgentModelTurn, AgentRevisionNumber, AgentRunId,
+    AgentRunScope, AgentSamplingSettings, StaticAgentModelProfileCatalog, TenantId,
     AGENT_MODEL_PROFILE_ATTRIBUTE_MAX_BYTES, AGENT_MODEL_PROFILE_MODEL_MAX_BYTES,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
@@ -246,4 +246,62 @@ fn the_router_refuses_a_route_whose_adapter_version_differs() {
     .with_route(profile_id("x"), Arc::new(other))
     .expect_err("a turn must carry one adapter version");
     assert_eq!(error.code(), "model-router-adapter-version-mismatch");
+}
+
+/// The router answers the retry policy its routes declare, because the
+/// dispatcher enforces the adapter's declaration as the ceiling on every model
+/// intent it dispatches: a router that answered the conservative default would
+/// refuse every intent a routed adapter permits, and report a route's
+/// non-idempotent declaration as read-only.
+#[test]
+fn the_router_answers_the_retry_policy_its_routes_declare() {
+    use rakka_agent::AgentModelAdapter as _;
+
+    let empty = AgentModelRouter::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION);
+    assert_eq!(
+        empty.retry_policy(),
+        AgentModelRetryPolicy::DEFAULT,
+        "a router with nothing routed declares the conservative default"
+    );
+
+    let policy = AgentModelRetryPolicy::read_only(3).expect("the policy is valid");
+    let routed = DeterministicModelAdapter::new()
+        .with_retry_policy(policy)
+        .expect("the adapter policy is valid");
+    let fallback = DeterministicModelAdapter::new()
+        .with_retry_policy(policy)
+        .expect("the adapter policy is valid");
+    let router = AgentModelRouter::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_route(profile_id("anthropic-sonnet"), Arc::new(routed))
+        .expect("the route agrees")
+        .with_default(Arc::new(fallback))
+        .expect("the default agrees");
+    assert_eq!(router.retry_policy(), policy);
+}
+
+/// One retry policy per router, checked where an adapter enters exactly as the
+/// adapter version is: the policy is a ceiling the dispatcher applies to the
+/// intent *before* it knows which route will answer, so routes that disagree
+/// have no single honest answer.
+#[test]
+fn the_router_refuses_a_route_whose_retry_policy_differs() {
+    let strict = DeterministicModelAdapter::new();
+    let lax = DeterministicModelAdapter::new()
+        .with_retry_policy(AgentModelRetryPolicy::read_only(2).expect("the policy is valid"))
+        .expect("the adapter policy is valid");
+
+    let error = AgentModelRouter::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_route(profile_id("strict"), Arc::new(strict.clone()))
+        .expect("the first route sets the policy")
+        .with_route(profile_id("lax"), Arc::new(lax.clone()))
+        .expect_err("a router declares one retry policy");
+    assert_eq!(error.code(), "model-router-retry-policy-mismatch");
+
+    // The default adapter is held to it too, in either order.
+    let error = AgentModelRouter::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_default(Arc::new(lax))
+        .expect("the default sets the policy")
+        .with_route(profile_id("strict"), Arc::new(strict))
+        .expect_err("a router declares one retry policy");
+    assert_eq!(error.code(), "model-router-retry-policy-mismatch");
 }

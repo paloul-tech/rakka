@@ -2621,6 +2621,9 @@ pub struct AuthorityFixture {
     pub tools: RecordingToolExecutor,
     pub probe: KillSwitchProbe,
     pub credentials: Option<Arc<ScriptedCredentialResolver>>,
+    /// The adapter the pipeline asks, when a test wants it to be something
+    /// other than [`Self::adapter`] — see [`AuthorityFixture::with_model_adapter`].
+    pub model_adapter: Option<Arc<dyn AgentModelAdapter>>,
     pub expire_grants: bool,
     pub fixed_refusal: Option<AgentAuthorityRefusal>,
 }
@@ -2669,6 +2672,7 @@ impl AuthorityFixture {
             tools: RecordingToolExecutor::new(),
             probe: KillSwitchProbe::new(),
             credentials: None,
+            model_adapter: None,
             expire_grants: false,
             fixed_refusal: None,
         }
@@ -2697,6 +2701,17 @@ impl AuthorityFixture {
     /// which is correct but hides every later gate.
     pub fn with_credential_resolver(mut self, token: &str) -> Self {
         self.credentials = Some(Arc::new(ScriptedCredentialResolver::new(token)));
+        self
+    }
+
+    /// Puts a different model adapter in front of the pipeline's model calls,
+    /// for the proofs whose subject is the adapter the *dispatcher* asks — its
+    /// declared retry policy is the ceiling on every model intent — rather
+    /// than the adapter that answers. A router wrapping [`Self::adapter`] is
+    /// the case this exists for: the fixture's own assertions on calls and
+    /// requests keep working, because the turn still comes from that adapter.
+    pub fn with_model_adapter(mut self, model: Arc<dyn AgentModelAdapter>) -> Self {
+        self.model_adapter = Some(model);
         self
     }
 
@@ -2848,7 +2863,9 @@ impl AuthorityFixture {
             self.fleet_store.clone(),
             self.fx.runs.clone(),
             self.wf_clock.clone(),
-            Arc::new(self.adapter.clone()),
+            self.model_adapter
+                .clone()
+                .unwrap_or_else(|| Arc::new(self.adapter.clone())),
             Arc::new(tools),
             gate,
             Arc::new(delivery),

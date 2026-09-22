@@ -26,10 +26,10 @@ use common::*;
 use rakka_agent::testkit::DeterministicModelAdapter;
 use rakka_agent::{
     AgentCredentialBindingRef, AgentEffectSpec, AgentModelCapabilities, AgentModelProfile,
-    AgentModelProfileId, AgentModelProviderKind, AgentModelTurn, AgentRevisionNumber,
-    AgentRunEffectRequest, AgentRunStatus, AgentSamplingSettings, AgentSettingsChange,
-    AgentTaskContent, AgentToolAuthority, StaticAgentModelProfileCatalog,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentModelProfileId, AgentModelProviderKind, AgentModelRetryPolicy, AgentModelRouter,
+    AgentModelTurn, AgentRevisionNumber, AgentRunEffectRequest, AgentRunStatus,
+    AgentSamplingSettings, AgentSettingsChange, AgentTaskContent, AgentToolAuthority,
+    StaticAgentModelProfileCatalog, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -84,18 +84,33 @@ fn proposing_turn() -> AgentModelTurn {
 /// own `UpdateSettings` command, so the selection is applied by
 /// [`select_profile`] once the agent exists.
 fn profiled_fixture(with_binding: bool, timeout_ms: Option<u64>) -> AuthorityFixture {
+    let mut spec = AgentEffectSpec::read_only();
+    if let Some(timeout) = timeout_ms {
+        spec = spec.with_timeout_ms(timeout);
+    }
+    profiled_fixture_with(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn()),
+        with_binding,
+        spec,
+    )
+}
+
+/// [`profiled_fixture`] over a caller-supplied adapter and model spec, for the
+/// proofs whose subject is what the adapter declares rather than what the
+/// authority resolves.
+fn profiled_fixture_with(
+    adapter: DeterministicModelAdapter,
+    with_binding: bool,
+    spec: AgentEffectSpec,
+) -> AuthorityFixture {
     let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
     let mut envelope = envelope_for_registry(&registry);
     envelope.model_profiles.insert(profile_id());
     if with_binding {
         envelope.credential_bindings.insert(binding());
     }
-    let mut spec = AgentEffectSpec::read_only();
-    if let Some(timeout) = timeout_ms {
-        spec = spec.with_timeout_ms(timeout);
-    }
     AuthorityFixture::new(
-        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn()),
+        adapter,
         AgentToolAuthority::new(registry).with_model_profiles(catalog(with_binding)),
         Some(spec),
     )
@@ -215,6 +230,46 @@ async fn a_credential_free_profile_dispatches_without_a_timeout() {
     let run = fx.fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
     assert_eq!(fx.adapter.calls(), 1);
+}
+
+/// A router is the adapter the dispatcher asks, so the retry policy it answers
+/// is the ceiling every model intent is held to. The routed adapter declares
+/// two attempts and the model spec asks for two: the call dispatches. The
+/// second arm is the falsification — the identical fixture behind a route that
+/// declares the conservative default is refused, so the first arm's pass is the
+/// route's declaration reaching the ceiling and not the ceiling going missing.
+#[tokio::test]
+async fn a_routed_adapters_declared_retry_policy_is_the_ceiling_the_dispatcher_applies() {
+    async fn drive(declared: AgentModelRetryPolicy) -> AuthorityFixture {
+        let adapter = DeterministicModelAdapter::new()
+            .with_turn_for(1, proposing_turn())
+            .with_retry_policy(declared)
+            .expect("the adapter policy is valid");
+        let router = AgentModelRouter::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+            .with_route(profile_id(), Arc::new(adapter.clone()))
+            .expect("the route agrees on version and policy");
+        assert_eq!(
+            rakka_agent::AgentModelAdapter::retry_policy(&router),
+            declared
+        );
+        let spec = AgentEffectSpec::read_only()
+            .with_max_attempts(2)
+            .expect("the spec is valid");
+        let fx = profiled_fixture_with(adapter, false, spec).with_model_adapter(Arc::new(router));
+        fx.start().await;
+        select_profile(&fx).await;
+        fx.pump().await;
+        fx
+    }
+
+    let fx = drive(AgentModelRetryPolicy::read_only(2).expect("the policy is valid")).await;
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(fx.adapter.calls(), 1, "the routed adapter answered");
+
+    let fx = drive(AgentModelRetryPolicy::DEFAULT).await;
+    assert_eq!(fx.terminal_failure_code().await, "model-policy-conflict");
+    assert_eq!(fx.adapter.calls(), 0, "nothing was invoked");
 }
 
 // ---------------------------------------------------------------------------

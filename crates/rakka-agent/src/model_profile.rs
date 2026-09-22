@@ -304,8 +304,20 @@ impl AgentModelProfileCatalog for StaticAgentModelProfileCatalog {
 /// because the version is persisted with each turn and an upgrade is an
 /// explicit migration ([specification 10.2](../../../docs/plans/rakka-agent/spec.md)):
 /// a router mixing versions would write turns no single migration describes.
+///
+/// Every route must also declare the same [`AgentModelRetryPolicy`], for the
+/// same reason one step later: the router *is* the adapter the dispatcher asks,
+/// and the dispatcher applies that declaration as a ceiling on the model
+/// intent's own policy before it knows which route will answer
+/// ([specification 11.2](../../../docs/plans/rakka-agent/spec.md)). Routes that
+/// disagree have no single honest answer — a router that picked the strictest
+/// would silently refuse intents a routed adapter permits, and one that picked
+/// the laxest would let an intent past a route that forbids it.
 pub struct AgentModelRouter {
     adapter_version: AgentRevisionNumber,
+    /// The policy every route declared, once one has been added. A router with
+    /// nothing routed yet has nothing to answer with but the default.
+    retry_policy: Option<AgentModelRetryPolicy>,
     routes: BTreeMap<AgentModelProfileId, Arc<dyn AgentModelAdapter>>,
     default: Option<Arc<dyn AgentModelAdapter>>,
 }
@@ -314,6 +326,7 @@ impl fmt::Debug for AgentModelRouter {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("AgentModelRouter")
             .field("adapter_version", &self.adapter_version)
+            .field("retry_policy", &self.retry_policy)
             .field("routes", &self.routes.keys().collect::<Vec<_>>())
             .field("default", &self.default.is_some())
             .finish()
@@ -326,6 +339,7 @@ impl AgentModelRouter {
     pub fn new(adapter_version: AgentRevisionNumber) -> Self {
         Self {
             adapter_version,
+            retry_policy: None,
             routes: BTreeMap::new(),
             default: None,
         }
@@ -345,17 +359,45 @@ impl AgentModelRouter {
         Ok(())
     }
 
+    /// The policy this adapter declares, once it agrees with the routes already
+    /// added — the router's own declaration from then on.
+    fn check_retry_policy(
+        &self,
+        adapter: &Arc<dyn AgentModelAdapter>,
+    ) -> Result<AgentModelRetryPolicy, AgentModelError> {
+        let policy = adapter.retry_policy();
+        if let Some(declared) = self.retry_policy {
+            if policy != declared {
+                return Err(AgentModelError::Refused {
+                    code: "model-router-retry-policy-mismatch",
+                    message: format!(
+                        "the router's routes declare a {} policy of {} attempts and this one \
+                         declares {} of {}",
+                        declared.safety_class,
+                        declared.max_attempts,
+                        policy.safety_class,
+                        policy.max_attempts
+                    ),
+                });
+            }
+        }
+        Ok(policy)
+    }
+
     /// Routes one profile to an adapter.
     ///
     /// # Errors
     ///
-    /// `model-router-adapter-version-mismatch` when the adapter's version differs.
+    /// `model-router-adapter-version-mismatch` when the adapter's version
+    /// differs, and `model-router-retry-policy-mismatch` when its declared
+    /// retry policy differs from the one the router's other adapters declare.
     pub fn with_route(
         mut self,
         profile: AgentModelProfileId,
         adapter: Arc<dyn AgentModelAdapter>,
     ) -> Result<Self, AgentModelError> {
         self.check_version(&adapter)?;
+        self.retry_policy = Some(self.check_retry_policy(&adapter)?);
         self.routes.insert(profile, adapter);
         Ok(self)
     }
@@ -364,12 +406,15 @@ impl AgentModelRouter {
     ///
     /// # Errors
     ///
-    /// `model-router-adapter-version-mismatch` when the adapter's version differs.
+    /// `model-router-adapter-version-mismatch` when the adapter's version
+    /// differs, and `model-router-retry-policy-mismatch` when its declared
+    /// retry policy differs from the one the router's other adapters declare.
     pub fn with_default(
         mut self,
         adapter: Arc<dyn AgentModelAdapter>,
     ) -> Result<Self, AgentModelError> {
         self.check_version(&adapter)?;
+        self.retry_policy = Some(self.check_retry_policy(&adapter)?);
         self.default = Some(adapter);
         Ok(self)
     }
@@ -403,8 +448,12 @@ impl AgentModelAdapter for AgentModelRouter {
         self.adapter_version
     }
 
+    /// The policy every route declared, and the conservative default until one
+    /// has been added: the dispatcher reads this as the ceiling on the model
+    /// intent, so answering anything but the routed adapters' own declaration
+    /// would make [`AgentModelAdapter::retry_policy`] inert behind a router.
     fn retry_policy(&self) -> AgentModelRetryPolicy {
-        AgentModelRetryPolicy::DEFAULT
+        self.retry_policy.unwrap_or(AgentModelRetryPolicy::DEFAULT)
     }
 
     fn call<'a>(&'a self, request: &'a AgentModelRequest) -> AgentModelFuture<'a> {
