@@ -677,6 +677,75 @@ async fn decisions_and_usage_reach_the_span_through_their_mappers() {
         .attributes
         .contains_key(rakka_agent::ATTR_GEN_AI_USAGE_INPUT_TOKENS));
 
+    // But a provider that reported *only* a cached read — both billed
+    // directions zero — did report something, and it is the one record of it.
+    let cached_only = AgentTelemetrySegment::new(
+        AgentSegmentOperation::ModelInference {
+            model_profile: Some("fast".to_string()),
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .usage(rakka_agent::AgentModelUsage {
+        cached_input_tokens: Some(3),
+        ..Default::default()
+    })
+    .ok();
+    assert_eq!(
+        cached_only
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.cached_input_tokens),
+        Some(3),
+        "a cached read the provider billed at zero is still a report"
+    );
+    let span = segment_span(&cached_only).expect("the span maps");
+    assert_eq!(
+        span.attributes
+            .get(rakka_agent::ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS)
+            .map(String::as_str),
+        Some("3")
+    );
+    // Reasoning tokens beside an empty completion are the same case.
+    let reasoning_only = AgentTelemetrySegment::new(
+        AgentSegmentOperation::ModelInference {
+            model_profile: Some("fast".to_string()),
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .usage(rakka_agent::AgentModelUsage {
+        reasoning_tokens: Some(7),
+        ..Default::default()
+    })
+    .ok();
+    assert_eq!(
+        reasoning_only
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.reasoning_tokens),
+        Some(7)
+    );
+    // A provider that reported an explicit zero in either optional field
+    // reported no tokens at all, and is still dropped.
+    let zeroed = AgentTelemetrySegment::new(
+        AgentSegmentOperation::ModelInference {
+            model_profile: Some("fast".to_string()),
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .usage(rakka_agent::AgentModelUsage {
+        cached_input_tokens: Some(0),
+        reasoning_tokens: Some(0),
+        ..Default::default()
+    })
+    .ok();
+    assert!(zeroed.usage.is_none(), "a zero is not a report");
+
     let reported = AgentTelemetrySegment::new(
         AgentSegmentOperation::ModelInference {
             model_profile: Some("fast".to_string()),

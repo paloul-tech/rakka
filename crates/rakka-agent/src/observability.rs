@@ -1938,14 +1938,25 @@ impl AgentTelemetrySegment {
     /// Attaches provider-reported token usage.
     ///
     /// Usage that reports no tokens at all is dropped rather than attached: a
-    /// zero is a claim about the provider there is no evidence for.
+    /// zero is a claim about the provider there is no evidence for. A count in
+    /// either optional direction is a report too, and one the billed totals do
+    /// not have to witness: a cached read whose provider bills it at zero, or
+    /// reasoning tokens beside an empty completion, would otherwise be dropped
+    /// with the zero — losing the only record that the provider reported them.
     #[must_use]
     pub fn usage(mut self, usage: crate::model::AgentModelUsage) -> Self {
-        self.usage = (usage.total_tokens() > 0).then_some(usage);
+        let reported = usage.total_tokens() > 0
+            || usage.cached_input_tokens.is_some_and(|tokens| tokens > 0)
+            || usage.reasoning_tokens.is_some_and(|tokens| tokens > 0);
+        self.usage = reported.then_some(usage);
         self
     }
 
     /// Attaches the provider's response metadata.
+    ///
+    /// Always `Some` once a model attempt returned a turn, even when the
+    /// provider reported neither field: the durable-agent-acceptance example's
+    /// gated walk counts these segments as its liveness proof.
     #[must_use]
     pub fn model_response(mut self, metadata: crate::model::AgentModelResponseMetadata) -> Self {
         self.model_response = Some(metadata);
