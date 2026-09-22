@@ -63,6 +63,7 @@ RAKKA_AGENT_OTEL_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s --test agent_otel_
 RAKKA_AGENT_OTEL_VALIDATE_COLLECTOR_CONFIG=1 cargo test -p rakka-k8s --test agent_otel_collector_topology -- --nocapture
 # Export to a live Collector rather than the in-process OTLP receiver.
 RAKKA_AGENT_OTEL_COLLECTOR_ENDPOINT=http://127.0.0.1:4317 cargo test -p rakka-example-agent-otlp-export-acceptance --test exporter_failure -- --nocapture
+RAKKA_MODEL_PROFILE=live RAKKA_MODEL_PROVIDER=anthropic RAKKA_MODEL_NAME=claude-sonnet-5 RAKKA_MODEL_API_KEY=... cargo test -p rakka-example-durable-agent-acceptance --test provider_walk -- --nocapture   # live model provider walk
 ```
 
 ## Architecture

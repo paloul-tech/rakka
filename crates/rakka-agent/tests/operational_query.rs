@@ -52,6 +52,7 @@ fn proposing_turn(answer: &str) -> AgentModelTurn {
             input_tokens: 10,
             output_tokens: 5,
             cost_micros: 3,
+            ..Default::default()
         })
 }
 

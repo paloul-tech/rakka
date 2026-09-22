@@ -56,6 +56,7 @@ fn proposing_turn(answer: &str) -> AgentModelTurn {
             input_tokens: 10,
             output_tokens: 5,
             cost_micros: 3,
+            ..Default::default()
         })
 }
 
@@ -1106,6 +1107,7 @@ async fn a_direction_the_provider_did_not_report_records_no_sample() {
                 input_tokens: 0,
                 output_tokens: 120,
                 cost_micros: 0,
+                ..Default::default()
             }),
     );
     let fx = Fixture::new(dispatcher).with_metrics(metrics.clone());

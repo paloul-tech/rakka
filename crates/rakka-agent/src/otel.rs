@@ -98,6 +98,16 @@ pub const ATTR_GEN_AI_PROVIDER_NAME: &str = "gen_ai.provider.name";
 /// produced that name without this attribute named a dimension no query could
 /// group by.
 pub const ATTR_GEN_AI_REQUEST_MODEL: &str = "gen_ai.request.model";
+/// GenAI attribute: the provider's finish or stop reason for its response,
+/// when it reported one.
+pub const ATTR_GEN_AI_RESPONSE_FINISH_REASONS: &str = "gen_ai.response.finish_reasons";
+/// GenAI attribute: the provider's response model name, when it reported one.
+///
+/// Distinct from [`ATTR_GEN_AI_REQUEST_MODEL`]: the request attribute is
+/// Rakka's own bounded model profile, and this one is whatever the provider
+/// itself said answered — observability provenance, never read back for
+/// inference.
+pub const ATTR_GEN_AI_RESPONSE_MODEL: &str = "gen_ai.response.model";
 /// GenAI attribute: the tool name from the bounded registry.
 pub const ATTR_GEN_AI_TOOL_NAME: &str = "gen_ai.tool.name";
 /// GenAI attribute: the tool type from the bounded registry.
@@ -153,6 +163,19 @@ pub const ATTR_RAKKA_AGENT_CHECKPOINT_KIND: &str =
 pub const ATTR_RAKKA_AGENT_A2A_OPERATION: &str = "rakka.agent.a2a.operation";
 /// Rakka attribute: the bounded memory tier of a memory segment.
 pub const ATTR_RAKKA_AGENT_MEMORY_TIER: &str = "rakka.agent.memory.tier";
+/// Rakka attribute: input tokens the provider served from its cache, when it
+/// reported them.
+///
+/// Rakka-namespaced rather than a GenAI name: the convention revision this
+/// crate pins ([`AGENT_GENAI_CONVENTION_REVISION`]) has no stable attribute
+/// for it.
+pub const ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS: &str =
+    "rakka.agent.model.cached_input_tokens";
+/// Rakka attribute: reasoning tokens the provider reported, when it did.
+///
+/// Rakka-namespaced for the same reason as
+/// [`ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS`].
+pub const ATTR_RAKKA_AGENT_MODEL_REASONING_TOKENS: &str = "rakka.agent.model.reasoning_tokens";
 /// Rakka attribute: how many loop transitions one resident slice advanced.
 pub const ATTR_RAKKA_AGENT_LOOP_TRANSITIONS: &str =
     crate::observability::SEGMENT_ATTR_LOOP_TRANSITIONS;
@@ -184,6 +207,8 @@ pub const AGENT_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     ATTR_GEN_AI_OPERATION_NAME,
     ATTR_GEN_AI_PROVIDER_NAME,
     ATTR_GEN_AI_REQUEST_MODEL,
+    ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
+    ATTR_GEN_AI_RESPONSE_MODEL,
     ATTR_GEN_AI_TOOL_NAME,
     ATTR_GEN_AI_TOOL_TYPE,
     ATTR_GEN_AI_USAGE_INPUT_TOKENS,
@@ -202,6 +227,8 @@ pub const AGENT_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     ATTR_RAKKA_AGENT_LOOP_PHASE,
     ATTR_RAKKA_AGENT_LOOP_TRANSITIONS,
     ATTR_RAKKA_AGENT_MEMORY_TIER,
+    ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS,
+    ATTR_RAKKA_AGENT_MODEL_REASONING_TOKENS,
     ATTR_RAKKA_AGENT_SETTINGS_REVISION,
     ATTR_RAKKA_AGENT_TASK_ID,
     ATTR_RAKKA_AGENT_TURN_INDEX,
@@ -752,6 +779,19 @@ pub fn segment_span(segment: &AgentTelemetrySegment) -> AgentOtlpResult<AgentOte
         attributes.extend(usage_attributes(usage));
     }
 
+    // Provider-reported response provenance, when the segment carried it.
+    if let Some(metadata) = &segment.model_response {
+        if let Some(model) = &metadata.model {
+            attributes.insert(ATTR_GEN_AI_RESPONSE_MODEL.to_string(), model.clone());
+        }
+        if let Some(reason) = &metadata.finish_reason {
+            attributes.insert(
+                ATTR_GEN_AI_RESPONSE_FINISH_REASONS.to_string(),
+                reason.clone(),
+            );
+        }
+    }
+
     // The bridge copies nothing into attributes on its own any more, so this
     // set is exactly what the adapter decided to export.
     span.attributes = allowlisted(attributes);
@@ -912,6 +952,22 @@ pub fn usage_attributes(usage: &AgentModelUsage) -> AgentAttributes {
     ] {
         if tokens > 0 {
             attributes.insert(key.to_string(), tokens.to_string());
+        }
+    }
+    for (key, tokens) in [
+        (
+            ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS,
+            usage.cached_input_tokens,
+        ),
+        (
+            ATTR_RAKKA_AGENT_MODEL_REASONING_TOKENS,
+            usage.reasoning_tokens,
+        ),
+    ] {
+        if let Some(tokens) = tokens {
+            if tokens > 0 {
+                attributes.insert(key.to_string(), tokens.to_string());
+            }
         }
     }
     attributes

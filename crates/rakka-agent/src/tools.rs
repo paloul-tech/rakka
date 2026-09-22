@@ -93,6 +93,7 @@ use crate::model::{
     AgentModelTurn, AgentToolCallRequest, AGENT_MODEL_TURN_MAX_BYTES,
     AGENT_TOOL_ARGUMENTS_MAX_BYTES,
 };
+use crate::model_profile::AgentModelProfileCatalog;
 use crate::task::{AgentContentDigest, AgentSchemaRef, AgentTaskContent};
 
 /// Largest model-visible tool description, in bytes.
@@ -220,7 +221,7 @@ pub type AgentToolResult<T> = Result<T, AgentToolError>;
 
 /// The kind of component behind a tool
 /// ([specification 11.7](../../../docs/plans/rakka-agent/spec.md)).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AgentToolKind {
@@ -268,7 +269,7 @@ impl Display for AgentToolKind {
 /// How a tool's result is bounded
 /// ([specification 11.7](../../../docs/plans/rakka-agent/spec.md): every
 /// descriptor declares bounded result/artifact behavior).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AgentToolResultBehavior {
@@ -304,7 +305,15 @@ impl Display for AgentToolResultBehavior {
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)): showing it
 /// to a model lets the model *ask*, and everything that decides whether the
 /// ask executes lives in the binding, the intent, and the grant.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// Decoding does **not** re-validate: `Deserialize` reconstructs the fields as
+/// written, while [`AgentToolDescriptor::new`] is what enforces the bounds. The
+/// descriptors a model is shown are validated where they enter — the registry
+/// builds them, and the dispatch authority validates the ones it puts on a
+/// grant — so a decoded descriptor from any other source is caller-checked
+/// input: call [`AgentToolDescriptor::validate`] on it before it is trusted,
+/// as the model-turn decode beside it does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentToolDescriptor {
     /// Stable tool name.
     pub tool: AgentToolId,
@@ -936,6 +945,13 @@ pub struct AgentDispatchGrant {
     pub credential_binding: Option<AgentCredentialBindingRef>,
     /// The execution policy the dispatch is routed through.
     pub execution_policy: Option<AgentExecutionPolicyRef>,
+    /// The revision of the model profile record that authorized a model
+    /// call, when a catalog resolved one.
+    #[serde(default)]
+    pub model_profile_revision: Option<AgentRevisionNumber>,
+    /// The digest of that record, for the attempt's audit trail.
+    #[serde(default)]
+    pub model_profile_digest: Option<AgentContentDigest>,
     /// When the grant was issued.
     pub issued_at: AgentTimestampMillis,
     /// When the grant expires.
@@ -1008,6 +1024,14 @@ pub struct AgentGrantedDispatch {
     pub model_profile: Option<AgentModelProfileId>,
     /// The sampling parameters the current settings resolve for the turn.
     pub sampling: Option<AgentSamplingSettings>,
+    /// The credential binding the selected model profile names, when the
+    /// authority resolved one; the dispatcher resolves it when the intent
+    /// itself carries none.
+    pub model_credential_binding: Option<AgentCredentialBindingRef>,
+    /// The descriptors the model may be shown for this call: registered,
+    /// declared by the envelope, not revoked by the current settings, and
+    /// narrowed by the run's setup when one exists.
+    pub tools: Vec<AgentToolDescriptor>,
     /// Every guardrail transform applied to the call, with its reason. The
     /// dispatch pipeline surfaces these through its tracing span so an applied
     /// transform is observable, not silent.
@@ -1111,6 +1135,9 @@ pub struct AgentToolAuthority {
     /// one declaration drives both the gate and the specs that satisfy it, so
     /// the two cannot drift apart.
     substrate_execution_policy: Option<AgentExecutionPolicyRef>,
+    /// The deployment's model profile catalog, when one is installed; without
+    /// it a profile is an opaque approved id, as before.
+    model_profiles: Option<Arc<dyn AgentModelProfileCatalog>>,
     grant_ttl_ms: u64,
 }
 
@@ -1274,9 +1301,10 @@ impl AgentToolAuthority {
     /// [`AGENT_MODEL_TURN_MAX_BYTES`]. A transform is decoded through the
     /// turn's validating deserializer and refused (`guardrail-transform-invalid`)
     /// when it does not form a bounded turn, when it rewrites the schema
-    /// version, adapter version, model profile, or usage the provider
-    /// reported, when it carries a tool call under a call id the model did not
-    /// produce, or when it carries two tool calls under one call id; a stage
+    /// version, adapter version, model profile, usage, response model, or
+    /// finish reason the provider reported, when it carries a tool call under
+    /// a call id the model did not produce, or when it carries two tool calls
+    /// under one call id; a stage
     /// may rewrite text, drop, reorder, or rewrite the model's own tool calls,
     /// and rewrite an inline proposal. A transform that changes the
     /// proposal's form — inline to artifact reference, reference to inline,
@@ -1336,12 +1364,14 @@ impl AgentToolAuthority {
                 || transformed.adapter_version != review.turn.adapter_version
                 || transformed.model_profile != review.turn.model_profile
                 || transformed.usage != review.turn.usage
+                || transformed.response_model != review.turn.response_model
+                || transformed.finish_reason != review.turn.finish_reason
             {
                 return Err(AgentAuthorityRefusal::of(
                     "guardrail-transform-invalid",
                     "a guardrail transform may rewrite a turn's text, tool calls, and proposal; \
-                     it may not rewrite its schema version, adapter version, model profile, or \
-                     usage",
+                     it may not rewrite its schema version, adapter version, model profile, \
+                     usage, response model, or finish reason",
                 ));
             }
             let invented = transformed.tool_calls.iter().any(|call| {
@@ -1412,6 +1442,7 @@ impl AgentToolAuthority {
             a2a_attested: false,
             execution_router: None,
             substrate_execution_policy: None,
+            model_profiles: None,
             grant_ttl_ms: AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
         }
     }
@@ -1538,6 +1569,28 @@ impl AgentToolAuthority {
         }
         self.a2a_attested = true;
         Ok(self)
+    }
+
+    /// Installs the deployment's model profile catalog.
+    ///
+    /// With a catalog, [`Self::authorize`] resolves the selected profile's
+    /// record for a model call: an unknown id refuses `model-profile-unknown`;
+    /// the record's credential binding passes the same envelope and revocation
+    /// checks a tool's binding does and is put on the grant, so the dispatcher
+    /// resolves it inside the attempt with no new path; the record's revision
+    /// and digest are recorded on the grant; and the record's binding, like a
+    /// binding the intent itself names, requires the effect's own
+    /// `timeout_ms`.
+    ///
+    /// That last rule holds with or without a catalog: a model call that
+    /// resolves any credential and carries no `timeout_ms` is refused
+    /// `model-timeout-unset`, because the resolver's only deadline input is
+    /// the effect's own timeout
+    /// ([Phase 7 design 4.2](../../../docs/superpowers/specs/2026-09-19-phase7-agent-surface-parity-design.md)).
+    #[must_use]
+    pub fn with_model_profiles(mut self, catalog: Arc<dyn AgentModelProfileCatalog>) -> Self {
+        self.model_profiles = Some(catalog);
+        self
     }
 
     /// Whether this authority has attested an A2A surface whose chain
@@ -2183,6 +2236,8 @@ impl AgentToolAuthority {
             tool_call,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms,
             reports,
             checkpoint: None,
@@ -2249,8 +2304,53 @@ impl AgentToolAuthority {
             }
         }
 
+        // The profile record, when a catalog is installed: its binding is
+        // checked exactly as a tool's, and its revision and digest ride the
+        // grant.
+        let mut model_credential_binding = None;
+        let mut model_profile_revision = None;
+        let mut model_profile_digest = None;
+        if let (Some(catalog), Some(profile_id)) = (&self.model_profiles, &profile) {
+            let Some(record) = catalog.profile(profile_id) else {
+                return Err(AgentAuthorityRefusal::of(
+                    "model-profile-unknown",
+                    format!("the deployment's model profile catalog knows no profile {profile_id}"),
+                ));
+            };
+            if let Some(binding) = &record.credential_binding {
+                self.check_credential(context, binding)?;
+                model_credential_binding = Some(binding.clone());
+            }
+            model_profile_revision = Some(record.revision);
+            model_profile_digest = Some(record.digest());
+        }
+
         if let Some(credential) = &intent.credential_binding {
             self.check_credential(context, credential)?;
+        }
+
+        // A credential-bearing model call must carry the attempt bound the
+        // resolver derives its deadline from, whichever side names the
+        // binding. The intent's own binding — which a deployment sets on the
+        // model [`crate::effect::AgentEffectSpec`] — and the profile's both
+        // reach the dispatcher's resolver, and the effect's timeout is a
+        // resolver's only deadline input, so an unbounded attempt could hold
+        // a live secret open indefinitely.
+        if intent.timeout_ms.is_none() {
+            if let Some(binding) = intent
+                .credential_binding
+                .as_ref()
+                .or(model_credential_binding.as_ref())
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    "model-timeout-unset",
+                    format!(
+                        "the model call resolves the credential binding {binding} and its \
+                         effect spec carries no timeout_ms; a resolver's only deadline input \
+                         is the effect's own timeout"
+                    ),
+                ));
+            }
         }
         self.check_execution_policy(intent.execution_policy.as_ref())?;
 
@@ -2296,20 +2396,44 @@ impl AgentToolAuthority {
             reports = decision.reports;
         }
 
+        // Visibility is not authority: the model is shown only what this
+        // agent could actually dispatch under the current envelopes and
+        // settings, narrowed by the run's setup exactly as `authorize_tool`
+        // consults it.
+        let mut tools: Vec<AgentToolDescriptor> = self
+            .registry
+            .model_visible(context.definition.envelope(), settings)
+            .into_iter()
+            .cloned()
+            .collect();
+        if let Some(setup) = context.setup {
+            tools.retain(|descriptor| setup.envelope().tools.contains_key(&descriptor.tool));
+        }
+
         Ok(AgentGrantedDispatch {
-            grant: self.grant(
-                context,
-                scope,
-                task,
-                goal,
-                intent,
-                None,
-                BTreeSet::new(),
-                now,
-            ),
+            grant: {
+                let mut grant = self.grant(
+                    context,
+                    scope,
+                    task,
+                    goal,
+                    intent,
+                    None,
+                    BTreeSet::new(),
+                    now,
+                );
+                if grant.credential_binding.is_none() {
+                    grant.credential_binding = model_credential_binding.clone();
+                }
+                grant.model_profile_revision = model_profile_revision;
+                grant.model_profile_digest = model_profile_digest;
+                grant
+            },
             tool_call: None,
             model_profile: profile,
             sampling: Some(settings.sampling),
+            model_credential_binding,
+            tools,
             transforms: Vec::new(),
             reports,
             checkpoint: None,
@@ -2351,6 +2475,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2394,6 +2520,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2438,6 +2566,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2504,6 +2634,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2585,6 +2717,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2631,6 +2765,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2715,6 +2851,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint: None,
@@ -2818,6 +2956,8 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: profile,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
             checkpoint,
@@ -2994,6 +3134,8 @@ impl AgentToolAuthority {
             capabilities,
             credential_binding: intent.credential_binding.clone(),
             execution_policy: intent.execution_policy.clone(),
+            model_profile_revision: None,
+            model_profile_digest: None,
             issued_at: now,
             expires_at: AgentTimestampMillis::new(
                 now.as_millis().saturating_add(self.grant_ttl_ms),
@@ -3238,6 +3380,10 @@ mod tests {
         AgentEnvironmentRef, AgentId, AgentOperationId, AgentOperationKind, AgentRunId, TenantId,
     };
     use crate::memory::AgentContextSnapshotRef;
+    use crate::model_profile::{
+        AgentModelCapabilities, AgentModelProfile, AgentModelProviderKind,
+        StaticAgentModelProfileCatalog,
+    };
     use crate::schema::{VersionedAgentRecord, CURRENT_AGENT_SETUP_SCHEMA_VERSION};
     use crate::task::AgentSchemaId;
     use rakka_agent_workflow::HumanCheckpointId;
@@ -3324,6 +3470,25 @@ mod tests {
             0,
             AgentRunEffectRequest::Tool {
                 call: Box::new(call),
+            },
+            spec,
+            AgentRevisionNumber::INITIAL,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the effect derives")
+    }
+
+    /// A model intent for turn 1, taking its profile from the current
+    /// settings exactly as the run's own model call does.
+    fn model_intent(spec: &AgentEffectSpec) -> AgentRunEffect {
+        let scope = scope();
+        AgentRunEffect::new(
+            &scope,
+            1,
+            0,
+            AgentRunEffectRequest::Model {
+                context: AgentContextSnapshotRef::for_turn(&scope, 1).expect("the ref derives"),
+                profile: None,
             },
             spec,
             AgentRevisionNumber::INITIAL,
@@ -4686,5 +4851,175 @@ mod tests {
             .expect_err("a model-request transform cannot be applied, so it refuses");
         assert_eq!(refusal.code, "guardrail-transform-unsupported");
         assert!(!refusal.retryable);
+    }
+
+    /// The grant a model call is authorized under carries what the profile
+    /// record decided: its revision and digest, its credential binding when
+    /// the intent names none, and the descriptor list the model may be shown.
+    ///
+    /// Read from the returned [`AgentGrantedDispatch`] rather than inferred
+    /// from a refusal code, because a refusal proves only that a gate fired —
+    /// nothing about what rides a grant that was issued.
+    #[test]
+    fn a_model_grant_records_the_profile_record_and_the_visible_tools() {
+        let profile_id = AgentModelProfileId::new("anthropic-sonnet").expect("the id is valid");
+        let profile_binding =
+            AgentCredentialBindingRef::new("anthropic-key").expect("the binding is valid");
+        let intent_binding =
+            AgentCredentialBindingRef::new("tenant-key").expect("the binding is valid");
+        let record = AgentModelProfile {
+            profile_id: profile_id.clone(),
+            revision: AgentRevisionNumber::new(3),
+            provider: AgentModelProviderKind::Anthropic,
+            model: "claude-sonnet-5".to_string(),
+            base_url: None,
+            credential_binding: Some(profile_binding.clone()),
+            default_sampling: AgentSamplingSettings::default(),
+            capabilities: AgentModelCapabilities { tool_calls: true },
+            attributes: BTreeMap::new(),
+        };
+        let catalog: Arc<dyn AgentModelProfileCatalog> = Arc::new(
+            StaticAgentModelProfileCatalog::new()
+                .with_profile(record.clone())
+                .expect("the record is valid"),
+        );
+
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::NonIdempotent);
+        let registry = AgentToolRegistry::new()
+            .register(AgentToolBinding::new(
+                descriptor("charge-card"),
+                declaration.clone(),
+                1,
+            ))
+            .expect("the tool registers");
+        let mut envelope = AgentAuthorityEnvelope::empty();
+        envelope
+            .tools
+            .insert(tool_id("charge-card"), declaration.clone());
+        envelope.model_profiles.insert(profile_id.clone());
+        envelope.credential_bindings.insert(profile_binding.clone());
+        envelope.credential_bindings.insert(intent_binding.clone());
+        let definition = AgentDefinitionRevision::initial(
+            AgentDefinition::new(
+                AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+                "Resolves tickets.",
+                envelope.clone(),
+            )
+            .expect("the definition is valid"),
+            provenance(),
+        );
+        let selected = AgentSettings {
+            model_profile: Some(profile_id.clone()),
+            ..AgentSettings::default()
+        };
+        let settings = SettingsRevision::initial(&definition, selected, provenance())
+            .expect("the settings are valid");
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+            delegation: None,
+        };
+        let authority = AgentToolAuthority::new(registry).with_model_profiles(catalog);
+
+        // A credential-bearing model call carries the attempt bound, so the
+        // grant is issued and can be read.
+        let granted = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &model_intent(&AgentEffectSpec::read_only().with_timeout_ms(30_000)),
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect("the profiled model call is granted");
+        assert_eq!(
+            granted.grant.model_profile_revision,
+            Some(AgentRevisionNumber::new(3)),
+            "the record's revision rides the grant"
+        );
+        assert_eq!(
+            granted.grant.model_profile_digest,
+            Some(record.digest()),
+            "the record's digest rides the grant"
+        );
+        assert_eq!(
+            granted.model_credential_binding.as_ref(),
+            Some(&profile_binding)
+        );
+        assert_eq!(
+            granted.grant.credential_binding.as_ref(),
+            Some(&profile_binding),
+            "an intent naming no binding takes the profile's"
+        );
+        assert_eq!(
+            granted
+                .tools
+                .iter()
+                .map(|descriptor| descriptor.tool.clone())
+                .collect::<Vec<_>>(),
+            vec![tool_id("charge-card")],
+            "the model is shown the registered, declared, unrevoked tool"
+        );
+
+        // The other precedence arm: an intent that names its own binding keeps
+        // it, and the profile's binding is still reported separately.
+        let owned = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &model_intent(
+                    &AgentEffectSpec::read_only()
+                        .with_timeout_ms(30_000)
+                        .with_credential_binding(intent_binding.clone()),
+                ),
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect("the intent's own binding is authorized");
+        assert_eq!(
+            owned.grant.credential_binding.as_ref(),
+            Some(&intent_binding),
+            "the intent's own binding is never replaced by the profile's"
+        );
+        assert_eq!(
+            owned.model_credential_binding.as_ref(),
+            Some(&profile_binding)
+        );
+
+        // A setup that omits the tool narrows what the model is shown, even
+        // though the definition still declares it.
+        let mut narrowed = AgentAuthorityEnvelope::empty();
+        narrowed.model_profiles.insert(profile_id);
+        narrowed.credential_bindings.insert(profile_binding);
+        let setup = AgentSetupRevision::new(
+            AgentRevisionNumber::INITIAL,
+            &definition,
+            narrowed,
+            provenance(),
+        )
+        .expect("dropping a tool is a legal narrowing");
+        let narrowed_context = context.with_setup(&setup);
+        let narrowed_grant = authority
+            .authorize(
+                &narrowed_context,
+                &scope(),
+                None,
+                None,
+                &model_intent(&AgentEffectSpec::read_only().with_timeout_ms(30_000)),
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect("the model call is still granted");
+        assert!(
+            narrowed_grant.tools.is_empty(),
+            "the run's setup narrows the model-visible list, not just dispatch"
+        );
     }
 }

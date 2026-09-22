@@ -1975,6 +1975,7 @@ mod tests {
             input_tokens: 30,
             output_tokens: 10,
             cost_micros: 0,
+            ..Default::default()
         });
 
         assert_eq!(budget.consumption().tokens, 40);

@@ -1860,6 +1860,7 @@ pub struct DeterministicModelAdapter {
     by_turn: Arc<Mutex<BTreeMap<u64, AgentModelTurn>>>,
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<AgentModelRequest>>>,
+    credentials: Arc<Mutex<Vec<Option<&'static str>>>>,
 }
 
 impl DeterministicModelAdapter {
@@ -1873,6 +1874,7 @@ impl DeterministicModelAdapter {
             by_turn: Arc::new(Mutex::new(BTreeMap::new())),
             calls: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
+            credentials: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1883,6 +1885,21 @@ impl DeterministicModelAdapter {
         self.requests
             .lock()
             .expect("the request log should not be poisoned")
+            .clone()
+    }
+
+    /// The material kind of the credential each call was handed, in call
+    /// order — a label, never a value.
+    ///
+    /// Only [`AgentModelAdapter::call_with`] records here, which is what makes
+    /// the log a proof: an entry exists exactly when the dispatcher took the
+    /// credential-bearing path, and `None` is a call it took with no
+    /// credential at all.
+    #[must_use]
+    pub fn credentials_seen(&self) -> Vec<Option<&'static str>> {
+        self.credentials
+            .lock()
+            .expect("the credential log should not be poisoned")
             .clone()
     }
 
@@ -1980,6 +1997,24 @@ impl AgentModelAdapter for DeterministicModelAdapter {
         // cancelled race — must not consume a scripted turn, exactly as the
         // Rig-backed adapter performs no provider call for a future never polled.
         Box::pin(async move { Ok(self.produce(request)) })
+    }
+
+    fn call_with<'a>(
+        &'a self,
+        request: &'a AgentModelRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentModelFuture<'a> {
+        // The label, not the value: a test asserts which *kind* of material an
+        // adapter was handed, and a testkit that kept the secret would be the
+        // one durable copy the secret-exclusion sweep cannot see.
+        let seen = credential.map(|credential| credential.material().kind_label());
+        Box::pin(async move {
+            self.credentials
+                .lock()
+                .expect("the credential log should not be poisoned")
+                .push(seen);
+            Ok(self.produce(request))
+        })
     }
 }
 
@@ -3403,6 +3438,7 @@ pub struct ScriptedCredentialResolver {
     token: String,
     failure: Option<(String, String)>,
     resolutions: Arc<AtomicUsize>,
+    deadlines: Arc<Mutex<Vec<Option<AgentTimestampMillis>>>>,
 }
 
 impl ScriptedCredentialResolver {
@@ -3413,6 +3449,7 @@ impl ScriptedCredentialResolver {
             token: token.into(),
             failure: None,
             resolutions: Arc::new(AtomicUsize::new(0)),
+            deadlines: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -3429,6 +3466,7 @@ impl ScriptedCredentialResolver {
             token: String::new(),
             failure: Some((code.into(), message.into())),
             resolutions: Arc::new(AtomicUsize::new(0)),
+            deadlines: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -3437,6 +3475,19 @@ impl ScriptedCredentialResolver {
     #[must_use]
     pub fn resolutions(&self) -> usize {
         self.resolutions.load(Ordering::SeqCst)
+    }
+
+    /// The `deadline_at` each resolution was handed, in resolution order.
+    ///
+    /// A real resolver derives the lease it asks a secret store for from this
+    /// field, so it is the one input a test can read back to prove the
+    /// dispatcher stamped the attempt bound at all.
+    #[must_use]
+    pub fn deadlines(&self) -> Vec<Option<AgentTimestampMillis>> {
+        self.deadlines
+            .lock()
+            .expect("the deadline log should not be poisoned")
+            .clone()
     }
 }
 
@@ -3454,10 +3505,14 @@ impl AgentEffectCredentialResolver for ScriptedCredentialResolver {
         &'a self,
         _scope: &'a AgentRunScope,
         _binding: &'a AgentCredentialBindingRef,
-        _effect: &'a AgentRunEffect,
+        effect: &'a AgentRunEffect,
     ) -> AgentDispatchFuture<'a, AgentEphemeralCredential> {
         Box::pin(async move {
             self.resolutions.fetch_add(1, Ordering::SeqCst);
+            self.deadlines
+                .lock()
+                .expect("the deadline log should not be poisoned")
+                .push(effect.deadline_at);
             if let Some((code, message)) = self.failure.as_ref() {
                 return Err(crate::dispatch::AgentDispatchError::collaborator(
                     code.clone(),

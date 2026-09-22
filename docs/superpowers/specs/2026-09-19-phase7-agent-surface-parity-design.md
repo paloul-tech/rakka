@@ -72,6 +72,17 @@ actually lives; and the guardrail context names an `AgentGuardrailSubject`
 because ingress has no run. Plan:
 `docs/superpowers/plans/2026-09-20-phase7-slice-7-2-response-guardrails.md`.
 
+**Plan refinements (2026-09-21, slice 7.1 plan).** Marked inline: the
+cross-attempt profile refusal is recorded, not enforced, because the
+checkpoint binding sees only the durable intent; the adapter and router
+refuse their own six codes through one `AgentModelError::Refused` variant,
+while the profile, the response-metadata bound, and the authority keep the
+answer shapes they already had (11.1); provider provenance is read through an optional extractor; the
+model-visible tool list is computed by the authority onto the grant;
+`AgentModelRouter` lives in the new `model_profile` module; the gated
+example walk asserts structural facts, not the acceptance transcript. Plan:
+`docs/superpowers/plans/2026-09-21-phase7-slice-7-1-wired-model-providers.md`.
+
 ## Summary
 
 **What this phase delivers.** Eight capabilities, each a decision section below:
@@ -481,10 +492,13 @@ additions:
    refuses an unknown id (`model-profile-unknown`), runs the existing
    `check_credential` against the profile's binding (so a revoked binding
    refuses the model call exactly as it refuses a tool), and records the
-   profile's `revision` and `digest()` on the grant descriptor
-   (`AgentGrantDescriptor`), so a recovery that finds a materially different
-   profile refuses (`model-profile-revision-mismatch`, spec 11.8's last
-   paragraph applied to models).
+   profile's `revision` and `digest()` on the grant
+   (`AgentDispatchGrant.model_profile_revision` and `model_profile_digest`),
+   re-resolving the record on every attempt. (plan refinement 2026-09-21:
+   the cross-attempt refusal `model-profile-revision-mismatch` needs the
+   digest carried into the checkpoint binding, which `checkpoints.rs:299`
+   builds from the durable intent alone; slice 7.1 records the digest and
+   defers that refusal to a follow-up, so the code is not answered yet.)
 2. `AgentGrantedDispatch.model_credential_binding: Option<AgentCredentialBindingRef>`
    and the grant's `credential_binding` set from it. The dispatcher's credential
    resolution (`dispatch.rs:2612`) resolves
@@ -586,7 +600,12 @@ shape with the backend left to the caller.
 Per attempt, `call_with` first validates the base URL the call will use
 (4.1's rules: it parses as a URL and carries no userinfo and no query string;
 `model-profile-invalid-base-url` otherwise) before anything else happens, then
-builds the provider client over the injected backend with the ephemeral
+builds the provider client (plan refinement 2026-09-21: the base URL is
+validated **once, at construction** — `RigProviderAdapter::new` runs
+`profile.validate()` and additionally refuses a `Custom` or `AzureOpenAi`
+profile with no `base_url`. The adapter owns an immutable profile record, so
+a per-attempt re-check could only reach the same answer more slowly; an
+attempt cannot be reached at all without a validated URL) over the injected backend with the ephemeral
 credential (`ClientBuilder::new(..).http_client(self.http.clone()).base_url(..)`
 — `rig-core-0.37.0/src/client/mod.rs:658` is the backend setter — then
 `completion_model(&profile.model)`), issues `completion`, maps the response
@@ -600,10 +619,16 @@ the provider's builder extension.
 The prompt assembly in `build_request` stays as it is in this phase except for
 one change that is a prerequisite for real providers: the request carries the
 model-visible tool list. `AgentModelRequest.tools: Vec<AgentToolDescriptor>` is
-filled by the dispatcher from `AgentToolRegistry::model_visible(envelope,
-settings)` (the security matrix's "descriptor rung" owed item), and the
+filled from `AgentToolRegistry::model_visible(envelope, settings)` (plan
+refinement 2026-09-21: computed by the authority, which owns the envelope
+and settings, onto `AgentGrantedDispatch.tools`, and copied onto the
+request by the dispatcher, which holds no registry) (the security matrix's "descriptor rung" owed item), and the
 adapter declares each as a Rig `ToolDefinition` beside the result tool. This
 turns "the model is never told which tools exist" into a real surface.
+(plan refinement 2026-09-21: a model-visible descriptor named like the
+adapter's own result tool refuses `model-result-tool-collision` before any
+request is built, since declaring both would put two tool definitions under
+one name on the wire — see 11.1.)
 (revised 2026-09-20) The list is the *filtered* model-visible set:
 `model_visible` (`tools.rs:723–735`) keeps a descriptor only when the envelope
 declares the tool and the current settings have not revoked it
@@ -648,7 +673,11 @@ the prompt is unchanged and remains its own slice.
 `gen_ai.response.model`, finish reason, cached and reasoning tokens (17.8's
 "provider fields have no slot") get slots on `AgentModelUsage` /
 `AgentModelTurn` as optional fields, filled by the Rig adapter where the
-provider reports them. Additive, schema note in section 11. A deployment's
+provider reports them (plan refinement 2026-09-21: cached and reasoning
+tokens from rig's `Usage` for every provider; response model and finish
+reason through an optional per-provider extractor on `RigModelAdapter`,
+installed for Anthropic and the OpenAI-completions family in this slice,
+because rig carries them only inside the provider's raw response type). Additive, schema note in section 11. A deployment's
 own adapter fills the same slots and its spans gain them from the segment it
 already writes.
 
@@ -677,7 +706,11 @@ already writes.
   `RAKKA_MODEL_PROFILE` plus the provider's credential env var, runs the same
   walk against a live provider through an env-backed credential resolver that
   lives in the example (never in a crate). Documented like the PostgreSQL
-  gates in CLAUDE.md.
+  gates in CLAUDE.md. (plan refinement 2026-09-21: the gated walk reuses the
+  world and the acceptance walk's definition, tool, and envelope, and asserts
+  structural facts — a terminal run, a recorded response model, secret
+  exclusion — not the 18-line transcript, which is scripted around content
+  sentinels and a dispatcher-death bullet a live model cannot reproduce.)
 
 ## 5. MCP client
 
@@ -1430,8 +1463,13 @@ fingerprint survive `build()` unchanged).
 ### 11.1 Compatibility (all additive unless noted)
 
 - New durable fields: `AgentModelTurn`/`AgentModelUsage` provider fields
-  (optional), `MemoryContextSnapshot.session_mode`, `AgentGrantDescriptor`
-  profile revision and digest, `AgentSettingsChange::MemoryMode`,
+  (optional), `MemoryContextSnapshot.session_mode`, the profile revision and
+  digest (plan refinement 2026-09-21: they are **not** durable fields. 4.2
+  item 1 and the implementation put them on `AgentDispatchGrant`, which is
+  `Serialize`-only and never persisted — a grant is derived per attempt from
+  the agent's current authority state — so they carry no schema version and
+  no N/N+1 window. What is persisted is the intent they authorize, which is
+  unchanged), `AgentSettingsChange::MemoryMode`,
   `AgentSegmentIdentity.{agent_name, agent_version}` (optional, default
   `None`). Each lands under the N/N+1 schema policy with a version bump where
   the record is versioned. `AgentRunEffect.deadline_at` gains a per-attempt
@@ -1476,9 +1514,26 @@ fingerprint survive `build()` unchanged).
   `crates/rakka-agent/tests/` parses the manifest and fails if the `rig`
   feature ever lists `reqwest`.
 - New stable codes, registered in `docs/rakka-compatibility.md`:
-  `model-profile-unknown`, `model-profile-revision-mismatch`,
-  `model-profile-invalid-base-url`, `model-timeout-unset`,
-  `guardrail-rule-invalid` (a built-in stage constructed with an empty or
+  `model-profile-unknown`, `model-profile-invalid-base-url`,
+  `model-profile-invalid-attribute`, `model-timeout-unset`,
+  `model-credential-missing`, `model-credential-material-unsupported`,
+  `model-router-adapter-version-mismatch`,
+  `model-router-retry-policy-mismatch` (plan refinement 2026-09-21: a router
+  requires every route and its default to declare one
+  `AgentModelRetryPolicy`, which it then answers as its own, because the
+  dispatcher applies the adapter's declaration as the ceiling on a model
+  intent before it knows which route will answer),
+  `model-response-metadata-too-long` (plan refinement 2026-09-21: six of
+  these codes are answered through one `AgentModelError::Refused` variant —
+  the router's three and the Rig adapters' three — while
+  `model-profile-invalid-base-url`/`-invalid-attribute` are
+  `AgentModelProfileError::code()`, `model-response-metadata-too-long` is its
+  own `AgentModelError` variant, and `model-timeout-unset` is an
+  `AgentAuthorityRefusal`; every one is read through a `code()`.
+  `model-profile-revision-mismatch` is deferred with 4.2 item 1),
+  `model-result-tool-collision` (plan refinement 2026-09-21: the Rig
+  adapters refuse, before any request is built, a model-visible tool whose
+  name equals the adapter's result tool), `guardrail-rule-invalid` (a built-in stage constructed with an empty or
   oversized rule; `guardrail-transform-invalid` and `checkpoint-required` are
   already registered and reused, so the first draft's
   `guardrail-checkpoint-unsupported-at-response` is withdrawn — plan

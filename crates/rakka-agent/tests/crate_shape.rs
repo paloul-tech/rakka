@@ -82,6 +82,25 @@ fn facade_propagates_the_agent_features() {
     );
 }
 
+/// The Rig pin selects a TLS backend and nothing else: rig's `reqwest` feature
+/// would enable `reqwest/system-proxy`, an environment-proxy egress bypass
+/// that Cargo feature unification would switch on for every crate in a
+/// consumer's graph.
+#[test]
+fn rig_core_enables_rustls_only_and_never_reqwest() {
+    let manifest = read("crates/rakka-agent/Cargo.toml");
+    let line = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with("rig-core"))
+        .expect("the rig-core dependency line exists");
+    assert!(line.contains("default-features = false"), "{line}");
+    assert!(line.contains("features = [\"rustls\"]"), "{line}");
+    assert!(
+        !line.contains("\"reqwest\""),
+        "rig's reqwest feature is never enabled: {line}"
+    );
+}
+
 #[test]
 fn agent_domain_does_not_depend_on_the_a2a_adapter() {
     let manifest = read("crates/rakka-agent/Cargo.toml");

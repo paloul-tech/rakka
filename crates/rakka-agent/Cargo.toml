@@ -37,11 +37,13 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-# Pinned, reviewed Rig version for the `rig` feature. Default features are off:
-# Rakka needs only Rig's provider-neutral completion contract, and the deploying
-# application supplies the concrete provider client and its transport
-# ([specification 10.2](../../docs/plans/rakka-agent/spec.md)).
-rig-core = { version = "=0.37.0", default-features = false, optional = true }
+# Pinned, reviewed Rig version for the `rig` feature. Default features are off,
+# with `rustls` alone: it selects a TLS backend for rig's non-optional
+# `reqwest` 0.13 and nothing else. Rig's `reqwest` feature is never enabled —
+# it turns on `reqwest/system-proxy`, an environment-proxy egress bypass, and
+# Cargo feature unification would switch it on for every crate in a consumer's
+# dependency graph. `crate_shape.rs` holds this.
+rig-core = { version = "=0.37.0", default-features = false, features = ["rustls"], optional = true }
 
 [dev-dependencies]
 # Property tests for the derived wake identity: same occurrence from any
@@ -49,6 +51,15 @@ rig-core = { version = "=0.37.0", default-features = false, optional = true }
 # never enters the publishable dependency tree.
 proptest.workspace = true
 rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
+# The in-process fake providers `rig_provider_fake_endpoint.rs` serves. The
+# HTTP backend it injects is rig's own re-exported client
+# (`rig_core::http_client::ReqwestClient`), never a direct `reqwest`
+# dev-dependency: `HttpClientExt` is implemented only for the exact `reqwest`
+# rig links, so a second edge free to resolve elsewhere would be a silent
+# version-skew trap. `bytes` is named only because rig's `HttpClientExt`
+# signatures are, and an impl must spell the trait's own bounds.
+axum.workspace = true
+bytes.workspace = true
 
 [lints]
 workspace = true

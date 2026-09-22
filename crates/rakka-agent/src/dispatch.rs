@@ -129,7 +129,8 @@ use crate::memory::{
     PrivateMemoryExpectation, SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
 };
 use crate::model::{
-    AgentModelAdapter, AgentModelRequest, AgentModelTurn, AgentToolCallId, AgentToolCallRequest,
+    AgentModelAdapter, AgentModelRequest, AgentModelResponseMetadata, AgentModelTurn,
+    AgentToolCallId, AgentToolCallRequest,
 };
 use crate::observability::{
     agent_linked_telemetry_context, agent_span_link, AgentSegmentOperation, AgentSegmentTimer,
@@ -1335,6 +1336,14 @@ fn consolidation_record(
 ///
 /// The resolver is consulted only after the attempt's durable `Started`, and
 /// the resolved value is dropped with the attempt.
+///
+/// The effect handed over carries two time fields: `timeout_ms`, the attempt
+/// bound its spec declared, and `deadline_at`, which the dispatcher stamps per
+/// attempt as the attempt's start plus that bound and never persists. A
+/// resolver derives the lease it asks for from `deadline_at`; when both are
+/// `None` the effect declared no bound, and a resolver may only ask for its
+/// minimum lease — which is why a credential-bearing model call without a
+/// timeout is refused at the authority.
 ///
 /// # The error text this returns becomes durable state
 ///
@@ -2675,9 +2684,24 @@ where
             return Ok(ClaimConclusion::Died);
         }
 
+        // The attempt bound, stamped once per attempt and never persisted:
+        // a durable deadline would outlive the generation it bounds.
+        let attempt_started_at = self.now();
+        let mut attempt_intent = intent.clone();
+        attempt_intent.deadline_at = intent.timeout_ms.map(|timeout_ms| {
+            AgentTimestampMillis::new(attempt_started_at.as_millis().saturating_add(timeout_ms))
+        });
+        let attempt_intent = &attempt_intent;
+        // The binding: the intent's own, or the one the grant carries from
+        // the selected model profile.
+        let credential_binding = intent
+            .credential_binding
+            .clone()
+            .or_else(|| granted.grant.credential_binding.clone());
+
         // Dispatch-time credential resolution, inside the bounded attempt. The
         // resolved value never outlives `outcome` below.
-        let credential = match &intent.credential_binding {
+        let credential = match &credential_binding {
             None => None,
             Some(binding) => match &self.credentials {
                 None => {
@@ -2699,7 +2723,7 @@ where
                         )
                         .await;
                 }
-                Some(resolver) => match resolver.resolve(scope, binding, intent).await {
+                Some(resolver) => match resolver.resolve(scope, binding, attempt_intent).await {
                     Ok(credential) => Some(credential),
                     Err(error) => {
                         // Resolution failures may be transient: burn the
@@ -2763,7 +2787,7 @@ where
         // whether an outcome is indeterminate.
         let attempt_timer = AgentSegmentTimer::start(self.now());
         let invoked = self
-            .invoke(scope, intent, &granted, credential.as_ref())
+            .invoke(scope, attempt_intent, &granted, credential.as_ref())
             .await;
         drop(credential);
         // The three attributes a retention policy selects on, and the reason
@@ -2799,7 +2823,12 @@ where
         // Provider-reported usage rides the attempt that produced it, so a
         // token count and the latency that produced it are one record.
         let attempt_segment = match &invoked {
-            Ok(AgentRunEffectOutcome::Model { turn }) => attempt_segment.usage(turn.usage),
+            Ok(AgentRunEffectOutcome::Model { turn }) => attempt_segment
+                .usage(turn.usage)
+                .model_response(AgentModelResponseMetadata {
+                    model: turn.response_model.clone(),
+                    finish_reason: turn.finish_reason.clone(),
+                }),
             _ => attempt_segment,
         };
         self.close_segment(scope, &intent.telemetry, attempt_segment);
@@ -3527,6 +3556,7 @@ where
                 if let Some(profile) = profile {
                     request = request.with_profile(profile);
                 }
+                request = request.with_tools(granted.tools.clone());
                 // No `unwrap_or_default`: an unprofiled deployment has no
                 // model profile, and an empty string is not the name of one.
                 let model_profile = request
@@ -3534,7 +3564,7 @@ where
                     .as_ref()
                     .map(|profile| profile.as_str().to_string());
                 let timer = AgentSegmentTimer::start(self.now());
-                let called = self.model.call(&request).await;
+                let called = self.model.call_with(&request, credential).await;
                 let segment = timer.close(AgentSegmentOperation::ModelInference { model_profile });
                 self.close_segment(
                     scope,

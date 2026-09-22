@@ -425,6 +425,56 @@ async fn a_resolved_credential_reaches_no_durable_record_of_a_completed_run() {
     assert_no_secret_anywhere(&fx).await;
 }
 
+/// A model call whose credential comes from a profile's binding leaves the
+/// credential on no durable record — the same durable sweep the tool-credential
+/// scenarios run ([`assert_no_secret_anywhere`]), over a profiled run. The
+/// telemetry surfaces are a separate scenario, below.
+#[tokio::test]
+async fn a_profile_resolved_model_credential_reaches_no_durable_record() {
+    use rakka_agent::{
+        AgentModelCapabilities, AgentModelProfile, AgentModelProfileId, AgentModelProviderKind,
+        AgentRevisionNumber, AgentSamplingSettings, AgentSettingsChange, AgentToolAuthority,
+        StaticAgentModelProfileCatalog,
+    };
+    let profile_id = AgentModelProfileId::new("profiled").expect("profile id");
+    let registry = tool_registry_for_spec(TOOL, &credentialed_spec());
+    let mut envelope = envelope_for_registry(&registry);
+    envelope.model_profiles.insert(profile_id.clone());
+    let catalog = StaticAgentModelProfileCatalog::new()
+        .with_profile(AgentModelProfile {
+            profile_id: profile_id.clone(),
+            revision: AgentRevisionNumber::INITIAL,
+            provider: AgentModelProviderKind::Anthropic,
+            model: "claude-sonnet-5".to_string(),
+            base_url: None,
+            // The tool's binding, borrowed for the model: the envelope already
+            // authorizes it, so the profile's secret is the same sentinel the
+            // rest of this file sweeps for.
+            credential_binding: credentialed_spec().credential_binding.clone(),
+            default_sampling: AgentSamplingSettings::default(),
+            capabilities: AgentModelCapabilities { tool_calls: true },
+            attributes: Default::default(),
+        })
+        .expect("valid");
+    let fx = AuthorityFixture::new(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn()),
+        AgentToolAuthority::new(registry).with_model_profiles(std::sync::Arc::new(catalog)),
+        Some(AgentEffectSpec::read_only().with_timeout_ms(30_000)),
+    )
+    .with_envelope(envelope)
+    .with_credential_resolver(SECRETS[0]);
+    fx.start().await;
+    fx.apply_settings(
+        "select-model-profile",
+        vec![AgentSettingsChange::ModelProfile(profile_id)],
+    )
+    .await;
+    fx.pump().await;
+    // Otherwise "absent everywhere" is true because nothing was resolved.
+    assert_eq!(fx.adapter.credentials_seen(), vec![Some("bearer-token")]);
+    assert_no_secret_anywhere(&fx).await;
+}
+
 // ---------------------------------------------------------------------------
 // 4. The failure path: a resolver's own detail never becomes durable state.
 // ---------------------------------------------------------------------------

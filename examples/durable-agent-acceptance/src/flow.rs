@@ -1,8 +1,12 @@
 //! The acceptance walk: every bullet of the spec 22 initial statement, in
-//! order, over the wired world.
+//! order, over the wired world — and, below it, the drive the gated
+//! live-provider walk of `crate::provider` reuses: the same agent, task
+//! definition, tool, and envelope, driven to a terminal run and swept for the
+//! provider key.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use a2a::{Message, Part, PartContent, Role, SendMessageRequest};
 use rakka_a2a::agents::A2AAgentTarget;
@@ -20,13 +24,13 @@ use rakka_agent::{
     AgentEntityReply, AgentId, AgentModelTurn, AgentOperationClass, AgentOperationId,
     AgentOperationKind, AgentPolicyRef, AgentPolicyRefs, AgentReconciliationDecision,
     AgentRevisionProvenance, AgentRunEffectOutcome, AgentRunEntityCommand, AgentRunEntityMessage,
-    AgentRunEntityReply, AgentRunScope, AgentRunSettlementStatus, AgentRunStatus,
-    AgentSchemaPolicy, AgentScope, AgentSettings, AgentTaskContent, AgentTaskCreation,
-    AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand, AgentTaskEntityMessage,
-    AgentTaskEntityReply, AgentTaskId, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId,
-    AgentTaskScope, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    AutonomyAdmissionDecision, SessionMemoryCursor, SessionMemoryStore, TenantId,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentRunEntityRef, AgentRunEntityReply, AgentRunScope, AgentRunSettlementStatus,
+    AgentRunStatus, AgentRunTerminalReason, AgentSchemaPolicy, AgentScope, AgentSettings,
+    AgentTaskContent, AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId,
+    AgentTaskEntityCommand, AgentTaskEntityMessage, AgentTaskEntityRef, AgentTaskEntityReply,
+    AgentTaskId, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope,
+    AgentTaskStatus, AgentToolCallId, AgentToolCallRequest, AgentToolId, AutonomyAdmissionDecision,
+    SessionMemoryCursor, SessionMemoryStore, TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, HumanCheckpointId, PrincipalRef,
@@ -44,11 +48,13 @@ fn tenant() -> TenantId {
     TenantId::new(TENANT)
 }
 
-fn agent_id() -> AgentId {
+/// The one agent both walks instantiate.
+pub(crate) fn agent_id() -> AgentId {
     AgentId::new(AGENT).expect("the agent id is valid")
 }
 
-fn agent_scope() -> AgentScope {
+/// That agent's scope under the walk's tenant.
+pub(crate) fn agent_scope() -> AgentScope {
     AgentScope::new(tenant(), agent_id()).expect("the agent scope is valid")
 }
 
@@ -200,22 +206,17 @@ fn send_request(message: &Message) -> SendMessageRequest {
     }
 }
 
-/// Runs the whole acceptance walk and returns the transcript plus the typed
-/// facts behind it.
-///
-/// # Panics
-///
-/// Panics if any bullet's fact does not hold — the walk is the check.
-#[allow(clippy::too_many_lines)]
-pub async fn run_acceptance() -> AcceptanceReport {
-    let world = World::new(
-        scripted_adapter(),
-        A2AAgentTarget::new(agent_id(), task_definition()),
-    );
-    let agent = registered_agent_entity_ref(&world.agent_registration, &agent_scope());
-    let mut lines = vec![String::new(); 18];
+// ---------------------------------------------------------------------------
+// The pieces both walks drive: one agent, one task, one run, one pass.
+// ---------------------------------------------------------------------------
 
-    // 1/18 — instantiate with versioned settings.
+/// The support agent's authority envelope: its one task definition, and every
+/// tool the deployment's registry declares.
+///
+/// The gated provider walk widens exactly two dimensions of this — the model
+/// profile it selected and that profile's credential binding — and nothing
+/// else, so both walks run the same agent under the same authority.
+pub(crate) fn support_envelope(world: &World) -> AgentAuthorityEnvelope {
     let mut envelope = AgentAuthorityEnvelope::empty();
     envelope
         .task_definitions
@@ -223,6 +224,17 @@ pub async fn run_acceptance() -> AcceptanceReport {
     for (tool, declaration) in world.registry.tool_declarations() {
         envelope.tools.insert(tool, declaration);
     }
+    envelope
+}
+
+/// Instantiates the support agent under `envelope` and `settings`, and answers
+/// the settings revision the sharded entity accepted.
+pub(crate) async fn instantiate_support_agent(
+    world: &World,
+    envelope: AgentAuthorityEnvelope,
+    settings: AgentSettings,
+) -> AgentRevisionNumber {
+    let agent = registered_agent_entity_ref(&world.agent_registration, &agent_scope());
     let definition = AgentDefinition::new(
         AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
         "Resolves customer support tickets end to end.",
@@ -240,7 +252,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
                     )
                     .expect("the operation id derives"),
                     definition: Box::new(definition),
-                    settings: Box::new(AgentSettings::default()),
+                    settings: Box::new(settings),
                     provenance: Box::new(provenance(1)),
                 },
                 reply_to,
@@ -252,9 +264,99 @@ pub async fn run_acceptance() -> AcceptanceReport {
     let AgentEntityReply::Applied { outcome } = reply else {
         panic!("the agent instantiates, got {reply:?}");
     };
+    outcome.settings_revision
+}
+
+/// Sends one A2A message into the in-process service core and answers the
+/// durable task identity it mapped to.
+pub(crate) async fn send_task(world: &World, message: &Message) -> String {
+    world
+        .service
+        .send_message(&a2a_server::ServiceParams::new(), &send_request(message))
+        .await
+        .expect("the send is accepted")
+        .id
+}
+
+/// The scope of the task's initial run: derived, never read back from a
+/// record, so both walks name the run before anything has written one.
+pub(crate) fn initial_run_scope(task_scope: &AgentTaskScope) -> AgentRunScope {
+    let run = run_id_for_assignment(task_scope.task(), AgentAssignmentGeneration::new(1))
+        .expect("the run id derives");
+    AgentRunScope::new(tenant(), agent_id(), run).expect("the run scope is valid")
+}
+
+/// Settles the sharded task entity: its owed cross-entity work, drained.
+pub(crate) async fn settle_task_entity(task: &AgentTaskEntityRef) {
+    let _reply = task
+        .ask(
+            |reply_to| AgentTaskEntityMessage::Settle { reply_to },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("the sharded task settles");
+}
+
+/// Settles the sharded run entity.
+pub(crate) async fn settle_run_entity(run: &AgentRunEntityRef) {
+    let _reply = run
+        .ask(
+            |reply_to| AgentRunEntityMessage::Settle { reply_to },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("the sharded run settles");
+}
+
+/// Passivates the run actor, so store-level result delivery and the actor
+/// never hold two copies of one revision.
+pub(crate) fn park_run_actor(world: &World, run_scope: &AgentRunScope) {
+    let _was_resident =
+        passivate_agent_run_entity(&world.sharding, world.run_registration.key(), run_scope)
+            .expect("run passivation routes");
+}
+
+/// The run's durable status, read from the store rather than the actor.
+pub(crate) async fn run_status(world: &World, run_scope: &AgentRunScope) -> Option<AgentRunStatus> {
+    load_agent_run_state(&world.runs, run_scope, &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .and_then(|state| state.status())
+}
+
+/// The first surface in `surfaces` that carries `needle`, when one does.
+///
+/// One needle, one sweep: the acceptance walk runs it over its planted content
+/// sentinels, and the gated provider walk over the resolved provider key.
+pub(crate) fn surface_carrying<'a>(
+    surfaces: &'a [(&'static str, String)],
+    needle: &str,
+) -> Option<&'a (&'static str, String)> {
+    surfaces
+        .iter()
+        .find(|(_label, surface)| surface.contains(needle))
+}
+
+/// Runs the whole acceptance walk and returns the transcript plus the typed
+/// facts behind it.
+///
+/// # Panics
+///
+/// Panics if any bullet's fact does not hold — the walk is the check.
+#[allow(clippy::too_many_lines)]
+pub async fn run_acceptance() -> AcceptanceReport {
+    let world = World::new(
+        scripted_adapter(),
+        A2AAgentTarget::new(agent_id(), task_definition()),
+    );
+    let mut lines = vec![String::new(); 18];
+
+    // 1/18 — instantiate with versioned settings.
+    let settings_revision =
+        instantiate_support_agent(&world, support_envelope(&world), AgentSettings::default()).await;
     lines[0] = format!(
         "ok  1/18 instantiated with versioned settings: revision {}",
-        outcome.settings_revision.get()
+        settings_revision.get()
     );
 
     // 2/18 — one deduplicated A2A task, one initial run. The run half of the
@@ -262,28 +364,16 @@ pub async fn run_acceptance() -> AcceptanceReport {
     // *derived* initial-run scope parked WaitingForApproval, so the identity
     // named here is the one the durable record answers for.
     let message = task_message("msg-1");
-    let first = world
-        .service
-        .send_message(&a2a_server::ServiceParams::new(), &send_request(&message))
-        .await
-        .expect("the first send is accepted");
-    let duplicate = world
-        .service
-        .send_message(&a2a_server::ServiceParams::new(), &send_request(&message))
-        .await
-        .expect("the duplicate send is accepted");
-    assert_eq!(first.id, duplicate.id, "one durable task identity");
-    let task_id = first.id.clone();
+    let first = send_task(&world, &message).await;
+    let duplicate = send_task(&world, &message).await;
+    assert_eq!(first, duplicate, "one durable task identity");
+    let task_id = first;
     let task_scope = AgentTaskScope::new(
         tenant(),
         AgentTaskId::new(&task_id).expect("the task id is valid"),
     )
     .expect("the task scope is valid");
-    let run_scope = {
-        let run = run_id_for_assignment(task_scope.task(), AgentAssignmentGeneration::new(1))
-            .expect("the run id derives");
-        AgentRunScope::new(tenant(), agent_id(), run).expect("the run scope is valid")
-    };
+    let run_scope = initial_run_scope(&task_scope);
     let task = registered_agent_task_entity_ref(&world.task_registration, &task_scope);
     let run = registered_agent_run_entity_ref(&world.run_registration, &run_scope);
     lines[1] =
@@ -292,35 +382,10 @@ pub async fn run_acceptance() -> AcceptanceReport {
     // Local drivers over the sharded surface. The run actor is passivated
     // before every dispatcher pass, so the store-level result delivery and
     // the actor never hold two copies of one revision.
-    let settle_task = || async {
-        let _reply = task
-            .ask(
-                |reply_to| AgentTaskEntityMessage::Settle { reply_to },
-                ASK_TIMEOUT,
-            )
-            .await
-            .expect("the sharded task settles");
-    };
-    let settle_run = || async {
-        let _reply = run
-            .ask(
-                |reply_to| AgentRunEntityMessage::Settle { reply_to },
-                ASK_TIMEOUT,
-            )
-            .await
-            .expect("the sharded run settles");
-    };
-    let park_run_actor = || {
-        let _was_resident =
-            passivate_agent_run_entity(&world.sharding, world.run_registration.key(), &run_scope)
-                .expect("run passivation routes");
-    };
-    let run_status = || async {
-        load_agent_run_state(&world.runs, &run_scope, &AgentSchemaPolicy::default())
-            .await
-            .expect("the run state loads")
-            .and_then(|state| state.status())
-    };
+    let settle_task = || settle_task_entity(&task);
+    let settle_run = || settle_run_entity(&run);
+    let park_run_actor = || park_run_actor(&world, &run_scope);
+    let run_status = || run_status(&world, &run_scope);
     let pump = || async {
         for _round in 0..16 {
             settle_task().await;
@@ -894,18 +959,30 @@ pub async fn run_acceptance() -> AcceptanceReport {
     // 17/18 — every default telemetry surface, swept for the planted content
     // sentinels here in the walk itself: `cargo run` fails on a leak, not
     // only the test.
-    let mut telemetry_surfaces = Vec::new();
-    telemetry_surfaces.push(format!("{:?}", snapshot.observations()));
-    telemetry_surfaces.push(serde_json::to_string(&operational).expect("the snapshot serializes"));
-    telemetry_surfaces.push(serde_json::to_string(&view).expect("the view serializes"));
-    for surface in &telemetry_surfaces {
-        for sentinel in CONTENT_SENTINELS {
-            assert!(
-                !surface.contains(sentinel),
-                "{sentinel} leaked into a default telemetry surface"
-            );
-        }
+    let labeled_surfaces = vec![
+        (
+            "metric observations",
+            format!("{:?}", snapshot.observations()),
+        ),
+        (
+            "operational snapshot",
+            serde_json::to_string(&operational).expect("the snapshot serializes"),
+        ),
+        (
+            "session view",
+            serde_json::to_string(&view).expect("the view serializes"),
+        ),
+    ];
+    for sentinel in CONTENT_SENTINELS {
+        assert!(
+            surface_carrying(&labeled_surfaces, sentinel).is_none(),
+            "{sentinel} leaked into a default telemetry surface"
+        );
     }
+    let telemetry_surfaces: Vec<String> = labeled_surfaces
+        .into_iter()
+        .map(|(_label, surface)| surface)
+        .collect();
     lines[16] = "ok 17/18 default telemetry carries no prompt, tool payload, memory content, \
                  or credential material"
         .to_string();
@@ -946,4 +1023,397 @@ pub async fn run_acceptance() -> AcceptanceReport {
     };
     world.system.shutdown();
     report
+}
+
+// ---------------------------------------------------------------------------
+// The gated provider walk's drive.
+// ---------------------------------------------------------------------------
+
+/// How many dispatch passes the gated walk drives before it gives up.
+///
+/// Comfortably above what the run's *own* bounds allow — its rejection budget,
+/// its approvals, and the passes a live model spends being told its proposal
+/// does not satisfy the task's rule — so that reaching this cap means the walk
+/// is wedged, not that the model was chatty. A live run observed here took 18.
+const PROVIDER_WALK_MAX_PASSES: usize = 40;
+
+/// Every durable record the world holds for one run, serialized to JSON.
+///
+/// This is the haystack the gated walk's secret-exclusion sweep scans. It is
+/// the whole of what the walk writes: the three sharded entity records, the
+/// task's append-only history, the workflow outbox the effects ticket through,
+/// the dispatcher fleet's index, the run's session memory, and the immutable
+/// context snapshot the run's durable state still names.
+async fn durable_records(
+    world: &World,
+    task_scope: &AgentTaskScope,
+    run_scope: &AgentRunScope,
+) -> Vec<(&'static str, String)> {
+    use rakka_agent::{AgentTaskHistoryStore, ContextSnapshotStore, SessionMemoryStore};
+    use rakka_persistence::{DurableStateStore, PersistenceId};
+
+    let mut records = Vec::new();
+    let mut push = |label: &'static str, json: String| records.push((label, json));
+
+    let agents = world
+        .agents
+        .load(&agent_scope().persistence_id())
+        .await
+        .expect("the agent record loads");
+    push(
+        "agents",
+        serde_json::to_string(&agents.map(|record| record.state)).expect("the record serializes"),
+    );
+    let tasks = world
+        .tasks
+        .load(&task_scope.persistence_id())
+        .await
+        .expect("the task record loads");
+    push(
+        "tasks",
+        serde_json::to_string(&tasks.map(|record| record.state)).expect("the record serializes"),
+    );
+    let runs = world
+        .runs
+        .load(&run_scope.persistence_id())
+        .await
+        .expect("the run record loads");
+    push(
+        "runs",
+        serde_json::to_string(&runs.as_ref().map(|record| &record.state))
+            .expect("the record serializes"),
+    );
+    let workflow = world
+        .workflow_store
+        .load(&PersistenceId::new(
+            rakka_agent::workflow_run_id(run_scope).as_str().to_string(),
+        ))
+        .await
+        .expect("the workflow record loads");
+    push(
+        "workflow",
+        serde_json::to_string(&workflow.map(|record| record.state)).expect("the record serializes"),
+    );
+    let fleet = world
+        .fleet_store
+        .load(&PersistenceId::new(
+            rakka_agent_workflow::agent_dispatcher_fleet_persistence_id()
+                .as_str()
+                .to_string(),
+        ))
+        .await
+        .expect("the fleet record loads");
+    push(
+        "fleet",
+        serde_json::to_string(&fleet.map(|record| record.state)).expect("the record serializes"),
+    );
+
+    let mut cursor = rakka_agent::AgentTaskHistoryCursor::start();
+    let mut history = Vec::new();
+    // Bounded: a walk's log is short, and a runaway page loop would hang the
+    // sweep rather than fail it.
+    for _page in 0..64 {
+        let Ok(page) = world.history.read(task_scope, cursor).await else {
+            break;
+        };
+        history.extend(page.entries);
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    push(
+        "task-history",
+        serde_json::to_string(&history).expect("the history entries serialize"),
+    );
+
+    let session = world
+        .session
+        .read(run_scope, SessionMemoryCursor::start())
+        .await
+        .expect("the session reads");
+    push(
+        "session",
+        serde_json::to_string(&session.entries).expect("the session entries serialize"),
+    );
+
+    let snapshot_ref = runs
+        .as_ref()
+        .and_then(|record| record.state.loop_state())
+        .and_then(|loop_state| loop_state.context_snapshot().cloned());
+    if let Some(reference) = snapshot_ref {
+        let snapshot = world
+            .snapshots
+            .load(run_scope, &reference)
+            .await
+            .expect("the context snapshot loads");
+        push(
+            "snapshots",
+            serde_json::to_string(&snapshot).expect("the snapshot serializes"),
+        );
+    }
+
+    records
+}
+
+/// One checkpoint id, escaped into a legal operation-id segment.
+///
+/// A checkpoint id is derived from the run scope, so it carries the `/` that
+/// separates a scope's parts — and an operation id refuses both that and the
+/// persistence separator. The escape is injective (`~` doubles), so two
+/// checkpoints can never derive one decision key, which is what makes the key
+/// a deduplication key rather than a name.
+fn operation_segment(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '~' => escaped.push_str("~~"),
+            '/' => escaped.push_str("~s"),
+            '|' => escaped.push_str("~p"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// Resolves every open approval checkpoint the run is parked on.
+///
+/// The gated walk is unattended, so the approval a checkpoint-required tool
+/// needs is the walk's own: the same `ResolveCheckpoint` command a human
+/// decision arrives as, so the run's durable path is the acceptance walk's.
+async fn approve_open_checkpoints(
+    world: &World,
+    run: &AgentRunEntityRef,
+    run_scope: &AgentRunScope,
+) -> Result<usize, String> {
+    let checkpoints: Vec<HumanCheckpointId> =
+        load_agent_run_state(&world.runs, run_scope, &AgentSchemaPolicy::default())
+            .await
+            .map_err(|error| format!("the run state does not load: {error}"))?
+            .and_then(|state| {
+                state.loop_state().map(|loop_state| {
+                    loop_state
+                        .open_checkpoints()
+                        .iter()
+                        .filter(|checkpoint| {
+                            checkpoint.kind == rakka_agent::AgentCheckpointKind::Approval
+                        })
+                        .map(|checkpoint| checkpoint.checkpoint_id.clone())
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+    let mut approved = 0;
+    for checkpoint_id in checkpoints {
+        let discriminator = format!("approve-{}", operation_segment(checkpoint_id.as_str()));
+        let reply = run
+            .ask(
+                |reply_to| AgentRunEntityMessage::Command {
+                    command: Box::new(AgentRunEntityCommand::ResolveCheckpoint {
+                        operation_id: AgentOperationId::for_agent(
+                            AgentOperationKind::CheckpointResolution,
+                            &agent_scope(),
+                            &discriminator,
+                        )
+                        .expect("the decision key derives"),
+                        checkpoint_id,
+                        resolver: PrincipalRef {
+                            principal_type: "service".to_string(),
+                            principal_id: "provider-walk".to_string(),
+                            display_name: None,
+                        },
+                        decision: Box::new(AgentCheckpointDecision::Approval(
+                            AgentApprovalDecision::Approve {
+                                credential_binding: None,
+                                expires_at: AgentTimestampMillis::new(10_000_000),
+                                allowed_use_count: 1,
+                            },
+                        )),
+                        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+                    }),
+                    reply_to,
+                },
+                ASK_TIMEOUT,
+            )
+            .await
+            .map_err(|error| format!("the sharded run does not answer the approval: {error}"))?;
+        match reply {
+            AgentRunEntityReply::Applied { .. } | AgentRunEntityReply::Duplicate { .. } => {
+                approved += 1;
+            }
+            other => return Err(format!("the approval was refused: {other:?}")),
+        }
+    }
+    Ok(approved)
+}
+
+/// Drives one run of the walk's task through the world, under `profile`.
+///
+/// The same agent, task definition, tool, and envelope the acceptance walk
+/// instantiates — widened by exactly the profile the environment described and
+/// its credential binding — driven until the run is terminal. What it asserts
+/// is structural, because a live model cannot reproduce a scripted transcript:
+/// the run terminates, the provider reported the model that answered, and no
+/// byte of the resolved provider key reached a durable record or a line of
+/// output.
+///
+/// # Errors
+///
+/// A run that does not terminate within `PROVIDER_WALK_MAX_PASSES` passes, a
+/// refused approval, or a leaked key.
+pub async fn drive_one_run_with_profile(
+    world: &World,
+    profile: &rakka_agent::AgentModelProfile,
+) -> Result<crate::provider::ProviderWalkReport, String> {
+    let mut envelope = support_envelope(world);
+    envelope.model_profiles.insert(profile.profile_id.clone());
+    if let Some(binding) = &profile.credential_binding {
+        envelope.credential_bindings.insert(binding.clone());
+    }
+    let settings = AgentSettings {
+        model_profile: Some(profile.profile_id.clone()),
+        ..AgentSettings::default()
+    };
+    let _revision = instantiate_support_agent(world, envelope, settings).await;
+
+    let task_id = send_task(world, &task_message("provider-1")).await;
+    let task_scope = AgentTaskScope::new(
+        tenant(),
+        AgentTaskId::new(&task_id).map_err(|error| format!("the task id is invalid: {error}"))?,
+    )
+    .map_err(|error| format!("the task scope is invalid: {error}"))?;
+    let run_scope = initial_run_scope(&task_scope);
+    let task = registered_agent_task_entity_ref(&world.task_registration, &task_scope);
+    let run = registered_agent_run_entity_ref(&world.run_registration, &run_scope);
+
+    // The dispatcher's own segments are where a provider's reported response
+    // model lands: the durable run record keeps the loop's decisions, not the
+    // provider's answer about itself.
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+
+    let mut passes = 0;
+    let mut terminal = None;
+    while passes < PROVIDER_WALK_MAX_PASSES {
+        settle_task_entity(&task).await;
+        settle_run_entity(&run).await;
+        park_run_actor(world, &run_scope);
+        passes += 1;
+        let pass = world
+            .pipeline()
+            .with_segments(segments.clone())
+            .pump_run(&run_scope)
+            .await
+            .map_err(|error| format!("the dispatch pass failed: {error}"))?;
+        let status = run_status(world, &run_scope).await;
+        if status.is_some_and(AgentRunStatus::is_terminal) {
+            settle_run_entity(&run).await;
+            settle_task_entity(&task).await;
+            terminal = status;
+            break;
+        }
+        let moved = pass.registered + pass.claimed + pass.delivered + pass.cancelled > 0;
+        if status == Some(AgentRunStatus::WaitingForApproval)
+            && approve_open_checkpoints(world, &run, &run_scope).await? > 0
+        {
+            continue;
+        }
+        if !moved && status != Some(AgentRunStatus::WaitingForApproval) {
+            return Err(format!(
+                "the run stalled at {} after {passes} passes",
+                status.map_or("no status", AgentRunStatus::as_label)
+            ));
+        }
+    }
+    let Some(terminal) = terminal else {
+        return Err(format!(
+            "the run did not terminate within {PROVIDER_WALK_MAX_PASSES} passes"
+        ));
+    };
+
+    // The reason the run ended is part of the fact: a live model that never
+    // proposes a result spends its budget and fails, and a line that only said
+    // "terminal" would read as a success.
+    let terminal_reason =
+        load_agent_run_state(&world.runs, &run_scope, &AgentSchemaPolicy::default())
+            .await
+            .map_err(|error| format!("the run state does not load: {error}"))?
+            .and_then(|state| state.snapshot())
+            .and_then(|snapshot| snapshot.terminal_reason)
+            .map_or_else(
+                || "no reason recorded".to_string(),
+                |reason| match &reason {
+                    // The effect's own stable failure code is the whole of
+                    // what a failed live call says here; the bounded detail
+                    // beside it in the durable record is provider text, and a
+                    // walk's summary line is not where that belongs.
+                    AgentRunTerminalReason::EffectFailed { code, .. } => {
+                        format!("{}: {code}", reason.code())
+                    }
+                    _ => reason.code().to_string(),
+                },
+            );
+
+    // The dispatcher fills a segment's `model_response` on exactly one thing:
+    // a model attempt that came back with a turn. Counting those is what tells
+    // a run that reached the provider from one that never made contact — a
+    // dead endpoint, a wrong base URL, or a refused credential also ends
+    // terminal with no response model and no key to find.
+    let model_turns = segments
+        .segments()
+        .iter()
+        .filter(|segment| segment.model_response.is_some())
+        .count();
+    let response_model = segments
+        .segments()
+        .into_iter()
+        .find_map(|segment| segment.model_response.and_then(|response| response.model));
+    let tool_invocations = world.tools.invocations().len();
+
+    let mut lines = vec![
+        format!(
+            "ok  profile: {} via {}",
+            profile.profile_id,
+            profile.provider.as_label()
+        ),
+        format!(
+            "ok  terminal: {} ({terminal_reason}) after {passes} passes",
+            terminal.as_label()
+        ),
+        format!(
+            "ok  response model: {}",
+            response_model.as_deref().unwrap_or("unreported")
+        ),
+        format!("ok  model turns: {model_turns}"),
+        format!("ok  tool invocations: {tool_invocations}"),
+    ];
+
+    // The key is read here only to prove its absence, and is never kept: the
+    // walk holds no field for it, and no line it prints carries it.
+    let records = durable_records(world, &task_scope, &run_scope).await;
+    let key = std::env::var(crate::provider::PROVIDER_KEY_VAR).unwrap_or_default();
+    if !key.is_empty() {
+        if let Some((label, _record)) = surface_carrying(&records, &key) {
+            return Err(format!("the provider key reached the {label} record"));
+        }
+        if lines.iter().any(|line| line.contains(&key)) {
+            return Err("the provider key reached the walk's own transcript".to_string());
+        }
+    }
+    lines.push(format!(
+        "ok  secret exclusion: {} durable records scanned, {}",
+        records.len(),
+        if key.is_empty() {
+            "no key to exclude"
+        } else {
+            "none carries the key"
+        }
+    ));
+
+    Ok(crate::provider::ProviderWalkReport {
+        lines,
+        provider: profile.provider.clone(),
+        model_turns,
+        response_model,
+        tool_invocations,
+    })
 }

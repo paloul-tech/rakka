@@ -73,6 +73,9 @@ license-file = "LICENSE"
 a2a = { package = "a2a-lf", version = "0.3.0" }
 a2a-server = { package = "a2a-server-lf", version = "0.4.0", default-features = false }
 axum = { version = "0.8", features = ["ws"] }
+# Named only where a trait impl must spell the bounds of a dependency's own
+# signatures (rig's `HttpClientExt`), never to move bytes around by choice.
+bytes = "1"
 etcd-client = { version = "0.19", default-features = false }
 futures-util = "0.3"
 http-body-util = "0.1"

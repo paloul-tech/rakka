@@ -22,14 +22,16 @@ use std::sync::Arc;
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     genai_operation, is_agent_span_attribute, segment_span, usage_attributes,
-    validate_agent_span_attributes, AgentEffectSpec, AgentGenAiSpanExporter, AgentModelTurn,
-    AgentRevisionNumber, AgentRunEffect, AgentRunEffectRequest, AgentSegmentIdentity,
-    AgentSegmentOperation, AgentSegmentSink, AgentSegmentTimer, AgentTaskContent,
-    AgentTelemetrySegment, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    AGENT_GENAI_CONVENTION_REVISION, AGENT_OTEL_SCOPE_NAME, AGENT_SPAN_ATTRIBUTE_KEYS,
-    ATTR_ERROR_TYPE, ATTR_GEN_AI_AGENT_ID, ATTR_GEN_AI_CONVERSATION_ID, ATTR_GEN_AI_OPERATION_NAME,
-    ATTR_GEN_AI_PROVIDER_NAME, ATTR_GEN_AI_TOOL_NAME, ATTR_GEN_AI_TOOL_TYPE, ATTR_RAKKA_ERROR_CODE,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    validate_agent_span_attributes, AgentEffectSpec, AgentGenAiSpanExporter,
+    AgentModelResponseMetadata, AgentModelTurn, AgentModelUsage, AgentRevisionNumber,
+    AgentRunEffect, AgentRunEffectRequest, AgentSegmentIdentity, AgentSegmentOperation,
+    AgentSegmentSink, AgentSegmentTimer, AgentTaskContent, AgentTelemetrySegment, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, AGENT_GENAI_CONVENTION_REVISION, AGENT_OTEL_SCOPE_NAME,
+    AGENT_SPAN_ATTRIBUTE_KEYS, ATTR_ERROR_TYPE, ATTR_GEN_AI_AGENT_ID, ATTR_GEN_AI_CONVERSATION_ID,
+    ATTR_GEN_AI_OPERATION_NAME, ATTR_GEN_AI_PROVIDER_NAME, ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
+    ATTR_GEN_AI_RESPONSE_MODEL, ATTR_GEN_AI_TOOL_NAME, ATTR_GEN_AI_TOOL_TYPE,
+    ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS, ATTR_RAKKA_AGENT_MODEL_REASONING_TOKENS,
+    ATTR_RAKKA_ERROR_CODE, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{
     AgentAttributes, AgentLogEvent, AgentLogSeverity, AgentOtelResource, AgentOtelSpanKind,
@@ -675,6 +677,75 @@ async fn decisions_and_usage_reach_the_span_through_their_mappers() {
         .attributes
         .contains_key(rakka_agent::ATTR_GEN_AI_USAGE_INPUT_TOKENS));
 
+    // But a provider that reported *only* a cached read — both billed
+    // directions zero — did report something, and it is the one record of it.
+    let cached_only = AgentTelemetrySegment::new(
+        AgentSegmentOperation::ModelInference {
+            model_profile: Some("fast".to_string()),
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .usage(rakka_agent::AgentModelUsage {
+        cached_input_tokens: Some(3),
+        ..Default::default()
+    })
+    .ok();
+    assert_eq!(
+        cached_only
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.cached_input_tokens),
+        Some(3),
+        "a cached read the provider billed at zero is still a report"
+    );
+    let span = segment_span(&cached_only).expect("the span maps");
+    assert_eq!(
+        span.attributes
+            .get(rakka_agent::ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS)
+            .map(String::as_str),
+        Some("3")
+    );
+    // Reasoning tokens beside an empty completion are the same case.
+    let reasoning_only = AgentTelemetrySegment::new(
+        AgentSegmentOperation::ModelInference {
+            model_profile: Some("fast".to_string()),
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .usage(rakka_agent::AgentModelUsage {
+        reasoning_tokens: Some(7),
+        ..Default::default()
+    })
+    .ok();
+    assert_eq!(
+        reasoning_only
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.reasoning_tokens),
+        Some(7)
+    );
+    // A provider that reported an explicit zero in either optional field
+    // reported no tokens at all, and is still dropped.
+    let zeroed = AgentTelemetrySegment::new(
+        AgentSegmentOperation::ModelInference {
+            model_profile: Some("fast".to_string()),
+        },
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+    )
+    .telemetry(traced())
+    .usage(rakka_agent::AgentModelUsage {
+        cached_input_tokens: Some(0),
+        reasoning_tokens: Some(0),
+        ..Default::default()
+    })
+    .ok();
+    assert!(zeroed.usage.is_none(), "a zero is not a report");
+
     let reported = AgentTelemetrySegment::new(
         AgentSegmentOperation::ModelInference {
             model_profile: Some("fast".to_string()),
@@ -687,6 +758,7 @@ async fn decisions_and_usage_reach_the_span_through_their_mappers() {
         input_tokens: 120,
         output_tokens: 45,
         cost_micros: 900,
+        ..Default::default()
     })
     .ok();
     let span = segment_span(&reported).expect("the span maps");
@@ -1054,6 +1126,7 @@ fn a_usage_direction_with_no_evidence_is_omitted_rather_than_written_as_zero() {
         input_tokens: 120,
         output_tokens: 45,
         cost_micros: 7,
+        ..Default::default()
     });
     assert_eq!(
         reported.get(rakka_agent::ATTR_GEN_AI_USAGE_INPUT_TOKENS),
@@ -1068,6 +1141,7 @@ fn a_usage_direction_with_no_evidence_is_omitted_rather_than_written_as_zero() {
         input_tokens: 0,
         output_tokens: 120,
         cost_micros: 0,
+        ..Default::default()
     });
     assert_eq!(
         one_sided.get(rakka_agent::ATTR_GEN_AI_USAGE_OUTPUT_TOKENS),
@@ -1204,4 +1278,70 @@ fn a_segment_with_a_durable_identity_exports_under_that_id() {
         spans[1].span_id, IDENTITY,
         "and still derives one for a segment that has none"
     );
+}
+
+/// The provider fields 17.8 owed have slots, and the mapping writes them only
+/// when the provider reported them.
+#[test]
+fn provider_response_fields_are_written_when_reported_and_omitted_when_not() {
+    let mut carried = segment(AgentSegmentOperation::ModelInference {
+        model_profile: Some("anthropic-sonnet".to_string()),
+    })
+    .usage(AgentModelUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        cost_micros: 0,
+        cached_input_tokens: Some(3),
+        reasoning_tokens: Some(2),
+    })
+    .model_response(AgentModelResponseMetadata::bounded(
+        Some("claude-sonnet-5-20260901".to_string()),
+        Some("end_turn".to_string()),
+    ));
+    let span = segment_span(&carried).expect("maps");
+    assert_eq!(
+        span.attributes
+            .get(ATTR_GEN_AI_RESPONSE_MODEL)
+            .map(String::as_str),
+        Some("claude-sonnet-5-20260901")
+    );
+    assert_eq!(
+        span.attributes
+            .get(ATTR_GEN_AI_RESPONSE_FINISH_REASONS)
+            .map(String::as_str),
+        Some("end_turn")
+    );
+    assert_eq!(
+        span.attributes
+            .get(ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS)
+            .map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(
+        span.attributes
+            .get(ATTR_RAKKA_AGENT_MODEL_REASONING_TOKENS)
+            .map(String::as_str),
+        Some("2")
+    );
+
+    carried.model_response = None;
+    carried.usage = Some(AgentModelUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        cost_micros: 0,
+        cached_input_tokens: Some(0),
+        reasoning_tokens: None,
+    });
+    let span = segment_span(&carried).expect("maps");
+    for key in [
+        ATTR_GEN_AI_RESPONSE_MODEL,
+        ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
+        ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS,
+        ATTR_RAKKA_AGENT_MODEL_REASONING_TOKENS,
+    ] {
+        assert!(
+            !span.attributes.contains_key(key),
+            "{key} is never invented"
+        );
+    }
 }
