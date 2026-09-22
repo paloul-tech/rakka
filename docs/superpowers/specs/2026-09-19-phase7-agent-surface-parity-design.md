@@ -75,8 +75,9 @@ because ingress has no run. Plan:
 **Plan refinements (2026-09-21, slice 7.1 plan).** Marked inline: the
 cross-attempt profile refusal is recorded, not enforced, because the
 checkpoint binding sees only the durable intent; the adapter and router
-refuse through one `AgentModelError::Refused` variant with the codes 11.1
-lists; provider provenance is read through an optional extractor; the
+refuse their own six codes through one `AgentModelError::Refused` variant,
+while the profile, the response-metadata bound, and the authority keep the
+answer shapes they already had (11.1); provider provenance is read through an optional extractor; the
 model-visible tool list is computed by the authority onto the grant;
 `AgentModelRouter` lives in the new `model_profile` module; the gated
 example walk asserts structural facts, not the acceptance transcript. Plan:
@@ -599,7 +600,12 @@ shape with the backend left to the caller.
 Per attempt, `call_with` first validates the base URL the call will use
 (4.1's rules: it parses as a URL and carries no userinfo and no query string;
 `model-profile-invalid-base-url` otherwise) before anything else happens, then
-builds the provider client over the injected backend with the ephemeral
+builds the provider client (plan refinement 2026-09-21: the base URL is
+validated **once, at construction** — `RigProviderAdapter::new` runs
+`profile.validate()` and additionally refuses a `Custom` or `AzureOpenAi`
+profile with no `base_url`. The adapter owns an immutable profile record, so
+a per-attempt re-check could only reach the same answer more slowly; an
+attempt cannot be reached at all without a validated URL) over the injected backend with the ephemeral
 credential (`ClientBuilder::new(..).http_client(self.http.clone()).base_url(..)`
 — `rig-core-0.37.0/src/client/mod.rs:658` is the backend setter — then
 `completion_model(&profile.model)`), issues `completion`, maps the response
@@ -1457,8 +1463,13 @@ fingerprint survive `build()` unchanged).
 ### 11.1 Compatibility (all additive unless noted)
 
 - New durable fields: `AgentModelTurn`/`AgentModelUsage` provider fields
-  (optional), `MemoryContextSnapshot.session_mode`, `AgentGrantDescriptor`
-  profile revision and digest, `AgentSettingsChange::MemoryMode`,
+  (optional), `MemoryContextSnapshot.session_mode`, the profile revision and
+  digest (plan refinement 2026-09-21: they are **not** durable fields. 4.2
+  item 1 and the implementation put them on `AgentDispatchGrant`, which is
+  `Serialize`-only and never persisted — a grant is derived per attempt from
+  the agent's current authority state — so they carry no schema version and
+  no N/N+1 window. What is persisted is the intent they authorize, which is
+  unchanged), `AgentSettingsChange::MemoryMode`,
   `AgentSegmentIdentity.{agent_name, agent_version}` (optional, default
   `None`). Each lands under the N/N+1 schema policy with a version bump where
   the record is versioned. `AgentRunEffect.deadline_at` gains a per-attempt
@@ -1507,9 +1518,19 @@ fingerprint survive `build()` unchanged).
   `model-profile-invalid-attribute`, `model-timeout-unset`,
   `model-credential-missing`, `model-credential-material-unsupported`,
   `model-router-adapter-version-mismatch`,
-  `model-response-metadata-too-long` (plan refinement 2026-09-21: the
-  adapter and the router refuse through one `AgentModelError::Refused`
-  variant; `model-profile-revision-mismatch` is deferred with 4.2 item 1),
+  `model-router-retry-policy-mismatch` (plan refinement 2026-09-21: a router
+  requires every route and its default to declare one
+  `AgentModelRetryPolicy`, which it then answers as its own, because the
+  dispatcher applies the adapter's declaration as the ceiling on a model
+  intent before it knows which route will answer),
+  `model-response-metadata-too-long` (plan refinement 2026-09-21: six of
+  these codes are answered through one `AgentModelError::Refused` variant —
+  the router's three and the Rig adapters' three — while
+  `model-profile-invalid-base-url`/`-invalid-attribute` are
+  `AgentModelProfileError::code()`, `model-response-metadata-too-long` is its
+  own `AgentModelError` variant, and `model-timeout-unset` is an
+  `AgentAuthorityRefusal`; every one is read through a `code()`.
+  `model-profile-revision-mismatch` is deferred with 4.2 item 1),
   `model-result-tool-collision` (plan refinement 2026-09-21: the Rig
   adapters refuse, before any request is built, a model-visible tool whose
   name equals the adapter's result tool), `guardrail-rule-invalid` (a built-in stage constructed with an empty or
