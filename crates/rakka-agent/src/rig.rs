@@ -54,14 +54,17 @@
 //! deploying application constructs the concrete `CompletionModel` with its
 //! credentials and hands it here, and nothing of it is persisted.
 
-use std::fmt::Display;
+use std::fmt::{self, Display};
 
 use rig_core::completion::{
     AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
     Message, ToolDefinition, Usage,
 };
+use rig_core::http_client::HttpClientExt;
 use rig_core::streaming::StreamingCompletionResponse;
 use rig_core::OneOrMany;
+
+use rakka_agent_workflow::AgentEphemeralCredential;
 
 use crate::definition::{AgentRevisionNumber, AgentToolId};
 use crate::loop_runtime::CURRENT_AGENT_LOOP_ADAPTER_VERSION;
@@ -70,6 +73,7 @@ use crate::model::{
     AgentModelResponseMetadata, AgentModelResult, AgentModelRetryPolicy, AgentModelTurn,
     AgentModelUsage, AgentToolCallId, AgentToolCallRequest,
 };
+use crate::model_profile::{AgentModelProfile, AgentModelProfileError, AgentModelProviderKind};
 use crate::task::AgentTaskContent;
 
 /// The default name of the tool a model calls to propose its typed task result.
@@ -445,6 +449,311 @@ where
                 .map_err(provider_error)?;
             self.turn_from_response(response, request)
         })
+    }
+}
+
+/// A per-profile Rig adapter that builds the provider client inside each
+/// attempt from the credential the dispatcher resolved, over an HTTP backend
+/// injected at construction.
+///
+/// The adapter never constructs an HTTP backend of its own: `reqwest::Client`
+/// is the plain case, and a deployment with an egress policy injects its own
+/// [`HttpClientExt`] type — every provider call leaves through the backend the
+/// deployment chose. Per attempt, `call_with` turns the ephemeral credential
+/// into the provider's key, builds the provider client over the injected
+/// backend, delegates the request to a [`RigModelAdapter`] over that client's
+/// completion model, and drops the client with the credential. Nothing
+/// long-lived holds a key: the profile this adapter stores is secret-free by
+/// construction, and the credential exists only for the duration of one call.
+///
+/// The profile's base URL is validated once, at construction, rather than per
+/// attempt — a profile record is immutable, so a second check inside the call
+/// could only reach the same answer more slowly.
+///
+/// [`HttpClientExt`]: rig_core::http_client::HttpClientExt
+pub struct RigProviderAdapter<H> {
+    profile: AgentModelProfile,
+    http: H,
+    adapter_version: AgentRevisionNumber,
+    retry_policy: AgentModelRetryPolicy,
+    result_tool: String,
+}
+
+impl<H> fmt::Debug for RigProviderAdapter<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RigProviderAdapter")
+            .field("profile", &self.profile.profile_id)
+            .field("provider", &self.profile.provider)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<H> RigProviderAdapter<H>
+where
+    H: HttpClientExt + Clone + fmt::Debug + Default + Send + Sync + 'static,
+{
+    /// An adapter for one validated profile over the given backend.
+    ///
+    /// # Errors
+    ///
+    /// The profile's own refusal, and `model-profile-invalid-base-url` for a
+    /// `Custom` or `AzureOpenAi` profile with no `base_url`: neither names an
+    /// endpoint a provider default could stand in for — a custom label is a
+    /// deployment's own gateway, and an Azure deployment's endpoint is its
+    /// resource — so a missing one would otherwise be discovered as a call to
+    /// whatever host rig defaults to.
+    pub fn new(profile: AgentModelProfile, http: H) -> Result<Self, AgentModelProfileError> {
+        profile.validate()?;
+        if matches!(
+            profile.provider,
+            AgentModelProviderKind::Custom(_) | AgentModelProviderKind::AzureOpenAi
+        ) && profile.base_url.is_none()
+        {
+            return Err(AgentModelProfileError::InvalidBaseUrl {
+                reason: "this provider kind needs a base_url",
+            });
+        }
+        Ok(Self {
+            profile,
+            http,
+            adapter_version: CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+            retry_policy: AgentModelRetryPolicy::DEFAULT,
+            result_tool: AGENT_RESULT_TOOL_DEFAULT.to_string(),
+        })
+    }
+
+    /// Stamps a specific adapter version onto the turns this adapter produces.
+    #[must_use]
+    pub fn with_adapter_version(mut self, adapter_version: AgentRevisionNumber) -> Self {
+        self.adapter_version = adapter_version;
+        self
+    }
+
+    /// Declares the retry policy this adapter's calls dispatch under.
+    ///
+    /// # Errors
+    ///
+    /// An invalid policy, as [`RigModelAdapter::with_retry_policy`].
+    pub fn with_retry_policy(
+        mut self,
+        retry_policy: AgentModelRetryPolicy,
+    ) -> AgentModelResult<Self> {
+        retry_policy.validate()?;
+        self.retry_policy = retry_policy;
+        Ok(self)
+    }
+
+    /// Renames the tool a model calls to propose its typed task result.
+    #[must_use]
+    pub fn with_result_tool(mut self, result_tool: impl Into<String>) -> Self {
+        self.result_tool = result_tool.into();
+        self
+    }
+
+    /// The provider key an ephemeral credential yields, when the material is a
+    /// kind a provider accepts.
+    ///
+    /// A provider authenticates with one opaque secret, so a bearer token and
+    /// an API key both reduce to it; the header the secret rides in is the
+    /// provider's own convention, not the credential's, so the API key's name
+    /// is deliberately not consulted.
+    fn provider_key(
+        credential: Option<&AgentEphemeralCredential>,
+    ) -> AgentModelResult<Option<String>> {
+        use rakka_agent_workflow::AgentEphemeralCredentialMaterial as Material;
+        match credential.map(AgentEphemeralCredential::material) {
+            None => Ok(None),
+            Some(Material::BearerToken { token }) => Ok(Some(token.clone())),
+            Some(Material::ApiKey { value, .. }) => Ok(Some(value.clone())),
+            Some(other) => Err(AgentModelError::Refused {
+                code: "model-credential-material-unsupported",
+                message: format!(
+                    "a provider takes an API key or a bearer token; the resolved credential is {}",
+                    other.kind_label()
+                ),
+            }),
+        }
+    }
+
+    /// The key a provider that cannot call unauthenticated requires.
+    fn required_key(
+        key: Option<String>,
+        provider: &AgentModelProviderKind,
+    ) -> AgentModelResult<String> {
+        key.ok_or_else(|| AgentModelError::Refused {
+            code: "model-credential-missing",
+            message: format!(
+                "the provider {} needs a credential and the attempt resolved none",
+                provider.as_label()
+            ),
+        })
+    }
+
+    /// The per-attempt [`RigModelAdapter`] this adapter delegates the mapping
+    /// to, carrying its own version, retry policy, and result tool.
+    ///
+    /// # Errors
+    ///
+    /// The stored retry policy's own refusal. It was validated where it was
+    /// declared, so this cannot fail in practice; it is propagated rather than
+    /// unwrapped because an attempt is not the place to panic.
+    fn inner<M: CompletionModel>(
+        &self,
+        model: M,
+        response_metadata: Option<fn(&M::Response) -> AgentModelResponseMetadata>,
+    ) -> AgentModelResult<RigModelAdapter<M>> {
+        let mut adapter = RigModelAdapter::new(model)
+            .with_retry_policy(self.retry_policy)?
+            .with_adapter_version(self.adapter_version)
+            .with_result_tool(self.result_tool.clone());
+        if let Some(extractor) = response_metadata {
+            adapter = adapter.with_response_metadata(extractor);
+        }
+        Ok(adapter)
+    }
+
+    /// Builds the provider client for one attempt and runs the request through it.
+    async fn call_provider(
+        &self,
+        request: &AgentModelRequest,
+        credential: Option<&AgentEphemeralCredential>,
+    ) -> AgentModelResult<AgentModelTurn> {
+        use rig_core::client::CompletionClient as _;
+        use rig_core::providers::{anthropic, azure, gemini, ollama, openai, openrouter};
+
+        let key = Self::provider_key(credential)?;
+        let profile = &self.profile;
+        let http = self.http.clone();
+        match &profile.provider {
+            AgentModelProviderKind::Anthropic => {
+                let mut builder = anthropic::Client::builder()
+                    .api_key(Self::required_key(key, &profile.provider)?)
+                    .http_client(http);
+                if let Some(url) = &profile.base_url {
+                    builder = builder.base_url(url);
+                }
+                if let Some(version) = profile.attributes.get("anthropic_version") {
+                    builder = builder.anthropic_version(version);
+                }
+                let client = builder.build().map_err(provider_error)?;
+                self.inner(
+                    client.completion_model(&profile.model),
+                    Some(anthropic_response_metadata),
+                )?
+                .call(request)
+                .await
+            }
+            AgentModelProviderKind::OpenAiResponses => {
+                let mut builder = openai::Client::builder()
+                    .api_key(Self::required_key(key, &profile.provider)?)
+                    .http_client(http);
+                if let Some(url) = &profile.base_url {
+                    builder = builder.base_url(url);
+                }
+                let client = builder.build().map_err(provider_error)?;
+                self.inner(client.completion_model(&profile.model), None)?
+                    .call(request)
+                    .await
+            }
+            AgentModelProviderKind::OpenAiCompletions | AgentModelProviderKind::Custom(_) => {
+                let mut builder = openai::Client::builder()
+                    .api_key(Self::required_key(key, &profile.provider)?)
+                    .http_client(http);
+                if let Some(url) = &profile.base_url {
+                    builder = builder.base_url(url);
+                }
+                let client = builder.build().map_err(provider_error)?.completions_api();
+                self.inner(
+                    client.completion_model(&profile.model),
+                    Some(openai_completions_response_metadata),
+                )?
+                .call(request)
+                .await
+            }
+            AgentModelProviderKind::OpenRouter => {
+                let mut builder = openrouter::Client::builder()
+                    .api_key(Self::required_key(key, &profile.provider)?)
+                    .http_client(http);
+                if let Some(url) = &profile.base_url {
+                    builder = builder.base_url(url);
+                }
+                let client = builder.build().map_err(provider_error)?;
+                self.inner(client.completion_model(&profile.model), None)?
+                    .call(request)
+                    .await
+            }
+            AgentModelProviderKind::Gemini => {
+                let mut builder = gemini::Client::builder()
+                    .api_key(Self::required_key(key, &profile.provider)?)
+                    .http_client(http);
+                if let Some(url) = &profile.base_url {
+                    builder = builder.base_url(url);
+                }
+                let client = builder.build().map_err(provider_error)?;
+                self.inner(client.completion_model(&profile.model), None)?
+                    .call(request)
+                    .await
+            }
+            AgentModelProviderKind::AzureOpenAi => {
+                // `new` refuses an Azure profile with no `base_url`, so the
+                // endpoint below is always the profile's own.
+                let endpoint = profile.base_url.clone().unwrap_or_default();
+                let mut builder = azure::Client::builder()
+                    .api_key(azure::AzureOpenAIAuth::ApiKey(Self::required_key(
+                        key,
+                        &profile.provider,
+                    )?))
+                    .http_client(http)
+                    .azure_endpoint(endpoint);
+                if let Some(version) = profile.attributes.get("api_version") {
+                    builder = builder.api_version(version);
+                }
+                let client = builder.build().map_err(provider_error)?;
+                self.inner(client.completion_model(&profile.model), None)?
+                    .call(request)
+                    .await
+            }
+            AgentModelProviderKind::Ollama => {
+                // Ollama is the one provider that answers unauthenticated, and
+                // rig maps an empty key to no header at all, so an attempt
+                // that resolved no credential is not refused here.
+                let mut builder = ollama::Client::builder()
+                    .api_key(ollama::OllamaApiKey::from(key.unwrap_or_default()))
+                    .http_client(http);
+                if let Some(url) = &profile.base_url {
+                    builder = builder.base_url(url);
+                }
+                let client = builder.build().map_err(provider_error)?;
+                self.inner(client.completion_model(&profile.model), None)?
+                    .call(request)
+                    .await
+            }
+        }
+    }
+}
+
+impl<H> AgentModelAdapter for RigProviderAdapter<H>
+where
+    H: HttpClientExt + Clone + fmt::Debug + Default + Send + Sync + 'static,
+{
+    fn adapter_version(&self) -> AgentRevisionNumber {
+        self.adapter_version
+    }
+
+    fn retry_policy(&self) -> AgentModelRetryPolicy {
+        self.retry_policy
+    }
+
+    fn call<'a>(&'a self, request: &'a AgentModelRequest) -> AgentModelFuture<'a> {
+        self.call_with(request, None)
+    }
+
+    fn call_with<'a>(
+        &'a self,
+        request: &'a AgentModelRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentModelFuture<'a> {
+        Box::pin(async move { self.call_provider(request, credential).await })
     }
 }
 
