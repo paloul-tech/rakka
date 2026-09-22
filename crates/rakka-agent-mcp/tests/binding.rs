@@ -53,6 +53,21 @@ fn tool_ids_are_prefixed_and_validated() {
 }
 
 #[test]
+fn tool_names_may_contain_dots() {
+    // MCP servers commonly name tools `a.b`; nothing in this crate splits a
+    // tool id on `.` — the sync and executor key by the full `AgentToolId`.
+    // Only the server id itself refuses `.`, so `mcp.<server>.` stays a
+    // stable, unambiguous prefix.
+    let binding = McpServerBinding::streamable_http(server("crm"), "https://mcp.example.test/mcp")
+        .with_tool("search.contacts", policy())
+        .expect("a dotted tool name is accepted");
+    assert_eq!(
+        binding.tool_id("search.contacts").expect("id").as_str(),
+        "mcp.crm.search.contacts"
+    );
+}
+
+#[test]
 fn the_url_rule_accepts_http_and_https_and_refuses_userinfo_and_fragments() {
     for ok in ["http://127.0.0.1:1/mcp", "https://h/mcp?x=1"] {
         McpServerBinding::streamable_http(server("s"), ok)
@@ -108,6 +123,47 @@ fn defaults_are_manual_refresh_the_two_versions_and_one_inline_attempt() {
     assert!(matches!(
         no_versions.validate().expect_err("versions"),
         McpRegistrationError::ProtocolVersionsEmpty { .. }
+    ));
+}
+
+#[test]
+fn with_max_attempts_no_longer_clamps_and_validate_is_the_gate() {
+    // `with_max_attempts` stores the value as given; only `validate` refuses
+    // a zero.
+    let built = McpServerBinding::streamable_http(server("s"), "https://h/mcp")
+        .with_tool("t", policy().with_max_attempts(0))
+        .expect("tool");
+    assert_eq!(built.tools["t"].max_attempts, 0);
+    let error = built.validate().expect_err("zero attempts is refused");
+    assert_eq!(error.code(), "mcp-binding-invalid");
+    assert!(matches!(
+        error,
+        McpRegistrationError::MaxAttemptsInvalid { .. }
+    ));
+}
+
+#[test]
+fn a_decoded_binding_with_zero_max_attempts_fails_validate() {
+    // `McpToolPolicy`'s fields are `pub` and it derives a plain `Deserialize`,
+    // so a hand-built or decoded policy can carry `max_attempts: 0` without
+    // going through `with_max_attempts` at all; `validate` must still catch
+    // it.
+    let binding = McpServerBinding::streamable_http(server("s"), "https://h/mcp")
+        .with_tool("t", policy())
+        .expect("tool");
+    let mut encoded: serde_json::Value =
+        serde_json::to_value(&binding).expect("binding encodes to a JSON value");
+    encoded["tools"]["t"]["max_attempts"] = serde_json::json!(0);
+    let decoded: McpServerBinding =
+        serde_json::from_value(encoded).expect("a zero max_attempts decodes fine");
+    assert_eq!(decoded.tools["t"].max_attempts, 0);
+    let error = decoded
+        .validate()
+        .expect_err("a decoded zero max_attempts is refused");
+    assert_eq!(error.code(), "mcp-binding-invalid");
+    assert!(matches!(
+        error,
+        McpRegistrationError::MaxAttemptsInvalid { .. }
     ));
 }
 

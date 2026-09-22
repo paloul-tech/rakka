@@ -54,15 +54,19 @@ pub const MCP_TOOL_ID_PREFIX: &str = "mcp.";
 /// Stable identity of one configured MCP server.
 ///
 /// A value that passes `rakka_agent::identity::validate_identity_segment` and
-/// additionally refuses a `.`, so a derived tool id `mcp.<server>.<tool>`
-/// always splits unambiguously into exactly three parts.
+/// additionally refuses a `.`. A tool name may itself contain dots (MCP
+/// servers commonly name tools `a.b`), so a derived tool id does not split
+/// into parts; what the server id's own `.`-refusal buys instead is that
+/// `mcp.<server>.` is always a stable, unambiguous prefix every one of that
+/// server's derived tool ids shares, which is what the sync and executor
+/// route on.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct McpServerId(String);
 
 impl McpServerId {
     /// Creates the server id, rejecting a value that cannot key a binding or
-    /// that would make a derived tool id ambiguous.
+    /// that would make the server's `mcp.<server>.` tool-id prefix ambiguous.
     ///
     /// # Errors
     ///
@@ -77,7 +81,7 @@ impl McpServerId {
         })?;
         if value.contains('.') {
             return Err(McpRegistrationError::InvalidServerId {
-                reason: "must not contain '.': a derived tool id mcp.<server>.<tool> would not split unambiguously".to_string(),
+                reason: "must not contain '.': the server's mcp.<server>. tool-id prefix would not be stable and unambiguous".to_string(),
             });
         }
         Ok(Self(value))
@@ -139,8 +143,9 @@ pub struct McpToolPolicy {
     /// The safety class, capabilities, and credential/environment
     /// declaration this policy authorizes for the tool.
     pub declaration: AgentToolDeclaration,
-    /// Maximum dispatch attempts. A policy built through [`Self::new`] or
-    /// [`Self::with_max_attempts`] always holds at least 1.
+    /// Maximum dispatch attempts. `0` is a policy [`McpServerBinding::validate`]
+    /// refuses; this field is not itself gated at construction, since it is
+    /// `pub` and also reachable by decoding.
     pub max_attempts: u32,
     /// Per-attempt timeout, in milliseconds; `None` defers to the
     /// dispatcher's own default.
@@ -166,10 +171,11 @@ impl McpToolPolicy {
         }
     }
 
-    /// Sets the maximum dispatch attempts, clamped to at least 1.
+    /// Sets the maximum dispatch attempts. Stored as given: `0` is only
+    /// refused later, by [`McpServerBinding::validate`].
     #[must_use]
     pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
-        self.max_attempts = max_attempts.max(1);
+        self.max_attempts = max_attempts;
         self
     }
 
@@ -333,8 +339,9 @@ impl McpServerBinding {
     }
 
     /// Refuses a binding that cannot be dispatched: an invalid endpoint URL,
-    /// an empty tool allow-list, a tool whose derived id is invalid, or an
-    /// empty or malformed protocol version list.
+    /// an empty tool allow-list, a tool whose derived id is invalid, a tool
+    /// policy with `max_attempts` of `0`, or an empty or malformed protocol
+    /// version list.
     ///
     /// # Errors
     ///
@@ -351,8 +358,14 @@ impl McpServerBinding {
                 server: self.server_id.to_string(),
             });
         }
-        for tool in self.tools.keys() {
+        for (tool, policy) in &self.tools {
             self.tool_id(tool)?;
+            if policy.max_attempts == 0 {
+                return Err(McpRegistrationError::MaxAttemptsInvalid {
+                    server: self.server_id.to_string(),
+                    tool: tool.clone(),
+                });
+            }
         }
         if self.protocol_versions.is_empty() {
             return Err(McpRegistrationError::ProtocolVersionsEmpty {
@@ -449,6 +462,14 @@ pub enum McpRegistrationError {
         /// The server whose binding lists no tools.
         server: String,
     },
+    /// A tool's policy declares `max_attempts` of `0`: no attempt could ever
+    /// be dispatched.
+    MaxAttemptsInvalid {
+        /// The server the tool belongs to.
+        server: String,
+        /// The tool whose policy declares zero attempts.
+        tool: String,
+    },
     /// The server id itself is invalid.
     InvalidServerId {
         /// Why the server id was refused.
@@ -472,6 +493,7 @@ impl McpRegistrationError {
             | Self::ProtocolVersionsEmpty { .. }
             | Self::ProtocolVersionInvalid { .. }
             | Self::NoTools { .. }
+            | Self::MaxAttemptsInvalid { .. }
             | Self::InvalidServerId { .. } => "mcp-binding-invalid",
         }
     }
@@ -522,6 +544,10 @@ impl Display for McpRegistrationError {
             Self::NoTools { server } => {
                 write!(f, "the MCP server {server} binding lists no tools")
             }
+            Self::MaxAttemptsInvalid { server, tool } => write!(
+                f,
+                "the MCP server {server}'s tool {tool} policy declares 0 max_attempts; no attempt could be dispatched"
+            ),
             Self::InvalidServerId { reason } => {
                 write!(f, "the MCP server id is invalid: {reason}")
             }
