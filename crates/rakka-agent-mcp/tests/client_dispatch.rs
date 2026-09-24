@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rakka_agent::{
-    AgentAuthorityRefusal, AgentDispatchToolExecutor, AgentEffectSafetyClass, AgentTaskContent,
-    AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration, AgentToolId,
+    AgentAuthorityRefusal, AgentContentDigest, AgentDispatchToolExecutor, AgentEffectSafetyClass,
+    AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration, AgentToolId,
     AgentToolResultBehavior,
 };
 use rakka_agent_mcp::testkit::{
@@ -333,6 +333,9 @@ async fn large_results_go_to_the_artifact_store_or_refuse_by_the_bindings_behavi
     let AgentTaskContent::Artifact(reference) = content else {
         panic!("expected an artifact, got {content:?}")
     };
+    // The fixture store passes the writer's checksum through and invents
+    // none, so a reference that validates here is one whose checksum the
+    // executor itself stamped.
     validate_artifact_ref(&reference).unwrap_or_else(|error| {
         panic!("the stored reference passes the workflow's own validation: {error}")
     });
@@ -351,10 +354,19 @@ async fn large_results_go_to_the_artifact_store_or_refuse_by_the_bindings_behavi
         "the artifact id derives from the effect, its generation, and the call"
     );
     assert_eq!(store.len().await, 1);
-    assert!(store
+    let stored = store
         .bytes(&reference.artifact_id)
         .await
-        .is_some_and(|b| b.len() > 5000));
+        .expect("the result reached the store");
+    assert!(stored.len() > 5000);
+    assert_eq!(
+        reference.checksum,
+        Some(format!(
+            "sha256:{}",
+            AgentContentDigest::sha256_of_bytes(&stored).value
+        )),
+        "the executor stamps SHA-256 over the exact bytes it wrote"
+    );
     let error = executor
         .execute(
             &run_scope(),

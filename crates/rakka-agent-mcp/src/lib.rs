@@ -12,8 +12,8 @@
 //!   executor — the egress seam and the check every outbound connection
 //!   passes, credential to header, protocol negotiation, the peer-agent rule,
 //!   error mapping.
-//! - `sync`: `sync_mcp_descriptors`, the stored descriptor set, hint
-//!   narrowing, staleness.
+//! - `sync`: `sync_mcp_descriptors` (and `sync_mcp_descriptors_over`, the
+//!   launcher path's), the stored descriptor set, hint narrowing, staleness.
 //! - `executor`: `McpDispatchToolExecutor`, the schema recheck, result
 //!   mapping.
 //! - `launcher`: the child-process seam and (feature `child-process`) the
@@ -45,8 +45,10 @@ pub use binding::{
 };
 pub use client::{McpAllowAllEgress, McpClientError, McpClientSession, McpEgressCheck};
 pub use executor::{mcp_artifact_store, McpArtifactStore, McpDispatchToolExecutor};
+#[cfg(feature = "child-process")]
+pub use launcher::TokioChildProcessLauncher;
 pub use launcher::{McpChildProcessLauncher, McpChildTransport, McpLaunchError, McpLaunchFuture};
 pub use sync::{
-    mcp_descriptor_staleness, sync_mcp_descriptors, McpDescriptorSet, McpDescriptorStaleness,
-    McpSyncError, McpSyncedDescriptor,
+    mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over, McpDescriptorSet,
+    McpDescriptorStaleness, McpSyncError, McpSyncedDescriptor,
 };

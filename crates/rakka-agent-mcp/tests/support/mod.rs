@@ -8,10 +8,16 @@
 //! would carry.
 //!
 //! [`SharedArtifactStore`] is here rather than `rakka-agent-workflow`'s
-//! `FakeArtifactStore` for one reason: that store's `Clone` copies its map, so
+//! `FakeArtifactStore` for two reasons: that store's `Clone` copies its map, so
 //! a test holding a clone cannot see what the executor wrote through the
-//! `McpArtifactStore` handle. This one shares its state behind an `Arc`, which
-//! is what makes "the large result reached the store" assertable at all.
+//! `McpArtifactStore` handle; and it lives behind `rakka-agent-workflow`'s own
+//! `testkit` feature, which this crate does not enable. This one shares its
+//! state behind an `Arc`, which is what makes "the large result reached the
+//! store" assertable at all.
+//!
+//! Under `testkit`, [`duplex_transport`] serves the fake MCP server over an
+//! in-memory pair — a child process's stdio with no process — and
+//! [`stored_set_for`] runs the launcher path's publish-time sync over one.
 
 // Each integration-test binary compiles this module independently; what one
 // binary leaves unused is not dead code.
@@ -26,7 +32,8 @@ use rakka_agent::{
 };
 use rakka_agent_workflow::{
     AgentArtifactError, AgentArtifactRead, AgentArtifactStore, AgentArtifactStoreFuture,
-    AgentArtifactWriteRequest, AgentTimestampMillis, ArtifactRef,
+    AgentArtifactWriteRequest, AgentAttributes, AgentTimestampMillis, ArtifactKind, ArtifactRef,
+    RedactionStatus,
 };
 use tokio::sync::Mutex;
 
@@ -127,6 +134,15 @@ impl SharedArtifactStore {
             .get(artifact_id)
             .map(|(_, bytes)| bytes.clone())
     }
+
+    /// Stores one artifact under its reference's id, as an operator's
+    /// publish step would have left it — a launch specification, say.
+    pub async fn insert(&self, reference: ArtifactRef, bytes: Vec<u8>) {
+        self.artifacts
+            .lock()
+            .await
+            .insert(reference.artifact_id.clone(), (reference, bytes));
+    }
 }
 
 impl AgentArtifactStore for SharedArtifactStore {
@@ -145,11 +161,10 @@ impl AgentArtifactStore for SharedArtifactStore {
                 artifact_id: artifact_id.clone(),
                 kind: request.kind,
                 uri: format!("memory://mcp-fixture/{artifact_id}"),
-                // The store's own checksum when the writer supplied none, as
-                // `rakka-agent-workflow`'s `FakeArtifactStore` does: a
-                // reference is only valid with one, and producing it is the
-                // store's job, not the writer's.
-                checksum: request.checksum.or_else(|| Some(format!("len:{byte_len}"))),
+                // Passed through as the writer sent it, never filled in: the
+                // executor stamps its own checksum on every write, and a store
+                // that invented one would hide a writer that forgot to.
+                checksum: request.checksum,
                 content_type: request.content_type,
                 byte_len: Some(byte_len),
                 retention_class: request.retention_class,
@@ -179,4 +194,66 @@ impl AgentArtifactStore for SharedArtifactStore {
                 .ok_or(AgentArtifactError::ArtifactNotFound { artifact_id })
         })
     }
+}
+
+/// The reference a child-process binding's launch specification is stored
+/// under: `spec-1`, a file, at `mem://spec-1`.
+#[must_use]
+pub fn spec_artifact_ref() -> ArtifactRef {
+    ArtifactRef {
+        artifact_id: "spec-1".to_string(),
+        kind: ArtifactKind::File,
+        uri: "mem://spec-1".to_string(),
+        checksum: None,
+        content_type: Some("application/json".to_string()),
+        byte_len: None,
+        retention_class: None,
+        encryption: None,
+        redaction: RedactionStatus::ReferenceOnly,
+        created_at: AgentTimestampMillis::new(1),
+        metadata: AgentAttributes::new(),
+    }
+}
+
+/// A child process's stdio with no process behind it: an in-memory pair whose
+/// far end is `server`, served by rmcp in a task of its own.
+///
+/// Must be called inside a runtime — the server side is spawned.
+#[cfg(feature = "testkit")]
+#[must_use]
+pub fn duplex_transport(
+    server: rakka_agent_mcp::testkit::FakeMcpServer,
+) -> rakka_agent_mcp::McpChildTransport {
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        // A client that drops the pair before the handshake finishes is a
+        // proof's own business, not a failure of the fake: nothing to report.
+        if let Ok(running) = rmcp::serve_server(server, tokio::io::split(server_side)).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let (read, write) = tokio::io::split(client_side);
+    rakka_agent_mcp::McpChildTransport::new(Box::new(read), Box::new(write))
+}
+
+/// The descriptor set a publish-time sync over the launcher path would store
+/// for `binding`, taken from `server` over an in-memory pair — no network, no
+/// process.
+///
+/// # Panics
+///
+/// When the fake refuses the sync, which would make every proof built on the
+/// set meaningless.
+#[cfg(feature = "testkit")]
+pub async fn stored_set_for(
+    binding: &rakka_agent_mcp::McpServerBinding,
+    server: &rakka_agent_mcp::testkit::FakeMcpServer,
+) -> rakka_agent_mcp::McpDescriptorSet {
+    rakka_agent_mcp::sync_mcp_descriptors_over(
+        duplex_transport(server.clone()),
+        binding,
+        AgentTimestampMillis::new(1),
+    )
+    .await
+    .expect("the fake syncs over the pair")
 }

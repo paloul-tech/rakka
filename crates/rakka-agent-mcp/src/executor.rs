@@ -16,7 +16,9 @@
 //!   few-second bound.
 //! - **The destination is admitted before the credential is read.** The egress
 //!   rule fires inside the `client` module's own `connect`, so a refusal
-//!   happens before a transport, a header, or a request exists.
+//!   happens before a transport, a header, or a request exists. A child
+//!   process is never handed a credential at all: an attempt that arrives
+//!   with one for a child-process binding is refused before the launcher runs.
 //! - **The published descriptor is the contract.** Before a call goes out, the
 //!   server's live input schema is compared with the digest the publish-time
 //!   sync pinned; a server that reshaped a tool is refused rather than called
@@ -159,6 +161,11 @@ impl<C> McpDispatchToolExecutor<C> {
     ///
     /// `egress` has no default: see [`McpEgressCheck`].
     ///
+    /// A `ChildProcess` binding is refused here, as `mcp-transport-unsupported`:
+    /// no child process runs without a launcher the deployment supplied, and
+    /// this constructor takes none. [`Self::with_launcher`] is the one that
+    /// admits them.
+    ///
     /// # Errors
     ///
     /// [`McpRegistrationError`] with its stable code.
@@ -168,6 +175,49 @@ impl<C> McpDispatchToolExecutor<C> {
         artifacts: McpArtifactStore,
         http: C,
         egress: Arc<dyn McpEgressCheck>,
+    ) -> Result<Self, McpRegistrationError> {
+        Self::build(descriptors, bindings, artifacts, http, egress, None)
+    }
+
+    /// Builds the executor exactly as [`Self::new`] does, with the
+    /// deployment's child-process launcher — the constructor that admits
+    /// `ChildProcess` bindings.
+    ///
+    /// Every such binding's attempts launch through `launcher`, and through
+    /// nothing else: the crate never spawns a process on its own account. The
+    /// launcher is taken together with the bindings so that no executor ever
+    /// holds a child-process binding it cannot dispatch.
+    ///
+    /// # Errors
+    ///
+    /// [`McpRegistrationError`] with its stable code.
+    pub fn with_launcher(
+        descriptors: Vec<McpDescriptorSet>,
+        bindings: Vec<McpServerBinding>,
+        artifacts: McpArtifactStore,
+        http: C,
+        egress: Arc<dyn McpEgressCheck>,
+        launcher: Arc<dyn McpChildProcessLauncher>,
+    ) -> Result<Self, McpRegistrationError> {
+        Self::build(
+            descriptors,
+            bindings,
+            artifacts,
+            http,
+            egress,
+            Some(launcher),
+        )
+    }
+
+    /// The one construction path: pairing, validation, and the routing table
+    /// derived under whichever launcher the public constructor supplied.
+    fn build(
+        descriptors: Vec<McpDescriptorSet>,
+        bindings: Vec<McpServerBinding>,
+        artifacts: McpArtifactStore,
+        http: C,
+        egress: Arc<dyn McpEgressCheck>,
+        launcher: Option<Arc<dyn McpChildProcessLauncher>>,
     ) -> Result<Self, McpRegistrationError> {
         let mut bound: BTreeMap<McpServerId, McpServerBinding> = BTreeMap::new();
         for binding in bindings {
@@ -207,14 +257,14 @@ impl<C> McpDispatchToolExecutor<C> {
                 server: server.to_string(),
             });
         }
-        let tools = routes(&servers, None)?;
+        let tools = routes(&servers, launcher.as_ref())?;
         Ok(Self {
             servers,
             tools,
             artifacts,
             http,
             egress,
-            launcher: None,
+            launcher,
             recheck_ttl_ms: MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS,
             rechecked: Mutex::new(BTreeMap::new()),
         })
@@ -226,10 +276,10 @@ impl<C> McpDispatchToolExecutor<C> {
     /// This admits no binding. [`Self::new`] already refused any
     /// `ChildProcess` binding, and an executor's bindings are fixed once it is
     /// built, so what this installs is the capability alone; a child-process
-    /// binding is admitted only by a constructor that takes the launcher
-    /// together with the bindings. The routing table is re-derived under the
-    /// launcher anyway, by the same rule `new` applied, so installing one can
-    /// never widen what was validated.
+    /// binding is admitted only by [`Self::with_launcher`], which takes the
+    /// launcher together with the bindings. The routing table is re-derived
+    /// under the launcher anyway, by the same rule `new` applied, so
+    /// installing one can never widen what was validated.
     ///
     /// # Errors
     ///
@@ -359,6 +409,11 @@ where
     /// outbound HTTP session, so *being connected* and *having passed the
     /// rule* are one event. The credential is handed straight through and read
     /// only on the far side of that check.
+    ///
+    /// A child-process binding takes the other path: a credential that
+    /// arrives for one is refused before the launcher is asked for anything —
+    /// only its presence is looked at, never its material — and the session
+    /// runs over whatever transport the launcher produced.
     fn open<'a>(
         &'a self,
         scope: &'a AgentRunScope,
@@ -373,6 +428,19 @@ where
                         .map_err(dispatch_error)
                 }
                 McpTransport::ChildProcess { spec_ref } => {
+                    // Before the launcher, and by presence alone: a stdio
+                    // child has no request to put a header on, so a resolved
+                    // credential here is a misbinding that must fail the
+                    // attempt rather than be silently dropped — and must do so
+                    // before any process exists that it could leak into.
+                    if credential.is_some() {
+                        return Err(dispatch_error(
+                            McpClientError::CredentialMaterialUnsupported {
+                                server: binding.server_id.to_string(),
+                                material: "child-process",
+                            },
+                        ));
+                    }
                     let Some(launcher) = self.launcher.as_ref() else {
                         return Err(AgentDispatchError::collaborator(
                             "mcp-transport-unsupported",
@@ -386,14 +454,7 @@ where
                     let transport = launcher.launch(scope, spec_ref).await.map_err(|error| {
                         AgentDispatchError::collaborator(error.code(), error.to_string())
                     })?;
-                    // The launched pair *is* rmcp's transport: `(R, W)` of an
-                    // `AsyncRead` and an `AsyncWrite` implements
-                    // `IntoTransport` (`rmcp-3.4.0/src/transport/async_rw.rs:24`).
-                    // `into_pair` is what makes each half concrete; see its
-                    // own documentation for why that is load-bearing. No
-                    // credential rides this path — a child process has no
-                    // request to put a header on.
-                    client::connect_over(transport.into_pair(), binding)
+                    client::connect_over(transport, binding)
                         .await
                         .map_err(dispatch_error)
                 }
@@ -547,6 +608,15 @@ where
                     structured_content: &result.structured_content,
                 })
                 .map_err(encoding_refused)?;
+                // The writer's checksum, not the store's: the default artifact
+                // policy refuses a reference without one, and a pass-through
+                // store only returns what it was given. SHA-256 over the exact
+                // bytes written, so a reader can tell a stored result from a
+                // substituted one.
+                let checksum = format!(
+                    "sha256:{}",
+                    AgentContentDigest::sha256_of_bytes(&bytes).value
+                );
                 // `new`'s defaults, retention class `standard` among them, so
                 // the reference a pass-through store returns still passes
                 // `validate_artifact_ref`. The executor holds no clock; the
@@ -559,6 +629,7 @@ where
                     bytes,
                     intent.created_at,
                 )
+                .checksum(checksum)
                 // Derived, so a re-driven attempt of the same generation
                 // writes the same artifact rather than a second one.
                 .artifact_id(format!(

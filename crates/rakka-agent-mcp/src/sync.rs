@@ -12,7 +12,10 @@
 //! The connection itself passes the host's
 //! [`McpEgressCheck`] first: a sync is the same
 //! outbound request, to the same operator-supplied URL, carrying the same
-//! resolved credential as a dispatch.
+//! resolved credential as a dispatch. A child-process binding is synced by
+//! [`sync_mcp_descriptors_over`] instead, over the transport the deployment's
+//! launcher produced — the same listing, bounds, and rules, with no URL to
+//! judge and no credential to carry.
 //!
 //! Two bounds and one rule then guard what crosses in:
 //!
@@ -43,7 +46,10 @@ use crate::binding::{
     McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
     MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
 };
-use crate::client::{connect, service_error, McpClientError, McpEgressCheck};
+use crate::client::{
+    connect, connect_over, service_error, McpClientError, McpClientSession, McpEgressCheck,
+};
+use crate::launcher::McpChildTransport;
 
 /// One tool as this adapter stored it at publish time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -311,14 +317,50 @@ where
     // before the credential is read; a refusal arrives here as
     // `McpClientError::Egress`, whose code is the host's own.
     let session = connect(http, binding, credential, egress).await?;
+    sync_over_session(session, binding, &server, synced_at).await
+}
+
+/// Syncs one child-process MCP server's allow-listed tools into a durable
+/// descriptor set, over the transport the deployment's launcher produced.
+///
+/// The same function as [`sync_mcp_descriptors`] from the handshake on — one
+/// session, one `tools/list`, the same bounds and hint rule, the session
+/// closed on every path — for the binding kind that has no URL to dial. It
+/// takes no egress check, because nothing is dialed, and no credential,
+/// because a stdio child has no header to carry one.
+///
+/// # Errors
+///
+/// [`McpSyncError`] with its stable code; a binding that is not a child
+/// process is refused as `mcp-descriptor-sync-failed` without a handshake.
+pub async fn sync_mcp_descriptors_over(
+    transport: McpChildTransport,
+    binding: &McpServerBinding,
+    synced_at: AgentTimestampMillis,
+) -> Result<McpDescriptorSet, McpSyncError> {
+    binding.validate()?;
+    let server = binding.server_id.to_string();
+    let session = connect_over(transport, binding).await?;
+    sync_over_session(session, binding, &server, synced_at).await
+}
+
+/// Everything after the handshake that both syncs share: one listing, the
+/// session closed, then the answer judged.
+async fn sync_over_session(
+    session: McpClientSession,
+    binding: &McpServerBinding,
+    server: &str,
+    synced_at: AgentTimestampMillis,
+) -> Result<McpDescriptorSet, McpSyncError> {
     let listed = session.peer().list_all_tools().await;
     let protocol_version = session.negotiated_version().as_str().to_string();
     let server_name = session.server_name().to_string();
     // The session is closed before the answer is judged: a refusal must not
-    // leave a transport (and its credential-bearing client) alive.
+    // leave a transport (and its credential-bearing client, or its child
+    // process) alive.
     let built = listed
-        .map_err(|error| McpSyncError::Client(service_error(&server, &error)))
-        .and_then(|listed| synced_descriptors(binding, &server, &listed));
+        .map_err(|error| McpSyncError::Client(service_error(server, &error)))
+        .and_then(|listed| synced_descriptors(binding, server, &listed));
     session.close().await;
     Ok(McpDescriptorSet {
         server_id: binding.server_id.clone(),

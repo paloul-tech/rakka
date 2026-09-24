@@ -65,5 +65,11 @@ axum.workspace = true
 tokio.workspace = true
 rmcp = { version = "=3.4.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
+# Spawns a real process through the unsandboxed reference launcher, so it
+# builds only where that launcher exists.
+[[test]]
+name = "child_process_launcher"
+required-features = ["child-process", "testkit"]
+
 [lints]
 workspace = true

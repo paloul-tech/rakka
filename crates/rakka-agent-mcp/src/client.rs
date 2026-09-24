@@ -21,6 +21,10 @@
 //!   check lives in this module rather than in each caller so that *being
 //!   connected* and *having passed the rule* are the same event: a new caller
 //!   cannot reach a server by forgetting to ask.
+//! - A child process is reached only through [`connect_over`], over the
+//!   transport a deployment's launcher produced. It dials nothing, so there is
+//!   no URL for the egress rule to judge, and it takes no credential, so none
+//!   can reach a process that has no header to carry it.
 //!
 //! [`StreamableHttpError::UnexpectedServerResponse`]: rmcp::transport::streamable_http_client::StreamableHttpError::UnexpectedServerResponse
 //! [specification 14.4]: ../../../docs/plans/rakka-agent/spec.md
@@ -46,6 +50,7 @@ use rmcp::transport::IntoTransport;
 use crate::binding::{
     McpServerBinding, McpServerId, McpTransport, MCP_CLIENT_NAME, MCP_PEER_AGENT_SERVER_PREFIX,
 };
+use crate::launcher::{concrete_pair, McpChildTransport};
 
 /// Why a client session could not be established, or could not be trusted.
 ///
@@ -327,17 +332,51 @@ where
     config.auth_header = auth_header;
     config.custom_headers = custom_headers;
     let transport = StreamableHttpClientTransport::with_client(http.clone(), config);
-    connect_over(transport, binding).await
+    open_session(transport, binding).await
 }
 
-/// Opens a session over an already-built transport: the child-process
-/// launcher's path, where the credential never becomes a header because there
-/// is no request to put one on.
+/// Opens a session to a child-process binding's server over the stdio a
+/// launcher produced — the launcher's path, where the credential never
+/// becomes a header because there is no request to put one on.
+///
+/// Takes no credential and applies no egress rule, and both are the point: a
+/// stdio child is reached over a pipe the deployment handed over, not a URL
+/// anything could dial, and it has no header a credential could ride. A
+/// binding over the Streamable HTTP transport is refused here — its session
+/// is opened only by the path that checks egress first.
 ///
 /// # Errors
 ///
-/// [`McpClientError`] with its stable code.
-pub(crate) async fn connect_over<T, E, A>(
+/// [`McpClientError`] with its stable code: `mcp-transport-failed` for a
+/// binding that is not a child process, or for a peer that broke the
+/// handshake.
+pub async fn connect_over(
+    transport: McpChildTransport,
+    binding: &McpServerBinding,
+) -> Result<McpClientSession, McpClientError> {
+    if !matches!(binding.transport, McpTransport::ChildProcess { .. }) {
+        return Err(McpClientError::Transport {
+            server: binding.server_id.to_string(),
+            reason: "the binding names no child process".to_string(),
+        });
+    }
+    match transport {
+        // The launched pair *is* rmcp's transport: `(R, W)` of an `AsyncRead`
+        // and an `AsyncWrite` implements `IntoTransport`
+        // (`rmcp-3.4.0/src/transport/async_rw.rs:24`). `concrete_pair` is what
+        // makes each half concrete; see its own documentation for why that is
+        // load-bearing.
+        McpChildTransport::Pair { reader, writer } => {
+            open_session(concrete_pair(reader, writer), binding).await
+        }
+        #[cfg(feature = "child-process")]
+        McpChildTransport::Process(process) => open_session(process, binding).await,
+    }
+}
+
+/// The handshake every session shares, over whichever transport the caller
+/// built: negotiate from the binding's declared versions, then [`finish`].
+async fn open_session<T, E, A>(
     transport: T,
     binding: &McpServerBinding,
 ) -> Result<McpClientSession, McpClientError>
@@ -357,10 +396,10 @@ where
     finish(running, &server).await
 }
 
-/// The step `connect` and `connect_over` share once rmcp has a running
-/// service: read the negotiated version and the peer's name, and refuse a peer
-/// that identifies as a Rakka agent — closing the session first, so the
-/// refusal leaves nothing open.
+/// The step every session shares once rmcp has a running service: read the
+/// negotiated version and the peer's name, and refuse a peer that identifies
+/// as a Rakka agent — closing the session first, so the refusal leaves nothing
+/// open.
 async fn finish(
     running: RunningService<RoleClient, ClientConfig>,
     server: &str,
