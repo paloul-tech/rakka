@@ -493,8 +493,18 @@ fn synced_descriptor(
             .with_parameters(input_schema.clone())
             .map_err(described)?;
     }
-    let mut derived =
-        AgentToolBinding::new(descriptor, policy.declaration.clone(), policy.max_attempts);
+    // The server-level credential binding reaches every tool that names
+    // none: the dispatcher resolves the *effect's* binding, and the effect
+    // takes it from this declaration, so a binding left only on the server
+    // would never be resolved at all. `McpServerBinding::validate` has
+    // already refused a tool that names a different one.
+    let mut declaration = policy.declaration.clone();
+    if declaration.credential_binding.is_none() {
+        declaration
+            .credential_binding
+            .clone_from(&binding.credential_binding);
+    }
+    let mut derived = AgentToolBinding::new(descriptor, declaration, policy.max_attempts);
     if let Some(timeout_ms) = policy.timeout_ms {
         derived = derived.with_timeout_ms(timeout_ms);
     }

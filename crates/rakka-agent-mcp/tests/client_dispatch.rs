@@ -125,9 +125,11 @@ fn binding(url: &str) -> McpServerBinding {
             ),
         )
         .expect("t")
-        .with_credential_binding(
-            rakka_agent::AgentCredentialBindingRef::new("crm-key").expect("binding"),
-        )
+}
+
+/// The logical credential binding a credentialed proof names.
+fn credential_binding() -> rakka_agent::AgentCredentialBindingRef {
+    rakka_agent::AgentCredentialBindingRef::new("crm-key").expect("binding")
 }
 
 fn call(tool: &str, arguments: serde_json::Value) -> AgentToolCallRequest {
@@ -147,8 +149,19 @@ async fn executor(
     CountingClient,
     SharedArtifactStore,
 ) {
+    executor_over(binding(url), egress).await
+}
+
+/// As [`executor`], over the given binding.
+async fn executor_over(
+    binding: McpServerBinding,
+    egress: Arc<dyn McpEgressCheck>,
+) -> (
+    McpDispatchToolExecutor<CountingClient>,
+    CountingClient,
+    SharedArtifactStore,
+) {
     let http = CountingClient::new();
-    let binding = binding(url);
     let set = sync_mcp_descriptors(
         &http,
         &binding,
@@ -173,7 +186,11 @@ async fn executor(
 #[tokio::test]
 async fn a_call_carries_the_credential_the_meta_and_maps_structured_content_inline() {
     let endpoint = serve_fake(fake()).await;
-    let (executor, http, _) = executor(&endpoint.url, Arc::new(McpAllowAllEgress)).await;
+    let (executor, http, _) = executor_over(
+        binding(&endpoint.url).with_credential_binding(credential_binding()),
+        Arc::new(McpAllowAllEgress),
+    )
+    .await;
     let sends_after_sync = http.sends();
     let credential = AgentEphemeralCredential::bearer_token("attempt-token-sentinel");
     let mut intent = tool_intent_with_timeout("mcp.crm.echo", Some(5_000));
@@ -430,7 +447,11 @@ impl McpEgressCheck for RefuseAll {
 #[tokio::test]
 async fn an_egress_refusal_fails_before_any_client_exists_and_never_touches_the_credential() {
     let endpoint = serve_fake(fake()).await;
-    let (executor, http, _) = executor(&endpoint.url, Arc::new(RefuseAll)).await;
+    let (executor, http, _) = executor_over(
+        binding(&endpoint.url).with_credential_binding(credential_binding()),
+        Arc::new(RefuseAll),
+    )
+    .await;
     let sends_after_sync = http.sends();
     let credential = AgentEphemeralCredential::bearer_token("never-sent");
     let error = executor
@@ -448,6 +469,56 @@ async fn an_egress_refusal_fails_before_any_client_exists_and_never_touches_the_
     );
     assert_eq!(http.sends(), sends_after_sync, "no client was built");
     assert!(endpoint.server.seen_calls().is_empty());
+}
+
+#[tokio::test]
+async fn an_http_binding_that_names_a_credential_fails_closed_without_one() {
+    let endpoint = serve_fake(fake()).await;
+    let mut declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::ReadOnly);
+    declaration.credential_binding = Some(credential_binding());
+    // The server's binding alone, and a tool's declaration alone: either one
+    // names a credential the attempt must carry.
+    let server_level = McpServerBinding::streamable_http(server_id(), &endpoint.url)
+        .with_tool(
+            "echo",
+            policy(
+                AgentEffectSafetyClass::ReadOnly,
+                AgentToolResultBehavior::InlineBounded,
+            ),
+        )
+        .expect("t")
+        .with_credential_binding(credential_binding());
+    let tool_level = McpServerBinding::streamable_http(server_id(), &endpoint.url)
+        .with_tool("echo", McpToolPolicy::new(declaration))
+        .expect("t");
+    for (level, binding) in [("server", server_level), ("tool", tool_level)] {
+        let (executor, http, _) = executor_over(binding, Arc::new(McpAllowAllEgress)).await;
+        let sends_after_sync = http.sends();
+        let error = executor
+            .execute(
+                &run_scope(),
+                &tool_intent_with_timeout("mcp.crm.echo", Some(5_000)),
+                &call("echo", json!({})),
+                None,
+            )
+            .await
+            .expect_err("a named credential that did not arrive");
+        let text = error.to_string();
+        assert!(
+            text.contains("mcp-credential-missing") && text.contains("crm-key"),
+            "the {level}-level binding: {text}"
+        );
+        assert_eq!(
+            http.sends(),
+            sends_after_sync,
+            "the {level}-level attempt sent nothing without its credential"
+        );
+    }
+    assert_eq!(
+        endpoint.server.call_count(),
+        0,
+        "no call reached the server"
+    );
 }
 
 #[tokio::test]

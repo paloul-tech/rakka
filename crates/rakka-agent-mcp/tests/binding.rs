@@ -290,3 +290,52 @@ fn a_child_process_binding_that_names_a_credential_is_refused_at_validate() {
         .validate()
         .expect("credentials ride the HTTP transport");
 }
+
+#[test]
+fn a_tool_credential_binding_must_agree_with_the_servers() {
+    let other = AgentCredentialBindingRef::new("other-key").expect("credential binding");
+    let declaring = |binding: AgentCredentialBindingRef| {
+        let mut declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent);
+        declaration.credential_binding = Some(binding);
+        McpToolPolicy::new(declaration)
+    };
+    let server_level = McpServerBinding::streamable_http(server("crm"), "https://h/mcp")
+        .with_credential_binding(credential());
+
+    // The server's binding alone, and a tool repeating it, are one credential.
+    server_level
+        .clone()
+        .with_tool("t", policy())
+        .expect("tool")
+        .validate()
+        .expect("the server-level binding alone");
+    server_level
+        .clone()
+        .with_tool("t", declaring(credential()))
+        .expect("tool")
+        .validate()
+        .expect("a tool repeating the server-level binding");
+    // A tool-level binding with none on the server is the tool's own.
+    McpServerBinding::streamable_http(server("crm"), "https://h/mcp")
+        .with_tool("t", declaring(other.clone()))
+        .expect("tool")
+        .validate()
+        .expect("a tool-level binding alone");
+
+    let error = server_level
+        .with_tool("t", policy())
+        .expect("tool")
+        .with_tool("u", declaring(other))
+        .expect("tool")
+        .validate()
+        .expect_err("two credentials for one server");
+    assert_eq!(error.code(), "mcp-binding-invalid");
+    assert!(
+        matches!(
+            error,
+            McpRegistrationError::CredentialBindingConflict { ref server, ref tool }
+                if server == "crm" && tool == "u"
+        ),
+        "{error:?}"
+    );
+}

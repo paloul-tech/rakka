@@ -255,7 +255,15 @@ pub struct McpServerBinding {
     pub server_id: McpServerId,
     /// How this adapter reaches the server.
     pub transport: McpTransport,
-    /// Logical credential binding a dispatch attempt may resolve.
+    /// Logical credential binding a dispatch attempt resolves, for every
+    /// tool of this server.
+    ///
+    /// The descriptor sync copies it into each synced tool declaration that
+    /// names none, because the dispatcher resolves the *effect's* binding and
+    /// the effect takes it from the tool's declaration; a tool that names one
+    /// must name this same one ([`Self::validate`]). The executor fails an
+    /// attempt closed, as `mcp-credential-missing`, when either level names a
+    /// binding and no credential arrived.
     pub credential_binding: Option<AgentCredentialBindingRef>,
     /// Protocol versions this binding negotiates, newest first.
     #[serde(default)]
@@ -367,8 +375,9 @@ impl McpServerBinding {
     /// Refuses a binding that cannot be dispatched: an invalid endpoint URL,
     /// a child-process binding that names a credential binding (on the server
     /// or in any tool's declaration), an empty tool allow-list, a tool whose
-    /// derived id is invalid, a tool policy with `max_attempts` of `0`, or an
-    /// empty or malformed protocol version list.
+    /// derived id is invalid, a tool whose declaration names a credential
+    /// binding other than the server-level one, a tool policy with
+    /// `max_attempts` of `0`, or an empty or malformed protocol version list.
     ///
     /// # Errors
     ///
@@ -407,6 +416,22 @@ impl McpServerBinding {
         }
         for (tool, policy) in &self.tools {
             self.tool_id(tool)?;
+            // One server, one credential: the sync hands the server-level
+            // binding to every tool that names none, so a tool naming a
+            // *different* one would make which secret reaches the server
+            // depend on the tool — a split no operator reading the server's
+            // binding would expect.
+            if let (Some(server_binding), Some(tool_binding)) = (
+                self.credential_binding.as_ref(),
+                policy.declaration.credential_binding.as_ref(),
+            ) {
+                if server_binding != tool_binding {
+                    return Err(McpRegistrationError::CredentialBindingConflict {
+                        server: self.server_id.to_string(),
+                        tool: tool.clone(),
+                    });
+                }
+            }
             if policy.max_attempts == 0 {
                 return Err(McpRegistrationError::MaxAttemptsInvalid {
                     server: self.server_id.to_string(),
@@ -500,6 +525,14 @@ pub enum McpRegistrationError {
         /// The child-process server that names a credential.
         server: String,
     },
+    /// A tool's declaration names a credential binding other than the
+    /// server-level one.
+    CredentialBindingConflict {
+        /// The server whose binding names the other credential binding.
+        server: String,
+        /// The tool whose declaration disagrees with it.
+        tool: String,
+    },
     /// A server-reported hint contradicts the operator's own tool
     /// declaration.
     HintContradictsDeclaration {
@@ -580,6 +613,7 @@ impl McpRegistrationError {
             | Self::NoTools { .. }
             | Self::MaxAttemptsInvalid { .. }
             | Self::CredentialOnChildProcess { .. }
+            | Self::CredentialBindingConflict { .. }
             | Self::InvalidServerId { .. } => "mcp-binding-invalid",
         }
     }
@@ -621,6 +655,11 @@ impl Display for McpRegistrationError {
                 f,
                 "the MCP server {server} is a child process and names a credential binding; \
                  a child process has no header to carry one"
+            ),
+            Self::CredentialBindingConflict { server, tool } => write!(
+                f,
+                "the MCP server {server}'s tool {tool} names a credential binding other than \
+                 the server's own; a tool may repeat the server-level binding or name none"
             ),
             Self::HintContradictsDeclaration { server, tool, hint } => write!(
                 f,

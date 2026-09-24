@@ -20,9 +20,11 @@
 //!   few-second bound.
 //! - **The destination is admitted before the credential is read.** The egress
 //!   rule fires inside the `client` module's own `connect`, so a refusal
-//!   happens before a transport, a header, or a request exists. A child
-//!   process is never handed a credential at all: an attempt that arrives
-//!   with one for a child-process binding is refused before the launcher runs.
+//!   happens before a transport, a header, or a request exists. A binding
+//!   that names a credential binding is never dialed without the credential
+//!   (`mcp-credential-missing`), and a child process is never handed one at
+//!   all: an attempt that arrives with one for a child-process binding is
+//!   refused before the launcher runs.
 //! - **The published descriptor is the contract.** Before a call goes out, the
 //!   server's live input schema is compared with the digest the publish-time
 //!   sync pinned; a server that reshaped a tool is refused rather than called
@@ -401,6 +403,7 @@ where
         let Some(policy) = server.binding.tools.get(&descriptor.tool) else {
             return Err(unbound());
         };
+        missing_credential(&server.binding, policy, credential)?;
         // One deadline for the whole attempt, taken before anything touches
         // the network: the handshake and the call (the recheck's listing runs
         // inside the call's window) spend the same budget rather than one
@@ -693,6 +696,40 @@ where
     ) -> AgentDispatchFuture<'a, AgentTaskContent> {
         Box::pin(self.attempt(scope, intent, call, credential))
     }
+}
+
+/// Fails an attempt closed when its HTTP binding names a credential binding —
+/// on the tool's declaration or on the server — and no credential arrived.
+///
+/// Before any client exists: a request that should carry a credential is
+/// never sent without one, which a server might answer anonymously. The
+/// message names the binding reference and nothing else. A child-process
+/// binding never names one (`McpServerBinding::validate` refuses it), so it
+/// has nothing to check here.
+fn missing_credential(
+    binding: &McpServerBinding,
+    policy: &McpToolPolicy,
+    credential: Option<&AgentEphemeralCredential>,
+) -> Result<(), AgentDispatchError> {
+    if credential.is_some() || !matches!(binding.transport, McpTransport::StreamableHttp { .. }) {
+        return Ok(());
+    }
+    let Some(required) = policy
+        .declaration
+        .credential_binding
+        .as_ref()
+        .or(binding.credential_binding.as_ref())
+    else {
+        return Ok(());
+    };
+    Err(AgentDispatchError::collaborator(
+        "mcp-credential-missing",
+        format!(
+            "the MCP server {} names the credential binding {required}, and the attempt \
+             carries no resolved credential",
+            binding.server_id
+        ),
+    ))
 }
 
 /// Validates the bound servers and derives the tool routing table.

@@ -109,17 +109,28 @@ fn credential_binding() -> AgentCredentialBindingRef {
 /// validated budget — and every other class is allowed two, so a retry would
 /// be visible.
 fn policy(class: AgentEffectSafetyClass, behavior: AgentToolResultBehavior) -> McpToolPolicy {
+    let mut policy = unbound_policy(class, behavior);
+    policy.declaration = policy
+        .declaration
+        .with_credential_binding(credential_binding());
+    policy
+}
+
+/// [`policy`] without the tool-level credential binding: the declaration
+/// names none, so only a server-level binding could supply one.
+fn unbound_policy(
+    class: AgentEffectSafetyClass,
+    behavior: AgentToolResultBehavior,
+) -> McpToolPolicy {
     let attempts = if class == AgentEffectSafetyClass::NonIdempotent {
         1
     } else {
         2
     };
-    McpToolPolicy::new(
-        AgentToolDeclaration::new(class).with_credential_binding(credential_binding()),
-    )
-    .with_max_attempts(attempts)
-    .with_timeout_ms(TOOL_TIMEOUT_MS)
-    .with_result_behavior(behavior)
+    McpToolPolicy::new(AgentToolDeclaration::new(class))
+        .with_max_attempts(attempts)
+        .with_timeout_ms(TOOL_TIMEOUT_MS)
+        .with_result_behavior(behavior)
 }
 
 /// The fake server: an echo tool and a tool whose text answer is too large to
@@ -141,7 +152,8 @@ fn fake_server() -> FakeMcpServer {
 }
 
 /// The operator's binding for the fake: both tools under one safety class,
-/// and the server-level credential binding the publish-time sync reads.
+/// each tool's declaration and the server naming the same credential binding
+/// — a tool may repeat the server-level binding, never name another.
 fn server_binding(url: &str, class: AgentEffectSafetyClass) -> McpServerBinding {
     McpServerBinding::streamable_http(McpServerId::new(SERVER).expect("server id"), url)
         .with_tool(
@@ -152,6 +164,24 @@ fn server_binding(url: &str, class: AgentEffectSafetyClass) -> McpServerBinding 
         .with_tool(
             "big",
             policy(class, AgentToolResultBehavior::ArtifactReference),
+        )
+        .expect("the big tool binds")
+        .with_credential_binding(credential_binding())
+}
+
+/// The same binding with the credential named on the server alone: neither
+/// tool's declaration names one, so the dispatcher resolves it only because
+/// the publish-time sync copied it into each synced declaration.
+fn server_level_binding(url: &str, class: AgentEffectSafetyClass) -> McpServerBinding {
+    McpServerBinding::streamable_http(McpServerId::new(SERVER).expect("server id"), url)
+        .with_tool(
+            "echo",
+            unbound_policy(class, AgentToolResultBehavior::InlineBounded),
+        )
+        .expect("the echo tool binds")
+        .with_tool(
+            "big",
+            unbound_policy(class, AgentToolResultBehavior::ArtifactReference),
         )
         .expect("the big tool binds")
         .with_credential_binding(credential_binding())
@@ -186,8 +216,26 @@ impl McpWorld {
         egress: Arc<dyn McpEgressCheck>,
         sync_credential: Option<&AgentEphemeralCredential>,
     ) -> Self {
-        let endpoint = serve_fake(fake_server()).await;
-        let binding = server_binding(&endpoint.url, class);
+        Self::assemble(
+            fake_server(),
+            |url| server_binding(url, class),
+            egress,
+            sync_credential,
+        )
+        .await
+    }
+
+    /// Serves `fake`, syncs the binding `binding_of` builds for its URL, and
+    /// builds the executor behind `egress` — the one construction path every
+    /// world takes.
+    async fn assemble(
+        fake: FakeMcpServer,
+        binding_of: impl FnOnce(&str) -> McpServerBinding,
+        egress: Arc<dyn McpEgressCheck>,
+        sync_credential: Option<&AgentEphemeralCredential>,
+    ) -> Self {
+        let endpoint = serve_fake(fake).await;
+        let binding = binding_of(&endpoint.url);
         let http = ReqwestClient::new();
         let set = sync_mcp_descriptors(
             &http,
@@ -847,4 +895,64 @@ async fn the_secret_exclusion_scan_covers_the_mcp_types() {
             "every registered tool carries the reference it resolves from"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 6. A credential binding named on the server alone.
+// ---------------------------------------------------------------------------
+
+/// The operator names the credential on the server binding and on no tool:
+/// the publish-time sync copies it into each synced declaration, so the
+/// committed effect names it, the dispatcher resolves it, and it reaches the
+/// wire exactly as a tool-level binding would.
+#[tokio::test]
+async fn a_server_level_credential_binding_alone_reaches_the_wire_through_the_dispatcher() {
+    let world = McpWorld::assemble(
+        fake_server(),
+        |url| server_level_binding(url, AgentEffectSafetyClass::Idempotent),
+        Arc::new(McpAllowAllEgress),
+        None,
+    )
+    .await;
+    assert!(
+        world
+            .binding
+            .tools
+            .values()
+            .all(|policy| policy.declaration.credential_binding.is_none()),
+        "no tool declaration names the credential; only the server does"
+    );
+    assert_eq!(world.binding.credential_binding, Some(credential_binding()));
+    let fx = world.fixture(ECHO, json!({ "q": "refunds" }));
+
+    let effect = start_and_commit_the_tool_call(&fx).await;
+    assert_eq!(
+        effect.credential_binding,
+        Some(credential_binding()),
+        "the effect names the server-level binding the sync carried into the declaration"
+    );
+    let pass = fx.one_pass().await;
+    assert_eq!(
+        pass.invoked, 1,
+        "the pass dispatched the tool call: {pass:?}"
+    );
+    fx.pump().await;
+
+    assert_eq!(
+        resolutions(&fx),
+        1,
+        "the dispatcher resolved the server-level binding inside the attempt"
+    );
+    let seen = world.endpoint.server.seen_calls();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0]
+            .authorization
+            .as_deref()
+            .is_some_and(|value| value.ends_with(SENTINEL)),
+        "the resolved credential reached the wire: {:?}",
+        seen[0].authorization
+    );
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
 }

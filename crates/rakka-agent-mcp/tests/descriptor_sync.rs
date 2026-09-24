@@ -485,3 +485,63 @@ async fn a_refusing_egress_rule_stops_the_sync_before_any_request_is_made() {
     assert!(counting.sends() > 0);
     assert_eq!(endpoint.server.list_calls(), 1);
 }
+
+#[tokio::test]
+async fn a_server_level_credential_binding_reaches_every_synced_declaration_that_names_none() {
+    let endpoint = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(tool("search"))
+            .with_tool(tool("update")),
+    )
+    .await;
+    let reference =
+        rakka_agent::AgentCredentialBindingRef::new("crm-key").expect("the binding ref is valid");
+    // Only the server names the binding: neither tool's declaration does.
+    let server_level = binding(&endpoint.url).with_credential_binding(reference.clone());
+    assert!(server_level
+        .tools
+        .values()
+        .all(|policy| policy.declaration.credential_binding.is_none()));
+    let set = sync_mcp_descriptors(
+        &client(),
+        &server_level,
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("syncs");
+    for descriptor in &set.descriptors {
+        assert_eq!(
+            descriptor.binding.declaration().credential_binding.as_ref(),
+            Some(&reference),
+            "{}'s synced declaration carries the server-level binding",
+            descriptor.tool
+        );
+        assert_eq!(
+            descriptor
+                .binding
+                .effect_spec()
+                .expect("the spec validates")
+                .credential_binding
+                .as_ref(),
+            Some(&reference),
+            "{}'s effect spec — what the dispatcher resolves — names it",
+            descriptor.tool
+        );
+    }
+
+    // With no binding anywhere, nothing is invented.
+    let unbound = sync_mcp_descriptors(
+        &client(),
+        &binding(&endpoint.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("syncs");
+    assert!(unbound
+        .bindings()
+        .all(|binding| binding.declaration().credential_binding.is_none()));
+}
