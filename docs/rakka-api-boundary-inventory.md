@@ -37,6 +37,9 @@ Component crates continue to own implementation-specific concepts:
 - `rakka-agent-knowledge-graph` owns the database-agnostic communal
   knowledge-graph domain, portable store SPI, and backend conformance harness;
   `rakka-agent-knowledge-graph-postgres` owns its PostgreSQL binding.
+- `rakka-agent-mcp` owns the MCP client adapter: server bindings, publish-time
+  descriptor sync, the dispatch executor over an injected transport client
+  behind a required egress check, and the child-process launcher seam.
 - `rakka-testkit` owns test/support helpers.
 
 ## Crate Inventory

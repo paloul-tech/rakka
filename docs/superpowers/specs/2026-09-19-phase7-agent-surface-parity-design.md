@@ -83,6 +83,43 @@ model-visible tool list is computed by the authority onto the grant;
 example walk asserts structural facts, not the acceptance transcript. Plan:
 `docs/superpowers/plans/2026-09-21-phase7-slice-7-1-wired-model-providers.md`.
 
+**Plan refinements (2026-09-22, slice 7.7 plan).** Twelve details the tree
+forced while planning slice 7.7, each marked inline as a plan refinement: no
+clock — `synced_at` is a plain parameter to sync and the dispatch-time
+recheck cache is monotonic in-process, not an injected `AgentClock`;
+`transport-io` joins the pinned `rmcp` features (a launcher's transport
+needs it) and `http` is a non-optional dependency, since rmcp re-exports
+neither for the credential-to-header step; `sync_mcp_descriptors` takes five
+arguments — `synced_at` and the `McpEgressCheck` are both required, so
+publish-time sync is gated exactly like a dispatch attempt — and
+`sync_mcp_descriptors_over` is its launcher-transport twin, which takes no
+egress check because nothing is dialed; `McpDescriptorRefresh` is `Manual |
+Interval { millis }` with `Listen` decoding but deferred (rmcp 3.4.0 ships no
+`subscriptions/listen`, and a listening session would contradict the
+stateless per-attempt client), `mcp_descriptor_staleness(stored, fresh)` the
+seam a deployment drives on its own timer for `Interval` instead; peer
+identity for the agent-channel rule is read from the initialize handshake
+(`peer_info().server_info.name`), not a separate `server/discover` call;
+`McpSyncedDescriptor::with_input_schema_artifact` (not
+`with_input_schema_ref`) records where an oversized schema was stored; every
+digest is SHA-256 (`AgentContentDigest::sha256_of_json`), and a tool name may
+contain dots; the hint rule only narrows a declaration, never widens one, and
+is ignored otherwise; the dispatch-time recheck's TTL is executor-configured
+(`with_descriptor_recheck_ttl_ms`, default 60 000 ms, `0` forces a recheck
+every attempt) behind the registered `tool-descriptor-revision-mismatch`; the
+executor's artifact store is `McpArtifactStore`, a mutex-guarded store, and
+its egress check lives inside `client::connect` itself, with `with_launcher`
+joining `with_child_process_launcher` as a second way to install one;
+`McpChildTransport` is an enum (`Pair` always, `Process` under
+`child-process`), and a credential is refused on a `ChildProcess` binding at
+`validate`, not deferred to dispatch, with every other transport-level
+failure — including the whole attempt's own deadline — the registered
+`mcp-transport-failed`; and the dispatcher proofs (`tests/mcp_client_dispatch.rs`)
+live in `rakka-agent`, reached through the crate's own unversioned
+dev-dependency cycle on `rakka-agent-mcp`'s `testkit` feature, not inside
+`rakka-agent-mcp` itself. Plan:
+`docs/superpowers/plans/2026-09-22-phase7-slice-7-7-mcp-client.md`.
+
 ## Summary
 
 **What this phase delivers.** Eight capabilities, each a decision section below:
@@ -730,6 +767,15 @@ feature, off by default (5.3, condition b). The pin, its feature list, and
 the MCP revision (`2026-07-28`, compatible `2025-11-25`) are recorded in the
 compatibility document's pin table. Facade feature `agent-mcp`.
 
+(plan refinement 2026-09-22) `transport-io` joins the pinned feature list
+(a launcher's `AsyncRead`/`AsyncWrite` pair is a transport only under it),
+and `http = "1"` is a non-optional dependency: rmcp re-exports neither
+`http` nor `reqwest`, and the credential-to-header step has to name the
+same `HeaderName`/`HeaderValue` types rmcp's own transport config takes. No
+clock: the crate constructs no `AgentClock` anywhere; `synced_at` is a plain
+parameter to descriptor sync (5.2) and the dispatch-time recheck cache
+(5.3) is monotonic in-process.
+
 ### 5.2 Server binding and descriptor sync
 
 ```rust
@@ -771,7 +817,21 @@ pub struct McpSyncedDescriptor {
 }
 ```
 
-It performs no I/O beyond `server/discover` and `tools/list`, touches no
+(plan refinement 2026-09-22) The shipped signature takes five arguments, not
+three: `sync_mcp_descriptors(http, &binding, credential, synced_at, &dyn
+McpEgressCheck)`. There is no clock inside the crate — `synced_at` is the
+caller's own timestamp, a plain parameter rather than something read from an
+injected `AgentClock` — and the egress check is required here exactly as it
+is at dispatch, so a publish-time sync is gated on the same terms as a
+dispatch attempt, before a client exists. `sync_mcp_descriptors_over(transport,
+&binding, synced_at)` is the launcher-produced-transport twin: it takes no
+egress check, because nothing is dialed, and no deadline of its own — the
+caller bounds it. Every digest here and on `McpDescriptorSet::digest()` is
+SHA-256 (`AgentContentDigest::sha256_of_json`), and a tool name may itself
+contain dots: nothing splits a tool id on them, so `mcp.<server_id>.` is
+still a stable, unambiguous prefix.
+
+It performs no I/O beyond the initialize handshake and `tools/list`, touches no
 store, and returns each allowed tool's `AgentToolBinding` together with the
 raw input schema and its digest, so a deployment runs it at publish time — an
 administrative operation, outside any run — and stores the result as release
@@ -779,25 +839,33 @@ data. It converts each allowed tool to an `AgentToolDescriptor { kind:
 RemoteMcp, description, parameters: inputSchema when ≤ 4 KiB, output_schema
 from outputSchema digest, version: from the schema digest }`; a schema over
 4 KiB is returned raw with the descriptor's `input_schema` left unset, for the
-caller to store as an artifact and reference (`McpSyncedDescriptor::with_input_schema_ref`);
+caller to store as an artifact and reference (plan refinement 2026-09-22:
+`McpSyncedDescriptor::with_input_schema_artifact`, not `with_input_schema_ref`
+as first drafted);
 a schema over `MCP_DESCRIPTOR_SCHEMA_MAX_BYTES` (64 KiB) is refused
 `mcp-descriptor-schema-too-large`; a transport or protocol failure during
 sync is `mcp-descriptor-sync-failed` (the version fallback of 5.3 applies
 first). For a child-process binding the same function runs over the
 transport the launcher (5.3) produced. MCP tool annotations (`readOnlyHint`,
 `idempotentHint`, `destructiveHint`) never widen a declaration; with
-`honor_hints` they may only narrow (a `destructiveHint: true` on a tool
-declared `Idempotent` refuses registration,
-`mcp-hint-contradicts-declaration`). Names are prefixed
+`honor_hints` they may only narrow (plan refinement 2026-09-22: precisely, a
+`destructiveHint: true` or an `idempotentHint: false` against a tool declared
+`ReadOnly`/`Idempotent`, or a `readOnlyHint: false` against `ReadOnly`, refuses
+registration under `mcp-hint-contradicts-declaration`; a hint that does not
+contradict the declaration is ignored). Names are prefixed
 `mcp.<server_id>.<tool>` to keep the registry namespace flat and stable.
 
 `McpDescriptorRefresh::Manual` is the default: a registry built from a stored
 `McpDescriptorSet` makes no network call at construction, which is what
-"agents are instantiated only from releases" requires. `Interval` and `Listen`
-are optional, for a deployment that owns its own registry-rebuild schedule:
-`Listen` subscribes to `subscriptions/listen` for `toolsListChanged` and marks
-the binding stale; `Interval` re-runs the sync on a timer and marks it stale
-on a digest change. Neither rebuilds a registry by itself.
+"agents are instantiated only from releases" requires. (plan refinement
+2026-09-22) `Interval { millis }` ships; `Listen` stays a decodable variant
+but is deferred rather than implemented — rmcp 3.4.0 has no
+`subscriptions/listen`, and a listening session would contradict the
+stateless per-attempt client every other path in this crate holds to.
+`mcp_descriptor_staleness(stored, fresh)` is the seam a deployment calls on
+its own timer to serve `Interval` in the meantime: it compares a stored set
+against a freshly synced one and reports added, removed, and changed tools.
+Neither rebuilds a registry by itself.
 
 Because `AgentToolRegistry` is immutable, a descriptor change is a new
 registry build. The grant already records the descriptor's schema digest; the
@@ -809,10 +877,13 @@ refresh mode: stored descriptors say what was published; the recheck says
 whether the server still agrees.
 
 Rule preserved: MCP is never an agent-to-agent channel (spec 14.4). A
-`McpServerBinding` whose `server/discover` identity names a Rakka agent server
-(`serverInfo.name` prefixed `rakka-agent`) is refused at registration
+`McpServerBinding` whose peer identifies as a Rakka agent server is refused
 (`mcp-peer-agent-channel-refused`), so a later Rakka MCP server cannot become
-a side channel between agents.
+a side channel between agents. (plan refinement 2026-09-22) Identity is read
+from the initialize handshake itself, not a separate `server/discover` call:
+`peer_info().server_info.name` prefixed `rakka-agent`
+(`MCP_PEER_AGENT_SERVER_PREFIX`), checked identically by `sync_mcp_descriptors`
+and by the executor's own `connect` at every dispatch attempt.
 
 ### 5.3 Client executor
 
@@ -846,6 +917,24 @@ pub trait McpChildProcessLauncher: Send + Sync + 'static {
 }
 ```
 
+(plan refinement 2026-09-22) No clock: the shipped executor holds no
+`clock: Arc<dyn AgentClock>` field and `new`/`with_launcher` take no clock
+argument; the descriptor recheck's cache is monotonic in-process instead.
+`artifacts` is `McpArtifactStore` (`Arc<tokio::sync::Mutex<dyn
+AgentArtifactStore + Send>>`), a mutex-guarded store rather than a bare
+`Arc<dyn AgentArtifactStore>`. `with_launcher(descriptors, bindings,
+artifacts, http, egress, launcher)` is a second, full constructor beside
+`with_child_process_launcher(self, launcher)`: it takes every argument `new`
+does plus the launcher, and admits `ChildProcess` bindings directly, where
+`with_child_process_launcher` is the builder that installs one onto an
+executor `new` already refused them from. `McpChildTransport` is an enum —
+`Pair { reader, writer }`, always available (the `transport-io` feature is
+not conditional), and `Process(rmcp::transport::TokioChildProcess)` under
+`child-process` — rather than a single concrete type; dropping a `Process`
+variant needs a Tokio runtime. `with_descriptor_recheck_ttl_ms` (default
+`MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS` = 60 000 ms; `0` rechecks on every
+attempt) and `bound_tools` are additional builder/accessor methods.
+
 The three conditions, each a stated invariant of the host:
 
 - **(a) Transport client injection.** The executor takes the HTTP client it
@@ -863,6 +952,14 @@ The three conditions, each a stated invariant of the host:
   without a policy is to pass `McpAllowAllEgress` by name, which is the
   in-cluster and test case and is visible in review. This is stricter than
   the fail-closed refusal the host suggested and needs no runtime check.
+  (plan refinement 2026-09-22) The check lives inside `client::connect`
+  itself — the one function both `sync_mcp_descriptors` and the executor's
+  per-attempt dial go through — rather than being re-implemented at each
+  caller, so *being connected* and *having passed the rule* are the same
+  event by construction. `connect_over` (the child-process path) is public,
+  non-generic, and takes no credential and no egress check: a stdio child is
+  reached over a pipe the deployment's launcher produced, not a URL anything
+  could dial, and it refuses a binding that names an HTTP transport.
 - **(b) No child process without a launcher.** `McpTransport::ChildProcess`
   stays a variant so a binding deserializes and is refused deterministically:
   `new` refuses it with `mcp-transport-unsupported` unless a launcher is
@@ -881,7 +978,12 @@ The three conditions, each a stated invariant of the host:
   dispatcher resolves it inside the attempt and passes it to `execute`; the
   executor sets the binding's declared header (`Authorization: Bearer ..` by
   default) from it for that attempt and never reads an environment variable,
-  a file, or a profile attribute for one.
+  a file, or a profile attribute for one. (plan refinement 2026-09-22) A
+  credential binding on a `ChildProcess` transport — at the server level or
+  on any individual tool declaration — is refused at `McpServerBinding::validate`
+  (`mcp-binding-invalid`), not deferred to dispatch: a stdio child has no
+  header to carry one, so binding construction is where that mismatch is
+  caught.
 
 Per attempt: build an `rmcp` client for the binding's transport over the
 injected client or the launcher's transport (stateless in 2026-07-28, so per
@@ -901,6 +1003,22 @@ map:
 | `UnsupportedProtocolVersionError` | retried once with the next listed version, then `mcp-protocol-unsupported` |
 | transport error, timeout from `intent.timeout_ms` | the existing failure classes; safety class decides retry |
 
+(plan refinement 2026-09-22) The whole attempt — connect and initialize, the
+dispatch-time descriptor recheck's `tools/list`, the call itself, and result
+mapping including the artifact write — runs under one shared deadline derived
+from the intent's `timeout_ms`; a timeout anywhere inside it is
+`mcp-transport-failed`, and unlike every other code in the table above this
+one is an `AgentDispatchError::Invocation` and is recorded as the error code
+itself rather than wrapped as `dispatch-collaborator-failed` with the inner
+code carried in the bounded detail. Every other row's determinacy still
+follows the binding's declared safety class, and every code above reaches
+the durable outbox row and the fleet index's `last_error_code` composed as
+`<code>: <message>` beside the pipeline's own `dispatch-collaborator-failed`.
+An artifact write is stamped `sha256:<hex>` and keyed
+`mcp-<effect id>-g<generation>-<call id>` — the effect id itself contains
+`/`, so an `AgentArtifactStore` implementation must accept a key with slashes
+in it.
+
 Guardrails at `ToolRequest` and `ToolResponse` apply unchanged; an MCP response
 is untrusted content and enters memory classified `Unclassified` like any tool
 result.
@@ -909,7 +1027,10 @@ Composition: the dispatcher holds one `tools: Arc<dyn AgentDispatchToolExecutor>
 so `rakka-agent` gains `AgentToolExecutorRouter`, routing by tool id prefix or
 binding kind to an executor, with a fallback. MCP, function, and process
 executors compose through it; a deployment with its own tiers wires the MCP
-executor as one more route and keeps its tiers as they are.
+executor as one more route and keeps its tiers as they are. (plan refinement
+2026-09-22) The router also resolves by the tool's registry-declared kind
+between the prefix match and the fallback; an exact tool id always wins
+first, and arguments never influence routing.
 
 ### 5.4 Tests
 
@@ -919,16 +1040,37 @@ executor as one more route and keeps its tiers as they are.
   and its output round-trips through serialization; a registry built from
   the stored set makes no network call (the fake server counts `tools/list`);
   `Manual` is the default; the 4 KiB and 64 KiB schema bounds.
-- `tests/client_dispatch.rs`: `tools/call` through the real dispatcher with
-  `ScriptedCredentialResolver`; idempotency key in `_meta`; artifact overflow;
-  `isError`; MRTR refusal; version fallback; descriptor mismatch refusal; the
+- `crates/rakka-agent-mcp/tests/client_dispatch.rs`: `tools/call` driven
+  directly against `McpDispatchToolExecutor::execute` (not the real
+  dispatcher — see the plan refinement below) over the in-process fake
+  server; idempotency key in `_meta`; artifact overflow; `isError`; MRTR
+  refusal; version fallback; descriptor mismatch refusal; the
   `secret_exclusion` scan extended to MCP types; (added 2026-09-20) a counting
   client fake proves every send goes through the injected client; an egress
   check refusal fails the attempt before any client is built and after the
   credential was dropped, and `McpAllowAllEgress` is the one opt-out (R17);
   a `ChildProcess` binding is refused
   `mcp-transport-unsupported` without a launcher and runs through a fake
-  launcher with one; the credential arrives only through the resolver.
+  launcher with one; the credential arrives only through the argument
+  `execute` takes, never a resolver — the file constructs no dispatcher.
+
+(plan refinement 2026-09-22) The proof that a tool call runs through the
+*real* dispatcher — `AgentDispatchAuthority`, the durable outbox, and a
+credential resolved by the pipeline itself and handed to the executor,
+rather than passed to `execute` by the test — lives in
+`crates/rakka-agent/tests/mcp_client_dispatch.rs`, not in
+`rakka-agent-mcp`: an MCP tool call dispatches through the router with the
+resolved credential; the credential never reaches a durable record or the
+fleet index; an egress refusal fails the attempt under the deployment's own
+code after the credential was resolved and dropped; a large result reaches
+the artifact store and the run records the reference; the secret-exclusion
+scan covers the MCP types. It reaches `rakka-agent` through the crate's own
+unversioned, path-only dev-dependency cycle on `rakka-agent-mcp`'s
+`testkit` feature (5.1) — a shape Cargo permits for dev-dependencies and
+that publishing strips, so the cycle never reaches a registry — because the
+pipeline fixture (`tests/common/mod.rs`'s `AuthorityFixture`) is test
+support, not exported API, and belongs beside the other dispatcher proofs
+rather than duplicated into the adapter crate.
 
 ## 6. Response guardrails
 
@@ -1541,7 +1683,17 @@ fingerprint survive `build()` unchanged).
   `mcp-result-too-large`, `mcp-hint-contradicts-declaration`,
   `mcp-peer-agent-channel-refused`, `mcp-transport-unsupported`,
   `mcp-descriptor-schema-too-large`, `mcp-descriptor-sync-failed`,
-  `tool-descriptor-revision-mismatch`, `plan-builder-unknown-endpoint`,
+  `tool-descriptor-revision-mismatch` (plan refinement 2026-09-22: four more
+  MCP codes join this list, for fourteen total —
+  `mcp-binding-invalid` (a `McpServerBinding::validate` refusal),
+  `mcp-tool-unbound` (a call naming a tool the executor holds no route for),
+  `mcp-credential-material-unsupported` (a resolved credential whose
+  material cannot become an HTTP header), and `mcp-transport-failed` (every
+  other transport/protocol failure and the whole attempt's own deadline; an
+  `AgentDispatchError::Invocation` code, recorded as the error code itself
+  rather than wrapped in `dispatch-collaborator-failed`). Rakka registers no
+  code of its own for an egress refusal: that failure rides the deployment's
+  own `McpEgressCheck` vocabulary), `plan-builder-unknown-endpoint`,
   `plan-builder-port-not-allowed`, `directory-tenant-mismatch`. The
   registry-backed check the plan owes (slice 6.4) is a good companion.
 - Pins added to the compatibility table: `rmcp =3.4.0` with features
