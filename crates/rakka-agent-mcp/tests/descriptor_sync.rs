@@ -12,15 +12,19 @@ use rakka_agent::{
     AgentEffectSafetyClass, AgentToolDeclaration, AgentToolKind, AgentToolRegistry,
     AGENT_TOOL_PARAMETERS_MAX_BYTES,
 };
-use rakka_agent_mcp::testkit::{serve_fake, CountingClient, FakeMcpServer, FakeTool};
+use rakka_agent_mcp::testkit::{
+    serve_fake, CountingClient, FakeMcpEndpoint, FakeMcpServer, FakeTool,
+};
 use rakka_agent_mcp::{
-    mcp_descriptor_staleness, sync_mcp_descriptors, McpAllowAllEgress, McpDescriptorSet,
-    McpDescriptorStaleness, McpEgressCheck, McpServerBinding, McpServerId, McpToolPolicy,
-    MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
+    mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over, McpAllowAllEgress,
+    McpDescriptorSet, McpDescriptorStaleness, McpEgressCheck, McpServerBinding, McpServerId,
+    McpToolPolicy, MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
 use rmcp::model::ToolAnnotations;
 use serde_json::json;
+
+mod support;
 
 fn schema(props: usize) -> serde_json::Value {
     let mut properties = serde_json::Map::new();
@@ -355,6 +359,121 @@ async fn version_negotiation_falls_back_to_the_next_listed_version_or_refuses() 
     .await
     .expect_err("no common version");
     assert_eq!(error.code(), "mcp-protocol-unsupported");
+}
+
+/// A server that predates 2026-07-28, listing both tools, supporting
+/// `versions`.
+async fn legacy_server(versions: Vec<rmcp::model::ProtocolVersion>) -> FakeMcpEndpoint {
+    serve_fake(
+        FakeMcpServer::new()
+            .with_tool(tool("search"))
+            .with_tool(tool("update"))
+            .with_supported_versions(versions)
+            .with_legacy_only(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_legacy_server_that_does_not_know_discover_is_reached_through_the_initialize_fallback() {
+    use rmcp::model::ProtocolVersion;
+
+    // The default binding lists 2025-11-25, so the client probes with
+    // `server/discover`, reads the method-not-found as a legacy server, and
+    // falls back to `initialize` on the same transport.
+    let legacy = legacy_server(ProtocolVersion::KNOWN_VERSIONS.to_vec()).await;
+    let set = sync_mcp_descriptors(
+        &client(),
+        &binding(&legacy.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("a 2025-11-25 server is reachable");
+    assert_eq!(set.protocol_version, "2025-11-25");
+    assert_eq!(
+        set.server_name, "fake-mcp-server",
+        "the identity came from the initialize result"
+    );
+    assert_eq!(set.descriptors.len(), 2);
+    assert_eq!(legacy.server.list_calls(), 1);
+
+    // A binding that lists only 2026-07-28 is negotiated by discovery alone,
+    // which does not fall back: the same server is unreachable to it.
+    let modern_only = binding(&legacy.url).with_protocol_versions(vec!["2026-07-28".to_string()]);
+    let error = sync_mcp_descriptors(
+        &client(),
+        &modern_only,
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("discovery alone cannot reach a legacy server");
+    assert_eq!(error.code(), "mcp-descriptor-sync-failed", "{error}");
+    assert!(
+        error.to_string().contains("JsonRpcError(-32601)"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_server_that_shares_no_listed_version_is_refused_as_protocol_unsupported() {
+    use rmcp::model::ProtocolVersion;
+
+    // The server refuses `initialize` outright: it supports no version that
+    // still has the handshake. Both phases failed, and the fallback's version
+    // refusal is the one reported. Over a launcher's stdio pair: rmcp's
+    // Streamable HTTP server drops the session of a failed `initialize`
+    // rather than answering it, so the refusal itself only reaches a client
+    // over a stream transport.
+    let refusing = FakeMcpServer::new()
+        .with_tool(tool("search"))
+        .with_tool(tool("update"))
+        .with_supported_versions(vec![ProtocolVersion::V_2026_07_28])
+        .with_legacy_only();
+    let child = McpServerBinding::child_process(
+        McpServerId::new("crm").expect("id"),
+        support::spec_artifact_ref(),
+    )
+    .with_tool("search", declared(AgentEffectSafetyClass::ReadOnly))
+    .expect("tool")
+    .with_tool("update", declared(AgentEffectSafetyClass::Idempotent))
+    .expect("tool");
+    let error = sync_mcp_descriptors_over(
+        support::duplex_transport(refusing),
+        &child,
+        AgentTimestampMillis::new(1),
+    )
+    .await
+    .expect_err("no common version");
+    assert_eq!(error.code(), "mcp-protocol-unsupported", "{error}");
+
+    // The server answers `initialize` with a version the binding never
+    // offered. rmcp's legacy handshake accepts whatever the server answers,
+    // so the session is held to the binding's list after the fact.
+    let older = legacy_server(vec![
+        ProtocolVersion::V_2025_06_18,
+        ProtocolVersion::V_2026_07_28,
+    ])
+    .await;
+    let error = sync_mcp_descriptors(
+        &client(),
+        &binding(&older.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("2025-06-18 is not a version the binding lists");
+    assert_eq!(error.code(), "mcp-protocol-unsupported", "{error}");
+    assert!(error.to_string().contains("2025-06-18"), "{error}");
+    assert_eq!(
+        older.server.list_calls(),
+        0,
+        "the refused session listed nothing"
+    );
 }
 
 #[tokio::test]

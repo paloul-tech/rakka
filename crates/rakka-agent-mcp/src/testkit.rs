@@ -19,8 +19,9 @@ use futures_util::stream::BoxStream;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage, ContentBlock,
-    CreateTaskResult, InputRequiredResult, ListToolsResult, PaginatedRequestParams,
-    ProtocolVersion, ServerCapabilities, ServerConfig, Task, TaskStatus, Tool, ToolAnnotations,
+    CreateTaskResult, DiscoverRequestMethod, DiscoverResult, InputRequiredResult, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Task, TaskStatus,
+    Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_client::{
@@ -179,6 +180,7 @@ struct FakeState {
     versions: Vec<ProtocolVersion>,
     list_calls: usize,
     list_delay: Option<Duration>,
+    legacy_only: bool,
     calls: Vec<SeenCall>,
     last_headers: Vec<(String, String)>,
 }
@@ -211,6 +213,7 @@ impl FakeMcpServer {
                 versions: ProtocolVersion::KNOWN_VERSIONS.to_vec(),
                 list_calls: 0,
                 list_delay: None,
+                legacy_only: false,
                 calls: Vec::new(),
                 last_headers: Vec::new(),
             })),
@@ -248,6 +251,19 @@ impl FakeMcpServer {
     #[must_use]
     pub fn with_list_delay(self, millis: u64) -> Self {
         self.lock().list_delay = Some(Duration::from_millis(millis));
+        self
+    }
+
+    /// Makes the server one that predates the 2026-07-28 revision: it answers
+    /// `server/discover` with method-not-found, as a server that has never
+    /// heard of the method does, and is reachable only through the legacy
+    /// `initialize` handshake, which negotiates among the versions
+    /// [`Self::with_supported_versions`] set — a client that requests one of
+    /// them gets it back, and one that requests another gets the newest of
+    /// them that still has an `initialize` handshake.
+    #[must_use]
+    pub fn with_legacy_only(self) -> Self {
+        self.lock().legacy_only = true;
         self
     }
 
@@ -320,6 +336,20 @@ impl ServerHandler for FakeMcpServer {
 
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
         std::borrow::Cow::Owned(self.lock().versions.clone())
+    }
+
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, McpError> {
+        if self.lock().legacy_only {
+            return Err(McpError::method_not_found::<DiscoverRequestMethod>());
+        }
+        // rmcp's own default, restated: overriding the method replaces it.
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        ))
     }
 
     async fn list_tools(

@@ -12,7 +12,11 @@
 //!   ([`StreamableHttpError::UnexpectedServerResponse`] carries a body
 //!   preview).
 //! - Protocol versions are negotiated from the binding's declared list, newest
-//!   first, and an unknown version is refused rather than sent.
+//!   first, and an unknown version is refused rather than sent. A binding that
+//!   lists a revision older than 2026-07-28 is reached through rmcp's `Auto`
+//!   lifecycle — `server/discover` first, the legacy `initialize` handshake
+//!   when the server answers it as a legacy server does — and every session,
+//!   whichever handshake opened it, is held to a version the binding lists.
 //! - A server that identifies as a Rakka agent is refused after the session is
 //!   closed ([specification 14.4]): MCP is never an agent-to-agent channel.
 //! - Every outbound connection passes the host's [`McpEgressCheck`] here, in
@@ -37,7 +41,7 @@ use std::time::Duration;
 use http::{HeaderName, HeaderValue};
 use rakka_agent::AgentAuthorityRefusal;
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentEphemeralCredentialMaterial};
-use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, ProtocolVersion};
+use rmcp::model::{ClientCapabilities, ClientConfig, ErrorCode, Implementation, ProtocolVersion};
 use rmcp::service::{
     serve_client_with_lifecycle, ClientInitializeError, ClientLifecycleMode, Peer, RoleClient,
     RunningService, ServiceError,
@@ -48,7 +52,8 @@ use rmcp::transport::streamable_http_client::{
 use rmcp::transport::IntoTransport;
 
 use crate::binding::{
-    McpServerBinding, McpServerId, McpTransport, MCP_CLIENT_NAME, MCP_PEER_AGENT_SERVER_PREFIX,
+    is_protocol_version_shaped, McpServerBinding, McpServerId, McpTransport, MCP_CLIENT_NAME,
+    MCP_PEER_AGENT_SERVER_PREFIX,
 };
 use crate::launcher::{concrete_pair, McpChildTransport};
 
@@ -375,7 +380,8 @@ pub async fn connect_over(
 }
 
 /// The handshake every session shares, over whichever transport the caller
-/// built: negotiate from the binding's declared versions, then [`finish`].
+/// built: negotiate from the binding's declared versions under the lifecycle
+/// they call for ([`lifecycle`]), then [`finish`].
 async fn open_session<T, E, A>(
     transport: T,
     binding: &McpServerBinding,
@@ -385,24 +391,70 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     let server = binding.server_id.to_string();
-    let preferred_versions = preferred_versions(binding)?;
-    let running = serve_client_with_lifecycle(
-        client_info(),
-        transport,
-        ClientLifecycleMode::Discover { preferred_versions },
-    )
-    .await
-    .map_err(|error| initialize_error(&server, &error))?;
-    finish(running, &server).await
+    let offered = preferred_versions(binding)?;
+    let running = serve_client_with_lifecycle(client_info(), transport, lifecycle(offered.clone()))
+        .await
+        .map_err(|error| initialize_error(&server, &offered, &error))?;
+    finish(running, &server, &offered).await
+}
+
+/// The first MCP revision that has no `initialize` handshake: from it on, a
+/// session is negotiated by `server/discover` alone.
+const DISCOVER_ONLY_SINCE: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+
+/// The lifecycle the declared versions call for.
+///
+/// A binding that lists only 2026-07-28 or later is negotiated by `Discover`,
+/// which does not fall back: a server that cannot answer `server/discover`
+/// cannot speak any version the binding lists.
+///
+/// A binding that lists an older revision is negotiated by `Auto`: rmcp probes
+/// with `server/discover` first, and when the server answers the probe as a
+/// server that predates 2026-07-28 does — a correlated JSON-RPC error, such as
+/// method-not-found, that is not a modern-era rejection
+/// (`rmcp-3.4.0/src/service/client.rs:1032`–`1043`) — or does not answer it
+/// within rmcp's ten-second probe window (`:657`), it runs the legacy
+/// `initialize` handshake on the same transport (`:799`–`:842`). The version
+/// that handshake requests is the *newest* legacy revision the binding lists,
+/// the one the 2025-11-25 lifecycle says a client should send; a server that
+/// answers with an older one is still held to the binding's list by
+/// [`finish`], because rmcp's legacy handshake accepts whatever version the
+/// server answers.
+fn lifecycle(preferred_versions: Vec<ProtocolVersion>) -> ClientLifecycleMode {
+    let legacy_version = preferred_versions
+        .iter()
+        .filter(|version| version.as_str() < DISCOVER_ONLY_SINCE.as_str())
+        .max_by(|left, right| left.as_str().cmp(right.as_str()))
+        .cloned();
+    match legacy_version {
+        None => ClientLifecycleMode::Discover { preferred_versions },
+        legacy_version => ClientLifecycleMode::Auto {
+            preferred_versions,
+            legacy_version,
+        },
+    }
 }
 
 /// The step every session shares once rmcp has a running service: read the
-/// negotiated version and the peer's name, and refuse a peer that identifies
-/// as a Rakka agent — closing the session first, so the refusal leaves nothing
-/// open.
+/// negotiated version and the peer's name, refuse a version the binding does
+/// not list, and refuse a peer that identifies as a Rakka agent — closing the
+/// session first, so a refusal leaves nothing open.
+///
+/// The version check matters for the legacy handshake alone — `server/discover`
+/// only ever selects from the offered list — but it runs for every session, so
+/// no path can hold one the binding did not declare.
+///
+/// The identity check reads what the server reported: `serverInfo` from the
+/// `initialize` result, or from the `_meta` of a `server/discover` result
+/// (`rmcp-3.4.0/src/model.rs:1290`–`1295`, `:1373`). A server that reports no
+/// `serverInfo` at all reads as an empty name and passes. That is the
+/// cooperative threat model the rule is written for — it keeps a Rakka agent
+/// served over MCP, which identifies itself, from becoming a side channel
+/// between agents — and not a defence against a server that hides what it is.
 async fn finish(
     running: RunningService<RoleClient, ClientConfig>,
     server: &str,
+    offered: &[ProtocolVersion],
 ) -> Result<McpClientSession, McpClientError> {
     let Some(peer_info) = running.peer_info() else {
         let _ = running.cancel().await;
@@ -412,6 +464,14 @@ async fn finish(
         });
     };
     let negotiated = peer_info.protocol_version.clone();
+    if !offered.contains(&negotiated) {
+        let _ = running.cancel().await;
+        return Err(McpClientError::ProtocolUnsupported {
+            server: server.to_string(),
+            client: version_labels(offered),
+            server_versions: reported_versions([negotiated.as_str()]),
+        });
+    }
     let server_name = peer_info
         .server_info
         .as_ref()
@@ -507,6 +567,33 @@ fn credential_headers(
     }
 }
 
+/// The most protocol versions a refusal reports the server as supporting.
+const REPORTED_VERSIONS_MAX: usize = 16;
+
+/// The labels of versions this client offered.
+fn version_labels(versions: &[ProtocolVersion]) -> Vec<String> {
+    versions
+        .iter()
+        .map(|version| version.as_str().to_string())
+        .collect()
+}
+
+/// The versions a server reported, as a refusal may carry them: only entries
+/// shaped `YYYY-MM-DD`, and at most [`REPORTED_VERSIONS_MAX`] of them.
+///
+/// The list is server-chosen text — rmcp's `ProtocolVersion` decodes any
+/// string (`rmcp-3.4.0/src/model.rs:241`) — and a refusal is written to the
+/// run's durable outbox row, so neither an arbitrary string nor an unbounded
+/// list of them may ride it.
+fn reported_versions<'a>(versions: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    versions
+        .into_iter()
+        .filter(|version| is_protocol_version_shaped(version))
+        .take(REPORTED_VERSIONS_MAX)
+        .map(str::to_string)
+        .collect()
+}
+
 /// Maps an rmcp initialization failure by variant name.
 ///
 /// Never by `Display`: [`ClientInitializeError::JsonRpcError`] and the
@@ -514,7 +601,17 @@ fn credential_headers(
 /// [`ClientInitializeError::ExpectedInitResponse`] embeds the whole response.
 /// A JSON-RPC code is a number the peer cannot steer text through, so it is
 /// the one detail carried through.
-fn initialize_error(server: &str, error: &ClientInitializeError) -> McpClientError {
+///
+/// A version refusal is [`McpClientError::ProtocolUnsupported`] wherever it
+/// surfaces: rmcp's own `NoCompatibleProtocolVersion`, and a JSON-RPC
+/// `UNSUPPORTED_PROTOCOL_VERSION` error (-32022) — which is how a server
+/// refuses the legacy `initialize` handshake when it supports no version that
+/// still has one.
+fn initialize_error(
+    server: &str,
+    offered: &[ProtocolVersion],
+    error: &ClientInitializeError,
+) -> McpClientError {
     let server = server.to_string();
     match error {
         ClientInitializeError::NoCompatibleProtocolVersion {
@@ -522,15 +619,30 @@ fn initialize_error(server: &str, error: &ClientInitializeError) -> McpClientErr
             server_supported,
         } => McpClientError::ProtocolUnsupported {
             server,
-            client: client_supported
-                .iter()
-                .map(|version| version.as_str().to_string())
-                .collect(),
-            server_versions: server_supported
-                .iter()
-                .map(|version| version.as_str().to_string())
-                .collect(),
+            client: version_labels(client_supported),
+            server_versions: reported_versions(
+                server_supported.iter().map(ProtocolVersion::as_str),
+            ),
         },
+        ClientInitializeError::JsonRpcError(data)
+            if data.code == ErrorCode::UNSUPPORTED_PROTOCOL_VERSION =>
+        {
+            let supported = data
+                .data
+                .as_ref()
+                .and_then(|data| data.get("supported"))
+                .and_then(serde_json::Value::as_array);
+            McpClientError::ProtocolUnsupported {
+                server,
+                client: version_labels(offered),
+                server_versions: reported_versions(
+                    supported
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str),
+                ),
+            }
+        }
         ClientInitializeError::TransportError { .. } => McpClientError::Transport {
             server,
             reason: "TransportError".to_string(),
@@ -567,16 +679,63 @@ fn initialize_error(server: &str, error: &ClientInitializeError) -> McpClientErr
             server,
             reason: "NoPreferredProtocolVersion".to_string(),
         },
-        ClientInitializeError::LegacyFallbackFailed { .. } => McpClientError::Protocol {
-            server,
-            reason: "LegacyFallbackFailed".to_string(),
-        },
+        ClientInitializeError::LegacyFallbackFailed { discover, fallback } => {
+            legacy_fallback_failed(
+                server.clone(),
+                initialize_error(&server, offered, discover),
+                initialize_error(&server, offered, fallback),
+            )
+        }
         // `ClientInitializeError` is `#[non_exhaustive]`: a version rmcp adds
         // later must not become an unmapped panic or a leaked `Display`.
         _ => McpClientError::Protocol {
             server,
             reason: "Unrecognized".to_string(),
         },
+    }
+}
+
+/// Maps a failed `Auto` lifecycle — the `server/discover` probe read as a
+/// legacy server, and then the legacy `initialize` handshake failed too — from
+/// what each phase itself failed on.
+///
+/// A version refusal from either phase is the truthful answer: the server
+/// shares no version with the binding, so the code is
+/// `mcp-protocol-unsupported`. Otherwise the fallback decides the variant — a
+/// transport failure is [`McpClientError::Transport`], anything else
+/// [`McpClientError::Protocol`] — and the reason names both phases, each by
+/// its own variant name, so an operator can tell a server that is down from
+/// one that answers neither handshake.
+fn legacy_fallback_failed(
+    server: String,
+    discover: McpClientError,
+    fallback: McpClientError,
+) -> McpClientError {
+    if matches!(fallback, McpClientError::ProtocolUnsupported { .. }) {
+        return fallback;
+    }
+    if matches!(discover, McpClientError::ProtocolUnsupported { .. }) {
+        return discover;
+    }
+    let reason = format!(
+        "LegacyFallbackFailed(discover: {}; fallback: {})",
+        phase_reason(&discover),
+        phase_reason(&fallback)
+    );
+    match fallback {
+        McpClientError::Transport { .. } => McpClientError::Transport { server, reason },
+        _ => McpClientError::Protocol { server, reason },
+    }
+}
+
+/// One phase's own reason: the variant name a transport or protocol failure
+/// carries, and the stable code for anything else.
+fn phase_reason(error: &McpClientError) -> &str {
+    match error {
+        McpClientError::Transport { reason, .. } | McpClientError::Protocol { reason, .. } => {
+            reason
+        }
+        other => other.code(),
     }
 }
 
@@ -630,9 +789,13 @@ mod tests {
     use rakka_agent::{AgentEffectSafetyClass, AgentToolDeclaration};
     use rakka_agent_workflow::AgentEphemeralCredential;
 
+    use rmcp::model::{ErrorCode, ProtocolVersion};
+    use rmcp::service::{ClientInitializeError, ClientLifecycleMode};
+    use rmcp::ErrorData;
+
     use super::{
-        client_info, credential_headers, preferred_versions, McpAllowAllEgress, McpClientError,
-        McpEgressCheck,
+        client_info, credential_headers, initialize_error, lifecycle, preferred_versions,
+        McpAllowAllEgress, McpClientError, McpEgressCheck,
     };
     use crate::binding::{McpServerBinding, McpServerId, McpToolPolicy, MCP_CLIENT_NAME};
 
@@ -776,5 +939,138 @@ mod tests {
             McpAllowAllEgress.check(&server, "https://anywhere.test/mcp"),
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_binding_that_lists_a_legacy_version_keeps_the_initialize_fallback() {
+        let offered = preferred_versions(&binding()).expect("the defaults are known");
+        assert_eq!(
+            lifecycle(offered.clone()),
+            ClientLifecycleMode::Auto {
+                preferred_versions: offered,
+                legacy_version: Some(ProtocolVersion::V_2025_11_25),
+            },
+            "the default list reaches a 2025-11-25 server through initialize"
+        );
+        let modern = vec![ProtocolVersion::V_2026_07_28];
+        assert_eq!(
+            lifecycle(modern.clone()),
+            ClientLifecycleMode::Discover {
+                preferred_versions: modern
+            },
+            "a 2026-07-28-only list has no handshake to fall back to"
+        );
+        // The legacy handshake requests the newest legacy version listed,
+        // whatever the list's order.
+        let several = vec![
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2026_07_28,
+            ProtocolVersion::V_2025_11_25,
+        ];
+        assert!(
+            matches!(
+                lifecycle(several),
+                ClientLifecycleMode::Auto { legacy_version: Some(ref version), .. }
+                    if *version == ProtocolVersion::V_2025_11_25
+            ),
+            "the newest legacy version is requested"
+        );
+    }
+
+    /// `server/discover` answered as a legacy server answers it.
+    fn discover_not_found() -> Box<ClientInitializeError> {
+        Box::new(ClientInitializeError::JsonRpcError(ErrorData::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "server/discover",
+            None,
+        )))
+    }
+
+    #[test]
+    fn a_failed_fallback_is_mapped_from_both_phases() {
+        let offered = [ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
+
+        // The fallback's transport failed: a transport failure naming both
+        // phases, and none of the peer's text.
+        let transport = initialize_error(
+            "crm",
+            &offered,
+            &ClientInitializeError::LegacyFallbackFailed {
+                discover: discover_not_found(),
+                fallback: Box::new(ClientInitializeError::ConnectionClosed(
+                    "peer-text-sentinel".to_string(),
+                )),
+            },
+        );
+        assert!(
+            matches!(transport, McpClientError::Transport { ref reason, .. }
+                if reason == "LegacyFallbackFailed(discover: JsonRpcError(-32601); fallback: ConnectionClosed)"),
+            "{transport:?}"
+        );
+        assert_eq!(transport.code(), "mcp-transport-failed");
+        assert!(!transport.to_string().contains("peer-text-sentinel"));
+
+        // The fallback answered, but not with a handshake: a protocol failure.
+        let protocol = initialize_error(
+            "crm",
+            &offered,
+            &ClientInitializeError::LegacyFallbackFailed {
+                discover: discover_not_found(),
+                fallback: Box::new(ClientInitializeError::ExpectedInitResult(None)),
+            },
+        );
+        assert!(
+            matches!(protocol, McpClientError::Protocol { ref reason, .. }
+                if reason == "LegacyFallbackFailed(discover: JsonRpcError(-32601); fallback: ExpectedInitResult)"),
+            "{protocol:?}"
+        );
+
+        // The fallback was refused for its version: the truthful code is the
+        // version refusal, carrying only the version-shaped entries the server
+        // reported.
+        let version = initialize_error(
+            "crm",
+            &offered,
+            &ClientInitializeError::LegacyFallbackFailed {
+                discover: discover_not_found(),
+                fallback: Box::new(ClientInitializeError::JsonRpcError(ErrorData::new(
+                    ErrorCode::UNSUPPORTED_PROTOCOL_VERSION,
+                    "Unsupported protocol version",
+                    Some(serde_json::json!({
+                        "requested": "2025-11-25",
+                        "supported": ["2026-07-28", "secret-sentinel", 7],
+                    })),
+                ))),
+            },
+        );
+        assert_eq!(version.code(), "mcp-protocol-unsupported");
+        assert_eq!(
+            version,
+            McpClientError::ProtocolUnsupported {
+                server: "crm".to_string(),
+                client: vec!["2026-07-28".to_string(), "2025-11-25".to_string()],
+                server_versions: vec!["2026-07-28".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_reported_version_list_is_shaped_and_bounded() {
+        let many: Vec<ProtocolVersion> = (0..40).map(|_| ProtocolVersion::V_2024_11_05).collect();
+        let error = initialize_error(
+            "crm",
+            &[ProtocolVersion::V_2026_07_28],
+            &ClientInitializeError::NoCompatibleProtocolVersion {
+                client_supported: vec![ProtocolVersion::V_2026_07_28],
+                server_supported: many,
+            },
+        );
+        let McpClientError::ProtocolUnsupported {
+            server_versions, ..
+        } = &error
+        else {
+            panic!("a version refusal: {error:?}")
+        };
+        assert_eq!(server_versions.len(), 16, "{server_versions:?}");
     }
 }

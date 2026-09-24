@@ -739,7 +739,7 @@ fn is_known_protocol_version(value: &str) -> bool {
 }
 
 /// Whether `value` is exactly ten ASCII bytes shaped `YYYY-MM-DD`.
-fn is_protocol_version_shaped(value: &str) -> bool {
+pub(crate) fn is_protocol_version_shaped(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 10
         && bytes[0..4].iter().all(u8::is_ascii_digit)
