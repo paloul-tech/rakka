@@ -47,7 +47,7 @@ fn declared(class: AgentEffectSafetyClass) -> McpToolPolicy {
 }
 
 fn client() -> rakka_agent_mcp::testkit::ReqwestClient {
-    rakka_agent_mcp::testkit::ReqwestClient::new()
+    rakka_agent_mcp::testkit::hardened_reqwest_client()
 }
 
 fn binding(url: &str) -> McpServerBinding {

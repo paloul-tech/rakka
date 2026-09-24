@@ -46,6 +46,31 @@ use tokio::task::JoinHandle;
 /// generic, and nothing in a production build has to name reqwest at all.
 pub use reqwest::Client as ReqwestClient;
 
+/// A [`ReqwestClient`] built the way an injected MCP client must be: no proxy
+/// of any kind and no redirects.
+///
+/// `no_proxy()` turns off the proxy matcher reqwest otherwise installs, which
+/// reads `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` from the environment whatever
+/// reqwest's features; `Policy::none()` keeps a `307`/`308` from re-sending a
+/// request — and a custom credential header, which reqwest does not strip
+/// across hosts — to a host the egress check never judged. Together they make
+/// the configured URL the one the request reaches, which is the only URL
+/// `McpEgressCheck` is given. The crate's own tests build every client with
+/// it, and [`CountingClient`] wraps one.
+///
+/// # Panics
+///
+/// When reqwest cannot build a client at all (no TLS backend initialised): a
+/// test with no client has nothing to prove.
+#[must_use]
+pub fn hardened_reqwest_client() -> ReqwestClient {
+    ReqwestClient::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("a proxy-free, redirect-free reqwest client builds")
+}
+
 /// What a fake tool answers with.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -568,11 +593,11 @@ impl Default for CountingClient {
 }
 
 impl CountingClient {
-    /// A counting client over a fresh reqwest client.
+    /// A counting client over a fresh [`hardened_reqwest_client`].
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: ReqwestClient::new(),
+            inner: hardened_reqwest_client(),
             sends: Arc::new(AtomicUsize::new(0)),
         }
     }

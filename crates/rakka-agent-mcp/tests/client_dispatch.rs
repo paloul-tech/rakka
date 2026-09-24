@@ -17,7 +17,8 @@ use rakka_agent::{
     AgentToolResultBehavior,
 };
 use rakka_agent_mcp::testkit::{
-    serve_fake, CountingClient, FakeMcpServer, FakeTool, FakeToolBehaviour, ReqwestClient,
+    hardened_reqwest_client, serve_fake, CountingClient, FakeMcpServer, FakeTool,
+    FakeToolBehaviour, ReqwestClient,
 };
 use rakka_agent_mcp::{
     mcp_artifact_store, sync_mcp_descriptors, McpAllowAllEgress, McpDescriptorSet,
@@ -268,7 +269,7 @@ async fn the_recheck_is_cached_under_the_ttl_and_refuses_a_changed_schema() {
         "the second attempt reused the cached listing"
     );
     let every_attempt = {
-        let http = ReqwestClient::new();
+        let http = hardened_reqwest_client();
         let binding = binding(&endpoint.url);
         let set = sync_mcp_descriptors(
             &http,
@@ -681,7 +682,7 @@ async fn a_listing_that_never_ends_is_refused_at_the_page_cap_by_the_sync_and_th
     )
     .await;
     let error = sync_mcp_descriptors(
-        &ReqwestClient::new(),
+        &hardened_reqwest_client(),
         &echo_binding(&endless.url),
         None,
         AgentTimestampMillis::new(1),
@@ -720,10 +721,97 @@ async fn a_listing_that_never_ends_is_refused_at_the_page_cap_by_the_sync_and_th
     assert_eq!(endless.server.call_count(), 0, "the tool was never called");
 }
 
+/// Serves `router` on an ephemeral loopback port, returning its base URL.
+async fn serve_router(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the loopback socket binds");
+    let address = listener.local_addr().expect("the address is readable");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{address}"), task)
+}
+
+#[tokio::test]
+async fn the_hardened_client_follows_no_redirect_so_a_307_cannot_carry_the_key_past_the_check() {
+    // Where a redirect would land: records the API-key header of anything
+    // that reaches it.
+    let landed: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+    let recorder = Arc::clone(&landed);
+    let (target, target_task) = serve_router(axum::Router::new().fallback(
+        move |headers: axum::http::HeaderMap| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let key = headers
+                    .get("x-api-key")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                recorder.lock().expect("the recorder is intact").push(key);
+                axum::http::StatusCode::NOT_FOUND
+            }
+        },
+    ))
+    .await;
+    // The URL the egress check is shown: a `307` to the target, which the
+    // check never sees.
+    let location = format!("{target}/mcp");
+    let (redirector, redirector_task) = serve_router(axum::Router::new().fallback(move || {
+        let location = location.clone();
+        async move {
+            (
+                axum::http::StatusCode::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, location)],
+            )
+        }
+    }))
+    .await;
+    let binding = echo_binding(&format!("{redirector}/mcp"));
+    let key = AgentEphemeralCredential::api_key("x-api-key", "redirected-key-sentinel");
+
+    // Positive control: a default client follows the `307` and re-sends the
+    // POST — API-key header included, since reqwest strips only
+    // `Authorization` across hosts — to a host the check never judged.
+    let _ = sync_mcp_descriptors(
+        &ReqwestClient::new(),
+        &binding,
+        Some(&key),
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await;
+    assert!(
+        landed
+            .lock()
+            .expect("the recorder is intact")
+            .iter()
+            .any(|seen| seen.as_deref() == Some("redirected-key-sentinel")),
+        "a default client carries the key across the redirect, so the hardening is load-bearing"
+    );
+
+    landed.lock().expect("the recorder is intact").clear();
+    let error = sync_mcp_descriptors(
+        &hardened_reqwest_client(),
+        &binding,
+        Some(&key),
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("a redirect is an answer the MCP client cannot use");
+    assert_eq!(error.code(), "mcp-descriptor-sync-failed");
+    assert!(
+        landed.lock().expect("the recorder is intact").is_empty(),
+        "the hardened client sent nothing past the URL the check was given"
+    );
+    target_task.abort();
+    redirector_task.abort();
+}
+
 #[tokio::test]
 async fn construction_is_offline_and_a_tool_without_a_descriptor_is_refused() {
     let endpoint = serve_fake(fake()).await;
-    let http = ReqwestClient::new();
+    let http = hardened_reqwest_client();
     let binding = binding(&endpoint.url);
     let set = sync_mcp_descriptors(
         &http,
@@ -800,7 +888,7 @@ async fn a_timeout_from_the_intent_bounds_the_call() {
         FakeToolBehaviour::Sleep { millis: 2_000 },
     )))
     .await;
-    let http = ReqwestClient::new();
+    let http = hardened_reqwest_client();
     let binding = McpServerBinding::streamable_http(server_id(), &endpoint.url)
         .with_tool(
             "slow",
@@ -875,7 +963,7 @@ fn echo_tool() -> FakeTool {
 async fn echo_set_from_a_healthy_server() -> McpDescriptorSet {
     let healthy = serve_fake(FakeMcpServer::new().with_tool(echo_tool())).await;
     sync_mcp_descriptors(
-        &ReqwestClient::new(),
+        &hardened_reqwest_client(),
         &echo_binding(&healthy.url),
         None,
         AgentTimestampMillis::new(1),
@@ -893,7 +981,7 @@ async fn echo_executor_at(url: &str) -> McpDispatchToolExecutor<ReqwestClient> {
         vec![echo_set_from_a_healthy_server().await],
         vec![echo_binding(url)],
         mcp_artifact_store(SharedArtifactStore::default()),
-        ReqwestClient::new(),
+        hardened_reqwest_client(),
         Arc::new(McpAllowAllEgress),
     )
     .expect("builds")

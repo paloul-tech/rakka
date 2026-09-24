@@ -1,8 +1,16 @@
 //! The crate's manifest holds the pin and the three conditions' feature
 //! shape: rmcp at exactly 3.4.0 with the client transport features and
-//! nothing that enables an environment-proxy egress bypass; the child
-//! process transport only behind `child-process`, off by default; the
-//! server side only for the testkit.
+//! nothing that enables reqwest's `system-proxy`; the child process transport
+//! only behind `child-process`, off by default; the server side only for the
+//! testkit.
+//!
+//! The proxy guard is a narrow property, and only that. `system-proxy` adds
+//! the operating system's proxy settings; reqwest reads
+//! `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` from the environment whatever its
+//! features, and a workspace build with `a2a-server-lf` carries
+//! `system-proxy` anyway. The egress control is the injected client's own
+//! build — `no_proxy()` and no redirects, as `McpEgressCheck` documents and
+//! `testkit::hardened_reqwest_client` builds — and the check itself.
 
 fn manifest() -> String {
     std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).expect("manifest")
@@ -17,7 +25,7 @@ fn dependency_line(manifest: &str, name: &str) -> String {
 }
 
 #[test]
-fn rmcp_is_pinned_exactly_with_the_client_features_and_nothing_proxying() {
+fn rmcp_is_pinned_exactly_with_the_client_features_and_no_system_proxy() {
     let manifest = manifest();
     let line = dependency_line(&manifest, "rmcp");
     assert!(line.contains("\"=3.4.0\""), "{line}");
@@ -44,11 +52,11 @@ fn rmcp_is_pinned_exactly_with_the_client_features_and_nothing_proxying() {
 }
 
 #[test]
-fn the_testkit_reqwest_line_carries_no_default_and_no_proxy() {
+fn the_testkit_reqwest_line_carries_no_default_and_no_system_proxy() {
     // The crate names `reqwest` only because rmcp does not re-export it, and
-    // only for the testkit's `ReqwestClient`. Its defaults would put an
-    // environment-proxy egress bypass (and a second TLS stack) on this graph,
-    // so the same guard the rmcp line carries is held on this one.
+    // only for the testkit's `ReqwestClient`. Its defaults would add
+    // `system-proxy` (the OS proxy settings) and a second TLS stack to this
+    // edge, so the same guard the rmcp line carries is held on this one.
     let manifest = manifest();
     let line = dependency_line(&manifest, "reqwest");
     assert!(line.contains("default-features = false"), "{line}");

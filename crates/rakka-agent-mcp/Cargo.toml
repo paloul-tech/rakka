@@ -29,8 +29,11 @@ testkit = ["rmcp/server", "rmcp/transport-streamable-http-server", "dep:axum", "
 
 [dependencies]
 # Exact pin (docs/rakka-compatibility.md). `client` + the Streamable HTTP
-# client over rmcp's own reqwest (`reqwest` = `reqwest?/rustls`, TLS only;
-# nothing here enables `reqwest/system-proxy`), and `transport-io` so a
+# client over rmcp's own reqwest (`reqwest` = `reqwest?/rustls`, a TLS backend
+# and nothing else; nothing here enables `reqwest/system-proxy`, which would
+# add the OS proxy settings to the environment proxies reqwest reads anyway —
+# the egress control is the injected client's `no_proxy()` and no-redirect
+# build plus `McpEgressCheck`, not this line), and `transport-io` so a
 # launcher's AsyncRead/AsyncWrite pair is a transport. The server side and
 # the child-process transport are feature-gated above.
 rmcp = { version = "=3.4.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest", "transport-io"] }
@@ -49,11 +52,13 @@ serde_json.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 axum = { workspace = true, optional = true }
-# The testkit's `ReqwestClient` re-export only. rmcp does not re-export its own
-# `reqwest`, and the testkit has to name the concrete client type rmcp
-# implements `StreamableHttpClient` for; `default-features = false` keeps
-# `reqwest/system-proxy` (and every other default) off this graph, and cargo
-# unifies the result with the `reqwest?/rustls` rmcp itself enables.
+# The testkit's `ReqwestClient` re-export and `hardened_reqwest_client` only.
+# rmcp does not re-export its own `reqwest`, and the testkit has to name the
+# concrete client type rmcp implements `StreamableHttpClient` for;
+# `default-features = false` keeps reqwest's defaults — `system-proxy` (the OS
+# proxy settings) and a second TLS stack among them — off this edge, and cargo
+# unifies the result with the `reqwest?/rustls` rmcp itself enables. Proxies
+# and redirects are turned off by the client's build, not by this line.
 reqwest = { version = "0.13", default-features = false, optional = true }
 # The testkit's `CountingClient` has to spell `StreamableHttpClient::get_stream`'s
 # return type, and rmcp re-exports only `sse_stream::Error` (as `SseError`,

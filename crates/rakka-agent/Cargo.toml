@@ -40,9 +40,11 @@ tracing.workspace = true
 # Pinned, reviewed Rig version for the `rig` feature. Default features are off,
 # with `rustls` alone: it selects a TLS backend for rig's non-optional
 # `reqwest` 0.13 and nothing else. Rig's `reqwest` feature is never enabled —
-# it turns on `reqwest/system-proxy`, an environment-proxy egress bypass, and
-# Cargo feature unification would switch it on for every crate in a consumer's
-# dependency graph. `crate_shape.rs` holds this.
+# it turns on `reqwest/system-proxy`, which adds the OS proxy settings to the
+# environment proxies reqwest reads regardless, and Cargo feature unification
+# would switch it on for every crate in a consumer's dependency graph. That is
+# a narrow property: the egress control is the HTTP backend the adapter is
+# handed (built with no proxy), never this line. `crate_shape.rs` holds it.
 rig-core = { version = "=0.37.0", default-features = false, features = ["rustls"], optional = true }
 
 [dev-dependencies]

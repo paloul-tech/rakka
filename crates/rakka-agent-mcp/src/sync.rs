@@ -325,7 +325,14 @@ impl From<McpRegistrationError> for McpSyncError {
 /// it on the same terms — and decides it *before* a client exists. A
 /// deployment that genuinely reaches anything passes
 /// [`McpAllowAllEgress`](crate::McpAllowAllEgress) and so records that the
-/// decision was taken.
+/// decision was taken. The check judges the configured URL only: `http` must
+/// be built with no proxy and no redirects, as [`McpEgressCheck`] describes,
+/// for the check to govern where the request actually goes.
+///
+/// The sync sets no deadline of its own — neither does rmcp, nor an injected
+/// `reqwest` client by default — so the caller bounds it: a publish step that
+/// awaits it under its own timeout, as a dispatch attempt awaits under the
+/// effect's.
 ///
 /// # Errors
 ///

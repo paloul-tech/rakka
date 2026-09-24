@@ -376,6 +376,30 @@ impl McpClientSession {
 ///
 /// The check applies at publish time as much as at dispatch time: a descriptor
 /// sync is the same outbound connection carrying the same credential.
+///
+/// # What the check sees, and what the injected client must add
+///
+/// The check judges the URL the binding configured — and nothing after it.
+/// Where the request actually goes is the injected client's decision, and a
+/// default `reqwest::Client` sends it elsewhere two ways the check never sees:
+///
+/// - It honours `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` from the environment
+///   whatever its features (reqwest 0.13 installs its system proxy matcher,
+///   which reads the environment, unless the builder opts out), and with
+///   reqwest's `system-proxy` feature the operating system's proxy settings
+///   too. No Rakka crate enables that feature, but a build that includes
+///   `a2a-server-lf` (the `a2a` feature) carries it through feature
+///   unification.
+/// - It follows up to ten redirects, and a `307`/`308` re-sends the POST to
+///   a host the check never saw. reqwest strips `Authorization` on a
+///   cross-host redirect but not a custom header, so an API-key credential
+///   would follow it.
+///
+/// The client a deployment injects must therefore be built with
+/// `ClientBuilder::no_proxy()` and `.redirect(reqwest::redirect::Policy::none())`
+/// — and with a pinned resolver where DNS rebinding matters — for this check
+/// to be the egress control it is written as. The testkit's
+/// `hardened_reqwest_client` (feature `testkit`) is exactly that client.
 pub trait McpEgressCheck: Send + Sync + 'static {
     /// Admits or refuses one outbound connection to `url` on `server`'s
     /// behalf.
@@ -680,7 +704,12 @@ fn credential_headers(
         AgentEphemeralCredentialMaterial::ApiKey { name, value } => {
             let name =
                 HeaderName::from_bytes(name.as_bytes()).map_err(|_| unsupported("api-key"))?;
-            let value = HeaderValue::from_str(value).map_err(|_| unsupported("api-key"))?;
+            let mut value = HeaderValue::from_str(value).map_err(|_| unsupported("api-key"))?;
+            // Kept out of the header map's `Debug` and out of an HTTP/2 HPACK
+            // table, as reqwest does for the bearer it builds itself. It does
+            // not keep the header from following a redirect: see
+            // `McpEgressCheck` for the client that must refuse one.
+            value.set_sensitive(true);
             custom_headers.insert(name, value);
             Ok((None, custom_headers))
         }
@@ -961,6 +990,14 @@ mod tests {
             .get(&http::HeaderName::from_static("x-api-key"))
             .expect("the header is set");
         assert_eq!(value, "k3y");
+        assert!(
+            value.is_sensitive(),
+            "the key is marked sensitive, as reqwest marks the bearer it builds"
+        );
+        assert!(
+            !format!("{custom:?}").contains("k3y"),
+            "a sensitive value never reaches the header map's Debug: {custom:?}"
+        );
     }
 
     #[test]

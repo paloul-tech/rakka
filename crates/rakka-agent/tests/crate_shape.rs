@@ -83,9 +83,11 @@ fn facade_propagates_the_agent_features() {
 }
 
 /// The Rig pin selects a TLS backend and nothing else: rig's `reqwest` feature
-/// would enable `reqwest/system-proxy`, an environment-proxy egress bypass
-/// that Cargo feature unification would switch on for every crate in a
-/// consumer's graph.
+/// would enable `reqwest/system-proxy` — the operating system's proxy
+/// settings, on top of the environment proxies reqwest reads whatever its
+/// features — and Cargo feature unification would switch it on for every
+/// crate in a consumer's graph. A narrow property, held for what it is: the
+/// egress control is the backend a deployment injects, built with no proxy.
 #[test]
 fn rig_core_enables_rustls_only_and_never_reqwest() {
     let manifest = read("crates/rakka-agent/Cargo.toml");

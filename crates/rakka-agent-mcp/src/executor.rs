@@ -171,7 +171,10 @@ impl<C> McpDispatchToolExecutor<C> {
     /// descriptor, because a tool with no pinned schema is one no attempt
     /// could ever recheck.
     ///
-    /// `egress` has no default: see [`McpEgressCheck`].
+    /// `egress` has no default: see [`McpEgressCheck`]. It judges the
+    /// configured URL only, so `http` must be built as that trait's
+    /// documentation describes — no proxy, no redirects — for the check to
+    /// govern where a request actually goes.
     ///
     /// A `ChildProcess` binding is refused here, as `mcp-transport-unsupported`:
     /// no child process runs without a launcher the deployment supplied, and

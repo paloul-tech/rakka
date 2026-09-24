@@ -32,7 +32,8 @@ use rakka_agent::{
     SessionMemoryEntry, SessionMemoryStore, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_mcp::testkit::{
-    serve_fake, FakeMcpEndpoint, FakeMcpServer, FakeTool, FakeToolBehaviour, ReqwestClient,
+    hardened_reqwest_client, serve_fake, FakeMcpEndpoint, FakeMcpServer, FakeTool,
+    FakeToolBehaviour, ReqwestClient,
 };
 use rakka_agent_mcp::{
     mcp_artifact_store, sync_mcp_descriptors, McpAllowAllEgress, McpDescriptorSet,
@@ -268,7 +269,7 @@ impl McpWorld {
     ) -> Self {
         let endpoint = serve_fake(fake).await;
         let binding = binding_of(&endpoint.url);
-        let http = ReqwestClient::new();
+        let http = hardened_reqwest_client();
         let set = sync_mcp_descriptors(
             &http,
             &binding,

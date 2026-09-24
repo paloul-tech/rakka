@@ -22,7 +22,9 @@ use rakka_agent::{
     AgentDispatchError, AgentDispatchToolExecutor, AgentEffectSafetyClass, AgentRunScope,
     AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration, AgentToolId,
 };
-use rakka_agent_mcp::testkit::{FakeMcpServer, FakeTool, FakeToolBehaviour, ReqwestClient};
+use rakka_agent_mcp::testkit::{
+    hardened_reqwest_client, FakeMcpServer, FakeTool, FakeToolBehaviour, ReqwestClient,
+};
 use rakka_agent_mcp::{
     mcp_artifact_store, sync_mcp_descriptors_over, McpAllowAllEgress, McpChildProcessLauncher,
     McpChildTransport, McpDescriptorSet, McpDispatchToolExecutor, McpLaunchError, McpLaunchFuture,
@@ -188,7 +190,7 @@ fn executor_with(
         vec![set],
         vec![binding()],
         mcp_artifact_store(SharedArtifactStore::default()),
-        ReqwestClient::new(),
+        hardened_reqwest_client(),
         Arc::new(McpAllowAllEgress),
         launcher,
     )
@@ -210,7 +212,7 @@ async fn a_child_process_binding_is_refused_without_a_launcher() {
         vec![set],
         vec![binding()],
         mcp_artifact_store(SharedArtifactStore::default()),
-        ReqwestClient::new(),
+        hardened_reqwest_client(),
         Arc::new(McpAllowAllEgress),
     )
     .expect_err("no launcher");
