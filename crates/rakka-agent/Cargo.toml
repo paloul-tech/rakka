@@ -67,8 +67,13 @@ bytes.workspace = true
 # `rakka-agent` library both crates see, so the executor's trait impls are the
 # pipeline's own. The proofs live here rather than in `rakka-agent-mcp`
 # because the pipeline fixture (`tests/common/mod.rs`'s `AuthorityFixture`)
-# is test support, not exported API.
-rakka-agent-mcp = { path = "../rakka-agent-mcp", version = "0.1.0", features = ["testkit"] }
+# is test support, not exported API. The edge is deliberately unversioned:
+# publishing strips a path-only dev-dependency from the published manifest,
+# so the cycle never reaches a registry — a versioned one would make each
+# crate wait on the other's first publish. (When this crate joins
+# `repository_hygiene.rs`'s publishable set, its versioned-internal-deps rule
+# must exempt this line rather than version it.)
+rakka-agent-mcp = { path = "../rakka-agent-mcp", features = ["testkit"] }
 
 [lints]
 workspace = true

@@ -3093,19 +3093,7 @@ impl AuthorityFixture {
 
     /// The durable status of the effect at one slot of the run's loop state.
     pub async fn effect_status(&self, slot: usize) -> Option<AgentRunEffectStatus> {
-        let state = rakka_agent::load_agent_run_state(
-            &self.fx.runs,
-            &run_scope(),
-            &rakka_agent::AgentSchemaPolicy::default(),
-        )
-        .await
-        .expect("the run state loads")?;
-        state
-            .loop_state()?
-            .effects()
-            .iter()
-            .find(|effect| effect.slot == slot)
-            .map(|effect| effect.status)
+        self.effect_at(slot).await.map(|effect| effect.status)
     }
 
     /// The run's effect record at one slot of its loop state, read from

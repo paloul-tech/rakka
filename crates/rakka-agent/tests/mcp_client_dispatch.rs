@@ -528,6 +528,10 @@ async fn the_credential_never_reaches_a_durable_record_or_the_fleet_index() {
     // durable content, recorded to the session.
     assert_surface_holds(&surfaces, "session-memory", "refunds");
     assert_surface_holds(&surfaces, "runs", "found");
+    assert!(
+        !metrics.snapshot().observations().is_empty(),
+        "no metric was recorded, so the metrics sweep is empty"
+    );
     surfaces.extend(fx.telemetry_surfaces(&metrics));
     let recorded_segments = segments.segments();
     assert!(
@@ -752,6 +756,18 @@ async fn the_secret_exclusion_scan_covers_the_mcp_types() {
         Some(&sync_credential),
     )
     .await;
+    // Positive control for the sync: the publish step really sent the
+    // credential, so a stored set without it is one that dropped it rather
+    // than one that never had it. Read before the run, whose own requests
+    // replace the fake's last-request headers.
+    let sync_headers = world.endpoint.server.seen_headers();
+    assert!(
+        sync_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value.ends_with(SENTINEL)
+        }),
+        "the publish-time sync never sent the credential, so the stored set's \
+         absence of it proves nothing: {sync_headers:?}"
+    );
     let fx = world.fixture(ECHO, json!({ "q": "refunds" }));
     fx.start().await;
     fx.pump().await;
