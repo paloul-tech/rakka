@@ -171,13 +171,6 @@ The reviewed pins behind the agent surface. A bump in any of them is a reviewed 
 | `GenAI semantic conventions` | `1.36.0` | `rakka_agent::AGENT_GENAI_CONVENTION_REVISION`, stamped into every exported batch's instrumentation scope | Specification 17.20 review; never a durable agent-state migration. |
 | `opentelemetry-collector-contrib (agent)` | `0.159.0` | `docs/plans/rakka-agent/kubernetes-agent-otel-collector-topology.yaml` | Revalidation procedure in [`rakka-agent-telemetry-validation-matrix.md`](rakka-agent-telemetry-validation-matrix.md). |
 | `opentelemetry-collector-contrib (workflow)` | `0.107.0` | `docs/plans/agentic-workflow/kubernetes-otel-collector-topology.yaml` | Deliberately not advanced with the agent tier; its own plan owns it. |
-
-### MCP client pins
-
-The MCP client adapter's own pins. `rakka-agent-mcp` is one dev-dependency edge away from `rakka-agent` rather than inside it (above), so these two rows are not yet swept by `compatibility_currency`'s reverse check; `crates/rakka-agent-mcp/tests/crate_shape.rs` holds the `rmcp` row to the crate's own manifest directly.
-
-| Dependency | Pin | Declared in | Bump policy |
-| --- | --- | --- | --- |
 | `rmcp` | `=3.4.0` | Declared in `crates/rakka-agent-mcp/Cargo.toml` with `default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest", "transport-io"]`; `transport-child-process` only under the crate's `child-process` feature; the server side only under `testkit` | Exact pin. A bump is a review of the client lifecycle, the tool model, and the MRTR/task result shapes; the fake server in `testkit` is re-run against it. |
 | `MCP protocol` | `2026-07-28 (2025-11-25 compatible)` | Declared in `rakka_agent_mcp::MCP_DEFAULT_PROTOCOL_VERSIONS`; negotiated per attempt by rmcp's Discover lifecycle | A revision move is a `McpServerBinding.protocol_versions` default change and a compatibility review of spec 14.4. |
 

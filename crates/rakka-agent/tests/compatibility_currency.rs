@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 use rakka_agent::otel::AGENT_GENAI_CONVENTION_REVISION;
 use rakka_agent::AgentRecordKind;
+use rakka_agent_mcp::MCP_DEFAULT_PROTOCOL_VERSIONS;
 use rakka_agent_workflow::{
     CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
     CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
@@ -171,11 +172,19 @@ fn declared_schema_versions() -> BTreeMap<String, (String, u32)> {
 /// Every pin the manifests and constants declare, keyed the way the document
 /// keys it. The `A2A protocol` row is held by `rakka-a2a`'s own tests, which
 /// can see the SDK; it is required to exist here and checked there.
+///
+/// `rakka-agent-mcp` is reachable here only through this crate's own
+/// unversioned dev-dependency on it (`features = ["testkit"]`, for the
+/// dispatcher proofs in `mcp_client_dispatch.rs`); that edge is what lets
+/// `rmcp` and `MCP protocol` be held here rather than left as an unswept
+/// side table.
 fn declared_pins() -> BTreeMap<String, String> {
     let root_manifest = read("Cargo.toml");
     let workspace = manifest_section(&root_manifest, "[workspace.dependencies]");
     let agent_manifest = read("crates/rakka-agent/Cargo.toml");
     let opentelemetry = manifest_value(&workspace, "opentelemetry", "version");
+    let mcp_manifest = read("crates/rakka-agent-mcp/Cargo.toml");
+    let mcp_dependencies = manifest_section(&mcp_manifest, "[dependencies]");
 
     BTreeMap::from([
         (
@@ -202,6 +211,17 @@ fn declared_pins() -> BTreeMap<String, String> {
         (
             "opentelemetry-collector-contrib (workflow)".to_string(),
             collector_tag("docs/plans/agentic-workflow/kubernetes-otel-collector-topology.yaml"),
+        ),
+        (
+            "rmcp".to_string(),
+            manifest_value(&mcp_dependencies, "rmcp", "version"),
+        ),
+        (
+            "MCP protocol".to_string(),
+            format!(
+                "{} ({} compatible)",
+                MCP_DEFAULT_PROTOCOL_VERSIONS[0], MCP_DEFAULT_PROTOCOL_VERSIONS[1]
+            ),
         ),
     ])
 }
