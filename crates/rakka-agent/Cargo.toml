@@ -60,6 +60,15 @@ rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
 # signatures are, and an impl must spell the trait's own bounds.
 axum.workspace = true
 bytes.workspace = true
+# The MCP executor and its in-process fake server, for
+# `mcp_client_dispatch.rs`'s proofs through the real dispatch pipeline. This is
+# a dev-dependency cycle — `rakka-agent-mcp` depends on `rakka-agent` — which
+# Cargo permits for dev-dependencies: an integration test links the one
+# `rakka-agent` library both crates see, so the executor's trait impls are the
+# pipeline's own. The proofs live here rather than in `rakka-agent-mcp`
+# because the pipeline fixture (`tests/common/mod.rs`'s `AuthorityFixture`)
+# is test support, not exported API.
+rakka-agent-mcp = { path = "../rakka-agent-mcp", version = "0.1.0", features = ["testkit"] }
 
 [lints]
 workspace = true

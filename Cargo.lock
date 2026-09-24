@@ -2080,6 +2080,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "proptest",
+ "rakka-agent-mcp",
  "rakka-agent-workflow",
  "rakka-cluster",
  "rakka-core",
