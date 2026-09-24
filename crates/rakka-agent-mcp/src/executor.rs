@@ -29,12 +29,16 @@
 //!   server's live input schema is compared with the digest the publish-time
 //!   sync pinned; a server that reshaped a tool is refused rather than called
 //!   with arguments the model chose against the old shape.
-//! - **A result is bounded before it becomes state.** Inline content stays
-//!   under [`MCP_INLINE_RESULT_MAX_BYTES`]; anything larger, and anything
-//!   carrying a binary or reference part, either becomes an artifact — when
-//!   the operator's policy says so — or is refused. A tool's own error text is
-//!   flattened and truncated, and no argument the model sent is ever echoed
-//!   back into a refusal.
+//! - **A result is bounded, and scrubbed of the credential, before it becomes
+//!   state.** Inline content stays under [`MCP_INLINE_RESULT_MAX_BYTES`];
+//!   anything larger, and anything carrying a binary or reference part,
+//!   either becomes an artifact — when the operator's policy says so — or is
+//!   refused. A tool's own error text is flattened and truncated, and no
+//!   argument the model sent is ever echoed back into a refusal. The server
+//!   received the attempt's credential, so every piece of server-chosen text
+//!   the attempt hands on to be kept — the error text, the inline result, the
+//!   artifact's bytes, a refusal's reported name — has the credential's
+//!   material replaced by `<redacted>` first, before any bound cuts it.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Formatter};
@@ -409,10 +413,13 @@ where
         // inside the call's window) spend the same budget rather than one
         // each.
         let deadline = attempt_deadline(intent, self.attempt_timeout_default_ms);
+        // The material the server receives with this attempt, and so could
+        // echo back into anything it answers.
+        let secrets = client::credential_secrets(credential);
         let session = within(deadline, self.open(scope, &server.binding, credential)).await??;
         let outcome = within(
             deadline,
-            self.call(&session, server, descriptor, policy, intent, call),
+            self.call(&session, server, descriptor, policy, intent, call, &secrets),
         )
         .await
         .and_then(std::convert::identity);
@@ -488,6 +495,7 @@ where
 
     /// The recheck, the request, and the mapping — everything after the
     /// handshake that the attempt's deadline bounds.
+    #[allow(clippy::too_many_arguments)]
     async fn call(
         &self,
         session: &McpClientSession,
@@ -496,6 +504,7 @@ where
         policy: &McpToolPolicy,
         intent: &AgentRunEffect,
         call: &AgentToolCallRequest,
+        secrets: &[&str],
     ) -> Result<AgentTaskContent, AgentDispatchError> {
         self.recheck(session, server, descriptor, &call.tool)
             .await?;
@@ -520,7 +529,8 @@ where
                     &error,
                 ))
             })?;
-        self.content(policy, &call.tool, intent, call, answer).await
+        self.content(policy, &call.tool, intent, call, answer, secrets)
+            .await
     }
 
     /// Refuses the attempt unless the server's live input schema is still the
@@ -566,7 +576,8 @@ where
         ))
     }
 
-    /// Maps one answered call onto bounded task content.
+    /// Maps one answered call onto bounded task content, scrubbed of
+    /// `secrets`.
     async fn content(
         &self,
         policy: &McpToolPolicy,
@@ -574,6 +585,7 @@ where
         intent: &AgentRunEffect,
         call: &AgentToolCallRequest,
         answer: CallToolResponse,
+        secrets: &[&str],
     ) -> Result<AgentTaskContent, AgentDispatchError> {
         match answer {
             CallToolResponse::InputRequired(_) => Err(AgentDispatchError::collaborator(
@@ -591,10 +603,11 @@ where
                 if result.is_error == Some(true) {
                     return Err(AgentDispatchError::collaborator(
                         "mcp-tool-error",
-                        error_detail(&result),
+                        error_detail(&result, secrets),
                     ));
                 }
-                self.bounded(policy, tool, intent, call, &result).await
+                self.bounded(policy, tool, intent, call, &result, secrets)
+                    .await
             }
             // `CallToolResponse` is `#[non_exhaustive]`: a response kind rmcp
             // adds later is one this client did not ask for, and it is refused
@@ -609,7 +622,8 @@ where
     }
 
     /// Inline when the result is small and wholly textual or structured; an
-    /// artifact when the binding says so; a refusal otherwise.
+    /// artifact when the binding says so; a refusal otherwise. Either way the
+    /// kept content is scrubbed of `secrets` before it is measured.
     async fn bounded(
         &self,
         policy: &McpToolPolicy,
@@ -617,8 +631,10 @@ where
         intent: &AgentRunEffect,
         call: &AgentToolCallRequest,
         result: &CallToolResult,
+        secrets: &[&str],
     ) -> Result<AgentTaskContent, AgentDispatchError> {
-        let (candidate, overflow) = candidate_of(result);
+        let (mut candidate, overflow) = candidate_of(result);
+        redact_value(&mut candidate, secrets);
         let encoded = serde_json::to_vec(&candidate).map_err(encoding_refused)?;
         if !overflow && encoded.len() <= MCP_INLINE_RESULT_MAX_BYTES {
             return AgentTaskContent::inline(candidate).map_err(|error| {
@@ -627,11 +643,12 @@ where
         }
         match policy.result_behavior {
             AgentToolResultBehavior::ArtifactReference => {
-                let bytes = serde_json::to_vec(&StoredResult {
+                let stored = serde_json::to_string(&StoredResult {
                     content: &result.content,
                     structured_content: &result.structured_content,
                 })
                 .map_err(encoding_refused)?;
+                let bytes = redact_json_text(&stored, secrets).into_bytes();
                 // The writer's checksum, not the store's: the default artifact
                 // policy refuses a reference without one, and a pass-through
                 // store only returns what it was given. SHA-256 over the exact
@@ -862,37 +879,77 @@ fn candidate_of(result: &CallToolResult) -> (Value, bool) {
     (candidate, overflow)
 }
 
-/// The detail a tool-reported error becomes: the first text block, flattened
-/// and truncated.
+/// Every string in `value`, object keys included, with each of `secrets`
+/// replaced by `<redacted>`.
+fn redact_value(value: &mut Value, secrets: &[&str]) {
+    if secrets.is_empty() {
+        return;
+    }
+    match value {
+        Value::String(text) => *text = client::redact(text, secrets),
+        Value::Array(items) => {
+            for item in items {
+                redact_value(item, secrets);
+            }
+        }
+        Value::Object(map) => {
+            let entries = std::mem::take(map);
+            for (key, mut nested) in entries {
+                redact_value(&mut nested, secrets);
+                map.insert(client::redact(&key, secrets), nested);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Encoded JSON with each of `secrets` replaced by `<redacted>`, in the form
+/// the secret takes inside a JSON string as well as its raw form: a secret
+/// with a character JSON escapes is not spelled the same way once encoded.
+fn redact_json_text(encoded: &str, secrets: &[&str]) -> String {
+    let escaped: Vec<String> = secrets
+        .iter()
+        .filter_map(|secret| {
+            let quoted = serde_json::to_string(secret).ok()?;
+            let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+            (inner != *secret).then(|| inner.to_string())
+        })
+        .collect();
+    let escaped: Vec<&str> = escaped.iter().map(String::as_str).collect();
+    client::redact(&client::redact(encoded, secrets), &escaped)
+}
+
+/// The detail a tool-reported error becomes: the first text block, scrubbed
+/// of `secrets`, flattened, and truncated.
 ///
 /// Bounded and control-character-free because this text is written to the
 /// run's durable outbox row and echoed across the dispatcher fleet, and the
-/// server chose it. Nothing the *model* sent is read here at all, so no
-/// argument can ride a refusal back out.
-fn error_detail(result: &CallToolResult) -> String {
+/// server chose it — and scrubbed because the server holds the attempt's
+/// credential and could echo it. Nothing the *model* sent is read here at
+/// all, so no argument can ride a refusal back out.
+fn error_detail(result: &CallToolResult, secrets: &[&str]) -> String {
     result
         .content
         .iter()
         .find_map(ContentBlock::as_text)
         .map_or_else(
             || "the tool reported an error".to_string(),
-            |text| bounded_detail(&text.text),
+            |text| bounded_detail(&text.text, secrets),
         )
 }
 
-/// Flattens control characters to spaces and truncates at a character
-/// boundary.
-fn bounded_detail(text: &str) -> String {
-    let flattened: String = text
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect();
+/// Scrubs `secrets`, flattens control characters to spaces, and truncates at
+/// a character boundary — in that order, so no cut can leave part of a
+/// secret behind.
+///
+/// Scrubbed twice: once as the server sent the text, and once as flattened,
+/// against each secret flattened the same way, so a secret that contains a
+/// character the flattening rewrites (a header value may carry a tab) is
+/// caught in either spelling.
+fn bounded_detail(text: &str, secrets: &[&str]) -> String {
+    let flat_secrets: Vec<String> = secrets.iter().map(|secret| flattened(secret)).collect();
+    let flat_secrets: Vec<&str> = flat_secrets.iter().map(String::as_str).collect();
+    let flattened = client::redact(&flattened(&client::redact(text, secrets)), &flat_secrets);
     if flattened.len() <= MCP_TOOL_ERROR_DETAIL_MAX_BYTES {
         return flattened;
     }
@@ -901,6 +958,19 @@ fn bounded_detail(text: &str) -> String {
         end -= 1;
     }
     flattened[..end].to_string()
+}
+
+/// `text` with every control character replaced by a space.
+fn flattened(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// A result this adapter could not even re-encode is a tool error, not a
@@ -947,8 +1017,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        bounded_detail, candidate_of, error_detail, mcp_artifact_store, McpArtifactStore,
-        McpDispatchToolExecutor,
+        bounded_detail, candidate_of, error_detail, mcp_artifact_store, redact_json_text,
+        redact_value, McpArtifactStore, McpDispatchToolExecutor,
     };
     use crate::binding::{
         McpServerBinding, McpServerId, McpToolPolicy, MCP_TOOL_ERROR_DETAIL_MAX_BYTES,
@@ -1168,16 +1238,54 @@ mod tests {
     #[test]
     fn an_error_with_no_text_reads_back_as_a_fixed_line() {
         let result = CallToolResult::error(Vec::new());
-        assert_eq!(error_detail(&result), "the tool reported an error");
+        assert_eq!(error_detail(&result, &[]), "the tool reported an error");
     }
 
     #[test]
     fn an_error_detail_is_flattened_and_bounded_at_a_character_boundary() {
         let result = CallToolResult::error(vec![ContentBlock::text("boom\nline2\ttabbed")]);
-        assert_eq!(error_detail(&result), "boom line2 tabbed");
+        assert_eq!(error_detail(&result, &[]), "boom line2 tabbed");
         let wide = "é".repeat(MCP_TOOL_ERROR_DETAIL_MAX_BYTES);
-        let bounded = bounded_detail(&wide);
+        let bounded = bounded_detail(&wide, &[]);
         assert!(bounded.len() <= MCP_TOOL_ERROR_DETAIL_MAX_BYTES);
         assert!(wide.starts_with(&bounded));
+    }
+
+    #[test]
+    fn an_error_detail_is_scrubbed_of_the_credential_before_it_is_cut() {
+        let secret = "tok-sentinel";
+        // Straddling the cut: a bound applied first would keep a prefix.
+        let padded = format!(
+            "{}{secret} tail",
+            "x".repeat(MCP_TOOL_ERROR_DETAIL_MAX_BYTES - 4)
+        );
+        let bounded = bounded_detail(&padded, &[secret]);
+        assert!(!bounded.contains("tok-"), "{bounded}");
+        // A secret with a tab in it, sent with the tab and sent flattened.
+        let tabbed = "a\tb-sentinel";
+        for spelling in ["a\tb-sentinel", "a b-sentinel"] {
+            let bounded = bounded_detail(&format!("key {spelling} leaked"), &[tabbed]);
+            assert_eq!(bounded, "key <redacted> leaked");
+        }
+    }
+
+    #[test]
+    fn a_kept_result_is_scrubbed_in_its_strings_its_keys_and_its_encoding() {
+        let secret = "tok\"sentinel";
+        let mut value = json!({
+            "text": format!("token={secret}"),
+            secret: [secret, 1],
+        });
+        redact_value(&mut value, &[secret]);
+        assert_eq!(
+            value,
+            json!({ "text": "token=<redacted>", "<redacted>": ["<redacted>", 1] })
+        );
+        let encoded = serde_json::to_string(&json!({ "text": secret })).expect("encodes");
+        assert!(encoded.contains("tok\\\"sentinel"), "{encoded}");
+        assert_eq!(
+            redact_json_text(&encoded, &[secret]),
+            r#"{"text":"<redacted>"}"#
+        );
     }
 }

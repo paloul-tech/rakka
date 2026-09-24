@@ -521,6 +521,151 @@ async fn an_http_binding_that_names_a_credential_fails_closed_without_one() {
     );
 }
 
+/// A credential value a hostile server echoes back into what it answers.
+const ECHOED_TOKEN: &str = "echoed-token-sentinel";
+
+#[tokio::test]
+async fn server_chosen_text_is_scrubbed_of_the_attempts_credential() {
+    let endpoint = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(FakeTool::new(
+                "leak",
+                "Fails, quoting the caller's token.",
+                json!({"type":"object"}),
+                FakeToolBehaviour::Error(format!("denied: {ECHOED_TOKEN} is revoked\nretry")),
+            ))
+            .with_tool(FakeTool::new(
+                "reflect",
+                "Answers with the caller's token.",
+                json!({"type":"object"}),
+                FakeToolBehaviour::Text(format!("token={ECHOED_TOKEN}")),
+            )),
+    )
+    .await;
+    let binding = McpServerBinding::streamable_http(server_id(), &endpoint.url)
+        .with_tool(
+            "leak",
+            policy(
+                AgentEffectSafetyClass::ReadOnly,
+                AgentToolResultBehavior::InlineBounded,
+            ),
+        )
+        .expect("t")
+        .with_tool(
+            "reflect",
+            policy(
+                AgentEffectSafetyClass::ReadOnly,
+                AgentToolResultBehavior::InlineBounded,
+            ),
+        )
+        .expect("t")
+        .with_credential_binding(credential_binding());
+    let (executor, _, _) = executor_over(binding, Arc::new(McpAllowAllEgress)).await;
+
+    // The tool's own error text, under either material kind the server can
+    // receive: the value is gone, the rest of the line is kept.
+    for credential in [
+        AgentEphemeralCredential::bearer_token(ECHOED_TOKEN),
+        AgentEphemeralCredential::api_key("x-api-key", ECHOED_TOKEN),
+    ] {
+        let error = executor
+            .execute(
+                &run_scope(),
+                &tool_intent_with_timeout("mcp.crm.leak", Some(5_000)),
+                &call("leak", json!({})),
+                Some(&credential),
+            )
+            .await
+            .expect_err("isError");
+        let text = error.to_string();
+        assert!(
+            text.contains("mcp-tool-error") && text.contains("denied: <redacted> is revoked retry"),
+            "{text}"
+        );
+        assert!(!text.contains(ECHOED_TOKEN), "{text}");
+    }
+
+    // A successful answer is kept content too.
+    let content = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.reflect", Some(5_000)),
+            &call("reflect", json!({})),
+            Some(&AgentEphemeralCredential::bearer_token(ECHOED_TOKEN)),
+        )
+        .await
+        .expect("answers");
+    assert_eq!(
+        content,
+        AgentTaskContent::inline(json!({ "text": "token=<redacted>" })).expect("inline")
+    );
+
+    // Positive control: with no credential there is nothing to scrub, and the
+    // same answer reads back verbatim.
+    let (unbound, _, _) = executor_over(
+        McpServerBinding::streamable_http(server_id(), &endpoint.url)
+            .with_tool(
+                "reflect",
+                policy(
+                    AgentEffectSafetyClass::ReadOnly,
+                    AgentToolResultBehavior::InlineBounded,
+                ),
+            )
+            .expect("t"),
+        Arc::new(McpAllowAllEgress),
+    )
+    .await;
+    let verbatim = unbound
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.reflect", Some(5_000)),
+            &call("reflect", json!({})),
+            None,
+        )
+        .await
+        .expect("answers");
+    assert_eq!(
+        verbatim,
+        AgentTaskContent::inline(json!({ "text": format!("token={ECHOED_TOKEN}") }))
+            .expect("inline")
+    );
+}
+
+#[tokio::test]
+async fn a_server_that_identifies_as_a_rakka_agent_is_refused_at_dispatch_as_well() {
+    // The publish-time sync saw a healthy server; by dispatch time the URL
+    // answers as a Rakka agent — and one that folds the caller's token into
+    // the name it reports.
+    let impostor = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(echo_tool())
+            .with_server_name(format!("rakka-agent-{ECHOED_TOKEN}")),
+    )
+    .await;
+    let executor = echo_executor_at(&impostor.url).await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(5_000)),
+            &call("echo", json!({})),
+            Some(&AgentEphemeralCredential::bearer_token(ECHOED_TOKEN)),
+        )
+        .await
+        .expect_err("MCP is never an agent-to-agent channel");
+    let text = error.to_string();
+    assert!(
+        text.contains("mcp-peer-agent-channel-refused") && text.contains("rakka-agent-<redacted>"),
+        "{text}"
+    );
+    assert!(!text.contains(ECHOED_TOKEN), "{text}");
+    assert_eq!(
+        impostor.server.list_calls(),
+        0,
+        "the refused session listed nothing"
+    );
+    assert_eq!(impostor.server.call_count(), 0, "and called nothing");
+}
+
 #[tokio::test]
 async fn construction_is_offline_and_a_tool_without_a_descriptor_is_refused() {
     let endpoint = serve_fake(fake()).await;

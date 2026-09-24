@@ -10,7 +10,10 @@
 //!   rmcp error *variant name* — never a response body, which is what an
 //!   rmcp error's own `Display` would splice in
 //!   ([`StreamableHttpError::UnexpectedServerResponse`] carries a body
-//!   preview).
+//!   preview). What a refusal does carry from the server — its reported name,
+//!   the versions it listed — is text the server chose, and the server holds
+//!   the credential, so every refusal `connect` returns has the credential's
+//!   material replaced by `<redacted>` first.
 //! - Protocol versions are negotiated from the binding's declared list, newest
 //!   first, and an unknown version is refused rather than sent. A binding that
 //!   lists a revision older than 2026-07-28 is reached through rmcp's `Auto`
@@ -188,6 +191,92 @@ impl Display for McpClientError {
 
 impl Error for McpClientError {}
 
+impl McpClientError {
+    /// The same refusal with every occurrence of each of `secrets` in its
+    /// text replaced by [`REDACTED`].
+    ///
+    /// A server that received the credential can echo it back in anything it
+    /// reports — its name, the versions it lists — and a refusal is written to
+    /// the run's durable outbox row and echoed across the dispatcher fleet.
+    pub(crate) fn redacted(self, secrets: &[&str]) -> Self {
+        if secrets.is_empty() {
+            return self;
+        }
+        let scrub = |text: String| redact(&text, secrets);
+        match self {
+            Self::ProtocolUnsupported {
+                server,
+                client,
+                server_versions,
+            } => Self::ProtocolUnsupported {
+                server,
+                client,
+                server_versions: server_versions.into_iter().map(scrub).collect(),
+            },
+            Self::PeerAgentChannel { server, name } => Self::PeerAgentChannel {
+                server,
+                name: scrub(name),
+            },
+            Self::Transport { server, reason } => Self::Transport {
+                server,
+                reason: scrub(reason),
+            },
+            Self::Protocol { server, reason } => Self::Protocol {
+                server,
+                reason: scrub(reason),
+            },
+            Self::Egress {
+                server,
+                code,
+                message,
+                retryable,
+            } => Self::Egress {
+                server,
+                code,
+                message: scrub(message),
+                retryable,
+            },
+            other @ Self::CredentialMaterialUnsupported { .. } => other,
+        }
+    }
+}
+
+/// What a credential's material is replaced by wherever a server could have
+/// echoed it into text Rakka keeps.
+pub(crate) const REDACTED: &str = "<redacted>";
+
+/// The secret values a resolved credential carries, for redaction: a bearer
+/// token, an API key's value, a basic password, a custom secret. Never a
+/// header or user name, and never an empty string, which would match
+/// everywhere.
+pub(crate) fn credential_secrets(credential: Option<&AgentEphemeralCredential>) -> Vec<&str> {
+    let Some(credential) = credential else {
+        return Vec::new();
+    };
+    let secret = match credential.material() {
+        AgentEphemeralCredentialMaterial::BearerToken { token } => token,
+        AgentEphemeralCredentialMaterial::ApiKey { value, .. }
+        | AgentEphemeralCredentialMaterial::Custom { value, .. } => value,
+        AgentEphemeralCredentialMaterial::Basic { password, .. } => password,
+    };
+    if secret.is_empty() {
+        Vec::new()
+    } else {
+        vec![secret.as_str()]
+    }
+}
+
+/// `text` with every occurrence of each of `secrets` replaced by
+/// [`REDACTED`]. Empty secrets are skipped.
+pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
+    secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(text.to_string(), |text, secret| {
+            text.replace(secret, REDACTED)
+        })
+}
+
 /// How long [`McpClientSession::close`] waits for a session's transport to
 /// finish closing before it stops waiting.
 ///
@@ -337,7 +426,11 @@ where
     config.auth_header = auth_header;
     config.custom_headers = custom_headers;
     let transport = StreamableHttpClientTransport::with_client(http.clone(), config);
-    open_session(transport, binding).await
+    // The server now holds the credential, so whatever it reports back into a
+    // refusal is scrubbed of it.
+    open_session(transport, binding)
+        .await
+        .map_err(|error| error.redacted(&credential_secrets(credential)))
 }
 
 /// Opens a session to a child-process binding's server over the stdio a
@@ -794,8 +887,8 @@ mod tests {
     use rmcp::ErrorData;
 
     use super::{
-        client_info, credential_headers, initialize_error, lifecycle, preferred_versions,
-        McpAllowAllEgress, McpClientError, McpEgressCheck,
+        client_info, credential_headers, credential_secrets, initialize_error, lifecycle,
+        preferred_versions, McpAllowAllEgress, McpClientError, McpEgressCheck,
     };
     use crate::binding::{McpServerBinding, McpServerId, McpToolPolicy, MCP_CLIENT_NAME};
 
@@ -1072,5 +1165,30 @@ mod tests {
             panic!("a version refusal: {error:?}")
         };
         assert_eq!(server_versions.len(), 16, "{server_versions:?}");
+    }
+
+    #[test]
+    fn a_refusal_is_scrubbed_of_the_secret_the_server_could_echo() {
+        let bearer = AgentEphemeralCredential::bearer_token("tok-sentinel");
+        let secrets = credential_secrets(Some(&bearer));
+        assert_eq!(secrets, vec!["tok-sentinel"]);
+        let refused = McpClientError::PeerAgentChannel {
+            server: "crm".to_string(),
+            name: "rakka-agent-tok-sentinel".to_string(),
+        }
+        .redacted(&secrets);
+        let text = refused.to_string();
+        assert!(
+            !text.contains("tok-sentinel") && text.contains("rakka-agent-<redacted>"),
+            "{text}"
+        );
+        assert_eq!(refused.code(), "mcp-peer-agent-channel-refused");
+
+        // An API key's value is the secret; its header name is not.
+        let key = AgentEphemeralCredential::api_key("x-api-key", "k3y-sentinel");
+        assert_eq!(credential_secrets(Some(&key)), vec!["k3y-sentinel"]);
+        assert!(credential_secrets(None).is_empty());
+        // An empty secret would match everywhere, so it is never one.
+        assert!(credential_secrets(Some(&AgentEphemeralCredential::bearer_token(""))).is_empty());
     }
 }

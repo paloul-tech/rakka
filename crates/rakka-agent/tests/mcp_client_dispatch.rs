@@ -50,6 +50,13 @@ use common::{run_scope, AuthorityFixture, SharedArtifactStore};
 /// nowhere else.
 const SENTINEL: &str = "run-token-sentinel";
 
+/// The token scenario 7's resolver mints instead of [`SENTINEL`], and its
+/// hostile server echoes back. A token of its own because the echo does reach
+/// one surface Rakka does not own: rmcp's own `DEBUG`/`TRACE` logging of the
+/// response it received. Scenario 2 sweeps a *process-global* log capture, so
+/// a shared token echoed here would read as a leak there.
+const ECHOED: &str = "echoed-token-sentinel";
+
 /// The MCP server every proof binds.
 const SERVER: &str = "crm";
 
@@ -61,6 +68,9 @@ const ECHO: &str = "mcp.crm.echo";
 
 /// The oversized tool's Rakka id.
 const BIG: &str = "mcp.crm.big";
+
+/// The Rakka id of the tool that fails quoting the credential it was sent.
+const LEAK: &str = "mcp.crm.leak";
 
 /// How many bytes of text the oversized tool answers with — past
 /// [`MCP_INLINE_RESULT_MAX_BYTES`], so the result cannot stay inline.
@@ -149,6 +159,28 @@ fn fake_server() -> FakeMcpServer {
             json!({"type": "object"}),
             FakeToolBehaviour::Text("x".repeat(BIG_RESULT_BYTES)),
         ))
+}
+
+/// [`fake_server`] plus a tool whose error text quotes the bearer token its
+/// request carried — a hostile server folding the credential into the text
+/// the dispatcher persists.
+fn leaking_fake_server() -> FakeMcpServer {
+    fake_server().with_tool(FakeTool::new(
+        "leak",
+        "Fails, quoting the credential it was sent.",
+        json!({"type": "object"}),
+        FakeToolBehaviour::Error(format!("denied: bearer {ECHOED} is revoked")),
+    ))
+}
+
+/// [`server_binding`] with the leaking tool allow-listed too.
+fn leaking_binding(url: &str, class: AgentEffectSafetyClass) -> McpServerBinding {
+    server_binding(url, class)
+        .with_tool(
+            "leak",
+            policy(class, AgentToolResultBehavior::InlineBounded),
+        )
+        .expect("the leak tool binds")
 }
 
 /// The operator's binding for the fake: both tools under one safety class,
@@ -274,12 +306,17 @@ impl McpWorld {
     /// The model asks for `tool` with `arguments` on turn 1 and proposes a
     /// result on turn 2.
     fn fixture(&self, tool: &str, arguments: Value) -> AuthorityFixture {
+        self.fixture_minting(tool, arguments, SENTINEL)
+    }
+
+    /// As [`Self::fixture`], with the credential resolver minting `token`.
+    fn fixture_minting(&self, tool: &str, arguments: Value, token: &str) -> AuthorityFixture {
         let adapter = DeterministicModelAdapter::new()
             .with_turn_for(1, tool_calling_turn(tool, arguments))
             .with_turn_for(2, proposing_turn());
         let fixture = AuthorityFixture::over(adapter, AgentToolRegistry::new(), None)
             .with_registered_bindings(self.set.bindings().cloned().collect())
-            .with_credential_resolver(SENTINEL)
+            .with_credential_resolver(token)
             .with_memory(AgentRunMemory::new(
                 self.session.clone(),
                 Arc::new(InMemoryContextSnapshotStore::new()),
@@ -955,4 +992,69 @@ async fn a_server_level_credential_binding_alone_reaches_the_wire_through_the_di
     );
     let run = fx.fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+// ---------------------------------------------------------------------------
+// 7. A server that echoes the credential into its error text.
+// ---------------------------------------------------------------------------
+
+/// The server answers `isError` with text that quotes the bearer token the
+/// dispatcher resolved and the executor sent. That text is the one piece of
+/// server-chosen content the dispatcher persists on a failed attempt — onto
+/// the outbox row and across the fleet index — so the executor scrubs the
+/// credential from it before the bound cuts it, and the persisted line
+/// carries `<redacted>` where the token was.
+#[tokio::test]
+async fn a_credential_the_server_echoes_into_its_error_text_is_redacted_before_it_is_persisted() {
+    let world = McpWorld::assemble(
+        leaking_fake_server(),
+        |url| leaking_binding(url, AgentEffectSafetyClass::NonIdempotent),
+        Arc::new(McpAllowAllEgress),
+        None,
+    )
+    .await;
+    let fx = world.fixture_minting(LEAK, json!({}), ECHOED);
+
+    start_and_commit_the_tool_call(&fx).await;
+    let pass = fx.one_pass().await;
+    assert_eq!(
+        (pass.invoked, pass.failed_attempts),
+        (1, 1),
+        "the dispatcher invoked the executor once and recorded the attempt failed: {pass:?}"
+    );
+    fx.pump().await;
+
+    // Positive control: the server really was sent the credential, and really
+    // did answer with it.
+    let seen = world.endpoint.server.seen_calls();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0]
+            .authorization
+            .as_deref()
+            .is_some_and(|value| value.ends_with(ECHOED)),
+        "the server never received the credential, so there was nothing to echo"
+    );
+
+    let effect = fx.effect_at(TOOL_SLOT).await.expect("the tool effect");
+    assert_eq!(effect.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(effect.last_error_code.as_deref(), Some(COLLABORATOR_FAILED));
+    let row = fx
+        .outbox_row(&effect)
+        .await
+        .expect("the ticket's outbox row");
+    let last_error = row
+        .attempts()
+        .last_error()
+        .expect("the failed attempt recorded its detail");
+    assert!(
+        last_error.contains("mcp-tool-error")
+            && last_error.contains("denied: bearer <redacted> is revoked"),
+        "the persisted line keeps the server's text with the token scrubbed: {last_error}"
+    );
+    assert!(!last_error.contains(ECHOED), "{last_error}");
+
+    let surfaces = fx.durable_surfaces().await;
+    assert_surface_holds(&surfaces, "fleet", "<redacted>");
+    assert_absent_from(&surfaces, ECHOED);
 }
