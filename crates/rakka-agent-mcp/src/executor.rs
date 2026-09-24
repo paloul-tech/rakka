@@ -7,10 +7,14 @@
 //!   and closed on every path out of it, including every refusal. Nothing
 //!   about a server survives an attempt except the schema recheck cache, which
 //!   is not authority — it can only refuse.
-//! - **The effect's timeout bounds the whole attempt.** One deadline, taken
-//!   when the attempt starts, covers the handshake, the recheck's listing,
-//!   the call, and the mapping — mirroring the `deadline_at` the dispatcher
-//!   stamps for the attempt and derives the credential lease from. A server
+//! - **The effect's timeout bounds the whole attempt, and no attempt is
+//!   unbounded.** One deadline, taken when the attempt starts, covers the
+//!   handshake, the recheck's listing, the call, and the mapping — mirroring
+//!   the `deadline_at` the dispatcher stamps for the attempt and derives the
+//!   credential lease from. An effect that committed no timeout is bounded by
+//!   the executor's own default instead
+//!   ([`MCP_ATTEMPT_TIMEOUT_DEFAULT_MS`], or
+//!   [`McpDispatchToolExecutor::with_attempt_timeout_default_ms`]). A server
 //!   that accepts a connection and then never answers holds a
 //!   credential-bearing client for at most that long, plus the close's own
 //!   few-second bound.
@@ -55,8 +59,8 @@ use serde_json::{json, Map, Value};
 
 use crate::binding::{
     McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy, McpTransport,
-    MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS, MCP_INLINE_RESULT_MAX_BYTES, MCP_META_IDEMPOTENCY_KEY,
-    MCP_TOOL_ERROR_DETAIL_MAX_BYTES,
+    MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS,
+    MCP_INLINE_RESULT_MAX_BYTES, MCP_META_IDEMPOTENCY_KEY, MCP_TOOL_ERROR_DETAIL_MAX_BYTES,
 };
 use crate::client::{self, McpClientError, McpClientSession, McpEgressCheck};
 use crate::launcher::McpChildProcessLauncher;
@@ -134,6 +138,7 @@ pub struct McpDispatchToolExecutor<C> {
     egress: Arc<dyn McpEgressCheck>,
     launcher: Option<Arc<dyn McpChildProcessLauncher>>,
     recheck_ttl_ms: u64,
+    attempt_timeout_default_ms: u64,
     rechecked: Mutex<BTreeMap<McpServerId, RecheckEntry>>,
 }
 
@@ -266,6 +271,7 @@ impl<C> McpDispatchToolExecutor<C> {
             egress,
             launcher,
             recheck_ttl_ms: MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS,
+            attempt_timeout_default_ms: MCP_ATTEMPT_TIMEOUT_DEFAULT_MS,
             rechecked: Mutex::new(BTreeMap::new()),
         })
     }
@@ -298,6 +304,18 @@ impl<C> McpDispatchToolExecutor<C> {
     #[must_use]
     pub const fn with_descriptor_recheck_ttl_ms(mut self, ttl_ms: u64) -> Self {
         self.recheck_ttl_ms = ttl_ms;
+        self
+    }
+
+    /// Sets the bound, in milliseconds, of an attempt whose effect carries no
+    /// timeout of its own (default [`MCP_ATTEMPT_TIMEOUT_DEFAULT_MS`]).
+    ///
+    /// Applies when the effect carries no timeout; an effect's own
+    /// `timeout_ms` always wins. There is no value that switches the bound
+    /// off: `0` ends such an attempt at once.
+    #[must_use]
+    pub const fn with_attempt_timeout_default_ms(mut self, timeout_ms: u64) -> Self {
+        self.attempt_timeout_default_ms = timeout_ms;
         self
     }
 
@@ -387,7 +405,7 @@ where
         // the network: the handshake and the call (the recheck's listing runs
         // inside the call's window) spend the same budget rather than one
         // each.
-        let deadline = attempt_deadline(intent);
+        let deadline = attempt_deadline(intent, self.attempt_timeout_default_ms);
         let session = within(deadline, self.open(scope, &server.binding, credential)).await??;
         let outcome = within(
             deadline,
@@ -720,13 +738,23 @@ fn routes(
     Ok(tools)
 }
 
-/// The instant the whole attempt must be over by, or `None` when the effect
-/// committed no timeout (or one so large that no clock could reach it).
+/// The instant the whole attempt must be over by: the effect's own timeout,
+/// or `default_ms` when the effect committed none. Never unbounded.
 ///
 /// `checked_add` rather than `+`: adding an unrepresentable duration to an
 /// [`Instant`](tokio::time::Instant) panics, and an effect's timeout is data.
-fn attempt_deadline(intent: &AgentRunEffect) -> Option<tokio::time::Instant> {
-    tokio::time::Instant::now().checked_add(Duration::from_millis(intent.timeout_ms?))
+/// A timeout the platform's clock cannot represent at all is bounded by the
+/// default rather than panicking or being read as "forever", and should even
+/// the default not be representable the attempt ends at once — failing
+/// closed, never open. A timeout the clock *can* represent is the effect's own
+/// choice and is honoured, however long.
+fn attempt_deadline(intent: &AgentRunEffect, default_ms: u64) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    intent
+        .timeout_ms
+        .and_then(|timeout_ms| now.checked_add(Duration::from_millis(timeout_ms)))
+        .or_else(|| now.checked_add(Duration::from_millis(default_ms)))
+        .unwrap_or(now)
 }
 
 /// Runs one stage of the attempt under its deadline.
@@ -735,12 +763,9 @@ fn attempt_deadline(intent: &AgentRunEffect) -> Option<tokio::time::Instant> {
 /// call, or the mapping — because what the dispatcher learns is one fact: the
 /// attempt did not land inside the effect's window.
 async fn within<T>(
-    deadline: Option<tokio::time::Instant>,
+    deadline: tokio::time::Instant,
     work: impl Future<Output = T>,
 ) -> Result<T, AgentDispatchError> {
-    let Some(deadline) = deadline else {
-        return Ok(work.await);
-    };
     tokio::time::timeout_at(deadline, work)
         .await
         .map_err(|_| AgentDispatchError::Invocation {

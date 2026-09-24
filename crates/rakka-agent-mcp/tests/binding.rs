@@ -5,7 +5,7 @@
 use rakka_agent::{AgentCredentialBindingRef, AgentEffectSafetyClass, AgentToolDeclaration};
 use rakka_agent_mcp::{
     McpDescriptorRefresh, McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
-    MCP_DEFAULT_PROTOCOL_VERSIONS,
+    MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DEFAULT_PROTOCOL_VERSIONS,
 };
 use rakka_agent_workflow::{
     AgentAttributes, AgentTimestampMillis, ArtifactKind, ArtifactRef, RedactionStatus,
@@ -100,7 +100,7 @@ fn the_url_rule_accepts_http_and_https_and_refuses_userinfo_and_fragments() {
 }
 
 #[test]
-fn defaults_are_manual_refresh_the_two_versions_and_one_inline_attempt() {
+fn defaults_are_manual_refresh_the_two_versions_and_one_bounded_inline_attempt() {
     let binding = McpServerBinding::streamable_http(server("s"), "https://h/mcp")
         .with_tool("t", policy())
         .expect("tool");
@@ -109,11 +109,15 @@ fn defaults_are_manual_refresh_the_two_versions_and_one_inline_attempt() {
         binding.protocol_versions,
         MCP_DEFAULT_PROTOCOL_VERSIONS.map(str::to_string).to_vec()
     );
+    // The attempt is bounded by default: a policy that says nothing about
+    // time still hands the effect, and so the dispatcher's deadline and
+    // credential lease, the executor's own default.
     let policy = &binding.tools["t"];
     assert_eq!(
         (policy.max_attempts, policy.timeout_ms, policy.honor_hints),
-        (1, None, false)
+        (1, Some(MCP_ATTEMPT_TIMEOUT_DEFAULT_MS), false)
     );
+    assert_eq!(MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, 30_000);
     assert!(binding.credential_binding.is_none());
     let empty = McpServerBinding::streamable_http(server("s"), "https://h/mcp");
     assert!(matches!(

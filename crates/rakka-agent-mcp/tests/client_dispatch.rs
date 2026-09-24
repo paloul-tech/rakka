@@ -678,10 +678,10 @@ async fn the_intents_timeout_bounds_a_listing_that_stalls_before_the_call() {
     );
 }
 
-#[tokio::test]
-async fn the_intents_timeout_bounds_a_handshake_that_is_never_answered() {
-    // A socket that accepts every connection and never writes a byte: the
-    // `initialize` request goes out and no answer ever comes back.
+/// A socket that accepts every connection and never writes a byte: an
+/// `initialize` or `server/discover` request goes out and no answer ever comes
+/// back. Returns the endpoint URL and the task holding the connections open.
+async fn silent_endpoint() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("the loopback socket binds");
@@ -692,7 +692,46 @@ async fn the_intents_timeout_bounds_a_handshake_that_is_never_answered() {
             held.push(socket);
         }
     });
-    let executor = echo_executor_at(&format!("http://{address}/mcp")).await;
+    (format!("http://{address}/mcp"), silent)
+}
+
+#[tokio::test]
+async fn an_intent_with_no_timeout_is_still_bounded_by_the_executors_default() {
+    // The effect committed no timeout at all — a decoded or hand-built policy
+    // with `timeout_ms: None` — and the server never answers. The executor's
+    // own default bounds the attempt anyway; the test shortens it, since the
+    // crate's default is thirty seconds.
+    let (url, silent) = silent_endpoint().await;
+    let executor = echo_executor_at(&url)
+        .await
+        .with_attempt_timeout_default_ms(200);
+    let intent = tool_intent_with_timeout("mcp.crm.echo", None);
+    assert_eq!(intent.timeout_ms, None, "the effect carries no timeout");
+    let started = Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        executor.execute(&run_scope(), &intent, &call("echo", json!({})), None),
+    )
+    .await
+    .expect("the attempt returned on its own rather than waiting forever")
+    .expect_err("the handshake was never answered");
+    silent.abort();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the executor's default fired inside the handshake: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        error.to_string().contains("mcp-transport-failed")
+            && error.to_string().contains(ATTEMPT_TIMED_OUT),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn the_intents_timeout_bounds_a_handshake_that_is_never_answered() {
+    let (url, silent) = silent_endpoint().await;
+    let executor = echo_executor_at(&url).await;
     let credential = AgentEphemeralCredential::bearer_token("attempt-token-sentinel");
     let started = Instant::now();
     let error = tokio::time::timeout(

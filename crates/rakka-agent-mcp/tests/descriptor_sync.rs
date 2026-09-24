@@ -16,7 +16,7 @@ use rakka_agent_mcp::testkit::{serve_fake, CountingClient, FakeMcpServer, FakeTo
 use rakka_agent_mcp::{
     mcp_descriptor_staleness, sync_mcp_descriptors, McpAllowAllEgress, McpDescriptorSet,
     McpDescriptorStaleness, McpEgressCheck, McpServerBinding, McpServerId, McpToolPolicy,
-    MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
+    MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
 use rmcp::model::ToolAnnotations;
@@ -91,6 +91,16 @@ async fn sync_returns_only_the_allow_listed_tools_as_prefixed_bindings_with_dige
     assert_eq!(
         search.binding.descriptor().parameters.as_ref(),
         Some(&search.input_schema)
+    );
+    assert_eq!(
+        search
+            .binding
+            .effect_spec()
+            .expect("the synced binding's spec validates")
+            .timeout_ms,
+        Some(MCP_ATTEMPT_TIMEOUT_DEFAULT_MS),
+        "the policy's default timeout rides the effect spec, so the dispatcher's deadline \
+         and the executor's bound agree"
     );
     assert_eq!(set.synced_at, AgentTimestampMillis::new(7));
     assert_eq!(set.protocol_version, "2026-07-28");

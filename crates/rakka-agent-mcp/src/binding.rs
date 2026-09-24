@@ -39,6 +39,20 @@ pub const MCP_TOOL_ERROR_DETAIL_MAX_BYTES: usize = 512;
 /// considered stale and due for a recheck.
 pub const MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS: u64 = 60_000;
 
+/// Default per-attempt timeout, in milliseconds, for an MCP tool call.
+///
+/// Two places use it, so that no configuration can leave an attempt
+/// unbounded. [`McpToolPolicy::new`] sets it as the policy's timeout, so the
+/// synced binding's effect spec carries it and the dispatcher's per-attempt
+/// `deadline_at` — and the credential lease derived from it — line up with
+/// the executor's own bound. And the executor falls back to it (or to the
+/// value `McpDispatchToolExecutor::with_attempt_timeout_default_ms` set) for
+/// an effect that committed no timeout at all: neither rmcp nor an injected
+/// `reqwest` client sets a default of its own, and one server that accepts a
+/// connection and never answers would otherwise hold a worker, and a live
+/// credential, forever.
+pub const MCP_ATTEMPT_TIMEOUT_DEFAULT_MS: u64 = 30_000;
+
 /// The client name this adapter identifies itself with during MCP
 /// initialization.
 pub const MCP_CLIENT_NAME: &str = "rakka-agent-mcp";
@@ -151,8 +165,15 @@ pub struct McpToolPolicy {
     /// refuses; this field is not itself gated at construction, since it is
     /// `pub` and also reachable by decoding.
     pub max_attempts: u32,
-    /// Per-attempt timeout, in milliseconds; `None` defers to the
-    /// dispatcher's own default.
+    /// Per-attempt timeout, in milliseconds, which the synced binding's
+    /// effect spec carries. [`Self::new`] sets
+    /// [`MCP_ATTEMPT_TIMEOUT_DEFAULT_MS`].
+    ///
+    /// `None` — reachable by decoding or by setting the field — leaves the
+    /// effect with no timeout: the dispatcher then stamps no `deadline_at` and
+    /// leases the credential for its minimum, while the executor still bounds
+    /// the attempt at its own default. The dispatcher has no default of its
+    /// own to defer to.
     pub timeout_ms: Option<u64>,
     /// How the tool's result is bounded.
     pub result_behavior: AgentToolResultBehavior,
@@ -162,14 +183,15 @@ pub struct McpToolPolicy {
 }
 
 impl McpToolPolicy {
-    /// Declares a policy for one dispatch attempt, inline-bounded, with the
-    /// server's own hints ignored.
+    /// Declares a policy for one dispatch attempt of at most
+    /// [`MCP_ATTEMPT_TIMEOUT_DEFAULT_MS`], inline-bounded, with the server's
+    /// own hints ignored.
     #[must_use]
     pub fn new(declaration: AgentToolDeclaration) -> Self {
         Self {
             declaration,
             max_attempts: 1,
-            timeout_ms: None,
+            timeout_ms: Some(MCP_ATTEMPT_TIMEOUT_DEFAULT_MS),
             result_behavior: AgentToolResultBehavior::InlineBounded,
             honor_hints: false,
         }
