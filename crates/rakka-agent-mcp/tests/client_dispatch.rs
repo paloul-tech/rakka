@@ -22,7 +22,7 @@ use rakka_agent_mcp::testkit::{
 use rakka_agent_mcp::{
     mcp_artifact_store, sync_mcp_descriptors, McpAllowAllEgress, McpDescriptorSet,
     McpDispatchToolExecutor, McpEgressCheck, McpRegistrationError, McpServerBinding, McpServerId,
-    McpToolPolicy, MCP_META_IDEMPOTENCY_KEY,
+    McpToolPolicy, MCP_LIST_PAGES_MAX, MCP_META_IDEMPOTENCY_KEY,
 };
 use rakka_agent_workflow::{
     validate_artifact_ref, AgentEphemeralCredential, AgentTimestampMillis,
@@ -232,9 +232,15 @@ async fn a_call_carries_the_credential_the_meta_and_maps_structured_content_inli
         "the effect's trace state rides `_meta`: {:?}",
         seen[0].meta
     );
-    assert!(
-        http.sends() > sends_after_sync,
-        "every send went through the injected client"
+    // Every send went through the injected client, and the attempt made
+    // exactly three: the `server/discover` handshake, the recheck's one-page
+    // `tools/list` (the first attempt finds the cache empty), and the
+    // `tools/call`. A discover-negotiated session is stateless — no session
+    // id, so no standalone stream to open and no session to delete at close.
+    assert_eq!(
+        http.sends() - sends_after_sync,
+        3,
+        "one attempt: handshake, recheck, call"
     );
     assert_eq!(
         endpoint.server.list_calls(),
@@ -664,6 +670,54 @@ async fn a_server_that_identifies_as_a_rakka_agent_is_refused_at_dispatch_as_wel
         "the refused session listed nothing"
     );
     assert_eq!(impostor.server.call_count(), 0, "and called nothing");
+}
+
+#[tokio::test]
+async fn a_listing_that_never_ends_is_refused_at_the_page_cap_by_the_sync_and_the_recheck() {
+    let endless = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(echo_tool())
+            .with_endless_pages(),
+    )
+    .await;
+    let error = sync_mcp_descriptors(
+        &ReqwestClient::new(),
+        &echo_binding(&endless.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("the sync never reads the listing to its end");
+    assert_eq!(error.code(), "mcp-descriptor-sync-failed");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{MCP_LIST_PAGES_MAX} pages")),
+        "{error}"
+    );
+    assert_eq!(endless.server.list_calls(), MCP_LIST_PAGES_MAX);
+
+    // The recheck: the set was synced from a healthy server, and the endless
+    // one answers at dispatch time.
+    let executor = echo_executor_at(&endless.url).await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(5_000)),
+            &call("echo", json!({})),
+            None,
+        )
+        .await
+        .expect_err("the recheck confirms nothing it did not read to its end");
+    assert!(
+        error
+            .to_string()
+            .contains("tool-descriptor-revision-mismatch"),
+        "{error}"
+    );
+    assert_eq!(endless.server.list_calls(), 2 * MCP_LIST_PAGES_MAX);
+    assert_eq!(endless.server.call_count(), 0, "the tool was never called");
 }
 
 #[tokio::test]

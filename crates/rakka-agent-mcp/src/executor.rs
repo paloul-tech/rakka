@@ -66,7 +66,8 @@ use serde_json::{json, Map, Value};
 use crate::binding::{
     McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy, McpTransport,
     MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS,
-    MCP_INLINE_RESULT_MAX_BYTES, MCP_META_IDEMPOTENCY_KEY, MCP_TOOL_ERROR_DETAIL_MAX_BYTES,
+    MCP_INLINE_RESULT_MAX_BYTES, MCP_LIST_PAGES_MAX, MCP_META_IDEMPOTENCY_KEY,
+    MCP_TOOL_ERROR_DETAIL_MAX_BYTES,
 };
 use crate::client::{self, McpClientError, McpClientSession, McpEgressCheck};
 use crate::launcher::McpChildProcessLauncher;
@@ -175,7 +176,8 @@ impl<C> McpDispatchToolExecutor<C> {
     /// A `ChildProcess` binding is refused here, as `mcp-transport-unsupported`:
     /// no child process runs without a launcher the deployment supplied, and
     /// this constructor takes none. [`Self::with_launcher`] is the one that
-    /// admits them.
+    /// admits them — the only one: a launcher is never installed on an
+    /// executor after the fact, since its bindings are fixed once it is built.
     ///
     /// # Errors
     ///
@@ -280,29 +282,6 @@ impl<C> McpDispatchToolExecutor<C> {
             attempt_timeout_default_ms: MCP_ATTEMPT_TIMEOUT_DEFAULT_MS,
             rechecked: Mutex::new(BTreeMap::new()),
         })
-    }
-
-    /// Installs the deployment's child-process launcher on an executor built
-    /// without child-process bindings.
-    ///
-    /// This admits no binding. [`Self::new`] already refused any
-    /// `ChildProcess` binding, and an executor's bindings are fixed once it is
-    /// built, so what this installs is the capability alone; a child-process
-    /// binding is admitted only by [`Self::with_launcher`], which takes the
-    /// launcher together with the bindings. The routing table is re-derived
-    /// under the launcher anyway, by the same rule `new` applied, so
-    /// installing one can never widen what was validated.
-    ///
-    /// # Errors
-    ///
-    /// [`McpRegistrationError`] with its stable code.
-    pub fn with_child_process_launcher(
-        mut self,
-        launcher: Arc<dyn McpChildProcessLauncher>,
-    ) -> Result<Self, McpRegistrationError> {
-        self.tools = routes(&self.servers, Some(&launcher))?;
-        self.launcher = Some(launcher);
-        Ok(self)
     }
 
     /// Sets how long a server's rechecked tool shapes stay usable before the
@@ -549,11 +528,22 @@ where
     ) -> Result<(), AgentDispatchError> {
         let id = &server.binding.server_id;
         if self.recheck_due(id) {
-            let listed = session
-                .peer()
+            let Some(listed) = session
                 .list_all_tools()
                 .await
-                .map_err(|error| dispatch_error(client::service_error(id.as_str(), &error)))?;
+                .map_err(|error| dispatch_error(client::service_error(id.as_str(), &error)))?
+            else {
+                // Not cached: a listing never read to its end confirms
+                // nothing, and the next attempt should read it again.
+                return Err(AgentDispatchError::collaborator(
+                    "tool-descriptor-revision-mismatch",
+                    format!(
+                        "{tool}: the server's tools/list did not end within \
+                         {MCP_LIST_PAGES_MAX} pages, so the published descriptor cannot be \
+                         confirmed"
+                    ),
+                ));
+            };
             let digests = listed
                 .iter()
                 .map(|listed| {
@@ -749,11 +739,9 @@ fn missing_credential(
     ))
 }
 
-/// Validates the bound servers and derives the tool routing table.
-///
-/// Runs both at construction and whenever the launcher changes, because the
-/// launcher is what decides whether a `ChildProcess` binding is dispatchable
-/// at all.
+/// Validates the bound servers and derives the tool routing table, under
+/// whichever launcher the constructor was given — the launcher is what decides
+/// whether a `ChildProcess` binding is dispatchable at all.
 fn routes(
     servers: &BTreeMap<McpServerId, McpBoundServer>,
     launcher: Option<&Arc<dyn McpChildProcessLauncher>>,
@@ -938,9 +926,9 @@ fn error_detail(result: &CallToolResult, secrets: &[&str]) -> String {
         )
 }
 
-/// Scrubs `secrets`, flattens control characters to spaces, and truncates at
-/// a character boundary — in that order, so no cut can leave part of a
-/// secret behind.
+/// Scrubs `secrets`, flattens every character that could break the line to a
+/// space, and truncates at a character boundary — in that order, so no cut
+/// can leave part of a secret behind.
 ///
 /// Scrubbed twice: once as the server sent the text, and once as flattened,
 /// against each secret flattened the same way, so a secret that contains a
@@ -960,17 +948,35 @@ fn bounded_detail(text: &str, secrets: &[&str]) -> String {
     flattened[..end].to_string()
 }
 
-/// `text` with every control character replaced by a space.
+/// `text` with every character [`breaks_the_line`] replaced by a space.
 fn flattened(text: &str) -> String {
     text.chars()
         .map(|character| {
-            if character.is_control() {
+            if breaks_the_line(character) {
                 ' '
             } else {
                 character
             }
         })
         .collect()
+}
+
+/// Whether a character could break a persisted line or change how it reads:
+/// a control character, Unicode's line and paragraph separators, or a
+/// bidirectional formatting control (the marks, embeddings, overrides, and
+/// isolates) that could make a log line display in an order other than the
+/// one it was written in.
+fn breaks_the_line(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// A result this adapter could not even re-encode is a tool error, not a
@@ -1097,6 +1103,7 @@ mod tests {
     fn set(name: &str, tools: &[&str]) -> McpDescriptorSet {
         let binding = http_binding(name);
         McpDescriptorSet {
+            schema_version: crate::sync::MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
             server_id: server(name),
             server_name: "fake".to_string(),
             protocol_version: "2026-07-28".to_string(),
@@ -1249,6 +1256,14 @@ mod tests {
         let bounded = bounded_detail(&wide, &[]);
         assert!(bounded.len() <= MCP_TOOL_ERROR_DETAIL_MAX_BYTES);
         assert!(wide.starts_with(&bounded));
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_and_bidi_controls_are_flattened_too() {
+        let text = "a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200F}f\u{2069}g";
+        assert_eq!(bounded_detail(text, &[]), "a b c d e f g");
+        // Ordinary non-ASCII text is kept.
+        assert_eq!(bounded_detail("réseau — 東京", &[]), "réseau — 東京");
     }
 
     #[test]

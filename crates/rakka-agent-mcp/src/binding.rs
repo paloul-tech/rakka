@@ -26,8 +26,18 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// holds that property for an operator-supplied list too.
 pub const MCP_DEFAULT_PROTOCOL_VERSIONS: [&str; 2] = ["2026-07-28", "2025-11-25"];
 
-/// Largest a synced tool descriptor's JSON schema may be, in bytes.
+/// Largest a synced tool's input or output JSON schema may be, in bytes.
 pub const MCP_DESCRIPTOR_SCHEMA_MAX_BYTES: usize = 64 * 1024;
+
+/// Most `tools/list` pages a descriptor sync or a dispatch-time recheck follows
+/// before it gives up on the listing.
+///
+/// A server chooses every `nextCursor`, so a listing that never ends is one
+/// cursor away; past this many pages the sync is refused
+/// (`mcp-descriptor-sync-failed`) and the recheck refuses the attempt
+/// (`tool-descriptor-revision-mismatch`), since a listing never read to its
+/// end cannot confirm the published schema.
+pub const MCP_LIST_PAGES_MAX: usize = 64;
 
 /// Largest an inline-bounded tool result may be, in bytes.
 pub const MCP_INLINE_RESULT_MAX_BYTES: usize = 2 * 1024;
@@ -467,6 +477,12 @@ impl McpServerBinding {
 }
 
 /// Why a binding, server id, or tool registration is refused.
+///
+/// A contradicting hint and a server that identifies as a Rakka agent are not
+/// here: both are facts about what a server *answered*, so they are the
+/// sync's and the client's own refusals
+/// (`McpSyncError::HintContradictsDeclaration`,
+/// `McpClientError::PeerAgentChannel`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum McpRegistrationError {
@@ -533,25 +549,6 @@ pub enum McpRegistrationError {
         /// The tool whose declaration disagrees with it.
         tool: String,
     },
-    /// A server-reported hint contradicts the operator's own tool
-    /// declaration.
-    HintContradictsDeclaration {
-        /// The server that reported the hint.
-        server: String,
-        /// The tool the hint was reported for.
-        tool: String,
-        /// The contradicted hint.
-        hint: &'static str,
-    },
-    /// The server identifies itself as a Rakka agent. MCP is never an
-    /// agent-to-agent channel (specification 14.4 of
-    /// `docs/plans/rakka-agent/spec.md`).
-    PeerAgentChannel {
-        /// The server that identified as a Rakka agent.
-        server: String,
-        /// The self-reported name that triggered the refusal.
-        name: String,
-    },
     /// The binding declares no protocol versions.
     ProtocolVersionsEmpty {
         /// The server with no declared protocol versions.
@@ -599,8 +596,6 @@ impl McpRegistrationError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::TransportUnsupported { .. } => "mcp-transport-unsupported",
-            Self::HintContradictsDeclaration { .. } => "mcp-hint-contradicts-declaration",
-            Self::PeerAgentChannel { .. } => "mcp-peer-agent-channel-refused",
             Self::InvalidUrl { .. }
             | Self::ToolNameInvalid { .. }
             | Self::DuplicateServer { .. }
@@ -660,14 +655,6 @@ impl Display for McpRegistrationError {
                 f,
                 "the MCP server {server}'s tool {tool} names a credential binding other than \
                  the server's own; a tool may repeat the server-level binding or name none"
-            ),
-            Self::HintContradictsDeclaration { server, tool, hint } => write!(
-                f,
-                "the MCP server {server}'s tool {tool} hint {hint:?} contradicts its declaration"
-            ),
-            Self::PeerAgentChannel { server, name } => write!(
-                f,
-                "the MCP server {server} identifies as a Rakka agent ({name}); MCP is never an agent-to-agent channel"
             ),
             Self::ProtocolVersionsEmpty { server } => {
                 write!(f, "the MCP server {server} declares no protocol versions")

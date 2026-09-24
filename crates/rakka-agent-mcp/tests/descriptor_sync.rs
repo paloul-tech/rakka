@@ -19,6 +19,7 @@ use rakka_agent_mcp::{
     mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over, McpAllowAllEgress,
     McpDescriptorSet, McpDescriptorStaleness, McpEgressCheck, McpServerBinding, McpServerId,
     McpToolPolicy, MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
+    MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
 use rmcp::model::ToolAnnotations;
@@ -109,10 +110,20 @@ async fn sync_returns_only_the_allow_listed_tools_as_prefixed_bindings_with_dige
     assert_eq!(set.synced_at, AgentTimestampMillis::new(7));
     assert_eq!(set.protocol_version, "2026-07-28");
     assert_eq!(endpoint.server.list_calls(), 1);
+    assert_eq!(set.schema_version, MCP_DESCRIPTOR_SET_SCHEMA_VERSION);
     let encoded = serde_json::to_string(&set).expect("encodes");
     let decoded: McpDescriptorSet = serde_json::from_str(&encoded).expect("decodes");
     assert_eq!(decoded, set);
     assert_eq!(decoded.digest(), set.digest());
+
+    // A set a newer build wrote is refused, not read as this build's shape.
+    let mut newer = serde_json::to_value(&set).expect("encodes");
+    newer["schema_version"] = json!(MCP_DESCRIPTOR_SET_SCHEMA_VERSION + 1);
+    let error = serde_json::from_value::<McpDescriptorSet>(newer).expect_err("a newer set");
+    assert!(
+        error.to_string().contains("newer than this build"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -237,6 +248,24 @@ async fn the_schema_bounds_are_the_4kib_inline_and_64kib_refusal_lines() {
     .await
     .expect_err("64 KiB");
     assert_eq!(error.code(), "mcp-descriptor-schema-too-large");
+
+    // The output schema is held to the same bound: it is digested and pinned
+    // just as the input one is.
+    let huge_output = serve_fake(FakeMcpServer::new().with_tool(tool("search")).with_tool(
+        FakeTool::text("update", "d", schema(1), "ok").with_output_schema(schema(3000)),
+    ))
+    .await;
+    let error = sync_mcp_descriptors(
+        &client(),
+        &binding(&huge_output.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("a 64 KiB output schema");
+    assert_eq!(error.code(), "mcp-descriptor-schema-too-large");
+    assert!(error.to_string().contains("update"), "{error}");
 }
 
 #[tokio::test]
@@ -533,6 +562,42 @@ async fn staleness_reports_added_removed_and_changed_tools() {
         McpDescriptorStaleness::Stale {
             changed: vec!["update".to_string()]
         }
+    );
+
+    // Added and removed: a set that dropped `update` and gained `extra`
+    // reports both, beside the unchanged `search`, which it does not.
+    let other = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(tool("search"))
+            .with_tool(tool("extra")),
+    )
+    .await;
+    let regrown = sync_mcp_descriptors(
+        &client(),
+        &McpServerBinding::streamable_http(McpServerId::new("crm").expect("id"), &other.url)
+            .with_tool("search", declared(AgentEffectSafetyClass::ReadOnly))
+            .expect("tool")
+            .with_tool("extra", declared(AgentEffectSafetyClass::ReadOnly))
+            .expect("tool"),
+        None,
+        AgentTimestampMillis::new(3),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("syncs");
+    assert_eq!(
+        mcp_descriptor_staleness(&stored, &regrown),
+        McpDescriptorStaleness::Stale {
+            changed: vec!["extra".to_string(), "update".to_string()]
+        },
+        "one added, one removed"
+    );
+    assert_eq!(
+        mcp_descriptor_staleness(&regrown, &stored),
+        McpDescriptorStaleness::Stale {
+            changed: vec!["extra".to_string(), "update".to_string()]
+        },
+        "and the same answer the other way round"
     );
 }
 

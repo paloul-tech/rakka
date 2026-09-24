@@ -28,7 +28,7 @@
 //!   check lives in this module rather than in each caller so that *being
 //!   connected* and *having passed the rule* are the same event: a new caller
 //!   cannot reach a server by forgetting to ask.
-//! - A child process is reached only through [`connect_over`], over the
+//! - A child process is reached only through `connect_over`, over the
 //!   transport a deployment's launcher produced. It dials nothing, so there is
 //!   no URL for the egress rule to judge, and it takes no credential, so none
 //!   can reach a process that has no header to carry it.
@@ -44,7 +44,10 @@ use std::time::Duration;
 use http::{HeaderName, HeaderValue};
 use rakka_agent::AgentAuthorityRefusal;
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentEphemeralCredentialMaterial};
-use rmcp::model::{ClientCapabilities, ClientConfig, ErrorCode, Implementation, ProtocolVersion};
+use rmcp::model::{
+    ClientCapabilities, ClientConfig, ErrorCode, Implementation, PaginatedRequestParams,
+    ProtocolVersion, Tool,
+};
 use rmcp::service::{
     serve_client_with_lifecycle, ClientInitializeError, ClientLifecycleMode, Peer, RoleClient,
     RunningService, ServiceError,
@@ -56,7 +59,7 @@ use rmcp::transport::IntoTransport;
 
 use crate::binding::{
     is_protocol_version_shaped, McpServerBinding, McpServerId, McpTransport, MCP_CLIENT_NAME,
-    MCP_PEER_AGENT_SERVER_PREFIX,
+    MCP_LIST_PAGES_MAX, MCP_PEER_AGENT_SERVER_PREFIX,
 };
 use crate::launcher::{concrete_pair, McpChildTransport};
 
@@ -277,7 +280,7 @@ pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
         })
 }
 
-/// How long [`McpClientSession::close`] waits for a session's transport to
+/// How long `McpClientSession::close` waits for a session's transport to
 /// finish closing before it stops waiting.
 ///
 /// A bound of its own, never an effect's timeout: a close is owed on every
@@ -294,7 +297,12 @@ const SESSION_CLOSE_BOUND: Duration = Duration::from_secs(3);
 /// Transport-agnostic on purpose: the Streamable HTTP path and the
 /// child-process path both hand rmcp a `RunningService`, and everything after
 /// the handshake — the negotiated version, the peer, the close — is the same.
-pub struct McpClientSession {
+///
+/// Crate-private, like every way to open one: rmcp's `Peer` is not part of
+/// this crate's public API, and the only public ways to reach a server are the
+/// descriptor syncs and the dispatch executor, each of which holds the rules a
+/// bare session would not.
+pub(crate) struct McpClientSession {
     running: RunningService<RoleClient, ClientConfig>,
     server_name: String,
     negotiated: ProtocolVersion,
@@ -303,20 +311,43 @@ pub struct McpClientSession {
 impl McpClientSession {
     /// The peer every request goes through.
     #[must_use]
-    pub fn peer(&self) -> &Peer<RoleClient> {
+    pub(crate) fn peer(&self) -> &Peer<RoleClient> {
         self.running.peer()
+    }
+
+    /// Every tool the server lists, following `nextCursor` for at most
+    /// [`MCP_LIST_PAGES_MAX`] pages; `None` when the listing had not ended by
+    /// then.
+    ///
+    /// rmcp's own `list_all_tools` follows the cursor for as long as the
+    /// server keeps handing one out, and the server chooses every cursor.
+    pub(crate) async fn list_all_tools(&self) -> Result<Option<Vec<Tool>>, ServiceError> {
+        let mut tools = Vec::new();
+        let mut cursor = None;
+        for _ in 0..MCP_LIST_PAGES_MAX {
+            let page = self
+                .peer()
+                .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+                .await?;
+            tools.extend(page.tools);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Ok(Some(tools));
+            }
+        }
+        Ok(None)
     }
 
     /// The protocol version this session negotiated.
     #[must_use]
-    pub const fn negotiated_version(&self) -> &ProtocolVersion {
+    pub(crate) const fn negotiated_version(&self) -> &ProtocolVersion {
         &self.negotiated
     }
 
     /// The server's self-reported implementation name, empty when the peer
     /// reported none (a discovery response need not carry one).
     #[must_use]
-    pub fn server_name(&self) -> &str {
+    pub(crate) fn server_name(&self) -> &str {
         &self.server_name
     }
 
@@ -329,7 +360,7 @@ impl McpClientSession {
     /// failure or an abandoned wait is not actionable — the session is
     /// cancelled either way — so neither is raised as a refusal of the
     /// caller's work.
-    pub async fn close(mut self) {
+    pub(crate) async fn close(mut self) {
         let _ = self.running.close_with_timeout(SESSION_CLOSE_BOUND).await;
     }
 }
@@ -448,7 +479,7 @@ where
 /// [`McpClientError`] with its stable code: `mcp-transport-failed` for a
 /// binding that is not a child process, or for a peer that broke the
 /// handshake.
-pub async fn connect_over(
+pub(crate) async fn connect_over(
     transport: McpChildTransport,
     binding: &McpServerBinding,
 ) -> Result<McpClientSession, McpClientError> {

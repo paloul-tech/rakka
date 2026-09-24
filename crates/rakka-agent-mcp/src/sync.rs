@@ -17,9 +17,12 @@
 //! launcher produced — the same listing, bounds, and rules, with no URL to
 //! judge and no credential to carry.
 //!
-//! Two bounds and one rule then guard what crosses in:
+//! Three bounds and one rule then guard what crosses in:
 //!
-//! - A schema over [`MCP_DESCRIPTOR_SCHEMA_MAX_BYTES`] is refused outright.
+//! - A listing that has not ended after [`MCP_LIST_PAGES_MAX`] pages is
+//!   refused.
+//! - An input or output schema over [`MCP_DESCRIPTOR_SCHEMA_MAX_BYTES`] is
+//!   refused outright.
 //! - A schema over [`AGENT_TOOL_PARAMETERS_MAX_BYTES`] is still synced, but
 //!   does not ride the model-visible descriptor; the raw schema comes back for
 //!   the caller to store behind an [`ArtifactRef`].
@@ -39,12 +42,13 @@ use rakka_agent::{
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis, ArtifactRef};
 use rmcp::model::{Tool, ToolAnnotations};
 use rmcp::transport::streamable_http_client::StreamableHttpClient;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeserializeError;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::binding::{
     McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
-    MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
+    MCP_DESCRIPTOR_SCHEMA_MAX_BYTES, MCP_LIST_PAGES_MAX,
 };
 use crate::client::{
     connect, connect_over, service_error, McpClientError, McpClientSession, McpEgressCheck,
@@ -95,9 +99,21 @@ impl McpSyncedDescriptor {
     }
 }
 
+/// The schema version of the stored [`McpDescriptorSet`] shape this build
+/// writes, and the newest it reads.
+pub const MCP_DESCRIPTOR_SET_SCHEMA_VERSION: u32 = 1;
+
 /// Everything one publish-time sync of one server produced.
+///
+/// Release data a deployment stores, so it carries its own
+/// [`Self::schema_version`]: a set written by a newer build is refused on
+/// decode rather than read as whatever this build's fields make of it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpDescriptorSet {
+    /// The stored shape's schema version: [`MCP_DESCRIPTOR_SET_SCHEMA_VERSION`]
+    /// as the sync writes it. Decoding refuses a newer one.
+    #[serde(deserialize_with = "known_set_schema_version")]
+    pub schema_version: u32,
     /// The server this set belongs to.
     pub server_id: McpServerId,
     /// The server's self-reported implementation name at sync time.
@@ -158,6 +174,22 @@ impl McpDescriptorSet {
             .iter()
             .find(|descriptor| descriptor.tool == tool)
     }
+}
+
+/// Decodes a descriptor set's schema version, refusing one newer than this
+/// build knows.
+fn known_set_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version > MCP_DESCRIPTOR_SET_SCHEMA_VERSION {
+        return Err(DeserializeError::custom(format!(
+            "the MCP descriptor set's schema version {version} is newer than this build's \
+             {MCP_DESCRIPTOR_SET_SCHEMA_VERSION}"
+        )));
+    }
+    Ok(version)
 }
 
 /// Whether a stored descriptor set still matches what the server exposes.
@@ -352,7 +384,7 @@ async fn sync_over_session(
     server: &str,
     synced_at: AgentTimestampMillis,
 ) -> Result<McpDescriptorSet, McpSyncError> {
-    let listed = session.peer().list_all_tools().await;
+    let listed = session.list_all_tools().await;
     let protocol_version = session.negotiated_version().as_str().to_string();
     let server_name = session.server_name().to_string();
     // The session is closed before the answer is judged: a refusal must not
@@ -360,9 +392,18 @@ async fn sync_over_session(
     // process) alive.
     let built = listed
         .map_err(|error| McpSyncError::Client(service_error(server, &error)))
+        .and_then(|listed| {
+            listed.ok_or_else(|| {
+                McpSyncError::Client(McpClientError::Protocol {
+                    server: server.to_string(),
+                    reason: format!("tools/list did not end within {MCP_LIST_PAGES_MAX} pages"),
+                })
+            })
+        })
         .and_then(|listed| synced_descriptors(binding, server, &listed));
     session.close().await;
     Ok(McpDescriptorSet {
+        schema_version: MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
         server_id: binding.server_id.clone(),
         server_name,
         protocol_version,
@@ -450,7 +491,20 @@ fn synced_descriptor(
 ) -> Result<McpSyncedDescriptor, McpSyncError> {
     let input_schema = Value::Object((*listed.input_schema).clone());
     let bytes = encoded_len(&input_schema, server, tool)?;
-    if bytes > MCP_DESCRIPTOR_SCHEMA_MAX_BYTES {
+    let output_schema = listed
+        .output_schema
+        .as_ref()
+        .map(|schema| Value::Object((**schema).clone()));
+    // Both schemas are bounded: the output schema is digested and pinned just
+    // as the input one is, and the server chooses its size too.
+    let output_bytes = match &output_schema {
+        Some(schema) => encoded_len(schema, server, tool)?,
+        None => 0,
+    };
+    if let Some(bytes) = [bytes, output_bytes]
+        .into_iter()
+        .find(|bytes| *bytes > MCP_DESCRIPTOR_SCHEMA_MAX_BYTES)
+    {
         return Err(McpSyncError::SchemaTooLarge {
             server: server.to_string(),
             tool: tool.to_string(),
@@ -508,10 +562,9 @@ fn synced_descriptor(
     if let Some(timeout_ms) = policy.timeout_ms {
         derived = derived.with_timeout_ms(timeout_ms);
     }
-    let output_schema_digest = listed
-        .output_schema
+    let output_schema_digest = output_schema
         .as_ref()
-        .map(|schema| AgentContentDigest::sha256_of_json(&Value::Object((**schema).clone())));
+        .map(AgentContentDigest::sha256_of_json);
     Ok(McpSyncedDescriptor {
         tool: tool.to_string(),
         binding: derived,
@@ -564,21 +617,36 @@ fn bounded_description(description: &str) -> String {
 ///
 /// A hint never narrows or widens a declaration — the operator's class is the
 /// authority — so the only thing a contradiction can do is refuse the sync.
-/// `destructiveHint` contradicts every class below [`AgentEffectSafetyClass::Reconcileable`]:
-/// `ReadOnly` claims the tool changes nothing and `Idempotent` claims a repeat
-/// is harmless, and a destructive tool denies both. A class at or above
-/// `Reconcileable` already expects damage, so the hint tells it nothing new.
+/// The rule, for a tool declared `ReadOnly` or `Idempotent` (the two classes
+/// that promise a repeat is harmless):
+///
+/// - `destructiveHint: true` contradicts both: a destructive tool is neither.
+/// - `idempotentHint: false` contradicts both: `ReadOnly` claims the tool
+///   changes nothing, which a repeat therefore cannot change either, and
+///   `Idempotent` claims it outright.
+/// - `readOnlyHint: false` contradicts `ReadOnly`.
+///
+/// A class at or above [`AgentEffectSafetyClass::Reconcileable`] already
+/// expects damage, so no hint tells it anything new. And `readOnlyHint: true`
+/// silences the other two: in MCP's own semantics `destructiveHint` and
+/// `idempotentHint` are meaningful only when `readOnlyHint` is false, and a
+/// server that calls a tool read-only has contradicted no class by it.
 fn hint_contradiction(
     annotations: Option<&ToolAnnotations>,
     safety: AgentEffectSafetyClass,
 ) -> Option<&'static str> {
     let annotations = annotations?;
-    if annotations.destructive_hint == Some(true)
-        && safety.strictness() < AgentEffectSafetyClass::Reconcileable.strictness()
-    {
+    if annotations.read_only_hint == Some(true) {
+        return None;
+    }
+    let promises_harmless_repeat = matches!(
+        safety,
+        AgentEffectSafetyClass::ReadOnly | AgentEffectSafetyClass::Idempotent
+    );
+    if annotations.destructive_hint == Some(true) && promises_harmless_repeat {
         return Some("destructiveHint");
     }
-    if annotations.idempotent_hint == Some(false) && safety == AgentEffectSafetyClass::Idempotent {
+    if annotations.idempotent_hint == Some(false) && promises_harmless_repeat {
         return Some("idempotentHint");
     }
     if annotations.read_only_hint == Some(false) && safety == AgentEffectSafetyClass::ReadOnly {
@@ -629,15 +697,53 @@ mod tests {
     }
 
     #[test]
-    fn a_non_idempotent_hint_contradicts_only_the_idempotent_declaration() {
+    fn a_non_idempotent_hint_contradicts_the_read_only_and_idempotent_declarations() {
         let hinted = ToolAnnotations::new().idempotent(false);
+        for safety in [
+            AgentEffectSafetyClass::ReadOnly,
+            AgentEffectSafetyClass::Idempotent,
+        ] {
+            assert_eq!(
+                hint_contradiction(Some(&hinted), safety),
+                Some("idempotentHint"),
+                "{safety:?}"
+            );
+        }
+        for safety in [
+            AgentEffectSafetyClass::Reconcileable,
+            AgentEffectSafetyClass::NonIdempotent,
+        ] {
+            assert_eq!(
+                hint_contradiction(Some(&hinted), safety),
+                None,
+                "{safety:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_hint_silences_the_destructive_and_idempotent_hints() {
+        let hinted = ToolAnnotations::new()
+            .read_only(true)
+            .destructive(true)
+            .idempotent(false);
+        for safety in [
+            AgentEffectSafetyClass::ReadOnly,
+            AgentEffectSafetyClass::Idempotent,
+            AgentEffectSafetyClass::Reconcileable,
+            AgentEffectSafetyClass::NonIdempotent,
+        ] {
+            assert_eq!(
+                hint_contradiction(Some(&hinted), safety),
+                None,
+                "{safety:?}"
+            );
+        }
+        // Without it, the same two hints refuse a `ReadOnly` declaration.
+        let unmarked = ToolAnnotations::new().destructive(true).idempotent(false);
         assert_eq!(
-            hint_contradiction(Some(&hinted), AgentEffectSafetyClass::Idempotent),
-            Some("idempotentHint")
-        );
-        assert_eq!(
-            hint_contradiction(Some(&hinted), AgentEffectSafetyClass::NonIdempotent),
-            None
+            hint_contradiction(Some(&unmarked), AgentEffectSafetyClass::ReadOnly),
+            Some("destructiveHint")
         );
     }
 

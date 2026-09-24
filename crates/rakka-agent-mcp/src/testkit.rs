@@ -181,6 +181,7 @@ struct FakeState {
     list_calls: usize,
     list_delay: Option<Duration>,
     legacy_only: bool,
+    endless_pages: bool,
     calls: Vec<SeenCall>,
     last_headers: Vec<(String, String)>,
 }
@@ -214,6 +215,7 @@ impl FakeMcpServer {
                 list_calls: 0,
                 list_delay: None,
                 legacy_only: false,
+                endless_pages: false,
                 calls: Vec::new(),
                 last_headers: Vec::new(),
             })),
@@ -264,6 +266,16 @@ impl FakeMcpServer {
     #[must_use]
     pub fn with_legacy_only(self) -> Self {
         self.lock().legacy_only = true;
+        self
+    }
+
+    /// Makes every `tools/list` page hand out another `nextCursor`, so the
+    /// listing never ends: the tools on the first page, and an empty page
+    /// after it, forever. Each page is one request counted in
+    /// [`Self::list_calls`].
+    #[must_use]
+    pub fn with_endless_pages(self) -> Self {
+        self.lock().endless_pages = true;
         self
     }
 
@@ -354,21 +366,31 @@ impl ServerHandler for FakeMcpServer {
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let first_page = request.and_then(|request| request.cursor).is_none();
         // Count and read under one lock, then drop it before any sleep: a std
         // guard must never cross an await point.
-        let (tools, delay) = {
+        let (tools, delay, next_cursor) = {
             let mut state = self.lock();
             state.list_calls += 1;
-            let tools = state.tools.iter().map(FakeTool::listed).collect();
-            (tools, state.list_delay)
+            let tools = if first_page || !state.endless_pages {
+                state.tools.iter().map(FakeTool::listed).collect()
+            } else {
+                Vec::new()
+            };
+            let next_cursor = state
+                .endless_pages
+                .then(|| format!("page-{}", state.list_calls));
+            (tools, state.list_delay, next_cursor)
         };
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
-        Ok(ListToolsResult::with_all_items(tools))
+        let mut page = ListToolsResult::with_all_items(tools);
+        page.next_cursor = next_cursor;
+        Ok(page)
     }
 
     async fn call_tool(

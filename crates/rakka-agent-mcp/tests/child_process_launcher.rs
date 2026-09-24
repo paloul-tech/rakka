@@ -1,6 +1,7 @@
 //! The unsandboxed reference launcher, feature `child-process`: it reads the
-//! spec artifact and spawns the command. Proven with `/bin/cat`, which echoes
-//! the client's first request back. rmcp reads the echoed `server/discover`
+//! spec artifact and spawns the command, and the launched transport is driven
+//! through the crate's public launcher path, `sync_mcp_descriptors_over`.
+//! Proven with `/bin/cat`, which echoes the client's first request back. rmcp reads the echoed `server/discover`
 //! as a request *from* the server — `ServerRequest` ends in a catch-all
 //! `CustomRequest` (`rmcp-3.4.0/src/model.rs:4604`–`4609`) — and ignores it
 //! as an unexpected pre-handshake message
@@ -24,10 +25,11 @@ use std::time::Duration;
 
 use rakka_agent::{AgentContentDigest, AgentEffectSafetyClass, AgentToolDeclaration};
 use rakka_agent_mcp::{
-    connect_over, mcp_artifact_store, McpChildProcessLauncher, McpChildTransport, McpServerBinding,
-    McpServerId, McpToolPolicy, TokioChildProcessLauncher, MCP_LAUNCH_SPEC_MAX_BYTES,
+    mcp_artifact_store, sync_mcp_descriptors_over, McpChildProcessLauncher, McpChildTransport,
+    McpDescriptorSet, McpServerBinding, McpServerId, McpSyncError, McpToolPolicy,
+    TokioChildProcessLauncher, MCP_LAUNCH_SPEC_MAX_BYTES,
 };
-use rakka_agent_workflow::ArtifactRef;
+use rakka_agent_workflow::{AgentTimestampMillis, ArtifactRef};
 use serde_json::{json, Value};
 
 mod support;
@@ -46,6 +48,12 @@ fn binding() -> McpServerBinding {
             McpToolPolicy::new(AgentToolDeclaration::new(AgentEffectSafetyClass::ReadOnly)),
         )
         .expect("t")
+}
+
+/// The launcher path's publish-time sync over one launched transport: the
+/// handshake, the listing, and the refusals a launched child reads back as.
+async fn sync_over(transport: McpChildTransport) -> Result<McpDescriptorSet, McpSyncError> {
+    sync_mcp_descriptors_over(transport, &binding(), AgentTimestampMillis::new(1)).await
 }
 
 /// A launcher over a store that holds `spec` at `spec-1`.
@@ -112,7 +120,7 @@ async fn the_reference_launcher_spawns_the_artifacts_command_and_it_dies_with_th
     let pid = pid_of(&transport);
     assert!(alive(pid).await, "a process was launched from the artifact");
 
-    let outcome = tokio::time::timeout(HANDSHAKE_BOUND, connect_over(transport, &binding())).await;
+    let outcome = tokio::time::timeout(HANDSHAKE_BOUND, sync_over(transport)).await;
     match outcome {
         Err(_elapsed) => {}
         Ok(Ok(_)) => panic!("an echo is not an MCP server"),
@@ -133,11 +141,7 @@ async fn a_child_that_never_reads_its_input_is_killed_when_the_transport_drops()
         .expect("the specification launches");
     let pid = pid_of(&transport);
     assert!(alive(pid).await, "a process was launched from the artifact");
-    let outcome = tokio::time::timeout(
-        Duration::from_millis(300),
-        connect_over(transport, &binding()),
-    )
-    .await;
+    let outcome = tokio::time::timeout(Duration::from_millis(300), sync_over(transport)).await;
     assert!(outcome.is_err(), "a sleeping child never answers");
     // `sleep` never sees end of input, so nothing but a kill ends it before
     // its thirty seconds are up.
@@ -152,13 +156,14 @@ async fn a_peer_that_refuses_the_handshake_reads_back_bounded_and_body_free() {
         .launch(&run_scope(), &spec_artifact_ref())
         .await
         .expect("the specification launches");
-    let error =
-        match tokio::time::timeout(HANDSHAKE_BOUND, connect_over(transport, &binding())).await {
-            Ok(Err(error)) => error,
-            Ok(Ok(_)) => panic!("a refused handshake opened no session"),
-            Err(_) => panic!("a refused handshake answers inside the bound"),
-        };
-    assert_eq!(error.code(), "mcp-transport-failed");
+    let error = match tokio::time::timeout(HANDSHAKE_BOUND, sync_over(transport)).await {
+        Ok(Err(error)) => error,
+        Ok(Ok(_)) => panic!("a refused handshake opened no session"),
+        Err(_) => panic!("a refused handshake answers inside the bound"),
+    };
+    // The launcher path's sync reads every transport or protocol failure as
+    // one fact: the descriptors could not be refreshed.
+    assert_eq!(error.code(), "mcp-descriptor-sync-failed");
     let message = error.to_string();
     assert!(message.len() < MESSAGE_BOUND, "{message}");
     assert!(message.contains("JsonRpcError(4001)"), "{message}");
@@ -182,12 +187,11 @@ async fn the_child_sees_only_the_environment_its_specification_names() {
         .launch(&run_scope(), &spec_artifact_ref())
         .await
         .expect("the specification launches");
-    let error =
-        match tokio::time::timeout(HANDSHAKE_BOUND, connect_over(transport, &binding())).await {
-            Ok(Err(error)) => error,
-            Ok(Ok(_)) => panic!("a refused handshake opened no session"),
-            Err(_) => panic!("a refused handshake answers inside the bound"),
-        };
+    let error = match tokio::time::timeout(HANDSHAKE_BOUND, sync_over(transport)).await {
+        Ok(Err(error)) => error,
+        Ok(Ok(_)) => panic!("a refused handshake opened no session"),
+        Err(_) => panic!("a refused handshake answers inside the bound"),
+    };
     assert!(
         error.to_string().contains("JsonRpcError(4001)"),
         "the child saw an environment other than its specification's: {error}"
