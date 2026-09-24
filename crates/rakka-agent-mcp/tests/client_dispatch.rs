@@ -1,13 +1,15 @@
 //! The MCP executor per attempt: the egress check before any client, the
 //! credential on the wire and nowhere else, `_meta` with the idempotency
-//! key and trace context, the schema recheck, and every result mapping —
-//! against the in-process fake, over a counting client.
+//! key and trace context, the schema recheck, every result mapping, and the
+//! effect's timeout over the whole attempt — against the in-process fake,
+//! over a counting client.
 //!
 //! The whole file is gated: it drives the in-process fake server, which only
 //! exists under `testkit`.
 #![cfg(feature = "testkit")]
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rakka_agent::{
     AgentAuthorityRefusal, AgentDispatchToolExecutor, AgentEffectSafetyClass, AgentTaskContent,
@@ -18,14 +20,26 @@ use rakka_agent_mcp::testkit::{
     serve_fake, CountingClient, FakeMcpServer, FakeTool, FakeToolBehaviour, ReqwestClient,
 };
 use rakka_agent_mcp::{
-    mcp_artifact_store, sync_mcp_descriptors, McpAllowAllEgress, McpDispatchToolExecutor,
-    McpEgressCheck, McpServerBinding, McpServerId, McpToolPolicy, MCP_META_IDEMPOTENCY_KEY,
+    mcp_artifact_store, sync_mcp_descriptors, McpAllowAllEgress, McpDescriptorSet,
+    McpDispatchToolExecutor, McpEgressCheck, McpRegistrationError, McpServerBinding, McpServerId,
+    McpToolPolicy, MCP_META_IDEMPOTENCY_KEY,
 };
-use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
+use rakka_agent_workflow::{
+    validate_artifact_ref, AgentEphemeralCredential, AgentTimestampMillis,
+    DEFAULT_AGENT_ARTIFACT_RETENTION_CLASS,
+};
 use serde_json::json;
 
 mod support;
 use support::{run_scope, tool_intent_with_timeout, SharedArtifactStore};
+
+/// A W3C `traceparent` the effect carries, as a real run would commit one.
+const TRACE_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01";
+/// A W3C `tracestate` the effect carries alongside it.
+const TRACE_STATE: &str = "rakka=t61rcWkgMzE";
+
+/// What every elapsed deadline reads as, wherever in the attempt it fired.
+const ATTEMPT_TIMED_OUT: &str = "the attempt exceeded the effect's timeout";
 
 fn server_id() -> McpServerId {
     McpServerId::new("crm").expect("id")
@@ -162,7 +176,9 @@ async fn a_call_carries_the_credential_the_meta_and_maps_structured_content_inli
     let (executor, http, _) = executor(&endpoint.url, Arc::new(McpAllowAllEgress)).await;
     let sends_after_sync = http.sends();
     let credential = AgentEphemeralCredential::bearer_token("attempt-token-sentinel");
-    let intent = tool_intent_with_timeout("mcp.crm.echo", Some(5_000));
+    let mut intent = tool_intent_with_timeout("mcp.crm.echo", Some(5_000));
+    intent.telemetry.trace_parent = Some(TRACE_PARENT.to_string());
+    intent.telemetry.trace_state = Some(TRACE_STATE.to_string());
     let content = executor
         .execute(
             &run_scope(),
@@ -187,9 +203,17 @@ async fn a_call_carries_the_credential_the_meta_and_maps_structured_content_inli
         seen[0].meta[MCP_META_IDEMPOTENCY_KEY],
         json!(intent.idempotency_key.as_str())
     );
-    assert!(
-        seen[0].meta.get("traceparent").is_some() == intent.telemetry.trace_parent.is_some(),
-        "the trace context rides `_meta` exactly when the effect carries one"
+    assert_eq!(
+        seen[0].meta["traceparent"],
+        json!(TRACE_PARENT),
+        "the effect's trace parent rides `_meta`: {:?}",
+        seen[0].meta
+    );
+    assert_eq!(
+        seen[0].meta["tracestate"],
+        json!(TRACE_STATE),
+        "the effect's trace state rides `_meta`: {:?}",
+        seen[0].meta
     );
     assert!(
         http.sends() > sends_after_sync,
@@ -242,10 +266,39 @@ async fn the_recheck_is_cached_under_the_ttl_and_refuses_a_changed_schema() {
         .expect("builds")
         .with_descriptor_recheck_ttl_ms(0)
     };
+    // Two successful attempts on the TTL-0 executor: the first would list on
+    // an empty cache whatever the TTL said, so only the second one shows that
+    // `0` means "every attempt".
+    let listed_before = endpoint.server.list_calls();
+    for attempt in ["first", "second"] {
+        every_attempt
+            .execute(&run_scope(), &intent, &call("echo", json!({})), None)
+            .await
+            .unwrap_or_else(|error| panic!("the {attempt} TTL-0 attempt answers: {error}"));
+    }
+    assert_eq!(
+        endpoint.server.list_calls(),
+        listed_before + 2,
+        "a TTL of 0 re-reads the listing on every attempt"
+    );
     endpoint.server.swap_tool_schema(
         "echo",
         json!({"type":"object","properties":{"changed":{"type":"string"}}}),
     );
+    // The default-TTL executor still holds a listing from before the swap, so
+    // it answers from the cache — that is what a TTL costs — and lists
+    // nothing.
+    executor
+        .execute(&run_scope(), &intent, &call("echo", json!({})), None)
+        .await
+        .expect("a cache hit compares against the last listing it read");
+    assert_eq!(
+        endpoint.server.list_calls(),
+        listed_before + 2,
+        "the cache hit made no listing"
+    );
+    let calls_before_mismatch = endpoint.server.call_count();
+    assert_eq!(calls_before_mismatch, 5, "2 + 2 TTL-0 + 1 cache hit");
     let error = every_attempt
         .execute(&run_scope(), &intent, &call("echo", json!({})), None)
         .await
@@ -257,8 +310,13 @@ async fn the_recheck_is_cached_under_the_ttl_and_refuses_a_changed_schema() {
         "{error}"
     );
     assert_eq!(
+        endpoint.server.list_calls(),
+        listed_before + 3,
+        "the TTL-0 executor re-read the reshaped listing"
+    );
+    assert_eq!(
         endpoint.server.call_count(),
-        2,
+        calls_before_mismatch,
         "the mismatched attempt never called the tool"
     );
 }
@@ -275,6 +333,23 @@ async fn large_results_go_to_the_artifact_store_or_refuse_by_the_bindings_behavi
     let AgentTaskContent::Artifact(reference) = content else {
         panic!("expected an artifact, got {content:?}")
     };
+    validate_artifact_ref(&reference).unwrap_or_else(|error| {
+        panic!("the stored reference passes the workflow's own validation: {error}")
+    });
+    assert_eq!(
+        reference.retention_class.as_deref(),
+        Some(DEFAULT_AGENT_ARTIFACT_RETENTION_CLASS),
+        "the write request kept the crate's default retention class"
+    );
+    assert_eq!(
+        reference.artifact_id,
+        format!(
+            "mcp-{}-g{}-call-1",
+            intent.effect_id,
+            intent.generation.get()
+        ),
+        "the artifact id derives from the effect, its generation, and the call"
+    );
     assert_eq!(store.len().await, 1);
     assert!(store
         .bytes(&reference.artifact_id)
@@ -419,6 +494,19 @@ async fn construction_is_offline_and_a_tool_without_a_descriptor_is_refused() {
     )
     .expect_err("a listed tool with no synced descriptor");
     assert_eq!(error.code(), "mcp-binding-invalid");
+    assert!(
+        matches!(
+            error,
+            McpRegistrationError::DescriptorMissing { ref server, ref tool }
+                if server == "crm" && tool == "extra"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "the MCP server crm's tool extra has no synced descriptor; re-sync the server before \
+         binding it"
+    );
 }
 
 #[tokio::test]
@@ -457,7 +545,7 @@ async fn a_timeout_from_the_intent_bounds_the_call() {
         Arc::new(McpAllowAllEgress),
     )
     .expect("builds");
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let error = executor
         .execute(
             &run_scope(),
@@ -468,11 +556,154 @@ async fn a_timeout_from_the_intent_bounds_the_call() {
         .await
         .expect_err("timed out");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(2),
         "the timeout bounded the call"
     );
     assert!(
-        error.to_string().contains("mcp-transport-failed"),
+        error.to_string().contains("mcp-transport-failed")
+            && error.to_string().contains(ATTEMPT_TIMED_OUT),
+        "{error}"
+    );
+}
+
+/// The echo tool alone, bound on `url`.
+fn echo_binding(url: &str) -> McpServerBinding {
+    McpServerBinding::streamable_http(server_id(), url)
+        .with_tool(
+            "echo",
+            policy(
+                AgentEffectSafetyClass::ReadOnly,
+                AgentToolResultBehavior::InlineBounded,
+            ),
+        )
+        .expect("t")
+}
+
+fn echo_tool() -> FakeTool {
+    FakeTool::new(
+        "echo",
+        "Echoes.",
+        json!({"type":"object"}),
+        FakeToolBehaviour::Echo,
+    )
+}
+
+/// The descriptor set a publish-time sync reads from a healthy server
+/// exposing only the echo tool.
+async fn echo_set_from_a_healthy_server() -> McpDescriptorSet {
+    let healthy = serve_fake(FakeMcpServer::new().with_tool(echo_tool())).await;
+    sync_mcp_descriptors(
+        &ReqwestClient::new(),
+        &echo_binding(&healthy.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("syncs")
+}
+
+/// An executor whose only binding points at `url`, over a set synced from a
+/// healthy server — the publish-time sync saw a server that answered; the
+/// dispatch-time one is whatever `url` serves.
+async fn echo_executor_at(url: &str) -> McpDispatchToolExecutor<ReqwestClient> {
+    McpDispatchToolExecutor::new(
+        vec![echo_set_from_a_healthy_server().await],
+        vec![echo_binding(url)],
+        mcp_artifact_store(SharedArtifactStore::default()),
+        ReqwestClient::new(),
+        Arc::new(McpAllowAllEgress),
+    )
+    .expect("builds")
+}
+
+#[tokio::test]
+async fn the_intents_timeout_bounds_a_listing_that_stalls_before_the_call() {
+    // The same tool, served by a server that opens the session and answers
+    // the handshake, then sits on its `tools/list` for far longer than the
+    // effect allows.
+    let stalled = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(echo_tool())
+            .with_list_delay(2_000),
+    )
+    .await;
+    let executor = echo_executor_at(&stalled.url).await;
+    let started = Instant::now();
+    // The outer bound only keeps a regression from hanging the suite; the
+    // assertion below is the one that measures the fix.
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        executor.execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(200)),
+            &call("echo", json!({})),
+            None,
+        ),
+    )
+    .await
+    .expect("the attempt returned on its own")
+    .expect_err("the listing stalled past the effect's timeout");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the deadline fired inside the stalled listing, not after it: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        error.to_string().contains("mcp-transport-failed")
+            && error.to_string().contains(ATTEMPT_TIMED_OUT),
+        "{error}"
+    );
+    assert_eq!(
+        stalled.server.list_calls(),
+        1,
+        "the attempt reached the recheck's listing"
+    );
+    assert_eq!(
+        stalled.server.call_count(),
+        0,
+        "the stalled attempt never sent tools/call"
+    );
+}
+
+#[tokio::test]
+async fn the_intents_timeout_bounds_a_handshake_that_is_never_answered() {
+    // A socket that accepts every connection and never writes a byte: the
+    // `initialize` request goes out and no answer ever comes back.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the loopback socket binds");
+    let address = listener.local_addr().expect("the address is readable");
+    let silent = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let executor = echo_executor_at(&format!("http://{address}/mcp")).await;
+    let credential = AgentEphemeralCredential::bearer_token("attempt-token-sentinel");
+    let started = Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        executor.execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(200)),
+            &call("echo", json!({})),
+            Some(&credential),
+        ),
+    )
+    .await
+    .expect("the attempt returned on its own")
+    .expect_err("the handshake was never answered");
+    silent.abort();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the deadline fired inside the handshake: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        error.to_string().contains("mcp-transport-failed")
+            && error.to_string().contains(ATTEMPT_TIMED_OUT),
         "{error}"
     );
 }

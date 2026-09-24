@@ -434,6 +434,15 @@ pub enum McpRegistrationError {
         /// The server with no registered binding.
         server: String,
     },
+    /// A tool the binding allow-lists has no descriptor in the server's
+    /// synced set: the tool is named validly, but no schema was pinned for it,
+    /// so no attempt could ever recheck it.
+    DescriptorMissing {
+        /// The server the tool belongs to.
+        server: String,
+        /// The allow-listed tool with no synced descriptor.
+        tool: String,
+    },
     /// The binding's transport is not enabled in this build.
     TransportUnsupported {
         /// The server whose transport is unsupported.
@@ -512,6 +521,7 @@ impl McpRegistrationError {
             | Self::DuplicateServer { .. }
             | Self::DescriptorSetMissing { .. }
             | Self::BindingMissing { .. }
+            | Self::DescriptorMissing { .. }
             | Self::ProtocolVersionsEmpty { .. }
             | Self::ProtocolVersionInvalid { .. }
             | Self::ProtocolVersionUnknown { .. }
@@ -545,6 +555,11 @@ impl Display for McpRegistrationError {
             Self::BindingMissing { server } => {
                 write!(f, "no MCP binding is registered for server {server}")
             }
+            Self::DescriptorMissing { server, tool } => write!(
+                f,
+                "the MCP server {server}'s tool {tool} has no synced descriptor; re-sync the \
+                 server before binding it"
+            ),
             Self::TransportUnsupported { server } => write!(
                 f,
                 "the MCP server {server}'s transport is not enabled in this build"

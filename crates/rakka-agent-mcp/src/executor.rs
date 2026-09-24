@@ -1,12 +1,19 @@
 //! [`McpDispatchToolExecutor`]: one MCP tool call per dispatch attempt, and
 //! the mapping from what a server answers onto bounded task content.
 //!
-//! Four properties this module holds:
+//! Five properties this module holds:
 //!
 //! - **One attempt is one session.** The client is built inside the attempt
 //!   and closed on every path out of it, including every refusal. Nothing
 //!   about a server survives an attempt except the schema recheck cache, which
 //!   is not authority — it can only refuse.
+//! - **The effect's timeout bounds the whole attempt.** One deadline, taken
+//!   when the attempt starts, covers the handshake, the recheck's listing,
+//!   the call, and the mapping — mirroring the `deadline_at` the dispatcher
+//!   stamps for the attempt and derives the credential lease from. A server
+//!   that accepts a connection and then never answers holds a
+//!   credential-bearing client for at most that long, plus the close's own
+//!   few-second bound.
 //! - **The destination is admitted before the credential is read.** The egress
 //!   rule fires inside the `client` module's own `connect`, so a refusal
 //!   happens before a transport, a header, or a request exists.
@@ -213,11 +220,16 @@ impl<C> McpDispatchToolExecutor<C> {
         })
     }
 
-    /// Installs the deployment's child-process launcher and re-validates.
+    /// Installs the deployment's child-process launcher on an executor built
+    /// without child-process bindings.
     ///
-    /// Re-validation is the point: [`Self::new`] refuses a `ChildProcess`
-    /// binding outright, so this is where such a binding becomes legal — and
-    /// it must become legal by the same rule, not by skipping it.
+    /// This admits no binding. [`Self::new`] already refused any
+    /// `ChildProcess` binding, and an executor's bindings are fixed once it is
+    /// built, so what this installs is the capability alone; a child-process
+    /// binding is admitted only by a constructor that takes the launcher
+    /// together with the bindings. The routing table is re-derived under the
+    /// launcher anyway, by the same rule `new` applied, so installing one can
+    /// never widen what was validated.
     ///
     /// # Errors
     ///
@@ -321,10 +333,21 @@ where
         let Some(policy) = server.binding.tools.get(&descriptor.tool) else {
             return Err(unbound());
         };
-        let session = self.open(scope, &server.binding, credential).await?;
-        let outcome = self
-            .call(&session, server, descriptor, policy, intent, call)
-            .await;
+        // One deadline for the whole attempt, taken before anything touches
+        // the network: the handshake and the call (the recheck's listing runs
+        // inside the call's window) spend the same budget rather than one
+        // each.
+        let deadline = attempt_deadline(intent);
+        let session = within(deadline, self.open(scope, &server.binding, credential)).await??;
+        let outcome = within(
+            deadline,
+            self.call(&session, server, descriptor, policy, intent, call),
+        )
+        .await
+        .and_then(std::convert::identity);
+        // Unconditional, and outside the effect's deadline: a close is owed on
+        // every path, including the one where the deadline just fired. It is
+        // bounded on its own terms by `McpClientSession::close`.
         session.close().await;
         outcome
     }
@@ -378,7 +401,8 @@ where
         })
     }
 
-    /// The recheck, the request, the timeout, and the mapping.
+    /// The recheck, the request, and the mapping — everything after the
+    /// handshake that the attempt's deadline bounds.
     async fn call(
         &self,
         session: &McpClientSession,
@@ -399,26 +423,18 @@ where
         let mut params =
             CallToolRequestParams::new(descriptor.tool.clone()).with_arguments(arguments);
         params.meta = Some(call_meta(intent));
-        // `unwrap_or` rather than a branch: an effect with no timeout is
-        // bounded by the far future, which `tokio::time::timeout` clamps
-        // rather than overflowing (`tokio-1.52.3/src/time/timeout.rs:92`).
-        let bound = Duration::from_millis(intent.timeout_ms.unwrap_or(u64::MAX / 2));
-        let answered = tokio::time::timeout(bound, session.peer().call_tool_once(params)).await;
-        let answer = match answered {
-            Err(_) => {
-                return Err(AgentDispatchError::Invocation {
-                    code: "mcp-transport-failed",
-                    message: "the call exceeded the effect's timeout".to_string(),
-                })
-            }
-            Ok(Err(error)) => {
-                return Err(dispatch_error(client::service_error(
+        // No timeout of its own: the attempt's deadline wraps this whole
+        // function, recheck included.
+        let answer = session
+            .peer()
+            .call_tool_once(params)
+            .await
+            .map_err(|error| {
+                dispatch_error(client::service_error(
                     server.binding.server_id.as_str(),
                     &error,
-                )))
-            }
-            Ok(Ok(answer)) => answer,
-        };
+                ))
+            })?;
         self.content(policy, &call.tool, intent, call, answer).await
     }
 
@@ -531,28 +547,26 @@ where
                     structured_content: &result.structured_content,
                 })
                 .map_err(encoding_refused)?;
-                let request = AgentArtifactWriteRequest {
-                    // Derived, so a re-driven attempt of the same generation
-                    // writes the same artifact rather than a second one.
-                    artifact_id: Some(format!(
-                        "mcp-{}-g{}-{}",
-                        intent.effect_id,
-                        intent.generation.get(),
-                        call.call_id
-                    )),
-                    // The retention class is the deployment's decision about
-                    // its own data, not this adapter's.
-                    retention_class: None,
-                    // The executor holds no clock; the effect's own commit
-                    // time is durable and identical across a re-drive, which
-                    // is what the derived artifact id needs it to be.
-                    ..AgentArtifactWriteRequest::new(
-                        ArtifactKind::File,
-                        "application/json",
-                        bytes,
-                        intent.created_at,
-                    )
-                };
+                // `new`'s defaults, retention class `standard` among them, so
+                // the reference a pass-through store returns still passes
+                // `validate_artifact_ref`. The executor holds no clock; the
+                // effect's own commit time is durable and identical across a
+                // re-drive, which is what the derived artifact id needs it to
+                // be.
+                let request = AgentArtifactWriteRequest::new(
+                    ArtifactKind::File,
+                    "application/json",
+                    bytes,
+                    intent.created_at,
+                )
+                // Derived, so a re-driven attempt of the same generation
+                // writes the same artifact rather than a second one.
+                .artifact_id(format!(
+                    "mcp-{}-g{}-{}",
+                    intent.effect_id,
+                    intent.generation.get(),
+                    call.call_id
+                ));
                 let mut store = self.artifacts.lock().await;
                 let reference = store.put_artifact(request).await.map_err(|error| {
                     AgentDispatchError::collaborator(error.code(), error.to_string())
@@ -615,12 +629,9 @@ fn routes(
                 .iter()
                 .position(|descriptor| &descriptor.tool == tool)
             else {
-                return Err(McpRegistrationError::ToolNameInvalid {
+                return Err(McpRegistrationError::DescriptorMissing {
                     server: server.to_string(),
                     tool: tool.clone(),
-                    reason: "the server's synced descriptor set holds no descriptor for it; \
-                             re-sync the server before binding it"
-                        .to_string(),
                 });
             };
             tools.insert(
@@ -633,6 +644,35 @@ fn routes(
         }
     }
     Ok(tools)
+}
+
+/// The instant the whole attempt must be over by, or `None` when the effect
+/// committed no timeout (or one so large that no clock could reach it).
+///
+/// `checked_add` rather than `+`: adding an unrepresentable duration to an
+/// [`Instant`](tokio::time::Instant) panics, and an effect's timeout is data.
+fn attempt_deadline(intent: &AgentRunEffect) -> Option<tokio::time::Instant> {
+    tokio::time::Instant::now().checked_add(Duration::from_millis(intent.timeout_ms?))
+}
+
+/// Runs one stage of the attempt under its deadline.
+///
+/// Elapsed reads the same wherever it fired — the handshake, the listing, the
+/// call, or the mapping — because what the dispatcher learns is one fact: the
+/// attempt did not land inside the effect's window.
+async fn within<T>(
+    deadline: Option<tokio::time::Instant>,
+    work: impl Future<Output = T>,
+) -> Result<T, AgentDispatchError> {
+    let Some(deadline) = deadline else {
+        return Ok(work.await);
+    };
+    tokio::time::timeout_at(deadline, work)
+        .await
+        .map_err(|_| AgentDispatchError::Invocation {
+            code: "mcp-transport-failed",
+            message: "the attempt exceeded the effect's timeout".to_string(),
+        })
 }
 
 /// The `_meta` one call carries: the effect's idempotency key, and the trace

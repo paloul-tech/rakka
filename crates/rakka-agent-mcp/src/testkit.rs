@@ -178,6 +178,7 @@ struct FakeState {
     server_name: String,
     versions: Vec<ProtocolVersion>,
     list_calls: usize,
+    list_delay: Option<Duration>,
     calls: Vec<SeenCall>,
     last_headers: Vec<(String, String)>,
 }
@@ -209,6 +210,7 @@ impl FakeMcpServer {
                 server_name: "fake-mcp-server".to_string(),
                 versions: ProtocolVersion::KNOWN_VERSIONS.to_vec(),
                 list_calls: 0,
+                list_delay: None,
                 calls: Vec::new(),
                 last_headers: Vec::new(),
             })),
@@ -236,7 +238,20 @@ impl FakeMcpServer {
         self
     }
 
-    /// How many `tools/list` requests the server has served.
+    /// Makes every `tools/list` sleep `millis` before it answers.
+    ///
+    /// The handshake still completes and the session stays open: only the
+    /// listing stalls, which is the shape of a server that accepts a client
+    /// and then never gets round to answering it. A listing is counted in
+    /// [`Self::list_calls`] when it *arrives*, so a proof can show the stalled
+    /// request was reached even when the client gave up on it.
+    #[must_use]
+    pub fn with_list_delay(self, millis: u64) -> Self {
+        self.lock().list_delay = Some(Duration::from_millis(millis));
+        self
+    }
+
+    /// How many `tools/list` requests the server has received.
     #[must_use]
     pub fn list_calls(&self) -> usize {
         self.lock().list_calls
@@ -312,9 +327,17 @@ impl ServerHandler for FakeMcpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let mut state = self.lock();
-        state.list_calls += 1;
-        let tools = state.tools.iter().map(FakeTool::listed).collect();
+        // Count and read under one lock, then drop it before any sleep: a std
+        // guard must never cross an await point.
+        let (tools, delay) = {
+            let mut state = self.lock();
+            state.list_calls += 1;
+            let tools = state.tools.iter().map(FakeTool::listed).collect();
+            (tools, state.list_delay)
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(ListToolsResult::with_all_items(tools))
     }
 

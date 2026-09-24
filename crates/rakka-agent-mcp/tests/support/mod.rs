@@ -145,7 +145,11 @@ impl AgentArtifactStore for SharedArtifactStore {
                 artifact_id: artifact_id.clone(),
                 kind: request.kind,
                 uri: format!("memory://mcp-fixture/{artifact_id}"),
-                checksum: request.checksum,
+                // The store's own checksum when the writer supplied none, as
+                // `rakka-agent-workflow`'s `FakeArtifactStore` does: a
+                // reference is only valid with one, and producing it is the
+                // store's job, not the writer's.
+                checksum: request.checksum.or_else(|| Some(format!("len:{byte_len}"))),
                 content_type: request.content_type,
                 byte_len: Some(byte_len),
                 retention_class: request.retention_class,

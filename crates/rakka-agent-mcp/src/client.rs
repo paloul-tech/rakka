@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
 use rakka_agent::AgentAuthorityRefusal;
@@ -177,6 +178,18 @@ impl Display for McpClientError {
 
 impl Error for McpClientError {}
 
+/// How long [`McpClientSession::close`] waits for a session's transport to
+/// finish closing before it stops waiting.
+///
+/// A bound of its own, never an effect's timeout: a close is owed on every
+/// path out of an attempt, including the one where the effect's deadline has
+/// just fired, so it cannot be charged to that deadline — but a wedged server
+/// must not be able to hang the drop either. What is abandoned at the bound is
+/// the wait, not the cleanup: the session is cancelled before the wait starts,
+/// and rmcp bounds its own session-delete request separately
+/// (`SESSION_CLEANUP_TIMEOUT`, `rmcp-3.4.0/src/transport/streamable_http_client.rs:42`).
+const SESSION_CLOSE_BOUND: Duration = Duration::from_secs(3);
+
 /// One negotiated MCP client session.
 ///
 /// Transport-agnostic on purpose: the Streamable HTTP path and the
@@ -208,12 +221,17 @@ impl McpClientSession {
         &self.server_name
     }
 
-    /// Cancels the session and waits for its transport to close.
+    /// Cancels the session and waits, for at most a few seconds, for its
+    /// transport to close.
     ///
-    /// A join failure is not actionable — the session is gone either way — so
-    /// it is dropped rather than raised as a refusal of the caller's work.
-    pub async fn close(self) {
-        let _ = self.running.cancel().await;
+    /// The cancellation is immediate and unconditional; only the wait is
+    /// bounded, so a server that never acknowledges the close costs the
+    /// caller a fixed few seconds rather than the rest of its life. A join
+    /// failure or an abandoned wait is not actionable — the session is
+    /// cancelled either way — so neither is raised as a refusal of the
+    /// caller's work.
+    pub async fn close(mut self) {
+        let _ = self.running.close_with_timeout(SESSION_CLOSE_BOUND).await;
     }
 }
 
