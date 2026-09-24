@@ -7,8 +7,8 @@
 //! asked (a stdio child has no header to carry it), a launcher's own refusal
 //! reads back under the transport-unsupported code, an HTTP binding is never
 //! synced over a launched transport, and an effect deadline that fires
-//! mid-handshake drops the launched transport — which is what obliges a
-//! launcher's process to die with it.
+//! mid-launch or mid-handshake drops the launch future or the launched
+//! transport — which is what obliges a launcher's process to die with either.
 //!
 //! The whole file is gated: it drives the in-process fake server, which only
 //! exists under `testkit`.
@@ -122,6 +122,37 @@ impl McpChildProcessLauncher for MuteLauncher {
     }
 }
 
+/// Sets its flag when dropped.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A launcher that never finishes launching — a sandbox still waiting on a
+/// readiness signal — and records when its launch future is dropped.
+struct StalledLauncher {
+    dropped: Arc<AtomicBool>,
+}
+
+impl McpChildProcessLauncher for StalledLauncher {
+    fn launch<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _spec: &'a ArtifactRef,
+    ) -> McpLaunchFuture<'a, McpChildTransport> {
+        // Armed before the first await, as the trait requires of a real
+        // process: whatever drops the future drops this with it.
+        let armed = DropFlag(Arc::clone(&self.dropped));
+        Box::pin(async move {
+            let _armed = armed;
+            std::future::pending().await
+        })
+    }
+}
+
 fn fake() -> FakeMcpServer {
     FakeMcpServer::new().with_tool(FakeTool::new(
         "echo",
@@ -211,6 +242,9 @@ async fn a_child_process_binding_runs_through_the_launchers_transport() {
 
 #[tokio::test]
 async fn a_credential_is_refused_before_the_launcher_is_asked() {
+    // The binding names no credential — `validate` would refuse one — so this
+    // is the credential a run's grant supplied, which only the dispatch-time
+    // check can catch.
     let server = fake();
     let set = stored_set_for(&binding(), &server).await;
     let launcher = DuplexLauncher::new(server.clone());
@@ -286,6 +320,37 @@ async fn a_streamable_http_binding_is_never_synced_over_a_launched_transport() {
         "{error}"
     );
     assert_eq!(server.list_calls(), 0, "nothing was listed");
+}
+
+#[tokio::test]
+async fn an_elapsed_deadline_mid_launch_cancels_the_launch_future() {
+    let server = fake();
+    let set = stored_set_for(&binding(), &server).await;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let executor = executor_with(
+        set,
+        Arc::new(StalledLauncher {
+            dropped: Arc::clone(&dropped),
+        }),
+    );
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.local.echo", Some(200)),
+            &echo_call(),
+            None,
+        )
+        .await
+        .expect_err("a launch that never returns never reaches a handshake");
+    assert_eq!(error.code(), "mcp-transport-failed");
+    assert!(error.to_string().contains(ATTEMPT_TIMED_OUT), "{error}");
+    // Dropped with the attempt, before any transport existed: this is the
+    // case the trait's rule covers — a process spawned inside `launch` must
+    // already be armed to die with this future.
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the deadline cancelled the launch itself"
+    );
 }
 
 #[tokio::test]

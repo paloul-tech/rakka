@@ -343,19 +343,40 @@ impl McpServerBinding {
     }
 
     /// Refuses a binding that cannot be dispatched: an invalid endpoint URL,
-    /// an empty tool allow-list, a tool whose derived id is invalid, a tool
-    /// policy with `max_attempts` of `0`, or an empty or malformed protocol
-    /// version list.
+    /// a child-process binding that names a credential binding (on the server
+    /// or in any tool's declaration), an empty tool allow-list, a tool whose
+    /// derived id is invalid, a tool policy with `max_attempts` of `0`, or an
+    /// empty or malformed protocol version list.
     ///
     /// # Errors
     ///
     /// [`McpRegistrationError`] with its stable code.
     pub fn validate(&self) -> Result<(), McpRegistrationError> {
-        if let McpTransport::StreamableHttp { url } = &self.transport {
-            check_streamable_http_url(url).map_err(|reason| McpRegistrationError::InvalidUrl {
-                server: self.server_id.to_string(),
-                reason,
-            })?;
+        match &self.transport {
+            McpTransport::StreamableHttp { url } => {
+                check_streamable_http_url(url).map_err(|reason| {
+                    McpRegistrationError::InvalidUrl {
+                        server: self.server_id.to_string(),
+                        reason,
+                    }
+                })?;
+            }
+            // Refused here, at the operator's gate, rather than on every
+            // attempt: a binding that names a credential would have the
+            // dispatcher resolve a real secret lease per attempt only for the
+            // executor to refuse it unread.
+            McpTransport::ChildProcess { .. } => {
+                let names_credential = self.credential_binding.is_some()
+                    || self
+                        .tools
+                        .values()
+                        .any(|policy| policy.declaration.credential_binding.is_some());
+                if names_credential {
+                    return Err(McpRegistrationError::CredentialOnChildProcess {
+                        server: self.server_id.to_string(),
+                    });
+                }
+            }
         }
         if self.tools.is_empty() {
             return Err(McpRegistrationError::NoTools {
@@ -448,6 +469,15 @@ pub enum McpRegistrationError {
         /// The server whose transport is unsupported.
         server: String,
     },
+    /// A child-process binding names a credential binding — on the server,
+    /// or in one of its tools' declarations. A stdio child has no request to
+    /// carry a credential, so a secret resolved for it on every attempt could
+    /// only ever be refused; credentials reach MCP servers over the Streamable
+    /// HTTP transport alone.
+    CredentialOnChildProcess {
+        /// The child-process server that names a credential.
+        server: String,
+    },
     /// A server-reported hint contradicts the operator's own tool
     /// declaration.
     HintContradictsDeclaration {
@@ -527,6 +557,7 @@ impl McpRegistrationError {
             | Self::ProtocolVersionUnknown { .. }
             | Self::NoTools { .. }
             | Self::MaxAttemptsInvalid { .. }
+            | Self::CredentialOnChildProcess { .. }
             | Self::InvalidServerId { .. } => "mcp-binding-invalid",
         }
     }
@@ -563,6 +594,11 @@ impl Display for McpRegistrationError {
             Self::TransportUnsupported { server } => write!(
                 f,
                 "the MCP server {server}'s transport is not enabled in this build"
+            ),
+            Self::CredentialOnChildProcess { server } => write!(
+                f,
+                "the MCP server {server} is a child process and names a credential binding; \
+                 a child process has no header to carry one"
             ),
             Self::HintContradictsDeclaration { server, tool, hint } => write!(
                 f,

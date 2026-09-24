@@ -433,6 +433,9 @@ where
                     // credential here is a misbinding that must fail the
                     // attempt rather than be silently dropped — and must do so
                     // before any process exists that it could leak into.
+                    // Defence in depth: `McpServerBinding::validate` already
+                    // refuses a child-process binding that names a credential,
+                    // but a run's grant can still supply one.
                     if credential.is_some() {
                         return Err(dispatch_error(
                             McpClientError::CredentialMaterialUnsupported {

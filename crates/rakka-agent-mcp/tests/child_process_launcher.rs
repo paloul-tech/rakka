@@ -14,17 +14,20 @@
 //! Around that, with `/bin/sh` scripts standing in for servers: a peer that
 //! refuses the handshake reads back bounded and body-free, the child sees only
 //! the environment its specification names, and every refusal of the
-//! specification itself names no command, argument, or path.
+//! specification itself names no command, argument, or path. The
+//! specification is bounded before it is decoded, verified against its
+//! reference's checksum when one is given, and its command must be absolute or
+//! resolvable through the `PATH` it names itself.
 #![cfg(all(unix, feature = "child-process", feature = "testkit"))]
 
 use std::time::Duration;
 
-use rakka_agent::{AgentEffectSafetyClass, AgentToolDeclaration};
-use rakka_agent_mcp::client::connect_over;
+use rakka_agent::{AgentContentDigest, AgentEffectSafetyClass, AgentToolDeclaration};
 use rakka_agent_mcp::{
-    mcp_artifact_store, McpChildProcessLauncher, McpChildTransport, McpServerBinding, McpServerId,
-    McpToolPolicy, TokioChildProcessLauncher,
+    connect_over, mcp_artifact_store, McpChildProcessLauncher, McpChildTransport, McpServerBinding,
+    McpServerId, McpToolPolicy, TokioChildProcessLauncher, MCP_LAUNCH_SPEC_MAX_BYTES,
 };
+use rakka_agent_workflow::ArtifactRef;
 use serde_json::{json, Value};
 
 mod support;
@@ -219,6 +222,30 @@ async fn a_specification_refusal_names_no_command_argument_or_path() {
             json!({"command": "/opt/secret-sentinel/server", "args": ["--token=secret-sentinel"]}),
             "could not be started",
         ),
+        // With the environment cleared, a bare name would fall back to libc's
+        // default search path.
+        (
+            json!({"command": "cat"}),
+            "command must be absolute or PATH must be set",
+        ),
+        // And a relative path would resolve against the host's working
+        // directory, `PATH` or not.
+        (
+            json!({"command": "./secret-sentinel", "env": {"PATH": "/bin"}}),
+            "command must be absolute",
+        ),
+        (
+            json!({"command": "/bin/cat", "env": {"": "secret-sentinel"}}),
+            "empty or contains '='",
+        ),
+        (
+            json!({"command": "/bin/cat", "env": {"A=secret-sentinel": "x"}}),
+            "empty or contains '='",
+        ),
+        (
+            json!({"command": "/bin/cat", "args": ["secret-sentinel".repeat(MCP_LAUNCH_SPEC_MAX_BYTES / 8)]}),
+            "larger than",
+        ),
     ] {
         let error = launcher_with(&spec)
             .await
@@ -231,4 +258,63 @@ async fn a_specification_refusal_names_no_command_argument_or_path() {
         assert!(message.len() < MESSAGE_BOUND, "{message}");
         assert!(!message.contains("secret-sentinel"), "{message}");
     }
+}
+
+#[tokio::test]
+async fn a_checksummed_specification_launches_only_when_its_bytes_match() {
+    let spec = json!({"command": "/bin/cat"});
+    let bytes = serde_json::to_vec(&spec).expect("the spec encodes");
+    let launcher = launcher_with(&spec).await;
+    let pinned = |checksum: String| ArtifactRef {
+        checksum: Some(checksum),
+        ..spec_artifact_ref()
+    };
+
+    let matching = format!(
+        "sha256:{}",
+        AgentContentDigest::sha256_of_bytes(&bytes).value
+    );
+    let transport = launcher
+        .launch(&run_scope(), &pinned(matching))
+        .await
+        .expect("the stored bytes are the pinned ones");
+    let pid = pid_of(&transport);
+    drop(transport);
+    gone_within(pid, Duration::from_secs(5)).await;
+
+    let substituted = format!(
+        "sha256:{}",
+        AgentContentDigest::sha256_of_bytes(b"another specification").value
+    );
+    for (checksum, expected) in [
+        (substituted, "does not match its reference's checksum"),
+        // A checksum this launcher cannot verify is refused, not skipped.
+        (
+            "len:18".to_string(),
+            "not a sha256 digest this launcher can verify",
+        ),
+    ] {
+        let error = launcher
+            .launch(&run_scope(), &pinned(checksum.clone()))
+            .await
+            .expect_err("the specification is not the pinned one");
+        let message = error.to_string();
+        assert_eq!(error.code(), "mcp-transport-unsupported", "{message}");
+        assert!(message.contains(expected), "{message}");
+        assert!(!message.contains(&checksum), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn a_bare_command_resolves_through_the_specifications_own_path() {
+    let launcher =
+        launcher_with(&json!({"command": "cat", "env": {"PATH": "/bin:/usr/bin"}})).await;
+    let transport = launcher
+        .launch(&run_scope(), &spec_artifact_ref())
+        .await
+        .expect("a bare name with PATH set launches");
+    let pid = pid_of(&transport);
+    assert!(alive(pid).await, "the process was found on the spec's PATH");
+    drop(transport);
+    gone_within(pid, Duration::from_secs(5)).await;
 }

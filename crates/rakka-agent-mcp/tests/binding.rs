@@ -2,10 +2,13 @@
 //! allow-list of tools with operator-declared safety; every refusal has a
 //! stable code and nothing in a binding is a secret.
 
-use rakka_agent::{AgentEffectSafetyClass, AgentToolDeclaration};
+use rakka_agent::{AgentCredentialBindingRef, AgentEffectSafetyClass, AgentToolDeclaration};
 use rakka_agent_mcp::{
     McpDescriptorRefresh, McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
     MCP_DEFAULT_PROTOCOL_VERSIONS,
+};
+use rakka_agent_workflow::{
+    AgentAttributes, AgentTimestampMillis, ArtifactKind, ArtifactRef, RedactionStatus,
 };
 
 fn server(id: &str) -> McpServerId {
@@ -219,4 +222,67 @@ fn a_binding_round_trips_and_carries_no_secret_shaped_field() {
             "{forbidden} appears in a binding's encoding: {encoded}"
         );
     }
+}
+
+fn launch_spec() -> ArtifactRef {
+    ArtifactRef {
+        artifact_id: "spec-1".to_string(),
+        kind: ArtifactKind::File,
+        uri: "mem://spec-1".to_string(),
+        checksum: None,
+        content_type: None,
+        byte_len: None,
+        retention_class: None,
+        encryption: None,
+        redaction: RedactionStatus::ReferenceOnly,
+        created_at: AgentTimestampMillis::new(1),
+        metadata: AgentAttributes::new(),
+    }
+}
+
+fn credential() -> AgentCredentialBindingRef {
+    AgentCredentialBindingRef::new("crm-key").expect("credential binding")
+}
+
+#[test]
+fn a_child_process_binding_that_names_a_credential_is_refused_at_validate() {
+    let child = McpServerBinding::child_process(server("local"), launch_spec())
+        .with_tool("t", policy())
+        .expect("tool");
+    child.validate().expect("no credential named: dispatchable");
+
+    // On the server.
+    let error = child
+        .clone()
+        .with_credential_binding(credential())
+        .validate()
+        .expect_err("a child process has no header to carry a credential");
+    assert_eq!(error.code(), "mcp-binding-invalid");
+    assert!(
+        matches!(error, McpRegistrationError::CredentialOnChildProcess { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("local"), "{error}");
+
+    // In a tool's declaration: the reference the dispatcher actually resolves
+    // from, so the rule would be hollow without it.
+    let mut declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent);
+    declaration.credential_binding = Some(credential());
+    let error = McpServerBinding::child_process(server("local"), launch_spec())
+        .with_tool("t", McpToolPolicy::new(declaration.clone()))
+        .expect("tool")
+        .validate()
+        .expect_err("a tool's credential binding is refused too");
+    assert!(
+        matches!(error, McpRegistrationError::CredentialOnChildProcess { .. }),
+        "{error}"
+    );
+
+    // The same credential on a Streamable HTTP binding is the supported path.
+    McpServerBinding::streamable_http(server("crm"), "https://h/mcp")
+        .with_credential_binding(credential())
+        .with_tool("t", McpToolPolicy::new(declaration))
+        .expect("tool")
+        .validate()
+        .expect("credentials ride the HTTP transport");
 }

@@ -43,11 +43,13 @@ pub use binding::{
     MCP_INLINE_RESULT_MAX_BYTES, MCP_META_IDEMPOTENCY_KEY, MCP_PEER_AGENT_SERVER_PREFIX,
     MCP_TOOL_ERROR_DETAIL_MAX_BYTES, MCP_TOOL_ID_PREFIX,
 };
-pub use client::{McpAllowAllEgress, McpClientError, McpClientSession, McpEgressCheck};
+pub use client::{
+    connect_over, McpAllowAllEgress, McpClientError, McpClientSession, McpEgressCheck,
+};
 pub use executor::{mcp_artifact_store, McpArtifactStore, McpDispatchToolExecutor};
-#[cfg(feature = "child-process")]
-pub use launcher::TokioChildProcessLauncher;
 pub use launcher::{McpChildProcessLauncher, McpChildTransport, McpLaunchError, McpLaunchFuture};
+#[cfg(feature = "child-process")]
+pub use launcher::{TokioChildProcessLauncher, MCP_LAUNCH_SPEC_MAX_BYTES};
 pub use sync::{
     mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over, McpDescriptorSet,
     McpDescriptorStaleness, McpSyncError, McpSyncedDescriptor,

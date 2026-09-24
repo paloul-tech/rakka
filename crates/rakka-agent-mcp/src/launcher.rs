@@ -18,7 +18,10 @@
 //! Every launched transport must take its process down with it. An effect's
 //! deadline that fires mid-handshake drops the transport without closing it,
 //! so a launcher whose process outlived the drop would leak one server per
-//! timed-out attempt.
+//! timed-out attempt. The same holds for the launch future, if it is dropped
+//! before returning: `launch` is cancelled by the same deadline, so a process
+//! must be armed to die with the future that spawned it (kill-on-drop or
+//! equivalent) before the first await.
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -59,6 +62,11 @@ pub enum McpChildTransport {
     },
     /// A child spawned by rmcp's own process transport, which kills the
     /// process when it is dropped.
+    ///
+    /// Dropping one needs a Tokio runtime: rmcp's drop hands the kill to a
+    /// spawned task (`rmcp-3.4.0/src/transport/child_process.rs:45`–`57`), and
+    /// `tokio::spawn` panics outside one. The dispatch executor always drops
+    /// it inside the runtime its attempt runs on.
     #[cfg(feature = "child-process")]
     Process(rmcp::transport::TokioChildProcess),
 }
@@ -202,13 +210,17 @@ impl Error for McpLaunchError {}
 /// sandbox, the user, the filesystem and network namespace, and the
 /// environment.
 ///
-/// **A launched process must not outlive the transport it returned.** The
-/// executor closes a session on every path it controls, but an effect's
-/// deadline that fires during the handshake abandons the attempt by dropping
-/// the transport, with no close at all. A launcher therefore ties the
-/// process's life to the transport's own — kill on drop, as
-/// `tokio::process::Command::kill_on_drop` does — rather than to a close it
-/// may never receive.
+/// **A launched process must not outlive the transport it returned** — nor
+/// the launch future, if it is dropped before returning. The executor closes
+/// a session on every path it controls, but an effect's deadline that fires
+/// during the handshake abandons the attempt by dropping the transport, with
+/// no close at all. A launcher therefore ties the process's life to the
+/// transport's own — kill on drop, as `tokio::process::Command::kill_on_drop`
+/// does — rather than to a close it may never receive. And `launch` is
+/// cancelled by the same deadline, so a process must be armed to die with the
+/// future that spawned it (kill-on-drop or equivalent) before the first
+/// await: a launcher that spawns and then waits for a readiness signal would
+/// otherwise leak one process per attempt that timed out while it waited.
 pub trait McpChildProcessLauncher: Send + Sync + 'static {
     /// Launches the server the specification names, for one attempt of one
     /// run.
@@ -224,15 +236,16 @@ pub trait McpChildProcessLauncher: Send + Sync + 'static {
 }
 
 #[cfg(feature = "child-process")]
-pub use reference::TokioChildProcessLauncher;
+pub use reference::{TokioChildProcessLauncher, MCP_LAUNCH_SPEC_MAX_BYTES};
 
 /// The unsandboxed reference launcher (feature `child-process`).
 #[cfg(feature = "child-process")]
 mod reference {
     use std::collections::BTreeMap;
+    use std::path::Path;
     use std::process::Stdio;
 
-    use rakka_agent::AgentRunScope;
+    use rakka_agent::{AgentContentDigest, AgentRunScope};
     use rakka_agent_workflow::ArtifactRef;
     use rmcp::transport::TokioChildProcess;
     use serde::Deserialize;
@@ -240,6 +253,11 @@ mod reference {
 
     use super::{McpChildProcessLauncher, McpChildTransport, McpLaunchError, McpLaunchFuture};
     use crate::executor::McpArtifactStore;
+
+    /// The largest launch specification [`TokioChildProcessLauncher`] will
+    /// decode, in bytes. A specification is a command, its arguments, and an
+    /// environment: anything larger is not one.
+    pub const MCP_LAUNCH_SPEC_MAX_BYTES: usize = 64 * 1024;
 
     /// Launches the command a binding's launch specification names, directly
     /// on the host, as rmcp's own child-process transport.
@@ -253,23 +271,40 @@ mod reference {
     ///
     /// The specification is the JSON artifact `spec` refers to:
     /// `{ "command": "...", "args": ["..."], "env": { "NAME": "value" } }`,
-    /// with `args` and `env` optional and no other field admitted. What it is
-    /// not given is as deliberate as what it is:
+    /// with `args` and `env` optional and no other field admitted. Before it
+    /// is decoded it must be at most [`MCP_LAUNCH_SPEC_MAX_BYTES`], and when
+    /// `spec` carries a checksum it must be `sha256:<hex>` and match the bytes
+    /// read — a checksum this launcher cannot verify is refused, not skipped.
+    ///
+    /// **The specification is durable artifact content, so it must carry no
+    /// secret material** — not in `args`, and not in `env`. A secret reaches
+    /// an MCP server only over the Streamable HTTP transport's credential
+    /// path, resolved per attempt and never stored; a child process has no
+    /// such path, and a binding that names a credential for one is refused.
+    ///
+    /// What the process is not given is as deliberate as what it is:
     ///
     /// - **No inherited environment.** `env` is the child's *entire*
     ///   environment. A server binary never sees this process's variables —
-    ///   among them, whatever credentials the host was started with. Name the
-    ///   command by absolute path, or put a `PATH` in `env`.
+    ///   among them, whatever credentials the host was started with. Every
+    ///   name must be non-empty and free of `=`.
+    /// - **No implicit command resolution.** With the environment cleared,
+    ///   the operating system's fallback would search libc's default path for
+    ///   a bare name, and a relative path would resolve against the host's
+    ///   working directory. So the command must be absolute, or a bare name
+    ///   with a `PATH` in `env` to search.
     /// - **No standard error.** It is discarded rather than inherited, so a
     ///   server's diagnostics never interleave with, or leak into, the host's
     ///   own log stream.
-    /// - **No life after the transport.** The process is killed when the
-    ///   transport is dropped — by `kill_on_drop` on the command, and by rmcp's
-    ///   own drop of `TokioChildProcess`
-    ///   (`rmcp-3.4.0/src/transport/child_process.rs:45`) — so an attempt
-    ///   abandoned mid-handshake cannot leave its server running.
+    /// - **No life after the transport, or after the launch.** The process is
+    ///   killed when the transport is dropped — by `kill_on_drop` on the
+    ///   command, and by rmcp's own drop of `TokioChildProcess`
+    ///   (`rmcp-3.4.0/src/transport/child_process.rs:45`) — and nothing is
+    ///   awaited between the spawn and the return, so a cancelled launch
+    ///   cannot strand one either.
     ///
-    /// No refusal repeats the command, an argument, or an environment value.
+    /// No refusal repeats the command, an argument, an environment name or
+    /// value, or a checksum.
     pub struct TokioChildProcessLauncher {
         artifacts: McpArtifactStore,
     }
@@ -307,19 +342,7 @@ mod reference {
                 .map_err(|error| McpLaunchError::SpecUnreadable {
                     reason: format!("the artifact store refused the read ({})", error.code()),
                 })?;
-                // Never serde's own message: a type mismatch quotes the value
-                // it met, and that value is a command, an argument, or an
-                // environment entry.
-                let launch: LaunchSpec = serde_json::from_slice(&read.bytes).map_err(|error| {
-                    McpLaunchError::SpecUnreadable {
-                        reason: shape_reason(error.classify()).to_string(),
-                    }
-                })?;
-                if launch.command.is_empty() {
-                    return Err(McpLaunchError::SpecUnreadable {
-                        reason: "the specification names no command".to_string(),
-                    });
-                }
+                let launch = decode(spec, &read.bytes)?;
                 let mut command = tokio::process::Command::new(&launch.command);
                 command
                     .args(&launch.args)
@@ -327,7 +350,9 @@ mod reference {
                     .envs(&launch.env)
                     .kill_on_drop(true);
                 // The error *kind* only: an I/O error's own text can carry the
-                // path the operating system failed on.
+                // path the operating system failed on. No await follows the
+                // spawn, so the process is never held by a future that could
+                // be cancelled before the transport owns it.
                 let (process, _no_stderr) = TokioChildProcess::builder(command)
                     .stderr(Stdio::null())
                     .spawn()
@@ -337,6 +362,61 @@ mod reference {
                 Ok(McpChildTransport::Process(process))
             })
         }
+    }
+
+    /// Bounds, verifies, decodes, and checks one stored specification.
+    fn decode(spec: &ArtifactRef, bytes: &[u8]) -> Result<LaunchSpec, McpLaunchError> {
+        let unreadable = |reason: &str| McpLaunchError::SpecUnreadable {
+            reason: reason.to_string(),
+        };
+        if bytes.len() > MCP_LAUNCH_SPEC_MAX_BYTES {
+            return Err(McpLaunchError::SpecUnreadable {
+                reason: format!(
+                    "the specification is larger than {MCP_LAUNCH_SPEC_MAX_BYTES} bytes"
+                ),
+            });
+        }
+        if let Some(checksum) = &spec.checksum {
+            let Some(expected) = checksum.strip_prefix("sha256:") else {
+                return Err(unreadable(
+                    "the specification's checksum is not a sha256 digest this launcher can verify",
+                ));
+            };
+            let actual = AgentContentDigest::sha256_of_bytes(bytes).value;
+            if !expected.eq_ignore_ascii_case(&actual) {
+                return Err(unreadable(
+                    "the specification does not match its reference's checksum",
+                ));
+            }
+        }
+        // Never serde's own message: a type mismatch quotes the value it met,
+        // and that value is a command, an argument, or an environment entry.
+        let launch: LaunchSpec = serde_json::from_slice(bytes)
+            .map_err(|error| unreadable(shape_reason(error.classify())))?;
+        if launch.command.is_empty() {
+            return Err(unreadable("the specification names no command"));
+        }
+        if !Path::new(&launch.command).is_absolute() {
+            if launch.command.contains('/') {
+                return Err(unreadable(
+                    "command must be absolute: a relative path would resolve against the \
+                     host's working directory",
+                ));
+            }
+            if !launch.env.contains_key("PATH") {
+                return Err(unreadable("command must be absolute or PATH must be set"));
+            }
+        }
+        if launch
+            .env
+            .keys()
+            .any(|name| name.is_empty() || name.contains('='))
+        {
+            return Err(unreadable(
+                "an environment name in the specification is empty or contains '='",
+            ));
+        }
+        Ok(launch)
     }
 
     /// Why a specification did not decode, by serde's error category alone.
