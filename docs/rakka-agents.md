@@ -39,6 +39,7 @@ enforced row names the test behind it:
 | `rakka-agent-postgres` | PostgreSQL session memory, context snapshots, agent-private long-term records, the pgvector retriever, and their migrations. | — (depend on it directly) |
 | `rakka-agent-knowledge-graph` | The communal knowledge graph: provenance-bearing claims, the trust lattice, the promotion gate, the portable store SPI, an in-memory reference store, and the backend conformance harness. | — |
 | `rakka-agent-knowledge-graph-postgres` | The graph's relational backend. | — |
+| `rakka-agent-mcp` | The MCP client adapter: server bindings with operator-declared tool policies, publish-time descriptor sync, the dispatch executor over an injected transport client with a required egress check, and the child-process launcher seam. | `agent-mcp` |
 | `rakka-a2a` (`agents` feature) | The typed A2A surface over the entities: ingress, the state projection, the agent-management and collaboration extensions, replay, and the goal view. | `a2a-agents`; `a2a-otel` adds the ingress span |
 
 Application code reaches the surface through `rakka::agent`,
@@ -134,7 +135,13 @@ leaves behind is the same either way.
    execution classes they serve and skip the rest before taking a lease. A tool
    call is dispatched only when its binding, dispatch grant, credential
    binding, checkpoint, execution policy, and immediate safety check all pass;
-   credentials are resolved at dispatch and never outlive the attempt.
+   credentials are resolved at dispatch and never outlive the attempt. Remote
+   MCP tools are registered from stored descriptor sets synced ahead of time
+   at publish, never discovered live inside a call, and are called per attempt
+   through the MCP executor over an injected transport client — built with no
+   proxy and no redirects, so the request reaches the URL the check judged —
+   behind a required egress check; MCP is never an agent-to-agent channel, and
+   a server that identifies itself as one is refused.
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect

@@ -40,9 +40,11 @@ tracing.workspace = true
 # Pinned, reviewed Rig version for the `rig` feature. Default features are off,
 # with `rustls` alone: it selects a TLS backend for rig's non-optional
 # `reqwest` 0.13 and nothing else. Rig's `reqwest` feature is never enabled —
-# it turns on `reqwest/system-proxy`, an environment-proxy egress bypass, and
-# Cargo feature unification would switch it on for every crate in a consumer's
-# dependency graph. `crate_shape.rs` holds this.
+# it turns on `reqwest/system-proxy`, which adds the OS proxy settings to the
+# environment proxies reqwest reads regardless, and Cargo feature unification
+# would switch it on for every crate in a consumer's dependency graph. That is
+# a narrow property: the egress control is the HTTP backend the adapter is
+# handed (built with no proxy), never this line. `crate_shape.rs` holds it.
 rig-core = { version = "=0.37.0", default-features = false, features = ["rustls"], optional = true }
 
 [dev-dependencies]
@@ -60,6 +62,20 @@ rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
 # signatures are, and an impl must spell the trait's own bounds.
 axum.workspace = true
 bytes.workspace = true
+# The MCP executor and its in-process fake server, for
+# `mcp_client_dispatch.rs`'s proofs through the real dispatch pipeline. This is
+# a dev-dependency cycle — `rakka-agent-mcp` depends on `rakka-agent` — which
+# Cargo permits for dev-dependencies: an integration test links the one
+# `rakka-agent` library both crates see, so the executor's trait impls are the
+# pipeline's own. The proofs live here rather than in `rakka-agent-mcp`
+# because the pipeline fixture (`tests/common/mod.rs`'s `AuthorityFixture`)
+# is test support, not exported API. The edge is deliberately unversioned:
+# publishing strips a path-only dev-dependency from the published manifest,
+# so the cycle never reaches a registry — a versioned one would make each
+# crate wait on the other's first publish. (When this crate joins
+# `repository_hygiene.rs`'s publishable set, its versioned-internal-deps rule
+# must exempt this line rather than version it.)
+rakka-agent-mcp = { path = "../rakka-agent-mcp", features = ["testkit"] }
 
 [lints]
 workspace = true

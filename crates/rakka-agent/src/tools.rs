@@ -485,7 +485,18 @@ impl Display for AgentEnvironmentConcurrencyProtocol {
 /// and fails safe: one non-idempotent attempt, no capabilities, no credential,
 /// so an ambiguous loss parks for reconciliation rather than guessing that a
 /// retry is harmless.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Decoding goes through a shadow record that re-validates: a binding can
+/// arrive from deployment configuration, so it crosses a trust boundary, and
+/// an out-of-bounds descriptor or an attempt bound of zero is refused where it
+/// enters rather than after a registry has been built around it.
+///
+/// Versioning: the decode ignores fields it does not know, so an older build
+/// reads a binding a newer build wrote. A restrictive field a later version
+/// adds is therefore dropped by an older reader, which then enforces less than
+/// the binding says — the decode fails open on a downgrade — so a binding must
+/// never be handed to a build older than the one that wrote it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentToolBinding {
     descriptor: AgentToolDescriptor,
     declaration: AgentToolDeclaration,
@@ -664,6 +675,65 @@ impl AgentToolBinding {
         spec.validate()?;
         Ok(spec)
     }
+
+    /// Rejects a binding whose descriptor is unbounded or whose attempt policy
+    /// the crash-and-timeout rules could not honor.
+    ///
+    /// This is the open part of the binding's validation — the part that needs
+    /// nothing but the binding itself. The closed part, which also weighs the
+    /// declaration against the environment contract, runs at
+    /// [`AgentToolRegistry::register`], where a binding becomes authoritative.
+    pub fn validate(&self) -> AgentToolResult<()> {
+        self.descriptor.validate()?;
+        self.effect_spec()?;
+        Ok(())
+    }
+}
+
+/// The wire and durable shape of [`AgentToolBinding`], validated on load.
+///
+/// Every field of the binding appears here, so a decode reconstructs it whole;
+/// [`AgentToolBinding::validate`] is then what refuses one that no
+/// construction path could have produced.
+#[derive(Deserialize)]
+struct AgentToolBindingRecord {
+    descriptor: AgentToolDescriptor,
+    declaration: AgentToolDeclaration,
+    max_attempts: u32,
+    #[serde(default)]
+    reconciliation_protocol: Option<AgentReconciliationProtocolRef>,
+    #[serde(default)]
+    environment_concurrency: Option<AgentEnvironmentConcurrencyProtocol>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    guardrails: BTreeSet<AgentGuardrailStageId>,
+    #[serde(default)]
+    checkpoint_required: bool,
+    #[serde(default)]
+    authorization_required: bool,
+}
+
+impl<'de> Deserialize<'de> for AgentToolBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let record = AgentToolBindingRecord::deserialize(deserializer)?;
+        let binding = Self {
+            descriptor: record.descriptor,
+            declaration: record.declaration,
+            max_attempts: record.max_attempts,
+            reconciliation_protocol: record.reconciliation_protocol,
+            environment_concurrency: record.environment_concurrency,
+            timeout_ms: record.timeout_ms,
+            guardrails: record.guardrails,
+            checkpoint_required: record.checkpoint_required,
+            authorization_required: record.authorization_required,
+        };
+        binding.validate().map_err(serde::de::Error::custom)?;
+        Ok(binding)
+    }
 }
 
 /// The deployment's registry of dispatchable tools
@@ -689,8 +759,7 @@ impl AgentToolRegistry {
     /// Registers one tool binding, refusing a duplicate or a binding whose
     /// failure policy the crash-and-timeout rules could not honor.
     pub fn register(mut self, binding: AgentToolBinding) -> AgentToolResult<Self> {
-        binding.descriptor.validate()?;
-        binding.effect_spec()?;
+        binding.validate()?;
         let tool = binding.descriptor.tool.clone();
         // The environment contract ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)):
         // a mutating environment tool must state the external coordination
@@ -1445,6 +1514,21 @@ impl AgentToolAuthority {
             model_profiles: None,
             grant_ttl_ms: AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
         }
+    }
+
+    /// The same authority over another registry.
+    ///
+    /// A deployment that learns what a tool *is* after the authority was
+    /// configured — a remote MCP server's tool list is discovered, not
+    /// declared in the binary — widens the registry this way rather than
+    /// rebuilding the authority, which would silently drop its guardrail
+    /// chain, attestations, router, and grant policy. Widening authorizes
+    /// nothing on its own: a registered tool still needs the envelope to
+    /// declare it and every dispatch still needs a grant.
+    #[must_use]
+    pub fn with_registry(mut self, registry: AgentToolRegistry) -> Self {
+        self.registry = registry;
+        self
     }
 
     /// Uses the deployment's guardrail chain.

@@ -1,0 +1,80 @@
+[package]
+name = "rakka-agent-mcp"
+version = "0.1.0"
+description.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+license-file.workspace = true
+# Not yet in the release-candidate publishable set (scripts/package-check.sh,
+# docs/rakka-v1-release-packaging.md); remove this guard when it enters it.
+publish = false
+
+[lib]
+name = "rakka_agent_mcp"
+
+[features]
+default = []
+# rmcp's stdio child-process transport and the unsandboxed reference launcher
+# `TokioChildProcessLauncher`. Off by default: a deployment that runs tools
+# inside its own sandbox implements `McpChildProcessLauncher` over that
+# sandbox and never enables this.
+child-process = ["rmcp/transport-child-process"]
+# The in-process fake MCP server and counting client the crate's own tests and
+# `rakka-agent`'s dispatcher proofs drive. Pulls rmcp's server side and axum.
+testkit = ["rmcp/server", "rmcp/transport-streamable-http-server", "dep:axum", "dep:reqwest", "dep:sse-stream"]
+
+[dependencies]
+# Exact pin (docs/rakka-compatibility.md). `client` + the Streamable HTTP
+# client over rmcp's own reqwest (`reqwest` = `reqwest?/rustls`, a TLS backend
+# and nothing else; nothing here enables `reqwest/system-proxy`, which would
+# add the OS proxy settings to the environment proxies reqwest reads anyway —
+# the egress control is the injected client's `no_proxy()` and no-redirect
+# build plus `McpEgressCheck`, not this line), and `transport-io` so a
+# launcher's AsyncRead/AsyncWrite pair is a transport. The server side and
+# the child-process transport are feature-gated above.
+rmcp = { version = "=3.4.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest", "transport-io"] }
+# The tool contracts this adapter fills: descriptors, bindings, declarations,
+# the dispatch executor trait, refusals, identity validation. Default features
+# off: an MCP executor never touches the model adapter.
+rakka-agent = { path = "../rakka-agent", version = "0.1.0", default-features = false }
+# `AgentEphemeralCredential`, `ArtifactRef`, the artifact store, timestamps.
+rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
+# `HeaderName`/`HeaderValue`: the types rmcp's transport config names for a
+# custom header. rmcp does not re-export `http`, so the credential-to-header
+# step has to name the same crate rmcp links.
+http = "1"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+axum = { workspace = true, optional = true }
+# The testkit's `ReqwestClient` re-export and `hardened_reqwest_client` only.
+# rmcp does not re-export its own `reqwest`, and the testkit has to name the
+# concrete client type rmcp implements `StreamableHttpClient` for;
+# `default-features = false` keeps reqwest's defaults — `system-proxy` (the OS
+# proxy settings) and a second TLS stack among them — off this edge, and cargo
+# unifies the result with the `reqwest?/rustls` rmcp itself enables. Proxies
+# and redirects are turned off by the client's build, not by this line.
+reqwest = { version = "0.13", default-features = false, optional = true }
+# The testkit's `CountingClient` has to spell `StreamableHttpClient::get_stream`'s
+# return type, and rmcp re-exports only `sse_stream::Error` (as `SseError`,
+# `rmcp-3.4.0/src/transport/streamable_http_client.rs:14`) — not `Sse` itself.
+sse-stream = { version = "0.2", optional = true }
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true
+rmcp = { version = "=3.4.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+
+# Spawns a real process through the unsandboxed reference launcher, so it
+# builds only where that launcher exists.
+[[test]]
+name = "child_process_launcher"
+required-features = ["child-process", "testkit"]
+
+[lints]
+workspace = true

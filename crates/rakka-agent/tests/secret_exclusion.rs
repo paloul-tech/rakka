@@ -396,6 +396,22 @@ async fn a_planted_sentinel_is_found_by_the_scanner() {
         "the scanner found no planted sentinel in any durable surface, so it \
          proves nothing about the ones it did not find"
     );
+
+    // The workflow substrate is keyed apart from the agent records — under
+    // the `workflow:` prefix its own `WorkflowId::persistence_id` adds — and a
+    // fixture that keys it any other way loads nothing and sweeps an empty
+    // string as a clean record. Tickets have flushed by now, so the outbox
+    // must be really there.
+    let workflow = surfaces
+        .iter()
+        .find(|(label, _)| *label == "workflow")
+        .map(|(_, encoded)| encoded.as_str())
+        .expect("the workflow substrate is a swept surface");
+    assert!(
+        workflow.contains("effect-dispatch/"),
+        "the workflow surface holds no flushed ticket, so every sweep of the \
+         outbox substrate reads nothing: {workflow:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

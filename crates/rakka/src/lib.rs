@@ -182,6 +182,14 @@ pub mod agent_workflow {
     pub use rakka_agent_workflow::*;
 }
 
+#[cfg(feature = "agent-mcp")]
+/// MCP client adapter: remote MCP servers as durable agent tools.
+///
+/// Enable with the `agent-mcp` facade feature, which brings `agent`.
+pub mod agent_mcp {
+    pub use rakka_agent_mcp::*;
+}
+
 #[cfg(feature = "a2a")]
 /// A2A protocol adapter for durable agent workflow runs.
 ///

@@ -33,11 +33,11 @@ use rakka_agent::{
     AgentBudgetDimension, AgentContinuousGoalSpec, AgentDefinition, AgentDefinitionId,
     AgentDelegationId, AgentDelegationRecord, AgentDelegationReport, AgentDelegationStatus,
     AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentDispatchPass,
-    AgentEffectPolicies, AgentEffectSpec, AgentEntityAddress, AgentEntityAuthority,
-    AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentEpochSpec,
-    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter,
-    AgentFanInPolicy, AgentGoalId, AgentGoalMode, AgentId, AgentModelAdapter, AgentModelTurn,
-    AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentRevisionNumber,
+    AgentDispatchToolExecutor, AgentEffectPolicies, AgentEffectSpec, AgentEntityAddress,
+    AgentEntityAuthority, AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore,
+    AgentEpochSpec, AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload,
+    AgentExchangeRouter, AgentFanInPolicy, AgentGoalId, AgentGoalMode, AgentId, AgentModelAdapter,
+    AgentModelTurn, AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentRevisionNumber,
     AgentRevisionProvenance, AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectSink,
     AgentRunEffectStatus, AgentRunEntityStore, AgentRunMemory, AgentRunScope, AgentRunSnapshot,
     AgentRunState, AgentRunStatus, AgentRunTerminalReason, AgentSchemaId, AgentSchemaRef,
@@ -703,14 +703,48 @@ pub fn task_definition() -> AgentTaskDefinition {
 
 /// A bounded model-visible descriptor for one test tool.
 pub fn tool_descriptor(tool: &str) -> AgentToolDescriptor {
+    tool_descriptor_of_kind(tool, AgentToolKind::Function)
+}
+
+/// The same descriptor under a chosen kind, for the tests whose subject is
+/// what the *kind* decides — routing by declared kind, say.
+pub fn tool_descriptor_of_kind(tool: &str, kind: AgentToolKind) -> AgentToolDescriptor {
     AgentToolDescriptor::new(
         rakka_agent::AgentToolId::new(tool).expect("tool id should be valid"),
-        AgentToolKind::Function,
+        kind,
         "A test tool.",
         schema("tool-input"),
         schema("tool-output"),
     )
     .expect("the descriptor should be valid")
+}
+
+/// The model's call for one tool, with empty arguments.
+pub fn tool_call(tool: &str) -> AgentToolCallRequest {
+    AgentToolCallRequest::new(
+        AgentToolCallId::new("call-1").expect("call id should be valid"),
+        rakka_agent::AgentToolId::new(tool).expect("tool id should be valid"),
+        serde_json::json!({}),
+    )
+    .expect("the call should be bounded")
+}
+
+/// The tool intent one call dispatches under: one non-idempotent attempt of
+/// the named tool, exactly as the run commits it.
+pub fn tool_intent(tool: &str) -> AgentRunEffect {
+    let call = tool_call(tool);
+    AgentRunEffect::new(
+        &run_scope(),
+        1,
+        0,
+        rakka_agent::AgentRunEffectRequest::Tool {
+            call: Box::new(call),
+        },
+        &AgentEffectSpec::non_idempotent(),
+        AgentRevisionNumber::INITIAL,
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the effect should derive")
 }
 
 /// Binds one test tool exactly as an effect spec classifies it, so the
@@ -2604,6 +2638,16 @@ impl AgentDispatchAuthority for FixedRefusalAuthority {
     }
 }
 
+/// The persistence id the run's inbox/outbox `WorkflowState` is stored under.
+///
+/// Derived exactly as the dispatcher's own inbox derives it — the agent run id
+/// mapped onto a `WorkflowId`, whose `persistence_id` adds the substrate's
+/// `workflow:` prefix — because a sweep that keys the store any other way
+/// loads nothing and reads an empty record as a clean one.
+pub fn workflow_persistence_id(run: &AgentRunScope) -> rakka_persistence::PersistenceId {
+    rakka_agent_workflow::agent_run_workflow_id(&rakka_agent::workflow_run_id(run)).persistence_id()
+}
+
 /// The authority fixture: the common task-and-run fixture over the durable
 /// workflow-outbox sink, plus the fleet, the executor, the kill-switch probe,
 /// and a configurable [`AgentToolAuthority`] behind the pipeline's required
@@ -2619,6 +2663,10 @@ pub struct AuthorityFixture {
     pub fleet_store: FleetStore,
     pub wf_clock: SharedAtomicWorkflowClock,
     pub tools: RecordingToolExecutor,
+    /// The executor the pipeline calls, when a test wants it to be something
+    /// other than the recording one — see
+    /// [`AuthorityFixture::with_tool_executor`].
+    pub tool_executor: Option<Arc<dyn AgentDispatchToolExecutor>>,
     pub probe: KillSwitchProbe,
     pub credentials: Option<Arc<ScriptedCredentialResolver>>,
     /// The adapter the pipeline asks, when a test wants it to be something
@@ -2626,6 +2674,10 @@ pub struct AuthorityFixture {
     pub model_adapter: Option<Arc<dyn AgentModelAdapter>>,
     pub expire_grants: bool,
     pub fixed_refusal: Option<AgentAuthorityRefusal>,
+    /// The segment sink the dispatch pipeline's *own* segments go to — the
+    /// authorize and attempt segments — when a test wires one; see
+    /// [`AuthorityFixture::with_dispatch_segments`].
+    pub dispatch_segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
 }
 
 impl AuthorityFixture {
@@ -2670,11 +2722,13 @@ impl AuthorityFixture {
             fleet_store,
             wf_clock,
             tools: RecordingToolExecutor::new(),
+            tool_executor: None,
             probe: KillSwitchProbe::new(),
             credentials: None,
             model_adapter: None,
             expire_grants: false,
             fixed_refusal: None,
+            dispatch_segments: None,
         }
     }
 
@@ -2692,6 +2746,51 @@ impl AuthorityFixture {
     /// guardrail-revision pin must catch.
     pub fn with_gate_authority(mut self, authority: AgentToolAuthority) -> Self {
         self.authority = authority;
+        self
+    }
+
+    /// Puts an executor other than the recording one in the pipeline's tool
+    /// slot, for the proofs whose subject is what the *executor* does with a
+    /// call — a router composing several, say. It replaces the executor for
+    /// every worker this fixture builds, [`Self::worker`] included.
+    pub fn with_tool_executor(mut self, executor: Arc<dyn AgentDispatchToolExecutor>) -> Self {
+        self.tool_executor = Some(executor);
+        self
+    }
+
+    /// Registers deployment tool bindings after the fixture was built: into
+    /// its registry, into the authority behind the dispatch gate, into the
+    /// commit-time effect policies, and into the envelope the agent is
+    /// instantiated under — the four places a tool must appear to be
+    /// dispatchable through the real pipeline.
+    ///
+    /// Call it before [`Self::start`], which is what instantiates the agent
+    /// under that envelope. It widens rather than replaces, so it composes
+    /// with a fixture whose authority already carries a guardrail chain and
+    /// with an envelope a test narrowed by hand.
+    pub fn with_registered_bindings(mut self, bindings: Vec<AgentToolBinding>) -> Self {
+        for binding in bindings {
+            let tool = binding.descriptor().tool.clone();
+            let declaration = binding.declaration().clone();
+            let spec = binding
+                .effect_spec()
+                .expect("the binding should project a valid effect spec");
+            self.registry = self
+                .registry
+                .register(binding)
+                .expect("the binding should register");
+            self.fx.policies = self
+                .fx
+                .policies
+                .clone()
+                .with_tool_spec(tool.clone(), spec)
+                .expect("the tool spec should be valid");
+            if let Some(credential) = &declaration.credential_binding {
+                self.envelope.credential_bindings.insert(credential.clone());
+            }
+            self.envelope.tools.insert(tool, declaration);
+        }
+        self.authority = self.authority.with_registry(self.registry.clone());
         self
     }
 
@@ -2759,6 +2858,19 @@ impl AuthorityFixture {
     /// one.
     pub fn with_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
         self.fx = self.fx.with_segments(sink);
+        self
+    }
+
+    /// Wires the dispatch pipeline's own segments — the authorize and attempt
+    /// segments every worker this fixture builds closes — into a sink.
+    ///
+    /// [`Self::with_segments`] wires the run entity and the result delivery,
+    /// not the pipeline, for the reason it gives: they are separate processes
+    /// in a real deployment. The attempt segment is the one that brackets the
+    /// external call with a resolved credential live, so a sweep that means
+    /// to cover it wires this as well.
+    pub fn with_dispatch_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
+        self.dispatch_segments = Some(sink);
         self
     }
 
@@ -2866,7 +2978,9 @@ impl AuthorityFixture {
             self.model_adapter
                 .clone()
                 .unwrap_or_else(|| Arc::new(self.adapter.clone())),
-            Arc::new(tools),
+            self.tool_executor
+                .clone()
+                .unwrap_or_else(|| Arc::new(tools) as Arc<dyn AgentDispatchToolExecutor>),
             gate,
             Arc::new(delivery),
         )
@@ -2874,6 +2988,9 @@ impl AuthorityFixture {
         .with_probe(Arc::new(self.probe.clone()));
         if let Some(credentials) = &self.credentials {
             pipeline = pipeline.with_credential_resolver(credentials.clone());
+        }
+        if let Some(segments) = &self.dispatch_segments {
+            pipeline = pipeline.with_segments(segments.clone());
         }
         pipeline
     }
@@ -2910,9 +3027,7 @@ impl AuthorityFixture {
         let run = run_scope();
         let task = task_scope();
         let agent = agent_scope();
-        let workflow_id = rakka_persistence::PersistenceId::new(
-            rakka_agent::workflow_run_id(&run).as_str().to_string(),
-        );
+        let workflow_id = workflow_persistence_id(&run);
         let fleet_id = rakka_persistence::PersistenceId::new(
             rakka_agent_workflow::agent_dispatcher_fleet_persistence_id()
                 .as_str()
@@ -2978,6 +3093,14 @@ impl AuthorityFixture {
 
     /// The durable status of the effect at one slot of the run's loop state.
     pub async fn effect_status(&self, slot: usize) -> Option<AgentRunEffectStatus> {
+        self.effect_at(slot).await.map(|effect| effect.status)
+    }
+
+    /// The run's effect record at one slot of its loop state, read from
+    /// durable state: status, stable failure code, and the derived identity —
+    /// the idempotency key an external call carries and the dispatch ticket
+    /// its outbox row is keyed by.
+    pub async fn effect_at(&self, slot: usize) -> Option<AgentRunEffect> {
         let state = rakka_agent::load_agent_run_state(
             &self.fx.runs,
             &run_scope(),
@@ -2990,7 +3113,28 @@ impl AuthorityFixture {
             .effects()
             .iter()
             .find(|effect| effect.slot == slot)
-            .map(|effect| effect.status)
+            .cloned()
+    }
+
+    /// The durable outbox row one effect generation's dispatch ticket wrote to
+    /// the run's workflow substrate — where a failed attempt's attempt count
+    /// and bounded `code: detail` line are persisted.
+    pub async fn outbox_row(
+        &self,
+        effect: &AgentRunEffect,
+    ) -> Option<rakka_agent_workflow::substrate::OutboxEntry> {
+        use rakka_persistence::DurableStateStore;
+        let record = self
+            .workflow_store
+            .load(&workflow_persistence_id(&run_scope()))
+            .await
+            .expect("the workflow store loads")?;
+        record
+            .state
+            .outbox_entry(&rakka_agent_workflow::substrate::OutboxMessageId::new(
+                effect.dispatch_ticket_id().as_str(),
+            ))
+            .cloned()
     }
 
     /// Drives the run until its tool ticket is flushed and ready to claim.
@@ -3227,5 +3371,95 @@ impl AuthorityFixture {
             }
         }
         Err("the dispatch pump did not quiesce".to_string())
+    }
+}
+
+/// One stored artifact: what the reference says, and the bytes behind it.
+type StoredArtifact = (rakka_agent_workflow::ArtifactRef, Vec<u8>);
+
+/// An in-memory artifact store whose state every clone shares, so a proof can
+/// read back what an executor wrote through its own handle.
+///
+/// The same shape as `rakka-agent-mcp`'s `tests/support/mod.rs` store, and here
+/// for the same two reasons: `rakka-agent-workflow`'s `FakeArtifactStore`
+/// copies its map on `Clone`, so a clone held by the test cannot see a write
+/// made through the executor's handle; and it lives behind that crate's own
+/// `testkit` feature, which this crate's tests do not enable. The writer's
+/// checksum is passed through and never invented, so a reference that
+/// validates is one whose checksum the writer stamped itself.
+#[derive(Debug, Clone, Default)]
+pub struct SharedArtifactStore {
+    artifacts: Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, StoredArtifact>>>,
+}
+
+impl SharedArtifactStore {
+    /// How many artifacts have been written.
+    pub async fn len(&self) -> usize {
+        self.artifacts.lock().await.len()
+    }
+
+    /// Whether nothing has been written.
+    pub async fn is_empty(&self) -> bool {
+        self.artifacts.lock().await.is_empty()
+    }
+
+    /// One artifact's stored bytes, by artifact id.
+    pub async fn bytes(&self, artifact_id: &str) -> Option<Vec<u8>> {
+        self.artifacts
+            .lock()
+            .await
+            .get(artifact_id)
+            .map(|(_, bytes)| bytes.clone())
+    }
+}
+
+impl rakka_agent_workflow::AgentArtifactStore for SharedArtifactStore {
+    fn put_artifact<'a>(
+        &'a mut self,
+        request: rakka_agent_workflow::AgentArtifactWriteRequest,
+    ) -> rakka_agent_workflow::AgentArtifactStoreFuture<'a, rakka_agent_workflow::ArtifactRef> {
+        let artifacts = Arc::clone(&self.artifacts);
+        Box::pin(async move {
+            let mut held = artifacts.lock().await;
+            let artifact_id = request
+                .artifact_id
+                .unwrap_or_else(|| format!("artifact-{}", held.len() + 1));
+            let byte_len = u64::try_from(request.bytes.len()).unwrap_or(u64::MAX);
+            let reference = rakka_agent_workflow::ArtifactRef {
+                artifact_id: artifact_id.clone(),
+                kind: request.kind,
+                uri: format!("memory://agent-fixture/{artifact_id}"),
+                checksum: request.checksum,
+                content_type: request.content_type,
+                byte_len: Some(byte_len),
+                retention_class: request.retention_class,
+                encryption: request.encryption,
+                redaction: request.redaction,
+                created_at: request.created_at,
+                metadata: request.metadata,
+            };
+            held.insert(artifact_id, (reference.clone(), request.bytes));
+            Ok(reference)
+        })
+    }
+
+    fn get_artifact<'a>(
+        &'a self,
+        reference: &'a rakka_agent_workflow::ArtifactRef,
+    ) -> rakka_agent_workflow::AgentArtifactStoreFuture<'a, rakka_agent_workflow::AgentArtifactRead>
+    {
+        let artifacts = Arc::clone(&self.artifacts);
+        let artifact_id = reference.artifact_id.clone();
+        Box::pin(async move {
+            let held = artifacts.lock().await;
+            held.get(&artifact_id)
+                .map(
+                    |(reference, bytes)| rakka_agent_workflow::AgentArtifactRead {
+                        reference: reference.clone(),
+                        bytes: bytes.clone(),
+                    },
+                )
+                .ok_or(rakka_agent_workflow::AgentArtifactError::ArtifactNotFound { artifact_id })
+        })
     }
 }

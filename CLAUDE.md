@@ -88,7 +88,8 @@ rakka-core                      foundation: Actor/ActorRef/ActorContext, ActorSy
                                 budgets, checkpoints, memory (rakka-agent-postgres = PostgreSQL/
                                 pgvector adapters; rakka-agent-knowledge-graph = communal claims,
                                 trust transitions, promotion gate, portable graph SPI + conformance;
-                                rakka-agent-knowledge-graph-postgres = the graph's relational backend)
+                                rakka-agent-knowledge-graph-postgres = the graph's relational backend;
+                                rakka-agent-mcp = the MCP client adapter (optional; `agent-mcp`))
 
 rakka                          top-level facade crate + curated `rakka::prelude`; re-exports
                                component crates behind cargo features (default = all)
