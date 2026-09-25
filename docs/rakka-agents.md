@@ -138,9 +138,10 @@ leaves behind is the same either way.
    credentials are resolved at dispatch and never outlive the attempt. Remote
    MCP tools are registered from stored descriptor sets synced ahead of time
    at publish, never discovered live inside a call, and are called per attempt
-   through the MCP executor over an injected transport client behind a
-   required egress check; MCP is never an agent-to-agent channel, and a server
-   that identifies itself as one is refused.
+   through the MCP executor over an injected transport client — built with no
+   proxy and no redirects, so the request reaches the URL the check judged —
+   behind a required egress check; MCP is never an agent-to-agent channel, and
+   a server that identifies itself as one is refused.
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect

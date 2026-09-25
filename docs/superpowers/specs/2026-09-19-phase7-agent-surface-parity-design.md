@@ -94,12 +94,16 @@ arguments — `synced_at` and the `McpEgressCheck` are both required, so
 publish-time sync is gated exactly like a dispatch attempt — and
 `sync_mcp_descriptors_over` is its launcher-transport twin, which takes no
 egress check because nothing is dialed; `McpDescriptorRefresh` is `Manual |
-Interval { millis }` with `Listen` decoding but deferred (rmcp 3.4.0 ships no
-`subscriptions/listen`, and a listening session would contradict the
-stateless per-attempt client), `mcp_descriptor_staleness(stored, fresh)` the
-seam a deployment drives on its own timer for `Interval` instead; peer
-identity for the agent-channel rule is read from the initialize handshake
-(`peer_info().server_info.name`), not a separate `server/discover` call;
+Interval { millis }` with `Listen` deferred and not a variant (corrected in
+the final review: rmcp 3.4.0 does ship `Peer::listen`; the deferral stands
+because a listening session would contradict the stateless per-attempt
+client), `mcp_descriptor_staleness(stored, fresh)` the seam a deployment
+drives on its own timer for `Interval` instead; peer identity for the
+agent-channel rule is `peer_info().server_info.name`, which the handshake
+fills — from the `initialize` result, or from the `serverInfo` a
+`server/discover` result carries in its `_meta` (corrected in the final
+review: this sentence first said identity came from `initialize` "not a
+separate `server/discover` call", which is backwards for `Discover`);
 `McpSyncedDescriptor::with_input_schema_artifact` (not
 `with_input_schema_ref`) records where an oversized schema was stored; every
 digest is SHA-256 (`AgentContentDigest::sha256_of_json`), and a tool name may
@@ -109,7 +113,8 @@ is ignored otherwise; the dispatch-time recheck's TTL is executor-configured
 every attempt) behind the registered `tool-descriptor-revision-mismatch`; the
 executor's artifact store is `McpArtifactStore`, a mutex-guarded store, and
 its egress check lives inside `client::connect` itself, with `with_launcher`
-joining `with_child_process_launcher` as a second way to install one;
+the constructor that admits a child-process binding (the final review removed
+`with_child_process_launcher`, which could never admit one);
 `McpChildTransport` is an enum (`Pair` always, `Process` under
 `child-process`), and a credential is refused on a `ChildProcess` binding at
 `validate`, not deferred to dispatch, with every other transport-level
@@ -119,6 +124,23 @@ live in `rakka-agent`, reached through the crate's own unversioned
 dev-dependency cycle on `rakka-agent-mcp`'s `testkit` feature, not inside
 `rakka-agent-mcp` itself. Plan:
 `docs/superpowers/plans/2026-09-22-phase7-slice-7-7-mcp-client.md`.
+
+**Final review (2026-09-24, slice 7.7).** The whole-branch review's fixes,
+each marked inline as "final review 2026-09-24": every MCP attempt is bounded
+(`McpToolPolicy::new` sets `MCP_ATTEMPT_TIMEOUT_DEFAULT_MS`, 30 s, and the
+executor applies the same default to an effect with no timeout); the
+server-level credential binding is copied into each synced tool declaration
+that names none, a tool naming a different one is refused, and an HTTP
+attempt whose named credential did not arrive fails closed under a fifteenth
+code, `mcp-credential-missing`; a binding listing a pre-2026-07-28 revision
+negotiates with rmcp's `Auto` lifecycle, so a 2025-11-25 server is reachable
+through the legacy `initialize` fallback; the attempt's credential material
+is redacted from every piece of server-chosen text an attempt keeps; the
+proxy rationale of 4.5, 5.1, and 11.1 is corrected — the egress control is the
+injected client's build (no proxy, no redirects) beside the check, not a
+feature list; and three plan-refinement marks in 5.2 (refinements 2, 3,
+and 4: `Listen`, identity, and the recheck TTL) are corrected against the
+rmcp 3.4.0 source.
 
 ## Summary
 
@@ -178,10 +200,13 @@ one up without re-deriving the design.
    human checkpoints is a follow-up.
 5. **Reversed 2026-09-20.** `rig-core` gains the `rustls` feature only, never
    `reqwest`: in `rig-core 0.37.0` the `reqwest` feature enables
-   `reqwest/system-proxy`, an environment-proxy egress bypass, and Cargo
-   feature unification would switch it on for every crate in a consumer's
-   graph. The first draft's "no provider can make an HTTP call at all" is
-   answered by `rustls` alone, which selects a TLS backend and nothing else
+   `reqwest/system-proxy`, and Cargo feature unification would switch it on
+   for every crate in a consumer's graph. (Corrected in the slice 7.7 final
+   review, 2026-09-24: `system-proxy` adds the operating system's proxy
+   settings; it is not the environment-proxy bypass — reqwest 0.13 honours
+   the environment's proxy variables whatever its features. The pin holds a
+   narrower property than first written; see 4.5.) The first draft's "no
+   provider can make an HTTP call at all" is answered by `rustls` alone, which selects a TLS backend and nothing else
    (section 4.5).
 6. `AGENT_GUARDRAIL_CONTENT_MAX_BYTES` rises from 8 KiB to 16 KiB so a full
    model turn (`AGENT_MODEL_TURN_MAX_BYTES`) can be evaluated without
@@ -686,20 +711,31 @@ the prompt is unchanged and remains its own slice.
   "tokio-tungstenite?/rustls-tls-webpki-roots"]` selects a TLS backend and
   nothing else (the tungstenite half is inert without a websocket feature);
   `reqwest = ["reqwest/charset", "reqwest/http2", "reqwest/system-proxy"]`,
-  and it is part of rig's `default`. `system-proxy` makes every provider call
-  honour the environment's proxy variables, which is an egress bypass, and
-  under Cargo feature unification any crate in a consumer's dependency graph
-  that enabled it would switch it on for the consumer's own `rig-core`,
-  whether or not that consumer asked. The `reqwest` feature is therefore
-  never enabled by any Rakka crate, example, or test. Rig does not gate
-  providers individually, so `rustls` alone reaches all of them; the
-  workspace has no other TLS backend.
+  and it is part of rig's `default`. `system-proxy` adds the operating
+  system's proxy settings (macOS System Configuration, the Windows
+  registry) to what reqwest consults, and under Cargo feature unification any
+  crate in a consumer's dependency graph that enabled it would switch it on
+  for the consumer's own `rig-core`, whether or not that consumer asked. The
+  `reqwest` feature is therefore never enabled by any Rakka crate, example,
+  or test. (Final review 2026-09-24: this first called `system-proxy` "an
+  egress bypass" that makes a call honour the environment's proxy variables.
+  It is not: reqwest 0.13's `ClientBuilder` installs its system proxy
+  matcher, which reads `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` from the
+  environment, whatever its features, unless the builder calls `no_proxy()`
+  (`reqwest-0.13.4/src/async_impl/client.rs:309`, `:415`, `:1430`); the
+  feature only adds the OS settings. And `a2a-server-lf` enables
+  `reqwest/system-proxy` itself, so a workspace build with the `a2a` feature
+  carries it anyway. The rule above still holds a real, narrower property —
+  no Rakka edge adds OS proxy settings — but the egress control is the HTTP
+  backend a deployment injects, built with no proxy and no redirects, never
+  this feature list.) Rig does not gate providers individually, so `rustls`
+  alone reaches all of them; the workspace has no other TLS backend.
 - The host builds `rig-core` with `default-features = false, features =
   ["rustls"]` for exactly this reason and keeps the facade's `agent-rig`
   feature (`crates/rakka/Cargo.toml:34`) off, with `rakka-agent` at
   `default-features = false` (`:60`). This pin makes Rakka's `rig` feature
   safe to enable beside such a build: it adds a TLS backend the host already
-  selected and no proxy behaviour.
+  selected and no OS-proxy behaviour of its own.
 - Rig's `rmcp` feature stays off: tool dispatch is Rakka's, never Rig's.
 - The pin review note in `rig.rs` gains the client-builder surface and the
   feature list to its compatibility checklist.
@@ -760,7 +796,14 @@ already writes.
 ["transport-streamable-http-client", "__reqwest"]`, `reqwest = ["__reqwest",
 "reqwest?/rustls"]`, and its `reqwest` dependency is `0.13.2` with
 `default-features = false, features = ["json", "stream"]`; none of these
-enables `system-proxy`, so the crate carries the same TLS-only stance as 4.5.
+enables `system-proxy`, so the crate carries the same TLS-only stance as 4.5
+— which, as 4.5 now records (final review 2026-09-24), is a narrow property:
+reqwest reads environment proxies whatever its features, and a `307`/`308`
+re-sends a POST, with any custom header, to a host no check saw. What keeps a
+request on the URL the egress check judged is the injected client's build
+(`no_proxy()`, `redirect(Policy::none())`, and a pinned resolver where DNS
+rebinding matters), which `testkit::hardened_reqwest_client` builds and
+`McpEgressCheck`'s documentation requires (5.3, condition a).
 `transport-child-process` (`["transport-async-rw", "tokio/process",
 "dep:process-wrap"]`) is enabled only under the crate's own `child-process`
 feature, off by default (5.3, condition b). The pin, its feature list, and
@@ -842,8 +885,9 @@ from outputSchema digest, version: from the schema digest }`; a schema over
 caller to store as an artifact and reference (plan refinement 2026-09-22:
 `McpSyncedDescriptor::with_input_schema_artifact`, not `with_input_schema_ref`
 as first drafted);
-a schema over `MCP_DESCRIPTOR_SCHEMA_MAX_BYTES` (64 KiB) is refused
-`mcp-descriptor-schema-too-large`; a transport or protocol failure during
+an input or output schema over `MCP_DESCRIPTOR_SCHEMA_MAX_BYTES` (64 KiB) is
+refused `mcp-descriptor-schema-too-large` (final review 2026-09-24: the
+output schema is bounded too); a transport or protocol failure during
 sync is `mcp-descriptor-sync-failed` (the version fallback of 5.3 applies
 first). For a child-process binding the same function runs over the
 transport the launcher (5.3) produced. MCP tool annotations (`readOnlyHint`,
@@ -852,16 +896,22 @@ transport the launcher (5.3) produced. MCP tool annotations (`readOnlyHint`,
 `destructiveHint: true` or an `idempotentHint: false` against a tool declared
 `ReadOnly`/`Idempotent`, or a `readOnlyHint: false` against `ReadOnly`, refuses
 registration under `mcp-hint-contradicts-declaration`; a hint that does not
-contradict the declaration is ignored). Names are prefixed
+contradict the declaration is ignored; final review 2026-09-24: a
+`readOnlyHint: true` silences the destructive and idempotent hints, as MCP's
+own semantics say, and the shipped code now matches this rule, which it had
+not for `idempotentHint: false` against `ReadOnly`). Names are prefixed
 `mcp.<server_id>.<tool>` to keep the registry namespace flat and stable.
 
 `McpDescriptorRefresh::Manual` is the default: a registry built from a stored
 `McpDescriptorSet` makes no network call at construction, which is what
 "agents are instantiated only from releases" requires. (plan refinement
-2026-09-22) `Interval { millis }` ships; `Listen` stays a decodable variant
-but is deferred rather than implemented — rmcp 3.4.0 has no
-`subscriptions/listen`, and a listening session would contradict the
-stateless per-attempt client every other path in this crate holds to.
+2026-09-22) `Interval { millis }` ships; `Listen` is deferred and is not a
+variant — a binding naming it fails to decode. (Final review 2026-09-24:
+this mark first said rmcp 3.4.0 has no `subscriptions/listen`; it does —
+`Peer<RoleClient>::listen`, `rmcp-3.4.0/src/service/client.rs:1195`. The
+deferral stands for the other reason alone: a listening session would
+contradict the stateless per-attempt client every other path in this crate
+holds to.)
 `mcp_descriptor_staleness(stored, fresh)` is the seam a deployment calls on
 its own timer to serve `Interval` in the meantime: it compares a stored set
 against a freshly synced one and reports added, removed, and changed tools.
@@ -870,20 +920,33 @@ Neither rebuilds a registry by itself.
 Because `AgentToolRegistry` is immutable, a descriptor change is a new
 registry build. The grant already records the descriptor's schema digest; the
 executor compares it against the live `tools/list` entry (cached under the
-result's `ttlMs`) and refuses on mismatch (`tool-descriptor-revision-mismatch`),
+executor's TTL) and refuses on mismatch (`tool-descriptor-revision-mismatch`),
 which is spec 11.8's "recovery MUST NOT silently execute against a materially
 different schema" made concrete. This dispatch-time recheck stays whatever the
 refresh mode: stored descriptors say what was published; the recheck says
-whether the server still agrees.
+whether the server still agrees. (Plan refinement 2026-09-22, corrected in
+the final review 2026-09-24: the refinement said rmcp 3.4.0's `tools/list`
+result carries no `ttlMs`; it does — `ListToolsResult.ttl_ms`. The TTL is
+the executor's own, `with_descriptor_recheck_ttl_ms`, because a server-chosen
+TTL would let the server decide how long a reshaped schema stays trusted. A
+listing that has not ended after `MCP_LIST_PAGES_MAX` (64) pages is refused,
+not cached.)
 
 Rule preserved: MCP is never an agent-to-agent channel (spec 14.4). A
 `McpServerBinding` whose peer identifies as a Rakka agent server is refused
 (`mcp-peer-agent-channel-refused`), so a later Rakka MCP server cannot become
-a side channel between agents. (plan refinement 2026-09-22) Identity is read
-from the initialize handshake itself, not a separate `server/discover` call:
-`peer_info().server_info.name` prefixed `rakka-agent`
-(`MCP_PEER_AGENT_SERVER_PREFIX`), checked identically by `sync_mcp_descriptors`
-and by the executor's own `connect` at every dispatch attempt.
+a side channel between agents. (plan refinement 2026-09-22, corrected in the
+final review 2026-09-24) Identity is `peer_info().server_info.name` prefixed
+`rakka-agent` (`MCP_PEER_AGENT_SERVER_PREFIX`), which the handshake fills:
+from the `initialize` result under the legacy lifecycle, and under `Discover`
+from the `serverInfo` a `server/discover` result carries in its optional
+`_meta` (`rmcp-3.4.0/src/model.rs:1290`, `:1373`) — this mark first said
+identity came from `initialize` "not a separate `server/discover` call",
+which is backwards. A server that reports no `serverInfo` reads as an empty
+name and passes: the rule is written for a cooperative threat model, a Rakka
+agent served over MCP that identifies itself, not a server that hides what
+it is. Checked identically by `sync_mcp_descriptors` and by the executor's
+own `connect` at every dispatch attempt (both proved).
 
 ### 5.3 Client executor
 
@@ -927,7 +990,11 @@ artifacts, http, egress, launcher)` is a second, full constructor beside
 `with_child_process_launcher(self, launcher)`: it takes every argument `new`
 does plus the launcher, and admits `ChildProcess` bindings directly, where
 `with_child_process_launcher` is the builder that installs one onto an
-executor `new` already refused them from. `McpChildTransport` is an enum —
+executor `new` already refused them from. (Final review 2026-09-24:
+`with_child_process_launcher` was removed. It could never admit a binding —
+`new` had already refused every `ChildProcess` binding, and an executor's
+bindings are fixed once it is built — so `with_launcher` is the one
+constructor that takes a launcher.) `McpChildTransport` is an enum —
 `Pair { reader, writer }`, always available (the `transport-io` feature is
 not conditional), and `Process(rmcp::transport::TokioChildProcess)` under
 `child-process` — rather than a single concrete type; dropping a `Process`
@@ -956,15 +1023,30 @@ The three conditions, each a stated invariant of the host:
   itself — the one function both `sync_mcp_descriptors` and the executor's
   per-attempt dial go through — rather than being re-implemented at each
   caller, so *being connected* and *having passed the rule* are the same
-  event by construction. `connect_over` (the child-process path) is public,
-  non-generic, and takes no credential and no egress check: a stdio child is
+  event by construction. `connect_over` (the child-process path) is
+  crate-private (final review 2026-09-24: it and the session type left the
+  public API with rmcp's `Peer`; a launched transport is reached publicly
+  through `sync_mcp_descriptors_over` and the executor), non-generic, and
+  takes no credential and no egress check: a stdio child is
   reached over a pipe the deployment's launcher produced, not a URL anything
-  could dial, and it refuses a binding that names an HTTP transport.
+  could dial, and it refuses a binding that names an HTTP transport. (Final
+  review 2026-09-24) The check judges the configured URL, and nothing after
+  it: where a request actually goes is the injected client's decision. A
+  default `reqwest::Client` honours the environment's proxy variables and
+  follows redirects — a `307`/`308` re-sends the POST, with an API-key header
+  reqwest does not strip across hosts, to a host the check never saw — so
+  the client a deployment injects must be built with `no_proxy()` and
+  `redirect(Policy::none())` (and a pinned resolver where DNS rebinding
+  matters), as `McpEgressCheck`, `McpDispatchToolExecutor::new`, and
+  `sync_mcp_descriptors` document and `testkit::hardened_reqwest_client`
+  builds. The API-key header value is marked sensitive.
 - **(b) No child process without a launcher.** `McpTransport::ChildProcess`
   stays a variant so a binding deserializes and is refused deterministically:
   `new` refuses it with `mcp-transport-unsupported` unless a launcher is
   installed first through `with_child_process_launcher` (which is why that
-  builder is fallible: it re-validates the bindings). The crate ships no
+  builder is fallible: it re-validates the bindings). (Final review
+  2026-09-24: through `with_launcher`, which takes the launcher together with
+  the bindings; the builder was removed.) The crate ships no
   launcher by default. rmcp's `transport-child-process` is compiled only under
   the crate's `child-process` feature, which also ships
   `TokioChildProcessLauncher`, an unsandboxed reference launcher for tests
@@ -983,7 +1065,17 @@ The three conditions, each a stated invariant of the host:
   on any individual tool declaration — is refused at `McpServerBinding::validate`
   (`mcp-binding-invalid`), not deferred to dispatch: a stdio child has no
   header to carry one, so binding construction is where that mismatch is
-  caught.
+  caught. (Final review 2026-09-24) The dispatcher resolves the *effect's*
+  binding, which the effect takes from the tool's declaration, so the sync
+  copies the server-level `credential_binding` into each synced declaration
+  that names none; `validate` refuses a tool declaration naming a different
+  one (`mcp-binding-invalid`); and an HTTP attempt whose binding — server or
+  tool — names a credential binding while no credential arrived fails closed,
+  before any client exists, under `mcp-credential-missing`. The server
+  receives the credential, so the executor replaces its material with
+  `<redacted>` in every piece of server-chosen text an attempt keeps: the
+  `isError` detail (before the 512-byte bound cuts it), the inline result,
+  the artifact's bytes, and a refusal's reported name and versions.
 
 Per attempt: build an `rmcp` client for the binding's transport over the
 injected client or the launcher's transport (stateless in 2026-07-28, so per
@@ -1014,6 +1106,18 @@ code carried in the bounded detail. Every other row's determinacy still
 follows the binding's declared safety class, and every code above reaches
 the durable outbox row and the fleet index's `last_error_code` composed as
 `<code>: <message>` beside the pipeline's own `dispatch-collaborator-failed`.
+(Final review 2026-09-24) An effect that committed no `timeout_ms` is bounded
+by the executor's own default, `MCP_ATTEMPT_TIMEOUT_DEFAULT_MS` (30 000 ms,
+`with_attempt_timeout_default_ms`), and `McpToolPolicy::new` sets that value
+as the policy's timeout so the effect spec — and the dispatcher's
+`deadline_at` and credential lease — carry it: no configuration leaves an
+attempt unbounded. The `UnsupportedProtocolVersionError` row is rmcp's own
+negotiation: a binding listing a revision older than 2026-07-28 negotiates
+with `ClientLifecycleMode::Auto` — `server/discover`, then the legacy
+`initialize` handshake at the newest legacy version listed when the server
+answers as a legacy server — and one listing only 2026-07-28 with `Discover`,
+which does not fall back; a failed fallback is mapped from both phases, and
+every session is held to a version the binding lists.
 An artifact write is stamped `sha256:<hex>` and keyed
 `mcp-<effect id>-g<generation>-<call id>` — the effect id itself contains
 `/`, so an `AgentArtifactStore` implementation must accept a key with slashes
@@ -1652,9 +1756,15 @@ fingerprint survive `build()` unchanged).
   alone (4.5), and no Rakka crate, example, or test may enable `reqwest`;
   `rakka-agent-mcp`'s `rmcp` features enable `reqwest?/rustls` alone (5.1).
   A consumer that keeps `agent-rig` off is unaffected either way; one that
-  enables it gains a TLS backend and no proxy behaviour. A test in
+  enables it gains a TLS backend and no OS-proxy behaviour. A test in
   `crates/rakka-agent/tests/` parses the manifest and fails if the `rig`
-  feature ever lists `reqwest`.
+  feature ever lists `reqwest`. (Final review 2026-09-24: a narrow property.
+  `system-proxy` adds the OS proxy settings; reqwest honours the
+  environment's proxy variables whatever its features; and `a2a-server-lf`
+  enables `reqwest/system-proxy` itself, so a build with the `a2a` feature
+  carries it. The egress control is the client or backend a deployment
+  injects — built with no proxy and no redirects — beside the MCP egress
+  check, never a feature list.)
 - New stable codes, registered in `docs/rakka-compatibility.md`:
   `model-profile-unknown`, `model-profile-invalid-base-url`,
   `model-profile-invalid-attribute`, `model-timeout-unset`,
@@ -1693,13 +1803,17 @@ fingerprint survive `build()` unchanged).
   `AgentDispatchError::Invocation` code, recorded as the error code itself
   rather than wrapped in `dispatch-collaborator-failed`). Rakka registers no
   code of its own for an egress refusal: that failure rides the deployment's
-  own `McpEgressCheck` vocabulary), `plan-builder-unknown-endpoint`,
+  own `McpEgressCheck` vocabulary; final review 2026-09-24: a fifteenth,
+  `mcp-credential-missing` — an HTTP binding naming a credential binding and
+  an attempt carrying no resolved credential),
+  `plan-builder-unknown-endpoint`,
   `plan-builder-port-not-allowed`, `directory-tenant-mismatch`. The
   registry-backed check the plan owes (slice 6.4) is a good companion.
 - Pins added to the compatibility table: `rmcp =3.4.0` with features
   `client`, `transport-streamable-http-client-reqwest`, `reqwest`
   (`transport-child-process` under the crate's `child-process` feature
-  only), MCP `2026-07-28` (`2025-11-25` compatible), and `rig-core =0.37.0`
+  only), MCP `2026-07-28` (`2025-11-25` compatible — reached through rmcp's
+  `Auto` lifecycle, final review 2026-09-24), and `rig-core =0.37.0`
   with `rustls` only. `a2a-server-lf` may move to 0.4.3 (public surface
   byte-identical, `a2a-pb` 0.2.0); optional.
 - `A2AOperation` gains `DirectoryRead`.
@@ -1716,7 +1830,11 @@ fingerprint survive `build()` unchanged).
   is validated before a provider client exists; an MCP server URL is handed to
   the egress check the executor was constructed with before a client exists,
   a required argument (R17). No Rakka crate enables a proxy-honouring HTTP
-  feature.
+  feature. (Final review 2026-09-24: that last sentence is a narrow property,
+  not the egress control — reqwest honours environment proxies whatever its
+  features and follows redirects by default, so the injected client must be
+  built with no proxy and no redirects for the check to govern where a
+  request goes; `a2a-server-lf` enables `reqwest/system-proxy` itself.)
 - Ingress guardrails run inside the service, so in-process delivery — not
   only HTTP — is covered; ingress and egress chains are attested against the
   authority's chain.

@@ -490,6 +490,12 @@ impl Display for AgentEnvironmentConcurrencyProtocol {
 /// arrive from deployment configuration, so it crosses a trust boundary, and
 /// an out-of-bounds descriptor or an attempt bound of zero is refused where it
 /// enters rather than after a registry has been built around it.
+///
+/// Versioning: the decode ignores fields it does not know, so an older build
+/// reads a binding a newer build wrote. A restrictive field a later version
+/// adds is therefore dropped by an older reader, which then enforces less than
+/// the binding says — the decode fails open on a downgrade — so a binding must
+/// never be handed to a build older than the one that wrote it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentToolBinding {
     descriptor: AgentToolDescriptor,

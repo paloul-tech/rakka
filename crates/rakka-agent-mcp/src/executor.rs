@@ -79,6 +79,12 @@ use crate::sync::{McpDescriptorSet, McpSyncedDescriptor};
 /// [`AgentArtifactStore::put_artifact`] takes `&mut self` while a dispatch
 /// executor is shared across concurrent attempts, and an `async` mutex because
 /// the write is awaited.
+///
+/// The executor writes each result under a derived artifact id,
+/// `mcp-<effect id>-g<generation>-<call id>`, so a re-driven attempt of the
+/// same generation rewrites one artifact rather than adding a second — and an
+/// effect id itself contains `/`, so the store behind this handle must accept
+/// an artifact id with slashes in it.
 pub type McpArtifactStore = Arc<tokio::sync::Mutex<dyn AgentArtifactStore + Send>>;
 
 /// Wraps one application-owned artifact store as an [`McpArtifactStore`].
