@@ -1752,6 +1752,16 @@ pub enum AgentConversationEntityCommand {
         /// Stable dedup identity of this turn, derived over the coordinate
         /// and the body digest by
         /// [`crate::coordination::conversation_turn_operation_id`].
+        ///
+        /// Over the body **as the caller sent it**. An `A2aIngress` stage
+        /// that rewrites the body does so after the id is derived, so the id
+        /// names the wire body while [`AgentConversationTurnSubmit::body`]
+        /// and the turn ledger hold the admitted one. A retried send under
+        /// the same chain re-derives the same id and the same rewrite and
+        /// converges. Under a chain whose revision changed between the send
+        /// and its retry, the operation log answers `Duplicate` inside its
+        /// window and the ledger answers `conversation-turn-content-mismatch`
+        /// past it.
         operation_id: AgentOperationId,
         /// The submission.
         submit: Box<AgentConversationTurnSubmit>,
@@ -1760,7 +1770,9 @@ pub enum AgentConversationEntityCommand {
     /// moderator and the round.
     EndEarly {
         /// Stable dedup identity of this end decision, round-qualified by
-        /// [`crate::coordination::conversation_end_operation_id`].
+        /// [`crate::coordination::conversation_end_operation_id`]. Over the
+        /// reason as the caller sent it; an ingress stage that rewrites or
+        /// clears the reason does not change the id.
         operation_id: AgentOperationId,
         /// The agent claiming the end. A claim, like a turn's speaker: the
         /// transition fences it against the durable moderator, so only the

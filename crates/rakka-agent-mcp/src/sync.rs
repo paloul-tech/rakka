@@ -17,7 +17,7 @@
 //! launcher produced — the same listing, bounds, and rules, with no URL to
 //! judge and no credential to carry.
 //!
-//! Three bounds and one rule then guard what crosses in:
+//! Four bounds and two rules then guard what crosses in:
 //!
 //! - A listing that has not ended after [`MCP_LIST_PAGES_MAX`] pages is
 //!   refused.
@@ -29,10 +29,17 @@
 //! - A server-reported hint never *changes* an operator's declaration. When
 //!   the binding opts into honoring hints, a hint that contradicts the
 //!   declaration refuses the sync; otherwise it is ignored.
+//! - The server's self-reported name is cut at [`MCP_SERVER_NAME_MAX_BYTES`].
+//! - Text that carries the credential the sync sent — in the server's name,
+//!   a description, or either schema — refuses the sync
+//!   (`mcp-descriptor-credential-echoed`). It is refused rather than
+//!   scrubbed because a scrubbed schema would no longer match the digest a
+//!   dispatch compares with the live server's.
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::time::Duration;
 
 use rakka_agent::{
     AgentContentDigest, AgentEffectSafetyClass, AgentRevisionNumber, AgentSchemaId, AgentSchemaRef,
@@ -48,10 +55,12 @@ use serde_json::{json, Value};
 
 use crate::binding::{
     McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
-    MCP_DESCRIPTOR_SCHEMA_MAX_BYTES, MCP_LIST_PAGES_MAX,
+    MCP_DESCRIPTOR_SCHEMA_MAX_BYTES, MCP_LIST_PAGES_MAX, MCP_SERVER_NAME_MAX_BYTES,
+    MCP_SYNC_TIMEOUT_DEFAULT_MS,
 };
 use crate::client::{
-    connect, connect_over, service_error, McpClientError, McpClientSession, McpEgressCheck,
+    connect, connect_over, credential_secrets, service_error, McpClientError, McpClientSession,
+    McpEgressCheck,
 };
 use crate::launcher::McpChildTransport;
 
@@ -240,6 +249,22 @@ pub enum McpSyncError {
         /// Why. A Rakka-side validation message, never server text.
         reason: String,
     },
+    /// The server's own text carries the credential this sync sent it.
+    ///
+    /// Nothing is stored. A descriptor set is release data and its
+    /// description and schema reach the model, so a set built from such a
+    /// listing would publish the secret; and a schema cannot be scrubbed
+    /// instead, because its digest is what a dispatch compares with the live
+    /// server's.
+    CredentialEchoed {
+        /// The server whose text carried it.
+        server: String,
+        /// The tool whose text carried it, or `None` for the server's name.
+        tool: Option<String>,
+        /// Which text: `server name`, `description`, `input schema`, or
+        /// `output schema`.
+        field: &'static str,
+    },
 }
 
 impl McpSyncError {
@@ -266,6 +291,7 @@ impl McpSyncError {
             Self::HintContradictsDeclaration { .. } => "mcp-hint-contradicts-declaration",
             Self::Registration(error) => error.code(),
             Self::Descriptor { .. } => "mcp-binding-invalid",
+            Self::CredentialEchoed { .. } => "mcp-descriptor-credential-echoed",
         }
     }
 }
@@ -296,6 +322,24 @@ impl Display for McpSyncError {
                 f,
                 "the MCP server {server}'s tool {tool} could not be described: {reason}"
             ),
+            Self::CredentialEchoed {
+                server,
+                tool: Some(tool),
+                field,
+            } => write!(
+                f,
+                "the MCP server {server}'s tool {tool} {field} carries the credential the sync \
+                 sent; nothing was stored"
+            ),
+            Self::CredentialEchoed {
+                server,
+                tool: None,
+                field,
+            } => write!(
+                f,
+                "the MCP server {server}'s {field} carries the credential the sync sent; \
+                 nothing was stored"
+            ),
         }
     }
 }
@@ -314,6 +358,24 @@ impl From<McpRegistrationError> for McpSyncError {
     }
 }
 
+/// The instant a sync must be over by. `checked_add` rather than `+`: a bound
+/// the platform's clock cannot represent ends the sync at once, failing
+/// closed rather than panicking or waiting forever.
+fn sync_deadline(timeout: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(timeout).unwrap_or(now)
+}
+
+/// What a sync that ran out of time answers: one fact to the operator, the
+/// descriptors could not be refreshed, under the code a transport failure of
+/// the sync already has.
+fn timed_out(server: &str, timeout: Duration) -> McpSyncError {
+    McpSyncError::Client(McpClientError::Transport {
+        server: server.to_string(),
+        reason: format!("the sync exceeded its {} ms bound", timeout.as_millis()),
+    })
+}
+
 /// Syncs one MCP server's allow-listed tools into a durable descriptor set.
 ///
 /// One session, one `tools/list`, then the session is closed — including on
@@ -329,10 +391,10 @@ impl From<McpRegistrationError> for McpSyncError {
 /// be built with no proxy and no redirects, as [`McpEgressCheck`] describes,
 /// for the check to govern where the request actually goes.
 ///
-/// The sync sets no deadline of its own — neither does rmcp, nor an injected
-/// `reqwest` client by default — so the caller bounds it: a publish step that
-/// awaits it under its own timeout, as a dispatch attempt awaits under the
-/// effect's.
+/// The whole sync — handshake and listing — is bounded by
+/// [`MCP_SYNC_TIMEOUT_DEFAULT_MS`]; [`sync_mcp_descriptors_within`] takes the
+/// caller's own bound. A sync that runs out of time is refused
+/// `mcp-descriptor-sync-failed`, with its session closed.
 ///
 /// # Errors
 ///
@@ -347,16 +409,57 @@ pub async fn sync_mcp_descriptors<C>(
 where
     C: StreamableHttpClient + Sync,
 {
+    sync_mcp_descriptors_within(
+        http,
+        binding,
+        credential,
+        synced_at,
+        egress,
+        Duration::from_millis(MCP_SYNC_TIMEOUT_DEFAULT_MS),
+    )
+    .await
+}
+
+/// As [`sync_mcp_descriptors`], under the caller's own bound.
+///
+/// `timeout` covers the handshake and the listing together. The session's
+/// close is owed on every path and is bounded on its own terms, so the call
+/// returns within `timeout` plus that fixed few seconds.
+///
+/// # Errors
+///
+/// [`McpSyncError`] with its stable code; a sync that ran out of time is
+/// `mcp-descriptor-sync-failed`.
+pub async fn sync_mcp_descriptors_within<C>(
+    http: &C,
+    binding: &McpServerBinding,
+    credential: Option<&AgentEphemeralCredential>,
+    synced_at: AgentTimestampMillis,
+    egress: &dyn McpEgressCheck,
+    timeout: Duration,
+) -> Result<McpDescriptorSet, McpSyncError>
+where
+    C: StreamableHttpClient + Sync,
+{
     // Validation first: an endpoint URL that fails the URL rule is a binding
     // refusal, and an egress rule should never be asked about a URL this
     // adapter would not dial anyway.
     binding.validate()?;
     let server = binding.server_id.to_string();
+    let deadline = sync_deadline(timeout);
     // The egress rule fires inside `connect`, before a client exists and
     // before the credential is read; a refusal arrives here as
     // `McpClientError::Egress`, whose code is the host's own.
-    let session = connect(http, binding, credential, egress).await?;
-    sync_over_session(session, binding, &server, synced_at).await
+    let session = tokio::time::timeout_at(deadline, connect(http, binding, credential, egress))
+        .await
+        .map_err(|_| timed_out(&server, timeout))??;
+    // The material the server now holds, and so could echo into anything it
+    // lists.
+    let secrets = credential_secrets(credential);
+    sync_over_session(
+        session, binding, &server, synced_at, &secrets, deadline, timeout,
+    )
+    .await
 }
 
 /// Syncs one child-process MCP server's allow-listed tools into a durable
@@ -366,7 +469,13 @@ where
 /// session, one `tools/list`, the same bounds and hint rule, the session
 /// closed on every path — for the binding kind that has no URL to dial. It
 /// takes no egress check, because nothing is dialed, and no credential,
-/// because a stdio child has no header to carry one.
+/// because a stdio child has no header to carry one. No credential travels
+/// over a launcher's transport, so there is none for the listing to echo.
+///
+/// The whole sync — handshake and listing — is bounded by
+/// [`MCP_SYNC_TIMEOUT_DEFAULT_MS`]; [`sync_mcp_descriptors_over_within`] takes
+/// the caller's own bound. A sync that runs out of time is refused
+/// `mcp-descriptor-sync-failed`, with its session closed.
 ///
 /// # Errors
 ///
@@ -377,10 +486,75 @@ pub async fn sync_mcp_descriptors_over(
     binding: &McpServerBinding,
     synced_at: AgentTimestampMillis,
 ) -> Result<McpDescriptorSet, McpSyncError> {
+    sync_mcp_descriptors_over_within(
+        transport,
+        binding,
+        synced_at,
+        Duration::from_millis(MCP_SYNC_TIMEOUT_DEFAULT_MS),
+    )
+    .await
+}
+
+/// As [`sync_mcp_descriptors_over`], under the caller's own bound.
+///
+/// # Errors
+///
+/// [`McpSyncError`] with its stable code; a sync that ran out of time is
+/// `mcp-descriptor-sync-failed`.
+pub async fn sync_mcp_descriptors_over_within(
+    transport: McpChildTransport,
+    binding: &McpServerBinding,
+    synced_at: AgentTimestampMillis,
+    timeout: Duration,
+) -> Result<McpDescriptorSet, McpSyncError> {
     binding.validate()?;
     let server = binding.server_id.to_string();
-    let session = connect_over(transport, binding).await?;
-    sync_over_session(session, binding, &server, synced_at).await
+    let deadline = sync_deadline(timeout);
+    let session = tokio::time::timeout_at(deadline, connect_over(transport, binding))
+        .await
+        .map_err(|_| timed_out(&server, timeout))??;
+    sync_over_session(session, binding, &server, synced_at, &[], deadline, timeout).await
+}
+
+/// Whether `text` carries any of `secrets`. An empty secret matches nothing.
+fn carries(text: &str, secrets: &[&str]) -> bool {
+    secrets
+        .iter()
+        .any(|secret| !secret.is_empty() && text.contains(secret))
+}
+
+/// Whether any string, key, or number in `value` carries any of `secrets`.
+///
+/// The value is walked decoded, so a secret whose JSON spelling differs from
+/// its own — one with a quote or a backslash in it — is found as itself. A
+/// number is compared whole rather than searched: a digit run inside a
+/// larger number is not the secret.
+fn value_carries(value: &Value, secrets: &[&str]) -> bool {
+    match value {
+        Value::String(text) => carries(text, secrets),
+        Value::Array(items) => items.iter().any(|item| value_carries(item, secrets)),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, nested)| carries(key, secrets) || value_carries(nested, secrets)),
+        Value::Number(number) => {
+            let spelled = number.to_string();
+            secrets.iter().any(|secret| *secret == spelled)
+        }
+        Value::Null | Value::Bool(_) => false,
+    }
+}
+
+/// The server's name as a set stores it: cut at
+/// [`MCP_SERVER_NAME_MAX_BYTES`], on a character boundary.
+fn bounded_server_name(name: &str) -> String {
+    if name.len() <= MCP_SERVER_NAME_MAX_BYTES {
+        return name.to_string();
+    }
+    let mut end = MCP_SERVER_NAME_MAX_BYTES;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
 }
 
 /// Everything after the handshake that both syncs share: one listing, the
@@ -390,15 +564,23 @@ async fn sync_over_session(
     binding: &McpServerBinding,
     server: &str,
     synced_at: AgentTimestampMillis,
+    secrets: &[&str],
+    deadline: tokio::time::Instant,
+    timeout: Duration,
 ) -> Result<McpDescriptorSet, McpSyncError> {
-    let listed = session.list_all_tools().await;
+    // Only the listing is awaited under the deadline. The close below is
+    // owed whether or not it fired, and is bounded on its own terms.
+    let listed = tokio::time::timeout_at(deadline, session.list_all_tools()).await;
     let protocol_version = session.negotiated_version().as_str().to_string();
-    let server_name = session.server_name().to_string();
+    let reported_name = session.server_name().to_string();
     // The session is closed before the answer is judged: a refusal must not
     // leave a transport (and its credential-bearing client, or its child
     // process) alive.
     let built = listed
-        .map_err(|error| McpSyncError::Client(service_error(server, &error)))
+        .map_err(|_| timed_out(server, timeout))
+        .and_then(|listed| {
+            listed.map_err(|error| McpSyncError::Client(service_error(server, &error)))
+        })
         .and_then(|listed| {
             listed.ok_or_else(|| {
                 McpSyncError::Client(McpClientError::Protocol {
@@ -407,12 +589,21 @@ async fn sync_over_session(
                 })
             })
         })
-        .and_then(|listed| synced_descriptors(binding, server, &listed));
+        .and_then(|listed| synced_descriptors(binding, server, &listed, secrets));
     session.close().await;
+    // Judged first: a server that echoes the credential is refused for that,
+    // whatever else its listing got wrong.
+    if carries(&reported_name, secrets) {
+        return Err(McpSyncError::CredentialEchoed {
+            server: server.to_string(),
+            tool: None,
+            field: "server name",
+        });
+    }
     Ok(McpDescriptorSet {
         schema_version: MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
         server_id: binding.server_id.clone(),
-        server_name,
+        server_name: bounded_server_name(&reported_name),
         protocol_version,
         synced_at,
         descriptors: built?,
@@ -470,6 +661,7 @@ fn synced_descriptors(
     binding: &McpServerBinding,
     server: &str,
     listed: &[Tool],
+    secrets: &[&str],
 ) -> Result<Vec<McpSyncedDescriptor>, McpSyncError> {
     binding
         .tools
@@ -483,7 +675,7 @@ fn synced_descriptors(
                     tool: tool.clone(),
                     reason: "the server does not list it".to_string(),
                 })?;
-            synced_descriptor(binding, server, tool, policy, found)
+            synced_descriptor(binding, server, tool, policy, found, secrets)
         })
         .collect()
 }
@@ -495,6 +687,7 @@ fn synced_descriptor(
     tool: &str,
     policy: &McpToolPolicy,
     listed: &Tool,
+    secrets: &[&str],
 ) -> Result<McpSyncedDescriptor, McpSyncError> {
     let input_schema = Value::Object((*listed.input_schema).clone());
     let bytes = encoded_len(&input_schema, server, tool)?;
@@ -517,6 +710,31 @@ fn synced_descriptor(
             tool: tool.to_string(),
             bytes,
         });
+    }
+    // Before anything is derived from the server's text: what it says about
+    // this tool must not carry the credential the sync sent it. The raw
+    // description is judged, not the bounded one — a cut could leave part of
+    // a secret behind and hide the rest.
+    let echoed = |field: &'static str| McpSyncError::CredentialEchoed {
+        server: server.to_string(),
+        tool: Some(tool.to_string()),
+        field,
+    };
+    if listed
+        .description
+        .as_deref()
+        .is_some_and(|description| carries(description, secrets))
+    {
+        return Err(echoed("description"));
+    }
+    if value_carries(&input_schema, secrets) {
+        return Err(echoed("input schema"));
+    }
+    if output_schema
+        .as_ref()
+        .is_some_and(|schema| value_carries(schema, secrets))
+    {
+        return Err(echoed("output schema"));
     }
     if policy.honor_hints {
         if let Some(hint) =
@@ -667,8 +885,23 @@ mod tests {
     use rakka_agent::AgentEffectSafetyClass;
     use rmcp::model::ToolAnnotations;
 
-    use super::{bounded_description, hint_contradiction};
+    use serde_json::json;
+
+    use super::{bounded_description, carries, hint_contradiction, value_carries};
     use rakka_agent::AGENT_TOOL_DESCRIPTION_MAX_LENGTH;
+
+    #[test]
+    fn an_empty_secret_matches_nothing() {
+        assert!(!carries("anything at all", &[""]));
+        assert!(!value_carries(&json!({"a": ["b", 1]}), &[""]));
+        assert!(!value_carries(&json!({"a": "b"}), &[]));
+    }
+
+    #[test]
+    fn a_number_is_compared_whole() {
+        assert!(value_carries(&json!({"maximum": 424_242}), &["424242"]));
+        assert!(!value_carries(&json!({"maximum": 1_424_242}), &["424242"]));
+    }
 
     #[test]
     fn no_annotations_can_contradict_nothing() {

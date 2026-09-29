@@ -474,8 +474,12 @@ pub enum AgentRunTerminalReason {
     EffectFailed {
         /// The effect that failed.
         effect_id: AgentEffectId,
-        /// Its stable failure code.
+        /// Its stable failure code: the pipeline's.
         code: String,
+        /// Which decision failed it, when one party decided. Observability
+        /// only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<crate::failure::AgentFailureReason>,
     },
     /// An ambiguous effect was closed by an explicitly scheduled compensation
     /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)); the run
@@ -4450,6 +4454,7 @@ fn apply_effect_outcome(
             // work already at the dispatch layer settles truthfully.
             effect.status = outcome.resolved_status();
             effect.last_error_code = Some(bounded_detail(code.clone()));
+            effect.last_error_reason = outcome.failure_reason().cloned();
             let failed_kind = effect.kind();
             let code = code.clone();
             // A handoff send resolves before the shared wind-down logic: the
@@ -4481,7 +4486,11 @@ fn apply_effect_outcome(
                         .handoff()
                         .map(|cell| cell.record.call_id.clone());
                     if let Some(cell) = run.loop_state.handoff_mut() {
-                        cell.settle_failed(bounded_detail(code.clone()), now);
+                        cell.settle_failed_because(
+                            bounded_detail(code.clone()),
+                            outcome.failure_reason().cloned(),
+                            now,
+                        );
                     }
                     if let Some(call_id) = call_id {
                         let content = AgentTaskContent::inline(serde_json::json!({
@@ -4566,7 +4575,11 @@ fn apply_effect_outcome(
                         if conflict {
                             cell.settle_conflicted(code.clone(), now);
                         } else {
-                            cell.settle_failed(code.clone(), now);
+                            cell.settle_failed_because(
+                                bounded_detail(code.clone()),
+                                outcome.failure_reason().cloned(),
+                                now,
+                            );
                         }
                     }
                     // A send whose delegation belongs to the run's fan-out
@@ -4643,7 +4656,7 @@ fn apply_effect_outcome(
                         if conflict {
                             cell.settle_conflicted(code.clone(), now);
                         } else {
-                            cell.settle_failed(code.clone(), now);
+                            cell.settle_failed(bounded_detail(code.clone()), now);
                         }
                     }
                     let member = crate::fan_in::AgentFanInMemberId::from(invocation_id.clone());
@@ -4689,6 +4702,7 @@ fn apply_effect_outcome(
                     run.terminal_reason = Some(AgentRunTerminalReason::EffectFailed {
                         effect_id: effect_id.clone(),
                         code: bounded_detail(code),
+                        reason: outcome.failure_reason().cloned(),
                     });
                 }
             }
@@ -4703,6 +4717,7 @@ fn apply_effect_outcome(
             // recorded is preserved untouched.
             effect.status = AgentRunEffectStatus::Indeterminate;
             effect.last_error_code = Some(bounded_detail(code.clone()));
+            effect.last_error_reason = outcome.failure_reason().cloned();
         }
         AgentRunEffectOutcome::Cancelled { .. } => {
             // The dispatch layer fenced and settled the generation without
@@ -5244,10 +5259,7 @@ fn resolve_checkpoint(
             state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
             // A denied consequential effect fails its generation: the run winds
             // down under a truthful code, exactly as a failed effect would.
-            let denial = AgentRunEffectOutcome::Failed {
-                code: "checkpoint-denied".to_string(),
-                message: reason,
-            };
+            let denial = AgentRunEffectOutcome::failed("checkpoint-denied".to_string(), reason);
             apply_effect_outcome(state, &bound_effect_id, &denial, now)?;
         }
         AgentCheckpointOutcome::EffectResolution(resolution) => {
@@ -5279,10 +5291,10 @@ fn resolve_checkpoint(
             // a truthful code and the run winds down — or finishes the
             // wind-down a cancellation already began, under that earlier
             // reason (scenario 57).
-            let abandonment = AgentRunEffectOutcome::Failed {
-                code: "reconciliation-abandoned".to_string(),
-                message: "the operator abandoned the ambiguous effect".to_string(),
-            };
+            let abandonment = AgentRunEffectOutcome::failed(
+                "reconciliation-abandoned".to_string(),
+                "the operator abandoned the ambiguous effect".to_string(),
+            );
             apply_effect_outcome(state, &bound_effect_id, &abandonment, now)?;
         }
         AgentCheckpointOutcome::Escalated => {
@@ -5371,6 +5383,7 @@ fn schedule_compensation(
     if let Some(effect) = run.loop_state.effect_mut(effect_id) {
         effect.status = AgentRunEffectStatus::Compensated;
         effect.last_error_code = Some(bounded_detail("compensated".to_string()));
+        effect.last_error_reason = None;
     }
 
     // Wind down first, then commit the compensation: the fence cancels only
@@ -5810,10 +5823,10 @@ fn fire_checkpoint_timers(
         match fired {
             AgentCheckpointTimerOutcome::Expired => {
                 state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
-                let expiry = AgentRunEffectOutcome::Failed {
-                    code: "checkpoint-expired".to_string(),
-                    message: format!("the {kind} checkpoint expired without a decision"),
-                };
+                let expiry = AgentRunEffectOutcome::failed(
+                    "checkpoint-expired".to_string(),
+                    format!("the {kind} checkpoint expired without a decision"),
+                );
                 apply_effect_outcome(state, &bound_effect_id, &expiry, now)?;
             }
             AgentCheckpointTimerOutcome::Escalated | AgentCheckpointTimerOutcome::Pending => {}
@@ -6414,6 +6427,12 @@ where
     memory: Option<AgentRunMemory>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
     segments: Option<Arc<dyn AgentSegmentSink>>,
+    /// The checkpoint the command in flight would resolve, when it is a
+    /// resolution command. Set by `apply`, read by `apply_command`.
+    resolving: Option<HumanCheckpointId>,
+    /// What the command in flight committed. Set by `apply_command` between
+    /// the transition and the settle pass, taken by `apply`.
+    committed: Option<CommittedTransition>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
     workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
     metrics: Arc<dyn MetricsRecorder>,
@@ -6462,6 +6481,8 @@ where
             memory: None,
             decisions: None,
             segments: None,
+            resolving: None,
+            committed: None,
             delegation: None,
             workflow_tools: None,
             metrics: Arc::new(NoopMetricsRecorder),
@@ -6709,6 +6730,13 @@ where
         // checkpoint record, closed only once the transition committed.
         let resolving = self.resolving_checkpoint(&command);
         let resolve_timer = resolving.as_ref().map(|_| AgentSegmentTimer::start(now));
+        // Read now, for a segment that may close after the cached record is
+        // gone.
+        let context_before = self.loop_telemetry();
+        self.resolving = resolving
+            .as_ref()
+            .map(|resolving| resolving.checkpoint_id.clone());
+        self.committed = None;
         let reverify = command.clone();
         let reply = match self.apply_command(command, router, now).await {
             // A command that *commits* is fenced by its own compare-and-set:
@@ -6726,20 +6754,30 @@ where
             // extra pass, whose verdict is authoritative whatever it says.
             // The happy path pays nothing, which is the point of a resident
             // entity at all.
-            Err(error) if run_refusal_may_be_stale(&error) => {
-                self.rematerialize(now).await?;
-                self.apply_command(reverify, router, now).await
-            }
+            //
+            // A re-read that fails answers the call but does not end it: the
+            // first pass may have committed a resolution before its settle
+            // pass failed, and the segments below are decided on what
+            // committed, not on how the call ended.
+            Err(error) if run_refusal_may_be_stale(&error) => match self.rematerialize(now).await {
+                Ok(()) => self.apply_command(reverify, router, now).await,
+                Err(reread) => Err(reread),
+            },
             other => other,
         };
+        let committed = self.committed.take().unwrap_or_default();
+        self.resolving = None;
         self.record_fan_in_resolution(resolution_before);
         // The resolution segment links the parked span and the incoming
         // request ([specification 17.11]), and exports under the identity the
-        // park linked forward to ([17.9]). A duplicate or a refusal resolved
-        // nothing and closes nothing.
-        let resolved = matches!(reply, Ok(AgentRunEntityReply::Applied { .. }));
+        // park linked forward to ([17.9]). Its subject is the resolution, and
+        // the resolution is the transition: it closes on the call whose
+        // transition committed and left the checkpoint no longer open,
+        // whatever the settle pass after it answered. A duplicate, a refusal,
+        // and an escalation resolved nothing and close nothing.
         let mut links = Vec::new();
-        if let (Some(resolving), Some(timer), true) = (resolving, resolve_timer, resolved) {
+        if let (Some(resolving), Some(timer), true) = (resolving, resolve_timer, committed.resolved)
+        {
             links = resolving.links();
             let mut segment = timer
                 .close(AgentSegmentOperation::CheckpointResolve)
@@ -6750,21 +6788,35 @@ where
             ) {
                 segment = segment.span_id(identity.span_id);
             }
-            self.close_segment_linked(segment.ok(), links.clone());
+            self.close_segment_under(segment.ok(), resolving.run.clone(), links.clone());
         }
         // Closed only when the wait actually ended. A command that arrives at
         // a waiting run and leaves it waiting — a duplicate, a refusal, a
         // partial fan-in — discharged nothing, and a resume segment for it
         // would claim a transition that did not happen.
+        //
+        // Where the record survived the call, the phase after the settle pass
+        // answers, and nothing about the commit enters it. Where the settle
+        // pass lost a write and dropped the record, the segment closes only
+        // if the run was terminal once the transition committed: a terminal
+        // run cannot wait again, so the commit decides what the clean call
+        // would have answered. A run that was not terminal at the commit
+        // closes nothing on that call, because what its settle pass would
+        // have left is unknown here. The context is the one read before the
+        // command.
         if let Some(timer) = resume_timer {
-            let resumed = self
+            let after = self
                 .state()
                 .ok()
-                .and_then(|state| state.loop_state().map(AgentLoopState::phase))
-                .is_some_and(|phase| !phase.is_waiting());
+                .and_then(|state| state.loop_state().map(AgentLoopState::phase));
+            let (resumed, context) = match after {
+                Some(phase) => (!phase.is_waiting(), self.loop_telemetry()),
+                None => (committed.terminal, context_before),
+            };
             if resumed {
-                self.close_segment_linked(
+                self.close_segment_under(
                     timer.close(AgentSegmentOperation::RunResume).ok(),
+                    context,
                     links,
                 );
             }
@@ -7034,6 +7086,9 @@ where
             }
         };
 
+        // The command's transition committed. Whether it resolved a
+        // checkpoint, and whether it left the run terminal, is decided here.
+        self.note_committed_transition();
         // The inner pass: `apply`'s own sampling scope wraps this call.
         self.settle_side_effects_inner(router, now).await?;
         Ok(reply)
@@ -7716,6 +7771,24 @@ where
             .unwrap_or_default()
     }
 
+    /// Records what the transition just committed, before the settle pass
+    /// can drop the record it is read from.
+    fn note_committed_transition(&mut self) {
+        let committed = self.state().ok().and_then(|state| {
+            let loop_state = state.loop_state()?;
+            Some(CommittedTransition {
+                resolved: self.resolving.as_ref().is_some_and(|checkpoint_id| {
+                    !loop_state
+                        .open_checkpoints()
+                        .iter()
+                        .any(|checkpoint| checkpoint.checkpoint_id == *checkpoint_id)
+                }),
+                terminal: state.status().is_some_and(AgentRunStatus::is_terminal),
+            })
+        });
+        self.committed = committed;
+    }
+
     /// [`Self::close_segment`] with span links appended to the run's context:
     /// the segment stays a child of the operation that activated the run, and
     /// the links name what else caused it.
@@ -7724,10 +7797,20 @@ where
         segment: crate::observability::AgentTelemetrySegment,
         links: Vec<AgentSpanLink>,
     ) {
+        self.close_segment_under(segment, self.loop_telemetry(), links);
+    }
+
+    /// [`Self::close_segment_linked`] under a context the caller read
+    /// earlier, for a segment closed after the cached record may be gone.
+    fn close_segment_under(
+        &self,
+        segment: crate::observability::AgentTelemetrySegment,
+        telemetry: AgentTelemetryContext,
+        links: Vec<AgentSpanLink>,
+    ) {
         let Some(sink) = self.segments.as_ref() else {
             return;
         };
-        let telemetry = self.loop_telemetry();
         let telemetry = if links.is_empty() {
             telemetry
         } else {
@@ -7849,6 +7932,7 @@ where
             effect_telemetry,
             checkpoint_id,
             request,
+            run: loop_state.telemetry().clone(),
         })
     }
 
@@ -9240,6 +9324,23 @@ fn indeterminate_transition_links(
     links
 }
 
+/// What the command in flight had committed when its transition returned,
+/// read before the settle pass that follows it.
+///
+/// The settle pass is the run's next piece of work, and a failure there is
+/// reported by the call's `Err`. It can also lose a compare-and-set, which
+/// drops the cached record — after which nothing about the transition can
+/// be read back. So the two facts a segment is decided on are read here,
+/// while the record the transition wrote is still the cached one.
+#[derive(Debug, Clone, Copy, Default)]
+struct CommittedTransition {
+    /// The checkpoint the command named is no longer open: it was resolved.
+    /// An escalation commits and leaves it open, and resolved nothing.
+    resolved: bool,
+    /// The run had reached a terminal status once the transition committed.
+    terminal: bool,
+}
+
 /// The checkpoint a resolution command names, read before the transition that
 /// retires it, with everything the `checkpoint-resolve` segment links.
 #[derive(Debug, Clone)]
@@ -9252,6 +9353,9 @@ struct ResolvingCheckpoint {
     checkpoint_id: HumanCheckpointId,
     /// The incoming request's context, from the command.
     request: AgentTelemetryContext,
+    /// The run's own context, read with the rest: a settle pass that loses a
+    /// write drops the cached record, and the context with it.
+    run: AgentTelemetryContext,
 }
 
 impl ResolvingCheckpoint {
@@ -9875,6 +9979,99 @@ mod tests {
         (scope, loop_state)
     }
 
+    /// A reason always explains the code beside it. Compensating an ambiguous
+    /// effect overwrites its code with `compensated`, so the reason the
+    /// failed attempt left must go with the code it explained.
+    #[test]
+    fn compensating_an_effect_clears_the_reason_its_code_no_longer_names() {
+        let now = AgentTimestampMillis::new(1);
+        let (scope, mut loop_state) = segment_mark_fixture();
+        let schema = AgentSchemaRef::new(
+            AgentSchemaId::new("result").expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        );
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("definition").expect("the definition id is valid"),
+            "The compensation fixture.",
+            schema.clone(),
+            schema,
+        )
+        .expect("the definition is valid");
+        let mut effect = AgentRunEffect::new(
+            &scope,
+            loop_state.turn(),
+            0,
+            AgentRunEffectRequest::Tool {
+                call: Box::new(
+                    AgentToolCallRequest::new(
+                        AgentToolCallId::new("call-1").expect("the call id is valid"),
+                        AgentToolId::new("charge-card").expect("the tool id is valid"),
+                        serde_json::json!({}),
+                    )
+                    .expect("the call is bounded"),
+                ),
+            },
+            &AgentEffectSpec::non_idempotent(),
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the effect derives");
+        effect.status = AgentRunEffectStatus::Indeterminate;
+        effect.last_error_code = Some("dispatch-collaborator-failed".to_string());
+        effect.last_error_reason = crate::failure::AgentFailureReason::new("mcp-tool-error");
+        assert!(
+            effect.last_error_reason.is_some(),
+            "the fixture holds a reason"
+        );
+        let effect_id = effect.effect_id.clone();
+        let generation = effect.generation;
+        loop_state
+            .record_effect(effect)
+            .expect("the effect records");
+        let mut state = AgentRunState::unassigned(scope.clone(), now);
+        state.run = Some(AgentRun {
+            binding: AgentRunBinding::new(
+                scope.clone(),
+                AgentTaskId::new("task").expect("the task id is valid"),
+            ),
+            generation: AgentAssignmentGeneration::new(1),
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "input": "x" }))
+                .expect("the input is inline-bounded"),
+            status: AgentRunStatus::WaitingForEffect,
+            loop_state,
+            terminal_reason: None,
+            settlement: AgentRunSettlementStatus::Owed,
+            accepted_at: now,
+            terminal_at: None,
+        });
+
+        schedule_compensation(
+            &mut state,
+            &effect_id,
+            generation,
+            AgentCompensationRef::new("refund-charge").expect("the ref is valid"),
+            &AgentEffectPolicies::default(),
+            now,
+        )
+        .expect("the compensation schedules");
+
+        let compensated = state
+            .run()
+            .expect("the run exists")
+            .loop_state
+            .effects()
+            .iter()
+            .find(|effect| effect.effect_id == effect_id)
+            .expect("the compensated effect is held");
+        assert_eq!(compensated.status, AgentRunEffectStatus::Compensated);
+        assert_eq!(compensated.last_error_code.as_deref(), Some("compensated"));
+        assert_eq!(
+            compensated.last_error_reason, None,
+            "no reason outlives the code it explained"
+        );
+    }
+
     /// A saturated decision outbox must not silence the decide span.
     ///
     /// The outbox is a ring, and it saturates exactly when a wired decision
@@ -10045,6 +10242,13 @@ mod tests {
     #[test]
     fn the_growth_reserve_covers_the_maximal_working_set() {
         let now = AgentTimestampMillis::new(1);
+        let maximal_reason = crate::failure::AgentFailureReason::guardrail(
+            crate::definition::AgentGuardrailStageId::new(
+                "s".repeat(crate::identity::AGENT_IDENTITY_MAX_LENGTH),
+            )
+            .expect("the stage id is valid"),
+            "c".repeat(crate::failure::AGENT_FAILURE_REASON_CODE_MAX_LENGTH),
+        );
         // Maximal identifiers: every derived id in the working set — effect
         // ids, idempotency keys, the proposal id — scales with these.
         let long = "a".repeat(crate::identity::AGENT_IDENTITY_MAX_LENGTH);
@@ -10130,6 +10334,8 @@ mod tests {
         )
         .expect("the model effect derives");
         model_effect.status = AgentRunEffectStatus::Succeeded;
+        model_effect.last_error_code = Some("c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH));
+        model_effect.last_error_reason = Some(maximal_reason.clone());
         run.loop_state
             .record_effect(model_effect)
             .expect("the model effect records");
@@ -10162,7 +10368,7 @@ mod tests {
         // One outstanding effect per call — each copies its call — and one
         // maximal tool result per call besides.
         for (index, call) in calls.into_iter().enumerate() {
-            let effect = AgentRunEffect::new(
+            let mut effect = AgentRunEffect::new(
                 &scope,
                 turn,
                 index + 1,
@@ -10174,6 +10380,8 @@ mod tests {
                 now,
             )
             .expect("the tool effect derives");
+            effect.last_error_code = Some("c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH));
+            effect.last_error_reason = Some(maximal_reason.clone());
             run.loop_state
                 .record_effect(effect)
                 .expect("the tool effect records");
@@ -10215,8 +10423,14 @@ mod tests {
             evidence: Vec::new(),
             accepted_at: now,
         });
-        run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
-            reason: "r".repeat(AGENT_RUN_DETAIL_MAX_LENGTH),
+        // The largest terminal reason: an effect failure naming the last
+        // effect the fan-out derived under the maximal identifiers, with its
+        // code at the detail bound and the maximal reason beside it.
+        run.terminal_reason = Some(AgentRunTerminalReason::EffectFailed {
+            effect_id: effect_id_for(&scope, turn, crate::model::AGENT_MODEL_MAX_TOOL_CALLS)
+                .expect("the effect id derives"),
+            code: "c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH),
+            reason: Some(maximal_reason.clone()),
         });
 
         let growth = run.materialized_size_bytes().saturating_sub(baseline);
@@ -10555,6 +10769,7 @@ mod tests {
             None,
             AgentHandoffStatus::Failed {
                 code: "run-winding-down".to_string(),
+                reason: None,
             },
         );
         let result = accept_handoff_result(&mut live, &envelope, now);
@@ -10585,6 +10800,7 @@ mod tests {
             }),
             AgentHandoffStatus::Failed {
                 code: "run-winding-down".to_string(),
+                reason: None,
             },
         );
         let result = accept_handoff_result(&mut terminal, &envelope, now);

@@ -95,5 +95,21 @@ required-features = ["agents"]
 name = "human_task_surface"
 required-features = ["agents"]
 
+[[test]]
+name = "conversation_surface"
+required-features = ["agents"]
+
+[[test]]
+name = "coordination_surface"
+required-features = ["agents"]
+
+[[test]]
+name = "handoff_surface"
+required-features = ["agents"]
+
+[[test]]
+name = "team_surface"
+required-features = ["agents"]
+
 [lints]
 workspace = true

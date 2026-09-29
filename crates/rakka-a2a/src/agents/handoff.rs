@@ -376,6 +376,7 @@ fn finding_for_error(
         } => Ok(AgentA2aHandoffFinding::Refused {
             code: "collaboration-version-unsupported".to_string(),
             message: reason.to_string(),
+            reason: None,
         }),
         RakkaAgentA2AError::Task(error) => {
             if task_error_is_ambiguous(&error) {
@@ -387,12 +388,19 @@ fn finding_for_error(
                 Ok(AgentA2aHandoffFinding::Refused {
                     code: error.code().to_string(),
                     message: error.to_string(),
+                    reason: None,
                 })
             }
         }
-        RakkaAgentA2AError::Refused { code, message } => {
-            Ok(AgentA2aHandoffFinding::Refused { code, message })
-        }
+        RakkaAgentA2AError::Refused {
+            code,
+            message,
+            reason,
+        } => Ok(AgentA2aHandoffFinding::Refused {
+            code,
+            message,
+            reason,
+        }),
         RakkaAgentA2AError::Entity(_)
         | RakkaAgentA2AError::Run(_)
         | RakkaAgentA2AError::Projection(_) => Err(AgentDispatchError::Invocation {
@@ -402,6 +410,7 @@ fn finding_for_error(
         definitive => Ok(AgentA2aHandoffFinding::Refused {
             code: definitive.code().to_string(),
             message: definitive.to_string(),
+            reason: None,
         }),
     }
 }
@@ -439,9 +448,10 @@ where
             let mut send = self.request_for(handoff);
             if let Some(chain) = self.egress_guardrails.as_ref() {
                 let text = super::guardrails::A2aCollaborationText {
-                    body: None,
                     reason: Some(handoff.reason.clone()),
                     context: handoff.context.clone(),
+                    reason_required: true,
+                    ..super::guardrails::A2aCollaborationText::default()
                 };
                 match super::guardrails::evaluate_a2a_content(
                     chain,
@@ -471,6 +481,7 @@ where
                         return Ok(AgentA2aHandoffFinding::Refused {
                             code: refusal.code,
                             message: refusal.message,
+                            reason: refusal.reason,
                         });
                     }
                 }

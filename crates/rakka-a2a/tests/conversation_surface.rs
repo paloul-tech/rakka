@@ -40,6 +40,8 @@ use rakka_agent_workflow::AgentTimestampMillis;
 use rakka_persistence::InMemoryDurableStateStore;
 use serde_json::{json, Value};
 
+mod support;
+
 type TaskStore = InMemoryDurableStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = InMemoryDurableStateStore<AgentRunState>;
@@ -133,6 +135,19 @@ impl Fixture {
     }
 
     fn with_authorizer(authorizer: Arc<dyn A2AAuthorizer>) -> Self {
+        Self::build(authorizer, None)
+    }
+
+    /// A fixture whose service evaluates `chain` at the `A2aIngress`
+    /// boundary.
+    fn with_ingress_chain(chain: rakka_agent::AgentGuardrailChain) -> Self {
+        Self::build(Arc::new(AllowAllAuthorizer), Some(chain))
+    }
+
+    fn build(
+        authorizer: Arc<dyn A2AAuthorizer>,
+        ingress: Option<rakka_agent::AgentGuardrailChain>,
+    ) -> Self {
         let tasks = TaskStore::new();
         let agents = AgentStore::new();
         let runs = RunStore::new();
@@ -184,26 +199,28 @@ impl Fixture {
 
         let catalog = A2AStaticAgentCatalog::new()
             .with_target(A2AAgentTarget::new(agent(MEMBER_A), task_definition()));
-        let service = Arc::new(
-            Service::new(
-                tasks,
-                agents.clone(),
-                history,
-                runs,
-                teams,
-                team_history,
-                conversations.clone(),
-                conversation_history.clone(),
-                router.clone(),
-                Arc::new(catalog),
-                Arc::new(InMemoryA2ATaskProjectionStore::local()),
-                Arc::new(A2AHeaderTenantResolver),
-                authorizer,
-            )
-            .with_clock(Arc::new(TestClock(clock.clone())))
-            .with_default_tenant(TENANT)
-            .with_metrics(metrics.clone()),
-        );
+        let mut service = Service::new(
+            tasks,
+            agents.clone(),
+            history,
+            runs,
+            teams,
+            team_history,
+            conversations.clone(),
+            conversation_history.clone(),
+            router.clone(),
+            Arc::new(catalog),
+            Arc::new(InMemoryA2ATaskProjectionStore::local()),
+            Arc::new(A2AHeaderTenantResolver),
+            authorizer,
+        )
+        .with_clock(Arc::new(TestClock(clock.clone())))
+        .with_default_tenant(TENANT)
+        .with_metrics(metrics.clone());
+        if let Some(chain) = ingress {
+            service = service.with_ingress_guardrails(Arc::new(chain));
+        }
+        let service = Arc::new(service);
 
         Self {
             metrics,
@@ -353,6 +370,22 @@ impl Fixture {
             .snapshot()
             .expect("the conversation state reads")
             .expect("the conversation exists")
+    }
+
+    /// The conversation's `Ended` history entry, when one was recorded: the
+    /// one place an early end's free-text reason is kept.
+    async fn ended_entry(&self) -> Option<rakka_agent::AgentConversationHistoryEntry> {
+        use rakka_agent::AgentConversationHistoryStore;
+        self.conversation_history
+            .read(
+                &conversation_scope(),
+                rakka_agent::AgentConversationHistoryCursor::start().with_limit(64),
+            )
+            .await
+            .expect("the history reads")
+            .entries
+            .into_iter()
+            .find(|entry| entry.kind == rakka_agent::AgentConversationHistoryKind::Ended)
     }
 }
 
@@ -1073,4 +1106,154 @@ async fn a_terminated_conversation_echoes_on_its_governing_tasks_projection() {
         Some(0),
         "the coordinates ride the echo"
     );
+}
+
+fn ingress(rules: Vec<Arc<dyn rakka_agent::AgentGuardrail>>) -> rakka_agent::AgentGuardrailChain {
+    support::chain_at(rakka_agent::AgentGuardrailBoundary::A2aIngress, rules)
+}
+
+/// The conversation leaf evaluates ingress once per command, names the
+/// conversation as its subject, and what a stage rewrote is the turn the
+/// conversation records.
+#[tokio::test]
+async fn an_ingress_chain_reviews_a_turn_and_its_transform_is_recorded() {
+    let recording = Arc::new(support::Recording::default());
+    let fixture = Fixture::with_ingress_chain(ingress(vec![
+        recording.clone(),
+        Arc::new(support::RedactClusterText),
+    ]));
+    fixture.conversation_world().await;
+
+    let response = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(conversation_message(
+                "turn-1",
+                submit_cluster(MEMBER_A, 0, 0, "SENSITIVE proposal", 25),
+            )),
+        )
+        .await
+        .expect("the turn is served");
+    assert!(
+        response_payload(&response).get("Applied").is_some(),
+        "{:?}",
+        response_payload(&response)
+    );
+    assert_eq!(recording.seen(), 1, "once per command");
+    assert_eq!(recording.subjects(), vec!["conversation"]);
+
+    let recorded = serde_json::to_string(&fixture.conversation_snapshot().await)
+        .expect("the snapshot encodes");
+    assert!(recorded.contains(support::REDACTED), "{recorded}");
+    assert!(!recorded.contains("SENSITIVE"), "{recorded}");
+}
+
+/// A block refuses the turn before the conversation sees it.
+#[tokio::test]
+async fn an_ingress_block_refuses_a_turn_and_the_conversation_is_unchanged() {
+    let fixture = Fixture::with_ingress_chain(ingress(vec![Arc::new(support::BlockMarker)]));
+    fixture.conversation_world().await;
+    let before = serde_json::to_string(&fixture.conversation_snapshot().await)
+        .expect("the snapshot encodes");
+    let error = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(conversation_message(
+                "turn-1",
+                submit_cluster(MEMBER_A, 0, 0, support::MARKER, 25),
+            )),
+        )
+        .await
+        .expect_err("the marker is blocked");
+    assert!(
+        matches!(
+            &error,
+            RakkaAgentA2AError::Refused { code, .. } if code == "guardrail-blocked"
+        ),
+        "got {error:?}"
+    );
+    // The snapshot read itself ticks the fixture's clock, so the comparison
+    // is of what the conversation recorded, not of when it was read.
+    let after = fixture.conversation_snapshot().await;
+    assert!(
+        !serde_json::to_string(&after)
+            .expect("the snapshot encodes")
+            .contains(support::MARKER),
+        "nothing of the blocked turn was recorded"
+    );
+    assert!(!before.contains(support::MARKER));
+}
+
+/// A turn's body is required; an end's reason is not.
+#[tokio::test]
+async fn a_cleared_turn_body_is_refused_and_a_cleared_end_reason_is_applied() {
+    let fixture = Fixture::with_ingress_chain(ingress(vec![Arc::new(support::ClearClusterText)]));
+    fixture.conversation_world().await;
+    let error = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(conversation_message(
+                "turn-1",
+                submit_cluster(MEMBER_A, 0, 0, "the proposal", 25),
+            )),
+        )
+        .await
+        .expect_err("a required body cannot be cleared");
+    assert!(
+        matches!(
+            &error,
+            RakkaAgentA2AError::Refused { code, .. } if code == "guardrail-transform-invalid"
+        ),
+        "got {error:?}"
+    );
+
+    // An end is a governed decision: it needs an authenticated principal.
+    let mut end = conversation_message("end-1", end_cluster(MODERATOR, 0, "SENSITIVE reason"));
+    end.metadata
+        .as_mut()
+        .expect("the message carries metadata")
+        .insert(META_PRINCIPAL_REF.to_string(), json!("user:operator-7"));
+    let ended = fixture
+        .service
+        .send(&params(), &send_request(end))
+        .await
+        .expect("an end whose reason a stage cleared is still an end");
+    assert!(
+        response_payload(&ended).get("Applied").is_some(),
+        "{:?}",
+        response_payload(&ended)
+    );
+    // The snapshot carries only the terminal reason's code; the free-text
+    // reason is recorded on the `Ended` history entry alone.
+    let entry = fixture.ended_entry().await.expect("the end is recorded");
+    assert_eq!(entry.reason, None, "history records the stage's clear");
+}
+
+/// The positive control for the cleared end reason: with no chain, the same
+/// end's `Ended` history entry carries the reason the caller sent, so the
+/// assertion above can fail.
+#[tokio::test]
+async fn an_end_reason_no_stage_cleared_is_recorded_in_history() {
+    let fixture = Fixture::new();
+    fixture.conversation_world().await;
+    let mut end = conversation_message("end-1", end_cluster(MODERATOR, 0, "SENSITIVE reason"));
+    end.metadata
+        .as_mut()
+        .expect("the message carries metadata")
+        .insert(META_PRINCIPAL_REF.to_string(), json!("user:operator-7"));
+    let ended = fixture
+        .service
+        .send(&params(), &send_request(end))
+        .await
+        .expect("the end is served");
+    assert!(
+        response_payload(&ended).get("Applied").is_some(),
+        "{:?}",
+        response_payload(&ended)
+    );
+    let entry = fixture.ended_entry().await.expect("the end is recorded");
+    assert_eq!(entry.reason.as_deref(), Some("SENSITIVE reason"));
 }

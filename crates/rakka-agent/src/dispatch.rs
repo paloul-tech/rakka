@@ -231,8 +231,20 @@ fn bounded_failure_line(prefix: &str, code: &str, detail: &str) -> String {
 /// it is bounded here because a collaborator supplies it.
 fn collaborator_code(error: &AgentDispatchError) -> String {
     match error {
-        AgentDispatchError::Collaborator { code, .. } => bounded_failure_detail(code),
+        AgentDispatchError::Collaborator { code, .. } => bounded_failure_code(code),
         other => other.code().to_string(),
+    }
+}
+
+/// Which decision failed an attempt, when a collaborator decided it: the
+/// collaborator's own code. `None` for every other failure, whose pipeline
+/// code already is the whole identity.
+fn collaborator_reason(error: &AgentDispatchError) -> Option<crate::failure::AgentFailureReason> {
+    match error {
+        AgentDispatchError::Collaborator { .. } => {
+            crate::failure::AgentFailureReason::new(collaborator_code(error))
+        }
+        _ => None,
     }
 }
 
@@ -409,6 +421,11 @@ pub trait AgentRunResultDelivery: Send + Sync {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentDispatchToolExecutor: Send + Sync {
     /// Performs the call and returns its bounded result.
     fn execute<'a>(
@@ -437,6 +454,11 @@ pub trait AgentDispatchToolExecutor: Send + Sync {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentCompensationExecutor: Send + Sync {
     /// Performs the compensation and returns its bounded result.
     fn execute<'a>(
@@ -488,6 +510,11 @@ pub enum AgentMemoryPromotionFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentMemoryPromotionExecutor: Send + Sync {
     /// Performs the promotion and returns its bounded finding.
     fn execute<'a>(
@@ -557,6 +584,11 @@ pub enum AgentGoalEvaluationFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentGoalEvaluationExecutor: Send + Sync {
     /// Performs the evaluation and returns its bounded finding.
     fn execute<'a>(
@@ -602,6 +634,9 @@ pub enum AgentA2aSendFinding {
         code: String,
         /// Human-readable detail.
         message: String,
+        /// Which decision refused, when one party decided: the guardrail
+        /// stage and reason code of an egress or ingress block.
+        reason: Option<crate::failure::AgentFailureReason>,
     },
 }
 
@@ -629,6 +664,12 @@ pub enum AgentA2aSendFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record and the delegation's cell — and `EffectFailed`, when the failure
+/// ends the run — as the failure's reason, bounded at
+/// `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentA2aSendExecutor: Send + Sync {
     /// Performs the send and returns its bounded finding.
     fn execute<'a>(
@@ -675,6 +716,9 @@ pub enum AgentA2aHandoffFinding {
         code: String,
         /// Human-readable detail.
         message: String,
+        /// Which decision refused, when one party decided: the guardrail
+        /// stage and reason code of an egress or ingress block.
+        reason: Option<crate::failure::AgentFailureReason>,
     },
 }
 
@@ -705,6 +749,11 @@ pub enum AgentA2aHandoffFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentA2aHandoffSendExecutor: Send + Sync {
     /// Performs the send and returns its bounded finding.
     fn execute<'a>(
@@ -783,6 +832,11 @@ pub enum AgentWorkflowStartFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentWorkflowStartExecutor: Send + Sync {
     /// Performs the start and returns its bounded finding.
     fn execute<'a>(
@@ -847,6 +901,11 @@ pub enum AgentWorkflowCancelFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentWorkflowCancelExecutor: Send + Sync {
     /// Performs the cancel delivery and returns its bounded finding.
     fn execute<'a>(
@@ -904,6 +963,11 @@ pub enum AgentClaimAppendFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentClaimAppendExecutor: Send + Sync {
     /// Performs the append and returns its bounded finding.
     fn execute<'a>(
@@ -1345,14 +1409,16 @@ fn consolidation_record(
 /// minimum lease — which is why a credential-bearing model call without a
 /// timeout is refused at the authority.
 ///
-/// # The error text this returns becomes durable state
+/// # The error's code becomes durable state; its text does not
 ///
-/// A failing attempt's error text is persisted — bounded to
-/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
-/// outbox row and echoed onto the dispatcher fleet's index entry, where
-/// every worker in the fleet can read it. Bounding is not sanitizing:
-/// what the text *contains* is this implementation's contract, and it
-/// MUST carry no credential, argument, or content material
+/// A failing resolution burns the attempt under the pipeline's
+/// `credential-resolution-failed` and a detail the dispatcher authors itself.
+/// The error's text is never persisted and never logged. Its **code** is: it
+/// is written on the dispatcher's log line and, once the retry budget is
+/// spent, recorded beside the pipeline code as the failure's reason, bounded
+/// at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`. A code is a stable identifier
+/// — `vault-unreachable`, `lease-too-short` — and MUST carry no credential,
+/// argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
 pub trait AgentEffectCredentialResolver: Send + Sync {
     /// Resolves the binding into an ephemeral in-memory credential.
@@ -2729,20 +2795,23 @@ where
                         // Resolution failures may be transient: burn the
                         // attempt under the intent's policy.
                         //
-                        // What the attempt *persists* is Rakka-authored. A
-                        // resolver's own failure text is application-supplied
-                        // and may quote a secret store's response verbatim,
-                        // and `record_attempt_failure` writes what it is given
-                        // into the durable outbox row and the fleet index —
-                        // two records every worker in the fleet can read. The
-                        // substrate already draws this line for itself
-                        // (`AgentCredentialError::to_outbox_dispatch_result`
+                        // What the attempt *persists* is Rakka-authored, save
+                        // one identifier. A resolver's own failure text is
+                        // application-supplied and may quote a secret store's
+                        // response verbatim, and `record_attempt_failure` writes
+                        // what it is given into the durable outbox row and the
+                        // fleet index — two records every worker in the fleet
+                        // can read. The substrate already draws this line for
+                        // itself (`AgentCredentialError::to_outbox_dispatch_result`
                         // emits its code alone), and
                         // [specification 16](../../../docs/plans/rakka-agent/spec.md)
                         // requires that credentials never be logged or
                         // persisted. The resolver keeps its own detail; the
                         // operator gets the logical binding, which is what
-                        // they act on.
+                        // they act on. The one thing of the resolver's that is
+                        // persisted is its stable code: once the retry budget
+                        // is spent, it rides the `Exhausted` word as the
+                        // failure's reason. Its detail never does.
                         tracing::warn!(
                             effect_id = intent.effect_id.as_str(),
                             generation = intent.generation.get(),
@@ -2763,6 +2832,10 @@ where
                                 attempt,
                                 "credential-resolution-failed",
                                 &detail,
+                                // The resolver's own code, which the line
+                                // above already logs: a stable identifier,
+                                // never the resolver's words.
+                                crate::failure::AgentFailureReason::new(collaborator_code(&error)),
                                 pass,
                             )
                             .await;
@@ -2848,6 +2921,7 @@ where
                         attempt,
                         error.code(),
                         &error.to_string(),
+                        collaborator_reason(&error),
                         pass,
                     )
                     .await;
@@ -2974,10 +3048,10 @@ where
         if let WorkflowTelemetryEvent::OutboxDispatchExhausted { attempts, .. } = &event {
             let attempts = *attempts;
             self.fleet.record_claim_failure(&claim, &event).await?;
-            let outcome = AgentRunEffectOutcome::Exhausted {
-                code: "dispatcher-lost-after-started".to_string(),
-                message: "the retry budget was spent recovering ambiguous attempts".to_string(),
-            };
+            let outcome = AgentRunEffectOutcome::exhausted(
+                "dispatcher-lost-after-started".to_string(),
+                "the retry budget was spent recovering ambiguous attempts".to_string(),
+            );
             let status = outcome.resolved_status();
             self.deliver_outcome(scope, intent, attempts, claim.fencing_token, outcome, pass)
                 .await?;
@@ -3334,6 +3408,10 @@ where
 
     /// Records one failed attempt against the outbox's aligned retry budget,
     /// delivering the generation's `Exhausted` word when the budget is spent.
+    ///
+    /// `reason` is the collaborator's own code, when a collaborator failed the
+    /// attempt; it rides the `Exhausted` word to the run's record and is
+    /// written nowhere else.
     #[allow(clippy::too_many_arguments)]
     async fn record_attempt_failure(
         &mut self,
@@ -3343,6 +3421,7 @@ where
         attempt: u32,
         code: &str,
         message: &str,
+        reason: Option<crate::failure::AgentFailureReason>,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
@@ -3372,10 +3451,7 @@ where
                 intent,
                 attempt,
                 claim.fencing_token,
-                AgentRunEffectOutcome::Exhausted {
-                    code: code.to_string(),
-                    message: detail,
-                },
+                AgentRunEffectOutcome::exhausted(code.to_string(), detail).with_reason(reason),
                 pass,
             )
             .await?;
@@ -3456,10 +3532,11 @@ where
                     code = %refusal.code,
                     "guardrail refused the tool response; the effect fails"
                 );
-                Ok(AgentRunEffectOutcome::Failed {
-                    code: bounded_failure_code(&refusal.code),
-                    message: bounded_failure_detail(&refusal.message),
-                })
+                Ok(AgentRunEffectOutcome::failed(
+                    bounded_failure_code(&refusal.code),
+                    bounded_failure_detail(&refusal.message),
+                )
+                .with_reason(refusal.reason.clone()))
             }
         }
     }
@@ -3529,10 +3606,11 @@ where
                     code = %refusal.code,
                     "guardrail refused the model response; the effect fails"
                 );
-                Ok(AgentRunEffectOutcome::Failed {
-                    code: bounded_failure_code(&refusal.code),
-                    message: bounded_failure_detail(&refusal.message),
-                })
+                Ok(AgentRunEffectOutcome::failed(
+                    bounded_failure_code(&refusal.code),
+                    bounded_failure_detail(&refusal.message),
+                )
+                .with_reason(refusal.reason.clone()))
             }
         }
     }
@@ -3618,11 +3696,10 @@ where
                     // Fail closed, definitively: nothing was invoked, an absent
                     // executor will not appear mid-generation, and the run's
                     // wind-down settles truthfully on the failure.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "compensation-executor-missing".to_string(),
-                        message: "no compensation executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "compensation-executor-missing".to_string(),
+                        "no compensation executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 let content = executor
                     .execute(scope, intent, compensation, credential)
@@ -3641,11 +3718,11 @@ where
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "memory-promotion-executor-missing".to_string(),
-                        message: "no memory-promotion executor is configured for this dispatcher"
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "memory-promotion-executor-missing".to_string(),
+                        "no memory-promotion executor is configured for this dispatcher"
                             .to_string(),
-                    });
+                    ));
                 };
                 let now = AgentTimestampMillis::new(self.clock.now().as_millis());
                 match executor.execute(scope, intent, promotion, now).await? {
@@ -3653,7 +3730,7 @@ where
                         Ok(AgentRunEffectOutcome::MemoryPromotion { promoted })
                     }
                     AgentMemoryPromotionFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
             }
@@ -3666,11 +3743,10 @@ where
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "a2a-send-executor-missing".to_string(),
-                        message: "no A2A send executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "a2a-send-executor-missing".to_string(),
+                        "no A2A send executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 match executor
                     .execute(scope, intent, delegation, credential)
@@ -3688,10 +3764,14 @@ where
                             peer_status,
                         },
                     }),
-                    AgentA2aSendFinding::Conflict { code, message }
-                    | AgentA2aSendFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    AgentA2aSendFinding::Conflict { code, message } => {
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
+                    AgentA2aSendFinding::Refused {
+                        code,
+                        message,
+                        reason,
+                    } => Ok(AgentRunEffectOutcome::failed(code, message).with_reason(reason)),
                 }
             }
             AgentRunEffectRequest::A2aHandoff { handoff } => {
@@ -3699,11 +3779,10 @@ where
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "a2a-handoff-executor-missing".to_string(),
-                        message: "no A2A handoff executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "a2a-handoff-executor-missing".to_string(),
+                        "no A2A handoff executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 match executor.execute(scope, intent, handoff, credential).await? {
                     AgentA2aHandoffFinding::Recorded {
@@ -3716,10 +3795,14 @@ where
                             peer_status,
                         },
                     }),
-                    AgentA2aHandoffFinding::Conflict { code, message }
-                    | AgentA2aHandoffFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    AgentA2aHandoffFinding::Conflict { code, message } => {
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
+                    AgentA2aHandoffFinding::Refused {
+                        code,
+                        message,
+                        reason,
+                    } => Ok(AgentRunEffectOutcome::failed(code, message).with_reason(reason)),
                 }
             }
             AgentRunEffectRequest::WorkflowStart { invocation } => {
@@ -3727,11 +3810,10 @@ where
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "workflow-start-executor-missing".to_string(),
-                        message: "no workflow start executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "workflow-start-executor-missing".to_string(),
+                        "no workflow start executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 match executor
                     .execute(scope, intent, invocation, credential)
@@ -3755,14 +3837,14 @@ where
                     // here, so the run entity's `Conflicted` settlement never
                     // depends on an executor picking the right string.
                     AgentWorkflowStartFinding::Conflict { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed {
-                            code: crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                        Ok(AgentRunEffectOutcome::failed(
+                            crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
                                 .to_string(),
-                            message: format!("{code}: {message}"),
-                        })
+                            format!("{code}: {message}"),
+                        ))
                     }
                     AgentWorkflowStartFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
             }
@@ -3772,11 +3854,10 @@ where
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation. The parent's wind-down then
                     // waits for the child's natural terminal result.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "workflow-cancel-executor-missing".to_string(),
-                        message: "no workflow cancel executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "workflow-cancel-executor-missing".to_string(),
+                        "no workflow cancel executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 match executor
                     .execute(scope, intent, invocation, reason, credential)
@@ -3793,7 +3874,7 @@ where
                         })
                     }
                     AgentWorkflowCancelFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
             }
@@ -3802,11 +3883,10 @@ where
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "claim-append-executor-missing".to_string(),
-                        message: "no claim-append executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "claim-append-executor-missing".to_string(),
+                        "no claim-append executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 let now = AgentTimestampMillis::new(self.clock.now().as_millis());
                 match executor
@@ -3817,7 +3897,7 @@ where
                         Ok(AgentRunEffectOutcome::ClaimAppend { claim })
                     }
                     AgentClaimAppendFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
             }
@@ -3881,12 +3961,12 @@ where
                     // The commit marked the effect checkpoint-required, so an
                     // approved dispatch always carries its grant; an absent
                     // one is a definitive wiring failure, never a retry.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "evaluation-grant-missing".to_string(),
-                        message: "a human-review evaluation dispatched without its approval \
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "evaluation-grant-missing".to_string(),
+                        "a human-review evaluation dispatched without its approval \
                                   grant"
                             .to_string(),
-                    });
+                    ));
                 };
                 // The commit door reserved this slot, so the append always
                 // fits ([`AgentGoalEvaluationMethod::evidence_reserve`]).
@@ -3905,20 +3985,19 @@ where
                 }
             }
             AgentGoalEvaluationMethod::VerificationWorkflow { .. } => {
-                return Ok(AgentRunEffectOutcome::Failed {
-                    code: "evaluation-workflow-deferred".to_string(),
-                    message: "a verification-workflow evaluation cannot execute until the \
+                return Ok(AgentRunEffectOutcome::failed(
+                    "evaluation-workflow-deferred".to_string(),
+                    "a verification-workflow evaluation cannot execute until the \
                               evaluation cell is bridged to the workflow-tool invocation path"
                         .to_string(),
-                });
+                ));
             }
             _ => {
                 let Some(executor) = self.goal_evaluations.as_ref() else {
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "evaluation-executor-missing".to_string(),
-                        message: "no goal-evaluation executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "evaluation-executor-missing".to_string(),
+                        "no goal-evaluation executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 executor
                     .execute(scope, intent, evaluation, credential, now)
@@ -3944,7 +4023,7 @@ where
                 })
             }
             AgentGoalEvaluationFinding::Refused { code, message } => {
-                Ok(AgentRunEffectOutcome::Failed { code, message })
+                Ok(AgentRunEffectOutcome::failed(code, message))
             }
         }
     }
@@ -3969,10 +4048,11 @@ where
             // The refusal is authored by an application-implemented
             // [`AgentDispatchAuthority`], and this outcome is durable run
             // state.
-            AgentRunEffectOutcome::Failed {
-                code: bounded_failure_code(&refusal.code),
-                message: bounded_failure_detail(&refusal.message),
-            },
+            AgentRunEffectOutcome::failed(
+                bounded_failure_code(&refusal.code),
+                bounded_failure_detail(&refusal.message),
+            )
+            .with_reason(refusal.reason.clone()),
             pass,
         )
         .await?;

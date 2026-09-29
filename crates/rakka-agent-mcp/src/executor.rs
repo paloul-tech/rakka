@@ -53,7 +53,8 @@ use rakka_agent::{
     AgentToolResultBehavior,
 };
 use rakka_agent_workflow::{
-    AgentArtifactStore, AgentArtifactWriteRequest, AgentEphemeralCredential, ArtifactKind,
+    validate_artifact_ref, AgentArtifactStore, AgentArtifactWriteRequest, AgentEphemeralCredential,
+    ArtifactKind, RedactionStatus,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, MetaObject,
@@ -63,6 +64,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClient;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+use crate::artifacts::McpArtifacts;
 use crate::binding::{
     McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy, McpTransport,
     MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS,
@@ -80,11 +82,11 @@ use crate::sync::{McpDescriptorSet, McpSyncedDescriptor};
 /// executor is shared across concurrent attempts, and an `async` mutex because
 /// the write is awaited.
 ///
-/// The executor writes each result under a derived artifact id,
-/// `mcp-<effect id>-g<generation>-<call id>`, so a re-driven attempt of the
-/// same generation rewrites one artifact rather than adding a second — and an
-/// effect id itself contains `/`, so the store behind this handle must accept
-/// an artifact id with slashes in it.
+/// An executor converts this handle into an [`McpArtifacts`] with `into()`;
+/// a deployment whose store is `&self` implements
+/// [`McpArtifactSink`](crate::McpArtifactSink) instead and never builds one of
+/// these. The reference launcher reads launch specifications through this
+/// handle.
 pub type McpArtifactStore = Arc<tokio::sync::Mutex<dyn AgentArtifactStore + Send>>;
 
 /// Wraps one application-owned artifact store as an [`McpArtifactStore`].
@@ -146,7 +148,7 @@ struct StoredResult<'a> {
 pub struct McpDispatchToolExecutor<C> {
     servers: BTreeMap<McpServerId, McpBoundServer>,
     tools: BTreeMap<AgentToolId, McpToolRoute>,
-    artifacts: McpArtifactStore,
+    artifacts: McpArtifacts,
     http: C,
     egress: Arc<dyn McpEgressCheck>,
     launcher: Option<Arc<dyn McpChildProcessLauncher>>,
@@ -182,6 +184,9 @@ impl<C> McpDispatchToolExecutor<C> {
     /// documentation describes — no proxy, no redirects — for the check to
     /// govern where a request actually goes.
     ///
+    /// `artifacts` is where an over-large result is written: an
+    /// [`McpArtifacts`], or an [`McpArtifactStore`] converted into one.
+    ///
     /// A `ChildProcess` binding is refused here, as `mcp-transport-unsupported`:
     /// no child process runs without a launcher the deployment supplied, and
     /// this constructor takes none. [`Self::with_launcher`] is the one that
@@ -194,11 +199,11 @@ impl<C> McpDispatchToolExecutor<C> {
     pub fn new(
         descriptors: Vec<McpDescriptorSet>,
         bindings: Vec<McpServerBinding>,
-        artifacts: McpArtifactStore,
+        artifacts: impl Into<McpArtifacts>,
         http: C,
         egress: Arc<dyn McpEgressCheck>,
     ) -> Result<Self, McpRegistrationError> {
-        Self::build(descriptors, bindings, artifacts, http, egress, None)
+        Self::build(descriptors, bindings, artifacts.into(), http, egress, None)
     }
 
     /// Builds the executor exactly as [`Self::new`] does, with the
@@ -210,13 +215,16 @@ impl<C> McpDispatchToolExecutor<C> {
     /// launcher is taken together with the bindings so that no executor ever
     /// holds a child-process binding it cannot dispatch.
     ///
+    /// `artifacts` is where an over-large result is written: an
+    /// [`McpArtifacts`], or an [`McpArtifactStore`] converted into one.
+    ///
     /// # Errors
     ///
     /// [`McpRegistrationError`] with its stable code.
     pub fn with_launcher(
         descriptors: Vec<McpDescriptorSet>,
         bindings: Vec<McpServerBinding>,
-        artifacts: McpArtifactStore,
+        artifacts: impl Into<McpArtifacts>,
         http: C,
         egress: Arc<dyn McpEgressCheck>,
         launcher: Arc<dyn McpChildProcessLauncher>,
@@ -224,7 +232,7 @@ impl<C> McpDispatchToolExecutor<C> {
         Self::build(
             descriptors,
             bindings,
-            artifacts,
+            artifacts.into(),
             http,
             egress,
             Some(launcher),
@@ -236,7 +244,7 @@ impl<C> McpDispatchToolExecutor<C> {
     fn build(
         descriptors: Vec<McpDescriptorSet>,
         bindings: Vec<McpServerBinding>,
-        artifacts: McpArtifactStore,
+        artifacts: McpArtifacts,
         http: C,
         egress: Arc<dyn McpEgressCheck>,
         launcher: Option<Arc<dyn McpChildProcessLauncher>>,
@@ -407,7 +415,9 @@ where
         let session = within(deadline, self.open(scope, &server.binding, credential)).await??;
         let outcome = within(
             deadline,
-            self.call(&session, server, descriptor, policy, intent, call, &secrets),
+            self.call(
+                &session, scope, server, descriptor, policy, intent, call, &secrets,
+            ),
         )
         .await
         .and_then(std::convert::identity);
@@ -487,6 +497,7 @@ where
     async fn call(
         &self,
         session: &McpClientSession,
+        scope: &AgentRunScope,
         server: &McpBoundServer,
         descriptor: &McpSyncedDescriptor,
         policy: &McpToolPolicy,
@@ -517,7 +528,7 @@ where
                     &error,
                 ))
             })?;
-        self.content(policy, &call.tool, intent, call, answer, secrets)
+        self.content(scope, policy, &call.tool, intent, call, answer, secrets)
             .await
     }
 
@@ -577,8 +588,10 @@ where
 
     /// Maps one answered call onto bounded task content, scrubbed of
     /// `secrets`.
+    #[allow(clippy::too_many_arguments)]
     async fn content(
         &self,
+        scope: &AgentRunScope,
         policy: &McpToolPolicy,
         tool: &AgentToolId,
         intent: &AgentRunEffect,
@@ -605,7 +618,7 @@ where
                         error_detail(&result, secrets),
                     ));
                 }
-                self.bounded(policy, tool, intent, call, &result, secrets)
+                self.bounded(scope, policy, tool, intent, call, &result, secrets)
                     .await
             }
             // `CallToolResponse` is `#[non_exhaustive]`: a response kind rmcp
@@ -620,11 +633,21 @@ where
         }
     }
 
-    /// Inline when the result is small and wholly textual or structured; an
-    /// artifact when the binding says so; a refusal otherwise. Either way the
-    /// kept content is scrubbed of `secrets` before it is measured.
+    /// Inline when the result is wholly textual or structured and fits the
+    /// run's own bound; an artifact when the binding says so; a refusal
+    /// otherwise. Either way the kept content is scrubbed of `secrets` before
+    /// it is measured.
+    ///
+    /// The measure is the run's: [`AgentTaskContent::size_bytes`], the
+    /// content's own serialization with its `{"inline":…}` or
+    /// `{"artifact":…}` wrapper, against
+    /// [`MCP_INLINE_RESULT_MAX_BYTES`] — the same 2 KiB the run enforces on
+    /// what a dispatcher delivers. Measuring the bare value would admit a
+    /// result the run then refuses.
+    #[allow(clippy::too_many_arguments)]
     async fn bounded(
         &self,
+        scope: &AgentRunScope,
         policy: &McpToolPolicy,
         tool: &AgentToolId,
         intent: &AgentRunEffect,
@@ -634,11 +657,15 @@ where
     ) -> Result<AgentTaskContent, AgentDispatchError> {
         let (mut candidate, overflow) = candidate_of(result);
         redact_value(&mut candidate, secrets);
-        let encoded = serde_json::to_vec(&candidate).map_err(encoding_refused)?;
-        if !overflow && encoded.len() <= MCP_INLINE_RESULT_MAX_BYTES {
-            return AgentTaskContent::inline(candidate).map_err(|error| {
-                AgentDispatchError::collaborator("mcp-tool-error", error.to_string())
-            });
+        if !overflow {
+            // A value over the task's own inline bound is not inline content
+            // at all, and falls through to the binding's behavior with
+            // everything else that is too large.
+            if let Ok(content) = AgentTaskContent::inline(candidate) {
+                if content.size_bytes() <= MCP_INLINE_RESULT_MAX_BYTES {
+                    return Ok(content);
+                }
+            }
         }
         match policy.result_behavior {
             AgentToolResultBehavior::ArtifactReference => {
@@ -647,42 +674,66 @@ where
                     structured_content: &result.structured_content,
                 })
                 .map_err(encoding_refused)?;
-                let bytes = redact_json_text(&stored, secrets).into_bytes();
-                // The writer's checksum, not the store's: the default artifact
-                // policy refuses a reference without one, and a pass-through
-                // store only returns what it was given. SHA-256 over the exact
-                // bytes written, so a reader can tell a stored result from a
-                // substituted one.
+                let scrubbed = redact_json_text(&stored, secrets);
+                // Marked only when the scrub changed something: `Redacted`
+                // is a statement about these bytes, not about the path.
+                let redaction = if scrubbed == stored {
+                    RedactionStatus::ReferenceOnly
+                } else {
+                    RedactionStatus::Redacted
+                };
+                let bytes = scrubbed.into_bytes();
+                // The writer's checksum, not the store's: the default
+                // artifact policy refuses a reference without one, and a
+                // pass-through store only returns what it was given. SHA-256
+                // over the exact bytes written, so a reader can tell a stored
+                // result from a substituted one.
                 let checksum = format!(
                     "sha256:{}",
                     AgentContentDigest::sha256_of_bytes(&bytes).value
                 );
-                // `new`'s defaults, retention class `standard` among them, so
-                // the reference a pass-through store returns still passes
-                // `validate_artifact_ref`. The executor holds no clock; the
-                // effect's own commit time is durable and identical across a
-                // re-drive, which is what the derived artifact id needs it to
-                // be.
+                // `new`'s defaults, retention class `standard` among them.
+                // The executor holds no clock; the effect's own commit time
+                // is durable and identical across a re-drive.
                 let request = AgentArtifactWriteRequest::new(
-                    ArtifactKind::File,
+                    ArtifactKind::ToolOutput,
                     "application/json",
                     bytes,
                     intent.created_at,
                 )
                 .checksum(checksum)
-                // Derived, so a re-driven attempt of the same generation
-                // writes the same artifact rather than a second one.
+                .redaction(redaction)
+                // Requested, not required: derived, so a store that honors
+                // it rewrites one artifact when the generation is re-driven.
                 .artifact_id(format!(
                     "mcp-{}-g{}-{}",
                     intent.effect_id,
                     intent.generation.get(),
                     call.call_id
                 ));
-                let mut store = self.artifacts.lock().await;
-                let reference = store.put_artifact(request).await.map_err(|error| {
+                let refused = |error: rakka_agent_workflow::AgentArtifactError| {
                     AgentDispatchError::collaborator(error.code(), error.to_string())
-                })?;
-                Ok(AgentTaskContent::artifact(reference))
+                };
+                let reference = self
+                    .artifacts
+                    .put_result(scope, request)
+                    .await
+                    .map_err(refused)?;
+                // The store is the deployment's, and what it returns becomes
+                // the run's record: a reference the default policy refuses
+                // fails here, not on the read that would find it later.
+                validate_artifact_ref(&reference).map_err(refused)?;
+                let content = AgentTaskContent::artifact(reference);
+                if content.size_bytes() > MCP_INLINE_RESULT_MAX_BYTES {
+                    return Err(AgentDispatchError::collaborator(
+                        "mcp-result-too-large",
+                        format!(
+                            "{tool}: the artifact reference the store returned is over \
+                             {MCP_INLINE_RESULT_MAX_BYTES} bytes once encoded"
+                        ),
+                    ));
+                }
+                Ok(content)
             }
             // `InlineBounded`, and — since `AgentToolResultBehavior` is
             // `#[non_exhaustive]` — any behavior a later version adds that

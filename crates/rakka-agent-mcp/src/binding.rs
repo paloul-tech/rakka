@@ -39,7 +39,15 @@ pub const MCP_DESCRIPTOR_SCHEMA_MAX_BYTES: usize = 64 * 1024;
 /// end cannot confirm the published schema.
 pub const MCP_LIST_PAGES_MAX: usize = 64;
 
-/// Largest an inline-bounded tool result may be, in bytes.
+/// Largest a server's self-reported implementation name may be as a
+/// descriptor set stores it, in bytes. A longer name is cut at a character
+/// boundary: the name is the server's to choose, and the set is release data.
+pub const MCP_SERVER_NAME_MAX_BYTES: usize = 256;
+
+/// Largest a tool result's content may be and stay inline, in bytes: the
+/// content as the run measures it, its `{"inline":…}` wrapper included, and
+/// equal to `rakka_agent::AGENT_TOOL_RESULT_MAX_BYTES`. An artifact reference
+/// is held to the same bound.
 pub const MCP_INLINE_RESULT_MAX_BYTES: usize = 2 * 1024;
 
 /// Largest a mapped tool error's detail text may be, in bytes.
@@ -62,6 +70,17 @@ pub const MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS: u64 = 60_000;
 /// connection and never answers would otherwise hold a worker, and a live
 /// credential, forever.
 pub const MCP_ATTEMPT_TIMEOUT_DEFAULT_MS: u64 = 30_000;
+
+/// Default bound, in milliseconds, on one publish-time descriptor sync: the
+/// handshake and the listing together.
+///
+/// [`sync_mcp_descriptors`](crate::sync_mcp_descriptors) and
+/// [`sync_mcp_descriptors_over`](crate::sync_mcp_descriptors_over) apply it,
+/// so no sync is unbounded; their `_within` twins take the caller's own.
+/// Thirty seconds, like an attempt's default: rmcp's legacy fallback alone
+/// can spend ten of them waiting for a `server/discover` a pre-2026-07-28
+/// server never answers.
+pub const MCP_SYNC_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 
 /// The client name this adapter identifies itself with during MCP
 /// initialization.

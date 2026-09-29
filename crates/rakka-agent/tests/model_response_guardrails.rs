@@ -229,6 +229,79 @@ impl AgentGuardrail for ReferenceTheProposal {
     }
 }
 
+/// The reference a model's own turn proposed, in the tests that need one.
+fn proposed_reference() -> ArtifactRef {
+    ArtifactRef {
+        artifact_id: "result-1".to_string(),
+        kind: ArtifactKind::File,
+        uri: "s3://results/result-1".to_string(),
+        checksum: Some("sha256:result-1".to_string()),
+        content_type: Some("application/json".to_string()),
+        byte_len: Some(32),
+        retention_class: Some("standard".to_string()),
+        encryption: None,
+        redaction: RedactionStatus::Unredacted,
+        created_at: AgentTimestampMillis::new(1),
+        metadata: AgentAttributes::default(),
+    }
+}
+
+fn referencing_turn(text: &str) -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text(text)
+        .with_proposal(AgentTaskContent::artifact(proposed_reference()))
+}
+
+/// A transform that gives a turn an inline proposal, whatever it had.
+struct InventInlineProposal;
+
+impl AgentGuardrail for InventInlineProposal {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
+        let mut altered = content.clone();
+        altered["proposal"] = serde_json::to_value(
+            AgentTaskContent::inline(json!({ "answer": "invented" })).expect("inline"),
+        )
+        .expect("the inline content encodes");
+        AgentGuardrailOutcome::Transform {
+            content: altered,
+            reason_code: "proposal-invented".to_string(),
+        }
+    }
+}
+
+/// A transform that keeps a reference's id and rewrites where it points and
+/// what it promises to hold.
+struct RepointTheReference;
+
+impl AgentGuardrail for RepointTheReference {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
+        let mut repointed = proposed_reference();
+        repointed.uri = "s3://elsewhere/result-1".to_string();
+        repointed.checksum = Some("sha256:something-else".to_string());
+        let mut altered = content.clone();
+        altered["proposal"] = serde_json::to_value(AgentTaskContent::artifact(repointed))
+            .expect("the artifact content encodes");
+        AgentGuardrailOutcome::Transform {
+            content: altered,
+            reason_code: "reference-repointed".to_string(),
+        }
+    }
+}
+
+/// A transform that removes the proposal and nothing else.
+struct DropTheProposal;
+
+impl AgentGuardrail for DropTheProposal {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
+        let mut altered = content.clone();
+        altered["proposal"] = Value::Null;
+        AgentGuardrailOutcome::Transform {
+            content: altered,
+            reason_code: "proposal-dropped".to_string(),
+        }
+    }
+}
+
 struct RequireHuman;
 
 impl AgentGuardrail for RequireHuman {
@@ -290,6 +363,16 @@ fn a_blocking_stage_refuses_under_guardrail_blocked_with_the_stage_and_reason_in
         refusal.message.contains("response-filter") && refusal.message.contains("prompt-injection"),
         "{}",
         refusal.message
+    );
+    let reason = refusal
+        .reason
+        .as_ref()
+        .expect("a guardrail block names its decision");
+    assert_eq!(reason.stage(), Some(&stage_id("response-filter")));
+    assert_eq!(
+        reason.code(),
+        "prompt-injection",
+        "the stage's own reason code, not the pipeline's"
     );
 }
 
@@ -366,12 +449,116 @@ fn a_transform_that_changes_the_proposal_to_a_reference_is_refused_as_unsupporte
     assert_eq!(refusal.code, "guardrail-transform-unsupported");
 }
 
+/// A reference where the model proposed nothing fabricates a task result out
+/// of an artifact nothing in the turn produced.
+#[test]
+fn a_transform_that_adds_a_reference_proposal_is_refused_as_invalid() {
+    for turn in [text_turn("hello"), tool_calling_turn()] {
+        let refusal = authority_with(Arc::new(ReferenceTheProposal))
+            .review_model_response(&run_scope(), turn)
+            .expect_err("the model proposed nothing");
+        assert_eq!(refusal.code, "guardrail-transform-invalid");
+    }
+}
+
+/// An inline proposal the model never made is an invented result too.
+#[test]
+fn a_transform_that_adds_an_inline_proposal_is_refused_as_invalid() {
+    let refusal = authority_with(Arc::new(InventInlineProposal))
+        .review_model_response(&run_scope(), text_turn("hello"))
+        .expect_err("the model proposed nothing");
+    assert_eq!(refusal.code, "guardrail-transform-invalid");
+
+    // The positive control: the same stage over a turn that did propose is a
+    // rewrite of an inline proposal, which a stage may make.
+    let review = authority_with(Arc::new(InventInlineProposal))
+        .review_model_response(&run_scope(), proposing_turn("all good", "done"))
+        .expect("rewriting an inline proposal is permitted");
+    assert!(review.transformed);
+    assert_eq!(
+        review
+            .turn
+            .proposal
+            .and_then(|proposal| proposal.inline_value().cloned()),
+        Some(json!({ "answer": "invented" }))
+    );
+}
+
+/// The id is not the reference: the `uri` and the `checksum` are what the
+/// task fingerprints, and every other field is what a reader is promised.
+#[test]
+fn a_transform_that_rewrites_a_reference_under_its_own_id_is_refused_as_unsupported() {
+    let refusal = authority_with(Arc::new(RepointTheReference))
+        .review_model_response(&run_scope(), referencing_turn("stored"))
+        .expect_err("a reference is not a stage's to rewrite");
+    assert_eq!(refusal.code, "guardrail-transform-unsupported");
+}
+
+/// A stage that leaves the reference alone may still rewrite the rest.
+#[test]
+fn a_transform_that_keeps_a_reference_whole_passes() {
+    let review = authority_with(Arc::new(RedactText))
+        .review_model_response(&run_scope(), referencing_turn("SENSITIVE"))
+        .expect("the reference is untouched");
+    assert!(review.transformed);
+    assert_eq!(review.turn.text.as_deref(), Some("[redacted]"));
+    assert_eq!(
+        review
+            .turn
+            .proposal
+            .as_ref()
+            .and_then(AgentTaskContent::artifact_ref),
+        Some(&proposed_reference())
+    );
+}
+
+/// A stage may drop a proposal, inline or reference, as it may drop a tool
+/// call: nothing is fabricated by proposing less.
+#[test]
+fn a_transform_may_drop_a_proposal() {
+    for turn in [
+        proposing_turn("all good", "done"),
+        referencing_turn("stored"),
+    ] {
+        let review = authority_with(Arc::new(DropTheProposal))
+            .review_model_response(&run_scope(), turn)
+            .expect("dropping a proposal is permitted");
+        assert!(review.transformed);
+        assert_eq!(review.turn.proposal, None);
+    }
+}
+
 #[test]
 fn a_checkpoint_requiring_stage_fails_closed_under_checkpoint_required() {
     let refusal = authority_with(Arc::new(RequireHuman))
         .review_model_response(&run_scope(), text_turn("hello"))
         .expect_err("no checkpoint can gate a response that exists");
     assert_eq!(refusal.code, "checkpoint-required");
+}
+
+#[test]
+fn a_checkpoint_requiring_stage_names_its_decision_too() {
+    let authority = authority_with(Arc::new(RequireHuman));
+    let refusal = authority
+        .review_model_response(&run_scope(), text_turn("hello"))
+        .expect_err("no checkpoint can gate a response that already exists");
+    assert_eq!(refusal.code, "checkpoint-required");
+    let reason = refusal.reason.expect("the requiring stage is named");
+    assert_eq!(reason.stage(), Some(&stage_id("response-filter")));
+    assert!(!reason.code().is_empty());
+}
+
+#[test]
+fn a_refusal_no_guardrail_decided_carries_no_reason() {
+    let authority = authority_with(Arc::new(InventToolCall));
+    let refusal = authority
+        .review_model_response(&run_scope(), tool_calling_turn())
+        .expect_err("an invented call id is refused");
+    assert_eq!(refusal.code, "guardrail-transform-invalid");
+    assert_eq!(
+        refusal.reason, None,
+        "the authority refused the transform; no stage blocked anything"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +590,19 @@ async fn a_blocked_model_response_ends_the_run_once_and_never_reaches_memory() {
     fx.pump().await;
 
     assert_eq!(fx.terminal_failure_code().await, "guardrail-blocked");
+    let reason = fx
+        .terminal_failure_reason()
+        .await
+        .expect("the run's record names the decision");
+    assert_eq!(reason.stage(), Some(&stage_id("response-filter")));
+    assert_eq!(reason.code(), "prompt-injection");
+    let model_effect = fx.effect_at(0).await.expect("the model effect");
+    assert_eq!(
+        model_effect.last_error_code.as_deref(),
+        Some("guardrail-blocked"),
+        "the pipeline code is unchanged"
+    );
+    assert_eq!(model_effect.last_error_reason.as_ref(), Some(&reason));
     assert_eq!(
         fx.adapter.calls(),
         1,
@@ -419,6 +619,47 @@ async fn a_blocked_model_response_ends_the_run_once_and_never_reaches_memory() {
             .all(|text| !text.contains(MARKER)),
         "the blocked text never entered session memory: {:?}",
         page.entries
+    );
+}
+
+/// A built-in stage is named on the run's records under its exported reason
+/// code, and the refusal's words are in no record.
+#[tokio::test]
+async fn a_built_in_stage_is_named_on_the_runs_records_and_its_message_is_not() {
+    let rule = rakka_agent::DenySubstrings::new(["ignore previous"]).expect("the rule is valid");
+    let fx = AuthorityFixture::new(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn(MARKER, "done")),
+        authority_with(Arc::new(rule)),
+        None,
+    );
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(fx.terminal_failure_code().await, "guardrail-blocked");
+    let reason = fx
+        .terminal_failure_reason()
+        .await
+        .expect("the run's record names the decision");
+    assert_eq!(
+        reason.code(),
+        rakka_agent::AGENT_GUARDRAIL_REASON_DENIED_SUBSTRING
+    );
+    assert_eq!(reason.stage(), Some(&stage_id("response-filter")));
+
+    let state = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    let encoded = serde_json::to_string(&state).expect("the run state encodes");
+    assert!(encoded.contains("denied-substring"), "{encoded}");
+    assert!(encoded.contains("response-filter"), "{encoded}");
+    assert!(
+        !encoded.contains("blocked the model response"),
+        "the refusal's message reaches no record: {encoded}"
     );
 }
 

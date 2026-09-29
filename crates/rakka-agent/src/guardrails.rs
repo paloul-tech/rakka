@@ -89,6 +89,11 @@ pub const AGENT_GUARDRAIL_MAX_STAGES: usize = 32;
 /// would not itself become a policy decision.
 pub const AGENT_GUARDRAIL_REASON_MAX_LENGTH: usize = 128;
 
+/// The reason code the chain itself blocks under when a stage's transform
+/// grew the content past the boundary's bound. The one reason code a chain
+/// authors rather than a stage.
+pub const AGENT_GUARDRAIL_REASON_TRANSFORM_OVERSIZED: &str = "guardrail-transform-oversized";
+
 /// Largest content a guardrail transform may produce, in bytes, at a boundary
 /// that declares no tighter bound of its own.
 ///
@@ -802,7 +807,7 @@ impl AgentGuardrailChain {
                             chain_revision: self.revision,
                             disposition: AgentGuardrailDisposition::Blocked {
                                 stage: stage.id.clone(),
-                                reason_code: "guardrail-transform-oversized".to_string(),
+                                reason_code: AGENT_GUARDRAIL_REASON_TRANSFORM_OVERSIZED.to_string(),
                                 evidence: None,
                             },
                             content: current,

@@ -42,6 +42,8 @@ use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 use rakka_core::InMemoryMetricsRecorder;
 use rakka_persistence::InMemoryDurableStateStore;
 
+mod support;
+
 type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = InMemoryDurableStateStore<AgentRunState>;
@@ -132,6 +134,19 @@ impl Fixture {
     }
 
     fn with_authorizer(authorizer: Arc<dyn A2AAuthorizer>) -> Self {
+        Self::build(authorizer, None)
+    }
+
+    /// A fixture whose service evaluates `chain` at the `A2aIngress`
+    /// boundary.
+    fn with_ingress_chain(chain: rakka_agent::AgentGuardrailChain) -> Self {
+        Self::build(Arc::new(AllowAllAuthorizer), Some(chain))
+    }
+
+    fn build(
+        authorizer: Arc<dyn A2AAuthorizer>,
+        ingress: Option<rakka_agent::AgentGuardrailChain>,
+    ) -> Self {
         let tasks = TaskStore::new();
         let agents = AgentStore::new();
         let runs = RunStore::new();
@@ -163,26 +178,28 @@ impl Fixture {
             AgentId::new(AGENT).expect("agent id should be valid"),
             definition(AgentTaskOwnership::Agent),
         ));
-        let service = Arc::new(
-            Service::new(
-                tasks.clone(),
-                agents.clone(),
-                history.clone(),
-                runs,
-                TeamStore::default(),
-                InMemoryAgentTeamHistoryStore::new(),
-                ConversationStore::default(),
-                rakka_agent::InMemoryAgentConversationHistoryStore::new(),
-                router.clone(),
-                Arc::new(catalog),
-                Arc::new(InMemoryA2ATaskProjectionStore::local()),
-                Arc::new(A2AHeaderTenantResolver),
-                authorizer,
-            )
-            .with_clock(Arc::new(TestClock(clock.clone())))
-            .with_default_tenant(TENANT)
-            .with_metrics(metrics.clone()),
-        );
+        let mut service = Service::new(
+            tasks.clone(),
+            agents.clone(),
+            history.clone(),
+            runs,
+            TeamStore::default(),
+            InMemoryAgentTeamHistoryStore::new(),
+            ConversationStore::default(),
+            rakka_agent::InMemoryAgentConversationHistoryStore::new(),
+            router.clone(),
+            Arc::new(catalog),
+            Arc::new(InMemoryA2ATaskProjectionStore::local()),
+            Arc::new(A2AHeaderTenantResolver),
+            authorizer,
+        )
+        .with_clock(Arc::new(TestClock(clock.clone())))
+        .with_default_tenant(TENANT)
+        .with_metrics(metrics.clone());
+        if let Some(chain) = ingress {
+            service = service.with_ingress_guardrails(Arc::new(chain));
+        }
+        let service = Arc::new(service);
 
         Self {
             tasks,
@@ -1073,4 +1090,63 @@ async fn the_typed_client_carries_its_principal_on_reads_and_cancellation() {
         .await
         .expect("the cancellation authorizes under the configured identity");
     assert_eq!(cancelled.task.as_str(), HUMAN_TASK);
+}
+
+/// The typed-result leaf evaluates ingress too: a poisoned submission is
+/// refused before the task sees it, and the stage is shown the task with no
+/// agent, because a human's result names none.
+#[tokio::test]
+async fn an_ingress_chain_reviews_a_result_submission() {
+    let recording = Arc::new(support::Recording::default());
+    let fixture = Fixture::with_ingress_chain(support::chain_at(
+        rakka_agent::AgentGuardrailBoundary::A2aIngress,
+        vec![recording.clone(), Arc::new(support::BlockMarker)],
+    ));
+    fixture.create_human_task().await;
+    let before = fixture.snapshot().await;
+
+    let error = fixture
+        .service
+        .send_message(
+            &params(),
+            &send_request(submission_message(
+                "poisoned",
+                json!({ "answer": support::MARKER }),
+            )),
+        )
+        .await
+        .expect_err("the marker is blocked");
+    assert!(
+        matches!(
+            &error,
+            RakkaAgentA2AError::Refused { code, .. } if code == "guardrail-blocked"
+        ),
+        "got {error:?}"
+    );
+    assert_eq!(recording.seen(), 1);
+    assert_eq!(recording.subjects(), vec!["task"]);
+
+    let after = fixture.snapshot().await;
+    assert_eq!(after.status, before.status);
+    assert!(after.accepted_result.is_none());
+    assert_eq!(
+        fixture
+            .history_count(AgentTaskHistoryKind::ResultProposed)
+            .await,
+        0,
+        "nothing of the blocked submission was recorded"
+    );
+
+    let accepted = fixture
+        .service
+        .send_message(
+            &params(),
+            &send_request(submission_message("clean", json!({ "answer": "approved" }))),
+        )
+        .await;
+    assert!(
+        accepted.is_ok(),
+        "a clean submission still lands: {accepted:?}"
+    );
+    assert_eq!(recording.seen(), 2);
 }

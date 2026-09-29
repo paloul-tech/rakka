@@ -207,7 +207,7 @@ fn client_error(error: RakkaAgentA2AError) -> AgentClientError {
         RakkaAgentA2AError::Projection(TaskProjectionError::ReplayWindowExpired { .. }) => {
             AgentClientError::ReplayWindowExpired
         }
-        RakkaAgentA2AError::Refused { code, message } => {
+        RakkaAgentA2AError::Refused { code, message, .. } => {
             AgentClientError::Refused { code, message }
         }
         other => AgentClientError::Transport {

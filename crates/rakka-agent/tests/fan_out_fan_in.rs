@@ -714,10 +714,10 @@ async fn a_straggler_send_failing_after_the_resolution_does_not_wind_the_run_dow
     record_outcome(
         &fixture,
         &straggler,
-        AgentRunEffectOutcome::Failed {
-            code: "peer-unavailable".to_string(),
-            message: "the specialist surface refused the send".to_string(),
-        },
+        AgentRunEffectOutcome::failed(
+            "peer-unavailable".to_string(),
+            "the specialist surface refused the send".to_string(),
+        ),
     )
     .await;
     let mut run = fixture.run();

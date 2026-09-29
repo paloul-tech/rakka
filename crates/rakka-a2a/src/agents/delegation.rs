@@ -254,6 +254,7 @@ fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, A
         } => Ok(AgentA2aSendFinding::Refused {
             code: "collaboration-version-unsupported".to_string(),
             message: reason.to_string(),
+            reason: None,
         }),
         // The same ambiguity rule as the handoff executor's: a store failure
         // may have struck *after* the child's durable creation committed —
@@ -274,6 +275,7 @@ fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, A
                 Ok(AgentA2aSendFinding::Refused {
                     code: error.code().to_string(),
                     message: error.to_string(),
+                    reason: None,
                 })
             }
         }
@@ -282,9 +284,15 @@ fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, A
         // `code()` is the flat `refused`, which would erase which rule
         // refused — an ingress guardrail block, say, reaching an in-process
         // send as `guardrail-blocked`.
-        RakkaAgentA2AError::Refused { code, message } => {
-            Ok(AgentA2aSendFinding::Refused { code, message })
-        }
+        RakkaAgentA2AError::Refused {
+            code,
+            message,
+            reason,
+        } => Ok(AgentA2aSendFinding::Refused {
+            code,
+            message,
+            reason,
+        }),
         RakkaAgentA2AError::Entity(_)
         | RakkaAgentA2AError::Run(_)
         | RakkaAgentA2AError::Projection(_) => Err(AgentDispatchError::Invocation {
@@ -294,6 +302,7 @@ fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, A
         definitive => Ok(AgentA2aSendFinding::Refused {
             code: definitive.code().to_string(),
             message: definitive.to_string(),
+            reason: None,
         }),
     }
 }
@@ -334,6 +343,7 @@ where
                     return Ok(AgentA2aSendFinding::Refused {
                         code: "delegation-input-unsupported".to_string(),
                         message,
+                        reason: None,
                     });
                 }
             };
@@ -355,6 +365,7 @@ where
                         return Ok(AgentA2aSendFinding::Refused {
                             code: refusal.code,
                             message: refusal.message,
+                            reason: refusal.reason,
                         });
                     }
                 }

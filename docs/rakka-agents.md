@@ -141,7 +141,11 @@ leaves behind is the same either way.
    through the MCP executor over an injected transport client — built with no
    proxy and no redirects, so the request reaches the URL the check judged —
    behind a required egress check; MCP is never an agent-to-agent channel, and
-   a server that identifies itself as one is refused.
+   a server that identifies itself as one is refused. A result too large to
+   stay inline is written through an artifact sink the deployment implements
+   (`McpArtifactSink`), handed the run it belongs to. A sync refuses a listing
+   whose server text echoes the credential it sent, and runs under a time
+   bound (`MCP_SYNC_TIMEOUT_DEFAULT_MS`, or the caller's own).
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect
@@ -269,8 +273,10 @@ incorrectly.
   deployment attests that the chain its retrieval bundle and its A2A surface
   evaluate is the chain its dispatch authority declares
   (`with_memory_ingress`, `with_a2a_guardrails`). A blocked model response
-  fails the effect once under `guardrail-blocked`; a transformed one is what
-  the run records. Four dependency-free stages ship in `guardrails::builtin`.
+  fails the effect once under `guardrail-blocked`; the run's record names the
+  stage and the reason code that decided beside that code; a transformed one
+  is what the run records. Four dependency-free stages ship in
+  `guardrails::builtin`.
 
 ## The A2A surface
 

@@ -1126,13 +1126,18 @@ pub struct AgentGrantedDispatch {
 /// requires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentAuthorityRefusal {
-    /// Stable machine-readable reason code.
+    /// Stable machine-readable reason code: the pipeline's.
     pub code: String,
     /// Human-readable detail.
     pub message: String,
     /// Whether the refusing condition may clear without a new definition,
     /// setup, or reconfiguration.
     pub retryable: bool,
+    /// Which decision refused, when one party decided: a guardrail's stage
+    /// and reason code. It reaches the failed effect's outcome and the run's
+    /// records beside `code`; the message does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<crate::failure::AgentFailureReason>,
 }
 
 impl AgentAuthorityRefusal {
@@ -1143,6 +1148,7 @@ impl AgentAuthorityRefusal {
             code: code.into(),
             message: message.into(),
             retryable: false,
+            reason: None,
         }
     }
 
@@ -1153,7 +1159,15 @@ impl AgentAuthorityRefusal {
             code: code.into(),
             message: message.into(),
             retryable: true,
+            reason: None,
         }
+    }
+
+    /// Names the decision that refused.
+    #[must_use]
+    pub fn with_reason(mut self, reason: Option<crate::failure::AgentFailureReason>) -> Self {
+        self.reason = reason;
+        self
     }
 }
 
@@ -1375,11 +1389,13 @@ impl AgentToolAuthority {
     /// a call id the model did not produce, or when it carries two tool calls
     /// under one call id; a stage
     /// may rewrite text, drop, reorder, or rewrite the model's own tool calls,
-    /// and rewrite an inline proposal. A transform that changes the
-    /// proposal's form — inline to artifact reference, reference to inline,
-    /// or a reference naming a different artifact — is refused
-    /// (`guardrail-transform-unsupported`), the `ToolResponse` precedent that
-    /// a reference cannot be rewritten. `RequireCheckpoint` fails closed
+    /// and rewrite an inline proposal. A stage may drop the proposal. A
+    /// transform that adds a proposal to a turn that made none is refused
+    /// (`guardrail-transform-invalid`), and one that changes the proposal's
+    /// form — inline to artifact reference, reference to inline — or any
+    /// field of a reference is refused (`guardrail-transform-unsupported`),
+    /// the `ToolResponse` precedent that a reference cannot be rewritten: a
+    /// reference survives a transform only whole. `RequireCheckpoint` fails closed
     /// (`checkpoint-required`): no checkpoint can gate a response that
     /// already exists.
     ///
@@ -1472,27 +1488,38 @@ impl AgentToolAuthority {
                     "a guardrail transform may not carry two tool calls under one call id",
                 ));
             }
-            // The proposal's *form* is not a stage's to change, for the
-            // reason a reference-held tool result cannot be rewritten
-            // ([`Self::review_tool_response`]): a reference names an
-            // immutable artifact the run never loads here, so turning an
-            // inline proposal into one fabricates an artifact, turning a
-            // reference into inline invents the bytes it stood for, and
-            // swapping in another artifact id proposes content nothing in
-            // this turn produced. Rewriting an inline proposal stays
-            // permitted.
-            if let (Some(original), Some(proposal)) = (&review.turn.proposal, &transformed.proposal)
-            {
-                let original_artifact = original.artifact_ref().map(|it| it.artifact_id.as_str());
-                let proposed_artifact = proposal.artifact_ref().map(|it| it.artifact_id.as_str());
-                if original_artifact != proposed_artifact {
+            // The proposal is the model's, and a stage may only make it say
+            // less. It may rewrite an inline proposal or drop any proposal.
+            // It may not add one where the model proposed nothing — that is
+            // an invented task result, the twin of an invented tool call. And
+            // a reference is not a stage's to write at all, for the reason a
+            // reference-held tool result cannot be rewritten
+            // ([`Self::review_tool_response`]): it names an immutable
+            // artifact the run never loads here, so turning an inline
+            // proposal into one fabricates an artifact, turning one into
+            // inline invents the bytes it stood for, and changing any field
+            // of one — its `uri` and `checksum` are what the task
+            // fingerprints — proposes content nothing in this turn produced.
+            // A reference survives a transform only whole.
+            match (&review.turn.proposal, &transformed.proposal) {
+                (None, Some(_)) => {
+                    return Err(AgentAuthorityRefusal::of(
+                        "guardrail-transform-invalid",
+                        "a guardrail transform may rewrite or drop the proposal the model made; \
+                         it may not add one to a turn that proposed nothing",
+                    ));
+                }
+                (Some(original), Some(proposal))
+                    if original.artifact_ref() != proposal.artifact_ref() =>
+                {
                     return Err(AgentAuthorityRefusal::of(
                         "guardrail-transform-unsupported",
                         "a guardrail transform may rewrite an inline proposal; it may not change \
-                         the proposal's form between inline and an artifact reference, nor name a \
-                         different artifact",
+                         the proposal's form between inline and an artifact reference, nor \
+                         change any field of a reference",
                     ));
                 }
+                _ => {}
             }
             review.turn = transformed;
             review.transformed = true;
@@ -3253,6 +3280,10 @@ impl Debug for AgentToolAuthority {
 /// disposition onto a refusal identically to every boundary this crate
 /// evaluates itself, rather than reimplementing the mapping.
 ///
+/// The refusal names the deciding stage and its reason code in `reason`, so
+/// the identity survives to the failed effect's record; the message keeps
+/// them too, and the block's evidence reference stays in the message only.
+///
 /// # Errors
 ///
 /// The refusal the disposition maps to: `guardrail-blocked` for a block,
@@ -3276,7 +3307,11 @@ pub fn refuse_guardrail_disposition(
             Err(AgentAuthorityRefusal::of(
                 "guardrail-blocked",
                 format!("guardrail stage {stage} blocked {what}: {reason_code}{evidence}"),
-            ))
+            )
+            .with_reason(Some(crate::failure::AgentFailureReason::guardrail(
+                stage.clone(),
+                reason_code,
+            ))))
         }
         AgentGuardrailDisposition::CheckpointRequired { stage, reason_code } => {
             if checkpoint_satisfied {
@@ -3288,7 +3323,11 @@ pub fn refuse_guardrail_disposition(
                     "guardrail stage {stage} requires a checkpoint grant, and none binds this \
                      intent: {reason_code}"
                 ),
-            ))
+            )
+            .with_reason(Some(crate::failure::AgentFailureReason::guardrail(
+                stage.clone(),
+                reason_code,
+            ))))
         }
     }
 }
@@ -5104,6 +5143,54 @@ mod tests {
         assert!(
             narrowed_grant.tools.is_empty(),
             "the run's setup narrows the model-visible list, not just dispatch"
+        );
+    }
+
+    #[test]
+    fn a_disposition_maps_its_stage_and_reason_onto_the_refusal() {
+        let stage = AgentGuardrailStageId::new("pii-filter").expect("id");
+        let blocked = AgentGuardrailDisposition::Blocked {
+            stage: stage.clone(),
+            reason_code: "denied-substring".to_string(),
+            evidence: None,
+        };
+        let refusal =
+            refuse_guardrail_disposition(&blocked, "the call", false).expect_err("a block refuses");
+        assert_eq!(refusal.code, "guardrail-blocked");
+        let reason = refusal.reason.expect("named");
+        assert_eq!(reason.stage(), Some(&stage));
+        assert_eq!(reason.code(), "denied-substring");
+
+        let gated = AgentGuardrailDisposition::CheckpointRequired {
+            stage: stage.clone(),
+            reason_code: "needs-approval".to_string(),
+        };
+        let refusal = refuse_guardrail_disposition(&gated, "the call", false)
+            .expect_err("no grant binds the intent");
+        assert_eq!(refusal.code, "checkpoint-required");
+        assert_eq!(
+            refusal.reason.as_ref().map(|reason| reason.code()),
+            Some("needs-approval")
+        );
+        assert!(refuse_guardrail_disposition(&gated, "the call", true).is_ok());
+        assert!(refuse_guardrail_disposition(
+            &AgentGuardrailDisposition::Allowed,
+            "the call",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_refusal_without_a_reason_serializes_as_it_always_did() {
+        let refusal = AgentAuthorityRefusal::of("tool-undeclared", "no such tool");
+        assert_eq!(
+            serde_json::to_value(&refusal).expect("encodes"),
+            serde_json::json!({
+                "code": "tool-undeclared",
+                "message": "no such tool",
+                "retryable": false
+            })
         );
     }
 }

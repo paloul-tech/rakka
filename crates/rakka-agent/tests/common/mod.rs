@@ -2176,6 +2176,7 @@ impl ApplyingHandoffExecutor {
             return rakka_agent::AgentA2aHandoffFinding::Refused {
                 code: error.code().to_string(),
                 message: error.to_string(),
+                reason: None,
             };
         }
         // The owed exchanges deliberately stay journaled: the executor
@@ -2211,6 +2212,7 @@ impl ApplyingHandoffExecutor {
             Ok(other) => rakka_agent::AgentA2aHandoffFinding::Refused {
                 code: "unexpected-reply".to_string(),
                 message: format!("unexpected entity reply {other:?}"),
+                reason: None,
             },
             // The probe posture: an error after the durable commit still
             // echoes the recorded transfer; only an unrecorded transfer is a
@@ -2222,6 +2224,7 @@ impl ApplyingHandoffExecutor {
             Err(error) => rakka_agent::AgentA2aHandoffFinding::Refused {
                 code: error.code().to_string(),
                 message: error.to_string(),
+                reason: None,
             },
         }
     }
@@ -2326,6 +2329,7 @@ impl AgentA2aSendExecutor for SkillNamedExecutor {
                 return Ok(AgentA2aSendFinding::Refused {
                     code: "peer-unavailable".to_string(),
                     message: "the specialist surface refused the send".to_string(),
+                    reason: None,
                 });
             }
             Ok(AgentA2aSendFinding::Sent {
@@ -2667,6 +2671,9 @@ pub struct AuthorityFixture {
     /// other than the recording one — see
     /// [`AuthorityFixture::with_tool_executor`].
     pub tool_executor: Option<Arc<dyn AgentDispatchToolExecutor>>,
+    /// The executor the pipeline hands delegation sends to, when a test wires
+    /// one — see [`AuthorityFixture::with_a2a_send_executor`].
+    pub a2a_send_executor: Option<Arc<dyn AgentA2aSendExecutor>>,
     pub probe: KillSwitchProbe,
     pub credentials: Option<Arc<ScriptedCredentialResolver>>,
     /// The adapter the pipeline asks, when a test wants it to be something
@@ -2723,6 +2730,7 @@ impl AuthorityFixture {
             wf_clock,
             tools: RecordingToolExecutor::new(),
             tool_executor: None,
+            a2a_send_executor: None,
             probe: KillSwitchProbe::new(),
             credentials: None,
             model_adapter: None,
@@ -2755,6 +2763,14 @@ impl AuthorityFixture {
     /// every worker this fixture builds, [`Self::worker`] included.
     pub fn with_tool_executor(mut self, executor: Arc<dyn AgentDispatchToolExecutor>) -> Self {
         self.tool_executor = Some(executor);
+        self
+    }
+
+    /// Puts an A2A send executor in the pipeline's delegation-send slot, for
+    /// the proofs whose subject is what the *production* dispatcher does with
+    /// a send's finding. It is wired into every worker this fixture builds.
+    pub fn with_a2a_send_executor(mut self, executor: Arc<dyn AgentA2aSendExecutor>) -> Self {
+        self.a2a_send_executor = Some(executor);
         self
     }
 
@@ -2893,6 +2909,13 @@ impl AuthorityFixture {
         self
     }
 
+    /// Wires the run entity to serve delegation, so the loop intercepts the
+    /// coordination tool and the dispatch gate sees real `A2aSend` intents.
+    pub fn with_delegation(mut self, config: rakka_agent::AgentRunDelegationConfig) -> Self {
+        self.fx = self.fx.with_delegation(config);
+        self
+    }
+
     pub async fn start(&self) {
         self.fx
             .instantiate_agent_with_envelope(self.envelope.clone())
@@ -2946,6 +2969,9 @@ impl AuthorityFixture {
         if let Some(config) = &self.fx.workflow_tools {
             delivery = delivery.with_workflow_tools(config.clone());
         }
+        if let Some(config) = &self.fx.delegation {
+            delivery = delivery.with_delegation(config.clone());
+        }
         if let Some(memory) = &self.fx.memory {
             delivery = delivery.with_memory(memory.clone());
         }
@@ -2988,6 +3014,9 @@ impl AuthorityFixture {
         .with_probe(Arc::new(self.probe.clone()));
         if let Some(credentials) = &self.credentials {
             pipeline = pipeline.with_credential_resolver(credentials.clone());
+        }
+        if let Some(executor) = &self.a2a_send_executor {
+            pipeline = pipeline.with_a2a_send_executor(executor.clone());
         }
         if let Some(segments) = &self.dispatch_segments {
             pipeline = pipeline.with_segments(segments.clone());
@@ -3243,6 +3272,16 @@ impl AuthorityFixture {
         );
         match run.terminal_reason {
             Some(AgentRunTerminalReason::EffectFailed { code, .. }) => code,
+            other => panic!("expected an effect failure, found {other:?}"),
+        }
+    }
+
+    /// Which decision failed the effect that stopped the run, when the
+    /// record names one.
+    pub async fn terminal_failure_reason(&self) -> Option<rakka_agent::AgentFailureReason> {
+        let run = self.fx.run_snapshot().await.expect("the run exists");
+        match run.terminal_reason {
+            Some(AgentRunTerminalReason::EffectFailed { reason, .. }) => reason,
             other => panic!("expected an effect failure, found {other:?}"),
         }
     }

@@ -747,6 +747,11 @@ async fn a_missing_mandatory_guardrail_stage_fails_closed_at_dispatch() {
     assert_eq!(fx.terminal_failure_code().await, "guardrail-stage-missing");
     assert_eq!(fx.adapter.calls(), 0, "the model boundary is guarded too");
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    assert_eq!(
+        fx.terminal_failure_reason().await,
+        None,
+        "the authority refused; no stage blocked, so no reason is invented"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -942,6 +947,13 @@ async fn a_blocked_tool_response_never_reaches_the_run() {
         .expect("the tool effect");
     assert_eq!(effect.status, AgentRunEffectStatus::Failed);
     assert_eq!(effect.last_error_code.as_deref(), Some("guardrail-blocked"));
+    let reason = effect
+        .last_error_reason
+        .as_ref()
+        .expect("the effect's record names the decision");
+    assert_eq!(reason.stage(), Some(&stage_id("response-filter")));
+    assert_eq!(reason.code(), "prompt-injection");
+    assert_eq!(fx.terminal_failure_reason().await.as_ref(), Some(reason));
 
     let page = session
         .read(&run_scope(), rakka_agent::SessionMemoryCursor::start())
@@ -1116,6 +1128,14 @@ async fn a_guardrail_block_keeps_a_tool_call_undispatchable() {
 
     assert_eq!(fx.terminal_failure_code().await, "guardrail-blocked");
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    let reason = fx
+        .terminal_failure_reason()
+        .await
+        .expect("a refused dispatch names the decision too");
+    assert_eq!(reason.stage(), Some(&stage_id("amount-limit")));
+    assert_eq!(reason.code(), "amount-over-limit");
+    let tool_effect = fx.effect_at(1).await.expect("the tool effect");
+    assert_eq!(tool_effect.last_error_reason.as_ref(), Some(&reason));
 
     // The deployment-mandatory stage cannot be narrowed away by any
     // definition or setup: the removal operation itself refuses.

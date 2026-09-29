@@ -53,6 +53,8 @@ use rakka_agent::{
 use rakka_agent_workflow::{AgentEffectId, AgentTimestampMillis};
 use rakka_persistence::InMemoryDurableStateStore;
 
+mod support;
+
 type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = CrashingStateStore<AgentRunState>;
@@ -172,6 +174,25 @@ impl Fixture {
         adapter: DeterministicModelAdapter,
         authorizer: Arc<dyn A2AAuthorizer>,
     ) -> Self {
+        Self::build(adapter, authorizer, None, None)
+    }
+
+    /// A fixture whose service evaluates `ingress` at the `A2aIngress`
+    /// boundary and whose handoff executor evaluates `egress` at `A2aEgress`.
+    fn with_chains(
+        adapter: DeterministicModelAdapter,
+        ingress: Option<rakka_agent::AgentGuardrailChain>,
+        egress: Option<rakka_agent::AgentGuardrailChain>,
+    ) -> Self {
+        Self::build(adapter, Arc::new(AllowAllAuthorizer), ingress, egress)
+    }
+
+    fn build(
+        adapter: DeterministicModelAdapter,
+        authorizer: Arc<dyn A2AAuthorizer>,
+        ingress: Option<rakka_agent::AgentGuardrailChain>,
+        egress: Option<rakka_agent::AgentGuardrailChain>,
+    ) -> Self {
         let tasks = TaskStore::new();
         let agents = AgentStore::new();
         let runs = RunStore::new();
@@ -201,25 +222,27 @@ impl Fixture {
         let catalog = A2AStaticAgentCatalog::new()
             .with_target(A2AAgentTarget::new(source(), definition()))
             .with_target(A2AAgentTarget::new(target(), definition()));
-        let service = Arc::new(
-            Service::new(
-                tasks.clone(),
-                agents.clone(),
-                history.clone(),
-                runs.clone(),
-                TeamStore::default(),
-                InMemoryAgentTeamHistoryStore::new(),
-                ConversationStore::default(),
-                rakka_agent::InMemoryAgentConversationHistoryStore::new(),
-                router.clone(),
-                Arc::new(catalog),
-                Arc::new(InMemoryA2ATaskProjectionStore::local()),
-                Arc::new(A2AHeaderTenantResolver),
-                authorizer,
-            )
-            .with_clock(Arc::new(TestClock(clock.clone())))
-            .with_default_tenant(TENANT),
-        );
+        let mut service = Service::new(
+            tasks.clone(),
+            agents.clone(),
+            history.clone(),
+            runs.clone(),
+            TeamStore::default(),
+            InMemoryAgentTeamHistoryStore::new(),
+            ConversationStore::default(),
+            rakka_agent::InMemoryAgentConversationHistoryStore::new(),
+            router.clone(),
+            Arc::new(catalog),
+            Arc::new(InMemoryA2ATaskProjectionStore::local()),
+            Arc::new(A2AHeaderTenantResolver),
+            authorizer,
+        )
+        .with_clock(Arc::new(TestClock(clock.clone())))
+        .with_default_tenant(TENANT);
+        if let Some(chain) = ingress {
+            service = service.with_ingress_guardrails(Arc::new(chain));
+        }
+        let service = Arc::new(service);
 
         // The outbound half: the model requests a transfer skill; the
         // application-owned catalog resolves the target — which must serve
@@ -250,8 +273,12 @@ impl Fixture {
         .expect("the handoff configuration declares the capability");
         run_transport.install_delegation(handoff.clone());
 
-        let dispatcher = ScriptedDispatcher::with_adapter(adapter)
-            .with_a2a_handoff_executor(Arc::new(A2AAgentHandoffSendExecutor::new(service.clone())));
+        let mut executor = A2AAgentHandoffSendExecutor::new(service.clone());
+        if let Some(chain) = egress {
+            executor = executor.with_egress_guardrails(Arc::new(chain));
+        }
+        let dispatcher =
+            ScriptedDispatcher::with_adapter(adapter).with_a2a_handoff_executor(Arc::new(executor));
 
         Self {
             tasks,
@@ -1142,4 +1169,145 @@ async fn a_superseded_replay_still_answers_recorded() {
         ),
         "a superseded hop still answers recorded, got {replay:?}"
     );
+}
+
+/// Drives the source's turn, which commits the transfer and sends it through
+/// the service, and answers the task's recorded handoff reason, when the
+/// transfer recorded one.
+async fn handed_off_reason(fixture: &Fixture) -> Option<String> {
+    fixture.instantiate(&source()).await;
+    fixture.instantiate(&target()).await;
+    fixture.create_task().await;
+    fixture
+        .service
+        .get_task(&params(), Some(TENANT), TASK, None, None)
+        .await
+        .expect("the projection bootstraps");
+    fixture.pump(&source(), 1).await;
+    fixture.pump(&source(), 1).await;
+
+    let mut task = AgentTaskEntityStore::new(
+        fixture.task_scope(),
+        fixture.tasks.clone(),
+        fixture.agents.clone(),
+        fixture.history.clone(),
+    );
+    task.recover(fixture.now())
+        .await
+        .expect("the task recovers");
+    task.snapshot()
+        .expect("the snapshot reads")
+        .expect("the task exists")
+        .handoff
+        .as_deref()
+        .map(|provenance| provenance.reason.clone())
+}
+
+fn both_turns() -> DeterministicModelAdapter {
+    DeterministicModelAdapter::new()
+        .with_turn(handoff_turn())
+        .with_turn(proposing_turn())
+}
+
+fn chain(
+    boundary: rakka_agent::AgentGuardrailBoundary,
+    rule: Arc<dyn rakka_agent::AgentGuardrail>,
+) -> rakka_agent::AgentGuardrailChain {
+    support::chain_at(boundary, vec![rule])
+}
+
+/// The egress text arm: what the executor's stage rewrote is what the task
+/// records.
+#[tokio::test]
+async fn an_egress_transform_of_the_handoff_reason_is_what_the_task_records() {
+    let fixture = Fixture::with_chains(
+        both_turns(),
+        None,
+        Some(chain(
+            rakka_agent::AgentGuardrailBoundary::A2aEgress,
+            Arc::new(support::RedactClusterText),
+        )),
+    );
+    assert_eq!(
+        handed_off_reason(&fixture).await.as_deref(),
+        Some(support::REDACTED)
+    );
+}
+
+/// The ingress text arm: what the service's stage rewrote is what the task
+/// records, and the stage was shown the transfer's target.
+#[tokio::test]
+async fn an_ingress_transform_of_the_handoff_reason_is_what_the_task_records() {
+    let recording = Arc::new(support::Recording::default());
+    let fixture = Fixture::with_chains(
+        both_turns(),
+        Some(support::chain_at(
+            rakka_agent::AgentGuardrailBoundary::A2aIngress,
+            vec![recording.clone(), Arc::new(support::RedactClusterText)],
+        )),
+        None,
+    );
+    assert_eq!(
+        handed_off_reason(&fixture).await.as_deref(),
+        Some(support::REDACTED)
+    );
+    assert!(
+        recording.subjects().contains(&"task-for-agent"),
+        "the handoff leaf names the task and the agent it transfers to: {:?}",
+        recording.subjects()
+    );
+    assert_eq!(
+        recording
+            .last_view()
+            .pointer("/collaboration/reason")
+            .and_then(Value::as_str),
+        Some("needs billing authority"),
+        "the first stage saw the reason the model gave"
+    );
+}
+
+/// A handoff's reason is required at both boundaries: a stage that clears it
+/// refuses the transfer, and no transfer is recorded under the original.
+#[tokio::test]
+async fn a_cleared_handoff_reason_refuses_the_transfer_at_either_boundary() {
+    for boundary in [
+        rakka_agent::AgentGuardrailBoundary::A2aEgress,
+        rakka_agent::AgentGuardrailBoundary::A2aIngress,
+    ] {
+        let cleared = Some(chain(boundary, Arc::new(support::ClearClusterText)));
+        let fixture = if boundary == rakka_agent::AgentGuardrailBoundary::A2aEgress {
+            Fixture::with_chains(both_turns(), None, cleared)
+        } else {
+            Fixture::with_chains(both_turns(), cleared, None)
+        };
+        assert_eq!(
+            handed_off_reason(&fixture).await,
+            None,
+            "no transfer was recorded at {boundary:?}"
+        );
+
+        let mut run = run_entity(
+            &fixture.run_scope(&source(), 1),
+            &fixture.runs,
+            &fixture.effects,
+        );
+        run.recover(fixture.now())
+            .await
+            .expect("the source recovers");
+        let state = run.state().expect("state");
+        let cell = state
+            .loop_state()
+            .expect("the loop exists")
+            .handoff()
+            .expect("the cell survives");
+        assert!(
+            matches!(
+                &cell.status,
+                rakka_agent::AgentHandoffStatus::Failed { code, .. }
+                    if code == "guardrail-transform-invalid"
+            ),
+            "at {boundary:?} the cell settles under the stage's own refusal, got {:?}",
+            cell.status
+        );
+    }
 }

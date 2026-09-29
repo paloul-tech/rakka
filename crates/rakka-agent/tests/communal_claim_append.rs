@@ -474,10 +474,10 @@ async fn a_failed_claim_append_does_not_wind_the_run_down() {
     assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
     let exhausted = resolve_claim_append(
         &fx,
-        AgentRunEffectOutcome::Exhausted {
-            code: "claim-store-unavailable".to_string(),
-            message: "every attempt failed".to_string(),
-        },
+        AgentRunEffectOutcome::exhausted(
+            "claim-store-unavailable".to_string(),
+            "every attempt failed".to_string(),
+        ),
     )
     .await;
     assert_eq!(exhausted.status, AgentRunEffectStatus::Exhausted);
@@ -803,10 +803,10 @@ async fn an_exhausted_post_terminal_claim_append_leaves_the_terminal_record_unto
     assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
     let exhausted = resolve_claim_append(
         &fx,
-        AgentRunEffectOutcome::Exhausted {
-            code: "claim-store-unavailable".to_string(),
-            message: "every attempt failed".to_string(),
-        },
+        AgentRunEffectOutcome::exhausted(
+            "claim-store-unavailable".to_string(),
+            "every attempt failed".to_string(),
+        ),
     )
     .await;
     assert_eq!(exhausted.status, AgentRunEffectStatus::Exhausted);

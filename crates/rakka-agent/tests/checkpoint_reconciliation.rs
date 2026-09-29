@@ -447,6 +447,157 @@ async fn an_escalate_decision_keeps_the_wait_nonterminal_until_a_resolving_decis
     assert_eq!(run.status, AgentRunStatus::Completed);
 }
 
+/// An escalation is not a resolution, so it leaves no resolve segment; the
+/// decision that does resolve leaves exactly one.
+#[tokio::test]
+async fn an_escalation_closes_no_resolve_segment_and_the_resolution_closes_one() {
+    use rakka_agent::{AgentSegmentOperation, InMemoryAgentSegmentSink};
+
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fx = fixture().with_segments(sink.clone());
+    let (_effect_id, _generation, checkpoint_id) = park_indeterminate(&fx).await;
+    let resolves = |sink: &InMemoryAgentSegmentSink| {
+        sink.segments()
+            .into_iter()
+            .filter(|segment| matches!(segment.operation, AgentSegmentOperation::CheckpointResolve))
+            .count()
+    };
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.apply(
+        resolve_command(
+            checkpoint_id.clone(),
+            "d1",
+            reconcile(AgentReconciliationDecision::Escalate),
+        ),
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the escalation applies");
+    assert_eq!(
+        resolves(&sink),
+        0,
+        "the checkpoint is still open: {:?}",
+        sink.operations()
+    );
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.apply(
+        resolve_command(checkpoint_id, "d2", confirmed_completed()),
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the resolution applies");
+    assert_eq!(resolves(&sink), 1, "{:?}", sink.operations());
+}
+
+/// A reconciliation that establishes the ambiguous outcome ends the run's wait
+/// in its own transition, and the settle pass after it parks the run on its
+/// next model call. What a clean call closes is the measure: a call whose
+/// settle pass lost any one of its writes closes the same resolve and resume
+/// segments on that call, and its re-drive closes nothing more.
+#[tokio::test]
+async fn a_reconciliation_whose_settle_pass_loses_a_write_closes_what_a_clean_one_closes() {
+    use rakka_agent::testkit::CrashPoint;
+    use rakka_agent::{AgentSegmentOperation, InMemoryAgentSegmentSink};
+
+    let counts = |sink: &InMemoryAgentSegmentSink| {
+        let segments = sink.segments();
+        let resolves = segments
+            .iter()
+            .filter(|segment| matches!(segment.operation, AgentSegmentOperation::CheckpointResolve))
+            .count();
+        let resumes = segments
+            .iter()
+            .filter(|segment| matches!(segment.operation, AgentSegmentOperation::RunResume))
+            .count();
+        (resolves, resumes)
+    };
+    let since = |now: (usize, usize), before: (usize, usize)| (now.0 - before.0, now.1 - before.1);
+
+    // The clean call is the measure, and it counts the writes a resolution
+    // performs: write 1 is the resolving transition, every later one is the
+    // settle pass's.
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fx = fixture().with_segments(sink.clone());
+    let (_effect_id, _generation, checkpoint_id) = park_indeterminate(&fx).await;
+    let before = counts(&sink);
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    fx.runs.reset_writes();
+    let reply = run
+        .apply(
+            resolve_command(checkpoint_id, "d1", confirmed_completed()),
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .expect("the resolution applies");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let writes = fx.runs.writes();
+    assert!(writes >= 2, "the settle pass writes after the transition");
+    let clean = since(counts(&sink), before);
+    assert_eq!(
+        clean,
+        (1, 0),
+        "the clean call resolved the checkpoint once, and its settle pass parked the run on \
+         its next model call before the phase was read: {:?}",
+        sink.operations()
+    );
+
+    for nth in 2..=writes {
+        let sink = Arc::new(InMemoryAgentSegmentSink::new());
+        let fx = fixture().with_segments(sink.clone());
+        let (_effect_id, _generation, checkpoint_id) = park_indeterminate(&fx).await;
+        let before = counts(&sink);
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("the run recovers");
+        fx.runs.crash_at(nth, CrashPoint::ConflictBeforeWrite);
+        let first = run
+            .apply(
+                resolve_command(checkpoint_id.clone(), "d1", confirmed_completed()),
+                &fx.router,
+                fx.now(),
+            )
+            .await;
+        fx.runs
+            .assert_crash_fired(nth, CrashPoint::ConflictBeforeWrite);
+        fx.runs.survive();
+        assert!(first.is_err(), "write {nth} lost: {first:?}");
+        assert_eq!(
+            since(counts(&sink), before),
+            clean,
+            "write {nth} lost: the errored call closes what a clean call closes: {:?}",
+            sink.operations()
+        );
+
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("the run recovers");
+        let replay = run
+            .apply(
+                resolve_command(checkpoint_id, "d1", confirmed_completed()),
+                &fx.router,
+                fx.now(),
+            )
+            .await
+            .expect("the replay answers");
+        assert!(
+            matches!(replay, AgentRunEntityReply::Duplicate { .. }),
+            "write {nth}: {replay:?}"
+        );
+        assert_eq!(
+            since(counts(&sink), before),
+            clean,
+            "write {nth}: the re-drive closes nothing more: {:?}",
+            sink.operations()
+        );
+    }
+}
+
 #[tokio::test]
 async fn cancellation_leaves_the_reconciliation_checkpoint_resolvable() {
     // Scenario 57, checkpoint half: cancellation fences new work but does not

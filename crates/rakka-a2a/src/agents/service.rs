@@ -465,6 +465,7 @@ where
         .map_err(|refusal| RakkaAgentA2AError::Refused {
             code: refusal.code,
             message: refusal.message,
+            reason: refusal.reason,
         })?;
         super::guardrails::log_review(&review, "the inbound A2A message");
         if review.parts.is_none() && review.text.is_none() {
@@ -1248,6 +1249,7 @@ where
                     return Err(RakkaAgentA2AError::Refused {
                         code: error.code().to_string(),
                         message: error.to_string(),
+                        reason: None,
                     });
                 }
                 Err(error) => return Err(error),
@@ -1786,12 +1788,17 @@ where
         match reply {
             AgentTaskEntityReply::Applied { .. } | AgentTaskEntityReply::Duplicate { .. } => {}
             AgentTaskEntityReply::Rejected { code, message } => {
-                return Err(RakkaAgentA2AError::Refused { code, message });
+                return Err(RakkaAgentA2AError::Refused {
+                    code,
+                    message,
+                    reason: None,
+                });
             }
             other => {
                 return Err(RakkaAgentA2AError::Refused {
                     code: "unexpected-reply".to_string(),
                     message: format!("unexpected entity reply {other:?}"),
+                    reason: None,
                 });
             }
         }

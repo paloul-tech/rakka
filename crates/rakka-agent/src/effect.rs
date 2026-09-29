@@ -1831,6 +1831,13 @@ pub struct AgentRunEffect {
     pub dispatched_at: Option<AgentTimestampMillis>,
     /// Stable code of the last dispatch or execution failure.
     pub last_error_code: Option<String>,
+    /// Which decision failed the last dispatch or execution, when one party
+    /// decided: a guardrail's stage and reason code, a collaborator's own
+    /// code. Beside [`Self::last_error_code`], which stays the pipeline's.
+    /// Observability only, never correctness: an effect persisted before
+    /// this field decodes with none, and no dispatch decision reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_reason: Option<crate::failure::AgentFailureReason>,
     /// Whether the effect may dispatch only under a durable checkpoint grant
     /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)). Projected
     /// from the tool binding at commit time, so the run parks on an approval
@@ -1901,6 +1908,7 @@ impl AgentRunEffect {
             created_at,
             dispatched_at: None,
             last_error_code: None,
+            last_error_reason: None,
             checkpoint_required: spec.checkpoint_required,
             authorization_required: spec.authorization_required,
             telemetry: AgentTelemetryContext::default(),
@@ -2003,6 +2011,7 @@ impl AgentRunEffect {
         self.last_fence = None;
         self.dispatched_at = None;
         self.last_error_code = None;
+        self.last_error_reason = None;
         self.created_at = now;
         self.telemetry = superseded_generation_telemetry(&self.telemetry);
         Ok(())
@@ -2324,17 +2333,26 @@ pub enum AgentRunEffectOutcome {
     },
     /// The generation failed definitively.
     Failed {
-        /// Stable machine-readable code.
+        /// Stable machine-readable code: the pipeline's.
         code: String,
         /// Human-readable detail.
         message: String,
+        /// Which decision failed it, when one party decided: a guardrail's
+        /// stage and reason code, a collaborator's own code. Observability
+        /// only; see [`AgentFailureReason`](crate::failure::AgentFailureReason).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<crate::failure::AgentFailureReason>,
     },
     /// The generation's retry budget was spent without a result.
     Exhausted {
-        /// Stable machine-readable code of the last failure.
+        /// Stable machine-readable code of the last failure: the pipeline's.
         code: String,
         /// Human-readable detail.
         message: String,
+        /// Which decision failed the last attempt, when one party decided.
+        /// Observability only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<crate::failure::AgentFailureReason>,
     },
     /// An attempt may have invoked the target and its outcome cannot be
     /// established mechanically. The run must park for reconciliation
@@ -2353,6 +2371,45 @@ pub enum AgentRunEffectOutcome {
 }
 
 impl AgentRunEffectOutcome {
+    /// A definitive failure with no deciding identity beyond its code.
+    #[must_use]
+    pub fn failed(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Failed {
+            code: code.into(),
+            message: message.into(),
+            reason: None,
+        }
+    }
+
+    /// A spent retry budget with no deciding identity beyond its code.
+    #[must_use]
+    pub fn exhausted(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Exhausted {
+            code: code.into(),
+            message: message.into(),
+            reason: None,
+        }
+    }
+
+    /// Sets which decision failed a `Failed` or `Exhausted` outcome. Every
+    /// other outcome is returned unchanged: nothing failed it.
+    #[must_use]
+    pub fn with_reason(mut self, deciding: Option<crate::failure::AgentFailureReason>) -> Self {
+        if let Self::Failed { reason, .. } | Self::Exhausted { reason, .. } = &mut self {
+            *reason = deciding;
+        }
+        self
+    }
+
+    /// Which decision failed the generation, when the outcome carries one.
+    #[must_use]
+    pub fn failure_reason(&self) -> Option<&crate::failure::AgentFailureReason> {
+        match self {
+            Self::Failed { reason, .. } | Self::Exhausted { reason, .. } => reason.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Whether the effect produced its bounded result.
     #[must_use]
     pub const fn is_completed(&self) -> bool {
@@ -3076,5 +3133,45 @@ mod tests {
         // has no field to hold one.
         let encoded = serde_json::to_string(&ticket).expect("the ticket serializes");
         assert!(!encoded.contains("secret"));
+    }
+
+    #[test]
+    fn an_outcome_written_before_the_reason_decodes_with_none() {
+        for (tag, outcome) in [
+            ("failed", AgentRunEffectOutcome::failed("c", "m")),
+            ("exhausted", AgentRunEffectOutcome::exhausted("c", "m")),
+        ] {
+            let old = serde_json::json!({ tag: { "code": "c", "message": "m" } });
+            let decoded: AgentRunEffectOutcome =
+                serde_json::from_value(old.clone()).expect("decodes");
+            assert_eq!(decoded, outcome);
+            assert_eq!(decoded.failure_reason(), None);
+            assert_eq!(
+                serde_json::to_value(&outcome).expect("encodes"),
+                old,
+                "an outcome without a reason serializes as it always did"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reason_rides_a_failed_and_an_exhausted_outcome_and_nothing_else() {
+        let reason = crate::failure::AgentFailureReason::new("egress_denied");
+        for outcome in [
+            AgentRunEffectOutcome::failed("c", "m"),
+            AgentRunEffectOutcome::exhausted("c", "m"),
+        ] {
+            let carried = outcome.with_reason(reason.clone());
+            assert_eq!(carried.failure_reason(), reason.as_ref());
+            assert_eq!(carried.failure_code(), Some("c"));
+            let decoded: AgentRunEffectOutcome =
+                serde_json::from_value(serde_json::to_value(&carried).expect("encodes"))
+                    .expect("decodes");
+            assert_eq!(decoded, carried);
+        }
+        let cancelled = AgentRunEffectOutcome::Cancelled {
+            reason: "fenced".to_string(),
+        };
+        assert_eq!(cancelled.clone().with_reason(reason), cancelled);
     }
 }

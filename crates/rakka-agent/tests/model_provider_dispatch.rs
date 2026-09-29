@@ -362,6 +362,159 @@ async fn the_profile_credential_reaches_call_with_under_the_attempt_deadline() {
     );
 }
 
+/// Every occurrence of the `deadline_at` key on the encoded durable surfaces,
+/// as `(surface, following text)` for the ones that are not `null`, plus the
+/// total number of occurrences seen.
+fn persisted_deadlines(
+    surfaces: &[(&'static str, String)],
+) -> (usize, Vec<(&'static str, String)>) {
+    const KEY: &str = "\"deadline_at\":";
+    let mut seen = 0;
+    let mut offending = Vec::new();
+    for (label, encoded) in surfaces {
+        for (at, _) in encoded.match_indices(KEY) {
+            seen += 1;
+            let rest = &encoded[at + KEY.len()..];
+            if !rest.starts_with("null") {
+                offending.push((*label, format!("{KEY}{}", &rest[..rest.len().min(40)])));
+            }
+        }
+    }
+    (seen, offending)
+}
+
+/// The deadline is the attempt's, not the effect's: a retry resolves its
+/// credential under a deadline recomputed from the retry's own start, and
+/// the durable record holds neither.
+#[tokio::test]
+async fn a_retried_model_call_resolves_under_a_deadline_recomputed_from_its_own_start() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rakka_agent::{AgentModelAdapter, AgentModelError, AgentModelFuture, AgentModelRequest};
+
+    const TIMEOUT_MS: u64 = 30_000;
+    const BETWEEN_ATTEMPTS_MS: u64 = 10_000;
+
+    /// Fails its first call the way a provider outage does, and answers the
+    /// second. It declares the two attempts it needs: the dispatcher reads an
+    /// adapter's declaration as a ceiling and refuses a spec that asks for
+    /// more (`model-policy-conflict`).
+    struct FailsOnce {
+        calls: AtomicUsize,
+    }
+
+    impl AgentModelAdapter for FailsOnce {
+        fn adapter_version(&self) -> AgentRevisionNumber {
+            CURRENT_AGENT_LOOP_ADAPTER_VERSION
+        }
+
+        fn retry_policy(&self) -> AgentModelRetryPolicy {
+            AgentModelRetryPolicy::read_only(2).expect("two read-only attempts is a valid policy")
+        }
+
+        fn call<'a>(&'a self, _request: &'a AgentModelRequest) -> AgentModelFuture<'a> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if call == 0 {
+                    Err(AgentModelError::Provider {
+                        message: "the provider is unavailable".to_string(),
+                    })
+                } else {
+                    Ok(proposing_turn())
+                }
+            })
+        }
+    }
+
+    let spec = AgentEffectSpec::read_only()
+        .with_timeout_ms(TIMEOUT_MS)
+        .with_max_attempts(2)
+        .expect("two attempts is a valid bound");
+    let retry_policy =
+        AgentModelRetryPolicy::read_only(2).expect("two read-only attempts is a valid policy");
+    let adapter = Arc::new(FailsOnce {
+        calls: AtomicUsize::new(0),
+    });
+    let fx = profiled_fixture_with(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, proposing_turn())
+            .with_retry_policy(retry_policy)
+            .expect("the adapter policy is valid"),
+        true,
+        spec,
+    )
+    .with_model_adapter(adapter.clone());
+    fx.start().await;
+    select_profile(&fx).await;
+    fx.settle().await;
+    assert_eq!(
+        committed_model_bound(&fx).await,
+        (Some(TIMEOUT_MS), None),
+        "the committed effect carries the bound and no deadline"
+    );
+
+    // The first attempt: the credential resolves, the provider fails, the
+    // attempt is recorded as failed and the ticket stays claimable.
+    let first = fx.one_pass().await;
+    assert_eq!(first.failed_attempts, 1, "{first:?}");
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    let resolver = fx.credentials.as_ref().expect("resolver");
+    let after_first = resolver.deadlines();
+    assert_eq!(after_first.len(), 1);
+    let first_deadline = after_first[0].expect("the first attempt carries a deadline");
+    assert!(
+        (TIMEOUT_MS..=fx.fx.now().as_millis() + TIMEOUT_MS).contains(&first_deadline.as_millis()),
+        "the first deadline is the first attempt's start plus the bound: {first_deadline:?}"
+    );
+
+    assert_eq!(
+        committed_model_bound(&fx).await,
+        (Some(TIMEOUT_MS), None),
+        "after the first attempt no deadline is on the effect record"
+    );
+    // Where the effect record still exists, the scan must see the key, or
+    // its later silence proves nothing.
+    let (seen, offending) = persisted_deadlines(&fx.durable_surfaces().await);
+    assert!(
+        seen > 0,
+        "the scan looks at a surface that carries the deadline_at key"
+    );
+    assert!(
+        offending.is_empty(),
+        "a deadline was persisted: {offending:?}"
+    );
+
+    // Time passes between the attempts, and only the dispatcher's clock
+    // knows it.
+    fx.wf_clock.advance(BETWEEN_ATTEMPTS_MS);
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(
+        adapter.calls.load(Ordering::SeqCst),
+        2,
+        "the second attempt answered"
+    );
+    let deadlines = resolver.deadlines();
+    assert_eq!(deadlines.len(), 2, "one resolution per attempt");
+    let second_deadline = deadlines[1].expect("the retry carries a deadline too");
+    assert!(
+        second_deadline.as_millis() >= first_deadline.as_millis() + BETWEEN_ATTEMPTS_MS,
+        "recomputed from the retry's own start, not carried over: \
+         {first_deadline:?} then {second_deadline:?}"
+    );
+    assert!(
+        second_deadline.as_millis() <= fx.fx.now().as_millis() + TIMEOUT_MS,
+        "and still the retry's start plus the bound: {second_deadline:?}"
+    );
+    let (_, offending) = persisted_deadlines(&fx.durable_surfaces().await);
+    assert!(
+        offending.is_empty(),
+        "no durable surface holds a deadline once the retry has run: {offending:?}"
+    );
+}
+
 /// A credential-free profile hands the adapter no credential at all: the
 /// `call_with` path is taken either way, and what rides it is the grant's
 /// binding, not the adapter's own configuration.

@@ -538,6 +538,44 @@ async fn a_resolver_failure_persists_its_stable_code_and_never_the_resolvers_det
     }
 }
 
+/// The resolver's own code is recorded beside the pipeline's once the
+/// retry budget is spent, and its detail still is not.
+#[tokio::test]
+async fn an_exhausted_resolution_records_the_resolvers_code_and_never_its_detail() {
+    let fx = credentialed_fixture().with_failing_credential_resolver(
+        "vault-unreachable",
+        "vault said: token=RAKKA-SECRET-VAULT-DETAIL",
+    );
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.terminal_failure_code().await,
+        "credential-resolution-failed",
+        "the pipeline code is unchanged"
+    );
+    let reason = fx
+        .terminal_failure_reason()
+        .await
+        .expect("the resolver's own code is recorded");
+    assert_eq!(reason.code(), "vault-unreachable");
+    assert_eq!(reason.stage(), None, "no guardrail decided this");
+
+    let tool_effect = fx.effect_at(1).await.expect("the tool effect");
+    assert_eq!(
+        tool_effect.last_error_code.as_deref(),
+        Some("credential-resolution-failed")
+    );
+    assert_eq!(tool_effect.last_error_reason.as_ref(), Some(&reason));
+
+    for (label, encoded) in fx.durable_surfaces().await {
+        assert!(
+            !encoded.contains("RAKKA-SECRET-VAULT-DETAIL"),
+            "durable surface {label:?} carries the resolver's own failure text: {encoded}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 5. An executor's failure detail is bounded before it reaches a durable row.
 // ---------------------------------------------------------------------------
@@ -572,6 +610,47 @@ async fn an_executor_failure_detail_is_bounded_before_it_reaches_a_durable_row()
             "durable surface {label:?} carries the executor's unbounded detail"
         );
     }
+}
+
+/// An executor's own code is recorded beside the pipeline's, bounded as a
+/// code is, whatever the executor put in its message.
+#[tokio::test]
+async fn an_exhausted_invocation_records_the_executors_code_as_a_bounded_field() {
+    let long_code = format!("executor-exploded-{}", "x".repeat(400));
+    let spec = credentialed_spec();
+    let adapter = DeterministicModelAdapter::new()
+        .with_turn_for(1, tool_calling_turn())
+        .with_turn_for(2, proposing_turn());
+    let mut fx = AuthorityFixture::over(adapter, tool_registry_for_spec(TOOL, &spec), None)
+        .with_credential_resolver("RAKKA-SECRET-BEARER");
+    fx.tools = RecordingToolExecutor::new().with_failure(
+        TOOL,
+        &long_code,
+        "RAKKA-SECRET-EXECUTOR-DETAIL in the message",
+    );
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.terminal_failure_code().await,
+        "dispatch-collaborator-failed"
+    );
+    let reason = fx
+        .terminal_failure_reason()
+        .await
+        .expect("the executor's own code is recorded");
+    assert_eq!(
+        reason.code().len(),
+        rakka_agent::AGENT_FAILURE_REASON_CODE_MAX_LENGTH,
+        "a verbose code is cut at the code bound"
+    );
+    assert!(reason.code().starts_with("executor-exploded-"));
+    assert!(
+        !serde_json::to_string(&reason)
+            .expect("encodes")
+            .contains("RAKKA-SECRET-EXECUTOR-DETAIL"),
+        "a reason is a code, never the message"
+    );
 }
 
 // ---------------------------------------------------------------------------

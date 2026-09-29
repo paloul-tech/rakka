@@ -42,6 +42,8 @@ use rakka_agent_workflow::AgentTimestampMillis;
 use rakka_persistence::InMemoryDurableStateStore;
 use serde_json::{json, Value};
 
+mod support;
+
 type TaskStore = InMemoryDurableStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = InMemoryDurableStateStore<AgentRunState>;
@@ -144,6 +146,19 @@ impl Fixture {
     }
 
     fn with_authorizer(authorizer: Arc<dyn A2AAuthorizer>) -> Self {
+        Self::build(authorizer, None)
+    }
+
+    /// A fixture whose service evaluates `chain` at the `A2aIngress`
+    /// boundary.
+    fn with_ingress_chain(chain: rakka_agent::AgentGuardrailChain) -> Self {
+        Self::build(Arc::new(AllowAllAuthorizer), Some(chain))
+    }
+
+    fn build(
+        authorizer: Arc<dyn A2AAuthorizer>,
+        ingress: Option<rakka_agent::AgentGuardrailChain>,
+    ) -> Self {
         let tasks = TaskStore::new();
         let agents = AgentStore::new();
         let runs = RunStore::new();
@@ -181,25 +196,27 @@ impl Fixture {
 
         let catalog = A2AStaticAgentCatalog::new()
             .with_target(A2AAgentTarget::new(member(MEMBER_A), task_definition()));
-        let service = Arc::new(
-            Service::new(
-                tasks.clone(),
-                agents.clone(),
-                history.clone(),
-                runs,
-                teams.clone(),
-                team_history.clone(),
-                ConversationStore::default(),
-                rakka_agent::InMemoryAgentConversationHistoryStore::new(),
-                router.clone(),
-                Arc::new(catalog),
-                Arc::new(InMemoryA2ATaskProjectionStore::local()),
-                Arc::new(A2AHeaderTenantResolver),
-                authorizer,
-            )
-            .with_clock(Arc::new(TestClock(clock.clone())))
-            .with_default_tenant(TENANT),
-        );
+        let mut service = Service::new(
+            tasks.clone(),
+            agents.clone(),
+            history.clone(),
+            runs,
+            teams.clone(),
+            team_history.clone(),
+            ConversationStore::default(),
+            rakka_agent::InMemoryAgentConversationHistoryStore::new(),
+            router.clone(),
+            Arc::new(catalog),
+            Arc::new(InMemoryA2ATaskProjectionStore::local()),
+            Arc::new(A2AHeaderTenantResolver),
+            authorizer,
+        )
+        .with_clock(Arc::new(TestClock(clock.clone())))
+        .with_default_tenant(TENANT);
+        if let Some(chain) = ingress {
+            service = service.with_ingress_guardrails(Arc::new(chain));
+        }
+        let service = Arc::new(service);
 
         Self {
             tasks,
@@ -1035,4 +1052,146 @@ async fn a_management_message_cannot_carry_a_collaboration_cluster() {
         .expect("the board holds the task");
     assert_eq!(entry.status, AgentTeamBoardEntryStatus::Open);
     assert_eq!(entry.claim_epoch, 0, "nothing durable happened");
+}
+
+fn message_cluster(member: &str, body: &str) -> Value {
+    json!({
+        "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
+        "team": TEAM,
+        "operation": "message",
+        "member": member,
+        "body": body,
+    })
+}
+
+fn ingress(rules: Vec<Arc<dyn rakka_agent::AgentGuardrail>>) -> rakka_agent::AgentGuardrailChain {
+    support::chain_at(rakka_agent::AgentGuardrailBoundary::A2aIngress, rules)
+}
+
+/// The team leaf evaluates ingress once per command, names the team as its
+/// subject, and what a stage rewrote is what the board records.
+#[tokio::test]
+async fn an_ingress_chain_reviews_a_team_message_and_its_transform_is_recorded() {
+    let recording = Arc::new(support::Recording::default());
+    let fixture = Fixture::with_ingress_chain(ingress(vec![
+        recording.clone(),
+        Arc::new(support::RedactClusterText),
+    ]));
+    fixture.board_world().await;
+
+    let response = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(team_message(
+                "m-1",
+                message_cluster(MEMBER_A, "SENSITIVE who owns this ticket?"),
+            )),
+        )
+        .await
+        .expect("the message is served");
+    assert!(
+        response_payload(&response).get("Applied").is_some(),
+        "{:?}",
+        response_payload(&response)
+    );
+    assert_eq!(recording.seen(), 1, "once per command");
+    assert_eq!(recording.subjects(), vec!["team"]);
+
+    let snapshot = fixture.team_snapshot().await;
+    let bodies: Vec<&str> = snapshot
+        .messages
+        .iter()
+        .map(|message| message.body.as_str())
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![support::REDACTED],
+        "the board holds the rewrite"
+    );
+}
+
+/// A block refuses the command before the board sees it.
+#[tokio::test]
+async fn an_ingress_block_refuses_a_team_message_and_the_board_is_unchanged() {
+    let fixture = Fixture::with_ingress_chain(ingress(vec![Arc::new(support::BlockMarker)]));
+    fixture.board_world().await;
+    let error = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(team_message(
+                "m-1",
+                message_cluster(MEMBER_A, support::MARKER),
+            )),
+        )
+        .await
+        .expect_err("the marker is blocked");
+    let RakkaAgentA2AError::Refused { code, reason, .. } = &error else {
+        panic!("expected a refusal, got {error:?}")
+    };
+    assert_eq!(code, "guardrail-blocked");
+    assert_eq!(
+        reason
+            .as_ref()
+            .and_then(|reason| reason.stage())
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("stage-0")
+    );
+    assert!(fixture.team_snapshot().await.messages.is_empty());
+}
+
+/// A message's body is required: a stage that clears it is refused as a
+/// stage's mistake, never passed on as the caller's missing field.
+#[tokio::test]
+async fn a_transform_that_clears_a_team_message_body_is_refused_as_the_stages_own() {
+    let fixture = Fixture::with_ingress_chain(ingress(vec![Arc::new(support::ClearClusterText)]));
+    fixture.board_world().await;
+    let error = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(team_message(
+                "m-1",
+                message_cluster(MEMBER_A, "who owns this ticket?"),
+            )),
+        )
+        .await
+        .expect_err("a required body cannot be cleared");
+    assert!(
+        matches!(
+            &error,
+            RakkaAgentA2AError::Refused { code, .. } if code == "guardrail-transform-invalid"
+        ),
+        "got {error:?}"
+    );
+    assert!(fixture.team_snapshot().await.messages.is_empty());
+}
+
+/// A body a stage rewrote to all whitespace is as cleared as a `null` one:
+/// refused as the stage's mistake, never as the caller's missing field.
+#[tokio::test]
+async fn a_transform_that_blanks_a_team_message_body_is_refused_as_the_stages_own() {
+    let fixture = Fixture::with_ingress_chain(ingress(vec![Arc::new(support::BlankClusterText)]));
+    fixture.board_world().await;
+    let error = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(team_message(
+                "m-1",
+                message_cluster(MEMBER_A, "who owns this ticket?"),
+            )),
+        )
+        .await
+        .expect_err("a required body cannot be blanked");
+    assert!(
+        matches!(
+            &error,
+            RakkaAgentA2AError::Refused { code, .. } if code == "guardrail-transform-invalid"
+        ),
+        "got {error:?}"
+    );
+    assert!(fixture.team_snapshot().await.messages.is_empty());
 }

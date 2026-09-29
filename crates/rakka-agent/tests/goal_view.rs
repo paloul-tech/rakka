@@ -99,6 +99,7 @@ impl AgentA2aSendExecutor for SkillSendExecutor {
                 return Ok(AgentA2aSendFinding::Refused {
                     code: "peer-unavailable".to_string(),
                     message: "the specialist surface refused the send".to_string(),
+                    reason: None,
                 });
             }
             Ok(AgentA2aSendFinding::Sent {
@@ -803,7 +804,7 @@ async fn a_failed_send_is_an_edge_without_a_node_or_omission() {
     assert_eq!(edges.len(), 2);
     assert!(edges
         .iter()
-        .any(|edge| matches!(&edge.status, AgentDelegationStatus::Failed { code } if code == "peer-unavailable")));
+        .any(|edge| matches!(&edge.status, AgentDelegationStatus::Failed { code, .. } if code == "peer-unavailable")));
     assert!(
         view.omissions.is_empty(),
         "a failed send left no child to omit"

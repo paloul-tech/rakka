@@ -54,6 +54,10 @@ pub enum RakkaAgentA2AError {
         code: String,
         /// Bounded refusal message.
         message: String,
+        /// Which decision refused, when one party decided: the guardrail
+        /// stage and reason code of an ingress block. In-process only; the
+        /// wire carries the code and the message.
+        reason: Option<rakka_agent::AgentFailureReason>,
     },
     /// The authorizer denied the operation.
     Unauthorized,
@@ -120,7 +124,7 @@ impl Display for RakkaAgentA2AError {
             Self::Projection(error) => Display::fmt(error, f),
             Self::Coordination(error) => Display::fmt(error, f),
             Self::GoalView(error) => Display::fmt(error, f),
-            Self::Refused { code, message } => write!(f, "refused ({code}): {message}"),
+            Self::Refused { code, message, .. } => write!(f, "refused ({code}): {message}"),
             Self::Unauthorized => write!(f, "the operation was not authorized"),
             Self::UnknownAgent {
                 agent,

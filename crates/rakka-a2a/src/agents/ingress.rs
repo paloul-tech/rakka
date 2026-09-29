@@ -211,6 +211,7 @@ pub fn normalize_agent_send(
         return Err(RakkaAgentA2AError::Refused {
             code: "result-binding-conflicts-with-collaboration".to_string(),
             message: "a typed-result submission cannot ride a collaboration engagement".to_string(),
+            reason: None,
         });
     }
     let operation_kind = match collaboration.as_ref() {
@@ -235,6 +236,7 @@ pub fn normalize_agent_send(
                         "a handoff send must deduplicate under its handoff id {}, not {}",
                         cluster.handoff, discriminator
                     ),
+                    reason: None,
                 });
             }
             AgentOperationKind::Handoff
@@ -250,6 +252,7 @@ pub fn normalize_agent_send(
                     message: "a team command must not name message.task_id; the board task \
                               rides the cluster's task field"
                         .to_string(),
+                    reason: None,
                 });
             }
             let team = rakka_agent::AgentTeamId::new(&cluster.team)?;
@@ -333,6 +336,7 @@ pub fn normalize_agent_send(
                     message: "a conversation command must not name message.task_id; the \
                               governing task is bound at creation"
                         .to_string(),
+                    reason: None,
                 });
             }
             let conversation = rakka_agent::AgentConversationId::new(&cluster.conversation)?;
@@ -437,6 +441,7 @@ pub fn normalize_agent_send(
                 code: "delegation-send-names-task".to_string(),
                 message: "a delegation creates a child task; it must not name message.task_id"
                     .to_string(),
+                reason: None,
             });
         }
         // One arm, one kind per intent: a continuation is a typed-result
@@ -454,6 +459,7 @@ pub fn normalize_agent_send(
                         message: "a typed-result submission must name the task it completes \
                                   via message.task_id"
                             .to_string(),
+                        reason: None,
                     });
                 }
                 AgentOperationKind::TaskCreation
