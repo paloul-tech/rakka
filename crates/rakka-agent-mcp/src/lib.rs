@@ -45,8 +45,8 @@ pub use binding::{
     McpTransport, MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_CLIENT_NAME, MCP_DEFAULT_PROTOCOL_VERSIONS,
     MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS, MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
     MCP_INLINE_RESULT_MAX_BYTES, MCP_LIST_PAGES_MAX, MCP_META_IDEMPOTENCY_KEY,
-    MCP_PEER_AGENT_SERVER_PREFIX, MCP_SERVER_NAME_MAX_BYTES, MCP_TOOL_ERROR_DETAIL_MAX_BYTES,
-    MCP_TOOL_ID_PREFIX,
+    MCP_PEER_AGENT_SERVER_PREFIX, MCP_SERVER_NAME_MAX_BYTES, MCP_SYNC_TIMEOUT_DEFAULT_MS,
+    MCP_TOOL_ERROR_DETAIL_MAX_BYTES, MCP_TOOL_ID_PREFIX,
 };
 pub use client::{McpAllowAllEgress, McpClientError, McpEgressCheck};
 pub use executor::{mcp_artifact_store, McpArtifactStore, McpDispatchToolExecutor};
@@ -54,6 +54,7 @@ pub use launcher::{McpChildProcessLauncher, McpChildTransport, McpLaunchError, M
 #[cfg(feature = "child-process")]
 pub use launcher::{TokioChildProcessLauncher, MCP_LAUNCH_SPEC_MAX_BYTES};
 pub use sync::{
-    mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over, McpDescriptorSet,
+    mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over,
+    sync_mcp_descriptors_over_within, sync_mcp_descriptors_within, McpDescriptorSet,
     McpDescriptorStaleness, McpSyncError, McpSyncedDescriptor, MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
 };

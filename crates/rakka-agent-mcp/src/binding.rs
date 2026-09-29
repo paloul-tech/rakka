@@ -71,6 +71,17 @@ pub const MCP_DESCRIPTOR_RECHECK_TTL_DEFAULT_MS: u64 = 60_000;
 /// credential, forever.
 pub const MCP_ATTEMPT_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 
+/// Default bound, in milliseconds, on one publish-time descriptor sync: the
+/// handshake and the listing together.
+///
+/// [`sync_mcp_descriptors`](crate::sync_mcp_descriptors) and
+/// [`sync_mcp_descriptors_over`](crate::sync_mcp_descriptors_over) apply it,
+/// so no sync is unbounded; their `_within` twins take the caller's own.
+/// Thirty seconds, like an attempt's default: rmcp's legacy fallback alone
+/// can spend ten of them waiting for a `server/discover` a pre-2026-07-28
+/// server never answers.
+pub const MCP_SYNC_TIMEOUT_DEFAULT_MS: u64 = 30_000;
+
 /// The client name this adapter identifies itself with during MCP
 /// initialization.
 pub const MCP_CLIENT_NAME: &str = "rakka-agent-mcp";

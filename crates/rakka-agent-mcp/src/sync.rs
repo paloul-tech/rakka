@@ -39,6 +39,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::time::Duration;
 
 use rakka_agent::{
     AgentContentDigest, AgentEffectSafetyClass, AgentRevisionNumber, AgentSchemaId, AgentSchemaRef,
@@ -55,6 +56,7 @@ use serde_json::{json, Value};
 use crate::binding::{
     McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
     MCP_DESCRIPTOR_SCHEMA_MAX_BYTES, MCP_LIST_PAGES_MAX, MCP_SERVER_NAME_MAX_BYTES,
+    MCP_SYNC_TIMEOUT_DEFAULT_MS,
 };
 use crate::client::{
     connect, connect_over, credential_secrets, service_error, McpClientError, McpClientSession,
@@ -356,6 +358,24 @@ impl From<McpRegistrationError> for McpSyncError {
     }
 }
 
+/// The instant a sync must be over by. `checked_add` rather than `+`: a bound
+/// the platform's clock cannot represent ends the sync at once, failing
+/// closed rather than panicking or waiting forever.
+fn sync_deadline(timeout: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(timeout).unwrap_or(now)
+}
+
+/// What a sync that ran out of time answers: one fact to the operator, the
+/// descriptors could not be refreshed, under the code a transport failure of
+/// the sync already has.
+fn timed_out(server: &str, timeout: Duration) -> McpSyncError {
+    McpSyncError::Client(McpClientError::Transport {
+        server: server.to_string(),
+        reason: format!("the sync exceeded its {} ms bound", timeout.as_millis()),
+    })
+}
+
 /// Syncs one MCP server's allow-listed tools into a durable descriptor set.
 ///
 /// One session, one `tools/list`, then the session is closed — including on
@@ -371,10 +391,10 @@ impl From<McpRegistrationError> for McpSyncError {
 /// be built with no proxy and no redirects, as [`McpEgressCheck`] describes,
 /// for the check to govern where the request actually goes.
 ///
-/// The sync sets no deadline of its own — neither does rmcp, nor an injected
-/// `reqwest` client by default — so the caller bounds it: a publish step that
-/// awaits it under its own timeout, as a dispatch attempt awaits under the
-/// effect's.
+/// The whole sync — handshake and listing — is bounded by
+/// [`MCP_SYNC_TIMEOUT_DEFAULT_MS`]; [`sync_mcp_descriptors_within`] takes the
+/// caller's own bound. A sync that runs out of time is refused
+/// `mcp-descriptor-sync-failed`, with its session closed.
 ///
 /// # Errors
 ///
@@ -389,19 +409,57 @@ pub async fn sync_mcp_descriptors<C>(
 where
     C: StreamableHttpClient + Sync,
 {
+    sync_mcp_descriptors_within(
+        http,
+        binding,
+        credential,
+        synced_at,
+        egress,
+        Duration::from_millis(MCP_SYNC_TIMEOUT_DEFAULT_MS),
+    )
+    .await
+}
+
+/// As [`sync_mcp_descriptors`], under the caller's own bound.
+///
+/// `timeout` covers the handshake and the listing together. The session's
+/// close is owed on every path and is bounded on its own terms, so the call
+/// returns within `timeout` plus that fixed few seconds.
+///
+/// # Errors
+///
+/// [`McpSyncError`] with its stable code; a sync that ran out of time is
+/// `mcp-descriptor-sync-failed`.
+pub async fn sync_mcp_descriptors_within<C>(
+    http: &C,
+    binding: &McpServerBinding,
+    credential: Option<&AgentEphemeralCredential>,
+    synced_at: AgentTimestampMillis,
+    egress: &dyn McpEgressCheck,
+    timeout: Duration,
+) -> Result<McpDescriptorSet, McpSyncError>
+where
+    C: StreamableHttpClient + Sync,
+{
     // Validation first: an endpoint URL that fails the URL rule is a binding
     // refusal, and an egress rule should never be asked about a URL this
     // adapter would not dial anyway.
     binding.validate()?;
     let server = binding.server_id.to_string();
+    let deadline = sync_deadline(timeout);
     // The egress rule fires inside `connect`, before a client exists and
     // before the credential is read; a refusal arrives here as
     // `McpClientError::Egress`, whose code is the host's own.
-    let session = connect(http, binding, credential, egress).await?;
+    let session = tokio::time::timeout_at(deadline, connect(http, binding, credential, egress))
+        .await
+        .map_err(|_| timed_out(&server, timeout))??;
     // The material the server now holds, and so could echo into anything it
     // lists.
     let secrets = credential_secrets(credential);
-    sync_over_session(session, binding, &server, synced_at, &secrets).await
+    sync_over_session(
+        session, binding, &server, synced_at, &secrets, deadline, timeout,
+    )
+    .await
 }
 
 /// Syncs one child-process MCP server's allow-listed tools into a durable
@@ -423,10 +481,34 @@ pub async fn sync_mcp_descriptors_over(
     binding: &McpServerBinding,
     synced_at: AgentTimestampMillis,
 ) -> Result<McpDescriptorSet, McpSyncError> {
+    sync_mcp_descriptors_over_within(
+        transport,
+        binding,
+        synced_at,
+        Duration::from_millis(MCP_SYNC_TIMEOUT_DEFAULT_MS),
+    )
+    .await
+}
+
+/// As [`sync_mcp_descriptors_over`], under the caller's own bound.
+///
+/// # Errors
+///
+/// [`McpSyncError`] with its stable code; a sync that ran out of time is
+/// `mcp-descriptor-sync-failed`.
+pub async fn sync_mcp_descriptors_over_within(
+    transport: McpChildTransport,
+    binding: &McpServerBinding,
+    synced_at: AgentTimestampMillis,
+    timeout: Duration,
+) -> Result<McpDescriptorSet, McpSyncError> {
     binding.validate()?;
     let server = binding.server_id.to_string();
-    let session = connect_over(transport, binding).await?;
-    sync_over_session(session, binding, &server, synced_at, &[]).await
+    let deadline = sync_deadline(timeout);
+    let session = tokio::time::timeout_at(deadline, connect_over(transport, binding))
+        .await
+        .map_err(|_| timed_out(&server, timeout))??;
+    sync_over_session(session, binding, &server, synced_at, &[], deadline, timeout).await
 }
 
 /// Whether `text` carries any of `secrets`. An empty secret matches nothing.
@@ -478,15 +560,22 @@ async fn sync_over_session(
     server: &str,
     synced_at: AgentTimestampMillis,
     secrets: &[&str],
+    deadline: tokio::time::Instant,
+    timeout: Duration,
 ) -> Result<McpDescriptorSet, McpSyncError> {
-    let listed = session.list_all_tools().await;
+    // Only the listing is awaited under the deadline. The close below is
+    // owed whether or not it fired, and is bounded on its own terms.
+    let listed = tokio::time::timeout_at(deadline, session.list_all_tools()).await;
     let protocol_version = session.negotiated_version().as_str().to_string();
     let reported_name = session.server_name().to_string();
     // The session is closed before the answer is judged: a refusal must not
     // leave a transport (and its credential-bearing client, or its child
     // process) alive.
     let built = listed
-        .map_err(|error| McpSyncError::Client(service_error(server, &error)))
+        .map_err(|_| timed_out(server, timeout))
+        .and_then(|listed| {
+            listed.map_err(|error| McpSyncError::Client(service_error(server, &error)))
+        })
         .and_then(|listed| {
             listed.ok_or_else(|| {
                 McpSyncError::Client(McpClientError::Protocol {
