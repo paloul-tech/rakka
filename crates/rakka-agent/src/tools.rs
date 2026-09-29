@@ -1389,11 +1389,13 @@ impl AgentToolAuthority {
     /// a call id the model did not produce, or when it carries two tool calls
     /// under one call id; a stage
     /// may rewrite text, drop, reorder, or rewrite the model's own tool calls,
-    /// and rewrite an inline proposal. A transform that changes the
-    /// proposal's form — inline to artifact reference, reference to inline,
-    /// or a reference naming a different artifact — is refused
-    /// (`guardrail-transform-unsupported`), the `ToolResponse` precedent that
-    /// a reference cannot be rewritten. `RequireCheckpoint` fails closed
+    /// and rewrite an inline proposal. A stage may drop the proposal. A
+    /// transform that adds a proposal to a turn that made none is refused
+    /// (`guardrail-transform-invalid`), and one that changes the proposal's
+    /// form — inline to artifact reference, reference to inline — or any
+    /// field of a reference is refused (`guardrail-transform-unsupported`),
+    /// the `ToolResponse` precedent that a reference cannot be rewritten: a
+    /// reference survives a transform only whole. `RequireCheckpoint` fails closed
     /// (`checkpoint-required`): no checkpoint can gate a response that
     /// already exists.
     ///
@@ -1486,27 +1488,38 @@ impl AgentToolAuthority {
                     "a guardrail transform may not carry two tool calls under one call id",
                 ));
             }
-            // The proposal's *form* is not a stage's to change, for the
-            // reason a reference-held tool result cannot be rewritten
-            // ([`Self::review_tool_response`]): a reference names an
-            // immutable artifact the run never loads here, so turning an
-            // inline proposal into one fabricates an artifact, turning a
-            // reference into inline invents the bytes it stood for, and
-            // swapping in another artifact id proposes content nothing in
-            // this turn produced. Rewriting an inline proposal stays
-            // permitted.
-            if let (Some(original), Some(proposal)) = (&review.turn.proposal, &transformed.proposal)
-            {
-                let original_artifact = original.artifact_ref().map(|it| it.artifact_id.as_str());
-                let proposed_artifact = proposal.artifact_ref().map(|it| it.artifact_id.as_str());
-                if original_artifact != proposed_artifact {
+            // The proposal is the model's, and a stage may only make it say
+            // less. It may rewrite an inline proposal or drop any proposal.
+            // It may not add one where the model proposed nothing — that is
+            // an invented task result, the twin of an invented tool call. And
+            // a reference is not a stage's to write at all, for the reason a
+            // reference-held tool result cannot be rewritten
+            // ([`Self::review_tool_response`]): it names an immutable
+            // artifact the run never loads here, so turning an inline
+            // proposal into one fabricates an artifact, turning one into
+            // inline invents the bytes it stood for, and changing any field
+            // of one — its `uri` and `checksum` are what the task
+            // fingerprints — proposes content nothing in this turn produced.
+            // A reference survives a transform only whole.
+            match (&review.turn.proposal, &transformed.proposal) {
+                (None, Some(_)) => {
+                    return Err(AgentAuthorityRefusal::of(
+                        "guardrail-transform-invalid",
+                        "a guardrail transform may rewrite or drop the proposal the model made; \
+                         it may not add one to a turn that proposed nothing",
+                    ));
+                }
+                (Some(original), Some(proposal))
+                    if original.artifact_ref() != proposal.artifact_ref() =>
+                {
                     return Err(AgentAuthorityRefusal::of(
                         "guardrail-transform-unsupported",
                         "a guardrail transform may rewrite an inline proposal; it may not change \
-                         the proposal's form between inline and an artifact reference, nor name a \
-                         different artifact",
+                         the proposal's form between inline and an artifact reference, nor \
+                         change any field of a reference",
                     ));
                 }
+                _ => {}
             }
             review.turn = transformed;
             review.transformed = true;
