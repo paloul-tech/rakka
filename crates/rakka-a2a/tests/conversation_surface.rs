@@ -371,6 +371,22 @@ impl Fixture {
             .expect("the conversation state reads")
             .expect("the conversation exists")
     }
+
+    /// The conversation's `Ended` history entry, when one was recorded: the
+    /// one place an early end's free-text reason is kept.
+    async fn ended_entry(&self) -> Option<rakka_agent::AgentConversationHistoryEntry> {
+        use rakka_agent::AgentConversationHistoryStore;
+        self.conversation_history
+            .read(
+                &conversation_scope(),
+                rakka_agent::AgentConversationHistoryCursor::start().with_limit(64),
+            )
+            .await
+            .expect("the history reads")
+            .entries
+            .into_iter()
+            .find(|entry| entry.kind == rakka_agent::AgentConversationHistoryKind::Ended)
+    }
 }
 
 fn params() -> a2a_server::ServiceParams {
@@ -1210,7 +1226,34 @@ async fn a_cleared_turn_body_is_refused_and_a_cleared_end_reason_is_applied() {
         "{:?}",
         response_payload(&ended)
     );
-    let recorded = serde_json::to_string(&fixture.conversation_snapshot().await)
-        .expect("the snapshot encodes");
-    assert!(!recorded.contains("SENSITIVE"), "{recorded}");
+    // The snapshot carries only the terminal reason's code; the free-text
+    // reason is recorded on the `Ended` history entry alone.
+    let entry = fixture.ended_entry().await.expect("the end is recorded");
+    assert_eq!(entry.reason, None, "history records the stage's clear");
+}
+
+/// The positive control for the cleared end reason: with no chain, the same
+/// end's `Ended` history entry carries the reason the caller sent, so the
+/// assertion above can fail.
+#[tokio::test]
+async fn an_end_reason_no_stage_cleared_is_recorded_in_history() {
+    let fixture = Fixture::new();
+    fixture.conversation_world().await;
+    let mut end = conversation_message("end-1", end_cluster(MODERATOR, 0, "SENSITIVE reason"));
+    end.metadata
+        .as_mut()
+        .expect("the message carries metadata")
+        .insert(META_PRINCIPAL_REF.to_string(), json!("user:operator-7"));
+    let ended = fixture
+        .service
+        .send(&params(), &send_request(end))
+        .await
+        .expect("the end is served");
+    assert!(
+        response_payload(&ended).get("Applied").is_some(),
+        "{:?}",
+        response_payload(&ended)
+    );
+    let entry = fixture.ended_entry().await.expect("the end is recorded");
+    assert_eq!(entry.reason.as_deref(), Some("SENSITIVE reason"));
 }

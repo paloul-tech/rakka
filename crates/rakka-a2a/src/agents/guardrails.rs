@@ -122,8 +122,8 @@ pub(crate) fn apply_collaboration_text(
 /// `guardrail-transform-unsupported` for a transform of digested parts, and
 /// `guardrail-transform-invalid` for a transform that does not decode to
 /// parts, drops them, touches anything but parts and cluster text, or leaves
-/// a collaboration field the command requires `null`, empty, or all
-/// whitespace.
+/// `null`, empty, or all whitespace a collaboration field the command
+/// requires and the message carried.
 pub(crate) fn evaluate_a2a_content(
     chain: &AgentGuardrailChain,
     boundary: AgentGuardrailBoundary,
@@ -255,13 +255,17 @@ pub(crate) fn evaluate_a2a_content(
         // blank value is cleared in every way that matters: a body's mapping
         // refuses it as missing exactly as it refuses an absent one, and a
         // blank handoff reason would record a transfer that explains nothing.
+        // The rule is about what the stage did: a required field that arrived
+        // blank is the sender's, whatever the stage leaves in it, and this
+        // check leaves it to the rest of the pipeline as if no chain ran.
         let cleared =
             |value: &Option<String>| value.as_deref().is_none_or(|value| value.trim().is_empty());
-        if (text.body_required && cleared(&new_text.body))
-            || (text.reason_required && cleared(&new_text.reason))
+        if (text.body_required && cleared(&new_text.body) && !cleared(&text.body))
+            || (text.reason_required && cleared(&new_text.reason) && !cleared(&text.reason))
         {
             return Err(invalid(
-                "it clears or blanks a collaboration field the command requires",
+                "it clears or blanks a collaboration field the command requires and the \
+                 message carried",
             ));
         }
         review.text = Some(new_text);
@@ -528,6 +532,36 @@ mod tests {
                 assert_eq!(held.as_deref(), Some(blank), "{view}");
             }
         }
+    }
+
+    /// A handoff-shaped text whose required reason arrived blank: the model
+    /// or the peer sent it that way, before any stage ran.
+    fn arrived_blank() -> A2aCollaborationText {
+        A2aCollaborationText {
+            body: None,
+            reason: Some(String::new()),
+            reason_required: true,
+            ..original()
+        }
+    }
+
+    #[test]
+    fn a_required_reason_that_arrived_blank_passes_a_stage_that_omits_it() {
+        // The stage rewrites only the parts and names no collaboration key.
+        let admitted = review_of(&arrived_blank(), json!({}))
+            .expect("a blank the stage did not produce is not the stage's doing")
+            .text
+            .expect("the review carries the cluster text");
+        assert_eq!(admitted.reason.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_required_reason_that_arrived_blank_passes_a_stage_that_returns_it_unchanged() {
+        let admitted = review_of(&arrived_blank(), json!({ "reason": "" }))
+            .expect("a blank the stage returned unchanged is not the stage's doing")
+            .text
+            .expect("the review carries the cluster text");
+        assert_eq!(admitted.reason.as_deref(), Some(""));
     }
 
     #[test]
