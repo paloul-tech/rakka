@@ -6754,10 +6754,15 @@ where
             // extra pass, whose verdict is authoritative whatever it says.
             // The happy path pays nothing, which is the point of a resident
             // entity at all.
-            Err(error) if run_refusal_may_be_stale(&error) => {
-                self.rematerialize(now).await?;
-                self.apply_command(reverify, router, now).await
-            }
+            //
+            // A re-read that fails answers the call but does not end it: the
+            // first pass may have committed a resolution before its settle
+            // pass failed, and the segments below are decided on what
+            // committed, not on how the call ended.
+            Err(error) if run_refusal_may_be_stale(&error) => match self.rematerialize(now).await {
+                Ok(()) => self.apply_command(reverify, router, now).await,
+                Err(reread) => Err(reread),
+            },
             other => other,
         };
         let committed = self.committed.take().unwrap_or_default();
