@@ -1198,8 +1198,8 @@ A failed or exhausted effect is recorded under the stable code of the
 dispatch step that failed. Where one party decided the failure — a guardrail
 stage, a credential resolver, an executor — the record SHOULD also carry that
 party's own stable code, and for a guardrail its stage identity, as a bounded
-field beside the step's code. The field is observability: no dispatch,
-recovery, or resolution decision MAY read it, and its absence MUST NOT change
+field beside the step's code. The field is observability: a dispatch,
+recovery, or resolution decision MUST NOT read it, and its absence MUST NOT change
 any outcome.
 
 ### 11.4 Dispatch Invariants
