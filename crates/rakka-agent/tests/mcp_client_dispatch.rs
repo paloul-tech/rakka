@@ -706,6 +706,21 @@ async fn an_egress_refusal_fails_the_attempt_under_the_deployments_code_after_th
         "an executor error spends the attempt; the single-attempt budget exhausts"
     );
     assert_eq!(effect.last_error_code.as_deref(), Some(COLLABORATOR_FAILED));
+    assert_eq!(
+        effect
+            .last_error_reason
+            .as_ref()
+            .map(rakka_agent::AgentFailureReason::code),
+        Some(EGRESS_DENIED),
+        "the deployment's own code is a field on the record, not a substring of a line"
+    );
+    assert_eq!(
+        fx.terminal_failure_reason()
+            .await
+            .as_ref()
+            .map(rakka_agent::AgentFailureReason::code),
+        Some(EGRESS_DENIED)
+    );
 
     let row = fx
         .outbox_row(&effect)
@@ -1040,6 +1055,14 @@ async fn a_credential_the_server_echoes_into_its_error_text_is_redacted_before_i
     let effect = fx.effect_at(TOOL_SLOT).await.expect("the tool effect");
     assert_eq!(effect.status, AgentRunEffectStatus::Exhausted);
     assert_eq!(effect.last_error_code.as_deref(), Some(COLLABORATOR_FAILED));
+    assert_eq!(
+        effect
+            .last_error_reason
+            .as_ref()
+            .map(rakka_agent::AgentFailureReason::code),
+        Some("mcp-tool-error"),
+        "the MCP code is the reason; the server's text is not part of it"
+    );
     let row = fx
         .outbox_row(&effect)
         .await

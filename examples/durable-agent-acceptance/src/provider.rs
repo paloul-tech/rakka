@@ -88,8 +88,9 @@ impl AgentEffectCredentialResolver for EnvCredentialResolver {
         _effect: &'a AgentRunEffect,
     ) -> AgentDispatchFuture<'a, AgentEphemeralCredential> {
         Box::pin(async move {
-            // The error text a failing resolution returns becomes durable
-            // state, so it names the variable and never what it held.
+            // A failing resolution's code becomes durable state and its text
+            // never does; the text still names the variable and never what it
+            // held.
             let value = std::env::var(&self.var).map_err(|_error| {
                 AgentDispatchError::collaborator(
                     "credential-env-unset",

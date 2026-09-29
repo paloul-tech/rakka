@@ -231,8 +231,20 @@ fn bounded_failure_line(prefix: &str, code: &str, detail: &str) -> String {
 /// it is bounded here because a collaborator supplies it.
 fn collaborator_code(error: &AgentDispatchError) -> String {
     match error {
-        AgentDispatchError::Collaborator { code, .. } => bounded_failure_detail(code),
+        AgentDispatchError::Collaborator { code, .. } => bounded_failure_code(code),
         other => other.code().to_string(),
+    }
+}
+
+/// Which decision failed an attempt, when a collaborator decided it: the
+/// collaborator's own code. `None` for every other failure, whose pipeline
+/// code already is the whole identity.
+fn collaborator_reason(error: &AgentDispatchError) -> Option<crate::failure::AgentFailureReason> {
+    match error {
+        AgentDispatchError::Collaborator { .. } => {
+            crate::failure::AgentFailureReason::new(collaborator_code(error))
+        }
+        _ => None,
     }
 }
 
@@ -1351,14 +1363,16 @@ fn consolidation_record(
 /// minimum lease — which is why a credential-bearing model call without a
 /// timeout is refused at the authority.
 ///
-/// # The error text this returns becomes durable state
+/// # The error's code becomes durable state; its text does not
 ///
-/// A failing attempt's error text is persisted — bounded to
-/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
-/// outbox row and echoed onto the dispatcher fleet's index entry, where
-/// every worker in the fleet can read it. Bounding is not sanitizing:
-/// what the text *contains* is this implementation's contract, and it
-/// MUST carry no credential, argument, or content material
+/// A failing resolution burns the attempt under the pipeline's
+/// `credential-resolution-failed` and a detail the dispatcher authors itself.
+/// The error's text is never persisted and never logged. Its **code** is: it
+/// is written on the dispatcher's log line and, once the retry budget is
+/// spent, recorded beside the pipeline code as the failure's reason, bounded
+/// at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`. A code is a stable identifier
+/// — `vault-unreachable`, `lease-too-short` — and MUST carry no credential,
+/// argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
 pub trait AgentEffectCredentialResolver: Send + Sync {
     /// Resolves the binding into an ephemeral in-memory credential.
@@ -2769,6 +2783,10 @@ where
                                 attempt,
                                 "credential-resolution-failed",
                                 &detail,
+                                // The resolver's own code, which the line
+                                // above already logs: a stable identifier,
+                                // never the resolver's words.
+                                crate::failure::AgentFailureReason::new(collaborator_code(&error)),
                                 pass,
                             )
                             .await;
@@ -2854,6 +2872,7 @@ where
                         attempt,
                         error.code(),
                         &error.to_string(),
+                        collaborator_reason(&error),
                         pass,
                     )
                     .await;
@@ -3340,6 +3359,10 @@ where
 
     /// Records one failed attempt against the outbox's aligned retry budget,
     /// delivering the generation's `Exhausted` word when the budget is spent.
+    ///
+    /// `reason` is the collaborator's own code, when a collaborator failed the
+    /// attempt; it rides the `Exhausted` word to the run's record and is
+    /// written nowhere else.
     #[allow(clippy::too_many_arguments)]
     async fn record_attempt_failure(
         &mut self,
@@ -3349,6 +3372,7 @@ where
         attempt: u32,
         code: &str,
         message: &str,
+        reason: Option<crate::failure::AgentFailureReason>,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
@@ -3378,7 +3402,7 @@ where
                 intent,
                 attempt,
                 claim.fencing_token,
-                AgentRunEffectOutcome::exhausted(code.to_string(), detail),
+                AgentRunEffectOutcome::exhausted(code.to_string(), detail).with_reason(reason),
                 pass,
             )
             .await?;
