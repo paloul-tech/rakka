@@ -448,9 +448,10 @@ where
             let mut send = self.request_for(handoff);
             if let Some(chain) = self.egress_guardrails.as_ref() {
                 let text = super::guardrails::A2aCollaborationText {
-                    body: None,
                     reason: Some(handoff.reason.clone()),
                     context: handoff.context.clone(),
+                    reason_required: true,
+                    ..super::guardrails::A2aCollaborationText::default()
                 };
                 match super::guardrails::evaluate_a2a_content(
                     chain,

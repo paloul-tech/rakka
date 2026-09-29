@@ -12,6 +12,7 @@ cargo test --workspace --all-features
 cargo check -p rakka-stream --no-default-features
 cargo check -p rakka-process --no-default-features
 cargo check -p rakka-a2a --no-default-features
+cargo check -p rakka-a2a --no-default-features --tests
 cargo check -p rakka-a2a --no-default-features --features agents
 cargo check -p rakka-a2a --no-default-features --features otel
 cargo check -p rakka-agent --no-default-features

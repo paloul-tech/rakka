@@ -30,6 +30,11 @@ pub(crate) struct A2aCollaborationText {
     pub(crate) reason: Option<String>,
     /// The handoff cluster's bounded context lines.
     pub(crate) context: Vec<String>,
+    /// Whether the command requires the body it carries: a stage may rewrite
+    /// it and may not clear it.
+    pub(crate) body_required: bool,
+    /// Whether the command requires the reason it carries.
+    pub(crate) reason_required: bool,
 }
 
 /// What the chain decided about one message: replacements only where a
@@ -58,19 +63,24 @@ pub(crate) fn collaboration_text(
     envelope: Option<&AgentCollaborationEnvelope>,
 ) -> Option<A2aCollaborationText> {
     match envelope? {
+        // A body is carried only by the verb that needs one, so a carried
+        // body is a required one.
         AgentCollaborationEnvelope::Team(cluster) => Some(A2aCollaborationText {
             body: cluster.body.clone(),
+            body_required: cluster.body.is_some(),
             ..A2aCollaborationText::default()
         }),
         AgentCollaborationEnvelope::Conversation(cluster) => Some(A2aCollaborationText {
             body: cluster.body.clone(),
             reason: cluster.reason.clone(),
-            context: Vec::new(),
+            body_required: cluster.body.is_some(),
+            ..A2aCollaborationText::default()
         }),
         AgentCollaborationEnvelope::Handoff(cluster) => Some(A2aCollaborationText {
-            body: None,
             reason: Some(cluster.reason.clone()),
             context: cluster.context.clone(),
+            reason_required: true,
+            ..A2aCollaborationText::default()
         }),
         AgentCollaborationEnvelope::Delegation(_) => None,
     }
@@ -100,8 +110,9 @@ pub(crate) fn apply_collaboration_text(
 /// Evaluates the chain over one message at an A2A boundary.
 ///
 /// In a transformed view, a collaboration key the stage omitted leaves that
-/// field unchanged and an explicit `null` clears it; a field the original did
-/// not carry may not be added.
+/// field unchanged and an explicit `null` clears it, unless the command
+/// requires the field, which a stage may rewrite and may not clear; a field
+/// the original did not carry may not be added.
 ///
 /// # Errors
 ///
@@ -224,12 +235,26 @@ pub(crate) fn evaluate_a2a_content(
                     ))
                 }
             },
+            body_required: text.body_required,
+            reason_required: text.reason_required,
         };
         if (text.body.is_none() && new_text.body.is_some())
             || (text.reason.is_none() && new_text.reason.is_some())
         {
             return Err(invalid(
                 "it adds a collaboration field the message did not carry",
+            ));
+        }
+        // Clearing is for a field the command can do without. A required
+        // one cleared here would be half-applied: a handoff's reason has no
+        // cleared form, so the original would survive a transform logged as
+        // applied, and a cleared body would fail the command downstream as a
+        // missing field and blame the caller for the stage's decision.
+        if (text.body_required && new_text.body.is_none())
+            || (text.reason_required && new_text.reason.is_none())
+        {
+            return Err(invalid(
+                "it clears a collaboration field the command requires",
             ));
         }
         review.text = Some(new_text);
@@ -309,6 +334,7 @@ mod tests {
             body: Some("the body".to_string()),
             reason: Some("the reason".to_string()),
             context: vec!["line one".to_string(), "line two".to_string()],
+            ..A2aCollaborationText::default()
         }
     }
 
@@ -421,6 +447,108 @@ mod tests {
                 .expect_err("a string is neither an array nor null")
                 .code,
             "guardrail-transform-invalid"
+        );
+    }
+
+    fn review_of(
+        text: &A2aCollaborationText,
+        collaboration: Value,
+    ) -> Result<A2aContentReview, AgentAuthorityRefusal> {
+        let scope = AgentTaskScope::new(
+            TenantId::new("acme"),
+            AgentTaskId::new("task-1").expect("the task id is valid"),
+        )
+        .expect("the task scope is valid");
+        evaluate_a2a_content(
+            &chain(collaboration),
+            AgentGuardrailBoundary::A2aIngress,
+            AgentGuardrailSubject::Task {
+                scope: &scope,
+                agent: None,
+            },
+            &parts(),
+            Some(text),
+        )
+    }
+
+    #[test]
+    fn a_required_field_may_be_rewritten_and_may_not_be_cleared() {
+        let required = A2aCollaborationText {
+            body_required: true,
+            reason_required: true,
+            ..original()
+        };
+        let rewritten = review_of(&required, json!({ "body": "[b]", "reason": "[r]" }))
+            .expect("rewriting is permitted")
+            .text
+            .expect("the review carries the cluster text");
+        assert_eq!(rewritten.body.as_deref(), Some("[b]"));
+        assert_eq!(rewritten.reason.as_deref(), Some("[r]"));
+        assert!(rewritten.body_required && rewritten.reason_required);
+
+        for cleared in [json!({ "body": null }), json!({ "reason": null })] {
+            let refusal = review_of(&required, cleared.clone())
+                .expect_err("a required field cannot be cleared");
+            assert_eq!(refusal.code, "guardrail-transform-invalid", "{cleared}");
+        }
+    }
+
+    #[test]
+    fn the_envelope_says_which_fields_are_required() {
+        use super::super::collaboration::parse_collaboration_envelope;
+        use super::super::{
+            AGENT_COLLABORATION_EXTENSION_URI, AGENT_COLLABORATION_SCHEMA_VERSION,
+            META_COLLABORATION,
+        };
+
+        // Parsed from the wire shape, so the proof holds to whatever the
+        // cluster types are.
+        let text_of = |cluster: Value| {
+            let mut message = a2a::Message::new(a2a::Role::User, parts());
+            message.extensions = Some(vec![AGENT_COLLABORATION_EXTENSION_URI.to_string()]);
+            let metadata: std::collections::HashMap<String, Value> =
+                [(META_COLLABORATION.to_string(), cluster)]
+                    .into_iter()
+                    .collect();
+            let envelope = parse_collaboration_envelope(&message, &metadata)
+                .expect("the cluster parses")
+                .expect("the message carries an envelope");
+            collaboration_text(Some(&envelope)).expect("the envelope carries text")
+        };
+
+        let handoff = text_of(json!({
+            "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
+            "handoff": "h-1",
+            "source-agent": "a",
+            "source-run": "r",
+            "source-generation": 1,
+            "target-agent": "b",
+            "target-task-definition": "d",
+            "reason": "needs billing authority",
+            "policy-revision": 1,
+        }));
+        assert!(handoff.reason_required && !handoff.body_required);
+
+        let message = text_of(json!({
+            "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
+            "team": "t",
+            "operation": "message",
+            "member": "a",
+            "body": "who owns this ticket?",
+        }));
+        assert!(message.body_required && !message.reason_required);
+
+        let end = text_of(json!({
+            "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
+            "conversation": "c",
+            "operation": "end",
+            "participant": "a",
+            "expected-round": 0,
+            "reason": "consensus",
+        }));
+        assert!(
+            !end.body_required && !end.reason_required,
+            "an end carries no body, and its reason is the one field a stage may clear"
         );
     }
 }

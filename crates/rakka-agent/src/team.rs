@@ -1977,7 +1977,9 @@ pub enum AgentTeamEntityCommand {
     },
     /// Appends a mediated peer message to the durable ring.
     AppendMessage {
-        /// Stable dedup identity of this append.
+        /// Stable dedup identity of this append. Derived over the cluster as
+        /// the caller sent it, body included; an ingress stage that rewrites
+        /// the body does not change the id.
         operation_id: AgentOperationId,
         /// The sending member.
         from: AgentId,
