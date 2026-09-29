@@ -22,8 +22,9 @@ use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, ScriptedDispat
 use rakka_agent::{
     AgentA2aSendExecutor, AgentA2aSendFinding, AgentDelegationRecord, AgentDelegationStatus,
     AgentDispatchFuture, AgentModelTurn, AgentOperationId, AgentOperationKind, AgentRunEffect,
-    AgentRunEffectKind, AgentRunEntityCommand, AgentRunScope, AgentRunStatus, AgentToolCallId,
-    AgentToolCallRequest, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentRunEffectKind, AgentRunEntityCommand, AgentRunScope, AgentRunStatus,
+    AgentRunTerminalReason, AgentToolCallId, AgentToolCallRequest,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentEphemeralCredential;
 use serde_json::json;
@@ -137,11 +138,26 @@ async fn an_absent_executor_fails_the_send_closed() {
 
 /// A send a guardrail blocked settles its cell under the pipeline code, with
 /// the stage and reason code beside it.
+///
+/// Since slice 4.4 a blocked send is a fan-in disposition the run survives,
+/// not a coordinator failure: the refusal reaches the model as the call's
+/// failed tool result, and the run finishes the task on its own terms. The
+/// send's failure never becomes the run's terminal reason, so the delegation
+/// cell is the record that carries the deciding stage.
 #[tokio::test]
 async fn a_blocked_send_records_the_deciding_stage_on_its_cell() {
     let fixture = Fixture::new(
         ScriptedDispatcher::with_adapter(
-            DeterministicModelAdapter::new().with_turn(delegating_turn()),
+            DeterministicModelAdapter::new()
+                .with_turn(delegating_turn())
+                .with_turn(
+                    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                        .with_text("Finishing without the specialist.")
+                        .with_proposal(
+                            rakka_agent::AgentTaskContent::inline(json!({ "answer": "solo" }))
+                                .expect("the proposal is inline-bounded"),
+                        ),
+                ),
         )
         .with_a2a_send_executor(Arc::new(BlockedExecutor)),
     )
@@ -155,7 +171,19 @@ async fn a_blocked_send_records_the_deciding_stage_on_its_cell() {
             reason: Some(blocking_reason()),
         }
     );
-    assert_eq!(run_status, Some(AgentRunStatus::Failed));
+    assert_eq!(
+        run_status,
+        Some(AgentRunStatus::Completed),
+        "the blocked send is a disposition the run survives"
+    );
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    assert_eq!(
+        state.run().expect("the record survives").terminal_reason,
+        Some(AgentRunTerminalReason::ResultAccepted),
+        "the run ends on its own result, not on the send's failure"
+    );
 }
 
 /// The same block through the production dispatcher: its send arm, not the

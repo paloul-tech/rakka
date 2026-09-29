@@ -4717,6 +4717,7 @@ fn apply_effect_outcome(
             // recorded is preserved untouched.
             effect.status = AgentRunEffectStatus::Indeterminate;
             effect.last_error_code = Some(bounded_detail(code.clone()));
+            effect.last_error_reason = outcome.failure_reason().cloned();
         }
         AgentRunEffectOutcome::Cancelled { .. } => {
             // The dispatch layer fenced and settled the generation without
@@ -5382,6 +5383,7 @@ fn schedule_compensation(
     if let Some(effect) = run.loop_state.effect_mut(effect_id) {
         effect.status = AgentRunEffectStatus::Compensated;
         effect.last_error_code = Some(bounded_detail("compensated".to_string()));
+        effect.last_error_reason = None;
     }
 
     // Wind down first, then commit the compensation: the fence cancels only
@@ -9886,6 +9888,99 @@ mod tests {
         (scope, loop_state)
     }
 
+    /// A reason always explains the code beside it. Compensating an ambiguous
+    /// effect overwrites its code with `compensated`, so the reason the
+    /// failed attempt left must go with the code it explained.
+    #[test]
+    fn compensating_an_effect_clears_the_reason_its_code_no_longer_names() {
+        let now = AgentTimestampMillis::new(1);
+        let (scope, mut loop_state) = segment_mark_fixture();
+        let schema = AgentSchemaRef::new(
+            AgentSchemaId::new("result").expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        );
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("definition").expect("the definition id is valid"),
+            "The compensation fixture.",
+            schema.clone(),
+            schema,
+        )
+        .expect("the definition is valid");
+        let mut effect = AgentRunEffect::new(
+            &scope,
+            loop_state.turn(),
+            0,
+            AgentRunEffectRequest::Tool {
+                call: Box::new(
+                    AgentToolCallRequest::new(
+                        AgentToolCallId::new("call-1").expect("the call id is valid"),
+                        AgentToolId::new("charge-card").expect("the tool id is valid"),
+                        serde_json::json!({}),
+                    )
+                    .expect("the call is bounded"),
+                ),
+            },
+            &AgentEffectSpec::non_idempotent(),
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the effect derives");
+        effect.status = AgentRunEffectStatus::Indeterminate;
+        effect.last_error_code = Some("dispatch-collaborator-failed".to_string());
+        effect.last_error_reason = crate::failure::AgentFailureReason::new("mcp-tool-error");
+        assert!(
+            effect.last_error_reason.is_some(),
+            "the fixture holds a reason"
+        );
+        let effect_id = effect.effect_id.clone();
+        let generation = effect.generation;
+        loop_state
+            .record_effect(effect)
+            .expect("the effect records");
+        let mut state = AgentRunState::unassigned(scope.clone(), now);
+        state.run = Some(AgentRun {
+            binding: AgentRunBinding::new(
+                scope.clone(),
+                AgentTaskId::new("task").expect("the task id is valid"),
+            ),
+            generation: AgentAssignmentGeneration::new(1),
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "input": "x" }))
+                .expect("the input is inline-bounded"),
+            status: AgentRunStatus::WaitingForEffect,
+            loop_state,
+            terminal_reason: None,
+            settlement: AgentRunSettlementStatus::Owed,
+            accepted_at: now,
+            terminal_at: None,
+        });
+
+        schedule_compensation(
+            &mut state,
+            &effect_id,
+            generation,
+            AgentCompensationRef::new("refund-charge").expect("the ref is valid"),
+            &AgentEffectPolicies::default(),
+            now,
+        )
+        .expect("the compensation schedules");
+
+        let compensated = state
+            .run()
+            .expect("the run exists")
+            .loop_state
+            .effects()
+            .iter()
+            .find(|effect| effect.effect_id == effect_id)
+            .expect("the compensated effect is held");
+        assert_eq!(compensated.status, AgentRunEffectStatus::Compensated);
+        assert_eq!(compensated.last_error_code.as_deref(), Some("compensated"));
+        assert_eq!(
+            compensated.last_error_reason, None,
+            "no reason outlives the code it explained"
+        );
+    }
+
     /// A saturated decision outbox must not silence the decide span.
     ///
     /// The outbox is a ring, and it saturates exactly when a wired decision
@@ -10237,8 +10332,14 @@ mod tests {
             evidence: Vec::new(),
             accepted_at: now,
         });
-        run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
-            reason: "r".repeat(AGENT_RUN_DETAIL_MAX_LENGTH),
+        // The largest terminal reason: an effect failure naming the last
+        // effect the fan-out derived under the maximal identifiers, with its
+        // code at the detail bound and the maximal reason beside it.
+        run.terminal_reason = Some(AgentRunTerminalReason::EffectFailed {
+            effect_id: effect_id_for(&scope, turn, crate::model::AGENT_MODEL_MAX_TOOL_CALLS)
+                .expect("the effect id derives"),
+            code: "c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH),
+            reason: Some(maximal_reason.clone()),
         });
 
         let growth = run.materialized_size_bytes().saturating_sub(baseline);
