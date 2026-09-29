@@ -42,6 +42,11 @@ pub type McpArtifactFuture<'a> =
 ///   generation, and the call, so a store that honors it rewrites one
 ///   artifact when an attempt is re-driven. A store that mints its own id
 ///   must be idempotent on the bytes instead.
+/// - `request.artifact_id` is an identity, not a path. It embeds the effect
+///   id, so it contains `/`, and the effect id's segments are validated only
+///   as identity segments, which admit `..`. A store that keys a filesystem
+///   path or an object key by it must encode it first. A store that mints
+///   its own id is unaffected.
 /// - The reference returned must pass the default artifact policy: a
 ///   checksum, a content type, a byte length, a retention class, and a
 ///   redaction status other than `Unknown`. The executor refuses one that
