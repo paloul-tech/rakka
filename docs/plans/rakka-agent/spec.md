@@ -1194,6 +1194,14 @@ terminal outcomes for one effect generation. Reconciliation of an
 indeterminate effect records evidence against that outcome; if a new invocation
 is authorized, it uses a new effect generation.
 
+A failed or exhausted effect is recorded under the stable code of the
+dispatch step that failed. Where one party decided the failure — a guardrail
+stage, a credential resolver, an executor — the record SHOULD also carry that
+party's own stable code, and for a guardrail its stage identity, as a bounded
+field beside the step's code. The field is observability: no dispatch,
+recovery, or resolution decision MAY read it, and its absence MUST NOT change
+any outcome.
+
 ### 11.4 Dispatch Invariants
 
 - The dispatcher MUST NOT invoke an external operation before `Started` is
@@ -1747,6 +1755,10 @@ hold a thread or agent actor while waiting.
 - A guardrail outcome MUST be one of an explicit bounded set such as `allow`,
   `block`, `transform`, `report-only`, or `require-checkpoint`, with a stable
   reason code and protected evidence reference when required.
+- A durable record MAY carry a guardrail's stage identity and stable reason
+  code. It MUST NOT carry the refusal's message, the evaluated content, or a
+  protected evidence reference outside the bounded failure detail that
+  already holds one.
 - Deployment/tenant policy MAY add mandatory guardrails that an agent
   definition, setup, model, or later settings update MUST NOT remove or weaken.
 - A guardrail transformation MUST be deterministic under a recorded revision
@@ -2073,6 +2085,12 @@ The span that opens a checkpoint MUST end after the durable wait and
 notification effect are accepted. No span object is held during passive wait.
 The later resolution/resume span MUST link to the parked span and the incoming
 human/service request span.
+
+The resolution span's subject is the resolving transition. It MUST be closed
+on the call whose transition committed the resolution, whether or not the
+work that followed the commit succeeded, and it MUST NOT be closed for a
+decision that left the checkpoint open, for a replay of an applied
+resolution, or for a refused one.
 
 Recovery spans MUST include bounded recovery cause and outcome, prior state,
 new owner/runtime component, recovered pending counts, stale-write conflicts,
