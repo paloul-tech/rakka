@@ -1,0 +1,316 @@
+//! When a checkpoint's resolution leaves its trace: on the call whose
+//! transition committed it, exactly once, whatever the settle pass after it
+//! did.
+
+use std::sync::Arc;
+
+use rakka_agent::testkit::{CrashPoint, ScriptedDispatcher};
+use rakka_agent::{
+    load_agent_run_state, AgentApprovalDecision, AgentCheckpoint, AgentCheckpointDecision,
+    AgentEffectPolicies, AgentEffectSpec, AgentModelTurn, AgentOperationId, AgentOperationKind,
+    AgentRunEffect, AgentRunEntityCommand, AgentRunEntityReply, AgentSchemaPolicy,
+    AgentSegmentOperation, AgentTaskContent, AgentTelemetrySegment, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, InMemoryAgentRunEffectSink, InMemoryAgentSegmentSink,
+    ATTR_AGENT_TELEMETRY_LINK_KIND, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    LINK_KIND_PARKED_CHECKPOINT, LINK_KIND_RESUME_REQUEST,
+};
+use rakka_agent_workflow::{AgentTelemetryContext, AgentTimestampMillis, PrincipalRef};
+
+mod common;
+
+use common::*;
+
+const INGRESS_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+const REQUEST_PARENT: &str = "00-1bf7651916cd43dd8448eb211c80319d-c7ad6b7169203332-01";
+
+fn context(trace_parent: &str) -> AgentTelemetryContext {
+    AgentTelemetryContext {
+        trace_parent: Some(trace_parent.to_string()),
+        ..AgentTelemetryContext::default()
+    }
+}
+
+/// A fixture whose one tool is checkpoint-required, so the run parks on an
+/// approval before anything dispatches.
+fn checkpointed_fixture() -> Fixture {
+    use std::sync::atomic::AtomicU64;
+
+    let tool = AgentToolId::new("charge-card").expect("tool id");
+    let policies = AgentEffectPolicies::new()
+        .with_tool_spec(
+            tool.clone(),
+            AgentEffectSpec::non_idempotent().with_checkpoint_required(),
+        )
+        .expect("the checkpoint-required tool spec is valid");
+    Fixture::with_sink(
+        ScriptedDispatcher::new()
+            .with_turn(
+                AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                    .with_text("Charging the card.")
+                    .with_tool_call(
+                        AgentToolCallRequest::new(
+                            AgentToolCallId::new("call-1").expect("call id"),
+                            tool,
+                            serde_json::json!({ "amount": 42 }),
+                        )
+                        .expect("the tool call is bounded"),
+                    ),
+            )
+            .with_turn(
+                AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                    .with_text("Done.")
+                    .with_proposal(
+                        AgentTaskContent::inline(serde_json::json!({ "answer": "charged" }))
+                            .expect("the proposal is inline-bounded"),
+                    ),
+            ),
+        InMemoryAgentRunEffectSink::new(),
+        policies,
+        Arc::new(AtomicU64::new(1)),
+    )
+}
+
+/// Parks a traced run on its approval checkpoint and answers the checkpoint
+/// and the effect it gates.
+async fn park(fx: &Fixture) -> (rakka_agent::AgentCheckpoint, AgentRunEffect) {
+    fx.instantiate_agent().await;
+    fx.create_task_traced(context(INGRESS_PARENT)).await;
+    fx.pump().await.expect("the run parks on its checkpoint");
+    let state = load_agent_run_state(&fx.runs, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+    let loop_state = state.loop_state().expect("the loop exists");
+    let checkpoint = loop_state
+        .open_checkpoints()
+        .first()
+        .expect("the approval checkpoint is open")
+        .clone();
+    let effect = loop_state
+        .effects()
+        .iter()
+        .find(|effect| effect.effect_id == checkpoint.bound_effect.effect_id)
+        .expect("the gated effect is on the loop")
+        .clone();
+    (checkpoint, effect)
+}
+
+fn approve(checkpoint: &rakka_agent::AgentCheckpoint, key: &str) -> AgentRunEntityCommand {
+    AgentRunEntityCommand::ResolveCheckpoint {
+        operation_id: AgentOperationId::for_agent(
+            AgentOperationKind::CheckpointResolution,
+            &agent_scope(),
+            key,
+        )
+        .expect("the decision key derives"),
+        checkpoint_id: checkpoint.checkpoint_id.clone(),
+        resolver: PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "approver".to_string(),
+            display_name: None,
+        },
+        decision: Box::new(AgentCheckpointDecision::Approval(
+            AgentApprovalDecision::Approve {
+                credential_binding: None,
+                expires_at: AgentTimestampMillis::new(1_000_000),
+                allowed_use_count: 1,
+            },
+        )),
+        telemetry: context(REQUEST_PARENT),
+    }
+}
+
+fn closed(sink: &InMemoryAgentSegmentSink, wanted: &str) -> Vec<AgentTelemetrySegment> {
+    sink.segments()
+        .into_iter()
+        .filter(|segment| match wanted {
+            "resolve" => matches!(segment.operation, AgentSegmentOperation::CheckpointResolve),
+            "resume" => matches!(segment.operation, AgentSegmentOperation::RunResume),
+            other => panic!("unknown segment class {other}"),
+        })
+        .collect()
+}
+
+/// The resolution of one clean call: how many resolve and resume segments a
+/// resolution closes when nothing goes wrong. The measure every other arm is
+/// held to.
+async fn clean_resolution() -> (usize, usize) {
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fx = checkpointed_fixture().with_segments(sink.clone());
+    let (checkpoint, _) = park(&fx).await;
+    let resumes_before = closed(&sink, "resume").len();
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    let reply = run
+        .apply(approve(&checkpoint, "d1"), &fx.router, fx.now())
+        .await
+        .expect("the decision applies");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    (
+        closed(&sink, "resolve").len(),
+        closed(&sink, "resume").len() - resumes_before,
+    )
+}
+
+#[tokio::test]
+async fn a_conflict_point_loses_the_armed_write_with_a_revision_conflict() {
+    use rakka_persistence::{DurableError, DurableStateStore};
+
+    let fx = checkpointed_fixture();
+    park(&fx).await;
+    let id = run_scope().persistence_id();
+    let before = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("loads")
+        .expect("the run exists");
+    fx.runs.crash_at(1, CrashPoint::ConflictBeforeWrite);
+    let lost = fx
+        .runs
+        .compare_and_set(&id, before.revision, before.state)
+        .await
+        .expect_err("a second writer moved the record first");
+    fx.runs
+        .assert_crash_fired(1, CrashPoint::ConflictBeforeWrite);
+    fx.runs.survive();
+    assert!(
+        matches!(lost, DurableError::RevisionConflict { .. }),
+        "{lost:?}"
+    );
+    let after = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("loads")
+        .expect("the run exists");
+    assert_ne!(
+        after.revision, before.revision,
+        "the second writer's write is what moved the record"
+    );
+}
+
+#[tokio::test]
+async fn a_resolution_whose_settle_pass_loses_a_write_still_leaves_its_trace_once() {
+    let (clean_resolves, clean_resumes) = clean_resolution().await;
+    assert_eq!(clean_resolves, 1, "the measure itself");
+
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fx = checkpointed_fixture().with_segments(sink.clone());
+    let (checkpoint, effect) = park(&fx).await;
+    let resumes_before = closed(&sink, "resume").len();
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    // Write 1 is the resolving transition. Write 2 is the settle pass's
+    // first compare-and-set, which a second writer beats.
+    fx.runs.crash_at(2, CrashPoint::ConflictBeforeWrite);
+    let first = run
+        .apply(approve(&checkpoint, "d1"), &fx.router, fx.now())
+        .await;
+    fx.runs
+        .assert_crash_fired(2, CrashPoint::ConflictBeforeWrite);
+    fx.runs.survive();
+    assert!(
+        first.is_err(),
+        "the settle pass lost its write, and the call says so: {first:?}"
+    );
+
+    // The resolution is durable, so its trace exists: once, under the
+    // identity the park linked forward to, a child of the run's ingress, and
+    // linking the parked span and the request.
+    let resolved = closed(&sink, "resolve");
+    assert_eq!(resolved.len(), 1, "{:?}", sink.operations());
+    let identity =
+        AgentCheckpoint::resolve_span_identity(&effect.telemetry, &checkpoint.checkpoint_id)
+            .expect("the resolve identity derives");
+    assert_eq!(
+        resolved[0].span_id.as_deref(),
+        Some(identity.span_id.as_str())
+    );
+    assert_eq!(
+        resolved[0].telemetry.trace_parent.as_deref(),
+        Some(INGRESS_PARENT),
+        "the run's context was read before the write that dropped the cached record"
+    );
+    for kind in [LINK_KIND_PARKED_CHECKPOINT, LINK_KIND_RESUME_REQUEST] {
+        assert!(
+            resolved[0].telemetry.span_links.iter().any(|link| {
+                link.attributes.get(ATTR_AGENT_TELEMETRY_LINK_KIND) == Some(&kind.to_string())
+            }),
+            "a `{kind}` link: {:?}",
+            resolved[0].telemetry.span_links
+        );
+    }
+
+    // The re-drive finds the operation applied, resolves nothing, and closes
+    // no second resolve segment.
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    let replay = run
+        .apply(approve(&checkpoint, "d1"), &fx.router, fx.now())
+        .await
+        .expect("the replay answers");
+    assert!(
+        matches!(replay, AgentRunEntityReply::Duplicate { .. }),
+        "{replay:?}"
+    );
+    assert_eq!(
+        closed(&sink, "resolve").len(),
+        clean_resolves,
+        "a duplicate resolved nothing and closes nothing"
+    );
+    assert_eq!(
+        closed(&sink, "resume").len() - resumes_before,
+        clean_resumes,
+        "across the errored call and its re-drive, the wait's end is recorded as often as a \
+         clean call records it"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_resolution_closes_nothing() {
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fx = checkpointed_fixture().with_segments(sink.clone());
+    let (checkpoint, _) = park(&fx).await;
+    for expected in ["applied", "duplicate"] {
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("the run recovers");
+        let reply = run
+            .apply(approve(&checkpoint, "d1"), &fx.router, fx.now())
+            .await
+            .expect("the decision answers");
+        match expected {
+            "applied" => assert!(matches!(reply, AgentRunEntityReply::Applied { .. })),
+            _ => assert!(matches!(reply, AgentRunEntityReply::Duplicate { .. })),
+        }
+        assert_eq!(
+            closed(&sink, "resolve").len(),
+            1,
+            "after the {expected} call"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_resolution_closes_nothing() {
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fx = checkpointed_fixture().with_segments(sink.clone());
+    let (checkpoint, _) = park(&fx).await;
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    // A lost first write: the transition itself never committed.
+    fx.runs.crash_at(1, CrashPoint::ConflictBeforeWrite);
+    let refused = run
+        .apply(approve(&checkpoint, "d1"), &fx.router, fx.now())
+        .await;
+    fx.runs
+        .assert_crash_fired(1, CrashPoint::ConflictBeforeWrite);
+    fx.runs.survive();
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(
+        closed(&sink, "resolve").is_empty(),
+        "nothing committed, so nothing was resolved: {:?}",
+        sink.operations()
+    );
+}

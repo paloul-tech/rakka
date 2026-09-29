@@ -3775,6 +3775,12 @@ pub enum CrashPoint {
     /// This is the window that matters: the entity is durably committed to
     /// something it has not yet told anyone about, and recovery must find it.
     AfterWrite,
+    /// The owner did not die: a second writer moved the durable record first,
+    /// so the owner's write loses its compare-and-set with a genuine
+    /// `RevisionConflict`. Unlike the two crashes, this is the failure an
+    /// entity with two writers meets in production, and the one that makes a
+    /// resident entity drop its cached record.
+    ConflictBeforeWrite,
 }
 
 /// Runs one recovery scenario once per (write, crash point): the exhaustive
@@ -3826,6 +3832,7 @@ where
     writes: Arc<AtomicUsize>,
     crash_at: Arc<AtomicUsize>,
     crash_after: Arc<std::sync::atomic::AtomicBool>,
+    conflict: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S> Clone for CrashingStateStore<S>
@@ -3838,6 +3845,7 @@ where
             writes: self.writes.clone(),
             crash_at: self.crash_at.clone(),
             crash_after: self.crash_after.clone(),
+            conflict: self.conflict.clone(),
         }
     }
 }
@@ -3875,6 +3883,7 @@ where
             writes: Arc::new(AtomicUsize::new(0)),
             crash_at: Arc::new(AtomicUsize::new(0)),
             crash_after: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            conflict: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -3892,6 +3901,10 @@ where
         self.crash_at.store(nth, Ordering::SeqCst);
         self.crash_after
             .store(matches!(point, CrashPoint::AfterWrite), Ordering::SeqCst);
+        self.conflict.store(
+            matches!(point, CrashPoint::ConflictBeforeWrite),
+            Ordering::SeqCst,
+        );
     }
 
     /// Stops killing the owner. The next activation recovers whatever the last
@@ -3953,9 +3966,24 @@ where
         let write = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
         let crash_at = self.crash_at.load(Ordering::SeqCst);
         let after = self.crash_after.load(Ordering::SeqCst);
+        let conflict = self.conflict.load(Ordering::SeqCst);
 
         Box::pin(async move {
-            if crash_at != 0 && write == crash_at && !after {
+            if crash_at != 0 && write == crash_at && conflict {
+                // The second writer: the record as it stands, written back
+                // at its own revision. Nothing about the state changes; the
+                // revision moves, which is all a lost compare-and-set is.
+                if let Some(record) = self.inner.load(persistence_id).await? {
+                    self.inner
+                        .compare_and_set(persistence_id, record.revision, record.state)
+                        .await?;
+                }
+                return self
+                    .inner
+                    .compare_and_set(persistence_id, expected_revision, state)
+                    .await;
+            }
+            if crash_at != 0 && write == crash_at && !after && !conflict {
                 return Err(rakka_persistence::DurableError::store(
                     "crashing-in-memory",
                     "the owner was lost before the write reached the store",
@@ -3986,9 +4014,10 @@ where
         let write = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
         let crash_at = self.crash_at.load(Ordering::SeqCst);
         let after = self.crash_after.load(Ordering::SeqCst);
+        let conflict = self.conflict.load(Ordering::SeqCst);
 
         Box::pin(async move {
-            if crash_at != 0 && write == crash_at && !after {
+            if crash_at != 0 && write == crash_at && !after && !conflict {
                 return Err(rakka_persistence::DurableError::store(
                     "crashing-in-memory",
                     "the owner was lost before the delete reached the store",

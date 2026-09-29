@@ -6427,6 +6427,12 @@ where
     memory: Option<AgentRunMemory>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
     segments: Option<Arc<dyn AgentSegmentSink>>,
+    /// The checkpoint the command in flight would resolve, when it is a
+    /// resolution command. Set by `apply`, read by `apply_command`.
+    resolving: Option<HumanCheckpointId>,
+    /// What the command in flight committed. Set by `apply_command` between
+    /// the transition and the settle pass, taken by `apply`.
+    committed: Option<CommittedTransition>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
     workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
     metrics: Arc<dyn MetricsRecorder>,
@@ -6475,6 +6481,8 @@ where
             memory: None,
             decisions: None,
             segments: None,
+            resolving: None,
+            committed: None,
             delegation: None,
             workflow_tools: None,
             metrics: Arc::new(NoopMetricsRecorder),
@@ -6722,6 +6730,13 @@ where
         // checkpoint record, closed only once the transition committed.
         let resolving = self.resolving_checkpoint(&command);
         let resolve_timer = resolving.as_ref().map(|_| AgentSegmentTimer::start(now));
+        // Read now, for a segment that may close after the cached record is
+        // gone.
+        let context_before = self.loop_telemetry();
+        self.resolving = resolving
+            .as_ref()
+            .map(|resolving| resolving.checkpoint_id.clone());
+        self.committed = None;
         let reverify = command.clone();
         let reply = match self.apply_command(command, router, now).await {
             // A command that *commits* is fenced by its own compare-and-set:
@@ -6745,14 +6760,19 @@ where
             }
             other => other,
         };
+        let committed = self.committed.take().unwrap_or_default();
+        self.resolving = None;
         self.record_fan_in_resolution(resolution_before);
         // The resolution segment links the parked span and the incoming
         // request ([specification 17.11]), and exports under the identity the
-        // park linked forward to ([17.9]). A duplicate or a refusal resolved
-        // nothing and closes nothing.
-        let resolved = matches!(reply, Ok(AgentRunEntityReply::Applied { .. }));
+        // park linked forward to ([17.9]). Its subject is the resolution, and
+        // the resolution is the transition: it closes on the call whose
+        // transition committed and left the checkpoint no longer open,
+        // whatever the settle pass after it answered. A duplicate, a refusal,
+        // and an escalation resolved nothing and close nothing.
         let mut links = Vec::new();
-        if let (Some(resolving), Some(timer), true) = (resolving, resolve_timer, resolved) {
+        if let (Some(resolving), Some(timer), true) = (resolving, resolve_timer, committed.resolved)
+        {
             links = resolving.links();
             let mut segment = timer
                 .close(AgentSegmentOperation::CheckpointResolve)
@@ -6763,21 +6783,34 @@ where
             ) {
                 segment = segment.span_id(identity.span_id);
             }
-            self.close_segment_linked(segment.ok(), links.clone());
+            self.close_segment_under(segment.ok(), resolving.run.clone(), links.clone());
         }
         // Closed only when the wait actually ended. A command that arrives at
         // a waiting run and leaves it waiting — a duplicate, a refusal, a
         // partial fan-in — discharged nothing, and a resume segment for it
-        // would claim a transition that did not happen.
+        // would claim a transition that did not happen. The wait ends either
+        // in the command's own transition or in the settle pass after it, and
+        // either one answers: a transition that ended it is not overruled by
+        // a settle pass that parks the run on its next wait. When the settle
+        // pass lost a write and dropped the record, what the transition
+        // itself committed answers alone, under the context read before the
+        // command.
         if let Some(timer) = resume_timer {
-            let resumed = self
+            let after = self
                 .state()
                 .ok()
-                .and_then(|state| state.loop_state().map(AgentLoopState::phase))
-                .is_some_and(|phase| !phase.is_waiting());
+                .and_then(|state| state.loop_state().map(AgentLoopState::phase));
+            let (resumed, context) = match after {
+                Some(phase) => (
+                    committed.resumed || !phase.is_waiting(),
+                    self.loop_telemetry(),
+                ),
+                None => (committed.resumed, context_before),
+            };
             if resumed {
-                self.close_segment_linked(
+                self.close_segment_under(
                     timer.close(AgentSegmentOperation::RunResume).ok(),
+                    context,
                     links,
                 );
             }
@@ -7047,6 +7080,9 @@ where
             }
         };
 
+        // The command's transition committed. Whether it resolved a
+        // checkpoint, and whether the wait ended, is decided here.
+        self.note_committed_transition();
         // The inner pass: `apply`'s own sampling scope wraps this call.
         self.settle_side_effects_inner(router, now).await?;
         Ok(reply)
@@ -7729,6 +7765,25 @@ where
             .unwrap_or_default()
     }
 
+    /// Records what the transition just committed, before the settle pass
+    /// can drop the record it is read from.
+    fn note_committed_transition(&mut self) {
+        let committed = self
+            .state()
+            .ok()
+            .and_then(|state| state.loop_state())
+            .map(|loop_state| CommittedTransition {
+                resolved: self.resolving.as_ref().is_some_and(|checkpoint_id| {
+                    !loop_state
+                        .open_checkpoints()
+                        .iter()
+                        .any(|checkpoint| checkpoint.checkpoint_id == *checkpoint_id)
+                }),
+                resumed: !loop_state.phase().is_waiting(),
+            });
+        self.committed = committed;
+    }
+
     /// [`Self::close_segment`] with span links appended to the run's context:
     /// the segment stays a child of the operation that activated the run, and
     /// the links name what else caused it.
@@ -7737,10 +7792,20 @@ where
         segment: crate::observability::AgentTelemetrySegment,
         links: Vec<AgentSpanLink>,
     ) {
+        self.close_segment_under(segment, self.loop_telemetry(), links);
+    }
+
+    /// [`Self::close_segment_linked`] under a context the caller read
+    /// earlier, for a segment closed after the cached record may be gone.
+    fn close_segment_under(
+        &self,
+        segment: crate::observability::AgentTelemetrySegment,
+        telemetry: AgentTelemetryContext,
+        links: Vec<AgentSpanLink>,
+    ) {
         let Some(sink) = self.segments.as_ref() else {
             return;
         };
-        let telemetry = self.loop_telemetry();
         let telemetry = if links.is_empty() {
             telemetry
         } else {
@@ -7862,6 +7927,7 @@ where
             effect_telemetry,
             checkpoint_id,
             request,
+            run: loop_state.telemetry().clone(),
         })
     }
 
@@ -9253,6 +9319,23 @@ fn indeterminate_transition_links(
     links
 }
 
+/// What the command in flight had committed when its transition returned,
+/// read before the settle pass that follows it.
+///
+/// The settle pass is the run's next piece of work, and a failure there is
+/// reported by the call's `Err`. It can also lose a compare-and-set, which
+/// drops the cached record — after which nothing about the transition can
+/// be read back. So the two facts a segment is decided on are read here,
+/// while the record the transition wrote is still the cached one.
+#[derive(Debug, Clone, Copy, Default)]
+struct CommittedTransition {
+    /// The checkpoint the command named is no longer open: it was resolved.
+    /// An escalation commits and leaves it open, and resolved nothing.
+    resolved: bool,
+    /// The run was not waiting once the transition committed.
+    resumed: bool,
+}
+
 /// The checkpoint a resolution command names, read before the transition that
 /// retires it, with everything the `checkpoint-resolve` segment links.
 #[derive(Debug, Clone)]
@@ -9265,6 +9348,9 @@ struct ResolvingCheckpoint {
     checkpoint_id: HumanCheckpointId,
     /// The incoming request's context, from the command.
     request: AgentTelemetryContext,
+    /// The run's own context, read with the rest: a settle pass that loses a
+    /// write drops the cached record, and the context with it.
+    run: AgentTelemetryContext,
 }
 
 impl ResolvingCheckpoint {
