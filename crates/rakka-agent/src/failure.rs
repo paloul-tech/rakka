@@ -86,13 +86,14 @@ impl AgentFailureReason {
     }
 }
 
-/// One line, cut at [`AGENT_FAILURE_REASON_CODE_MAX_LENGTH`] on a character
+/// One line, with every character [`breaks_the_line`] names turned into a
+/// space, cut at [`AGENT_FAILURE_REASON_CODE_MAX_LENGTH`] on a character
 /// boundary.
 fn bounded(code: &str) -> String {
     let flat: String = code
         .chars()
         .map(|character| {
-            if character.is_control() {
+            if breaks_the_line(character) {
                 ' '
             } else {
                 character
@@ -107,6 +108,25 @@ fn bounded(code: &str) -> String {
         end -= 1;
     }
     flat[..end].to_string()
+}
+
+/// Whether a character could break a recorded line or change how it reads:
+/// a control character, Unicode's line and paragraph separators, or a
+/// bidirectional formatting control (the Arabic letter mark, the
+/// directional marks, embeddings, overrides, and isolates) that could make
+/// a record display in an order other than the one it was written in.
+fn breaks_the_line(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// Bounds a decoded code exactly as a constructed one is bounded.
@@ -144,6 +164,26 @@ mod tests {
         );
         let broken = AgentFailureReason::new("vault\nlease").expect("a reason");
         assert_eq!(broken.code(), "vault lease");
+        // Unicode's line and paragraph separators and the bidirectional
+        // formatting controls break a line, or change how it reads, as
+        // surely as a control character does.
+        for separator in [
+            '\u{2028}', '\u{2029}', '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}',
+            '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            let reason =
+                AgentFailureReason::new(format!("vault{separator}lease")).expect("a reason");
+            assert_eq!(
+                reason.code(),
+                "vault lease",
+                "U+{:04X} becomes a space",
+                u32::from(separator)
+            );
+        }
+        let decoded: AgentFailureReason =
+            serde_json::from_value(json!({"code": "vault\u{202E}lease\u{2028}x"}))
+                .expect("decodes");
+        assert_eq!(decoded.code(), "vault lease x", "decode flattens alike");
     }
 
     #[test]
