@@ -39,7 +39,10 @@ pub const MCP_DESCRIPTOR_SCHEMA_MAX_BYTES: usize = 64 * 1024;
 /// end cannot confirm the published schema.
 pub const MCP_LIST_PAGES_MAX: usize = 64;
 
-/// Largest an inline-bounded tool result may be, in bytes.
+/// Largest a tool result's content may be and stay inline, in bytes: the
+/// content as the run measures it, its `{"inline":…}` wrapper included, and
+/// equal to `rakka_agent::AGENT_TOOL_RESULT_MAX_BYTES`. An artifact reference
+/// is held to the same bound.
 pub const MCP_INLINE_RESULT_MAX_BYTES: usize = 2 * 1024;
 
 /// Largest a mapped tool error's detail text may be, in bytes.

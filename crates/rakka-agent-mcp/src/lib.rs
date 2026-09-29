@@ -16,6 +16,8 @@
 //!   launcher path's), the stored descriptor set, hint narrowing, staleness.
 //! - `executor`: `McpDispatchToolExecutor`, the schema recheck, result
 //!   mapping.
+//! - `artifacts` — the `&self` sink an executor writes an over-large result
+//!   through.
 //! - `launcher`: the child-process seam and (feature `child-process`) the
 //!   unsandboxed reference launcher.
 //! - `testkit` (feature `testkit`): the in-process fake server and counting
@@ -28,6 +30,7 @@
 
 #![forbid(unsafe_code)]
 
+mod artifacts;
 pub mod binding;
 pub mod client;
 pub mod executor;
@@ -36,6 +39,7 @@ pub mod sync;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
+pub use artifacts::{McpArtifactFuture, McpArtifactSink, McpArtifacts};
 pub use binding::{
     McpDescriptorRefresh, McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
     McpTransport, MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_CLIENT_NAME, MCP_DEFAULT_PROTOCOL_VERSIONS,
