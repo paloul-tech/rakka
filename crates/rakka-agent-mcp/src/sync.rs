@@ -472,6 +472,11 @@ where
 /// because a stdio child has no header to carry one. No credential travels
 /// over a launcher's transport, so there is none for the listing to echo.
 ///
+/// The whole sync — handshake and listing — is bounded by
+/// [`MCP_SYNC_TIMEOUT_DEFAULT_MS`]; [`sync_mcp_descriptors_over_within`] takes
+/// the caller's own bound. A sync that runs out of time is refused
+/// `mcp-descriptor-sync-failed`, with its session closed.
+///
 /// # Errors
 ///
 /// [`McpSyncError`] with its stable code; a binding that is not a child
