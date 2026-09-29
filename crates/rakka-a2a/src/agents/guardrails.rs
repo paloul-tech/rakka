@@ -121,7 +121,9 @@ pub(crate) fn apply_collaboration_text(
 /// `guardrail-content-unencodable` when the parts do not encode,
 /// `guardrail-transform-unsupported` for a transform of digested parts, and
 /// `guardrail-transform-invalid` for a transform that does not decode to
-/// parts, drops them, or touches anything but parts and cluster text.
+/// parts, drops them, touches anything but parts and cluster text, or leaves
+/// a collaboration field the command requires `null`, empty, or all
+/// whitespace.
 pub(crate) fn evaluate_a2a_content(
     chain: &AgentGuardrailChain,
     boundary: AgentGuardrailBoundary,
@@ -249,12 +251,17 @@ pub(crate) fn evaluate_a2a_content(
         // one cleared here would be half-applied: a handoff's reason has no
         // cleared form, so the original would survive a transform logged as
         // applied, and a cleared body would fail the command downstream as a
-        // missing field and blame the caller for the stage's decision.
-        if (text.body_required && new_text.body.is_none())
-            || (text.reason_required && new_text.reason.is_none())
+        // missing field and blame the caller for the stage's decision. A
+        // blank value is cleared in every way that matters: a body's mapping
+        // refuses it as missing exactly as it refuses an absent one, and a
+        // blank handoff reason would record a transfer that explains nothing.
+        let cleared =
+            |value: &Option<String>| value.as_deref().is_none_or(|value| value.trim().is_empty());
+        if (text.body_required && cleared(&new_text.body))
+            || (text.reason_required && cleared(&new_text.reason))
         {
             return Err(invalid(
-                "it clears a collaboration field the command requires",
+                "it clears or blanks a collaboration field the command requires",
             ));
         }
         review.text = Some(new_text);
@@ -490,6 +497,36 @@ mod tests {
             let refusal = review_of(&required, cleared.clone())
                 .expect_err("a required field cannot be cleared");
             assert_eq!(refusal.code, "guardrail-transform-invalid", "{cleared}");
+        }
+    }
+
+    #[test]
+    fn a_required_field_may_not_be_blanked_and_an_optional_one_may() {
+        let required = A2aCollaborationText {
+            body_required: true,
+            reason_required: true,
+            ..original()
+        };
+        for field in ["body", "reason"] {
+            for blank in ["", "   "] {
+                let view = json!({ field: blank });
+                let refusal = review_of(&required, view.clone())
+                    .expect_err("a required field cannot be blanked");
+                assert_eq!(refusal.code, "guardrail-transform-invalid", "{view}");
+
+                // `original()` requires neither field: a stage may set an
+                // optional one to anything, blank included.
+                let admitted = review_of(&original(), view.clone())
+                    .expect("an optional field may be blanked")
+                    .text
+                    .expect("the review carries the cluster text");
+                let held = if field == "body" {
+                    admitted.body
+                } else {
+                    admitted.reason
+                };
+                assert_eq!(held.as_deref(), Some(blank), "{view}");
+            }
         }
     }
 

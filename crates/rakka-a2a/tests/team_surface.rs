@@ -1168,3 +1168,30 @@ async fn a_transform_that_clears_a_team_message_body_is_refused_as_the_stages_ow
     );
     assert!(fixture.team_snapshot().await.messages.is_empty());
 }
+
+/// A body a stage rewrote to all whitespace is as cleared as a `null` one:
+/// refused as the stage's mistake, never as the caller's missing field.
+#[tokio::test]
+async fn a_transform_that_blanks_a_team_message_body_is_refused_as_the_stages_own() {
+    let fixture = Fixture::with_ingress_chain(ingress(vec![Arc::new(support::BlankClusterText)]));
+    fixture.board_world().await;
+    let error = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(team_message(
+                "m-1",
+                message_cluster(MEMBER_A, "who owns this ticket?"),
+            )),
+        )
+        .await
+        .expect_err("a required body cannot be blanked");
+    assert!(
+        matches!(
+            &error,
+            RakkaAgentA2AError::Refused { code, .. } if code == "guardrail-transform-invalid"
+        ),
+        "got {error:?}"
+    );
+    assert!(fixture.team_snapshot().await.messages.is_empty());
+}

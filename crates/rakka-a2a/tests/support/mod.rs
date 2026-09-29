@@ -142,6 +142,18 @@ impl AgentGuardrail for ClearClusterText {
     }
 }
 
+/// Sets every cluster text field the view carries to all whitespace.
+pub struct BlankClusterText;
+
+impl AgentGuardrail for BlankClusterText {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
+        AgentGuardrailOutcome::Transform {
+            content: rewritten(content, Value::String("   ".to_string())),
+            reason_code: "cluster-text-blanked".to_string(),
+        }
+    }
+}
+
 /// The view with `body` and `reason` set to `value` wherever the
 /// collaboration object carries a non-null one.
 fn rewritten(content: &Value, value: Value) -> Value {
