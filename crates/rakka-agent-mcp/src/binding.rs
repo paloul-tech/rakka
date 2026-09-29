@@ -39,6 +39,11 @@ pub const MCP_DESCRIPTOR_SCHEMA_MAX_BYTES: usize = 64 * 1024;
 /// end cannot confirm the published schema.
 pub const MCP_LIST_PAGES_MAX: usize = 64;
 
+/// Largest a server's self-reported implementation name may be as a
+/// descriptor set stores it, in bytes. A longer name is cut at a character
+/// boundary: the name is the server's to choose, and the set is release data.
+pub const MCP_SERVER_NAME_MAX_BYTES: usize = 256;
+
 /// Largest a tool result's content may be and stay inline, in bytes: the
 /// content as the run measures it, its `{"inline":…}` wrapper included, and
 /// equal to `rakka_agent::AGENT_TOOL_RESULT_MAX_BYTES`. An artifact reference
