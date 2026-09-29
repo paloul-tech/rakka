@@ -66,7 +66,17 @@ enum StartMode {
     Started,
     Adopted,
     Refused,
+    /// Refused under a code longer than the run keeps.
+    RefusedOversized,
     Conflict,
+}
+
+/// A code longer than the run keeps: the detail bound and then some.
+fn oversized_start_code() -> String {
+    format!(
+        "workflow-registry-refused-{}",
+        "x".repeat(rakka_agent::AGENT_RUN_DETAIL_MAX_LENGTH)
+    )
 }
 
 /// A recording executor: every sighting's derived identities, and a scripted
@@ -112,6 +122,10 @@ impl AgentWorkflowStartExecutor for RecordingWorkflowExecutor {
                 StartMode::Refused => AgentWorkflowStartFinding::Refused {
                     code: "workflow-registry-unknown".to_string(),
                     message: "the registry serves no such workflow".to_string(),
+                },
+                StartMode::RefusedOversized => AgentWorkflowStartFinding::Refused {
+                    code: oversized_start_code(),
+                    message: "the registry refused the start".to_string(),
                 },
                 StartMode::Conflict => AgentWorkflowStartFinding::Conflict {
                     // Deliberately not the canonical code: the dispatch layer
@@ -728,6 +742,34 @@ async fn a_failed_start_is_a_fan_in_disposition_not_a_coordinator_failure() {
     .await
     .expect_err("a settled non-started cell owns no child");
     assert_eq!(error.code(), "workflow-result-not-owned");
+}
+
+/// The code a failed start's cell keeps is bounded as the effect record's
+/// is: an executor's oversized code is cut at `AGENT_RUN_DETAIL_MAX_LENGTH`
+/// bytes on a character boundary, so the cell a run keeps past its turn
+/// cannot grow the record by whatever a deployment's executor answers.
+#[tokio::test]
+async fn a_failed_starts_cell_keeps_its_code_bounded() {
+    let executor = RecordingWorkflowExecutor::new(StartMode::RefusedOversized);
+    let fixture = workflow_fixture(executor, workflow_await_turn());
+    create_workflow_task(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    let (_, cell_status) = committed_invocation(&fixture).await;
+    let AgentWorkflowInvocationStatus::Failed { code } = cell_status else {
+        panic!("the refused start settles its cell failed: {cell_status:?}");
+    };
+    let delivered = oversized_start_code();
+    assert!(delivered.len() > rakka_agent::AGENT_RUN_DETAIL_MAX_LENGTH);
+    assert!(
+        code.len() <= rakka_agent::AGENT_RUN_DETAIL_MAX_LENGTH,
+        "the cell keeps {} bytes",
+        code.len()
+    );
+    assert!(
+        !code.is_empty() && delivered.starts_with(&code),
+        "the cell keeps a prefix of the delivered code"
+    );
 }
 
 /// An executor conflict settles the cell `Conflicted`: a child exists that

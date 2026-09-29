@@ -4576,7 +4576,7 @@ fn apply_effect_outcome(
                             cell.settle_conflicted(code.clone(), now);
                         } else {
                             cell.settle_failed_because(
-                                code.clone(),
+                                bounded_detail(code.clone()),
                                 outcome.failure_reason().cloned(),
                                 now,
                             );
@@ -4656,7 +4656,7 @@ fn apply_effect_outcome(
                         if conflict {
                             cell.settle_conflicted(code.clone(), now);
                         } else {
-                            cell.settle_failed(code.clone(), now);
+                            cell.settle_failed(bounded_detail(code.clone()), now);
                         }
                     }
                     let member = crate::fan_in::AgentFanInMemberId::from(invocation_id.clone());

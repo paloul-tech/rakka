@@ -90,6 +90,35 @@ impl AgentA2aSendExecutor for BlockedExecutor {
     }
 }
 
+/// A code longer than the run keeps: the detail bound and then some.
+fn oversized_refusal_code() -> String {
+    format!(
+        "peer-refused-{}",
+        "x".repeat(rakka_agent::AGENT_RUN_DETAIL_MAX_LENGTH)
+    )
+}
+
+/// Refuses every send under a code no stable-code contract would mint.
+struct OversizedCodeExecutor;
+
+impl AgentA2aSendExecutor for OversizedCodeExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _delegation: &'a AgentDelegationRecord,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding> {
+        Box::pin(async move {
+            Ok(AgentA2aSendFinding::Refused {
+                code: oversized_refusal_code(),
+                message: "the peer refused the send".to_string(),
+                reason: None,
+            })
+        })
+    }
+}
+
 async fn drive(fixture: &Fixture) -> (AgentDelegationStatus, Option<AgentRunStatus>) {
     fixture.instantiate_agent().await;
     fixture
@@ -183,6 +212,46 @@ async fn a_blocked_send_records_the_deciding_stage_on_its_cell() {
         state.run().expect("the record survives").terminal_reason,
         Some(AgentRunTerminalReason::ResultAccepted),
         "the run ends on its own result, not on the send's failure"
+    );
+}
+
+/// The code a failed send's cell keeps is bounded as the effect record's
+/// is: an executor's oversized code is cut at `AGENT_RUN_DETAIL_MAX_LENGTH`
+/// bytes on a character boundary, so the cell a run keeps past its turn
+/// cannot grow the record by whatever a deployment's executor answers.
+#[tokio::test]
+async fn a_failed_sends_cell_keeps_its_code_bounded() {
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(delegating_turn())
+                .with_turn(
+                    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                        .with_text("Finishing without the specialist.")
+                        .with_proposal(
+                            rakka_agent::AgentTaskContent::inline(json!({ "answer": "solo" }))
+                                .expect("the proposal is inline-bounded"),
+                        ),
+                ),
+        )
+        .with_a2a_send_executor(Arc::new(OversizedCodeExecutor)),
+    )
+    .with_delegation(delegation_config());
+
+    let (status, _) = drive(&fixture).await;
+    let AgentDelegationStatus::Failed { code, .. } = status else {
+        panic!("the refused send settles its cell failed: {status:?}");
+    };
+    let delivered = oversized_refusal_code();
+    assert!(delivered.len() > rakka_agent::AGENT_RUN_DETAIL_MAX_LENGTH);
+    assert!(
+        code.len() <= rakka_agent::AGENT_RUN_DETAIL_MAX_LENGTH,
+        "the cell keeps {} bytes",
+        code.len()
+    );
+    assert!(
+        !code.is_empty() && delivered.starts_with(&code),
+        "the cell keeps a prefix of the delivered code"
     );
 }
 
