@@ -6788,12 +6788,16 @@ where
         // Closed only when the wait actually ended. A command that arrives at
         // a waiting run and leaves it waiting — a duplicate, a refusal, a
         // partial fan-in — discharged nothing, and a resume segment for it
-        // would claim a transition that did not happen. The wait ends either
-        // in the command's own transition or in the settle pass after it, and
-        // either one answers: a transition that ended it is not overruled by
-        // a settle pass that parks the run on its next wait. When the settle
-        // pass lost a write and dropped the record, what the transition
-        // itself committed answers alone, under the context read before the
+        // would claim a transition that did not happen.
+        //
+        // Where the record survived the call, the phase after the settle pass
+        // answers, and nothing about the commit enters it. Where the settle
+        // pass lost a write and dropped the record, the segment closes only
+        // if the run was terminal once the transition committed: a terminal
+        // run cannot wait again, so the commit decides what the clean call
+        // would have answered. A run that was not terminal at the commit
+        // closes nothing on that call, because what its settle pass would
+        // have left is unknown here. The context is the one read before the
         // command.
         if let Some(timer) = resume_timer {
             let after = self
@@ -6801,11 +6805,8 @@ where
                 .ok()
                 .and_then(|state| state.loop_state().map(AgentLoopState::phase));
             let (resumed, context) = match after {
-                Some(phase) => (
-                    committed.resumed || !phase.is_waiting(),
-                    self.loop_telemetry(),
-                ),
-                None => (committed.resumed, context_before),
+                Some(phase) => (!phase.is_waiting(), self.loop_telemetry()),
+                None => (committed.terminal, context_before),
             };
             if resumed {
                 self.close_segment_under(
@@ -7081,7 +7082,7 @@ where
         };
 
         // The command's transition committed. Whether it resolved a
-        // checkpoint, and whether the wait ended, is decided here.
+        // checkpoint, and whether it left the run terminal, is decided here.
         self.note_committed_transition();
         // The inner pass: `apply`'s own sampling scope wraps this call.
         self.settle_side_effects_inner(router, now).await?;
@@ -7768,19 +7769,18 @@ where
     /// Records what the transition just committed, before the settle pass
     /// can drop the record it is read from.
     fn note_committed_transition(&mut self) {
-        let committed = self
-            .state()
-            .ok()
-            .and_then(|state| state.loop_state())
-            .map(|loop_state| CommittedTransition {
+        let committed = self.state().ok().and_then(|state| {
+            let loop_state = state.loop_state()?;
+            Some(CommittedTransition {
                 resolved: self.resolving.as_ref().is_some_and(|checkpoint_id| {
                     !loop_state
                         .open_checkpoints()
                         .iter()
                         .any(|checkpoint| checkpoint.checkpoint_id == *checkpoint_id)
                 }),
-                resumed: !loop_state.phase().is_waiting(),
-            });
+                terminal: state.status().is_some_and(AgentRunStatus::is_terminal),
+            })
+        });
         self.committed = committed;
     }
 
@@ -9332,8 +9332,8 @@ struct CommittedTransition {
     /// The checkpoint the command named is no longer open: it was resolved.
     /// An escalation commits and leaves it open, and resolved nothing.
     resolved: bool,
-    /// The run was not waiting once the transition committed.
-    resumed: bool,
+    /// The run had reached a terminal status once the transition committed.
+    terminal: bool,
 }
 
 /// The checkpoint a resolution command names, read before the transition that

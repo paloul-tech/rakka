@@ -4,11 +4,11 @@
 
 use std::sync::Arc;
 
-use rakka_agent::testkit::{CrashPoint, ScriptedDispatcher};
+use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     load_agent_run_state, AgentApprovalDecision, AgentCheckpoint, AgentCheckpointDecision,
     AgentEffectPolicies, AgentEffectSpec, AgentModelTurn, AgentOperationId, AgentOperationKind,
-    AgentRunEffect, AgentRunEntityCommand, AgentRunEntityReply, AgentSchemaPolicy,
+    AgentRunEffect, AgentRunEntityCommand, AgentRunEntityReply, AgentRunStatus, AgentSchemaPolicy,
     AgentSegmentOperation, AgentTaskContent, AgentTelemetrySegment, AgentToolCallId,
     AgentToolCallRequest, AgentToolId, InMemoryAgentRunEffectSink, InMemoryAgentSegmentSink,
     ATTR_AGENT_TELEMETRY_LINK_KIND, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
@@ -96,6 +96,32 @@ async fn park(fx: &Fixture) -> (rakka_agent::AgentCheckpoint, AgentRunEffect) {
 }
 
 fn approve(checkpoint: &rakka_agent::AgentCheckpoint, key: &str) -> AgentRunEntityCommand {
+    decide(
+        checkpoint,
+        key,
+        AgentApprovalDecision::Approve {
+            credential_binding: None,
+            expires_at: AgentTimestampMillis::new(1_000_000),
+            allowed_use_count: 1,
+        },
+    )
+}
+
+fn deny(checkpoint: &rakka_agent::AgentCheckpoint, key: &str) -> AgentRunEntityCommand {
+    decide(
+        checkpoint,
+        key,
+        AgentApprovalDecision::Deny {
+            reason: "not-authorized".to_string(),
+        },
+    )
+}
+
+fn decide(
+    checkpoint: &rakka_agent::AgentCheckpoint,
+    key: &str,
+    decision: AgentApprovalDecision,
+) -> AgentRunEntityCommand {
     AgentRunEntityCommand::ResolveCheckpoint {
         operation_id: AgentOperationId::for_agent(
             AgentOperationKind::CheckpointResolution,
@@ -109,13 +135,7 @@ fn approve(checkpoint: &rakka_agent::AgentCheckpoint, key: &str) -> AgentRunEnti
             principal_id: "approver".to_string(),
             display_name: None,
         },
-        decision: Box::new(AgentCheckpointDecision::Approval(
-            AgentApprovalDecision::Approve {
-                credential_binding: None,
-                expires_at: AgentTimestampMillis::new(1_000_000),
-                allowed_use_count: 1,
-            },
-        )),
+        decision: Box::new(AgentCheckpointDecision::Approval(decision)),
         telemetry: context(REQUEST_PARENT),
     }
 }
@@ -313,4 +333,152 @@ async fn a_refused_resolution_closes_nothing() {
         "nothing committed, so nothing was resolved: {:?}",
         sink.operations()
     );
+}
+
+/// How many resolve and resume segments the sink holds, since `before`.
+fn counts_since(sink: &InMemoryAgentSegmentSink, before: (usize, usize)) -> (usize, usize) {
+    (
+        closed(sink, "resolve").len() - before.0,
+        closed(sink, "resume").len() - before.1,
+    )
+}
+
+/// A denial fails the gated effect and ends the run in its own transition, so
+/// the commit alone decides what a clean call closes. A denial whose settle
+/// pass lost its first write closes all of it on that first call, and its
+/// re-drive closes nothing more.
+#[tokio::test]
+async fn a_denial_that_ends_the_run_closes_on_its_first_call_what_a_clean_one_closes() {
+    // The clean denial is the measure.
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fx = checkpointed_fixture().with_segments(sink.clone());
+    let (checkpoint, _) = park(&fx).await;
+    let before = counts_since(&sink, (0, 0));
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    fx.runs.reset_writes();
+    let reply = run
+        .apply(deny(&checkpoint, "d1"), &fx.router, fx.now())
+        .await
+        .expect("the denial applies");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    assert!(
+        fx.runs.writes() >= 2,
+        "the settle pass writes after the transition"
+    );
+    let state = load_agent_run_state(&fx.runs, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+    assert!(
+        state.status().is_some_and(AgentRunStatus::is_terminal),
+        "a denial ends the run: {:?}",
+        state.status()
+    );
+    let clean = counts_since(&sink, before);
+    assert_eq!(
+        clean,
+        (1, 1),
+        "a clean denial resolves the checkpoint once and ends the wait once: {:?}",
+        sink.operations()
+    );
+
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fx = checkpointed_fixture().with_segments(sink.clone());
+    let (checkpoint, _) = park(&fx).await;
+    let before = counts_since(&sink, (0, 0));
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    // Write 1 is the denying transition. Write 2 is the settle pass's first
+    // compare-and-set, which a second writer beats.
+    fx.runs.crash_at(2, CrashPoint::ConflictBeforeWrite);
+    let first = run
+        .apply(deny(&checkpoint, "d1"), &fx.router, fx.now())
+        .await;
+    fx.runs
+        .assert_crash_fired(2, CrashPoint::ConflictBeforeWrite);
+    fx.runs.survive();
+    assert!(
+        first.is_err(),
+        "the settle pass lost its write, and the call says so: {first:?}"
+    );
+    assert_eq!(
+        counts_since(&sink, before),
+        clean,
+        "the first call closes everything a clean denial closes: {:?}",
+        sink.operations()
+    );
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    let replay = run
+        .apply(deny(&checkpoint, "d1"), &fx.router, fx.now())
+        .await
+        .expect("the replay answers");
+    assert!(
+        matches!(replay, AgentRunEntityReply::Duplicate { .. }),
+        "{replay:?}"
+    );
+    assert_eq!(
+        counts_since(&sink, before),
+        clean,
+        "the re-drive closes nothing more: {:?}",
+        sink.operations()
+    );
+}
+
+/// An ordinary run — a model call, a tool call, and a model call that
+/// proposes — closes the one `run-resume` segment it closed before a
+/// resolution's segment was decided at its commit: wherever the record
+/// survives the call, the resume rule is the one it always was. The same
+/// run as `telemetry_segments.rs`'s full run.
+#[tokio::test]
+async fn an_ordinary_run_closes_the_resume_segments_it_always_closed() {
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fx = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn_for(
+                    1,
+                    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                        .with_text("Let me look that up.")
+                        .with_tool_call(
+                            AgentToolCallRequest::new(
+                                AgentToolCallId::new("call-1").expect("call id"),
+                                AgentToolId::new("lookup").expect("tool id"),
+                                serde_json::json!({ "query": "ticket" }),
+                            )
+                            .expect("the tool call is bounded"),
+                        ),
+                )
+                .with_turn_for(
+                    2,
+                    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                        .with_text("I have an answer.")
+                        .with_proposal(
+                            AgentTaskContent::inline(serde_json::json!({ "answer": "resolved" }))
+                                .expect("the proposal is inline-bounded"),
+                        ),
+                ),
+        )
+        .with_tool_result(
+            "lookup",
+            AgentTaskContent::inline(serde_json::json!({ "found": true }))
+                .expect("the tool result is inline-bounded"),
+        ),
+    )
+    .with_segments(sink.clone());
+    fx.instantiate_agent().await;
+    fx.create_task_traced(context(INGRESS_PARENT)).await;
+    fx.pump().await.expect("the run completes");
+    let state = load_agent_run_state(&fx.runs, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+    assert_eq!(state.status(), Some(AgentRunStatus::Completed));
+    // Three waits are discharged here (the first model call, the tool call,
+    // the second model call), and the first two calls that discharge one
+    // park the run on the next wait in their own settle pass. The count is
+    // the one the run closed before this rule existed.
+    assert_eq!(closed(&sink, "resume").len(), 1, "{:?}", sink.operations());
 }

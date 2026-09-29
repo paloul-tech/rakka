@@ -497,27 +497,35 @@ async fn an_escalation_closes_no_resolve_segment_and_the_resolution_closes_one()
 
 /// A reconciliation that establishes the ambiguous outcome ends the run's wait
 /// in its own transition, and the settle pass after it parks the run on its
-/// next model call. The wait that ended is recorded once, on the call that
-/// ended it: on a clean call, and on a call whose settle pass lost any of its
-/// writes, across that call and its re-drive.
+/// next model call. What a clean call closes is the measure: a call whose
+/// settle pass lost any one of its writes closes the same resolve and resume
+/// segments on that call, and its re-drive closes nothing more.
 #[tokio::test]
-async fn a_reconciled_wait_closes_one_resume_segment_whatever_the_settle_pass_did() {
+async fn a_reconciliation_whose_settle_pass_loses_a_write_closes_what_a_clean_one_closes() {
     use rakka_agent::testkit::CrashPoint;
     use rakka_agent::{AgentSegmentOperation, InMemoryAgentSegmentSink};
 
-    let resumes = |sink: &InMemoryAgentSegmentSink| {
-        sink.segments()
-            .into_iter()
+    let counts = |sink: &InMemoryAgentSegmentSink| {
+        let segments = sink.segments();
+        let resolves = segments
+            .iter()
+            .filter(|segment| matches!(segment.operation, AgentSegmentOperation::CheckpointResolve))
+            .count();
+        let resumes = segments
+            .iter()
             .filter(|segment| matches!(segment.operation, AgentSegmentOperation::RunResume))
-            .count()
+            .count();
+        (resolves, resumes)
     };
+    let since = |now: (usize, usize), before: (usize, usize)| (now.0 - before.0, now.1 - before.1);
 
-    // The clean call measures the writes a resolution performs: write 1 is
-    // the resolving transition, every later one is the settle pass's.
+    // The clean call is the measure, and it counts the writes a resolution
+    // performs: write 1 is the resolving transition, every later one is the
+    // settle pass's.
     let sink = Arc::new(InMemoryAgentSegmentSink::new());
     let fx = fixture().with_segments(sink.clone());
     let (_effect_id, _generation, checkpoint_id) = park_indeterminate(&fx).await;
-    let before = resumes(&sink);
+    let before = counts(&sink);
     let mut run = fx.run();
     run.recover(fx.now()).await.expect("the run recovers");
     fx.runs.reset_writes();
@@ -532,10 +540,12 @@ async fn a_reconciled_wait_closes_one_resume_segment_whatever_the_settle_pass_di
     assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
     let writes = fx.runs.writes();
     assert!(writes >= 2, "the settle pass writes after the transition");
+    let clean = since(counts(&sink), before);
     assert_eq!(
-        resumes(&sink) - before,
-        1,
-        "the clean call ended one wait: {:?}",
+        clean,
+        (1, 0),
+        "the clean call resolved the checkpoint once, and its settle pass parked the run on \
+         its next model call before the phase was read: {:?}",
         sink.operations()
     );
 
@@ -543,7 +553,7 @@ async fn a_reconciled_wait_closes_one_resume_segment_whatever_the_settle_pass_di
         let sink = Arc::new(InMemoryAgentSegmentSink::new());
         let fx = fixture().with_segments(sink.clone());
         let (_effect_id, _generation, checkpoint_id) = park_indeterminate(&fx).await;
-        let before = resumes(&sink);
+        let before = counts(&sink);
         let mut run = fx.run();
         run.recover(fx.now()).await.expect("the run recovers");
         fx.runs.crash_at(nth, CrashPoint::ConflictBeforeWrite);
@@ -559,9 +569,9 @@ async fn a_reconciled_wait_closes_one_resume_segment_whatever_the_settle_pass_di
         fx.runs.survive();
         assert!(first.is_err(), "write {nth} lost: {first:?}");
         assert_eq!(
-            resumes(&sink) - before,
-            1,
-            "write {nth} lost after the wait ended, and the call that ended it says so: {:?}",
+            since(counts(&sink), before),
+            clean,
+            "write {nth} lost: the errored call closes what a clean call closes: {:?}",
             sink.operations()
         );
 
@@ -580,9 +590,10 @@ async fn a_reconciled_wait_closes_one_resume_segment_whatever_the_settle_pass_di
             "write {nth}: {replay:?}"
         );
         assert_eq!(
-            resumes(&sink) - before,
-            1,
-            "write {nth}: a re-drive ends no second wait"
+            since(counts(&sink), before),
+            clean,
+            "write {nth}: the re-drive closes nothing more: {:?}",
+            sink.operations()
         );
     }
 }
