@@ -362,6 +362,27 @@ async fn the_profile_credential_reaches_call_with_under_the_attempt_deadline() {
     );
 }
 
+/// Every occurrence of the `deadline_at` key on the encoded durable surfaces,
+/// as `(surface, following text)` for the ones that are not `null`, plus the
+/// total number of occurrences seen.
+fn persisted_deadlines(
+    surfaces: &[(&'static str, String)],
+) -> (usize, Vec<(&'static str, String)>) {
+    const KEY: &str = "\"deadline_at\":";
+    let mut seen = 0;
+    let mut offending = Vec::new();
+    for (label, encoded) in surfaces {
+        for (at, _) in encoded.match_indices(KEY) {
+            seen += 1;
+            let rest = &encoded[at + KEY.len()..];
+            if !rest.starts_with("null") {
+                offending.push((*label, format!("{KEY}{}", &rest[..rest.len().min(40)])));
+            }
+        }
+    }
+    (seen, offending)
+}
+
 /// The deadline is the attempt's, not the effect's: a retry resolves its
 /// credential under a deadline recomputed from the retry's own start, and
 /// the durable record holds neither.
@@ -449,7 +470,18 @@ async fn a_retried_model_call_resolves_under_a_deadline_recomputed_from_its_own_
     assert_eq!(
         committed_model_bound(&fx).await,
         (Some(TIMEOUT_MS), None),
-        "the first attempt's deadline was never persisted"
+        "after the first attempt no deadline is on the effect record"
+    );
+    // Where the effect record still exists, the scan must see the key, or
+    // its later silence proves nothing.
+    let (seen, offending) = persisted_deadlines(&fx.durable_surfaces().await);
+    assert!(
+        seen > 0,
+        "the scan looks at a surface that carries the deadline_at key"
+    );
+    assert!(
+        offending.is_empty(),
+        "a deadline was persisted: {offending:?}"
     );
 
     // Time passes between the attempts, and only the dispatcher's clock
@@ -475,6 +507,11 @@ async fn a_retried_model_call_resolves_under_a_deadline_recomputed_from_its_own_
     assert!(
         second_deadline.as_millis() <= fx.fx.now().as_millis() + TIMEOUT_MS,
         "and still the retry's start plus the bound: {second_deadline:?}"
+    );
+    let (_, offending) = persisted_deadlines(&fx.durable_surfaces().await);
+    assert!(
+        offending.is_empty(),
+        "no durable surface holds a deadline once the retry has run: {offending:?}"
     );
 }
 
