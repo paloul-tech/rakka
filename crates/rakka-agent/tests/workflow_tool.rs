@@ -1106,6 +1106,7 @@ fn failing_send_executor() -> Arc<dyn rakka_agent::AgentA2aSendExecutor> {
                 Ok(rakka_agent::AgentA2aSendFinding::Refused {
                     code: "peer-unavailable".to_string(),
                     message: "the specialist surface refused the send".to_string(),
+                    reason: None,
                 })
             })
         }

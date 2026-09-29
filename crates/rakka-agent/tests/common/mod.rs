@@ -2176,6 +2176,7 @@ impl ApplyingHandoffExecutor {
             return rakka_agent::AgentA2aHandoffFinding::Refused {
                 code: error.code().to_string(),
                 message: error.to_string(),
+                reason: None,
             };
         }
         // The owed exchanges deliberately stay journaled: the executor
@@ -2211,6 +2212,7 @@ impl ApplyingHandoffExecutor {
             Ok(other) => rakka_agent::AgentA2aHandoffFinding::Refused {
                 code: "unexpected-reply".to_string(),
                 message: format!("unexpected entity reply {other:?}"),
+                reason: None,
             },
             // The probe posture: an error after the durable commit still
             // echoes the recorded transfer; only an unrecorded transfer is a
@@ -2222,6 +2224,7 @@ impl ApplyingHandoffExecutor {
             Err(error) => rakka_agent::AgentA2aHandoffFinding::Refused {
                 code: error.code().to_string(),
                 message: error.to_string(),
+                reason: None,
             },
         }
     }
@@ -2326,6 +2329,7 @@ impl AgentA2aSendExecutor for SkillNamedExecutor {
                 return Ok(AgentA2aSendFinding::Refused {
                     code: "peer-unavailable".to_string(),
                     message: "the specialist surface refused the send".to_string(),
+                    reason: None,
                 });
             }
             Ok(AgentA2aSendFinding::Sent {

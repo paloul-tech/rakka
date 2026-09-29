@@ -376,6 +376,7 @@ fn finding_for_error(
         } => Ok(AgentA2aHandoffFinding::Refused {
             code: "collaboration-version-unsupported".to_string(),
             message: reason.to_string(),
+            reason: None,
         }),
         RakkaAgentA2AError::Task(error) => {
             if task_error_is_ambiguous(&error) {
@@ -387,12 +388,19 @@ fn finding_for_error(
                 Ok(AgentA2aHandoffFinding::Refused {
                     code: error.code().to_string(),
                     message: error.to_string(),
+                    reason: None,
                 })
             }
         }
-        RakkaAgentA2AError::Refused { code, message } => {
-            Ok(AgentA2aHandoffFinding::Refused { code, message })
-        }
+        RakkaAgentA2AError::Refused {
+            code,
+            message,
+            reason,
+        } => Ok(AgentA2aHandoffFinding::Refused {
+            code,
+            message,
+            reason,
+        }),
         RakkaAgentA2AError::Entity(_)
         | RakkaAgentA2AError::Run(_)
         | RakkaAgentA2AError::Projection(_) => Err(AgentDispatchError::Invocation {
@@ -402,6 +410,7 @@ fn finding_for_error(
         definitive => Ok(AgentA2aHandoffFinding::Refused {
             code: definitive.code().to_string(),
             message: definitive.to_string(),
+            reason: None,
         }),
     }
 }
@@ -471,6 +480,7 @@ where
                         return Ok(AgentA2aHandoffFinding::Refused {
                             code: refusal.code,
                             message: refusal.message,
+                            reason: refusal.reason,
                         });
                     }
                 }

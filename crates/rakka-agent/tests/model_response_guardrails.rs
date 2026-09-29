@@ -291,6 +291,16 @@ fn a_blocking_stage_refuses_under_guardrail_blocked_with_the_stage_and_reason_in
         "{}",
         refusal.message
     );
+    let reason = refusal
+        .reason
+        .as_ref()
+        .expect("a guardrail block names its decision");
+    assert_eq!(reason.stage(), Some(&stage_id("response-filter")));
+    assert_eq!(
+        reason.code(),
+        "prompt-injection",
+        "the stage's own reason code, not the pipeline's"
+    );
 }
 
 #[test]
@@ -372,6 +382,31 @@ fn a_checkpoint_requiring_stage_fails_closed_under_checkpoint_required() {
         .review_model_response(&run_scope(), text_turn("hello"))
         .expect_err("no checkpoint can gate a response that exists");
     assert_eq!(refusal.code, "checkpoint-required");
+}
+
+#[test]
+fn a_checkpoint_requiring_stage_names_its_decision_too() {
+    let authority = authority_with(Arc::new(RequireHuman));
+    let refusal = authority
+        .review_model_response(&run_scope(), text_turn("hello"))
+        .expect_err("no checkpoint can gate a response that already exists");
+    assert_eq!(refusal.code, "checkpoint-required");
+    let reason = refusal.reason.expect("the requiring stage is named");
+    assert_eq!(reason.stage(), Some(&stage_id("response-filter")));
+    assert!(!reason.code().is_empty());
+}
+
+#[test]
+fn a_refusal_no_guardrail_decided_carries_no_reason() {
+    let authority = authority_with(Arc::new(InventToolCall));
+    let refusal = authority
+        .review_model_response(&run_scope(), tool_calling_turn())
+        .expect_err("an invented call id is refused");
+    assert_eq!(refusal.code, "guardrail-transform-invalid");
+    assert_eq!(
+        refusal.reason, None,
+        "the authority refused the transform; no stage blocked anything"
+    );
 }
 
 // ---------------------------------------------------------------------------

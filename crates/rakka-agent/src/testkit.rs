@@ -2527,10 +2527,14 @@ where
                                 peer_status,
                             },
                         },
-                        Ok(crate::dispatch::AgentA2aSendFinding::Conflict { code, message })
-                        | Ok(crate::dispatch::AgentA2aSendFinding::Refused { code, message }) => {
+                        Ok(crate::dispatch::AgentA2aSendFinding::Conflict { code, message }) => {
                             AgentRunEffectOutcome::failed(code, message)
                         }
+                        Ok(crate::dispatch::AgentA2aSendFinding::Refused {
+                            code,
+                            message,
+                            reason,
+                        }) => AgentRunEffectOutcome::failed(code, message).with_reason(reason),
                         // The in-process driver has no attempt machinery: a
                         // retryable failure surfaces as a failed effect, the
                         // model-adapter precedent above.
@@ -2576,10 +2580,14 @@ where
                                 peer_status,
                             },
                         },
-                        Ok(crate::dispatch::AgentA2aHandoffFinding::Conflict { code, message })
-                        | Ok(crate::dispatch::AgentA2aHandoffFinding::Refused { code, message }) => {
+                        Ok(crate::dispatch::AgentA2aHandoffFinding::Conflict { code, message }) => {
                             AgentRunEffectOutcome::failed(code, message)
                         }
+                        Ok(crate::dispatch::AgentA2aHandoffFinding::Refused {
+                            code,
+                            message,
+                            reason,
+                        }) => AgentRunEffectOutcome::failed(code, message).with_reason(reason),
                         // The in-process driver has no attempt machinery: a
                         // retryable failure surfaces as an *exhausted* effect
                         // — the real pipeline's spent retry budget — so the

@@ -1126,13 +1126,18 @@ pub struct AgentGrantedDispatch {
 /// requires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentAuthorityRefusal {
-    /// Stable machine-readable reason code.
+    /// Stable machine-readable reason code: the pipeline's.
     pub code: String,
     /// Human-readable detail.
     pub message: String,
     /// Whether the refusing condition may clear without a new definition,
     /// setup, or reconfiguration.
     pub retryable: bool,
+    /// Which decision refused, when one party decided: a guardrail's stage
+    /// and reason code. It reaches the failed effect's outcome and the run's
+    /// records beside `code`; the message does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<crate::failure::AgentFailureReason>,
 }
 
 impl AgentAuthorityRefusal {
@@ -1143,6 +1148,7 @@ impl AgentAuthorityRefusal {
             code: code.into(),
             message: message.into(),
             retryable: false,
+            reason: None,
         }
     }
 
@@ -1153,7 +1159,15 @@ impl AgentAuthorityRefusal {
             code: code.into(),
             message: message.into(),
             retryable: true,
+            reason: None,
         }
+    }
+
+    /// Names the decision that refused.
+    #[must_use]
+    pub fn with_reason(mut self, reason: Option<crate::failure::AgentFailureReason>) -> Self {
+        self.reason = reason;
+        self
     }
 }
 
@@ -3253,6 +3267,10 @@ impl Debug for AgentToolAuthority {
 /// disposition onto a refusal identically to every boundary this crate
 /// evaluates itself, rather than reimplementing the mapping.
 ///
+/// The refusal names the deciding stage and its reason code in `reason`, so
+/// the identity survives to the failed effect's record; the message keeps
+/// them too, and the block's evidence reference stays in the message only.
+///
 /// # Errors
 ///
 /// The refusal the disposition maps to: `guardrail-blocked` for a block,
@@ -3276,7 +3294,11 @@ pub fn refuse_guardrail_disposition(
             Err(AgentAuthorityRefusal::of(
                 "guardrail-blocked",
                 format!("guardrail stage {stage} blocked {what}: {reason_code}{evidence}"),
-            ))
+            )
+            .with_reason(Some(crate::failure::AgentFailureReason::guardrail(
+                stage.clone(),
+                reason_code,
+            ))))
         }
         AgentGuardrailDisposition::CheckpointRequired { stage, reason_code } => {
             if checkpoint_satisfied {
@@ -3288,7 +3310,11 @@ pub fn refuse_guardrail_disposition(
                     "guardrail stage {stage} requires a checkpoint grant, and none binds this \
                      intent: {reason_code}"
                 ),
-            ))
+            )
+            .with_reason(Some(crate::failure::AgentFailureReason::guardrail(
+                stage.clone(),
+                reason_code,
+            ))))
         }
     }
 }
@@ -5104,6 +5130,54 @@ mod tests {
         assert!(
             narrowed_grant.tools.is_empty(),
             "the run's setup narrows the model-visible list, not just dispatch"
+        );
+    }
+
+    #[test]
+    fn a_disposition_maps_its_stage_and_reason_onto_the_refusal() {
+        let stage = AgentGuardrailStageId::new("pii-filter").expect("id");
+        let blocked = AgentGuardrailDisposition::Blocked {
+            stage: stage.clone(),
+            reason_code: "denied-substring".to_string(),
+            evidence: None,
+        };
+        let refusal =
+            refuse_guardrail_disposition(&blocked, "the call", false).expect_err("a block refuses");
+        assert_eq!(refusal.code, "guardrail-blocked");
+        let reason = refusal.reason.expect("named");
+        assert_eq!(reason.stage(), Some(&stage));
+        assert_eq!(reason.code(), "denied-substring");
+
+        let gated = AgentGuardrailDisposition::CheckpointRequired {
+            stage: stage.clone(),
+            reason_code: "needs-approval".to_string(),
+        };
+        let refusal = refuse_guardrail_disposition(&gated, "the call", false)
+            .expect_err("no grant binds the intent");
+        assert_eq!(refusal.code, "checkpoint-required");
+        assert_eq!(
+            refusal.reason.as_ref().map(|reason| reason.code()),
+            Some("needs-approval")
+        );
+        assert!(refuse_guardrail_disposition(&gated, "the call", true).is_ok());
+        assert!(refuse_guardrail_disposition(
+            &AgentGuardrailDisposition::Allowed,
+            "the call",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_refusal_without_a_reason_serializes_as_it_always_did() {
+        let refusal = AgentAuthorityRefusal::of("tool-undeclared", "no such tool");
+        assert_eq!(
+            serde_json::to_value(&refusal).expect("encodes"),
+            serde_json::json!({
+                "code": "tool-undeclared",
+                "message": "no such tool",
+                "retryable": false
+            })
         );
     }
 }

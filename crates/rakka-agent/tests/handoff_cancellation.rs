@@ -113,6 +113,7 @@ impl AgentA2aHandoffSendExecutor for ApplyingHandoffExecutor {
                 return Ok(AgentA2aHandoffFinding::Refused {
                     code: error.code().to_string(),
                     message: error.to_string(),
+                    reason: None,
                 });
             }
             let router = AgentExchangeRouter::new();
@@ -140,6 +141,7 @@ impl AgentA2aHandoffSendExecutor for ApplyingHandoffExecutor {
                 (Err(error), None) => Ok(AgentA2aHandoffFinding::Refused {
                     code: error.code().to_string(),
                     message: error.to_string(),
+                    reason: None,
                 }),
             }
         })

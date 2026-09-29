@@ -602,6 +602,9 @@ pub enum AgentA2aSendFinding {
         code: String,
         /// Human-readable detail.
         message: String,
+        /// Which decision refused, when one party decided: the guardrail
+        /// stage and reason code of an egress or ingress block.
+        reason: Option<crate::failure::AgentFailureReason>,
     },
 }
 
@@ -675,6 +678,9 @@ pub enum AgentA2aHandoffFinding {
         code: String,
         /// Human-readable detail.
         message: String,
+        /// Which decision refused, when one party decided: the guardrail
+        /// stage and reason code of an egress or ingress block.
+        reason: Option<crate::failure::AgentFailureReason>,
     },
 }
 
@@ -3456,7 +3462,8 @@ where
                 Ok(AgentRunEffectOutcome::failed(
                     bounded_failure_code(&refusal.code),
                     bounded_failure_detail(&refusal.message),
-                ))
+                )
+                .with_reason(refusal.reason.clone()))
             }
         }
     }
@@ -3529,7 +3536,8 @@ where
                 Ok(AgentRunEffectOutcome::failed(
                     bounded_failure_code(&refusal.code),
                     bounded_failure_detail(&refusal.message),
-                ))
+                )
+                .with_reason(refusal.reason.clone()))
             }
         }
     }
@@ -3683,10 +3691,14 @@ where
                             peer_status,
                         },
                     }),
-                    AgentA2aSendFinding::Conflict { code, message }
-                    | AgentA2aSendFinding::Refused { code, message } => {
+                    AgentA2aSendFinding::Conflict { code, message } => {
                         Ok(AgentRunEffectOutcome::failed(code, message))
                     }
+                    AgentA2aSendFinding::Refused {
+                        code,
+                        message,
+                        reason,
+                    } => Ok(AgentRunEffectOutcome::failed(code, message).with_reason(reason)),
                 }
             }
             AgentRunEffectRequest::A2aHandoff { handoff } => {
@@ -3710,10 +3722,14 @@ where
                             peer_status,
                         },
                     }),
-                    AgentA2aHandoffFinding::Conflict { code, message }
-                    | AgentA2aHandoffFinding::Refused { code, message } => {
+                    AgentA2aHandoffFinding::Conflict { code, message } => {
                         Ok(AgentRunEffectOutcome::failed(code, message))
                     }
+                    AgentA2aHandoffFinding::Refused {
+                        code,
+                        message,
+                        reason,
+                    } => Ok(AgentRunEffectOutcome::failed(code, message).with_reason(reason)),
                 }
             }
             AgentRunEffectRequest::WorkflowStart { invocation } => {
@@ -3962,7 +3978,8 @@ where
             AgentRunEffectOutcome::failed(
                 bounded_failure_code(&refusal.code),
                 bounded_failure_detail(&refusal.message),
-            ),
+            )
+            .with_reason(refusal.reason.clone()),
             pass,
         )
         .await?;

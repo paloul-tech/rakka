@@ -123,6 +123,13 @@ fn chain_at(
         .expect("the stage registers")
 }
 
+/// The stage a finding or an error names, as text.
+fn named_stage(reason: Option<&rakka_agent::AgentFailureReason>) -> Option<String> {
+    reason
+        .and_then(rakka_agent::AgentFailureReason::stage)
+        .map(ToString::to_string)
+}
+
 /// Counts evaluations and records the last content it saw.
 #[derive(Default)]
 struct Recording {
@@ -418,6 +425,14 @@ async fn an_ingress_block_refuses_the_send_and_creates_nothing() {
             matches!(&error, RakkaAgentA2AError::Refused { code, .. } if code == "guardrail-blocked"),
             "got {error:?}"
         );
+        let RakkaAgentA2AError::Refused { reason, .. } = &error else {
+            unreachable!("asserted above")
+        };
+        assert_eq!(
+            named_stage(reason.as_ref()).as_deref(),
+            Some("a2a-filter"),
+            "the ingress block names its stage on the error an in-process caller reads"
+        );
     }
     // The second refusal alone proves nothing — the block precedes dedup, so
     // it would answer the same way over a task the first send had created.
@@ -678,6 +693,18 @@ async fn an_ingress_block_reaches_an_in_process_executor_as_a_refused_finding() 
         matches!(&finding, AgentA2aSendFinding::Refused { code, .. } if code == "guardrail-blocked"),
         "got {finding:?}"
     );
+    let AgentA2aSendFinding::Refused { reason, .. } = &finding else {
+        unreachable!("asserted above")
+    };
+    assert_eq!(
+        named_stage(reason.as_ref()).as_deref(),
+        Some("a2a-filter"),
+        "the blocking stage is named on the finding"
+    );
+    assert_eq!(
+        reason.as_ref().map(rakka_agent::AgentFailureReason::code),
+        Some("prompt-injection")
+    );
 }
 
 /// An egress block refuses the delegation before the service sees the message.
@@ -707,6 +734,18 @@ async fn an_egress_block_refuses_the_delegation_send_before_the_service_sees_it(
     assert!(
         matches!(&finding, AgentA2aSendFinding::Refused { code, .. } if code == "guardrail-blocked"),
         "got {finding:?}"
+    );
+    let AgentA2aSendFinding::Refused { reason, .. } = &finding else {
+        unreachable!("asserted above")
+    };
+    assert_eq!(
+        named_stage(reason.as_ref()).as_deref(),
+        Some("a2a-filter"),
+        "the blocking stage is named on the finding"
+    );
+    assert_eq!(
+        reason.as_ref().map(rakka_agent::AgentFailureReason::code),
+        Some("prompt-injection")
     );
     assert_eq!(
         recording.seen.load(Ordering::SeqCst),
@@ -768,6 +807,18 @@ async fn an_egress_block_refuses_the_handoff_send() {
     assert!(
         matches!(&finding, AgentA2aHandoffFinding::Refused { code, .. } if code == "guardrail-blocked"),
         "got {finding:?}"
+    );
+    let AgentA2aHandoffFinding::Refused { reason, .. } = &finding else {
+        unreachable!("asserted above")
+    };
+    assert_eq!(
+        named_stage(reason.as_ref()).as_deref(),
+        Some("a2a-filter"),
+        "the blocking stage is named on the finding"
+    );
+    assert_eq!(
+        reason.as_ref().map(rakka_agent::AgentFailureReason::code),
+        Some("prompt-injection")
     );
     assert_eq!(recording.seen.load(Ordering::SeqCst), 0);
 }
