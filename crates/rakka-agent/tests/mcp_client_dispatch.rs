@@ -657,7 +657,9 @@ async fn the_credential_never_reaches_a_durable_record_or_the_fleet_index() {
 /// `dispatch-collaborator-failed` as the stable code — the effect's
 /// `last_error_code`, the run's terminal reason — and the deployment's own
 /// `egress-denied-by-policy` rides the bounded detail on the outbox row and
-/// the fleet index.
+/// the fleet index. The deployment's code is also the failure's reason, a
+/// field of its own on the effect record (`last_error_reason`) and on the
+/// terminal reason, and this test asserts both.
 #[tokio::test]
 async fn an_egress_refusal_fails_the_attempt_under_the_deployments_code_after_the_credential_was_resolved_and_dropped(
 ) {

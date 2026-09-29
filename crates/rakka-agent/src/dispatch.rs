@@ -421,6 +421,11 @@ pub trait AgentRunResultDelivery: Send + Sync {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentDispatchToolExecutor: Send + Sync {
     /// Performs the call and returns its bounded result.
     fn execute<'a>(
@@ -449,6 +454,11 @@ pub trait AgentDispatchToolExecutor: Send + Sync {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentCompensationExecutor: Send + Sync {
     /// Performs the compensation and returns its bounded result.
     fn execute<'a>(
@@ -500,6 +510,11 @@ pub enum AgentMemoryPromotionFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentMemoryPromotionExecutor: Send + Sync {
     /// Performs the promotion and returns its bounded finding.
     fn execute<'a>(
@@ -569,6 +584,11 @@ pub enum AgentGoalEvaluationFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentGoalEvaluationExecutor: Send + Sync {
     /// Performs the evaluation and returns its bounded finding.
     fn execute<'a>(
@@ -644,6 +664,12 @@ pub enum AgentA2aSendFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record and the delegation's cell — and `EffectFailed`, when the failure
+/// ends the run — as the failure's reason, bounded at
+/// `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentA2aSendExecutor: Send + Sync {
     /// Performs the send and returns its bounded finding.
     fn execute<'a>(
@@ -723,6 +749,11 @@ pub enum AgentA2aHandoffFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentA2aHandoffSendExecutor: Send + Sync {
     /// Performs the send and returns its bounded finding.
     fn execute<'a>(
@@ -801,6 +832,11 @@ pub enum AgentWorkflowStartFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentWorkflowStartExecutor: Send + Sync {
     /// Performs the start and returns its bounded finding.
     fn execute<'a>(
@@ -865,6 +901,11 @@ pub enum AgentWorkflowCancelFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentWorkflowCancelExecutor: Send + Sync {
     /// Performs the cancel delivery and returns its bounded finding.
     fn execute<'a>(
@@ -922,6 +963,11 @@ pub enum AgentClaimAppendFinding {
 /// what the text *contains* is this implementation's contract, and it
 /// MUST carry no credential, argument, or content material
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentClaimAppendExecutor: Send + Sync {
     /// Performs the append and returns its bounded finding.
     fn execute<'a>(
@@ -2749,20 +2795,23 @@ where
                         // Resolution failures may be transient: burn the
                         // attempt under the intent's policy.
                         //
-                        // What the attempt *persists* is Rakka-authored. A
-                        // resolver's own failure text is application-supplied
-                        // and may quote a secret store's response verbatim,
-                        // and `record_attempt_failure` writes what it is given
-                        // into the durable outbox row and the fleet index —
-                        // two records every worker in the fleet can read. The
-                        // substrate already draws this line for itself
-                        // (`AgentCredentialError::to_outbox_dispatch_result`
+                        // What the attempt *persists* is Rakka-authored, save
+                        // one identifier. A resolver's own failure text is
+                        // application-supplied and may quote a secret store's
+                        // response verbatim, and `record_attempt_failure` writes
+                        // what it is given into the durable outbox row and the
+                        // fleet index — two records every worker in the fleet
+                        // can read. The substrate already draws this line for
+                        // itself (`AgentCredentialError::to_outbox_dispatch_result`
                         // emits its code alone), and
                         // [specification 16](../../../docs/plans/rakka-agent/spec.md)
                         // requires that credentials never be logged or
                         // persisted. The resolver keeps its own detail; the
                         // operator gets the logical binding, which is what
-                        // they act on.
+                        // they act on. The one thing of the resolver's that is
+                        // persisted is its stable code: once the retry budget
+                        // is spent, it rides the `Exhausted` word as the
+                        // failure's reason. Its detail never does.
                         tracing::warn!(
                             effect_id = intent.effect_id.as_str(),
                             generation = intent.generation.get(),
