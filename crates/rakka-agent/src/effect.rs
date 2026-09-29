@@ -1831,6 +1831,13 @@ pub struct AgentRunEffect {
     pub dispatched_at: Option<AgentTimestampMillis>,
     /// Stable code of the last dispatch or execution failure.
     pub last_error_code: Option<String>,
+    /// Which decision failed the last dispatch or execution, when one party
+    /// decided: a guardrail's stage and reason code, a collaborator's own
+    /// code. Beside [`Self::last_error_code`], which stays the pipeline's.
+    /// Observability only, never correctness: an effect persisted before
+    /// this field decodes with none, and no dispatch decision reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_reason: Option<crate::failure::AgentFailureReason>,
     /// Whether the effect may dispatch only under a durable checkpoint grant
     /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)). Projected
     /// from the tool binding at commit time, so the run parks on an approval
@@ -1901,6 +1908,7 @@ impl AgentRunEffect {
             created_at,
             dispatched_at: None,
             last_error_code: None,
+            last_error_reason: None,
             checkpoint_required: spec.checkpoint_required,
             authorization_required: spec.authorization_required,
             telemetry: AgentTelemetryContext::default(),
@@ -2003,6 +2011,7 @@ impl AgentRunEffect {
         self.last_fence = None;
         self.dispatched_at = None;
         self.last_error_code = None;
+        self.last_error_reason = None;
         self.created_at = now;
         self.telemetry = superseded_generation_telemetry(&self.telemetry);
         Ok(())

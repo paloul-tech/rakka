@@ -21,15 +21,16 @@ use common::{
     handoff_target_run_scope, handoff_target_scope, handoff_tool_id, run_scope, task_definition,
     ApplyingHandoffExecutor, Fixture, HANDOFF_SKILL, HANDOFF_TARGET,
 };
-use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
+use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::SessionMemoryStore;
 use rakka_agent::{
     handoff_id_for, AgentA2aHandoffFinding, AgentA2aHandoffSendExecutor, AgentAssignmentGeneration,
     AgentAssignmentStatus, AgentDispatchFuture, AgentHandoffRecord, AgentHandoffStatus,
     AgentLoopPhase, AgentModelTurn, AgentOperationId, AgentOperationKind,
-    AgentRunCollaborationView, AgentRunEffect, AgentRunEffectKind, AgentRunScope, AgentRunStatus,
-    AgentTaskContent, AgentTaskEntityCommand, AgentTaskEntityReply, AgentTaskEntityStore,
-    AgentTaskHandoffStatus, AgentTaskScope, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest,
+    AgentRunCollaborationView, AgentRunEffect, AgentRunEffectKind, AgentRunEffectStatus,
+    AgentRunScope, AgentRunStatus, AgentRunTerminalReason, AgentTaskContent,
+    AgentTaskEntityCommand, AgentTaskEntityReply, AgentTaskEntityStore, AgentTaskHandoffStatus,
+    AgentTaskScope, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentEphemeralCredential;
@@ -79,6 +80,22 @@ impl StubHandoffExecutor {
             finding: AgentA2aHandoffFinding::Recorded {
                 target_generation: Some(AgentAssignmentGeneration::new(2)),
                 peer_status: "working".to_string(),
+            },
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Refuses every send as an egress guardrail would.
+    fn blocked() -> Arc<Self> {
+        Arc::new(Self {
+            finding: AgentA2aHandoffFinding::Refused {
+                code: "guardrail-blocked".to_string(),
+                message: "guardrail stage a2a-filter blocked the outbound handoff message"
+                    .to_string(),
+                reason: Some(rakka_agent::AgentFailureReason::guardrail(
+                    rakka_agent::AgentGuardrailStageId::new("a2a-filter").expect("id"),
+                    "prompt-injection",
+                )),
             },
             seen: Mutex::new(Vec::new()),
         })
@@ -726,6 +743,87 @@ async fn a_refused_target_restores_the_source_and_the_run_resumes() {
     ));
     assert!(provenance.result_settled);
     assert!(task.accepted_result.is_some());
+}
+
+/// A handoff a guardrail blocked never reaches a terminal reason: the run
+/// survives it. The deciding stage is on the two records that do exist, the
+/// handoff cell and the send's effect.
+///
+/// The cell outlives the run. The send's effect leaves the loop with its turn
+/// (`AgentLoopState::clear_turn`), so the completed record no longer holds
+/// it: the effect is read from every state the flow commits, by losing the
+/// owner after each write in turn, and must be seen failed at least once.
+#[tokio::test]
+async fn a_blocked_handoff_records_the_deciding_stage_and_the_run_survives() {
+    let blocked = || {
+        handoff_fixture(
+            StubHandoffExecutor::blocked(),
+            vec![handoff_turn(handoff_arguments()), proposing_turn()],
+        )
+    };
+    let fixture = blocked();
+    create_goal_task(&fixture).await;
+    fixture.runs.reset_writes();
+    fixture.pump().await.expect("the loop should converge");
+    let writes = fixture.runs.writes();
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    assert_eq!(
+        state.status(),
+        Some(AgentRunStatus::Completed),
+        "the source resumed past the refusal"
+    );
+    let source = state.run().expect("the record survives");
+    let cell = source.loop_state.handoff().expect("the cell survives");
+    let AgentHandoffStatus::Failed { code, reason } = &cell.status else {
+        panic!("the cell settles failed, got {:?}", cell.status)
+    };
+    assert_eq!(code, "guardrail-blocked");
+    let reason = reason.as_ref().expect("the deciding stage is recorded");
+    assert_eq!(reason.code(), "prompt-injection");
+    assert_eq!(
+        reason.stage().map(ToString::to_string).as_deref(),
+        Some("a2a-filter")
+    );
+    assert_eq!(
+        source.terminal_reason,
+        Some(AgentRunTerminalReason::ResultAccepted)
+    );
+
+    let mut failed_sends = 0;
+    for point in 1..=writes {
+        let crashed = blocked();
+        create_goal_task(&crashed).await;
+        crashed.runs.crash_at(point, CrashPoint::AfterWrite);
+        let _ = crashed.pump().await;
+        crashed
+            .runs
+            .assert_crash_fired(point, CrashPoint::AfterWrite);
+        crashed.runs.survive();
+        let committed = rakka_persistence::DurableStateStore::load(
+            &crashed.runs,
+            &run_scope().persistence_id(),
+        )
+        .await
+        .expect("the run state loads")
+        .expect("a write committed it");
+        let Some(held) = committed.state.run() else {
+            continue;
+        };
+        for send in held.loop_state.effects().iter().filter(|effect| {
+            effect.effect_id == cell.record.effect && effect.status == AgentRunEffectStatus::Failed
+        }) {
+            failed_sends += 1;
+            assert_eq!(send.last_error_code.as_deref(), Some("guardrail-blocked"));
+            assert_eq!(send.last_error_reason.as_ref(), Some(reason));
+        }
+    }
+    assert!(
+        failed_sends > 0,
+        "no committed state held the failed send; the sweep covers {writes} writes"
+    );
 }
 
 /// Records persisted before this slice decode without the new fields, and a

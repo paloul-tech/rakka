@@ -474,8 +474,12 @@ pub enum AgentRunTerminalReason {
     EffectFailed {
         /// The effect that failed.
         effect_id: AgentEffectId,
-        /// Its stable failure code.
+        /// Its stable failure code: the pipeline's.
         code: String,
+        /// Which decision failed it, when one party decided. Observability
+        /// only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<crate::failure::AgentFailureReason>,
     },
     /// An ambiguous effect was closed by an explicitly scheduled compensation
     /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)); the run
@@ -4450,6 +4454,7 @@ fn apply_effect_outcome(
             // work already at the dispatch layer settles truthfully.
             effect.status = outcome.resolved_status();
             effect.last_error_code = Some(bounded_detail(code.clone()));
+            effect.last_error_reason = outcome.failure_reason().cloned();
             let failed_kind = effect.kind();
             let code = code.clone();
             // A handoff send resolves before the shared wind-down logic: the
@@ -4481,7 +4486,11 @@ fn apply_effect_outcome(
                         .handoff()
                         .map(|cell| cell.record.call_id.clone());
                     if let Some(cell) = run.loop_state.handoff_mut() {
-                        cell.settle_failed(bounded_detail(code.clone()), now);
+                        cell.settle_failed_because(
+                            bounded_detail(code.clone()),
+                            outcome.failure_reason().cloned(),
+                            now,
+                        );
                     }
                     if let Some(call_id) = call_id {
                         let content = AgentTaskContent::inline(serde_json::json!({
@@ -4566,7 +4575,11 @@ fn apply_effect_outcome(
                         if conflict {
                             cell.settle_conflicted(code.clone(), now);
                         } else {
-                            cell.settle_failed(code.clone(), now);
+                            cell.settle_failed_because(
+                                code.clone(),
+                                outcome.failure_reason().cloned(),
+                                now,
+                            );
                         }
                     }
                     // A send whose delegation belongs to the run's fan-out
@@ -4689,6 +4702,7 @@ fn apply_effect_outcome(
                     run.terminal_reason = Some(AgentRunTerminalReason::EffectFailed {
                         effect_id: effect_id.clone(),
                         code: bounded_detail(code),
+                        reason: outcome.failure_reason().cloned(),
                     });
                 }
             }
@@ -10042,6 +10056,13 @@ mod tests {
     #[test]
     fn the_growth_reserve_covers_the_maximal_working_set() {
         let now = AgentTimestampMillis::new(1);
+        let maximal_reason = crate::failure::AgentFailureReason::guardrail(
+            crate::definition::AgentGuardrailStageId::new(
+                "s".repeat(crate::identity::AGENT_IDENTITY_MAX_LENGTH),
+            )
+            .expect("the stage id is valid"),
+            "c".repeat(crate::failure::AGENT_FAILURE_REASON_CODE_MAX_LENGTH),
+        );
         // Maximal identifiers: every derived id in the working set — effect
         // ids, idempotency keys, the proposal id — scales with these.
         let long = "a".repeat(crate::identity::AGENT_IDENTITY_MAX_LENGTH);
@@ -10127,6 +10148,8 @@ mod tests {
         )
         .expect("the model effect derives");
         model_effect.status = AgentRunEffectStatus::Succeeded;
+        model_effect.last_error_code = Some("c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH));
+        model_effect.last_error_reason = Some(maximal_reason.clone());
         run.loop_state
             .record_effect(model_effect)
             .expect("the model effect records");
@@ -10159,7 +10182,7 @@ mod tests {
         // One outstanding effect per call — each copies its call — and one
         // maximal tool result per call besides.
         for (index, call) in calls.into_iter().enumerate() {
-            let effect = AgentRunEffect::new(
+            let mut effect = AgentRunEffect::new(
                 &scope,
                 turn,
                 index + 1,
@@ -10171,6 +10194,8 @@ mod tests {
                 now,
             )
             .expect("the tool effect derives");
+            effect.last_error_code = Some("c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH));
+            effect.last_error_reason = Some(maximal_reason.clone());
             run.loop_state
                 .record_effect(effect)
                 .expect("the tool effect records");
@@ -10552,6 +10577,7 @@ mod tests {
             None,
             AgentHandoffStatus::Failed {
                 code: "run-winding-down".to_string(),
+                reason: None,
             },
         );
         let result = accept_handoff_result(&mut live, &envelope, now);
@@ -10582,6 +10608,7 @@ mod tests {
             }),
             AgentHandoffStatus::Failed {
                 code: "run-winding-down".to_string(),
+                reason: None,
             },
         );
         let result = accept_handoff_result(&mut terminal, &envelope, now);

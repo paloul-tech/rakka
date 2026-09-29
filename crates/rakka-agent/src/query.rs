@@ -561,7 +561,7 @@ impl AgentGoalHandoffView {
             AgentHandoffStatus::Pending => (None, None),
             AgentHandoffStatus::Sent { target_generation } => (None, *target_generation),
             AgentHandoffStatus::Accepted { generation, .. } => (None, Some(*generation)),
-            AgentHandoffStatus::Refused { code } | AgentHandoffStatus::Failed { code } => {
+            AgentHandoffStatus::Refused { code } | AgentHandoffStatus::Failed { code, .. } => {
                 (Some(code.clone()), None)
             }
         };

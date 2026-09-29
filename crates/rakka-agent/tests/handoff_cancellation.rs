@@ -254,7 +254,7 @@ async fn a_cancellation_fence_settles_the_unsent_handoff_cell() {
                 assert!(
                     matches!(
                         &cell.status,
-                        AgentHandoffStatus::Failed { code } if code == "run-winding-down"
+                        AgentHandoffStatus::Failed { code, .. } if code == "run-winding-down"
                     ),
                     "the fence settles the unsent send's cell in the same transition, got {:?}",
                     cell.status

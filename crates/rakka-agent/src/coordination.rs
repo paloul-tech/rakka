@@ -1510,6 +1510,10 @@ pub enum AgentHandoffStatus {
     Failed {
         /// Stable machine-readable failure code.
         code: String,
+        /// Which decision failed the send, when one party decided.
+        /// Observability only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<crate::failure::AgentFailureReason>,
     },
 }
 
@@ -1643,12 +1647,26 @@ impl AgentHandoffCell {
         self.settled_at = Some(now);
     }
 
-    /// Settles the cell with a definitive failure, first-writer-wins.
+    /// Settles the cell with a definitive failure no single party decided.
     pub fn settle_failed(&mut self, code: impl Into<String>, now: AgentTimestampMillis) {
+        self.settle_failed_because(code, None, now);
+    }
+
+    /// Settles the cell with a definitive failure and the decision behind
+    /// it, first-writer-wins.
+    pub fn settle_failed_because(
+        &mut self,
+        code: impl Into<String>,
+        reason: Option<crate::failure::AgentFailureReason>,
+        now: AgentTimestampMillis,
+    ) {
         if self.status.is_settled() {
             return;
         }
-        self.status = AgentHandoffStatus::Failed { code: code.into() };
+        self.status = AgentHandoffStatus::Failed {
+            code: code.into(),
+            reason,
+        };
         self.settled_at = Some(now);
     }
 }

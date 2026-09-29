@@ -438,6 +438,19 @@ async fn a_blocked_model_response_ends_the_run_once_and_never_reaches_memory() {
     fx.pump().await;
 
     assert_eq!(fx.terminal_failure_code().await, "guardrail-blocked");
+    let reason = fx
+        .terminal_failure_reason()
+        .await
+        .expect("the run's record names the decision");
+    assert_eq!(reason.stage(), Some(&stage_id("response-filter")));
+    assert_eq!(reason.code(), "prompt-injection");
+    let model_effect = fx.effect_at(0).await.expect("the model effect");
+    assert_eq!(
+        model_effect.last_error_code.as_deref(),
+        Some("guardrail-blocked"),
+        "the pipeline code is unchanged"
+    );
+    assert_eq!(model_effect.last_error_reason.as_ref(), Some(&reason));
     assert_eq!(
         fx.adapter.calls(),
         1,
@@ -454,6 +467,47 @@ async fn a_blocked_model_response_ends_the_run_once_and_never_reaches_memory() {
             .all(|text| !text.contains(MARKER)),
         "the blocked text never entered session memory: {:?}",
         page.entries
+    );
+}
+
+/// A built-in stage is named on the run's records under its exported reason
+/// code, and the refusal's words are in no record.
+#[tokio::test]
+async fn a_built_in_stage_is_named_on_the_runs_records_and_its_message_is_not() {
+    let rule = rakka_agent::DenySubstrings::new(["ignore previous"]).expect("the rule is valid");
+    let fx = AuthorityFixture::new(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn(MARKER, "done")),
+        authority_with(Arc::new(rule)),
+        None,
+    );
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(fx.terminal_failure_code().await, "guardrail-blocked");
+    let reason = fx
+        .terminal_failure_reason()
+        .await
+        .expect("the run's record names the decision");
+    assert_eq!(
+        reason.code(),
+        rakka_agent::AGENT_GUARDRAIL_REASON_DENIED_SUBSTRING
+    );
+    assert_eq!(reason.stage(), Some(&stage_id("response-filter")));
+
+    let state = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    let encoded = serde_json::to_string(&state).expect("the run state encodes");
+    assert!(encoded.contains("denied-substring"), "{encoded}");
+    assert!(encoded.contains("response-filter"), "{encoded}");
+    assert!(
+        !encoded.contains("blocked the model response"),
+        "the refusal's message reaches no record: {encoded}"
     );
 }
 

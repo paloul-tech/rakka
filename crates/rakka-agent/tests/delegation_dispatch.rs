@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use common::{
     delegation_config, delegation_tool_id, goal_spec_draft, goal_spec_with_delegation,
-    goal_task_creation_command, task_definition, Fixture, AGENT, SKILL, TENANT,
+    goal_task_creation_command, run_scope, task_definition, AuthorityFixture, Fixture, AGENT,
+    SKILL, TENANT,
 };
 use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
@@ -54,6 +55,35 @@ impl AgentA2aSendExecutor for ConflictExecutor {
             Ok(AgentA2aSendFinding::Conflict {
                 code: "delegation-child-conflict".to_string(),
                 message: "the peer holds a child this delegation does not own".to_string(),
+            })
+        })
+    }
+}
+
+/// Refuses every send as an egress guardrail would: the pipeline code, and
+/// the stage and reason code that decided.
+struct BlockedExecutor;
+
+fn blocking_reason() -> rakka_agent::AgentFailureReason {
+    rakka_agent::AgentFailureReason::guardrail(
+        rakka_agent::AgentGuardrailStageId::new("a2a-filter").expect("id"),
+        "prompt-injection",
+    )
+}
+
+impl AgentA2aSendExecutor for BlockedExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _delegation: &'a AgentDelegationRecord,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding> {
+        Box::pin(async move {
+            Ok(AgentA2aSendFinding::Refused {
+                code: "guardrail-blocked".to_string(),
+                message: "guardrail stage a2a-filter blocked the outbound A2A message".to_string(),
+                reason: Some(blocking_reason()),
             })
         })
     }
@@ -98,10 +128,85 @@ async fn an_absent_executor_fails_the_send_closed() {
     assert_eq!(
         status,
         AgentDelegationStatus::Failed {
-            code: "a2a-send-executor-missing".to_string()
+            code: "a2a-send-executor-missing".to_string(),
+            reason: None,
         }
     );
     assert_eq!(run_status, Some(AgentRunStatus::Failed));
+}
+
+/// A send a guardrail blocked settles its cell under the pipeline code, with
+/// the stage and reason code beside it.
+#[tokio::test]
+async fn a_blocked_send_records_the_deciding_stage_on_its_cell() {
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new().with_turn(delegating_turn()),
+        )
+        .with_a2a_send_executor(Arc::new(BlockedExecutor)),
+    )
+    .with_delegation(delegation_config());
+
+    let (status, run_status) = drive(&fixture).await;
+    assert_eq!(
+        status,
+        AgentDelegationStatus::Failed {
+            code: "guardrail-blocked".to_string(),
+            reason: Some(blocking_reason()),
+        }
+    );
+    assert_eq!(run_status, Some(AgentRunStatus::Failed));
+}
+
+/// The same block through the production dispatcher: its send arm, not the
+/// scripted driver's copy, carries the deciding stage to the cell.
+///
+/// The send is a member of the turn's fan-in group, so its refusal is a
+/// disposition the coordinator survives, and its effect leaves the loop with
+/// its turn: the cell is the record that keeps the decision.
+#[tokio::test]
+async fn the_pipeline_records_a_blocked_sends_deciding_stage_on_its_cell() {
+    let fx = AuthorityFixture::over(
+        DeterministicModelAdapter::new().with_turn(delegating_turn()),
+        rakka_agent::AgentToolRegistry::new(),
+        None,
+    )
+    .with_delegation(delegation_config())
+    .with_a2a_send_executor(Arc::new(BlockedExecutor));
+    fx.fx
+        .instantiate_agent_with_envelope(fx.envelope.clone())
+        .await;
+    fx.fx
+        .apply_task_command(goal_task_creation_command(
+            task_definition(),
+            goal_spec_draft(goal_spec_with_delegation(), true),
+        ))
+        .await
+        .expect("the goal task should create");
+    fx.pump().await;
+
+    let state = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    let loop_state = state.loop_state().expect("loop state");
+    assert_eq!(loop_state.delegation_count(), 1);
+    let cell = loop_state
+        .delegations()
+        .values()
+        .next()
+        .expect("the cell exists");
+    assert_eq!(
+        cell.status,
+        AgentDelegationStatus::Failed {
+            code: "guardrail-blocked".to_string(),
+            reason: Some(blocking_reason()),
+        }
+    );
 }
 
 /// A cancellation that lands between the compare-and-set committing a
@@ -184,7 +289,8 @@ async fn a_cancellation_fence_settles_the_unsent_delegation_cell() {
                 assert_eq!(
                     cell.status,
                     AgentDelegationStatus::Failed {
-                        code: "run-winding-down".to_string()
+                        code: "run-winding-down".to_string(),
+                        reason: None,
                     },
                     "the fence settles the unsent send's cell in the same transition"
                 );
