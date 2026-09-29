@@ -4,7 +4,11 @@ Status: design spec, awaiting review. Drafted 2026-09-19; scope reduced
 2026-09-20 at the author's direction (see "Cut from the first draft" in the
 summary); revised 2026-09-20 after the host's product-authority assessment
 (section 0); the host accepted the revision later the same day, and its one
-optional ask back is adopted as R17 (section 0, "Host response"). Branch
+optional ask back is adopted as R17 (section 0, "Host response"). **The phase
+was cut after slice 7.7 on 2026-09-28** at the owner's direction (section 0,
+"Phase cut"): slices 7.2, 7.1, and 7.7 are delivered, slices 7.3 through 7.6,
+7.8, and 7.9 are deferred with their designs intact (11.4), and slice 7.10 is
+revised to the delivered slices' follow-ups and the close (12). Branch
 `rakka-agents`.
 Brief: close the developer-facing gaps section 10 of
 [`docs/comparisons/akka/rakka-akka-comparison-audit-2026-09-19.md`](../../comparisons/akka/rakka-akka-comparison-audit-2026-09-19.md)
@@ -142,6 +146,41 @@ feature list; and three plan-refinement marks in 5.2 (refinements 2, 3,
 and 4: `Listen`, identity, and the recheck TTL) are corrected against the
 rmcp 3.4.0 source.
 
+**Phase cut (2026-09-28).** The owner cut the phase after slice 7.7, the
+point section 12 named for a short phase. The reason is the consumer's: the
+host's assessment rated the remaining capabilities not needed, and the host
+has since built the one thing the directory would have offered, its own
+fleet index. Three slices are delivered and merged: 7.2 (PR #77), 7.1 (PR
+#78), and 7.7 (PR #79). Six are deferred, each with its design section left
+whole so a later phase starts from it: 7.3 (section 7.1's stores and
+watchers), 7.4 (section 3), 7.5 (section 7.2), 7.6 (section 9), 7.8 (section
+8), and 7.9 (section 10); 11.4 lists them with the five capabilities cut from
+the first draft. Slice 7.10 is revised from the acceptance walk across every
+capability to the delivered slices' follow-ups and the close (12), and the
+acceptance statement is reduced to what was delivered (13). Two follow-ups
+need a decision before they can be built and are recorded as open in 11.4:
+the mapping of an MCP input-required answer to a human checkpoint, and the
+enforcement of `model-profile-revision-mismatch`. What follows the phase is
+issue #69, the first of the consumer's priorities in section 14.
+
+**Slice 7.10 (2026-09-28).** What the follow-up slice built, each marked
+inline as "slice 7.10": the MCP executor writes an over-large result through
+`McpArtifactSink`, a `&self` seam handed the run scope, and measures every
+result as the run does (5.3); a sync refuses server text that carries the
+credential it sent, bounds the server name, and runs under a deadline (5.2);
+a failure's deciding identity, `AgentFailureReason`, rides from the refusal
+to the run's records, and a collaborator's own code is the reason of an
+exhausted outcome (11.1, and issue #80); a `checkpoint-resolve` segment
+closes when the resolution commits; a model-response transform may not add a
+proposal or rewrite a reference (6.1); an A2A transform may not clear or
+blank a field the command requires and the message carried, and every
+ingress leaf is proven with a chain installed (6.3); and the two-attempt
+deadline proof 4.7 named exists. One statement of 4.2 item 3 is corrected:
+the per-attempt deadline reaches the credential resolver and the tool
+executors on the intent they are handed; a model adapter's `call_with`
+receives the request, which carries none. Plan:
+`docs/superpowers/plans/2026-09-28-phase7-slice-7-10-follow-ups-and-close.md`.
+
 ## Summary
 
 **What this phase delivers.** Eight capabilities, each a decision section below:
@@ -156,6 +195,14 @@ rmcp 3.4.0 source.
 | 6 | Memory modes | Session memory gains Akka's read-only, write-only, filtered, and disabled modes as a declarative policy on the run memory bundle | 8 |
 | 7 | Registry | A tenant-scoped agent directory: a durable read model derived from agent entity snapshots that answers resolve, enumerate, and skill queries, feeds the A2A card, and can stand in as the delegation catalog when a deployment installs it | 9 |
 | 8 | Builder DSL | Two code-first Rust builders that emit the existing data: `AgentDefinition::builder` and a compiled-plan builder that emits a validated, fingerprinted `AgentCompiledExecutionPlan`. Neither is a text DSL or a compiler | 10 |
+
+**Status after the cut (2026-09-28).** Delivered: capabilities 2 (wired
+model providers), 3 (MCP client), and 4 (response guardrails). Deferred, with
+their sections kept as the design a later phase starts from: capabilities 1
+(mounted endpoint), 5 (streaming), 6 (memory modes), 7 (registry), and 8
+(builder DSL). Of the decisions listed below, 1, 3, 7, and 11 belong to
+deferred capabilities and travel with them; decision 4's follow-up is one of
+the two open decisions in 11.4.
 
 **Ordering (revised 2026-09-20).** Response guardrails first (slice 7.2): it
 depends on nothing, and it is proven with `DeterministicModelAdapter`
@@ -593,7 +640,9 @@ additions:
      ever asked for. An unprofiled model call, or a profile with no binding,
      is unaffected.
    - The dispatcher stamps `deadline_at = attempt start + timeout_ms` on the
-     intent it hands to `resolve`, to `execute`, and to `call_with`, per
+     intent it hands to `resolve`, to `execute`, and to `call_with`
+     (slice 7.10: `call_with` receives the request, which has no deadline
+     field; the stamp is observable at the resolver and the executors), per
      attempt: recomputed on retry and not persisted, because a durable
      `deadline_at` would outlive the generation it bounds. When `timeout_ms`
      is `None` the field stays `None`, which the previous point makes
@@ -768,7 +817,9 @@ already writes.
   (added 2026-09-20) a credential-bearing model call with no `timeout_ms` is
   refused `model-timeout-unset` before the resolver is called, and the intent
   a `ScriptedCredentialResolver` receives carries `deadline_at` equal to the
-  attempt start plus `timeout_ms`, recomputed on the retry.
+  attempt start plus `timeout_ms`, recomputed on the retry
+  (slice 7.10: proven by
+  `a_retried_model_call_resolves_under_a_deadline_recomputed_from_its_own_start`).
 - `crates/rakka-agent/tests/rig_provider_fake_endpoint.rs`: an in-process axum
   fake of the OpenAI-compatible completions API and of the Anthropic messages
   API; the real `RigProviderAdapter` runs against both over an injected
@@ -869,7 +920,8 @@ is at dispatch, so a publish-time sync is gated on the same terms as a
 dispatch attempt, before a client exists. `sync_mcp_descriptors_over(transport,
 &binding, synced_at)` is the launcher-produced-transport twin: it takes no
 egress check, because nothing is dialed, and no deadline of its own — the
-caller bounds it. Every digest here and on `McpDescriptorSet::digest()` is
+caller bounds it (slice 7.10: both syncs apply `MCP_SYNC_TIMEOUT_DEFAULT_MS`;
+the `_within` twins take the caller's bound). Every digest here and on `McpDescriptorSet::digest()` is
 SHA-256 (`AgentContentDigest::sha256_of_json`), and a tool name may itself
 contain dots: nothing splits a tool id on them, so `mcp.<server_id>.` is
 still a stable, unambiguous prefix.
@@ -878,7 +930,8 @@ It performs no I/O beyond the initialize handshake and `tools/list`, touches no
 store, and returns each allowed tool's `AgentToolBinding` together with the
 raw input schema and its digest, so a deployment runs it at publish time — an
 administrative operation, outside any run — and stores the result as release
-data. It converts each allowed tool to an `AgentToolDescriptor { kind:
+data (slice 7.10: server text that carries the sync's credential refuses the
+sync; the server name is cut at 256 bytes). It converts each allowed tool to an `AgentToolDescriptor { kind:
 RemoteMcp, description, parameters: inputSchema when ≤ 4 KiB, output_schema
 from outputSchema digest, version: from the schema digest }`; a schema over
 4 KiB is returned raw with the descriptor's `input_schema` left unset, for the
@@ -966,6 +1019,7 @@ impl<C> McpDispatchToolExecutor<C> where C: <rmcp's Streamable HTTP client trait
     pub fn new(descriptors: Vec<McpDescriptorSet>, bindings: Vec<McpServerBinding>, artifacts: Arc<dyn AgentArtifactStore>, clock: Arc<dyn AgentClock>, http: C, egress: Arc<dyn McpEgressCheck>)
         -> Result<Self, McpRegistrationError>;               // refuses ChildProcess bindings without a launcher: mcp-transport-unsupported
     pub fn with_child_process_launcher(self, launcher: Arc<dyn McpChildProcessLauncher>) -> Result<Self, McpRegistrationError>;
+    // (slice 7.10: the constructor is `with_launcher`, as the prose below says)
 }
 pub struct McpAllowAllEgress;                                 // the explicit opt-out: implements McpEgressCheck as always-Ok, for in-cluster and test use
 impl<C: ..> AgentDispatchToolExecutor for McpDispatchToolExecutor<C> { fn execute(scope, intent, call, credential) -> AgentDispatchFuture<AgentTaskContent> }   // dispatch.rs:409–418
@@ -985,7 +1039,8 @@ pub trait McpChildProcessLauncher: Send + Sync + 'static {
 argument; the descriptor recheck's cache is monotonic in-process instead.
 `artifacts` is `McpArtifactStore` (`Arc<tokio::sync::Mutex<dyn
 AgentArtifactStore + Send>>`), a mutex-guarded store rather than a bare
-`Arc<dyn AgentArtifactStore>`. `with_launcher(descriptors, bindings,
+`Arc<dyn AgentArtifactStore>` (slice 7.10: `artifacts` is
+`impl Into<McpArtifacts>`; the write seam is `McpArtifactSink`). `with_launcher(descriptors, bindings,
 artifacts, http, egress, launcher)` is a second, full constructor beside
 `with_child_process_launcher(self, launcher)`: it takes every argument `new`
 does plus the launcher, and admits `ChildProcess` bindings directly, where
@@ -1088,7 +1143,7 @@ map:
 
 | MCP result | Outcome |
 | --- | --- |
-| `resultType: complete`, `structuredContent` or text ≤ 2 KiB | `AgentTaskContent::Inline` |
+| `resultType: complete`, `structuredContent` or text ≤ 2 KiB (slice 7.10: measured as the run measures it, its `{"inline":…}` wrapper included) | `AgentTaskContent::Inline` |
 | larger content, or binary parts | written to the artifact store, `AgentTaskContent::Artifact` (the binding's `result_behavior` must be `ArtifactReference`, else `mcp-result-too-large`) |
 | `isError: true` | dispatch error `mcp-tool-error` with bounded detail (512 bytes) |
 | `resultType: input_required` (MRTR) | `mcp-input-required`, determinate failure in this phase |
@@ -1121,7 +1176,9 @@ every session is held to a version the binding lists.
 An artifact write is stamped `sha256:<hex>` and keyed
 `mcp-<effect id>-g<generation>-<call id>` — the effect id itself contains
 `/`, so an `AgentArtifactStore` implementation must accept a key with slashes
-in it.
+in it (slice 7.10: the key is requested, not required; a sink that honors it
+must accept `/`, one may mint its own, and the reference it returns must pass
+`validate_artifact_ref`).
 
 Guardrails at `ToolRequest` and `ToolResponse` apply unchanged; an MCP response
 is untrusted content and enters memory classified `Unclassified` like any tool
@@ -1201,9 +1258,9 @@ constructing `AgentRunEffectOutcome::Model`, mirroring `reviewed_tool_outcome`:
 | Outcome | Effect |
 | --- | --- |
 | Allow | unchanged turn |
-| Transform | the reviewed turn replaces the original; it is re-validated (`AgentModelTurn::validate`) and refused if a transform pushed it over a bound (`guardrail-transform-invalid`); transforms and reports are logged; the durable turn is the transformed one, which satisfies spec 16's "a retry MUST reuse the accepted transformed input" because the turn is committed exactly once by `RecordEffectResult` |
+| Transform | the reviewed turn replaces the original; it is re-validated (`AgentModelTurn::validate`) and refused if a transform pushed it over a bound (`guardrail-transform-invalid`) (slice 7.10: a transform may not add a proposal, and a reference survives only whole); transforms and reports are logged; the durable turn is the transformed one, which satisfies spec 16's "a retry MUST reuse the accepted transformed input" because the turn is committed exactly once by `RecordEffectResult` |
 | ReportOnly | reports logged; turn unchanged |
-| Block | `AgentRunEffectOutcome::Failed { code: "guardrail-blocked", message }`, the stage id and its reason code in the message, through the `ToolResponse` mapping (`refuse_guardrail_disposition`) unchanged (plan refinement 2026-09-20: the first draft said the stage's reason code; the precedent and the host's terminal-code classification say `guardrail-blocked`); the run winds down as `EffectFailed`, delivered once, never retried, exactly as a refused tool response |
+| Block | `AgentRunEffectOutcome::Failed { code: "guardrail-blocked", message }`, the stage id and its reason code in the message (slice 7.10: and in the outcome's `reason`, which the run records beside the code), through the `ToolResponse` mapping (`refuse_guardrail_disposition`) unchanged (plan refinement 2026-09-20: the first draft said the stage's reason code; the precedent and the host's terminal-code classification say `guardrail-blocked`); the run winds down as `EffectFailed`, delivered once, never retried, exactly as a refused tool response |
 | RequireCheckpoint | fails closed under `checkpoint-required`, exactly the `ToolResponse` precedent (plan refinement 2026-09-20: no new code); gating an already-produced answer behind a human is a follow-up |
 
 `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` and
@@ -1261,11 +1318,14 @@ Closing #70 fully:
   `AgentGuardrailSubject` (`Task`, `Team`, or `Conversation`), since no run
   exists at ingress. Block answers `RakkaAgentA2AError::Refused { code:
   "guardrail-blocked", message }` (`error.rs:52`; the stage and its reason
-  code in the message), which the handler maps to
+  code in the message) (slice 7.10: and in its in-process `reason`, which
+  the wire does not carry), which the handler maps to
   the SDK invalid-request error with the code under `io.rakka.code`, and
   which an in-process send executor records as a determinate send failure
   under that code, the disposition it gives any other send failure; Transform
-  replaces the parts the request is normalized from; RequireCheckpoint fails
+  replaces the parts the request is normalized from (slice 7.10: and the
+  cluster text it rewrites, unless it clears or blanks a field the command
+  requires and the message carried, which is `guardrail-transform-invalid`); RequireCheckpoint fails
   closed. `manage_agent` (`:731`) carries a command, not content a model will
   see, and stays outside the boundary. Attestation mirrors
   `with_memory_ingress` (`tools.rs:1233–1247`):
@@ -1805,7 +1865,8 @@ fingerprint survive `build()` unchanged).
   code of its own for an egress refusal: that failure rides the deployment's
   own `McpEgressCheck` vocabulary; final review 2026-09-24: a fifteenth,
   `mcp-credential-missing` — an HTTP binding naming a credential binding and
-  an attempt carrying no resolved credential),
+  an attempt carrying no resolved credential)
+  (slice 7.10: `mcp-descriptor-credential-echoed` is the sixteenth),
   `plan-builder-unknown-endpoint`,
   `plan-builder-port-not-allowed`, `directory-tenant-mismatch`. The
   registry-backed check the plan owes (slice 6.4) is a good companion.
@@ -1898,12 +1959,88 @@ phase starts from a known place rather than from this document's history.
   provenance (spec 13.2), plus a deterministic truncating executor in the
   testkit. `include_summaries` already selects summaries into the window.
 
+Deferred on 2026-09-28 by the phase cut. Each keeps its design section, which
+was checked against the tree at `a757ad2` and must be re-checked against the
+tree a later phase starts from.
+
+- **PostgreSQL history stores and watchers (slice 7.3).** Section 7.1. The
+  seam is the three history-store traits and their
+  `assert_*_history_store_contract` harnesses; the watcher leg is a separate
+  `check_*` (R10). A deployment that owns its stores, as the host does,
+  constructs none of it.
+- **Mounted agent endpoint (slice 7.4).** Section 3. The seam is
+  `RakkaAgentA2AService`, whose constructor, `send`, and `send_message` are
+  unchanged by anything delivered (R9); the handler adds error mapping only,
+  because ingress is already evaluated inside the service (6.3).
+- **Task-state SSE (slice 7.5).** Section 7.2. It needs 7.4, and 7.3 for
+  multi-pod truth. The replayable event read contract it serves from has
+  existed since slice 5.5.
+- **Agent directory (slice 7.6).** Section 9. A projection, never a sixth
+  entity, and never a default of any path (R11). The host's own fleet index
+  answers the same enumeration for its deployment.
+- **Memory modes (slice 7.8).** Section 8. A bundle field outside the digest
+  `with_memory_ingress` attests (R12). The smallest of the six, and the only
+  one that adds agent behavior a release could set.
+- **Builders (slice 7.9).** Section 10. They emit the existing data and add
+  no runtime surface.
+
+Open decisions, recorded on 2026-09-28. Each adds durable state, so each
+needs the owner's ruling before a plan can be written.
+
+- **MCP input-required mapped to a human checkpoint.** Today the executor
+  refuses `mcp-input-required` and keeps nothing of what the server asked.
+  The facts a design starts from, at `ebc7147`:
+  - rmcp 3.4.0 surfaces the answer as
+    `CallToolResponse::InputRequired(InputRequiredResult { input_requests,
+    request_state, .. })`, only on a session negotiated at 2026-07-28. The
+    continuation is a new `tools/call` with the same name and arguments plus
+    `input_responses`, keyed as the requests were, and the `request_state`
+    echoed byte for byte. Nothing else ties the rounds together, and a
+    server may expire the state.
+  - A 2025-11-25 server asks through `elicitation/create` on the live
+    session, which a per-attempt client cannot hold open across a human
+    wait. The mapping can serve 2026-07-28 servers only.
+  - `AgentDispatchToolExecutor::execute` answers content or an error, and
+    every error is a retryable attempt failure. The mapping needs an outcome
+    that parks.
+  - A checkpoint decision carries approve or deny. The mapping needs a
+    decision that carries a structured, bounded answer, and a checkpoint
+    record that carries the question: today it has a summary of at most
+    1 024 characters and up to sixteen context artifacts.
+  - Checkpoint ids are `{effect}#ck-{kind}-g{generation}` and a duplicate id
+    is a replay, so a second round on one generation collides.
+  - A grant's digest covers the whole serialized effect request, so a
+    continuation field on a tool request must be absent when unused.
+  - rmcp requires `request_state` back untouched, and the executor scrubs
+    the attempt's credential from every server-chosen text it keeps. A
+    persisted state that carries the credential forces a choice between the
+    two rules.
+  - No public ingress sends `ResolveCheckpoint`; it is a run-entity command
+    a deployment's own surface delivers.
+- **`model-profile-revision-mismatch` enforced, or withdrawn.** 4.2 item 1
+  records the profile's revision and digest on the per-attempt grant and
+  enforces nothing across attempts. The facts, at `ebc7147`: the durable
+  model intent is committed with `profile: None`, and the profile is
+  re-selected from the agent's current settings on every attempt; the
+  checkpoint binding's target for every model call is therefore
+  `model:default`; and `AgentModelProfile::digest()` is the FNV fingerprint,
+  which a checkpoint binding refuses. Enforcing the code needs a durable pin
+  of the profile's id, revision, and a SHA-256 digest, written either at
+  commit, where the run has no catalog, or at the first attempt, which costs
+  a durable write per model effect. Withdrawing it means stating that the
+  current catalog wins, with the envelope and revocation checks that already
+  run on every attempt. The ruling turns on one question: whether a release
+  rollout should fail an in-flight model call's retry.
+
 ## 12. Slices and order
 
-(revised 2026-09-20)
+(revised 2026-09-20; status column and row 7.10 revised 2026-09-28 by the
+phase cut)
 
 Each slice ends green under `scripts/validate.sh`, with its tests named above,
-and updates the docs it touches. Estimated in slices, not hours.
+and updates the docs it touches. Estimated in slices, not hours. Status as of
+2026-09-28: 7.2 merged (PR #77), 7.1 merged (PR #78), 7.7 merged (PR #79);
+7.3, 7.4, 7.5, 7.6, 7.8, and 7.9 deferred (11.4); 7.10 revised and planned.
 
 | Slice | Content | Depends on |
 | --- | --- | --- |
@@ -1916,7 +2053,7 @@ and updates the docs it touches. Estimated in slices, not hours.
 | 7.6 | Agent directory, stores, writers, sweep, catalogs, cards, routes, fleet gauge, identity fields for the agent name | 7.4 |
 | 7.8 | Memory modes | — |
 | 7.9 | Definition, task, goal builders; compiled plan builder with caller-supplied identity; examples rewritten | — |
-| 7.10 | Phase close: spec amendments, matrices, changelog, product doc, boundary inventory, acceptance example `mounted-agent-endpoint-acceptance` that drives a real HTTP client through card, send, stream, MCP tool call, and directory lookup | all |
+| 7.10 | (revised 2026-09-28) Follow-ups and phase close: the MCP artifact sink and the run's own size measure; a sync that refuses an echoed credential and is bounded in time; a failure's deciding identity on the run's records and the `checkpoint-resolve` segment on commit (issue #80); the model-response proposal rule and the required collaboration field rule, with every ingress leaf proven under a chain; the two-attempt deadline proof; spec amendments, matrices, changelog, product doc, boundary inventory. No acceptance example: the one the first revision named drove capabilities the cut deferred | 7.2, 7.1, 7.7 |
 
 Independent tracks that can run in parallel: {7.2 → 7.1 → 7.7}, in
 consumer-priority order; {7.3 → 7.4 → 7.5, 7.6}; {7.8}; {7.9}. Consumer
@@ -1924,10 +2061,42 @@ priority, from the host's assessment: 7.2 needed; 7.1's three seams wanted;
 7.7 wanted under the conditions in section 5; 7.3, 7.4, 7.5, 7.6, 7.8, and
 7.9 not requested by the host, and each is inert for a deployment that does
 not mount or install it. If the phase is cut short, it is cut after 7.7.
+(2026-09-28: it was. Plan for 7.10:
+`docs/superpowers/plans/2026-09-28-phase7-slice-7-10-follow-ups-and-close.md`.)
 
 ## 13. Acceptance statement
 
-The phase is complete when one acceptance walk, run from the repository with
+(revised 2026-09-28 by the phase cut) The phase is complete when the three
+delivered capabilities are each proven through the real dispatcher, from
+durable state, with no external service, and slice 7.10 is green under
+`scripts/validate.sh`. The proofs are the delivered slices' own:
+
+1. **Providers (step 4 below).** A model turn through `RigProviderAdapter`
+   over an injected client against the in-process fake provider, selected by
+   profile, with a credential that appears on no persisted record and was
+   resolved under the attempt's deadline, recomputed on a retry:
+   `crates/rakka-agent/tests/model_provider_dispatch.rs`,
+   `crates/rakka-agent/tests/secret_exclusion.rs`, and the rig adapter's own
+   fake-endpoint tests.
+2. **MCP client (step 5 below).** A tool call through
+   `McpDispatchToolExecutor` over an injected client to the in-process MCP
+   server, from descriptors synced ahead and stored, its result in session
+   memory naming the effect: `crates/rakka-agent/tests/mcp_client_dispatch.rs`.
+3. **Response guardrails (step 6 below).** A `ModelResponse` stage that
+   transforms one turn and blocks another, the blocked run ending
+   `EffectFailed` under the pipeline code with the stage and its reason code
+   beside it, and an `A2aIngress` stage firing for a delegation delivered
+   in-process with no handler on the path:
+   `crates/rakka-agent/tests/model_response_guardrails.rs` and
+   `crates/rakka-a2a/tests/ingress_egress_guardrails.rs`.
+
+No single walk crosses the three, and none is built: the walk this section
+first described drove the mounted endpoint, the stream, the directory, and
+the builders, all deferred. Steps 1, 2, 3, 7, and 8 below are the deferred
+capabilities' acceptance and return with them.
+
+The first revision's statement, kept for the phase that resumes it: the phase
+is complete when one acceptance walk, run from the repository with
 no external service, does the following through the network surface and
 proves each step from durable state, not from the frames it received:
 
@@ -1961,7 +2130,11 @@ five existing acceptance examples do.
 
 ## 14. Consumer priorities beyond this phase
 
-(added 2026-09-20) Recorded from the host's assessment
+(added 2026-09-20; 2026-09-28: the phase is cut and closed by slice 7.10,
+and item 2 below, issue #69, is next. Item 1 is delivered, with its third
+part, wait segments for timer and child waits, still open on issue #70. The
+host has since filed two briefs as issues #80 and #81; slice 7.10 answers
+#80.) Recorded from the host's assessment
 (`../paloul.rakka.host/docs/specs/2026-09-20-upstream-phase7-parity-assessment.md`,
 sections 4 and 5), in the host's order, for what should follow or replace the
 back half of this phase (slices 7.3 through 7.6, 7.8, 7.9). Nothing in this
