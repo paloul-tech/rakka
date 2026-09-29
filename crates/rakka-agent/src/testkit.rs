@@ -2141,10 +2141,7 @@ fn model_outcome(produced: AgentModelResult<AgentModelTurn>) -> AgentRunEffectOu
         Ok(turn) => AgentRunEffectOutcome::Model {
             turn: Box::new(turn),
         },
-        Err(error) => AgentRunEffectOutcome::Failed {
-            code: error.code().to_string(),
-            message: error.to_string(),
-        },
+        Err(error) => AgentRunEffectOutcome::failed(error.code().to_string(), error.to_string()),
     }
 }
 
@@ -2456,10 +2453,10 @@ where
                         call_id: crate::effect::compensation_call_id(effect),
                         content,
                     },
-                    None => AgentRunEffectOutcome::Failed {
-                        code: "compensation-unscripted".to_string(),
-                        message: format!("no scripted result for compensation {compensation}"),
-                    },
+                    None => AgentRunEffectOutcome::failed(
+                        "compensation-unscripted".to_string(),
+                        format!("no scripted result for compensation {compensation}"),
+                    ),
                 };
                 self.memoize(effect, outcome)
             }
@@ -2472,12 +2469,12 @@ where
                 if let Some(outcome) = self.cached(effect) {
                     return outcome;
                 }
-                AgentRunEffectOutcome::Failed {
-                    code: "memory-promotion-unscoped".to_string(),
-                    message: "a memory promotion is answered through drive or promotion_outcome, \
+                AgentRunEffectOutcome::failed(
+                    "memory-promotion-unscoped".to_string(),
+                    "a memory promotion is answered through drive or promotion_outcome, \
                               which carry the run scope"
                         .to_string(),
-                }
+                )
             }
             AgentRunEffectRequest::Evaluation { .. } => {
                 // An evaluation needs the run scope — and, for a human
@@ -2487,12 +2484,12 @@ where
                 if let Some(outcome) = self.cached(effect) {
                     return outcome;
                 }
-                AgentRunEffectOutcome::Failed {
-                    code: "goal-evaluation-unscoped".to_string(),
-                    message: "a goal evaluation is answered through drive or \
+                AgentRunEffectOutcome::failed(
+                    "goal-evaluation-unscoped".to_string(),
+                    "a goal evaluation is answered through drive or \
                               evaluation_outcome, which carry the run scope"
                         .to_string(),
-                }
+                )
             }
             AgentRunEffectRequest::A2aSend { delegation } => {
                 // The record carries its own parent scope, so the send needs
@@ -2510,10 +2507,10 @@ where
                     .expect("the A2A send executor slot should not be poisoned")
                     .clone();
                 let outcome = match executor {
-                    None => AgentRunEffectOutcome::Failed {
-                        code: "a2a-send-executor-missing".to_string(),
-                        message: "no A2A send executor is wired into this dispatcher".to_string(),
-                    },
+                    None => AgentRunEffectOutcome::failed(
+                        "a2a-send-executor-missing".to_string(),
+                        "no A2A send executor is wired into this dispatcher".to_string(),
+                    ),
                     Some(executor) => match executor
                         .execute(&delegation.parent_run, effect, delegation, None)
                         .await
@@ -2532,15 +2529,15 @@ where
                         },
                         Ok(crate::dispatch::AgentA2aSendFinding::Conflict { code, message })
                         | Ok(crate::dispatch::AgentA2aSendFinding::Refused { code, message }) => {
-                            AgentRunEffectOutcome::Failed { code, message }
+                            AgentRunEffectOutcome::failed(code, message)
                         }
                         // The in-process driver has no attempt machinery: a
                         // retryable failure surfaces as a failed effect, the
                         // model-adapter precedent above.
-                        Err(error) => AgentRunEffectOutcome::Failed {
-                            code: "a2a-send-attempt-failed".to_string(),
-                            message: error.to_string(),
-                        },
+                        Err(error) => AgentRunEffectOutcome::failed(
+                            "a2a-send-attempt-failed".to_string(),
+                            error.to_string(),
+                        ),
                     },
                 };
                 self.memoize(effect, outcome)
@@ -2561,11 +2558,10 @@ where
                     .expect("the A2A handoff executor slot should not be poisoned")
                     .clone();
                 let outcome = match executor {
-                    None => AgentRunEffectOutcome::Failed {
-                        code: "a2a-handoff-executor-missing".to_string(),
-                        message: "no A2A handoff executor is wired into this dispatcher"
-                            .to_string(),
-                    },
+                    None => AgentRunEffectOutcome::failed(
+                        "a2a-handoff-executor-missing".to_string(),
+                        "no A2A handoff executor is wired into this dispatcher".to_string(),
+                    ),
                     Some(executor) => match executor
                         .execute(&handoff.source_run, effect, handoff, None)
                         .await
@@ -2582,17 +2578,17 @@ where
                         },
                         Ok(crate::dispatch::AgentA2aHandoffFinding::Conflict { code, message })
                         | Ok(crate::dispatch::AgentA2aHandoffFinding::Refused { code, message }) => {
-                            AgentRunEffectOutcome::Failed { code, message }
+                            AgentRunEffectOutcome::failed(code, message)
                         }
                         // The in-process driver has no attempt machinery: a
                         // retryable failure surfaces as an *exhausted* effect
                         // — the real pipeline's spent retry budget — so the
                         // run parks indeterminate rather than resuming beside
                         // a possibly-recorded transfer.
-                        Err(error) => AgentRunEffectOutcome::Exhausted {
-                            code: "a2a-handoff-attempt-failed".to_string(),
-                            message: error.to_string(),
-                        },
+                        Err(error) => AgentRunEffectOutcome::exhausted(
+                            "a2a-handoff-attempt-failed".to_string(),
+                            error.to_string(),
+                        ),
                     },
                 };
                 self.memoize(effect, outcome)
@@ -2613,11 +2609,10 @@ where
                     .expect("the workflow start executor slot should not be poisoned")
                     .clone();
                 let outcome = match executor {
-                    None => AgentRunEffectOutcome::Failed {
-                        code: "workflow-start-executor-missing".to_string(),
-                        message: "no workflow start executor is wired into this dispatcher"
-                            .to_string(),
-                    },
+                    None => AgentRunEffectOutcome::failed(
+                        "workflow-start-executor-missing".to_string(),
+                        "no workflow start executor is wired into this dispatcher".to_string(),
+                    ),
                     Some(executor) => match executor
                         .execute(&invocation.parent_run, effect, invocation, None)
                         .await
@@ -2641,22 +2636,22 @@ where
                         Ok(crate::dispatch::AgentWorkflowStartFinding::Conflict {
                             code,
                             message,
-                        }) => AgentRunEffectOutcome::Failed {
-                            code: crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                        }) => AgentRunEffectOutcome::failed(
+                            crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
                                 .to_string(),
-                            message: format!("{code}: {message}"),
-                        },
+                            format!("{code}: {message}"),
+                        ),
                         Ok(crate::dispatch::AgentWorkflowStartFinding::Refused {
                             code,
                             message,
-                        }) => AgentRunEffectOutcome::Failed { code, message },
+                        }) => AgentRunEffectOutcome::failed(code, message),
                         // The in-process driver has no attempt machinery: a
                         // retryable failure surfaces as a failed effect, the
                         // model-adapter precedent above.
-                        Err(error) => AgentRunEffectOutcome::Failed {
-                            code: "workflow-start-attempt-failed".to_string(),
-                            message: error.to_string(),
-                        },
+                        Err(error) => AgentRunEffectOutcome::failed(
+                            "workflow-start-attempt-failed".to_string(),
+                            error.to_string(),
+                        ),
                     },
                 };
                 self.memoize(effect, outcome)
@@ -2677,11 +2672,10 @@ where
                     .expect("the workflow cancel executor slot should not be poisoned")
                     .clone();
                 let outcome = match executor {
-                    None => AgentRunEffectOutcome::Failed {
-                        code: "workflow-cancel-executor-missing".to_string(),
-                        message: "no workflow cancel executor is wired into this dispatcher"
-                            .to_string(),
-                    },
+                    None => AgentRunEffectOutcome::failed(
+                        "workflow-cancel-executor-missing".to_string(),
+                        "no workflow cancel executor is wired into this dispatcher".to_string(),
+                    ),
                     Some(executor) => match executor
                         .execute(&invocation.parent_run, effect, invocation, reason, None)
                         .await
@@ -2699,14 +2693,14 @@ where
                         Ok(crate::dispatch::AgentWorkflowCancelFinding::Refused {
                             code,
                             message,
-                        }) => AgentRunEffectOutcome::Failed { code, message },
+                        }) => AgentRunEffectOutcome::failed(code, message),
                         // The in-process driver has no attempt machinery: a
                         // retryable failure surfaces as a failed effect, the
                         // model-adapter precedent above.
-                        Err(error) => AgentRunEffectOutcome::Failed {
-                            code: "workflow-cancel-attempt-failed".to_string(),
-                            message: error.to_string(),
-                        },
+                        Err(error) => AgentRunEffectOutcome::failed(
+                            "workflow-cancel-attempt-failed".to_string(),
+                            error.to_string(),
+                        ),
                     },
                 };
                 self.memoize(effect, outcome)
@@ -2719,12 +2713,12 @@ where
                 if let Some(outcome) = self.cached(effect) {
                     return outcome;
                 }
-                AgentRunEffectOutcome::Failed {
-                    code: "claim-append-unscoped".to_string(),
-                    message: "a claim append is answered through drive or claim_append_outcome, \
+                AgentRunEffectOutcome::failed(
+                    "claim-append-unscoped".to_string(),
+                    "a claim append is answered through drive or claim_append_outcome, \
                               which carry the run scope"
                         .to_string(),
-                }
+                )
             }
         }
     }
@@ -2750,10 +2744,10 @@ where
             .expect("the claim-append executor slot should not be poisoned")
             .clone();
         let outcome = match executor {
-            None => AgentRunEffectOutcome::Failed {
-                code: "claim-append-executor-missing".to_string(),
-                message: "no claim-append executor is wired into this dispatcher".to_string(),
-            },
+            None => AgentRunEffectOutcome::failed(
+                "claim-append-executor-missing".to_string(),
+                "no claim-append executor is wired into this dispatcher".to_string(),
+            ),
             Some(executor) => match executor
                 .execute(scope, effect, append, provenance, now)
                 .await
@@ -2762,15 +2756,15 @@ where
                     AgentRunEffectOutcome::ClaimAppend { claim }
                 }
                 Ok(crate::dispatch::AgentClaimAppendFinding::Refused { code, message }) => {
-                    AgentRunEffectOutcome::Failed { code, message }
+                    AgentRunEffectOutcome::failed(code, message)
                 }
                 // The in-process driver has no attempt machinery: a
                 // retryable failure surfaces as a failed effect, the
                 // model-adapter precedent above.
-                Err(error) => AgentRunEffectOutcome::Failed {
-                    code: "claim-append-attempt-failed".to_string(),
-                    message: error.to_string(),
-                },
+                Err(error) => AgentRunEffectOutcome::failed(
+                    "claim-append-attempt-failed".to_string(),
+                    error.to_string(),
+                ),
             },
         };
         self.memoize(effect, outcome)
@@ -2796,24 +2790,24 @@ where
             .expect("the promotion executor slot should not be poisoned")
             .clone();
         let outcome = match executor {
-            None => AgentRunEffectOutcome::Failed {
-                code: "memory-promotion-executor-missing".to_string(),
-                message: "no memory-promotion executor is wired into this dispatcher".to_string(),
-            },
+            None => AgentRunEffectOutcome::failed(
+                "memory-promotion-executor-missing".to_string(),
+                "no memory-promotion executor is wired into this dispatcher".to_string(),
+            ),
             Some(executor) => match executor.execute(scope, effect, promotion, now).await {
                 Ok(AgentMemoryPromotionFinding::Promoted { promoted }) => {
                     AgentRunEffectOutcome::MemoryPromotion { promoted }
                 }
                 Ok(AgentMemoryPromotionFinding::Refused { code, message }) => {
-                    AgentRunEffectOutcome::Failed { code, message }
+                    AgentRunEffectOutcome::failed(code, message)
                 }
                 // The in-process driver has no attempt machinery: a retryable
                 // failure surfaces as a failed effect, the model-adapter
                 // precedent above.
-                Err(error) => AgentRunEffectOutcome::Failed {
-                    code: "memory-promotion-attempt-failed".to_string(),
-                    message: error.to_string(),
-                },
+                Err(error) => AgentRunEffectOutcome::failed(
+                    "memory-promotion-attempt-failed".to_string(),
+                    error.to_string(),
+                ),
             },
         };
         self.memoize(effect, outcome)
@@ -2848,10 +2842,10 @@ where
                 Err(error) => {
                     return self.memoize(
                         effect,
-                        AgentRunEffectOutcome::Failed {
-                            code: "evaluation-identity-invalid".to_string(),
-                            message: error.to_string(),
-                        },
+                        AgentRunEffectOutcome::failed(
+                            "evaluation-identity-invalid".to_string(),
+                            error.to_string(),
+                        ),
                     );
                 }
             };
@@ -2879,12 +2873,12 @@ where
                 None => {
                     return self.memoize(
                         effect,
-                        AgentRunEffectOutcome::Failed {
-                            code: "evaluation-grant-missing".to_string(),
-                            message: "a human-review evaluation dispatched without its approval \
+                        AgentRunEffectOutcome::failed(
+                            "evaluation-grant-missing".to_string(),
+                            "a human-review evaluation dispatched without its approval \
                                       grant"
                                 .to_string(),
-                        },
+                        ),
                     );
                 }
                 Some(grant) => {
@@ -2906,12 +2900,12 @@ where
             AgentGoalEvaluationMethod::VerificationWorkflow { .. } => {
                 return self.memoize(
                     effect,
-                    AgentRunEffectOutcome::Failed {
-                        code: "evaluation-workflow-deferred".to_string(),
-                        message: "a verification-workflow evaluation cannot execute until the \
+                    AgentRunEffectOutcome::failed(
+                        "evaluation-workflow-deferred".to_string(),
+                        "a verification-workflow evaluation cannot execute until the \
                                   evaluation cell is bridged to the workflow-tool invocation path"
                             .to_string(),
-                    },
+                    ),
                 );
             }
             _ => {
@@ -2924,12 +2918,12 @@ where
                     None => {
                         return self.memoize(
                             effect,
-                            AgentRunEffectOutcome::Failed {
-                                code: "evaluation-executor-missing".to_string(),
-                                message: "no goal-evaluation executor is wired into this \
+                            AgentRunEffectOutcome::failed(
+                                "evaluation-executor-missing".to_string(),
+                                "no goal-evaluation executor is wired into this \
                                           dispatcher"
                                     .to_string(),
-                            },
+                            ),
                         );
                     }
                     Some(executor) => {
@@ -2941,10 +2935,10 @@ where
                             Err(error) => {
                                 return self.memoize(
                                     effect,
-                                    AgentRunEffectOutcome::Failed {
-                                        code: "evaluation-attempt-failed".to_string(),
-                                        message: error.to_string(),
-                                    },
+                                    AgentRunEffectOutcome::failed(
+                                        "evaluation-attempt-failed".to_string(),
+                                        error.to_string(),
+                                    ),
                                 );
                             }
                         }
@@ -2962,13 +2956,13 @@ where
                 Ok(record) => AgentRunEffectOutcome::Evaluation {
                     record: Box::new(record),
                 },
-                Err(error) => AgentRunEffectOutcome::Failed {
-                    code: "evaluation-record-invalid".to_string(),
-                    message: error.to_string(),
-                },
+                Err(error) => AgentRunEffectOutcome::failed(
+                    "evaluation-record-invalid".to_string(),
+                    error.to_string(),
+                ),
             },
             AgentGoalEvaluationFinding::Refused { code, message } => {
-                AgentRunEffectOutcome::Failed { code, message }
+                AgentRunEffectOutcome::failed(code, message)
             }
         };
         self.memoize(effect, outcome)
@@ -3010,7 +3004,7 @@ where
             .get(&tool)
             .cloned()
         {
-            AgentRunEffectOutcome::Failed { code, message }
+            AgentRunEffectOutcome::failed(code, message)
         } else {
             let content = self
                 .tools

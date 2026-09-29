@@ -5244,10 +5244,7 @@ fn resolve_checkpoint(
             state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
             // A denied consequential effect fails its generation: the run winds
             // down under a truthful code, exactly as a failed effect would.
-            let denial = AgentRunEffectOutcome::Failed {
-                code: "checkpoint-denied".to_string(),
-                message: reason,
-            };
+            let denial = AgentRunEffectOutcome::failed("checkpoint-denied".to_string(), reason);
             apply_effect_outcome(state, &bound_effect_id, &denial, now)?;
         }
         AgentCheckpointOutcome::EffectResolution(resolution) => {
@@ -5279,10 +5276,10 @@ fn resolve_checkpoint(
             // a truthful code and the run winds down — or finishes the
             // wind-down a cancellation already began, under that earlier
             // reason (scenario 57).
-            let abandonment = AgentRunEffectOutcome::Failed {
-                code: "reconciliation-abandoned".to_string(),
-                message: "the operator abandoned the ambiguous effect".to_string(),
-            };
+            let abandonment = AgentRunEffectOutcome::failed(
+                "reconciliation-abandoned".to_string(),
+                "the operator abandoned the ambiguous effect".to_string(),
+            );
             apply_effect_outcome(state, &bound_effect_id, &abandonment, now)?;
         }
         AgentCheckpointOutcome::Escalated => {
@@ -5810,10 +5807,10 @@ fn fire_checkpoint_timers(
         match fired {
             AgentCheckpointTimerOutcome::Expired => {
                 state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
-                let expiry = AgentRunEffectOutcome::Failed {
-                    code: "checkpoint-expired".to_string(),
-                    message: format!("the {kind} checkpoint expired without a decision"),
-                };
+                let expiry = AgentRunEffectOutcome::failed(
+                    "checkpoint-expired".to_string(),
+                    format!("the {kind} checkpoint expired without a decision"),
+                );
                 apply_effect_outcome(state, &bound_effect_id, &expiry, now)?;
             }
             AgentCheckpointTimerOutcome::Escalated | AgentCheckpointTimerOutcome::Pending => {}

@@ -65,6 +65,7 @@ pub mod dispatch;
 pub mod effect;
 pub mod evaluation;
 pub mod events;
+pub mod failure;
 pub mod fan_in;
 pub mod goal;
 pub mod guardrails;
@@ -195,16 +196,18 @@ pub use events::{
     AgentCoordinationReplayResult, AgentCoordinationSources, AGENT_COORDINATION_CURSOR_SEPARATOR,
     AGENT_COORDINATION_DEFAULT_PAGE_SIZE, AGENT_COORDINATION_MAX_PAGE_SIZE,
 };
+pub use failure::{AgentFailureReason, AGENT_FAILURE_REASON_CODE_MAX_LENGTH};
 pub use guardrails::builtin::{
     DenySubstrings, MaxTextLength, ReportOnly, RequireResultTool, AGENT_BUILTIN_DENY_MAX_ENTRIES,
-    AGENT_BUILTIN_DENY_MAX_ENTRY_BYTES,
+    AGENT_BUILTIN_DENY_MAX_ENTRY_BYTES, AGENT_GUARDRAIL_REASON_DENIED_SUBSTRING,
+    AGENT_GUARDRAIL_REASON_TEXT_TOO_LONG, AGENT_GUARDRAIL_REASON_UNDECLARED_TOOL_CALL,
 };
 pub use guardrails::{
     AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
     AgentGuardrailDecision, AgentGuardrailDisposition, AgentGuardrailError, AgentGuardrailOutcome,
     AgentGuardrailReport, AgentGuardrailResult, AgentGuardrailStage, AgentGuardrailSubject,
     AgentGuardrailTransform, AGENT_GUARDRAIL_CONTENT_MAX_BYTES, AGENT_GUARDRAIL_MAX_STAGES,
-    AGENT_GUARDRAIL_REASON_MAX_LENGTH,
+    AGENT_GUARDRAIL_REASON_MAX_LENGTH, AGENT_GUARDRAIL_REASON_TRANSFORM_OVERSIZED,
 };
 pub use loop_runtime::{
     AgentGoalEvaluationCell, AgentLoopPhase, AgentLoopState, AgentMemoryPromotionRecord,

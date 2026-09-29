@@ -2974,10 +2974,10 @@ where
         if let WorkflowTelemetryEvent::OutboxDispatchExhausted { attempts, .. } = &event {
             let attempts = *attempts;
             self.fleet.record_claim_failure(&claim, &event).await?;
-            let outcome = AgentRunEffectOutcome::Exhausted {
-                code: "dispatcher-lost-after-started".to_string(),
-                message: "the retry budget was spent recovering ambiguous attempts".to_string(),
-            };
+            let outcome = AgentRunEffectOutcome::exhausted(
+                "dispatcher-lost-after-started".to_string(),
+                "the retry budget was spent recovering ambiguous attempts".to_string(),
+            );
             let status = outcome.resolved_status();
             self.deliver_outcome(scope, intent, attempts, claim.fencing_token, outcome, pass)
                 .await?;
@@ -3372,10 +3372,7 @@ where
                 intent,
                 attempt,
                 claim.fencing_token,
-                AgentRunEffectOutcome::Exhausted {
-                    code: code.to_string(),
-                    message: detail,
-                },
+                AgentRunEffectOutcome::exhausted(code.to_string(), detail),
                 pass,
             )
             .await?;
@@ -3456,10 +3453,10 @@ where
                     code = %refusal.code,
                     "guardrail refused the tool response; the effect fails"
                 );
-                Ok(AgentRunEffectOutcome::Failed {
-                    code: bounded_failure_code(&refusal.code),
-                    message: bounded_failure_detail(&refusal.message),
-                })
+                Ok(AgentRunEffectOutcome::failed(
+                    bounded_failure_code(&refusal.code),
+                    bounded_failure_detail(&refusal.message),
+                ))
             }
         }
     }
@@ -3529,10 +3526,10 @@ where
                     code = %refusal.code,
                     "guardrail refused the model response; the effect fails"
                 );
-                Ok(AgentRunEffectOutcome::Failed {
-                    code: bounded_failure_code(&refusal.code),
-                    message: bounded_failure_detail(&refusal.message),
-                })
+                Ok(AgentRunEffectOutcome::failed(
+                    bounded_failure_code(&refusal.code),
+                    bounded_failure_detail(&refusal.message),
+                ))
             }
         }
     }
@@ -3618,11 +3615,10 @@ where
                     // Fail closed, definitively: nothing was invoked, an absent
                     // executor will not appear mid-generation, and the run's
                     // wind-down settles truthfully on the failure.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "compensation-executor-missing".to_string(),
-                        message: "no compensation executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "compensation-executor-missing".to_string(),
+                        "no compensation executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 let content = executor
                     .execute(scope, intent, compensation, credential)
@@ -3641,11 +3637,11 @@ where
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "memory-promotion-executor-missing".to_string(),
-                        message: "no memory-promotion executor is configured for this dispatcher"
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "memory-promotion-executor-missing".to_string(),
+                        "no memory-promotion executor is configured for this dispatcher"
                             .to_string(),
-                    });
+                    ));
                 };
                 let now = AgentTimestampMillis::new(self.clock.now().as_millis());
                 match executor.execute(scope, intent, promotion, now).await? {
@@ -3653,7 +3649,7 @@ where
                         Ok(AgentRunEffectOutcome::MemoryPromotion { promoted })
                     }
                     AgentMemoryPromotionFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
             }
@@ -3666,11 +3662,10 @@ where
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "a2a-send-executor-missing".to_string(),
-                        message: "no A2A send executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "a2a-send-executor-missing".to_string(),
+                        "no A2A send executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 match executor
                     .execute(scope, intent, delegation, credential)
@@ -3690,7 +3685,7 @@ where
                     }),
                     AgentA2aSendFinding::Conflict { code, message }
                     | AgentA2aSendFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
             }
@@ -3699,11 +3694,10 @@ where
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "a2a-handoff-executor-missing".to_string(),
-                        message: "no A2A handoff executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "a2a-handoff-executor-missing".to_string(),
+                        "no A2A handoff executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 match executor.execute(scope, intent, handoff, credential).await? {
                     AgentA2aHandoffFinding::Recorded {
@@ -3718,7 +3712,7 @@ where
                     }),
                     AgentA2aHandoffFinding::Conflict { code, message }
                     | AgentA2aHandoffFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
             }
@@ -3727,11 +3721,10 @@ where
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "workflow-start-executor-missing".to_string(),
-                        message: "no workflow start executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "workflow-start-executor-missing".to_string(),
+                        "no workflow start executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 match executor
                     .execute(scope, intent, invocation, credential)
@@ -3755,14 +3748,14 @@ where
                     // here, so the run entity's `Conflicted` settlement never
                     // depends on an executor picking the right string.
                     AgentWorkflowStartFinding::Conflict { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed {
-                            code: crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                        Ok(AgentRunEffectOutcome::failed(
+                            crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
                                 .to_string(),
-                            message: format!("{code}: {message}"),
-                        })
+                            format!("{code}: {message}"),
+                        ))
                     }
                     AgentWorkflowStartFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
             }
@@ -3772,11 +3765,10 @@ where
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation. The parent's wind-down then
                     // waits for the child's natural terminal result.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "workflow-cancel-executor-missing".to_string(),
-                        message: "no workflow cancel executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "workflow-cancel-executor-missing".to_string(),
+                        "no workflow cancel executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 match executor
                     .execute(scope, intent, invocation, reason, credential)
@@ -3793,7 +3785,7 @@ where
                         })
                     }
                     AgentWorkflowCancelFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
             }
@@ -3802,11 +3794,10 @@ where
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "claim-append-executor-missing".to_string(),
-                        message: "no claim-append executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "claim-append-executor-missing".to_string(),
+                        "no claim-append executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 let now = AgentTimestampMillis::new(self.clock.now().as_millis());
                 match executor
@@ -3817,7 +3808,7 @@ where
                         Ok(AgentRunEffectOutcome::ClaimAppend { claim })
                     }
                     AgentClaimAppendFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
             }
@@ -3881,12 +3872,12 @@ where
                     // The commit marked the effect checkpoint-required, so an
                     // approved dispatch always carries its grant; an absent
                     // one is a definitive wiring failure, never a retry.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "evaluation-grant-missing".to_string(),
-                        message: "a human-review evaluation dispatched without its approval \
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "evaluation-grant-missing".to_string(),
+                        "a human-review evaluation dispatched without its approval \
                                   grant"
                             .to_string(),
-                    });
+                    ));
                 };
                 // The commit door reserved this slot, so the append always
                 // fits ([`AgentGoalEvaluationMethod::evidence_reserve`]).
@@ -3905,20 +3896,19 @@ where
                 }
             }
             AgentGoalEvaluationMethod::VerificationWorkflow { .. } => {
-                return Ok(AgentRunEffectOutcome::Failed {
-                    code: "evaluation-workflow-deferred".to_string(),
-                    message: "a verification-workflow evaluation cannot execute until the \
+                return Ok(AgentRunEffectOutcome::failed(
+                    "evaluation-workflow-deferred".to_string(),
+                    "a verification-workflow evaluation cannot execute until the \
                               evaluation cell is bridged to the workflow-tool invocation path"
                         .to_string(),
-                });
+                ));
             }
             _ => {
                 let Some(executor) = self.goal_evaluations.as_ref() else {
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "evaluation-executor-missing".to_string(),
-                        message: "no goal-evaluation executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "evaluation-executor-missing".to_string(),
+                        "no goal-evaluation executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 executor
                     .execute(scope, intent, evaluation, credential, now)
@@ -3944,7 +3934,7 @@ where
                 })
             }
             AgentGoalEvaluationFinding::Refused { code, message } => {
-                Ok(AgentRunEffectOutcome::Failed { code, message })
+                Ok(AgentRunEffectOutcome::failed(code, message))
             }
         }
     }
@@ -3969,10 +3959,10 @@ where
             // The refusal is authored by an application-implemented
             // [`AgentDispatchAuthority`], and this outcome is durable run
             // state.
-            AgentRunEffectOutcome::Failed {
-                code: bounded_failure_code(&refusal.code),
-                message: bounded_failure_detail(&refusal.message),
-            },
+            AgentRunEffectOutcome::failed(
+                bounded_failure_code(&refusal.code),
+                bounded_failure_detail(&refusal.message),
+            ),
             pass,
         )
         .await?;

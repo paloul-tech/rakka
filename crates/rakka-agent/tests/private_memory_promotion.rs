@@ -1543,10 +1543,10 @@ async fn an_exhausted_post_terminal_promotion_leaves_the_terminal_record_untouch
     assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
     let exhausted = resolve_promotion(
         &fx,
-        AgentRunEffectOutcome::Exhausted {
-            code: "memory-promotion-source-missing".to_string(),
-            message: "the session rows were purged".to_string(),
-        },
+        AgentRunEffectOutcome::exhausted(
+            "memory-promotion-source-missing".to_string(),
+            "the session rows were purged".to_string(),
+        ),
     )
     .await;
     assert_eq!(exhausted.status, AgentRunEffectStatus::Exhausted);
