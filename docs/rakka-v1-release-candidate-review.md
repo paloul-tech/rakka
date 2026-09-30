@@ -87,4 +87,4 @@ Historical and active implementation plans live under `docs/plans/`.
 
 ## Release Candidate Decision
 
-After review, the remaining decision is not technical packaging readiness alone. The repository license is declared (MIT); a public release also needs a contribution policy and a user-approved publishing action.
+After review, the remaining decision is not technical packaging readiness alone. The repository license (MIT) and contribution policy (`CONTRIBUTING.md`: contributions under the same MIT terms) are declared; a public release also needs a user-approved publishing action.
