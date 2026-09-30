@@ -301,7 +301,7 @@ mod tests {
         let card = A2AAgentCardBuilder::new("Rakka A2A", "durable agent")
             .public_base_url("https://agents.example.test/rakka-a2a")
             .push_notifications(true)
-            .provider("Rakka", "https://github.com/rakka-rs/rakka")
+            .provider("Rakka", "https://github.com/paloul-tech/rakka")
             .build(&catalog);
 
         assert_eq!(card.capabilities.streaming, Some(true));

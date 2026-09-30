@@ -16,7 +16,8 @@ This document records the important limits of the v1 release candidate and the m
 - HTTP/gRPC adapters are integration surfaces, not a full web framework or auth platform.
 - Protobuf compatibility is policy-driven; v1 does not automatically diff descriptors.
 - Observability exporters provide Prometheus/OpenTelemetry-oriented primitives, not hosted dashboards or vendor agents.
-- The repository does not declare a license yet; release packaging must not claim one.
+- The repository is MIT-licensed (`LICENSE`), and every crate manifest declares `license = "MIT"`. Declaring a license is not permission to publish.
+- Contributions are accepted under the same MIT terms as the project (inbound = outbound), as `CONTRIBUTING.md` states. The repository requires no contributor license agreement (CLA) and no Developer Certificate of Origin (DCO) sign-off.
 - Packaging checks are validation-only and offline-only. They do not publish crates or upload artifacts.
 
 ## Agent Domain
@@ -41,11 +42,10 @@ Likely post-v1 work:
 - More production observability examples, dashboards, and alert guidance.
 - Descriptor-based Protobuf compatibility checks.
 - Per-actor sidecar or external workload ownership model.
-- Release process finalization once the repository license and publishing policy are explicit.
+- Release process finalization once the publishing policy is explicit.
 
 ## Review Questions
 
 - Which APIs should be promoted from v1 draft to semver-stable first?
 - Which coordination backend is the right next step for durable shard ownership?
 - Which deployment target should receive the first production packaging story: raw manifests, Helm, or an operator?
-- What license and contribution policy should the repository declare before any public release?

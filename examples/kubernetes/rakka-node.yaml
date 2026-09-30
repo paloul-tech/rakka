@@ -1,6 +1,6 @@
 # Reviewable Kubernetes example for a three-node Rakka cluster.
 #
-# Replace ghcr.io/rakka-rs/rakka-node:0.1.0 with an application image that
+# Replace ghcr.io/paloul-tech/rakka-node:0.1.0 with an application image that
 # exposes:
 # - HTTP readiness at /ready on port 8080
 # - HTTP liveness at /live on port 8080
@@ -166,7 +166,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
         - name: rakka-node
-          image: ghcr.io/rakka-rs/rakka-node:0.1.0
+          image: ghcr.io/paloul-tech/rakka-node:0.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: remoting

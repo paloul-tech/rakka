@@ -30,7 +30,7 @@
   - `RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture` (both multi-process gates: the loopback compatibility example and the multi-pod agent fault sweep)
   - `RAKKA_ETCD_TEST_ENDPOINTS=http://127.0.0.1:2379 cargo test -p rakka-discovery-etcd --test etcd_discovery -- --nocapture`
   - `RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image> examples/kubernetes/local-cluster-scenario.sh`
-- Examples are runnable packages and double as behavioral documentation; expected output is in `README.md` and example READMEs. `cargo run -p rakka-example-multi-pod-agent-fault-soak` runs the multi-pod agent fault sweep directly, without a gate, in about two minutes.
+- Examples are runnable packages and double as behavioral documentation; expected output is in `examples/README.md` and example READMEs; `CONTRIBUTING.md` is the contributor guide. `cargo run -p rakka-example-multi-pod-agent-fault-soak` runs the multi-pod agent fault sweep directly, without a gate, in about two minutes.
 
 ## 3. Architecture & Code Map
 

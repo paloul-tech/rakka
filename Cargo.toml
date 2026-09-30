@@ -55,11 +55,11 @@ members = [
 edition = "2021"
 rust-version = "1.88"
 description = "A Rust actor framework foundation with typed actors, sharding, remoting, process ownership, and Kubernetes operation."
-repository = "https://github.com/rakka-rs/rakka"
-homepage = "https://github.com/rakka-rs/rakka"
+repository = "https://github.com/paloul-tech/rakka"
+homepage = "https://github.com/paloul-tech/rakka"
 documentation = "https://docs.rs/rakka"
 readme = "README.md"
-license-file = "LICENSE"
+license = "MIT"
 
 [workspace.dependencies]
 # The A2A SDK crates, imported under the short names `a2a` and `a2a-server`.

@@ -164,6 +164,16 @@ fn publishable_crates_have_release_metadata_and_versioned_internal_deps() {
             manifest.contains("description.workspace = true"),
             "{manifest_path} should inherit workspace description"
         );
+        assert!(
+            manifest.contains("license.workspace = true"),
+            "{manifest_path} should inherit the workspace license"
+        );
+        assert!(
+            repo_root()
+                .join(format!("crates/{crate_name}/LICENSE"))
+                .is_file(),
+            "crates/{crate_name}/LICENSE should resolve to the root license so the packaged crate carries it"
+        );
 
         for line in manifest
             .lines()
@@ -314,6 +324,9 @@ fn release_docs_and_ignore_rules_are_present() {
 
     let root_manifest = read("Cargo.toml");
     assert!(root_manifest.contains("rust-version = "));
+    assert!(root_manifest.contains("license = \"MIT\""));
+    assert!(root_manifest.contains("repository = \"https://github.com/paloul-tech/rakka\""));
+    assert!(read("LICENSE").starts_with("MIT License"));
     assert!(root_manifest.contains("description = "));
 
     let release_docs = read("docs/rakka-v1-release-packaging.md");
@@ -455,7 +468,11 @@ fn relative_links(relative: &str) -> Vec<(String, PathBuf)> {
 
 #[test]
 fn documentation_relative_links_resolve() {
-    let mut documents = vec!["README.md".to_string()];
+    let mut documents = vec![
+        "README.md".to_string(),
+        "CONTRIBUTING.md".to_string(),
+        "examples/README.md".to_string(),
+    ];
     let mut docs: Vec<String> = fs::read_dir(repo_root().join("docs"))
         .expect("docs/ is readable")
         .map(|entry| entry.expect("a directory entry is readable").path())
@@ -509,4 +526,26 @@ fn readme_links_the_agent_documentation_set() {
             );
         }
     }
+}
+
+#[test]
+fn examples_index_names_every_example_package() {
+    let index = read("examples/README.md");
+    let mut checked = 0;
+    for entry in fs::read_dir(repo_root().join("examples")).expect("examples/ is readable") {
+        let directory = entry.expect("a directory entry is readable").path();
+        if !directory.join("Cargo.toml").is_file() {
+            continue;
+        }
+        let name = directory.file_name().unwrap().to_string_lossy();
+        checked += 1;
+        assert!(
+            index.contains(&format!("| [`rakka-example-{name}`](")),
+            "examples/README.md has no index row for rakka-example-{name}"
+        );
+    }
+    assert!(
+        checked > 0,
+        "the example scan found nothing, so nothing is checked"
+    );
 }
