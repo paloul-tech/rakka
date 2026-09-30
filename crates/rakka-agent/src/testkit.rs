@@ -51,7 +51,7 @@ use std::fmt::{self, Debug};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
+use rakka_agent_workflow::{AgentCorrelationId, AgentTelemetryContext, AgentTimestampMillis};
 use rakka_core::MetricsRecorder;
 use rakka_persistence::DurableStateStore;
 use serde::{Deserialize, Serialize};
@@ -70,17 +70,17 @@ use crate::definition::{AgentCredentialBindingRef, AgentModelProfileId, AgentRev
 use crate::dispatch::{
     AgentDispatchError, AgentDispatchFuture, AgentDispatchProbe, AgentDispatchToolExecutor,
     AgentDispatchWindow, AgentEffectCredentialResolver, AgentEffectReconciler,
-    AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentReconciliationFinding,
-    AgentRunResultDelivery,
+    AgentGoalEvaluationExecutor, AgentGoalEvaluationFinding, AgentMemoryPromotionExecutor,
+    AgentMemoryPromotionFinding, AgentReconciliationFinding, AgentRunResultDelivery,
 };
 use crate::effect::{
     AgentEffectPolicies, AgentMemoryPromotionRequest, AgentReconciliationProtocolRef,
     AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
     AgentRunEffectStatus,
 };
-use crate::identity::{AgentOperationId, AgentRunScope};
+use crate::identity::{AgentOperationId, AgentRunScope, AgentTaskScope};
 use crate::loop_runtime::{AgentLoopState, CURRENT_AGENT_LOOP_ADAPTER_VERSION};
-use crate::memory::{AgentContextSnapshotRef, AgentRunMemory};
+use crate::memory::{AgentContextSnapshotRef, AgentRunMemory, MemoryError};
 use crate::model::{
     AgentModelAdapter, AgentModelFuture, AgentModelRequest, AgentModelResult,
     AgentModelRetryPolicy, AgentModelTurn, AgentToolCallRequest,
@@ -91,10 +91,12 @@ use crate::run::{
 };
 use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
 use crate::task::{
-    AgentRunAcceptance, AgentRunAssignment, AgentTaskContent, AgentTaskEntityStore, AgentTaskError,
-    AgentTaskHistoryStore, AgentTaskState, AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE,
-    AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
+    AgentRunAcceptance, AgentRunAssignment, AgentTaskContent, AgentTaskEntityCommand,
+    AgentTaskEntityReply, AgentTaskEntityStore, AgentTaskError, AgentTaskHistoryStore,
+    AgentTaskState, AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
 };
+use crate::wake_scanner::{AgentWakeDelivery, AgentWakeDeliveryFuture};
+use crate::wake_timers::AgentWakeRewakeParker;
 
 /// Payload type of a [`ProbeCreation`] command.
 pub const PROBE_CREATION_TYPE: &str = "rakka.agent.testkit.ProbeCreation";
@@ -372,6 +374,23 @@ impl AgentExchangeParticipant for ChoreographyProbe {
                 apply_ledger(state, envelope, 1)
             }
             AgentExchangeKind::BudgetSettlement => apply_ledger(state, envelope, -1),
+            // An epoch result, a goal evaluation, a delegation result, a
+            // cancellation request, a handoff resolution, a team-board
+            // exchange, a dependency edge, or a terminal notice is a durable
+            // transition but not a balance movement: the probe records the
+            // application without crediting.
+            AgentExchangeKind::EpochResult
+            | AgentExchangeKind::GoalEvaluation
+            | AgentExchangeKind::DelegationResult
+            | AgentExchangeKind::RunCancel
+            | AgentExchangeKind::DelegationCancel
+            | AgentExchangeKind::HandoffResult
+            | AgentExchangeKind::TeamClaim
+            | AgentExchangeKind::TeamClaimResult
+            | AgentExchangeKind::DependencyRegistration
+            | AgentExchangeKind::DependencyOutcome
+            | AgentExchangeKind::TeamTerminalNotice
+            | AgentExchangeKind::ConversationTerminalNotice => apply_ledger(state, envelope, 0),
         };
 
         // Every applied exchange is a transition, whether it accepted or
@@ -763,6 +782,31 @@ impl AgentExchangeParticipant for RunAcceptanceProbe {
         envelope: &AgentExchangeEnvelope,
         now: AgentTimestampMillis,
     ) -> AgentExchangeTransition {
+        if envelope.kind() == AgentExchangeKind::RunCancel {
+            // The probe models a run with nothing outstanding: the request
+            // is durably recorded and the wind-down is instantly terminal.
+            let receipt = crate::task::AgentRunCancelReceipt {
+                run: match &state.address {
+                    AgentEntityAddress::Run(scope) => scope.clone(),
+                    other => AgentRunScope::new(
+                        other.tenant().clone(),
+                        crate::AgentId::new("probe").expect("the literal is a valid agent id"),
+                        crate::AgentRunId::new("probe").expect("the literal is a valid run id"),
+                    )
+                    .expect("the probe scope is well formed"),
+                },
+                status: crate::run::AgentRunStatus::Cancelled,
+            };
+            return AgentExchangeTransition::new(AgentExchangeResult::accepted(
+                AgentExchangePayload::encode(
+                    crate::task::AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE,
+                    &receipt,
+                )
+                .unwrap_or_else(|_| {
+                    AgentExchangePayload::empty(crate::task::AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE)
+                }),
+            ));
+        }
         if envelope.kind() != AgentExchangeKind::Assignment {
             return AgentExchangeTransition::new(AgentExchangeResult::rejected(
                 "unsupported-exchange",
@@ -985,6 +1029,497 @@ fn task_delivery_error(error: AgentTaskError) -> AgentExchangeDeliveryError {
     AgentExchangeDeliveryError::new(error.code(), error.to_string())
 }
 
+/// Delivers exchanges to a real [`crate::team::AgentTeamEntityStore`] over a shared
+/// durable store, exactly as [`InProcessTaskEntityTransport`] does for
+/// tasks: every delivery re-materializes the entity from durable state
+/// alone, so it exercises the passivate-anytime contract, and the same
+/// [`ExchangeFault`] queue injects the failure windows.
+pub struct InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    store: Store,
+    history: History,
+    router: AgentExchangeRouter,
+    clock: Arc<AtomicU64>,
+    faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    acceptances: Arc<AtomicUsize>,
+}
+
+impl<Store, History> Clone for InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            history: self.history.clone(),
+            router: self.router.clone(),
+            clock: self.clock.clone(),
+            faults: self.faults.clone(),
+            acceptances: self.acceptances.clone(),
+        }
+    }
+}
+
+impl<Store, History> InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    /// Creates a transport that delivers to team entities in one durable
+    /// store.
+    #[must_use]
+    pub fn new(
+        store: Store,
+        history: History,
+        router: AgentExchangeRouter,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            store,
+            history,
+            router,
+            clock,
+            faults: Arc::new(Mutex::new(VecDeque::new())),
+            acceptances: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Queues a fault to inject into the next delivery.
+    pub fn inject(&self, fault: ExchangeFault) {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .push_back(fault);
+    }
+
+    /// How many envelopes reached a team entity's durable accept path,
+    /// including the ones whose reply was then lost.
+    #[must_use]
+    pub fn acceptances(&self) -> usize {
+        self.acceptances.load(Ordering::SeqCst)
+    }
+
+    fn take_fault(&self) -> Option<ExchangeFault> {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .pop_front()
+    }
+
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+impl<Store, History> AgentExchangeTransport for InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    fn deliver<'a>(
+        &'a self,
+        envelope: &'a AgentExchangeEnvelope,
+    ) -> AgentExchangeDeliveryFuture<'a> {
+        let fault = self.take_fault();
+
+        Box::pin(async move {
+            if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-envelope",
+                    "the envelope never reached the team entity",
+                ));
+            }
+
+            let AgentEntityAddress::Team(scope) = envelope.target().clone() else {
+                return Err(AgentExchangeDeliveryError::new(
+                    "exchange-no-route",
+                    "this transport serves team entities only",
+                ));
+            };
+
+            let mut entity = crate::team::AgentTeamEntityStore::new(
+                scope,
+                self.store.clone(),
+                self.history.clone(),
+            );
+
+            self.acceptances.fetch_add(1, Ordering::SeqCst);
+            let now = self.now();
+            let mut reply = entity
+                .accept(envelope, &self.router, now)
+                .await
+                .map_err(team_delivery_error)?;
+
+            if matches!(fault, Some(ExchangeFault::DeliverTwice)) {
+                self.acceptances.fetch_add(1, Ordering::SeqCst);
+                let now = self.now();
+                reply = entity
+                    .accept(envelope, &self.router, now)
+                    .await
+                    .map_err(team_delivery_error)?;
+            }
+
+            if matches!(fault, Some(ExchangeFault::LoseReply)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-reply",
+                    "the team accepted the exchange, and its reply was lost",
+                ));
+            }
+
+            Ok(reply)
+        })
+    }
+}
+
+fn team_delivery_error(error: crate::team::AgentTeamError) -> AgentExchangeDeliveryError {
+    AgentExchangeDeliveryError::new(error.code(), error.to_string())
+}
+
+/// Delivers exchanges to a real
+/// [`crate::conversation::AgentConversationEntityStore`] over a shared durable
+/// store, exactly as [`InProcessTaskEntityTransport`] does for tasks: every
+/// delivery re-materializes the entity from durable state alone, so it
+/// exercises the passivate-anytime contract, and the same [`ExchangeFault`]
+/// queue injects the failure windows.
+pub struct InProcessConversationEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    store: Store,
+    agents: Agents,
+    history: History,
+    router: AgentExchangeRouter,
+    clock: Arc<AtomicU64>,
+    faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    acceptances: Arc<AtomicUsize>,
+}
+
+impl<Store, Agents, History> Clone for InProcessConversationEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            agents: self.agents.clone(),
+            history: self.history.clone(),
+            router: self.router.clone(),
+            clock: self.clock.clone(),
+            faults: self.faults.clone(),
+            acceptances: self.acceptances.clone(),
+        }
+    }
+}
+
+impl<Store, Agents, History> InProcessConversationEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    /// Creates a transport that delivers to conversation entities in one
+    /// durable store.
+    #[must_use]
+    pub fn new(
+        store: Store,
+        agents: Agents,
+        history: History,
+        router: AgentExchangeRouter,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            store,
+            agents,
+            history,
+            router,
+            clock,
+            faults: Arc::new(Mutex::new(VecDeque::new())),
+            acceptances: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Queues a fault to inject into the next delivery.
+    pub fn inject(&self, fault: ExchangeFault) {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .push_back(fault);
+    }
+
+    /// How many envelopes reached a conversation entity's durable accept
+    /// path, including the ones whose reply was then lost.
+    #[must_use]
+    pub fn acceptances(&self) -> usize {
+        self.acceptances.load(Ordering::SeqCst)
+    }
+
+    fn take_fault(&self) -> Option<ExchangeFault> {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .pop_front()
+    }
+
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+impl<Store, Agents, History> AgentExchangeTransport
+    for InProcessConversationEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    fn deliver<'a>(
+        &'a self,
+        envelope: &'a AgentExchangeEnvelope,
+    ) -> AgentExchangeDeliveryFuture<'a> {
+        let fault = self.take_fault();
+
+        Box::pin(async move {
+            if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-envelope",
+                    "the envelope never reached the conversation entity",
+                ));
+            }
+
+            let AgentEntityAddress::Conversation(scope) = envelope.target().clone() else {
+                return Err(AgentExchangeDeliveryError::new(
+                    "exchange-no-route",
+                    "this transport serves conversation entities only",
+                ));
+            };
+
+            let mut entity = crate::conversation::AgentConversationEntityStore::new(
+                scope,
+                self.store.clone(),
+                self.agents.clone(),
+                self.history.clone(),
+            );
+
+            self.acceptances.fetch_add(1, Ordering::SeqCst);
+            let now = self.now();
+            let mut reply = entity
+                .accept(envelope, &self.router, now)
+                .await
+                .map_err(conversation_delivery_error)?;
+
+            if matches!(fault, Some(ExchangeFault::DeliverTwice)) {
+                self.acceptances.fetch_add(1, Ordering::SeqCst);
+                let now = self.now();
+                reply = entity
+                    .accept(envelope, &self.router, now)
+                    .await
+                    .map_err(conversation_delivery_error)?;
+            }
+
+            if matches!(fault, Some(ExchangeFault::LoseReply)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-reply",
+                    "the conversation accepted the exchange, and its reply was lost",
+                ));
+            }
+
+            Ok(reply)
+        })
+    }
+}
+
+fn conversation_delivery_error(
+    error: crate::conversation::AgentConversationError,
+) -> AgentExchangeDeliveryError {
+    AgentExchangeDeliveryError::new(error.code(), error.to_string())
+}
+
+/// Delivers wake admission commands to a real [`AgentTaskEntityStore`] over a
+/// shared durable store.
+///
+/// Every delivery re-materializes the entity from durable state alone — which
+/// is what a scanner delivering to a passivated controller looks like from the
+/// outside. The same [`ExchangeFault`] queue the exchange transports use
+/// injects the wake failure windows: a command lost before the entity, a
+/// duplicate delivery of the same derived operation id, and a reply lost after
+/// the controller dispositioned the wake — the window that leaves a timer
+/// entry pending for the next pass to redeliver.
+pub struct InProcessWakeDelivery<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    store: Store,
+    agents: Agents,
+    history: History,
+    router: AgentExchangeRouter,
+    clock: Arc<AtomicU64>,
+    faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    deliveries: Arc<AtomicUsize>,
+    rewake_parker: Option<Arc<dyn AgentWakeRewakeParker>>,
+}
+
+impl<Store, Agents, History> Clone for InProcessWakeDelivery<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            agents: self.agents.clone(),
+            history: self.history.clone(),
+            router: self.router.clone(),
+            clock: self.clock.clone(),
+            faults: self.faults.clone(),
+            deliveries: self.deliveries.clone(),
+            rewake_parker: self.rewake_parker.clone(),
+        }
+    }
+}
+
+impl<Store, Agents, History> InProcessWakeDelivery<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    /// Creates a delivery into task entities over one durable store.
+    #[must_use]
+    pub fn new(
+        store: Store,
+        agents: Agents,
+        history: History,
+        router: AgentExchangeRouter,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            store,
+            agents,
+            history,
+            router,
+            clock,
+            faults: Arc::new(Mutex::new(VecDeque::new())),
+            deliveries: Arc::new(AtomicUsize::new(0)),
+            rewake_parker: None,
+        }
+    }
+
+    /// Wires the wake-timer parker the delivered entities' settle passes park
+    /// controller-originated re-wakes through.
+    #[must_use]
+    pub fn with_wake_timers(mut self, parker: Arc<dyn AgentWakeRewakeParker>) -> Self {
+        self.rewake_parker = Some(parker);
+        self
+    }
+
+    /// Queues a fault to inject into the next delivery.
+    pub fn inject(&self, fault: ExchangeFault) {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .push_back(fault);
+    }
+
+    /// How many commands reached a task entity's durable apply path, including
+    /// the ones whose reply was then lost.
+    #[must_use]
+    pub fn deliveries(&self) -> usize {
+        self.deliveries.load(Ordering::SeqCst)
+    }
+
+    fn take_fault(&self) -> Option<ExchangeFault> {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .pop_front()
+    }
+
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst))
+    }
+
+    async fn apply_once(
+        &self,
+        scope: &AgentTaskScope,
+        command: AgentTaskEntityCommand,
+    ) -> AgentTaskEntityReply {
+        let mut entity = AgentTaskEntityStore::new(
+            scope.clone(),
+            self.store.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        );
+        if let Some(parker) = self.rewake_parker.clone() {
+            entity = entity.with_wake_timers(parker);
+        }
+        self.deliveries.fetch_add(1, Ordering::SeqCst);
+        let now = self.now();
+        match entity.apply(command, &self.router, now).await {
+            Ok(reply) => reply,
+            // The entity actor answers a domain refusal as a rejection reply,
+            // so the delivery does too: a scanner must see the same protocol
+            // either way.
+            Err(error) => AgentTaskEntityReply::Rejected {
+                code: error.code().to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
+impl<Store, Agents, History> AgentWakeDelivery for InProcessWakeDelivery<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    fn deliver<'a>(
+        &'a self,
+        scope: &'a AgentTaskScope,
+        command: AgentTaskEntityCommand,
+    ) -> AgentWakeDeliveryFuture<'a> {
+        let fault = self.take_fault();
+
+        Box::pin(async move {
+            if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-command",
+                    "the command never reached the task entity",
+                ));
+            }
+
+            let mut reply = self.apply_once(scope, command.clone()).await;
+
+            if matches!(fault, Some(ExchangeFault::DeliverTwice)) {
+                // The same command arrives again at the same durable receiver.
+                // The reply the scanner sees is the second one, which must
+                // carry the same logical result as the first.
+                reply = self.apply_once(scope, command).await;
+            }
+
+            if matches!(fault, Some(ExchangeFault::LoseReply)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-reply",
+                    "the controller dispositioned the wake, and its reply was lost",
+                ));
+            }
+
+            Ok(reply)
+        })
+    }
+}
+
 fn run_delivery_error(error: AgentRunError) -> AgentExchangeDeliveryError {
     AgentExchangeDeliveryError::new(error.code(), error.to_string())
 }
@@ -1007,8 +1542,12 @@ where
     policies: AgentEffectPolicies,
     memory: Arc<Mutex<Option<AgentRunMemory>>>,
     decisions: Arc<Mutex<Option<Arc<dyn AgentDecisionEventSink>>>>,
+    segments: Arc<Mutex<Option<Arc<dyn crate::observability::AgentSegmentSink>>>>,
     metrics: Arc<Mutex<Option<Arc<dyn MetricsRecorder>>>>,
+    delegation: Arc<Mutex<Option<crate::delegation::AgentRunDelegationConfig>>>,
+    workflow_tools: Arc<Mutex<Option<crate::workflow_tool::AgentRunWorkflowConfig>>>,
     faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    deliveries: Arc<AtomicUsize>,
     acceptances: Arc<AtomicUsize>,
 }
 
@@ -1026,8 +1565,12 @@ where
             policies: self.policies.clone(),
             memory: self.memory.clone(),
             decisions: self.decisions.clone(),
+            segments: self.segments.clone(),
             metrics: self.metrics.clone(),
+            delegation: self.delegation.clone(),
+            workflow_tools: self.workflow_tools.clone(),
             faults: self.faults.clone(),
+            deliveries: self.deliveries.clone(),
             acceptances: self.acceptances.clone(),
         }
     }
@@ -1054,10 +1597,25 @@ where
             policies: AgentEffectPolicies::default(),
             memory: Arc::new(Mutex::new(None)),
             decisions: Arc::new(Mutex::new(None)),
+            segments: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(None)),
+            delegation: Arc::new(Mutex::new(None)),
+            workflow_tools: Arc::new(Mutex::new(None)),
             faults: Arc::new(Mutex::new(VecDeque::new())),
+            deliveries: Arc::new(AtomicUsize::new(0)),
             acceptances: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// How many deliveries this transport was asked to make.
+    ///
+    /// Counted before an injected fault can swallow the envelope, so a test can
+    /// tell a fault that fired from one queued on a transport the envelope
+    /// never travelled — a delivery driven around this transport increments
+    /// nothing here, however much durable state it changes.
+    #[must_use]
+    pub fn deliveries(&self) -> usize {
+        self.deliveries.load(Ordering::SeqCst)
     }
 
     /// Wires every run entity this transport builds with a session-memory
@@ -1087,6 +1645,15 @@ where
             .expect("the decision slot should not be poisoned") = Some(sink);
     }
 
+    /// Wires every run entity this transport builds with a bounded-segment
+    /// sink, under the same shared-slot rule as [`Self::install_memory`].
+    pub fn install_segments(&self, sink: Arc<dyn crate::observability::AgentSegmentSink>) {
+        *self
+            .segments
+            .lock()
+            .expect("the segment slot should not be poisoned") = Some(sink);
+    }
+
     /// Wires every run entity this transport builds with a metrics recorder,
     /// under the same shared-slot rule as [`Self::install_memory`].
     pub fn install_metrics(&self, metrics: Arc<dyn MetricsRecorder>) {
@@ -1094,6 +1661,26 @@ where
             .metrics
             .lock()
             .expect("the metrics slot should not be poisoned") = Some(metrics);
+    }
+
+    /// Wires every run entity this transport builds to serve delegation,
+    /// under the same shared-slot rule as [`Self::install_memory`]: every
+    /// driver of a run must share one wiring, because an entity that
+    /// advances the loop unwired refuses the coordination tool.
+    pub fn install_delegation(&self, config: crate::delegation::AgentRunDelegationConfig) {
+        *self
+            .delegation
+            .lock()
+            .expect("the delegation slot should not be poisoned") = Some(config);
+    }
+
+    /// Wires every run entity this transport builds to serve workflow tools,
+    /// under the same shared-slot rule as [`Self::install_memory`].
+    pub fn install_workflow_tools(&self, config: crate::workflow_tool::AgentRunWorkflowConfig) {
+        *self
+            .workflow_tools
+            .lock()
+            .expect("the workflow-tool slot should not be poisoned") = Some(config);
     }
 
     /// Uses explicit effect specs for the effects hosted runs commit.
@@ -1144,6 +1731,9 @@ where
         envelope: &'a AgentExchangeEnvelope,
     ) -> AgentExchangeDeliveryFuture<'a> {
         let fault = self.take_fault();
+        // Counted before the fault can swallow the envelope, so a test can tell
+        // "the fault fired" from "nothing was ever delivered here".
+        self.deliveries.fetch_add(1, Ordering::SeqCst);
 
         Box::pin(async move {
             if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
@@ -1179,6 +1769,14 @@ where
             if let Some(decisions) = decisions {
                 entity = entity.with_decision_events(decisions);
             }
+            let segments = self
+                .segments
+                .lock()
+                .expect("the segment slot should not be poisoned")
+                .clone();
+            if let Some(segments) = segments {
+                entity = entity.with_segments(segments);
+            }
             let metrics = self
                 .metrics
                 .lock()
@@ -1186,6 +1784,22 @@ where
                 .clone();
             if let Some(metrics) = metrics {
                 entity = entity.with_metrics(metrics);
+            }
+            let delegation = self
+                .delegation
+                .lock()
+                .expect("the delegation slot should not be poisoned")
+                .clone();
+            if let Some(delegation) = delegation {
+                entity = entity.with_delegation(delegation);
+            }
+            let workflow_tools = self
+                .workflow_tools
+                .lock()
+                .expect("the workflow-tool slot should not be poisoned")
+                .clone();
+            if let Some(workflow_tools) = workflow_tools {
+                entity = entity.with_workflow_tools(workflow_tools);
             }
 
             self.acceptances.fetch_add(1, Ordering::SeqCst);
@@ -1245,6 +1859,8 @@ pub struct DeterministicModelAdapter {
     turns: Arc<Mutex<VecDeque<AgentModelTurn>>>,
     by_turn: Arc<Mutex<BTreeMap<u64, AgentModelTurn>>>,
     calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<AgentModelRequest>>>,
+    credentials: Arc<Mutex<Vec<Option<&'static str>>>>,
 }
 
 impl DeterministicModelAdapter {
@@ -1257,7 +1873,34 @@ impl DeterministicModelAdapter {
             turns: Arc::new(Mutex::new(VecDeque::new())),
             by_turn: Arc::new(Mutex::new(BTreeMap::new())),
             calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            credentials: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Every request this adapter has produced a turn for, in call order —
+    /// what a test reads to see the bounded request a driver actually built.
+    #[must_use]
+    pub fn requests(&self) -> Vec<AgentModelRequest> {
+        self.requests
+            .lock()
+            .expect("the request log should not be poisoned")
+            .clone()
+    }
+
+    /// The material kind of the credential each call was handed, in call
+    /// order — a label, never a value.
+    ///
+    /// Only [`AgentModelAdapter::call_with`] records here, which is what makes
+    /// the log a proof: an entry exists exactly when the dispatcher took the
+    /// credential-bearing path, and `None` is a call it took with no
+    /// credential at all.
+    #[must_use]
+    pub fn credentials_seen(&self) -> Vec<Option<&'static str>> {
+        self.credentials
+            .lock()
+            .expect("the credential log should not be poisoned")
+            .clone()
     }
 
     /// Scripts the turn the next unconditioned model call returns.
@@ -1313,6 +1956,10 @@ impl DeterministicModelAdapter {
     #[must_use]
     pub fn produce(&self, request: &AgentModelRequest) -> AgentModelTurn {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests
+            .lock()
+            .expect("the request log should not be poisoned")
+            .push(request.clone());
         if let Some(turn) = self
             .by_turn
             .lock()
@@ -1351,15 +1998,37 @@ impl AgentModelAdapter for DeterministicModelAdapter {
         // Rig-backed adapter performs no provider call for a future never polled.
         Box::pin(async move { Ok(self.produce(request)) })
     }
+
+    fn call_with<'a>(
+        &'a self,
+        request: &'a AgentModelRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentModelFuture<'a> {
+        // The label, not the value: a test asserts which *kind* of material an
+        // adapter was handed, and a testkit that kept the secret would be the
+        // one durable copy the secret-exclusion sweep cannot see.
+        let seen = credential.map(|credential| credential.material().kind_label());
+        Box::pin(async move {
+            self.credentials
+                .lock()
+                .expect("the credential log should not be poisoned")
+                .push(seen);
+            Ok(self.produce(request))
+        })
+    }
 }
 
-/// Builds the bounded model request one model effect resolves to.
+/// Builds the bounded model request one model effect resolves to, under the
+/// effect's trace context — the every-driver rule: the real pipeline stamps
+/// it, so this driver does too.
 fn model_request(
     context: &AgentContextSnapshotRef,
     profile: Option<&AgentModelProfileId>,
     turn: u64,
+    telemetry: &AgentTelemetryContext,
 ) -> AgentModelRequest {
-    let mut request = AgentModelRequest::new(context.clone(), turn);
+    let mut request =
+        AgentModelRequest::new(context.clone(), turn).with_telemetry(telemetry.clone());
     if let Some(profile) = profile {
         request = request.with_profile(profile.clone());
     }
@@ -1397,6 +2066,12 @@ pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
     failures: Arc<Mutex<BTreeMap<String, (String, String)>>>,
     compensations: Arc<Mutex<BTreeMap<String, AgentTaskContent>>>,
     promotions: Arc<Mutex<Option<Arc<dyn AgentMemoryPromotionExecutor>>>>,
+    evaluations: Arc<Mutex<Option<Arc<dyn AgentGoalEvaluationExecutor>>>>,
+    a2a_sends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentA2aSendExecutor>>>>,
+    a2a_handoffs: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentA2aHandoffSendExecutor>>>>,
+    workflow_starts: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowStartExecutor>>>>,
+    workflow_cancels: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowCancelExecutor>>>>,
+    claim_appends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentClaimAppendExecutor>>>>,
     model_calls: Arc<AtomicUsize>,
     tool_calls: Arc<AtomicUsize>,
 }
@@ -1466,10 +2141,7 @@ fn model_outcome(produced: AgentModelResult<AgentModelTurn>) -> AgentRunEffectOu
         Ok(turn) => AgentRunEffectOutcome::Model {
             turn: Box::new(turn),
         },
-        Err(error) => AgentRunEffectOutcome::Failed {
-            code: error.code().to_string(),
-            message: error.to_string(),
-        },
+        Err(error) => AgentRunEffectOutcome::failed(error.code().to_string(), error.to_string()),
     }
 }
 
@@ -1487,6 +2159,12 @@ where
             failures: Arc::new(Mutex::new(BTreeMap::new())),
             compensations: Arc::new(Mutex::new(BTreeMap::new())),
             promotions: Arc::new(Mutex::new(None)),
+            evaluations: Arc::new(Mutex::new(None)),
+            a2a_sends: Arc::new(Mutex::new(None)),
+            a2a_handoffs: Arc::new(Mutex::new(None)),
+            workflow_starts: Arc::new(Mutex::new(None)),
+            workflow_cancels: Arc::new(Mutex::new(None)),
+            claim_appends: Arc::new(Mutex::new(None)),
             model_calls: Arc::new(AtomicUsize::new(0)),
             tool_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -1546,6 +2224,103 @@ where
         self
     }
 
+    /// Executes goal-evaluation effects through the given executor. An
+    /// unwired evaluation fails with the real pipeline's
+    /// `evaluation-executor-missing` code; a human review never consults the
+    /// executor — its effect-bound approval grant is its verdict, exactly as
+    /// in the real pipeline.
+    #[must_use]
+    pub fn with_goal_evaluation_executor(
+        self,
+        executor: Arc<dyn AgentGoalEvaluationExecutor>,
+    ) -> Self {
+        *self
+            .evaluations
+            .lock()
+            .expect("the evaluation executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes outbound A2A send effects through the given executor. An
+    /// unwired send fails with the real pipeline's
+    /// `a2a-send-executor-missing` code, exactly as the real dispatcher
+    /// fails closed.
+    #[must_use]
+    pub fn with_a2a_send_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentA2aSendExecutor>,
+    ) -> Self {
+        *self
+            .a2a_sends
+            .lock()
+            .expect("the A2A send executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes outbound handoff send effects through the given executor. An
+    /// unwired handoff fails with the real pipeline's
+    /// `a2a-handoff-executor-missing` code, exactly as the real dispatcher
+    /// fails closed.
+    #[must_use]
+    pub fn with_a2a_handoff_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentA2aHandoffSendExecutor>,
+    ) -> Self {
+        *self
+            .a2a_handoffs
+            .lock()
+            .expect("the A2A handoff executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes workflow start effects through the given executor. An
+    /// unwired start fails with the real pipeline's
+    /// `workflow-start-executor-missing` code, exactly as the real
+    /// dispatcher fails closed.
+    #[must_use]
+    pub fn with_workflow_start_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentWorkflowStartExecutor>,
+    ) -> Self {
+        *self
+            .workflow_starts
+            .lock()
+            .expect("the workflow start executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes workflow cancel effects through the given executor. An
+    /// unwired cancel fails with the real pipeline's
+    /// `workflow-cancel-executor-missing` code, exactly as the real
+    /// dispatcher fails closed.
+    #[must_use]
+    pub fn with_workflow_cancel_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentWorkflowCancelExecutor>,
+    ) -> Self {
+        *self
+            .workflow_cancels
+            .lock()
+            .expect("the workflow cancel executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes communal claim appends through the given executor. An
+    /// unwired append fails with the real pipeline's
+    /// `claim-append-executor-missing` code, exactly as the real dispatcher
+    /// fails closed.
+    #[must_use]
+    pub fn with_claim_append_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentClaimAppendExecutor>,
+    ) -> Self {
+        *self
+            .claim_appends
+            .lock()
+            .expect("the claim-append executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
     /// How many model calls the dispatcher has answered, re-invocations included.
     #[must_use]
     pub fn model_calls(&self) -> usize {
@@ -1590,6 +2365,23 @@ where
                     self.promotion_outcome(&scope, &effect, promotion, now)
                         .await
                 }
+                // An append executor writes under the run scope only `drive`
+                // holds.
+                AgentRunEffectRequest::ClaimAppend { append, provenance } => {
+                    self.claim_append_outcome(&scope, &effect, append, provenance, now)
+                        .await
+                }
+                // An evaluation needs the scope, and — for a human review —
+                // the grant the run's own checkpoint issued, exactly as the
+                // real authority reads it from the loop state.
+                AgentRunEffectRequest::Evaluation { evaluation } => {
+                    let grant = entity
+                        .state()?
+                        .loop_state()
+                        .and_then(|loop_state| loop_state.grant_for(&effect).cloned());
+                    self.evaluation_outcome(&scope, &effect, evaluation, grant.as_ref(), now)
+                        .await
+                }
                 _ => self.answer(&effect).await,
             };
             let command = AgentRunEntityCommand::RecordEffectResult {
@@ -1628,7 +2420,8 @@ where
                 if let Some(outcome) = self.cached(effect) {
                     return outcome;
                 }
-                let request = model_request(context, profile.as_ref(), effect.turn);
+                let request =
+                    model_request(context, profile.as_ref(), effect.turn, &effect.telemetry);
                 // A provider failure or an unboundable turn is a failed effect,
                 // exactly as a real dispatcher surfaces one; the interim loop
                 // stops the run on it, and slice 1.7's retry policy governs
@@ -1660,10 +2453,10 @@ where
                         call_id: crate::effect::compensation_call_id(effect),
                         content,
                     },
-                    None => AgentRunEffectOutcome::Failed {
-                        code: "compensation-unscripted".to_string(),
-                        message: format!("no scripted result for compensation {compensation}"),
-                    },
+                    None => AgentRunEffectOutcome::failed(
+                        "compensation-unscripted".to_string(),
+                        format!("no scripted result for compensation {compensation}"),
+                    ),
                 };
                 self.memoize(effect, outcome)
             }
@@ -1676,14 +2469,313 @@ where
                 if let Some(outcome) = self.cached(effect) {
                     return outcome;
                 }
-                AgentRunEffectOutcome::Failed {
-                    code: "memory-promotion-unscoped".to_string(),
-                    message: "a memory promotion is answered through drive or promotion_outcome, \
+                AgentRunEffectOutcome::failed(
+                    "memory-promotion-unscoped".to_string(),
+                    "a memory promotion is answered through drive or promotion_outcome, \
                               which carry the run scope"
                         .to_string(),
+                )
+            }
+            AgentRunEffectRequest::Evaluation { .. } => {
+                // An evaluation needs the run scope — and, for a human
+                // review, the grant — that only `drive` or
+                // [`Self::evaluation_outcome`] carry. Deliberately not
+                // memoized, so a later scoped answer can still resolve it.
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
                 }
+                AgentRunEffectOutcome::failed(
+                    "goal-evaluation-unscoped".to_string(),
+                    "a goal evaluation is answered through drive or \
+                              evaluation_outcome, which carry the run scope"
+                        .to_string(),
+                )
+            }
+            AgentRunEffectRequest::A2aSend { delegation } => {
+                // The record carries its own parent scope, so the send needs
+                // nothing `answer` does not hold. Memoized like a tool call:
+                // a re-invocation of the same generation returns the same
+                // receipt, which is exactly what the derived deduplication
+                // key promises.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .a2a_sends
+                    .lock()
+                    .expect("the A2A send executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::failed(
+                        "a2a-send-executor-missing".to_string(),
+                        "no A2A send executor is wired into this dispatcher".to_string(),
+                    ),
+                    Some(executor) => match executor
+                        .execute(&delegation.parent_run, effect, delegation, None)
+                        .await
+                    {
+                        Ok(crate::dispatch::AgentA2aSendFinding::Sent {
+                            child_task,
+                            child_run,
+                            peer_status,
+                        }) => AgentRunEffectOutcome::A2aSend {
+                            receipt: crate::delegation::AgentA2aSendReceipt {
+                                delegation: delegation.delegation.clone(),
+                                child_task,
+                                child_run,
+                                peer_status,
+                            },
+                        },
+                        Ok(crate::dispatch::AgentA2aSendFinding::Conflict { code, message }) => {
+                            AgentRunEffectOutcome::failed(code, message)
+                        }
+                        Ok(crate::dispatch::AgentA2aSendFinding::Refused {
+                            code,
+                            message,
+                            reason,
+                        }) => AgentRunEffectOutcome::failed(code, message).with_reason(reason),
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as a failed effect, the
+                        // model-adapter precedent above.
+                        Err(error) => AgentRunEffectOutcome::failed(
+                            "a2a-send-attempt-failed".to_string(),
+                            error.to_string(),
+                        ),
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::A2aHandoff { handoff } => {
+                // The record carries its own source scope, so the send needs
+                // nothing `answer` does not hold. Memoized like a tool call:
+                // a re-invocation of the same generation returns the same
+                // receipt, which is exactly what the derived deduplication
+                // key promises.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .a2a_handoffs
+                    .lock()
+                    .expect("the A2A handoff executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::failed(
+                        "a2a-handoff-executor-missing".to_string(),
+                        "no A2A handoff executor is wired into this dispatcher".to_string(),
+                    ),
+                    Some(executor) => match executor
+                        .execute(&handoff.source_run, effect, handoff, None)
+                        .await
+                    {
+                        Ok(crate::dispatch::AgentA2aHandoffFinding::Recorded {
+                            target_generation,
+                            peer_status,
+                        }) => AgentRunEffectOutcome::A2aHandoff {
+                            receipt: crate::coordination::AgentA2aHandoffReceipt {
+                                handoff: handoff.handoff.clone(),
+                                target_generation,
+                                peer_status,
+                            },
+                        },
+                        Ok(crate::dispatch::AgentA2aHandoffFinding::Conflict { code, message }) => {
+                            AgentRunEffectOutcome::failed(code, message)
+                        }
+                        Ok(crate::dispatch::AgentA2aHandoffFinding::Refused {
+                            code,
+                            message,
+                            reason,
+                        }) => AgentRunEffectOutcome::failed(code, message).with_reason(reason),
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as an *exhausted* effect
+                        // — the real pipeline's spent retry budget — so the
+                        // run parks indeterminate rather than resuming beside
+                        // a possibly-recorded transfer.
+                        Err(error) => AgentRunEffectOutcome::exhausted(
+                            "a2a-handoff-attempt-failed".to_string(),
+                            error.to_string(),
+                        ),
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::WorkflowStart { invocation } => {
+                // The record carries its own parent scope, so the start needs
+                // nothing `answer` does not hold. Memoized like a send: a
+                // re-invocation of the same generation returns the same
+                // receipt, which is exactly what the derived generation-free
+                // `StartRun` identities promise.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .workflow_starts
+                    .lock()
+                    .expect("the workflow start executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::failed(
+                        "workflow-start-executor-missing".to_string(),
+                        "no workflow start executor is wired into this dispatcher".to_string(),
+                    ),
+                    Some(executor) => match executor
+                        .execute(&invocation.parent_run, effect, invocation, None)
+                        .await
+                    {
+                        Ok(
+                            finding @ (crate::dispatch::AgentWorkflowStartFinding::Started
+                            | crate::dispatch::AgentWorkflowStartFinding::Adopted),
+                        ) => AgentRunEffectOutcome::WorkflowStart {
+                            receipt: crate::workflow_tool::AgentWorkflowStartReceipt {
+                                invocation: invocation.invocation.clone(),
+                                child_run: invocation.child_run.clone(),
+                                adopted: matches!(
+                                    finding,
+                                    crate::dispatch::AgentWorkflowStartFinding::Adopted
+                                ),
+                            },
+                        },
+                        // The real dispatcher's conflict normalization,
+                        // verbatim: the cell's `Conflicted` settlement is
+                        // structural, never an executor string convention.
+                        Ok(crate::dispatch::AgentWorkflowStartFinding::Conflict {
+                            code,
+                            message,
+                        }) => AgentRunEffectOutcome::failed(
+                            crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                                .to_string(),
+                            format!("{code}: {message}"),
+                        ),
+                        Ok(crate::dispatch::AgentWorkflowStartFinding::Refused {
+                            code,
+                            message,
+                        }) => AgentRunEffectOutcome::failed(code, message),
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as a failed effect, the
+                        // model-adapter precedent above.
+                        Err(error) => AgentRunEffectOutcome::failed(
+                            "workflow-start-attempt-failed".to_string(),
+                            error.to_string(),
+                        ),
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::WorkflowCancel { invocation, reason } => {
+                // The record carries its own parent scope, so the cancel
+                // needs nothing `answer` does not hold. Memoized like a
+                // start: a re-invocation of the same generation returns the
+                // same outcome, which is exactly what the derived
+                // generation-free `CancelRun` identities promise.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .workflow_cancels
+                    .lock()
+                    .expect("the workflow cancel executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::failed(
+                        "workflow-cancel-executor-missing".to_string(),
+                        "no workflow cancel executor is wired into this dispatcher".to_string(),
+                    ),
+                    Some(executor) => match executor
+                        .execute(&invocation.parent_run, effect, invocation, reason, None)
+                        .await
+                    {
+                        Ok(crate::dispatch::AgentWorkflowCancelFinding::Requested) => {
+                            AgentRunEffectOutcome::WorkflowCancel {
+                                already_finished: false,
+                            }
+                        }
+                        Ok(crate::dispatch::AgentWorkflowCancelFinding::AlreadyFinished) => {
+                            AgentRunEffectOutcome::WorkflowCancel {
+                                already_finished: true,
+                            }
+                        }
+                        Ok(crate::dispatch::AgentWorkflowCancelFinding::Refused {
+                            code,
+                            message,
+                        }) => AgentRunEffectOutcome::failed(code, message),
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as a failed effect, the
+                        // model-adapter precedent above.
+                        Err(error) => AgentRunEffectOutcome::failed(
+                            "workflow-cancel-attempt-failed".to_string(),
+                            error.to_string(),
+                        ),
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::ClaimAppend { .. } => {
+                // An append executor runs under the run scope only `drive`
+                // holds. Answer it through [`Self::drive`] or
+                // [`Self::claim_append_outcome`]. Deliberately not memoized,
+                // so a later scoped answer can still resolve the effect.
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                AgentRunEffectOutcome::failed(
+                    "claim-append-unscoped".to_string(),
+                    "a claim append is answered through drive or claim_append_outcome, \
+                              which carry the run scope"
+                        .to_string(),
+                )
             }
         }
+    }
+
+    /// What this dispatcher returns for one claim-append effect, running the
+    /// wired executor under the run's scope. Memoized on the effect id and
+    /// generation exactly like every other answer.
+    pub async fn claim_append_outcome(
+        &self,
+        scope: &AgentRunScope,
+        effect: &AgentRunEffect,
+        append: &crate::effect::AgentClaimAppendRequest,
+        provenance: &crate::effect::AgentClaimAppendProvenance,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEffectOutcome {
+        self.tool_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(outcome) = self.cached(effect) {
+            return outcome;
+        }
+        let executor = self
+            .claim_appends
+            .lock()
+            .expect("the claim-append executor slot should not be poisoned")
+            .clone();
+        let outcome = match executor {
+            None => AgentRunEffectOutcome::failed(
+                "claim-append-executor-missing".to_string(),
+                "no claim-append executor is wired into this dispatcher".to_string(),
+            ),
+            Some(executor) => match executor
+                .execute(scope, effect, append, provenance, now)
+                .await
+            {
+                Ok(crate::dispatch::AgentClaimAppendFinding::Appended { claim }) => {
+                    AgentRunEffectOutcome::ClaimAppend { claim }
+                }
+                Ok(crate::dispatch::AgentClaimAppendFinding::Refused { code, message }) => {
+                    AgentRunEffectOutcome::failed(code, message)
+                }
+                // The in-process driver has no attempt machinery: a
+                // retryable failure surfaces as a failed effect, the
+                // model-adapter precedent above.
+                Err(error) => AgentRunEffectOutcome::failed(
+                    "claim-append-attempt-failed".to_string(),
+                    error.to_string(),
+                ),
+            },
+        };
+        self.memoize(effect, outcome)
     }
 
     /// What this dispatcher returns for one memory-promotion effect, running
@@ -1706,25 +2798,180 @@ where
             .expect("the promotion executor slot should not be poisoned")
             .clone();
         let outcome = match executor {
-            None => AgentRunEffectOutcome::Failed {
-                code: "memory-promotion-executor-missing".to_string(),
-                message: "no memory-promotion executor is wired into this dispatcher".to_string(),
-            },
+            None => AgentRunEffectOutcome::failed(
+                "memory-promotion-executor-missing".to_string(),
+                "no memory-promotion executor is wired into this dispatcher".to_string(),
+            ),
             Some(executor) => match executor.execute(scope, effect, promotion, now).await {
                 Ok(AgentMemoryPromotionFinding::Promoted { promoted }) => {
                     AgentRunEffectOutcome::MemoryPromotion { promoted }
                 }
                 Ok(AgentMemoryPromotionFinding::Refused { code, message }) => {
-                    AgentRunEffectOutcome::Failed { code, message }
+                    AgentRunEffectOutcome::failed(code, message)
                 }
                 // The in-process driver has no attempt machinery: a retryable
                 // failure surfaces as a failed effect, the model-adapter
                 // precedent above.
-                Err(error) => AgentRunEffectOutcome::Failed {
-                    code: "memory-promotion-attempt-failed".to_string(),
-                    message: error.to_string(),
-                },
+                Err(error) => AgentRunEffectOutcome::failed(
+                    "memory-promotion-attempt-failed".to_string(),
+                    error.to_string(),
+                ),
             },
+        };
+        self.memoize(effect, outcome)
+    }
+
+    /// What this dispatcher returns for one goal-evaluation effect, mirroring
+    /// the real pipeline's evaluation arm: a human review's verdict is the
+    /// effect-bound approval grant, a verification workflow fails closed as
+    /// deferred, and everything else runs the wired executor or fails with the
+    /// real `evaluation-executor-missing` code. Memoized on the effect id and
+    /// generation exactly like every other answer.
+    pub async fn evaluation_outcome(
+        &self,
+        scope: &AgentRunScope,
+        effect: &AgentRunEffect,
+        evaluation: &crate::evaluation::AgentGoalEvaluationRequest,
+        grant: Option<&crate::checkpoints::AgentCheckpointGrant>,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEffectOutcome {
+        use crate::evaluation::{
+            goal_evaluation_record_id, AgentGoalEvaluationMethod, AgentGoalEvaluationOutcome,
+            AgentGoalEvaluationRecord, AgentGoalEvidenceRef,
+        };
+
+        self.tool_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(outcome) = self.cached(effect) {
+            return outcome;
+        }
+        let evaluation_id =
+            match goal_evaluation_record_id(scope, effect.turn, effect.slot, effect.generation) {
+                Ok(evaluation_id) => evaluation_id,
+                Err(error) => {
+                    return self.memoize(
+                        effect,
+                        AgentRunEffectOutcome::failed(
+                            "evaluation-identity-invalid".to_string(),
+                            error.to_string(),
+                        ),
+                    );
+                }
+            };
+        let build = |outcome: AgentGoalEvaluationOutcome,
+                     reason_code: String,
+                     evidence: Vec<AgentGoalEvidenceRef>,
+                     evaluated_by| {
+            AgentGoalEvaluationRecord::new(
+                evaluation_id.clone(),
+                evaluation.goal.clone(),
+                evaluation.evaluator.clone(),
+                evaluation.method.kind(),
+                evaluation.criteria_revision,
+                outcome,
+                reason_code,
+                evidence,
+                evaluated_by,
+                effect.effect_id.clone(),
+                effect.generation,
+                now,
+            )
+        };
+        let finding = match &evaluation.method {
+            AgentGoalEvaluationMethod::HumanReview => match grant {
+                None => {
+                    return self.memoize(
+                        effect,
+                        AgentRunEffectOutcome::failed(
+                            "evaluation-grant-missing".to_string(),
+                            "a human-review evaluation dispatched without its approval \
+                                      grant"
+                                .to_string(),
+                        ),
+                    );
+                }
+                Some(grant) => {
+                    let mut evidence = evaluation.evidence.clone();
+                    evidence.push(AgentGoalEvidenceRef {
+                        class: crate::evaluation::AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS
+                            .to_string(),
+                        artifact: None,
+                        digest: Some(grant.argument_digest.clone()),
+                    });
+                    AgentGoalEvaluationFinding::Evaluated {
+                        outcome: AgentGoalEvaluationOutcome::Satisfied,
+                        reason_code: "human-approved".to_string(),
+                        evidence,
+                        evaluated_by: Some(grant.resolver.clone()),
+                    }
+                }
+            },
+            AgentGoalEvaluationMethod::VerificationWorkflow { .. } => {
+                return self.memoize(
+                    effect,
+                    AgentRunEffectOutcome::failed(
+                        "evaluation-workflow-deferred".to_string(),
+                        "a verification-workflow evaluation cannot execute until the \
+                                  evaluation cell is bridged to the workflow-tool invocation path"
+                            .to_string(),
+                    ),
+                );
+            }
+            _ => {
+                let executor = self
+                    .evaluations
+                    .lock()
+                    .expect("the evaluation executor slot should not be poisoned")
+                    .clone();
+                match executor {
+                    None => {
+                        return self.memoize(
+                            effect,
+                            AgentRunEffectOutcome::failed(
+                                "evaluation-executor-missing".to_string(),
+                                "no goal-evaluation executor is wired into this \
+                                          dispatcher"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                    Some(executor) => {
+                        match executor.execute(scope, effect, evaluation, None, now).await {
+                            Ok(finding) => finding,
+                            // The in-process driver has no attempt machinery:
+                            // a retryable failure surfaces as a failed effect,
+                            // the promotion precedent above.
+                            Err(error) => {
+                                return self.memoize(
+                                    effect,
+                                    AgentRunEffectOutcome::failed(
+                                        "evaluation-attempt-failed".to_string(),
+                                        error.to_string(),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let outcome = match finding {
+            AgentGoalEvaluationFinding::Evaluated {
+                outcome,
+                reason_code,
+                evidence,
+                evaluated_by,
+            } => match build(outcome, reason_code, evidence, evaluated_by) {
+                Ok(record) => AgentRunEffectOutcome::Evaluation {
+                    record: Box::new(record),
+                },
+                Err(error) => AgentRunEffectOutcome::failed(
+                    "evaluation-record-invalid".to_string(),
+                    error.to_string(),
+                ),
+            },
+            AgentGoalEvaluationFinding::Refused { code, message } => {
+                AgentRunEffectOutcome::failed(code, message)
+            }
         };
         self.memoize(effect, outcome)
     }
@@ -1765,7 +3012,7 @@ where
             .get(&tool)
             .cloned()
         {
-            AgentRunEffectOutcome::Failed { code, message }
+            AgentRunEffectOutcome::failed(code, message)
         } else {
             let content = self
                 .tools
@@ -1811,6 +3058,12 @@ where
     router: AgentExchangeRouter,
     clock: Arc<AtomicU64>,
     policies: AgentEffectPolicies,
+    workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
+    delegation: Option<crate::delegation::AgentRunDelegationConfig>,
+    memory: Option<crate::memory::AgentRunMemory>,
+    segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
+    metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
+    decisions: Option<Arc<dyn crate::observability::AgentDecisionEventSink>>,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -1832,6 +3085,12 @@ where
             router,
             clock,
             policies: AgentEffectPolicies::default(),
+            workflow_tools: None,
+            delegation: None,
+            memory: None,
+            segments: None,
+            metrics: None,
+            decisions: None,
         }
     }
 
@@ -1839,6 +3098,90 @@ where
     #[must_use]
     pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
         self.policies = policies;
+        self
+    }
+
+    /// Wires the entities this delivery builds to serve workflow tools —
+    /// the delivered model result is what the loop evaluates, so the
+    /// interception must be wired on this path too.
+    #[must_use]
+    pub fn with_workflow_tools(
+        mut self,
+        config: crate::workflow_tool::AgentRunWorkflowConfig,
+    ) -> Self {
+        self.workflow_tools = Some(config);
+        self
+    }
+
+    /// Wires the entity this delivery drives with a bounded-segment sink.
+    ///
+    /// Delivering a durable result *advances the loop* — it is what discharges
+    /// a wait, folds a turn, and opens the next checkpoint — so this driver
+    /// closes segments as much as the entity a caller drives directly. Every
+    /// driver of a run must share one wiring, the same rule session memory and
+    /// decision events already follow: an unwired driver silently closes
+    /// nothing for every transition it commits.
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn crate::observability::AgentSegmentSink>) -> Self {
+        self.segments = Some(sink);
+        self
+    }
+
+    /// Wires the entity this delivery drives with the run's memory bundle.
+    ///
+    /// The same every-driver rule: delivering a tool result is what makes
+    /// the turn record, and a turn recorded by a driver without the bundle
+    /// owes no session entry — so a deployment whose run reads its own tool
+    /// results back from session memory must wire the delivery too.
+    #[must_use]
+    pub fn with_memory(mut self, memory: crate::memory::AgentRunMemory) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// Wires the entity this delivery drives with a metrics recorder.
+    ///
+    /// The same rule as [`Self::with_segments`], one field over, and it was
+    /// missed: delivering a durable result folds the turn and settles the
+    /// effect, so this driver is where `rakka.agent.turn.duration`,
+    /// `rakka.agent.model.tokens`, `rakka.agent.effect.outcomes`, and
+    /// `rakka.agent.effect.outstanding.duration` are recorded. An unwired
+    /// delivery records **none** of them while the sharded entity beside it
+    /// reports a healthy metric surface — which is exactly how a 17.12 clause
+    /// can read "implemented" and publish nothing. Found by the telemetry
+    /// export walk, whose exported metric set was missing every instrument
+    /// this path owns.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn rakka_core::MetricsRecorder>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Wires the entity this delivery drives with a decision-event sink.
+    ///
+    /// The third field to need this and the third to have been missed. The
+    /// delivered model result *is* the deciding transition of a model turn —
+    /// it is the only place the turn's decision is recorded — so a sharded
+    /// registration wired with `with_decision_events` while the delivery
+    /// beside it is not writes no specification-17.7 record for exactly the
+    /// turns a model answered, and counts no `rakka.agent.decisions`. Both
+    /// halves read as wired; neither reports the gap.
+    #[must_use]
+    pub fn with_decision_events(
+        mut self,
+        sink: Arc<dyn crate::observability::AgentDecisionEventSink>,
+    ) -> Self {
+        self.decisions = Some(sink);
+        self
+    }
+
+    /// Wires the entities this delivery builds to serve delegation — the
+    /// delivered model result is where a fan-out turn is intercepted, so an
+    /// unwired delivery would refuse the coordination and await verbs the
+    /// run's durable state was committed under.
+    #[must_use]
+    pub fn with_delegation(mut self, config: crate::delegation::AgentRunDelegationConfig) -> Self {
+        self.delegation = Some(config);
         self
     }
 }
@@ -1857,6 +3200,24 @@ where
             let mut entity =
                 AgentRunEntityStore::new(scope.clone(), self.store.clone(), self.effects.clone())
                     .with_effect_policies(self.policies.clone());
+            if let Some(config) = &self.workflow_tools {
+                entity = entity.with_workflow_tools(config.clone());
+            }
+            if let Some(config) = &self.delegation {
+                entity = entity.with_delegation(config.clone());
+            }
+            if let Some(memory) = &self.memory {
+                entity = entity.with_memory(memory.clone());
+            }
+            if let Some(segments) = &self.segments {
+                entity = entity.with_segments(segments.clone());
+            }
+            if let Some(metrics) = &self.metrics {
+                entity = entity.with_metrics(metrics.clone());
+            }
+            if let Some(decisions) = &self.decisions {
+                entity = entity.with_decision_events(decisions.clone());
+            }
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity
                 .apply(command, &self.router, now)
@@ -2077,7 +3438,9 @@ impl AgentEffectReconciler for ScriptedReconciler {
 #[derive(Clone)]
 pub struct ScriptedCredentialResolver {
     token: String,
+    failure: Option<(String, String)>,
     resolutions: Arc<AtomicUsize>,
+    deadlines: Arc<Mutex<Vec<Option<AgentTimestampMillis>>>>,
 }
 
 impl ScriptedCredentialResolver {
@@ -2086,14 +3449,47 @@ impl ScriptedCredentialResolver {
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
+            failure: None,
             resolutions: Arc::new(AtomicUsize::new(0)),
+            deadlines: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// How many bindings have been resolved.
+    /// A resolver that always fails with `code` and `message`.
+    ///
+    /// The message stands in for what a real resolver quotes back from a
+    /// secret store, which is why it exists: the failure path — not the happy
+    /// path — is where an application-supplied string reaches a durable
+    /// record, so proving the runtime does not persist it needs a resolver
+    /// that fails.
+    #[must_use]
+    pub fn failing(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            token: String::new(),
+            failure: Some((code.into(), message.into())),
+            resolutions: Arc::new(AtomicUsize::new(0)),
+            deadlines: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// How many bindings have been resolved — attempted, whether the
+    /// resolution succeeded or failed.
     #[must_use]
     pub fn resolutions(&self) -> usize {
         self.resolutions.load(Ordering::SeqCst)
+    }
+
+    /// The `deadline_at` each resolution was handed, in resolution order.
+    ///
+    /// A real resolver derives the lease it asks a secret store for from this
+    /// field, so it is the one input a test can read back to prove the
+    /// dispatcher stamped the attempt bound at all.
+    #[must_use]
+    pub fn deadlines(&self) -> Vec<Option<AgentTimestampMillis>> {
+        self.deadlines
+            .lock()
+            .expect("the deadline log should not be poisoned")
+            .clone()
     }
 }
 
@@ -2111,13 +3507,153 @@ impl AgentEffectCredentialResolver for ScriptedCredentialResolver {
         &'a self,
         _scope: &'a AgentRunScope,
         _binding: &'a AgentCredentialBindingRef,
-        _effect: &'a AgentRunEffect,
+        effect: &'a AgentRunEffect,
     ) -> AgentDispatchFuture<'a, AgentEphemeralCredential> {
         Box::pin(async move {
             self.resolutions.fetch_add(1, Ordering::SeqCst);
+            self.deadlines
+                .lock()
+                .expect("the deadline log should not be poisoned")
+                .push(effect.deadline_at);
+            if let Some((code, message)) = self.failure.as_ref() {
+                return Err(crate::dispatch::AgentDispatchError::collaborator(
+                    code.clone(),
+                    message.clone(),
+                ));
+            }
             Ok(AgentEphemeralCredential::bearer_token(self.token.clone()))
         })
     }
+}
+
+/// Captures every `tracing` event this process emits, so a test can assert
+/// what a structured log carries.
+///
+/// Structured logs are the one observability surface with no in-process reader
+/// of its own: metrics have a recorder, decision events have a sink, and spans
+/// are persisted context — but a `tracing::warn!` goes nowhere a test can see.
+/// A secret-exclusion sweep that skipped them would be asserting about every
+/// surface except the one a developer reaches for first.
+///
+/// Implemented directly against the `tracing` facade rather than through
+/// `tracing-subscriber`, which the workspace does not depend on: `tracing`
+/// re-exports [`tracing::Subscriber`], [`tracing::Event`],
+/// [`tracing::Metadata`], and [`tracing::field::Visit`], which is everything a
+/// capture needs. Adding a dependency for a two-line log surface would not pay
+/// for itself.
+///
+/// The subscriber installs *globally* and once per process
+/// ([`Self::install_global`]). A thread-local default would be tidier, but its
+/// guard is `!Send` and would have to be held across `.await` points inside a
+/// `#[tokio::test]` — which happens to work on the current-thread runtime and
+/// is a trap for whoever changes the runtime next. One global buffer shared by
+/// the binary's tests is the honest trade: each test drains what it needs.
+#[derive(Clone, Default)]
+pub struct CapturingSubscriber {
+    events: Arc<Mutex<Vec<String>>>,
+    next_span: Arc<AtomicU64>,
+}
+
+impl CapturingSubscriber {
+    /// Installs the capture as this process's global subscriber, returning a
+    /// handle onto its buffer.
+    ///
+    /// Idempotent: a second call returns a handle onto the buffer the first
+    /// installed, because a process may set a global default only once.
+    #[must_use]
+    pub fn install_global() -> Self {
+        static INSTALLED: std::sync::OnceLock<CapturingSubscriber> = std::sync::OnceLock::new();
+        INSTALLED
+            .get_or_init(|| {
+                let subscriber = Self::default();
+                // A prior global default is not an error here: it means
+                // something else in this binary already installed one, and
+                // the buffer simply stays empty rather than the test aborting.
+                let _ = tracing::subscriber::set_global_default(subscriber.clone());
+                subscriber
+            })
+            .clone()
+    }
+
+    /// Every event captured so far, rendered as
+    /// `target|level|message|field=value,...`.
+    #[must_use]
+    pub fn events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .expect("the capture buffer should not be poisoned")
+            .clone()
+    }
+
+    /// Drops everything captured so far.
+    pub fn clear(&self) {
+        self.events
+            .lock()
+            .expect("the capture buffer should not be poisoned")
+            .clear();
+    }
+}
+
+impl Debug for CapturingSubscriber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapturingSubscriber")
+            .field("events", &self.events().len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Renders one event's fields into `key=value` pairs.
+#[derive(Default)]
+struct CapturedFields {
+    message: String,
+    fields: Vec<String>,
+}
+
+impl tracing::field::Visit for CapturedFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+    }
+}
+
+impl tracing::Subscriber for CapturingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        // Ids are opaque and must be non-zero; the capture holds no span
+        // state, so a monotonic counter is the whole implementation.
+        tracing::span::Id::from_u64(self.next_span.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = CapturedFields::default();
+        event.record(&mut visitor);
+        let metadata = event.metadata();
+        let rendered = format!(
+            "{}|{}|{}|{}",
+            metadata.target(),
+            metadata.level(),
+            visitor.message,
+            visitor.fields.join(",")
+        );
+        self.events
+            .lock()
+            .expect("the capture buffer should not be poisoned")
+            .push(rendered);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 /// A workflow clock over a shared atomic counter, so a test can advance time
@@ -2239,6 +3775,12 @@ pub enum CrashPoint {
     /// This is the window that matters: the entity is durably committed to
     /// something it has not yet told anyone about, and recovery must find it.
     AfterWrite,
+    /// The owner did not die: a second writer moved the durable record first,
+    /// so the owner's write loses its compare-and-set with a genuine
+    /// `RevisionConflict`. Unlike the two crashes, this is the failure an
+    /// entity with two writers meets in production, and the one that makes a
+    /// resident entity drop its cached record.
+    ConflictBeforeWrite,
 }
 
 /// Runs one recovery scenario once per (write, crash point): the exhaustive
@@ -2290,6 +3832,7 @@ where
     writes: Arc<AtomicUsize>,
     crash_at: Arc<AtomicUsize>,
     crash_after: Arc<std::sync::atomic::AtomicBool>,
+    conflict: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S> Clone for CrashingStateStore<S>
@@ -2302,6 +3845,7 @@ where
             writes: self.writes.clone(),
             crash_at: self.crash_at.clone(),
             crash_after: self.crash_after.clone(),
+            conflict: self.conflict.clone(),
         }
     }
 }
@@ -2339,6 +3883,7 @@ where
             writes: Arc::new(AtomicUsize::new(0)),
             crash_at: Arc::new(AtomicUsize::new(0)),
             crash_after: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            conflict: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -2356,6 +3901,10 @@ where
         self.crash_at.store(nth, Ordering::SeqCst);
         self.crash_after
             .store(matches!(point, CrashPoint::AfterWrite), Ordering::SeqCst);
+        self.conflict.store(
+            matches!(point, CrashPoint::ConflictBeforeWrite),
+            Ordering::SeqCst,
+        );
     }
 
     /// Stops killing the owner. The next activation recovers whatever the last
@@ -2417,9 +3966,24 @@ where
         let write = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
         let crash_at = self.crash_at.load(Ordering::SeqCst);
         let after = self.crash_after.load(Ordering::SeqCst);
+        let conflict = self.conflict.load(Ordering::SeqCst);
 
         Box::pin(async move {
-            if crash_at != 0 && write == crash_at && !after {
+            if crash_at != 0 && write == crash_at && conflict {
+                // The second writer: the record as it stands, written back
+                // at its own revision. Nothing about the state changes; the
+                // revision moves, which is all a lost compare-and-set is.
+                if let Some(record) = self.inner.load(persistence_id).await? {
+                    self.inner
+                        .compare_and_set(persistence_id, record.revision, record.state)
+                        .await?;
+                }
+                return self
+                    .inner
+                    .compare_and_set(persistence_id, expected_revision, state)
+                    .await;
+            }
+            if crash_at != 0 && write == crash_at && !after && !conflict {
                 return Err(rakka_persistence::DurableError::store(
                     "crashing-in-memory",
                     "the owner was lost before the write reached the store",
@@ -2450,9 +4014,10 @@ where
         let write = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
         let crash_at = self.crash_at.load(Ordering::SeqCst);
         let after = self.crash_after.load(Ordering::SeqCst);
+        let conflict = self.conflict.load(Ordering::SeqCst);
 
         Box::pin(async move {
-            if crash_at != 0 && write == crash_at && !after {
+            if crash_at != 0 && write == crash_at && !after && !conflict {
                 return Err(rakka_persistence::DurableError::store(
                     "crashing-in-memory",
                     "the owner was lost before the delete reached the store",
@@ -2529,7 +4094,9 @@ impl DeferredExchangeRouter {
         AgentExchangeRouter::new()
             .with_route(AgentEntityClass::Agent, transport.clone())
             .with_route(AgentEntityClass::Task, transport.clone())
-            .with_route(AgentEntityClass::Run, transport)
+            .with_route(AgentEntityClass::Run, transport.clone())
+            .with_route(AgentEntityClass::Team, transport.clone())
+            .with_route(AgentEntityClass::Conversation, transport)
     }
 }
 
@@ -2652,6 +4219,799 @@ where
             .await
         })
     }
+}
+
+/// A deterministic [`AgentMemoryEmbedder`](crate::retrieval::AgentMemoryEmbedder)
+/// for tests: a fixed-dimension token-hash bag-of-words embedding, no network,
+/// no model.
+///
+/// The same text always embeds to the same vector, related texts share
+/// components (each token increments the component its hash selects), and the
+/// declared [`crate::memory::MemoryEmbeddingRef`] identity is stable — which
+/// is exactly what retrieval and index-drift tests need. The version is
+/// configurable so a test can prove an embedder upgrade makes old vectors
+/// non-candidates.
+#[derive(Debug, Clone)]
+pub struct DeterministicEmbedder {
+    dimensions: u32,
+    version: AgentRevisionNumber,
+}
+
+impl DeterministicEmbedder {
+    /// The model name the embedder declares.
+    pub const MODEL: &'static str = "deterministic-test-embedder";
+
+    /// An embedder with eight dimensions at the initial version.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            dimensions: 8,
+            version: AgentRevisionNumber::INITIAL,
+        }
+    }
+
+    /// Uses an explicit dimension count (clamped to at least one).
+    #[must_use]
+    pub const fn with_dimensions(mut self, dimensions: u32) -> Self {
+        self.dimensions = if dimensions == 0 { 1 } else { dimensions };
+        self
+    }
+
+    /// Uses an explicit pipeline version.
+    #[must_use]
+    pub const fn with_version(mut self, version: AgentRevisionNumber) -> Self {
+        self.version = version;
+        self
+    }
+}
+
+impl Default for DeterministicEmbedder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::retrieval::AgentMemoryEmbedder for DeterministicEmbedder {
+    fn embedding_ref(&self) -> crate::memory::MemoryEmbeddingRef {
+        crate::memory::MemoryEmbeddingRef {
+            model: Self::MODEL.to_string(),
+            dimensions: self.dimensions,
+            version: self.version,
+        }
+    }
+
+    fn embed<'a>(&'a self, text: &'a str) -> crate::memory::MemoryFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            let mut vector = vec![0f32; self.dimensions as usize];
+            for token in text
+                .split(|character: char| !character.is_alphanumeric())
+                .filter(|token| !token.is_empty())
+            {
+                // FNV-1a over the lowercased token selects the component;
+                // deterministic across platforms and runs.
+                let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                for byte in token.to_lowercase().bytes() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                let index = (hash % u64::from(self.dimensions)) as usize;
+                vector[index] += 1.0;
+            }
+            Ok(vector)
+        })
+    }
+}
+
+/// A scripted
+/// [`AgentPrivateMemoryRetriever`](crate::retrieval::AgentPrivateMemoryRetriever)
+/// for tests: queued outcomes, answered in order, with every call recorded.
+///
+/// An exhausted script answers an empty outcome, so a test scripts only the
+/// calls it is proving. Clones share the queue and the counters, matching the
+/// testkit's shared-slot convention.
+#[derive(Clone)]
+pub struct ScriptedPrivateMemoryRetriever {
+    outcomes: Arc<Mutex<VecDeque<Result<crate::retrieval::MemoryRetrievalOutcome, MemoryError>>>>,
+    calls: Arc<AtomicUsize>,
+    version: AgentRevisionNumber,
+}
+
+impl Default for ScriptedPrivateMemoryRetriever {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScriptedPrivateMemoryRetriever {
+    /// A retriever with an empty script at the initial version.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            outcomes: Arc::new(Mutex::new(VecDeque::new())),
+            calls: Arc::new(AtomicUsize::new(0)),
+            version: AgentRevisionNumber::INITIAL,
+        }
+    }
+
+    /// Queues one retrieval outcome.
+    #[must_use]
+    pub fn with_outcome(self, outcome: crate::retrieval::MemoryRetrievalOutcome) -> Self {
+        self.outcomes
+            .lock()
+            .expect("the scripted retriever should not be poisoned")
+            .push_back(Ok(outcome));
+        self
+    }
+
+    /// Queues one retrieval failure — the outage the assembly path degrades
+    /// on.
+    #[must_use]
+    pub fn with_error(self, error: MemoryError) -> Self {
+        self.outcomes
+            .lock()
+            .expect("the scripted retriever should not be poisoned")
+            .push_back(Err(error));
+        self
+    }
+
+    /// Uses an explicit retriever version, so a test can bump it and prove a
+    /// retried model input does not move.
+    #[must_use]
+    pub const fn with_retriever_version(mut self, version: AgentRevisionNumber) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// How many retrievals have been asked of this retriever.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl crate::retrieval::AgentPrivateMemoryRetriever for ScriptedPrivateMemoryRetriever {
+    fn backend_name(&self) -> &'static str {
+        "scripted"
+    }
+
+    fn retriever_version(&self) -> AgentRevisionNumber {
+        self.version
+    }
+
+    fn retrieve<'a>(
+        &'a self,
+        _scope: &'a crate::identity::AgentScope,
+        _query: &'a crate::retrieval::MemoryRetrievalQuery,
+        _now: rakka_agent_workflow::AgentTimestampMillis,
+    ) -> crate::memory::MemoryFuture<'a, crate::retrieval::MemoryRetrievalOutcome> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.outcomes
+                .lock()
+                .expect("the scripted retriever should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(crate::retrieval::MemoryRetrievalOutcome {
+                        memories: Vec::new(),
+                        index_watermark: None,
+                    })
+                })
+        })
+    }
+}
+
+/// How much history a backend under test keeps.
+///
+/// The contract splits on it, because the two halves are different promises: an
+/// unbounded backend must never lose an entry, and a bounded one must *say* it
+/// lost them rather than answer a short page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryRetention {
+    /// The backend keeps everything appended to it.
+    Unbounded,
+    /// The backend keeps at most this many entries per scope, evicting oldest.
+    Bounded(usize),
+}
+
+/// How many entries a conformance run appends.
+///
+/// Comfortably past the default page size, so paging is exercised for real
+/// rather than in one page that happens to hold everything.
+const HISTORY_CONTRACT_ENTRIES: u64 = 24;
+
+/// Page size the contract reads with: small enough that the log needs several.
+const HISTORY_CONTRACT_PAGE: usize = 5;
+
+fn history_contract_operation(sequence: u64) -> AgentOperationId {
+    // Segments cannot carry the scope separator, so the scope key itself is not
+    // one; the contract only needs distinct ids per sequence.
+    AgentOperationId::new(
+        crate::identity::AgentOperationKind::Command,
+        ["history-contract", &sequence.to_string()],
+    )
+    .expect("the harness derives a legal operation id")
+}
+
+/// Asserts one [`AgentTaskHistoryStore`] keeps the contract every backend owes
+/// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The store must be empty for `scope`. The harness appends its own entries, so
+/// a backend in another crate can prove itself without reaching into this one's
+/// record constructors — the duplication that let the substrate's two projection
+/// backends drift apart.
+///
+/// What it proves: appends are idempotent on `(scope, sequence)` and a *different*
+/// entry at an occupied sequence fails closed; a cursor pages the whole log in
+/// order, once each, with no gap; under
+/// [`HistoryRetention::Bounded`] — a cursor preceding the retained window answers
+/// [`AgentTaskError::HistoryWindowExpired`] naming a floor the reader can
+/// actually resume from, rather than a short page it would mistake for the truth;
+/// and a hole *inside* the log — the discontinuity a durable backend can grow
+/// through TTL or manual deletion — delivers the retained prefix whole, refuses
+/// the read that starts at the hole with the floor past it, and resumes cleanly
+/// from that floor.
+///
+/// # Panics
+///
+/// On any breach of that contract, naming what it observed.
+pub async fn assert_task_history_store_contract<Store>(
+    store: &Store,
+    scope: &AgentTaskScope,
+    retention: HistoryRetention,
+) where
+    Store: AgentTaskHistoryStore,
+{
+    use crate::task::{
+        AgentTaskHistoryCursor, AgentTaskHistoryEntry, AgentTaskHistoryKind,
+        AgentTaskHistorySequence, AgentTaskStatus,
+    };
+
+    let entry = |sequence: u64| {
+        AgentTaskHistoryEntry::new(
+            AgentTaskHistorySequence::new(sequence),
+            AgentTaskHistoryKind::Created,
+            history_contract_operation(sequence),
+            AgentTaskStatus::Created,
+            AgentTimestampMillis::new(sequence),
+        )
+    };
+
+    let first = entry(AgentTaskHistorySequence::FIRST.get());
+    store
+        .append(scope, &first)
+        .await
+        .expect("the first append succeeds");
+    store
+        .append(scope, &first)
+        .await
+        .expect("re-driving an interrupted flush writes the same entry to the same slot");
+    let mut conflicting = entry(AgentTaskHistorySequence::FIRST.get());
+    conflicting.kind = AgentTaskHistoryKind::Terminated;
+    store
+        .append(scope, &conflicting)
+        .await
+        .expect_err("a different entry at an occupied sequence fails closed");
+
+    for sequence in (AgentTaskHistorySequence::FIRST.get() + 1)..=HISTORY_CONTRACT_ENTRIES {
+        store
+            .append(scope, &entry(sequence))
+            .await
+            .expect("appends succeed in sequence order");
+    }
+
+    let floor = match retention {
+        HistoryRetention::Unbounded => AgentTaskHistorySequence::FIRST.get(),
+        HistoryRetention::Bounded(kept) => {
+            // The store's documented zero-means-one clamp applies to the
+            // harness's own arithmetic too, so `Bounded(0)` proves the clamp
+            // instead of panicking on an off-by-one floor.
+            let kept = (kept as u64).max(1);
+            assert!(
+                kept < HISTORY_CONTRACT_ENTRIES,
+                "a bounded contract run must append past the window to exercise it"
+            );
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept + 1;
+            match store
+                .read(scope, AgentTaskHistoryCursor::start())
+                .await
+                .expect_err("a cursor before the retained window is refused, never short-paged")
+            {
+                AgentTaskError::HistoryWindowExpired {
+                    oldest_retained: Some(oldest),
+                } => {
+                    assert_eq!(
+                        oldest.get(),
+                        expected_floor,
+                        "the reported floor is the oldest entry actually retained"
+                    );
+                    oldest.get()
+                }
+                other => panic!("an expired window names its floor, got {other:?}"),
+            }
+        }
+    };
+
+    let mut cursor = AgentTaskHistoryCursor::start()
+        .resuming_at(AgentTaskHistorySequence::new(floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        let page = store
+            .read(scope, cursor)
+            .await
+            .expect("the reported floor is a legal resume point");
+        pages += 1;
+        assert!(
+            page.entries.len() <= HISTORY_CONTRACT_PAGE,
+            "a page never exceeds the size the cursor asked for"
+        );
+        seen.extend(page.entries.iter().map(|held| held.sequence.get()));
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 64, "paging must terminate");
+    }
+
+    let expected: Vec<u64> = (floor..=HISTORY_CONTRACT_ENTRIES).collect();
+    assert_eq!(
+        seen, expected,
+        "the cursor pages the retained log in order, once each, with no gap"
+    );
+    // Only meaningful when the retained window is larger than a page; a
+    // tightly bounded store legitimately answers in one.
+    if expected.len() > HISTORY_CONTRACT_PAGE {
+        assert!(
+            pages > 1,
+            "a log longer than a page must need more than one to prove the cursor"
+        );
+    }
+
+    // A hole *inside* the log: an entry that never lands while a later one
+    // does — the shape a durable backend can grow through TTL or manual
+    // deletion, and the shape a reader must never be paged across silently.
+    // The retained prefix before the hole is delivered whole, the read that
+    // starts at the hole is refused naming the floor past it, and resuming at
+    // that floor delivers the tail.
+    let after_hole = HISTORY_CONTRACT_ENTRIES + 2;
+    store
+        .append(scope, &entry(after_hole))
+        .await
+        .expect("an append past an unfilled sequence succeeds");
+    // A bounded window evicts its oldest for the new entry, moving the floor.
+    let prefix_floor = match retention {
+        HistoryRetention::Unbounded => floor,
+        HistoryRetention::Bounded(_) => floor + 1,
+    };
+    let mut cursor = AgentTaskHistoryCursor::start()
+        .resuming_at(AgentTaskHistorySequence::new(prefix_floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut prefix: Vec<u64> = Vec::new();
+    let mut probes = 0_usize;
+    let refusal = loop {
+        match store.read(scope, cursor).await {
+            Ok(page) => {
+                prefix.extend(page.entries.iter().map(|held| held.sequence.get()));
+                match page.next {
+                    Some(next) => cursor = next,
+                    None => panic!("a reader must be refused at the hole, not run off the end"),
+                }
+            }
+            Err(error) => break error,
+        }
+        probes += 1;
+        assert!(probes < 64, "paging toward the hole must terminate");
+    };
+    assert_eq!(
+        prefix,
+        (prefix_floor..=HISTORY_CONTRACT_ENTRIES).collect::<Vec<u64>>(),
+        "the retained prefix before the hole is delivered whole"
+    );
+    match refusal {
+        AgentTaskError::HistoryWindowExpired {
+            oldest_retained: Some(oldest),
+        } => assert_eq!(
+            oldest.get(),
+            after_hole,
+            "the refusal names the first entry past the hole"
+        ),
+        other => panic!("the read at the hole answers an expired window, got {other:?}"),
+    }
+    let tail = store
+        .read(
+            scope,
+            AgentTaskHistoryCursor::start()
+                .resuming_at(AgentTaskHistorySequence::new(after_hole))
+                .with_limit(HISTORY_CONTRACT_PAGE),
+        )
+        .await
+        .expect("the floor past the hole is a legal resume point");
+    assert_eq!(
+        tail.entries
+            .iter()
+            .map(|held| held.sequence.get())
+            .collect::<Vec<u64>>(),
+        vec![after_hole],
+        "resuming past the hole delivers the tail"
+    );
+    assert!(tail.next.is_none(), "the tail is the end of the log");
+}
+
+/// Asserts one [`AgentTeamHistoryStore`] keeps the same contract.
+///
+/// See [`assert_task_history_store_contract`] for what is proven and why.
+///
+/// [`AgentTeamHistoryStore`]: crate::team::AgentTeamHistoryStore
+///
+/// # Panics
+///
+/// On any breach of that contract, naming what it observed.
+pub async fn assert_team_history_store_contract<Store>(
+    store: &Store,
+    scope: &crate::identity::AgentTeamScope,
+    retention: HistoryRetention,
+) where
+    Store: crate::team::AgentTeamHistoryStore,
+{
+    use crate::team::{
+        AgentTeamError, AgentTeamHistoryCursor, AgentTeamHistoryEntry, AgentTeamHistoryKind,
+        AgentTeamHistorySequence,
+    };
+
+    let entry = |sequence: u64| {
+        AgentTeamHistoryEntry::new(
+            AgentTeamHistorySequence::new(sequence),
+            AgentTeamHistoryKind::Created,
+            history_contract_operation(sequence),
+            AgentTimestampMillis::new(sequence),
+        )
+    };
+
+    let first = entry(AgentTeamHistorySequence::FIRST.get());
+    store
+        .append(scope, &first)
+        .await
+        .expect("the first append succeeds");
+    store
+        .append(scope, &first)
+        .await
+        .expect("re-driving an interrupted flush writes the same entry to the same slot");
+    let mut conflicting = entry(AgentTeamHistorySequence::FIRST.get());
+    conflicting.kind = AgentTeamHistoryKind::Disbanded;
+    store
+        .append(scope, &conflicting)
+        .await
+        .expect_err("a different entry at an occupied sequence fails closed");
+
+    for sequence in (AgentTeamHistorySequence::FIRST.get() + 1)..=HISTORY_CONTRACT_ENTRIES {
+        store
+            .append(scope, &entry(sequence))
+            .await
+            .expect("appends succeed in sequence order");
+    }
+
+    let floor = match retention {
+        HistoryRetention::Unbounded => AgentTeamHistorySequence::FIRST.get(),
+        HistoryRetention::Bounded(kept) => {
+            // The store's documented zero-means-one clamp applies to the
+            // harness's own arithmetic too, so `Bounded(0)` proves the clamp
+            // instead of panicking on an off-by-one floor.
+            let kept = (kept as u64).max(1);
+            assert!(
+                kept < HISTORY_CONTRACT_ENTRIES,
+                "a bounded contract run must append past the window to exercise it"
+            );
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept + 1;
+            match store
+                .read(scope, AgentTeamHistoryCursor::start())
+                .await
+                .expect_err("a cursor before the retained window is refused, never short-paged")
+            {
+                AgentTeamError::HistoryWindowExpired {
+                    oldest_retained: Some(oldest),
+                } => {
+                    assert_eq!(oldest.get(), expected_floor, "the reported floor is real");
+                    oldest.get()
+                }
+                other => panic!("an expired window names its floor, got {other:?}"),
+            }
+        }
+    };
+
+    let mut cursor = AgentTeamHistoryCursor::start()
+        .resuming_at(AgentTeamHistorySequence::new(floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        let page = store
+            .read(scope, cursor)
+            .await
+            .expect("the reported floor is a legal resume point");
+        pages += 1;
+        assert!(
+            page.entries.len() <= HISTORY_CONTRACT_PAGE,
+            "a page never exceeds the size the cursor asked for"
+        );
+        seen.extend(page.entries.iter().map(|held| held.sequence.get()));
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 64, "paging must terminate");
+    }
+
+    let expected: Vec<u64> = (floor..=HISTORY_CONTRACT_ENTRIES).collect();
+    assert_eq!(
+        seen, expected,
+        "the cursor pages the retained log in order, once each, with no gap"
+    );
+    // Only meaningful when the retained window is larger than a page; a
+    // tightly bounded store legitimately answers in one.
+    if expected.len() > HISTORY_CONTRACT_PAGE {
+        assert!(
+            pages > 1,
+            "a log longer than a page must need more than one to prove the cursor"
+        );
+    }
+
+    // A hole *inside* the log: an entry that never lands while a later one
+    // does — the shape a durable backend can grow through TTL or manual
+    // deletion, and the shape a reader must never be paged across silently.
+    // The retained prefix before the hole is delivered whole, the read that
+    // starts at the hole is refused naming the floor past it, and resuming at
+    // that floor delivers the tail.
+    let after_hole = HISTORY_CONTRACT_ENTRIES + 2;
+    store
+        .append(scope, &entry(after_hole))
+        .await
+        .expect("an append past an unfilled sequence succeeds");
+    // A bounded window evicts its oldest for the new entry, moving the floor.
+    let prefix_floor = match retention {
+        HistoryRetention::Unbounded => floor,
+        HistoryRetention::Bounded(_) => floor + 1,
+    };
+    let mut cursor = AgentTeamHistoryCursor::start()
+        .resuming_at(AgentTeamHistorySequence::new(prefix_floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut prefix: Vec<u64> = Vec::new();
+    let mut probes = 0_usize;
+    let refusal = loop {
+        match store.read(scope, cursor).await {
+            Ok(page) => {
+                prefix.extend(page.entries.iter().map(|held| held.sequence.get()));
+                match page.next {
+                    Some(next) => cursor = next,
+                    None => panic!("a reader must be refused at the hole, not run off the end"),
+                }
+            }
+            Err(error) => break error,
+        }
+        probes += 1;
+        assert!(probes < 64, "paging toward the hole must terminate");
+    };
+    assert_eq!(
+        prefix,
+        (prefix_floor..=HISTORY_CONTRACT_ENTRIES).collect::<Vec<u64>>(),
+        "the retained prefix before the hole is delivered whole"
+    );
+    match refusal {
+        AgentTeamError::HistoryWindowExpired {
+            oldest_retained: Some(oldest),
+        } => assert_eq!(
+            oldest.get(),
+            after_hole,
+            "the refusal names the first entry past the hole"
+        ),
+        other => panic!("the read at the hole answers an expired window, got {other:?}"),
+    }
+    let tail = store
+        .read(
+            scope,
+            AgentTeamHistoryCursor::start()
+                .resuming_at(AgentTeamHistorySequence::new(after_hole))
+                .with_limit(HISTORY_CONTRACT_PAGE),
+        )
+        .await
+        .expect("the floor past the hole is a legal resume point");
+    assert_eq!(
+        tail.entries
+            .iter()
+            .map(|held| held.sequence.get())
+            .collect::<Vec<u64>>(),
+        vec![after_hole],
+        "resuming past the hole delivers the tail"
+    );
+    assert!(tail.next.is_none(), "the tail is the end of the log");
+}
+
+/// Asserts one [`AgentConversationHistoryStore`] keeps the same contract.
+///
+/// See [`assert_task_history_store_contract`] for what is proven and why.
+///
+/// [`AgentConversationHistoryStore`]: crate::conversation::AgentConversationHistoryStore
+///
+/// # Panics
+///
+/// On any breach of that contract, naming what it observed.
+pub async fn assert_conversation_history_store_contract<Store>(
+    store: &Store,
+    scope: &crate::identity::AgentConversationScope,
+    retention: HistoryRetention,
+) where
+    Store: crate::conversation::AgentConversationHistoryStore,
+{
+    use crate::conversation::{
+        AgentConversationError, AgentConversationHistoryCursor, AgentConversationHistoryEntry,
+        AgentConversationHistoryKind, AgentConversationHistorySequence,
+    };
+
+    let entry = |sequence: u64| {
+        AgentConversationHistoryEntry::new(
+            AgentConversationHistorySequence::new(sequence),
+            AgentConversationHistoryKind::Created,
+            history_contract_operation(sequence),
+            AgentTimestampMillis::new(sequence),
+        )
+    };
+
+    let first = entry(AgentConversationHistorySequence::FIRST.get());
+    store
+        .append(scope, &first)
+        .await
+        .expect("the first append succeeds");
+    store
+        .append(scope, &first)
+        .await
+        .expect("re-driving an interrupted flush writes the same entry to the same slot");
+    let mut conflicting = entry(AgentConversationHistorySequence::FIRST.get());
+    conflicting.kind = AgentConversationHistoryKind::Ended;
+    store
+        .append(scope, &conflicting)
+        .await
+        .expect_err("a different entry at an occupied sequence fails closed");
+
+    for sequence in (AgentConversationHistorySequence::FIRST.get() + 1)..=HISTORY_CONTRACT_ENTRIES {
+        store
+            .append(scope, &entry(sequence))
+            .await
+            .expect("appends succeed in sequence order");
+    }
+
+    let floor = match retention {
+        HistoryRetention::Unbounded => AgentConversationHistorySequence::FIRST.get(),
+        HistoryRetention::Bounded(kept) => {
+            // The store's documented zero-means-one clamp applies to the
+            // harness's own arithmetic too, so `Bounded(0)` proves the clamp
+            // instead of panicking on an off-by-one floor.
+            let kept = (kept as u64).max(1);
+            assert!(
+                kept < HISTORY_CONTRACT_ENTRIES,
+                "a bounded contract run must append past the window to exercise it"
+            );
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept + 1;
+            match store
+                .read(scope, AgentConversationHistoryCursor::start())
+                .await
+                .expect_err("a cursor before the retained window is refused, never short-paged")
+            {
+                AgentConversationError::HistoryWindowExpired {
+                    oldest_retained: Some(oldest),
+                } => {
+                    assert_eq!(oldest.get(), expected_floor, "the reported floor is real");
+                    oldest.get()
+                }
+                other => panic!("an expired window names its floor, got {other:?}"),
+            }
+        }
+    };
+
+    let mut cursor = AgentConversationHistoryCursor::start()
+        .resuming_at(AgentConversationHistorySequence::new(floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        let page = store
+            .read(scope, cursor)
+            .await
+            .expect("the reported floor is a legal resume point");
+        pages += 1;
+        assert!(
+            page.entries.len() <= HISTORY_CONTRACT_PAGE,
+            "a page never exceeds the size the cursor asked for"
+        );
+        seen.extend(page.entries.iter().map(|held| held.sequence.get()));
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 64, "paging must terminate");
+    }
+
+    let expected: Vec<u64> = (floor..=HISTORY_CONTRACT_ENTRIES).collect();
+    assert_eq!(
+        seen, expected,
+        "the cursor pages the retained log in order, once each, with no gap"
+    );
+    // Only meaningful when the retained window is larger than a page; a
+    // tightly bounded store legitimately answers in one.
+    if expected.len() > HISTORY_CONTRACT_PAGE {
+        assert!(
+            pages > 1,
+            "a log longer than a page must need more than one to prove the cursor"
+        );
+    }
+
+    // A hole *inside* the log: an entry that never lands while a later one
+    // does — the shape a durable backend can grow through TTL or manual
+    // deletion, and the shape a reader must never be paged across silently.
+    // The retained prefix before the hole is delivered whole, the read that
+    // starts at the hole is refused naming the floor past it, and resuming at
+    // that floor delivers the tail.
+    let after_hole = HISTORY_CONTRACT_ENTRIES + 2;
+    store
+        .append(scope, &entry(after_hole))
+        .await
+        .expect("an append past an unfilled sequence succeeds");
+    // A bounded window evicts its oldest for the new entry, moving the floor.
+    let prefix_floor = match retention {
+        HistoryRetention::Unbounded => floor,
+        HistoryRetention::Bounded(_) => floor + 1,
+    };
+    let mut cursor = AgentConversationHistoryCursor::start()
+        .resuming_at(AgentConversationHistorySequence::new(prefix_floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut prefix: Vec<u64> = Vec::new();
+    let mut probes = 0_usize;
+    let refusal = loop {
+        match store.read(scope, cursor).await {
+            Ok(page) => {
+                prefix.extend(page.entries.iter().map(|held| held.sequence.get()));
+                match page.next {
+                    Some(next) => cursor = next,
+                    None => panic!("a reader must be refused at the hole, not run off the end"),
+                }
+            }
+            Err(error) => break error,
+        }
+        probes += 1;
+        assert!(probes < 64, "paging toward the hole must terminate");
+    };
+    assert_eq!(
+        prefix,
+        (prefix_floor..=HISTORY_CONTRACT_ENTRIES).collect::<Vec<u64>>(),
+        "the retained prefix before the hole is delivered whole"
+    );
+    match refusal {
+        AgentConversationError::HistoryWindowExpired {
+            oldest_retained: Some(oldest),
+        } => assert_eq!(
+            oldest.get(),
+            after_hole,
+            "the refusal names the first entry past the hole"
+        ),
+        other => panic!("the read at the hole answers an expired window, got {other:?}"),
+    }
+    let tail = store
+        .read(
+            scope,
+            AgentConversationHistoryCursor::start()
+                .resuming_at(AgentConversationHistorySequence::new(after_hole))
+                .with_limit(HISTORY_CONTRACT_PAGE),
+        )
+        .await
+        .expect("the floor past the hole is a legal resume point");
+    assert_eq!(
+        tail.entries
+            .iter()
+            .map(|held| held.sequence.get())
+            .collect::<Vec<u64>>(),
+        vec![after_hole],
+        "resuming past the hole delivers the tail"
+    );
+    assert!(tail.next.is_none(), "the tail is the end of the log");
 }
 
 #[cfg(test)]

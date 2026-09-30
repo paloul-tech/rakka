@@ -39,7 +39,7 @@ use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 
-use rakka_agent_workflow::StateSchemaVersion;
+use rakka_agent_workflow::{AgentEphemeralCredential, AgentTelemetryContext, StateSchemaVersion};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -85,12 +85,70 @@ validated_id! {
     pub AgentToolCallId, "agent_tool_call_id"
 }
 
+/// Longest provider-reported response model name or finish reason a turn
+/// carries, in bytes.
+pub const AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES: usize = 128;
+
+/// What a provider reported about its answer beyond the content: the model
+/// that actually answered and why it stopped. Observability only, never read
+/// for inference; bounded so a turn stays within its record limits.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AgentModelResponseMetadata {
+    /// The provider's response model name, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The provider's finish or stop reason, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+fn truncate_at_boundary(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
+impl AgentModelResponseMetadata {
+    /// Metadata with each field truncated to [`AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES`]
+    /// at a character boundary, so provider text can never produce an
+    /// unbounded turn. An empty string is folded to `None`: an adapter must
+    /// never export `gen_ai.response.model = ""` or an equally empty finish
+    /// reason.
+    #[must_use]
+    pub fn bounded(model: Option<String>, finish_reason: Option<String>) -> Self {
+        Self {
+            model: model
+                .map(|value| truncate_at_boundary(value, AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES))
+                .filter(|value| !value.is_empty()),
+            finish_reason: finish_reason
+                .map(|value| truncate_at_boundary(value, AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES))
+                .filter(|value| !value.is_empty()),
+        }
+    }
+}
+
 /// What one model turn consumed.
 ///
 /// The dimensions are the ones the run's ledger charges
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)). A provider
 /// that reports nothing leaves them zero; a budget is still charged for the call
 /// itself.
+///
+/// Because the counts are plain, **zero is not evidence of zero**: an
+/// unreported dimension and a genuinely empty one are the same value here, and
+/// nothing downstream can tell them apart. The budget charges the total either
+/// way — the work was done and billed — while telemetry treats a zero as
+/// silence and records nothing for it
+/// ([`METRIC_AGENT_MODEL_TOKENS`](crate::METRIC_AGENT_MODEL_TOKENS), and
+/// `usage_attributes` behind the `otel` feature). Those two readings are
+/// deliberate and different: a ledger must not under-charge, and an instrument
+/// must not invent a sample.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentModelUsage {
     /// Prompt tokens the provider billed.
@@ -99,6 +157,13 @@ pub struct AgentModelUsage {
     pub output_tokens: u64,
     /// Provider cost, in micro-units of currency.
     pub cost_micros: u64,
+    /// Input tokens the provider served from its cache, when it reported
+    /// them; observability, never billing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    /// Reasoning tokens the provider reported, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl AgentModelUsage {
@@ -199,6 +264,19 @@ pub struct AgentModelTurn {
     pub proposal: Option<AgentTaskContent>,
     /// What the turn consumed.
     pub usage: AgentModelUsage,
+    /// The provider's response model name, when it reported one.
+    ///
+    /// Provenance, never inference: nothing downstream reads it to decide
+    /// anything, and it is bounded at
+    /// [`AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_model: Option<String>,
+    /// The provider's finish or stop reason, when it reported one.
+    ///
+    /// Provenance, never inference; bounded at
+    /// [`AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 impl AgentModelTurn {
@@ -213,6 +291,8 @@ impl AgentModelTurn {
             tool_calls: Vec::new(),
             proposal: None,
             usage: AgentModelUsage::default(),
+            response_model: None,
+            finish_reason: None,
         }
     }
 
@@ -248,6 +328,20 @@ impl AgentModelTurn {
     #[must_use]
     pub const fn with_usage(mut self, usage: AgentModelUsage) -> Self {
         self.usage = usage;
+        self
+    }
+
+    /// Sets the provider's response model name.
+    #[must_use]
+    pub fn with_response_model(mut self, response_model: impl Into<String>) -> Self {
+        self.response_model = Some(response_model.into());
+        self
+    }
+
+    /// Sets the provider's finish or stop reason.
+    #[must_use]
+    pub fn with_finish_reason(mut self, finish_reason: impl Into<String>) -> Self {
+        self.finish_reason = Some(finish_reason.into());
         self
     }
 
@@ -291,6 +385,20 @@ impl AgentModelTurn {
                     message: error.to_string(),
                 })?;
         }
+        for (field, value) in [
+            ("response_model", &self.response_model),
+            ("finish_reason", &self.finish_reason),
+        ] {
+            if let Some(value) = value {
+                if value.len() > AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES {
+                    return Err(AgentModelError::ResponseMetadataTooLong {
+                        field,
+                        bytes: value.len(),
+                        maximum: AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES,
+                    });
+                }
+            }
+        }
 
         let bytes = self.size_bytes();
         if bytes > AGENT_MODEL_TURN_MAX_BYTES {
@@ -331,6 +439,10 @@ struct AgentModelTurnRecord {
     proposal: Option<AgentTaskContent>,
     #[serde(default)]
     usage: AgentModelUsage,
+    #[serde(default)]
+    response_model: Option<String>,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for AgentModelTurn {
@@ -347,6 +459,8 @@ impl<'de> Deserialize<'de> for AgentModelTurn {
             tool_calls: record.tool_calls,
             proposal: record.proposal,
             usage: record.usage,
+            response_model: record.response_model,
+            finish_reason: record.finish_reason,
         };
         turn.validate().map_err(serde::de::Error::custom)?;
         Ok(turn)
@@ -366,7 +480,11 @@ impl<'de> Deserialize<'de> for AgentModelTurn {
 /// model call may need is named by the agent's definition and resolved inside
 /// the dispatcher's bounded attempt, never here
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: the request carries tool descriptors, whose inline parameter
+// schemas are `serde_json::Value` — which is `PartialEq` and not `Eq`. The
+// authority's own [`crate::tools::AgentGrantedDispatch`], which carries the
+// same descriptors, draws the line in the same place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentModelRequest {
     /// The immutable context the call is prepared against.
     ///
@@ -392,6 +510,24 @@ pub struct AgentModelRequest {
     pub settings_revision: AgentRevisionNumber,
     /// The turn this request serves, counting from one.
     pub turn: u64,
+    /// The run's durable trace context — the context the model effect was
+    /// committed under, which the dispatcher receives verbatim on the intent
+    /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)) — so
+    /// an adapter may parent its provider span on the run's trace rather than
+    /// rooting one of its own. Observability only, never correctness: an
+    /// adapter must not read it for inference, no dispatch decision reads it,
+    /// and a request built or encoded before the field decodes to the empty
+    /// context.
+    #[serde(default)]
+    pub telemetry: AgentTelemetryContext,
+    /// The descriptors the model may be shown for this call: the registered
+    /// tools the envelope declares, minus those the current settings revoke,
+    /// narrowed by the run's setup — the authority's `model_visible`
+    /// derivation, carried here so the adapter declares each beside the
+    /// result tool. Visibility is not authority: a call the model makes still
+    /// needs a grant to dispatch.
+    #[serde(default)]
+    pub tools: Vec<crate::tools::AgentToolDescriptor>,
 }
 
 impl AgentModelRequest {
@@ -399,7 +535,8 @@ impl AgentModelRequest {
     ///
     /// The profile and sampling default to unset; the interim loop prepares a
     /// model effect with neither, and slice 1.8 fills them from the settings
-    /// resolved at dispatch.
+    /// resolved at dispatch. The trace context defaults to empty; a driver
+    /// stamps the effect's context through [`Self::with_telemetry`].
     #[must_use]
     pub fn new(context: AgentContextSnapshotRef, turn: u64) -> Self {
         Self {
@@ -408,7 +545,16 @@ impl AgentModelRequest {
             sampling: AgentSamplingSettings::default(),
             settings_revision: AgentRevisionNumber::INITIAL,
             turn,
+            telemetry: AgentTelemetryContext::default(),
+            tools: Vec::new(),
         }
+    }
+
+    /// Stamps the run's durable trace context onto the request.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: AgentTelemetryContext) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     /// Selects the model profile the request resolves against.
@@ -429,6 +575,13 @@ impl AgentModelRequest {
     #[must_use]
     pub const fn with_settings_revision(mut self, revision: AgentRevisionNumber) -> Self {
         self.settings_revision = revision;
+        self
+    }
+
+    /// Carries the model-visible tool list.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<crate::tools::AgentToolDescriptor>) -> Self {
+        self.tools = tools;
         self
     }
 }
@@ -594,6 +747,36 @@ pub trait AgentModelAdapter: Send + Sync {
     /// so an adapter that assembles an out-of-bounds turn is refused where the
     /// outcome enters rather than after the run has recorded it.
     fn call<'a>(&'a self, request: &'a AgentModelRequest) -> AgentModelFuture<'a>;
+
+    /// Performs one bounded model call with the credential the dispatcher
+    /// resolved for this attempt, when the effect's grant named a binding.
+    ///
+    /// The dispatcher calls this and only this. The default forwards to
+    /// [`Self::call`], so an adapter that takes its credentials at
+    /// construction keeps working unchanged; an adapter that builds a
+    /// provider client per attempt overrides it, reads the material for the
+    /// duration of the call, and holds nothing afterwards. The credential is
+    /// the one [`crate::dispatch::AgentEffectCredentialResolver::resolve`]
+    /// produced inside the attempt, under the effect's own deadline; an
+    /// adapter never resolves a credential itself and never holds a resolver.
+    ///
+    /// # The error text this returns becomes durable state
+    ///
+    /// A failing call's error text is persisted — bounded to
+    /// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`](crate::dispatch::AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH)
+    /// — on the run's durable outbox row and echoed onto the dispatcher
+    /// fleet's index entry, where every worker in the fleet can read it. An
+    /// adapter must never place credential material, request content, or a
+    /// provider's verbatim response body in the error it returns — a stable
+    /// code and a short reason are the contract.
+    fn call_with<'a>(
+        &'a self,
+        request: &'a AgentModelRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentModelFuture<'a> {
+        let _ = credential;
+        self.call(request)
+    }
 }
 
 /// A model call that could not produce a bounded, interpretable turn.
@@ -657,6 +840,25 @@ pub enum AgentModelError {
         /// The provider or mapping failure detail.
         message: String,
     },
+    /// The adapter refused the call under a stable code of its own, before
+    /// or instead of asking a provider — an invalid profile, unsupported
+    /// credential material, or a route that does not exist.
+    Refused {
+        /// The stable code the refusal is answered under.
+        code: &'static str,
+        /// Bounded human-readable detail.
+        message: String,
+    },
+    /// A provider-reported response model name or finish reason exceeded its
+    /// bound.
+    ResponseMetadataTooLong {
+        /// Which field was rejected: `"response_model"` or `"finish_reason"`.
+        field: &'static str,
+        /// Length of the rejected value, in bytes.
+        bytes: usize,
+        /// Maximum accepted length, in bytes.
+        maximum: usize,
+    },
 }
 
 impl AgentModelError {
@@ -673,6 +875,8 @@ impl AgentModelError {
             Self::Encoding { .. } => "model-encoding-failed",
             Self::InvalidRetryPolicy { .. } => "model-retry-policy-invalid",
             Self::Provider { .. } => "model-provider-failed",
+            Self::Refused { code, .. } => code,
+            Self::ResponseMetadataTooLong { .. } => "model-response-metadata-too-long",
         }
     }
 }
@@ -713,6 +917,17 @@ impl Display for AgentModelError {
             Self::Provider { message } => {
                 write!(f, "the model provider call failed: {message}")
             }
+            Self::Refused { code, message } => {
+                write!(f, "the model adapter refused the call ({code}): {message}")
+            }
+            Self::ResponseMetadataTooLong {
+                field,
+                bytes,
+                maximum,
+            } => write!(
+                f,
+                "the model turn's {field} is {bytes} bytes, which exceeds the {maximum} byte limit"
+            ),
         }
     }
 }
@@ -808,5 +1023,38 @@ mod tests {
         .expect("the policy serializes");
         serde_json::from_value::<AgentModelRetryPolicy>(auto_retry)
             .expect_err("a non-idempotent auto-retry policy is refused on load");
+    }
+
+    #[test]
+    fn response_metadata_is_bounded_on_the_turn_and_truncated_by_the_helper() {
+        let turn = AgentModelTurn::new(AgentRevisionNumber::INITIAL)
+            .with_response_model("m".repeat(AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES + 1));
+        assert_eq!(
+            turn.validate().expect_err("too long").code(),
+            "model-response-metadata-too-long"
+        );
+        let bounded =
+            AgentModelResponseMetadata::bounded(Some("m".repeat(500)), Some("é".repeat(200)));
+        assert_eq!(
+            bounded.model.as_deref().map(str::len),
+            Some(AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES)
+        );
+        assert!(bounded.finish_reason.as_deref().is_some_and(|s| s.len()
+            <= AGENT_MODEL_RESPONSE_FIELD_MAX_BYTES
+            && s.is_char_boundary(s.len())));
+        let encoded = serde_json::to_string(&AgentModelTurn::new(AgentRevisionNumber::INITIAL))
+            .expect("encodes");
+        assert!(
+            !encoded.contains("response_model"),
+            "absent fields are not serialized: {encoded}"
+        );
+        let decoded: AgentModelTurn =
+            serde_json::from_str(&encoded).expect("a pre-field record decodes");
+        assert!(decoded.response_model.is_none() && decoded.usage.cached_input_tokens.is_none());
+        assert_eq!(
+            AgentModelResponseMetadata::bounded(Some(String::new()), Some(String::new())),
+            AgentModelResponseMetadata::default(),
+            "an empty string is not a report"
+        );
     }
 }

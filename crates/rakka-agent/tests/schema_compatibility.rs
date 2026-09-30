@@ -6,12 +6,13 @@
 //! because that is where an N/N+1 rolling update actually meets a foreign record.
 
 use rakka_agent::{
-    load_agent_entity_state, AgentAuthorityEnvelope, AgentDefinition, AgentDefinitionId,
-    AgentDefinitionRevision, AgentEntityState, AgentEntityStore, AgentId, AgentRecordKind,
-    AgentRevisionProvenance, AgentSchemaCompatibility, AgentSchemaPolicy, AgentScope,
-    AgentSettings, SettingsRevision, TenantId, CURRENT_AGENT_DEFINITION_SCHEMA_VERSION,
-    CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION, CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
-    CURRENT_AGENT_SETUP_SCHEMA_VERSION,
+    load_agent_entity_state, AgentAdmissionEvaluator, AgentAdmissionRequirement,
+    AgentAuthorityEnvelope, AgentDefinition, AgentDefinitionId, AgentDefinitionRevision,
+    AgentEntityState, AgentEntityStore, AgentId, AgentOperationClass, AgentRecordKind,
+    AgentRevisionNumber, AgentRevisionProvenance, AgentSchemaCompatibility, AgentSchemaPolicy,
+    AgentScope, AgentSettings, AutonomyAdmissionDecision, SettingsRevision, TenantId,
+    CURRENT_AGENT_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_SETTINGS_SCHEMA_VERSION, CURRENT_AGENT_SETUP_SCHEMA_VERSION,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef, StateSchemaVersion,
@@ -174,6 +175,59 @@ async fn a_nested_definition_or_settings_version_is_checked_too() {
     let error = load_agent_entity_state(&store, &scope(), &AgentSchemaPolicy::default())
         .await
         .expect_err("a settings revision from a newer binary must not be interpreted");
+    assert_eq!(error.code(), "schema-version-ahead");
+}
+
+/// The entity state with an admission decision on record, as the entity
+/// persists it after `Admit`, with the decision's schema version rewritten.
+fn admitted_state_with_admission_version(version: u32) -> AgentEntityState {
+    let decision = AutonomyAdmissionDecision::new(
+        [AgentOperationClass::BoundedAsync].into_iter().collect(),
+        AgentRevisionNumber::INITIAL,
+        AgentRevisionNumber::INITIAL,
+        AgentAuthorityEnvelope::empty(),
+        AgentAdmissionEvaluator::Service("risk-policy-service".to_string()),
+        AgentAdmissionRequirement::ALL.into_iter().collect(),
+        AgentTimestampMillis::new(2),
+    )
+    .expect("an admission naming every requirement is complete");
+    let mut value: Value = serde_json::to_value(state()).expect("state should serialize");
+    let mut admission = serde_json::to_value(&decision).expect("the decision serializes");
+    assert_eq!(
+        admission["schema_version"],
+        json!(AgentRecordKind::AdmissionDecision
+            .current_schema_version()
+            .get()),
+        "the doctored path must reach the decision's schema version"
+    );
+    admission["schema_version"] = json!(version);
+    value["admission"] = admission;
+    serde_json::from_value(value).expect("the tampered record should still deserialize")
+}
+
+#[tokio::test]
+async fn a_nested_admission_decision_version_is_checked_too() {
+    // The admission decision is the record that authorizes unattended work,
+    // and it is rewritten by `Admit` and erased by `Retract`. A decision from
+    // a newer binary must fail closed at load, exactly like the definition and
+    // settings beside it; the same record at the current version loads.
+    let current = AgentRecordKind::AdmissionDecision
+        .current_schema_version()
+        .get();
+    let store = store_with(admitted_state_with_admission_version(current)).await;
+    let loaded = load_agent_entity_state(&store, &scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("a current admission decision loads")
+        .expect("the record exists");
+    assert!(
+        loaded.admission().is_some(),
+        "the fixture records an admission"
+    );
+
+    let store = store_with(admitted_state_with_admission_version(current + 1)).await;
+    let error = load_agent_entity_state(&store, &scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect_err("an admission decision from a newer binary must not be interpreted");
     assert_eq!(error.code(), "schema-version-ahead");
 }
 

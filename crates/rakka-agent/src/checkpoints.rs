@@ -56,8 +56,8 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use rakka_agent_workflow::{
-    AgentAuditEventId, AgentEffectId, AgentTelemetryContext, AgentTimestampMillis, ArtifactRef,
-    HumanCheckpointId, PrincipalRef, StateSchemaVersion,
+    AgentAuditEventId, AgentEffectId, AgentTelemetryContext, AgentTimestampMillis,
+    AgentTraceContext, ArtifactRef, HumanCheckpointId, PrincipalRef, StateSchemaVersion,
 };
 use serde::{Deserialize, Serialize};
 
@@ -364,13 +364,65 @@ pub struct AgentCheckpointGrant {
 }
 
 impl AgentCheckpointGrant {
+    /// Accepts that this grant covers the given attempt of the exact subject
+    /// the binding describes, or fails closed
+    /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The binding MUST be recomputed by the caller from the authoritative
+    /// content being gated — never read back from recorded state — so a
+    /// subject that changed after the decision can never pass under a stale
+    /// digest. This is the effect-independent half of [`Self::validate_for`],
+    /// and the seam a non-effect gate (the communal claim promotion gate of
+    /// specification 13.4) validates through: the same digest-binding, expiry,
+    /// and use-count semantics, one code path.
+    pub fn validate_for_binding(
+        &self,
+        binding: &AgentCheckpointEffectBinding,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> Result<(), AgentCheckpointGrantError> {
+        // Defence in depth: neither side of the comparison may bind a
+        // non-cryptographic digest, whatever wrote it.
+        if !self.argument_digest.algorithm.is_cryptographic()
+            || !binding.argument_digest.algorithm.is_cryptographic()
+        {
+            return Err(AgentCheckpointGrantError::NonCryptographicDigest);
+        }
+        if self.effect_id != binding.effect_id
+            || self.generation != binding.generation
+            || self.target != binding.target
+            || self.safety_class != binding.safety_class
+        {
+            return Err(AgentCheckpointGrantError::IntentMismatch);
+        }
+        if self.credential_binding != binding.credential_binding {
+            return Err(AgentCheckpointGrantError::CredentialBindingChanged);
+        }
+        if self.argument_digest != binding.argument_digest {
+            return Err(AgentCheckpointGrantError::ArgumentDigestMismatch);
+        }
+        // Strictly after: a grant is valid through its expiry instant.
+        if now.as_millis() > self.expires_at.as_millis() {
+            return Err(AgentCheckpointGrantError::Expired);
+        }
+        if attempt > self.allowed_use_count {
+            return Err(AgentCheckpointGrantError::UsesExhausted);
+        }
+        Ok(())
+    }
+
     /// Accepts that this grant covers the given attempt of the given intent, or
     /// fails closed ([specification 12.3](../../../docs/plans/rakka-agent/spec.md):
     /// the dispatcher rechecks grant validity before invocation).
     ///
     /// The argument digest is *recomputed* cryptographically from the intent and
     /// compared, so an argument that changed after the human approved it can
-    /// never pass — the fingerprint the effect carries is irrelevant here.
+    /// never pass — the fingerprint the effect carries is irrelevant here. The
+    /// identity checks run before the digest is computed, so the error
+    /// precedence of earlier releases is preserved; the delegated
+    /// [`Self::validate_for_binding`] additionally compares the dispatch
+    /// target, a pure strengthening (a legitimately resolved grant copies its
+    /// target from the same intent).
     pub fn validate_for(
         &self,
         scope: &AgentRunScope,
@@ -393,21 +445,9 @@ impl AgentCheckpointGrant {
         if self.credential_binding != intent.credential_binding {
             return Err(AgentCheckpointGrantError::CredentialBindingChanged);
         }
-        let recomputed = intent
-            .request
-            .cryptographic_argument_digest()
+        let binding = AgentCheckpointEffectBinding::of_effect(intent)
             .map_err(|_| AgentCheckpointGrantError::ArgumentDigestUncomputable)?;
-        if self.argument_digest != recomputed {
-            return Err(AgentCheckpointGrantError::ArgumentDigestMismatch);
-        }
-        // Strictly after: a grant is valid through its expiry instant.
-        if now.as_millis() > self.expires_at.as_millis() {
-            return Err(AgentCheckpointGrantError::Expired);
-        }
-        if attempt > self.allowed_use_count {
-            return Err(AgentCheckpointGrantError::UsesExhausted);
-        }
-        Ok(())
+        self.validate_for_binding(&binding, attempt, now)
     }
 }
 
@@ -709,6 +749,69 @@ pub struct AgentCheckpoint {
 }
 
 impl AgentCheckpoint {
+    /// The durable span identity of the `checkpoint-open` segment that parks
+    /// `checkpoint_id`, derived from the gated effect's trace context.
+    ///
+    /// Stored on the record at open as [`Self::telemetry`], so the resolution
+    /// can link back to the parked span
+    /// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub fn parked_span_identity(
+        effect_telemetry: &AgentTelemetryContext,
+        checkpoint_id: &HumanCheckpointId,
+    ) -> Option<AgentTraceContext> {
+        crate::observability::agent_durable_span_identity(
+            effect_telemetry,
+            &["checkpoint-open", checkpoint_id.as_str()],
+        )
+    }
+
+    /// The durable span identity of the `checkpoint-resolve` segment that
+    /// will resolve `checkpoint_id`, derived from the gated effect's trace
+    /// context — before the resolution exists, which is what lets an
+    /// indeterminate park link *forward* to the reconciliation decision it
+    /// waits for ([specification 17.9](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub fn resolve_span_identity(
+        effect_telemetry: &AgentTelemetryContext,
+        checkpoint_id: &HumanCheckpointId,
+    ) -> Option<AgentTraceContext> {
+        crate::observability::agent_durable_span_identity(
+            effect_telemetry,
+            &["checkpoint-resolve", checkpoint_id.as_str()],
+        )
+    }
+
+    /// The stable, derived id of the checkpoint of `kind` gating one effect
+    /// generation, so a re-driven transition opens the same checkpoint rather
+    /// than a second one.
+    ///
+    /// The kind is folded in because one generation can wait on more than one
+    /// kind over its life — an approval before dispatch, a reconciliation after
+    /// an ambiguous loss — and the two are different records. The derivation is
+    /// public because the dispatcher names the reconciliation checkpoint an
+    /// indeterminate park will open *before* the run opens it: the park's span
+    /// links forward to the decision that resolves that checkpoint
+    /// ([specification 17.9](../../../docs/plans/rakka-agent/spec.md)), which
+    /// is only possible when both sides derive the same id from the effect.
+    #[must_use]
+    pub fn id_for_effect(
+        effect_id: &AgentEffectId,
+        generation: AgentEffectGeneration,
+        kind: AgentCheckpointKind,
+    ) -> HumanCheckpointId {
+        let tag = match kind {
+            AgentCheckpointKind::Approval => "approval",
+            AgentCheckpointKind::SecurityAuthorization => "authz",
+            AgentCheckpointKind::IndeterminateEffectReconciliation => "reconcile",
+        };
+        HumanCheckpointId::new(format!(
+            "{}#ck-{tag}-g{}",
+            effect_id.as_str(),
+            generation.get()
+        ))
+    }
+
     /// Opens a checkpoint of `kind` bound to `effect`, with the default allowed
     /// decision set for the kind.
     ///

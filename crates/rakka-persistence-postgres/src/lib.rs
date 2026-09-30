@@ -29,6 +29,22 @@ pub const fn subsystem() -> Subsystem {
 /// Backend name for PostgreSQL durable state telemetry.
 pub const BACKEND_NAME: &str = "postgres";
 
+/// PostgreSQL advisory lock id held while applying this crate's migration.
+///
+/// `CREATE TABLE IF NOT EXISTS` is *not* atomic against a concurrent creation
+/// of the same table: both migrators see the table missing, both proceed, and
+/// the loser fails against the system catalogs with a `pg_type` unique
+/// violation rather than the no-op the `IF NOT EXISTS` reads like. Two nodes
+/// starting at once against a fresh database is the ordinary case that hits it,
+/// so the migration takes a session advisory lock first — the same guard
+/// `rakka-a2a`, `rakka-sharding-postgres`, and `rakka-agent-postgres` already
+/// apply to theirs.
+///
+/// The id is this crate's own, distinct from every sibling's, so the
+/// subsystems' migrations do not serialize against each other in a shared
+/// database.
+pub const MIGRATION_LOCK_ID: i64 = 982_451_707;
+
 /// Default durable state table name.
 pub const TABLE_NAME: &str = "rakka_durable_state";
 
@@ -98,13 +114,10 @@ where
         Self { client, codec }
     }
 
-    /// Applies the default table migration.
+    /// Applies the default table migration, safe to run concurrently
+    /// ([`MIGRATION_LOCK_ID`]).
     pub async fn migrate(&self) -> DurableResult<()> {
-        self.client
-            .batch_execute(MIGRATION_SQL)
-            .await
-            .map_err(map_postgres_error)?;
-        Ok(())
+        apply_migration_under_lock(&self.client).await
     }
 }
 
@@ -280,13 +293,10 @@ where
         }
     }
 
-    /// Applies the default table migration.
+    /// Applies the default table migration, safe to run concurrently
+    /// ([`MIGRATION_LOCK_ID`]).
     pub async fn migrate(&self) -> DurableResult<()> {
-        self.client
-            .batch_execute(MIGRATION_SQL)
-            .await
-            .map_err(map_postgres_error)?;
-        Ok(())
+        apply_migration_under_lock(&self.client).await
     }
 }
 
@@ -498,13 +508,10 @@ where
         }
     }
 
-    /// Applies the default table migration.
+    /// Applies the default table migration, safe to run concurrently
+    /// ([`MIGRATION_LOCK_ID`]).
     pub async fn migrate(&self) -> DurableResult<()> {
-        self.client
-            .batch_execute(MIGRATION_SQL)
-            .await
-            .map_err(map_postgres_error)?;
-        Ok(())
+        apply_migration_under_lock(&self.client).await
     }
 }
 
@@ -866,6 +873,29 @@ where
     Ok(SnapshotRecord::new(codec.decode(&snapshot)?, metadata))
 }
 
+/// Applies the idempotent schema under the crate's advisory lock, so
+/// concurrent migrators do not race PostgreSQL's system catalogs
+/// ([`MIGRATION_LOCK_ID`]).
+///
+/// The lock is released whether or not the batch applied, and the batch's error
+/// is reported ahead of the unlock's: a failed migration is the more useful
+/// diagnosis, and the lock is session-scoped, so a lost connection releases it
+/// regardless. The batch is one implicit transaction, so a failure applies
+/// nothing.
+async fn apply_migration_under_lock(client: &Client) -> DurableResult<()> {
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
+        .await
+        .map_err(map_postgres_error)?;
+    let applied = client.batch_execute(MIGRATION_SQL).await;
+    let unlocked = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
+        .await;
+    applied.map_err(map_postgres_error)?;
+    unlocked.map_err(map_postgres_error)?;
+    Ok(())
+}
+
 fn map_postgres_error(error: tokio_postgres::Error) -> DurableError {
     let mut message = error.to_string();
     let mut source = error.source();
@@ -885,6 +915,81 @@ mod tests {
     };
     use rakka_persistence::register_persistence_shutdown_task;
     use tokio_postgres::NoTls;
+
+    #[tokio::test]
+    async fn postgres_concurrent_migrators_do_not_race_when_dsn_is_set() {
+        // Two nodes starting at once against a fresh database both run the
+        // migration, and `CREATE TABLE IF NOT EXISTS` is not atomic against a
+        // concurrent creation: without the advisory lock the loser fails with a
+        // `pg_type` unique violation instead of the no-op it reads like.
+        //
+        // The race only exists while the tables are absent, so this runs in a
+        // private schema rather than dropping the shared ones out from under
+        // the tests running beside it: an empty `search_path` schema is a fresh
+        // namespace for the same unqualified DDL.
+        let dsn = match std::env::var("RAKKA_POSTGRES_TEST_DSN") {
+            Ok(dsn) => dsn,
+            Err(_) => return,
+        };
+        let schema = format!(
+            "rakka_migration_race_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let (setup, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                eprintln!("postgres connection error: {error}");
+            }
+        });
+        setup
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .expect("the private schema is created");
+
+        // Each migrator needs its own session: an advisory lock is re-entrant
+        // within one session, so racing on a shared connection would prove
+        // nothing.
+        let mut migrators = Vec::new();
+        for _ in 0..4u32 {
+            let dsn = dsn.clone();
+            let schema = schema.clone();
+            migrators.push(tokio::spawn(async move {
+                let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+                tokio::spawn(async move {
+                    if let Err(error) = connection.await {
+                        eprintln!("postgres connection error: {error}");
+                    }
+                });
+                client
+                    .batch_execute(&format!("SET search_path TO {schema}"))
+                    .await
+                    .expect("the migrator targets the private schema");
+                PostgresDurableStateStore::new(client, BytesStateCodec)
+                    .migrate()
+                    .await
+            }));
+        }
+
+        let mut failures = Vec::new();
+        for migrator in migrators {
+            if let Err(error) = migrator.await.expect("the migrator task completes") {
+                failures.push(error.to_string());
+            }
+        }
+
+        let cleanup = setup
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await;
+        assert!(
+            failures.is_empty(),
+            "concurrent migrators raced the system catalogs: {failures:?}"
+        );
+        cleanup.expect("the private schema is dropped");
+    }
 
     #[tokio::test]
     async fn postgres_round_trip_when_dsn_is_set() {

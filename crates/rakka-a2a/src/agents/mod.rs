@@ -15,9 +15,22 @@
 //! siblings — nothing here changes the existing workflow handler — and the
 //! dependency is one-directional: `rakka-agent` never depends on this crate.
 
+/// The stable `error.type` the A2A edge writes onto a failed ingress segment.
+///
+/// The protocol adapter owns the ingress `SERVER` span the agent domain's
+/// convention mapping defers to it, so it owns this value too. It sits beside
+/// `rakka_agent::AGENT_SEGMENT_ERROR_TYPES` in the compatibility surface an
+/// operator writes retention rules against, and is declared rather than
+/// spelled at the call site so the two cannot drift.
+pub const A2A_INGRESS_ERROR_TYPE: &str = "rakka.a2a.ingress";
+
 pub mod catalog;
 pub mod client;
+pub mod collaboration;
+pub mod delegation;
 pub mod error;
+mod guardrails;
+pub mod handoff;
 pub mod ingress;
 pub mod management;
 pub mod projection;
@@ -26,8 +39,20 @@ mod sync;
 
 pub use catalog::{A2AAgentCatalog, A2AAgentSelector, A2AAgentTarget, A2AStaticAgentCatalog};
 pub use client::A2AAgentClientTransport;
+pub use collaboration::{
+    agent_collaboration_extension, collaboration_echo, handoff_echo, is_collaboration_message,
+    parse_collaboration_envelope, parse_collaboration_metadata, AgentCollaborationBudget,
+    AgentCollaborationEnvelope, AgentCollaborationMetadata, AgentCollaborationSchemaRef,
+    AgentHandoffCollaborationMetadata, AGENT_COLLABORATION_EXTENSION_PREFIX,
+    AGENT_COLLABORATION_EXTENSION_URI, AGENT_COLLABORATION_SCHEMA_VERSION, META_COLLABORATION,
+};
+pub use delegation::A2AAgentDelegationSendExecutor;
 pub use error::{RakkaAgentA2AError, RakkaAgentA2AResult};
-pub use ingress::{NormalizedAgentCommand, META_AGENT_ID, META_TASK_DEFINITION};
+pub use handoff::A2AAgentHandoffSendExecutor;
+pub use ingress::{
+    AgentTaskResultBinding, NormalizedAgentCommand, META_AGENT_ID, META_AGENT_RESULT,
+    META_TASK_DEFINITION,
+};
 pub use management::{
     agent_management_extension, management_request_message, parse_management_response,
     AgentManagementCommand, AgentManagementDescription, AgentManagementOutcome,

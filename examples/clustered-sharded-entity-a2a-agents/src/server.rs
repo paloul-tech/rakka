@@ -353,7 +353,7 @@ pub(crate) fn build_agent_card(
     )
     .version(env!("CARGO_PKG_VERSION"))
     .public_base_url(base_url)
-    .provider("Rakka", "https://github.com/rakka-rs/rakka")
+    .provider("Rakka", "https://github.com/paloul-tech/rakka")
     .build(catalog)
 }
 

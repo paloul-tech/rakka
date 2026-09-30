@@ -325,3 +325,60 @@ fn run_id() -> AgentRunId {
 fn tenant_id() -> AgentTenantId {
     AgentTenantId::new("tenant-trace-context")
 }
+
+/// A caller's link attributes are bounded where the context is built, not
+/// discovered at export.
+///
+/// The returned context is *persisted*, and every span later built under it
+/// copies these links onto its export record — where one over-long or
+/// multi-line attribute makes the record fail validation for the whole life of
+/// the run. A caller cannot be expected to know the export bound, so the
+/// boundary that accepts its attributes applies it.
+#[test]
+fn a_resume_context_bounds_the_link_attributes_it_is_handed() {
+    let step_context = agent_child_telemetry_context(
+        &AgentTelemetryContext {
+            trace_parent: Some(ROOT_TRACE_PARENT.to_string()),
+            ..AgentTelemetryContext::default()
+        },
+        STEP_SPAN_ID,
+    )
+    .expect("the child context is created");
+
+    let resumed = agent_durable_resume_telemetry_context(
+        &step_context,
+        TIMER_SPAN_ID,
+        AgentAttributes::from([
+            ("resume_kind".to_string(), "timer-fired".to_string()),
+            ("multiline".to_string(), "two\nlines".to_string()),
+            (
+                "oversized".to_string(),
+                "x".repeat(rakka_agent_workflow::AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES + 1),
+            ),
+        ]),
+    )
+    .expect("the resume context is created");
+
+    let link = &resumed.span_links[0];
+    assert_eq!(
+        link.attributes.get("resume_kind").map(String::as_str),
+        Some("timer-fired"),
+        "what can be exported is kept"
+    );
+    assert!(
+        !link.attributes.contains_key("multiline") && !link.attributes.contains_key("oversized"),
+        "and what cannot is dropped here rather than at export: {:?}",
+        link.attributes
+    );
+
+    // The whole point: a span built under this context exports.
+    rakka_agent_workflow::AgentOtelSpanExport::from_telemetry_context(
+        "rakka.agent.run.resume",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &resumed,
+    )
+    .expect("the span builds")
+    .validate()
+    .expect("a persisted link must never make a record unexportable");
+}

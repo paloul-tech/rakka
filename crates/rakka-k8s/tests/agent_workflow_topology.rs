@@ -90,7 +90,7 @@ fn topology_defines_agent_workflow_runtime_contract() {
         "serviceAccountName: rakka-agent-workflow",
         "terminationGracePeriodSeconds: 45",
         "runAsNonRoot: true",
-        "image: ghcr.io/rakka-rs/rakka-agent-workflow:0.1.0",
+        "image: ghcr.io/paloul-tech/rakka-agent-workflow:0.1.0",
         "name: remoting",
         "containerPort: 2552",
         "name: http",

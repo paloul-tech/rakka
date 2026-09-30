@@ -49,7 +49,10 @@ pub enum AgentAutonomyTargetClass {
     Webhook,
     /// A2A push notification callback.
     PushNotification,
-    /// Target that is not part of the Phase 5 supported catalog.
+    /// Child workflow start command
+    /// (agent-domain workflows-as-tools, slice 4.5).
+    ChildWorkflow,
+    /// Target that is not part of the supported catalog.
     Other,
 }
 
@@ -66,6 +69,7 @@ impl AgentAutonomyTargetClass {
             Self::Timer => "timer",
             Self::Webhook => "webhook",
             Self::PushNotification => "push-notification",
+            Self::ChildWorkflow => "child-workflow",
             Self::Other => "other",
         }
     }
@@ -82,6 +86,7 @@ impl AgentAutonomyTargetClass {
             "timer" => Self::Timer,
             "webhook" => Self::Webhook,
             "push-notification" | "push" | "a2a-push" => Self::PushNotification,
+            "child-workflow" => Self::ChildWorkflow,
             "other" => Self::Other,
             _ => return None,
         })
@@ -102,8 +107,12 @@ impl AgentAutonomyTargetClass {
 
     /// Maps the dispatcher routing class onto the autonomy policy class.
     ///
-    /// Dispatch classes outside the Phase 5 autonomy catalog map to
+    /// Dispatch classes outside the supported autonomy catalog map to
     /// [`Self::Other`], which fails closed against the default catalog.
+    /// `ChildWorkflow` is first-class since agent-domain workflows-as-tools
+    /// (slice 4.5): a workflow invoked as a tool carries explicit budgets,
+    /// capabilities, and approval policy rather than the generic `Other`
+    /// denial.
     #[must_use]
     pub const fn from_dispatch_class(class: AgentDispatchTargetClass) -> Self {
         match class {
@@ -114,12 +123,12 @@ impl AgentAutonomyTargetClass {
             AgentDispatchTargetClass::Webhook => Self::Webhook,
             AgentDispatchTargetClass::PushNotification => Self::PushNotification,
             AgentDispatchTargetClass::Human => Self::HumanCheckpoint,
+            AgentDispatchTargetClass::ChildWorkflow => Self::ChildWorkflow,
             AgentDispatchTargetClass::Http
             | AgentDispatchTargetClass::Grpc
             | AgentDispatchTargetClass::Notification
             | AgentDispatchTargetClass::Stream
             | AgentDispatchTargetClass::Artifact
-            | AgentDispatchTargetClass::ChildWorkflow
             | AgentDispatchTargetClass::Audit
             | AgentDispatchTargetClass::Other => Self::Other,
         }
@@ -270,7 +279,8 @@ impl AgentEffectTargetCatalog {
             ArtifactPreferred, ArtifactRequired, InlineAllowed, NoPayload,
         };
         use AgentAutonomyIdempotencyPolicy::{
-            A2aMessageId, CheckpointId, EffectIdempotencyKey, TargetEventKey, TimerId,
+            A2aMessageId, CheckpointId, DeduplicationKey, EffectIdempotencyKey, TargetEventKey,
+            TimerId,
         };
 
         Self::empty()
@@ -292,11 +302,22 @@ impl AgentEffectTargetCatalog {
                 EffectIdempotencyKey,
                 AgentAutonomyArtifactPolicies::new(ArtifactPreferred, ArtifactRequired),
             ))
+            // `ToolCall` and the relaxed input policy admit the agent
+            // domain's outbound A2A sends (slice 4.3): they ride the
+            // executor-routed tool family with target type `a2a-peer` and
+            // carry inline delegation payloads rather than an input
+            // artifact, and the dispatcher classifies them as `A2aPeer` —
+            // a catalog that refused the kind would deny exactly the sends
+            // the classification routes.
             .with_descriptor(AgentAutonomyTargetClassDescriptor::new(
                 AgentAutonomyTargetClass::A2aPeer,
-                [AgentEffectKind::HttpCall, AgentEffectKind::GrpcCall],
+                [
+                    AgentEffectKind::HttpCall,
+                    AgentEffectKind::GrpcCall,
+                    AgentEffectKind::ToolCall,
+                ],
                 A2aMessageId,
-                AgentAutonomyArtifactPolicies::new(ArtifactRequired, ArtifactRequired),
+                AgentAutonomyArtifactPolicies::new(ArtifactPreferred, ArtifactRequired),
             ))
             .with_descriptor(AgentAutonomyTargetClassDescriptor::new(
                 AgentAutonomyTargetClass::HumanCheckpoint,
@@ -321,6 +342,22 @@ impl AgentEffectTargetCatalog {
                 [],
                 TimerId,
                 AgentAutonomyArtifactPolicies::new(NoPayload, InlineAllowed),
+            ))
+            // A child-workflow start converges on the outbox deduplication
+            // key: it is the derived invocation identity the child run's own
+            // inbox deduplicates on, so every replay adopts the one child.
+            // `ToolCall` is accepted because agent-domain workflows-as-tools
+            // (slice 4.5) ride the executor-routed tool family with target
+            // type `workflow-tool`, which the dispatcher classifies as
+            // `ChildWorkflow`.
+            .with_descriptor(AgentAutonomyTargetClassDescriptor::new(
+                AgentAutonomyTargetClass::ChildWorkflow,
+                [
+                    AgentEffectKind::ChildWorkflowCommand,
+                    AgentEffectKind::ToolCall,
+                ],
+                DeduplicationKey,
+                AgentAutonomyArtifactPolicies::new(ArtifactPreferred, ArtifactPreferred),
             ))
     }
 
@@ -574,6 +611,7 @@ impl AgentAutonomyPolicy {
             .allow_target_class(AgentAutonomyTargetClass::Timer)
             .allow_target_class(AgentAutonomyTargetClass::Webhook)
             .allow_target_class(AgentAutonomyTargetClass::PushNotification)
+            .allow_target_class(AgentAutonomyTargetClass::ChildWorkflow)
     }
 
     /// Allows one target class.

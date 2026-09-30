@@ -1,6 +1,7 @@
 //! The run entity and its durable loop.
 //!
-//! Specification: sections 6.5, 9.3, 9.4, 9.5, and 15; scenario 2 of section 18.
+//! Specification: sections 6.5, 9.3, 9.4, 9.5, and 15; scenarios 2 and 10 of
+//! section 18.
 //! A run must survive an actor restart after *every* loop transition and resume
 //! from what it durably persisted — never by replaying a model call it already
 //! made, and never by waiting forever on an effect it forgot to dispatch.
@@ -38,6 +39,7 @@ fn proposing_turn(answer: &str) -> AgentModelTurn {
             input_tokens: 10,
             output_tokens: 5,
             cost_micros: 3,
+            ..Default::default()
         })
 }
 
@@ -94,7 +96,7 @@ async fn a_run_serves_its_task_through_the_durable_loop_and_never_completes_it_a
     assert_eq!(task.status, AgentTaskStatus::Completed);
     assert_eq!(
         task.accepted_result.expect("the task holds the result").run,
-        *run_scope().run()
+        Some(run_scope().run().clone())
     );
 
     // One turn, one model call, one durable effect.

@@ -438,6 +438,51 @@ fn optional_multi_process_compatibility_example_is_gated() {
     );
 }
 
+#[test]
+fn optional_multi_pod_agent_fault_harness_is_gated() {
+    // The agent domain's own multi-process gate, added by slice 6.1. The
+    // compatibility example above proves two nodes can talk; this one proves
+    // the durable agent entities recover on a *different pod* when the one
+    // holding them dies, which is what specification 15 actually requires.
+    //
+    // The only copy. The example carried an identical test — same name, gate,
+    // command and marker — so under the gate the ~2 minute sweep ran twice, and
+    // the two had already drifted on how they treat the skip. This is the copy
+    // CLAUDE.md documents as the entry point.
+    if std::env::var("RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping the multi-pod agent fault harness; set \
+             RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1"
+        );
+        return;
+    }
+
+    let output = Command::new("cargo")
+        .args(["run", "-p", "rakka-example-multi-pod-agent-fault-soak"])
+        .current_dir(repo_root())
+        .output()
+        .expect("the multi-pod agent fault harness should run when enabled");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "multi-pod agent fault harness failed:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if stdout.contains("skipped: loopback binding is unavailable") {
+        eprintln!("multi-pod harness skipped: loopback binding is unavailable");
+        return;
+    }
+    assert!(
+        stdout.contains("converged from the shared record"),
+        "expected the sweep's convergence marker in stdout:\n{stdout}"
+    );
+}
+
 fn assert_readiness_reports_compatibility_failure(local_node_id: NodeId, message: String) {
     let health = KubernetesNodeHealth::new(local_node_id);
     health.record_compatibility_failure(message);

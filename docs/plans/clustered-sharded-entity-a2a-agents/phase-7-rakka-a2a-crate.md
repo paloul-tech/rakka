@@ -99,7 +99,7 @@ Initial features:
 - `http`: shared route composition with Rakka HTTP observability route helpers
   where appropriate.
 - `k8s`: drain/readiness helpers and snapshot registration guidance.
-- `otel`: trace context propagation and OpenTelemetry label/attribute helpers.
+- `otel`: the OpenTelemetry GenAI convention mapping for the A2A edge — the ingress `SERVER` span and its attribute helpers, activating `rakka-agent/otel` (amended by slice 6.3a: trace-context propagation is unconditional and not gated by this feature).
 - `testkit`: in-memory stores, fixtures, and compatibility probes.
 
 Add a top-level facade feature only after the crate API settles:

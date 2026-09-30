@@ -71,9 +71,28 @@ fn observability_testkit_asserts_representative_workflow_execution() {
         AgentTimestampMillis::new(130),
         &audit_event.telemetry_context,
     )
-    .expect("span should build from telemetry context")
-    .attribute("step.kind", "human-checkpoint")
-    .attribute("checkpoint.status", "open");
+    .expect("span should build from telemetry context");
+    // The context supplies the trace identity and the links, and no
+    // attributes: baggage is a propagation context rather than a span
+    // attribute set, and baggage from an external caller is untrusted
+    // (specification 17.15). This probe used to rely on the copy, which is
+    // precisely why the copy had to be removed with a test that names it.
+    assert!(
+        span.attributes.is_empty(),
+        "a context must contribute no span attributes: {:?}",
+        span.attributes
+    );
+    assert!(
+        !audit_event.telemetry_context.baggage.is_empty(),
+        "the fixture must carry baggage, or the assertion above proves nothing"
+    );
+
+    // What an emitter decides to export, it sets.
+    let span = span
+        .attribute("workflow_type", "test-workflow")
+        .attribute("tenant_tier", "gold")
+        .attribute("step.kind", "human-checkpoint")
+        .attribute("checkpoint.status", "open");
     assert_agent_span_attributes(
         &span,
         "agent.workflow.human-checkpoint.resume",

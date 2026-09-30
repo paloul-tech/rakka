@@ -1,7 +1,8 @@
 //! The acceptance walk, asserted: the transcript the binary prints is
 //! exactly the one the README documents, and the typed facts behind every
 //! line hold. `cargo test --workspace` runs this, so the documented stdout
-//! cannot rot.
+//! cannot rot. The content sentinels the walk plants are asserted absent from
+//! every telemetry surface it exposes (scenario 25 of section 18).
 
 use rakka_example_durable_agent_acceptance::report::EXPECTED_TRANSCRIPT;
 use rakka_example_durable_agent_acceptance::{run_acceptance, CONTENT_SENTINELS};

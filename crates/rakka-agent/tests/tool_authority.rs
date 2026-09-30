@@ -1,7 +1,9 @@
 //! The tool authority layers over the real dispatch pipeline.
 //!
 //! Specification: sections 11.7, 11.8, and 16; scenarios 44 and 54 of
-//! section 18. Every test drives the production path: the run commits the
+//! section 18, with scenario 13's revocation swept under owner loss and
+//! scenario 7's idempotency-key contract re-proven under run-owner loss.
+//! Every test drives the production path: the run commits the
 //! effect intent, the ticket reaches the durable outbox, the dispatcher
 //! fleet leases it — and the [`rakka_agent::AgentDispatchAuthority`] decides,
 //! before durable `Started`, whether the attempt may invoke anything.
@@ -15,46 +17,28 @@
 //! failure code names the check that refused.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use rakka_agent::testkit::{
-    sweep_crash_points, DeterministicModelAdapter, InProcessRunResultDelivery, KillSwitchProbe,
-    RecordingToolExecutor, ScriptedDispatcher, SharedAtomicWorkflowClock,
-};
+use rakka_agent::testkit::{sweep_crash_points, DeterministicModelAdapter};
+use rakka_agent::SessionMemoryStore;
 use rakka_agent::{
     AgentAuthorityEnvelope, AgentDefinition, AgentDefinitionId, AgentDefinitionRevision,
-    AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentDispatchPass,
-    AgentDispatchWindow, AgentEffectSpec, AgentEntityAuthority, AgentEntityCommand,
-    AgentEntityStore, AgentExecutionPolicyRef, AgentExecutionPolicyRouter, AgentGuardrail,
-    AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailOutcome,
-    AgentGuardrailStage, AgentGuardrailStageId, AgentModelTurn, AgentOperationId,
-    AgentOperationKind, AgentPolicyRef, AgentReconciliationProtocolRef, AgentRevisionNumber,
-    AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectStatus, AgentRunScope, AgentRunState,
-    AgentRunStatus, AgentRunTerminalReason, AgentSettings, AgentSettingsChange, AgentSetupRevision,
-    AgentTaskContent, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest,
-    AgentToolDeclaration, AgentToolId, AgentToolRegistry, WorkflowAgentRunEffectSink,
+    AgentDispatchWindow, AgentEffectSpec, AgentExecutionPolicyRef, AgentExecutionPolicyRouter,
+    AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
+    AgentGuardrailOutcome, AgentGuardrailStage, AgentGuardrailStageId, AgentModelTurn,
+    AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentReconciliationProtocolRef,
+    AgentRevisionNumber, AgentRunEffectStatus, AgentRunStatus, AgentSettings, AgentSettingsChange,
+    AgentSetupRevision, AgentTaskContent, AgentToolAuthority, AgentToolCallId,
+    AgentToolCallRequest, AgentToolDeclaration, AgentToolId, AgentToolRegistry,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
-use rakka_agent_workflow::substrate::WorkflowState;
 use rakka_agent_workflow::AgentTimestampMillis;
-use rakka_agent_workflow::{
-    AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorkerId,
-};
-use rakka_persistence::InMemoryDurableStateStore;
 use serde_json::Value;
 
 mod common;
 
 use common::*;
 
-type WorkflowStore = InMemoryDurableStateStore<WorkflowState>;
-type FleetStore = InMemoryDurableStateStore<AgentDispatcherFleetState>;
-type WorkflowSink = WorkflowAgentRunEffectSink<WorkflowStore, SharedAtomicWorkflowClock>;
-type Pipeline =
-    AgentRunEffectDispatcher<WorkflowStore, FleetStore, RunStore, SharedAtomicWorkflowClock>;
-
-const LEASE_MS: u64 = 60_000;
 const TOOL: &str = "charge-card";
 
 fn tool_id() -> AgentToolId {
@@ -85,351 +69,6 @@ fn proposing_turn(answer: &str) -> AgentModelTurn {
 
 fn stage_id(id: &str) -> AgentGuardrailStageId {
     AgentGuardrailStageId::new(id).expect("the stage id is valid")
-}
-
-/// An [`AgentDispatchAuthority`] decorator that backdates every issued
-/// grant's expiry, so the dispatcher's own pre-attempt revalidation — not the
-/// authority — is what refuses the attempt.
-struct ExpiredGrantAuthority<Inner>(Inner);
-
-impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAuthority<Inner> {
-    fn authorize<'a>(
-        &'a self,
-        scope: &'a AgentRunScope,
-        run: &'a AgentRunState,
-        intent: &'a AgentRunEffect,
-        attempt: u32,
-        now: AgentTimestampMillis,
-    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
-        let inner = self.0.authorize(scope, run, intent, attempt, now);
-        Box::pin(async move {
-            match inner.await? {
-                AgentDispatchDecision::Granted(mut granted) => {
-                    granted.grant.expires_at =
-                        AgentTimestampMillis::new(now.as_millis().saturating_sub(1));
-                    Ok(AgentDispatchDecision::Granted(granted))
-                }
-                refused => Ok(refused),
-            }
-        })
-    }
-}
-
-/// The authority fixture: the common task-and-run fixture over the durable
-/// workflow-outbox sink, plus the fleet, the executor, the kill-switch probe,
-/// and a configurable [`AgentToolAuthority`] behind the pipeline's required
-/// gate.
-struct AuthorityFixture {
-    fx: Fixture<DeterministicModelAdapter, WorkflowSink>,
-    adapter: DeterministicModelAdapter,
-    registry: AgentToolRegistry,
-    authority: AgentToolAuthority,
-    setup: Option<AgentSetupRevision>,
-    envelope: AgentAuthorityEnvelope,
-    workflow_store: WorkflowStore,
-    fleet_store: FleetStore,
-    wf_clock: SharedAtomicWorkflowClock,
-    tools: RecordingToolExecutor,
-    probe: KillSwitchProbe,
-    expire_grants: bool,
-}
-
-impl AuthorityFixture {
-    /// A fixture whose commit-time policies are the given authority's own
-    /// projection ([`AgentToolAuthority::effect_policies`]), so the intents
-    /// the run commits carry the guardrail-revision pin the dispatch gate
-    /// validates.
-    fn new(
-        adapter: DeterministicModelAdapter,
-        authority: AgentToolAuthority,
-        model_spec: Option<AgentEffectSpec>,
-    ) -> Self {
-        let registry = authority.registry().clone();
-        let mut policies = authority
-            .effect_policies()
-            .expect("the authority projects valid policies");
-        if let Some(spec) = model_spec {
-            policies = policies
-                .with_model_spec(spec)
-                .expect("the model spec is valid");
-        }
-        let counter = Arc::new(AtomicU64::new(1));
-        let wf_clock = SharedAtomicWorkflowClock::new(counter.clone());
-        let workflow_store = WorkflowStore::new();
-        let fleet_store = FleetStore::new();
-        let sink = WorkflowAgentRunEffectSink::new(workflow_store.clone(), wf_clock.clone());
-        let fx = Fixture::with_sink(
-            ScriptedDispatcher::with_adapter(adapter.clone()),
-            sink,
-            policies,
-            counter,
-        );
-        let envelope = envelope_for_registry(&registry);
-        Self {
-            fx,
-            adapter,
-            registry,
-            authority,
-            setup: None,
-            envelope,
-            workflow_store,
-            fleet_store,
-            wf_clock,
-            tools: RecordingToolExecutor::new(),
-            probe: KillSwitchProbe::new(),
-            expire_grants: false,
-        }
-    }
-
-    /// A fixture over the plain authority of one registry.
-    fn over(
-        adapter: DeterministicModelAdapter,
-        registry: AgentToolRegistry,
-        model_spec: Option<AgentEffectSpec>,
-    ) -> Self {
-        Self::new(adapter, AgentToolAuthority::new(registry), model_spec)
-    }
-
-    /// Replaces the dispatch-gate authority *without* recomputing the
-    /// commit-time policies — the deliberate commit/dispatch drift the
-    /// guardrail-revision pin must catch.
-    fn with_gate_authority(mut self, authority: AgentToolAuthority) -> Self {
-        self.authority = authority;
-        self
-    }
-
-    /// Backdates every issued grant's expiry, so the dispatcher's
-    /// pre-attempt revalidation refuses it.
-    fn with_expired_grants(mut self) -> Self {
-        self.expire_grants = true;
-        self
-    }
-
-    /// Replaces the envelope the agent is instantiated under.
-    fn with_envelope(mut self, envelope: AgentAuthorityEnvelope) -> Self {
-        self.envelope = envelope;
-        self
-    }
-
-    /// Enforces the given run setup at dispatch, for this fixture's run.
-    fn with_setup(mut self, setup: AgentSetupRevision) -> Self {
-        self.setup = Some(setup);
-        self
-    }
-
-    async fn start(&self) {
-        self.fx
-            .instantiate_agent_with_envelope(self.envelope.clone())
-            .await;
-        self.fx.create_task().await;
-    }
-
-    /// A fresh dispatch worker over the shared durable stores.
-    fn pipeline(&self) -> Pipeline {
-        let mut gate = AgentEntityAuthority::new(self.fx.agents.clone(), self.authority.clone());
-        if let Some(setup) = &self.setup {
-            gate = gate.with_setup_for_run(run_scope(), setup.clone());
-        }
-        let gate: Arc<dyn AgentDispatchAuthority> = if self.expire_grants {
-            Arc::new(ExpiredGrantAuthority(gate))
-        } else {
-            Arc::new(gate)
-        };
-        AgentRunEffectDispatcher::new(
-            AgentDispatcherWorkerId::new("worker-1"),
-            self.workflow_store.clone(),
-            self.fleet_store.clone(),
-            self.fx.runs.clone(),
-            self.wf_clock.clone(),
-            Arc::new(self.adapter.clone()),
-            Arc::new(self.tools.clone()),
-            gate,
-            Arc::new(
-                InProcessRunResultDelivery::new(
-                    self.fx.runs.clone(),
-                    self.fx.effects.clone(),
-                    self.fx.router.clone(),
-                    self.fx.clock.clone(),
-                )
-                .with_effect_policies(self.fx.policies.clone()),
-            ),
-        )
-        .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
-        .with_probe(Arc::new(self.probe.clone()))
-    }
-
-    /// Advances the shared clock past the fleet lease.
-    fn expire_lease(&self) {
-        self.wf_clock.advance(LEASE_MS + 1);
-    }
-
-    /// The durable status of the effect at one slot of the run's loop state.
-    async fn effect_status(&self, slot: usize) -> Option<AgentRunEffectStatus> {
-        let state = rakka_agent::load_agent_run_state(
-            &self.fx.runs,
-            &run_scope(),
-            &rakka_agent::AgentSchemaPolicy::default(),
-        )
-        .await
-        .expect("the run state loads")?;
-        state
-            .loop_state()?
-            .effects()
-            .iter()
-            .find(|effect| effect.slot == slot)
-            .map(|effect| effect.status)
-    }
-
-    /// Drives the run until its tool ticket is flushed and ready to claim.
-    async fn pump_until_tool_ticket(&self) {
-        for _round in 0..8 {
-            self.settle().await;
-            let ready = self.effect_status(1).await == Some(AgentRunEffectStatus::Ready);
-            if ready {
-                // Flush the ticket to the outbox once more (idempotent), so
-                // the pipeline can register it.
-                self.settle().await;
-                return;
-            }
-            let _pass = self
-                .pipeline()
-                .pump_run(&run_scope())
-                .await
-                .expect("the pass runs");
-        }
-        panic!("the tool ticket never became ready");
-    }
-
-    /// Settles the entities from durable state: the task drives its owed
-    /// exchanges, the run cranks its loop and flushes its tickets.
-    async fn settle(&self) {
-        let now = self.fx.now();
-        let mut task = rakka_agent::AgentTaskEntityStore::new(
-            task_scope(),
-            self.fx.tasks.clone(),
-            self.fx.agents.clone(),
-            self.fx.history.clone(),
-        );
-        task.recover(now).await.expect("the task recovers");
-        task.settle_side_effects(&self.fx.router, now)
-            .await
-            .expect("the task settles");
-
-        let now = self.fx.now();
-        let mut run = self.fx.run();
-        run.recover(now).await.expect("the run recovers");
-        run.settle_side_effects(&self.fx.router, now)
-            .await
-            .expect("the run settles");
-    }
-
-    /// One settle-and-dispatch round.
-    async fn one_pass(&self) -> AgentDispatchPass {
-        self.settle().await;
-        self.pipeline()
-            .pump_run(&run_scope())
-            .await
-            .expect("the dispatch pass runs")
-    }
-
-    /// Drives entities and the dispatch pipeline until the run is terminal or
-    /// nothing moves. Each round uses a fresh worker.
-    async fn pump(&self) {
-        for _round in 0..16 {
-            let pass = self.one_pass().await;
-            let snapshot = self.fx.run_snapshot().await;
-            let terminal = snapshot
-                .as_ref()
-                .is_some_and(|run| run.status.is_terminal());
-            if terminal {
-                self.settle().await;
-                return;
-            }
-            if pass.registered == 0
-                && pass.claimed == 0
-                && pass.delivered == 0
-                && pass.cancelled == 0
-            {
-                return;
-            }
-        }
-        panic!("the dispatch pump did not quiesce");
-    }
-
-    /// The stable code of the effect failure that stopped the run.
-    async fn terminal_failure_code(&self) -> String {
-        let run = self.fx.run_snapshot().await.expect("the run exists");
-        assert_eq!(
-            run.status,
-            AgentRunStatus::Failed,
-            "the run should have stopped on the refused effect"
-        );
-        match run.terminal_reason {
-            Some(AgentRunTerminalReason::EffectFailed { code, .. }) => code,
-            other => panic!("expected an effect failure, found {other:?}"),
-        }
-    }
-
-    /// Applies a settings update to the agent entity — an immediate-safety
-    /// change once it carries a revocation.
-    async fn apply_settings(&self, discriminator: &str, changes: Vec<AgentSettingsChange>) {
-        let mut agent = AgentEntityStore::new(agent_scope(), self.fx.agents.clone());
-        agent.recover().await.expect("the agent recovers");
-        let expected_revision = agent
-            .state()
-            .expect("the state reads")
-            .expect("the agent exists")
-            .settings()
-            .revision();
-        agent
-            .apply(AgentEntityCommand::UpdateSettings {
-                operation_id: AgentOperationId::for_agent(
-                    AgentOperationKind::SettingsUpdate,
-                    &agent_scope(),
-                    discriminator,
-                )
-                .expect("operation id should be derivable"),
-                expected_revision,
-                changes,
-                provenance: Box::new(provenance(90)),
-            })
-            .await
-            .expect("the settings update applies");
-    }
-
-    /// Suspends or resumes the agent through its lifecycle protocol.
-    async fn set_suspended(&self, suspended: bool, discriminator: &str) {
-        let mut agent = AgentEntityStore::new(agent_scope(), self.fx.agents.clone());
-        agent.recover().await.expect("the agent recovers");
-        let expected_lifecycle_revision = agent
-            .state()
-            .expect("the state reads")
-            .expect("the agent exists")
-            .lifecycle_revision();
-        let operation_id = AgentOperationId::for_agent(
-            AgentOperationKind::LifecycleCommand,
-            &agent_scope(),
-            discriminator,
-        )
-        .expect("operation id should be derivable");
-        let command = if suspended {
-            AgentEntityCommand::Suspend {
-                operation_id,
-                expected_lifecycle_revision,
-                provenance: Box::new(provenance(91)),
-            }
-        } else {
-            AgentEntityCommand::Resume {
-                operation_id,
-                expected_lifecycle_revision,
-                provenance: Box::new(provenance(92)),
-            }
-        };
-        agent
-            .apply(command)
-            .await
-            .expect("the lifecycle command applies");
-    }
 }
 
 /// An adapter scripted for one tool turn and one closing proposal.
@@ -480,6 +119,104 @@ async fn a_registered_but_undeclared_tool_is_undispatchable() {
 
     assert_eq!(fx.terminal_failure_code().await, "undeclared-tool");
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Specification 8.6: a kind-`Workflow` registration is model-visible toolset
+// projection, never a generic dispatch path. Its calls exist only as the
+// loop's workflow interception — a generic `Tool` intent naming one means the
+// run was not wired for workflow tools, and the authority refuses it before
+// anything is invoked.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_workflow_kind_registration_never_dispatches_generically() {
+    let registry = AgentToolRegistry::new()
+        .register(rakka_agent::AgentToolBinding::unclassified(
+            rakka_agent::AgentToolDescriptor::new(
+                tool_id(),
+                rakka_agent::AgentToolKind::Workflow,
+                "The refund workflow, projected into the toolset.",
+                schema("workflow-input"),
+                schema("workflow-output"),
+            )
+            .expect("the descriptor is valid"),
+        ))
+        .expect("the tool registers");
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None);
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.terminal_failure_code().await,
+        "workflow-tool-requires-interception"
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 0, "nothing was invoked");
+}
+
+// ---------------------------------------------------------------------------
+// Specification 8.6 / 7.3: the workflow-tool envelope door, per attempt. The
+// loop's interception commits the invocation on wiring alone — authority is
+// the dispatch gate's business, and `AgentAuthorityEnvelope::workflow_tools`
+// is what it re-checks on every attempt.
+// ---------------------------------------------------------------------------
+
+fn workflow_then_proposal() -> DeterministicModelAdapter {
+    DeterministicModelAdapter::new()
+        .with_turn(
+            AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                .with_text("Invoking the refund workflow.")
+                .with_tool_call(
+                    AgentToolCallRequest::new(
+                        AgentToolCallId::new("invoke-1").expect("call id should be valid"),
+                        AgentToolId::new(WORKFLOW_TOOL).expect("tool id should be valid"),
+                        serde_json::json!({ "order": "o-1" }),
+                    )
+                    .expect("the tool call is bounded"),
+                ),
+        )
+        .with_turn(proposing_turn("workflow-evidence"))
+}
+
+#[tokio::test]
+async fn a_workflow_start_is_undispatchable_until_the_definition_declares_it() {
+    // Undeclared: the envelope never lists the workflow tool, so the dispatch
+    // authority refuses the attempt with `undeclared-workflow-tool` before
+    // any executor could be reached. The refusal is a fan-in disposition the
+    // coordinator survives — the cell, not the run's terminal reason, holds
+    // the code.
+    let mut envelope = AgentAuthorityEnvelope::empty();
+    envelope.task_definitions.insert(task_definition_id());
+    let fx = AuthorityFixture::over(workflow_then_proposal(), AgentToolRegistry::new(), None)
+        .with_envelope(envelope)
+        .with_workflow_tools(workflow_config());
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.workflow_cell_failure_code().await.as_deref(),
+        Some("undeclared-workflow-tool")
+    );
+    assert_eq!(fx.tools.invocation_count(WORKFLOW_TOOL), 0);
+
+    // Declared: the same shape with the envelope naming the tool passes the
+    // door — the attempt proceeds to invocation, where this pipeline's absent
+    // start executor is what fails it. The code moving from the envelope
+    // refusal to the executor failure is the gate admitting the attempt.
+    let mut envelope = AgentAuthorityEnvelope::empty();
+    envelope.task_definitions.insert(task_definition_id());
+    envelope.workflow_tools.insert(workflow_tool_id());
+    let fx = AuthorityFixture::over(workflow_then_proposal(), AgentToolRegistry::new(), None)
+        .with_envelope(envelope)
+        .with_workflow_tools(workflow_config());
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.workflow_cell_failure_code().await.as_deref(),
+        Some("workflow-start-executor-missing"),
+        "the envelope door admitted the attempt; only the unwired executor failed it"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +363,7 @@ async fn a_resolved_checkpoint_grant_lets_the_gated_tool_dispatch() {
                         allowed_use_count: 1,
                     },
                 )),
+                telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
             },
             &fx.fx.router,
             fx.fx.now(),
@@ -1009,6 +747,11 @@ async fn a_missing_mandatory_guardrail_stage_fails_closed_at_dispatch() {
     assert_eq!(fx.terminal_failure_code().await, "guardrail-stage-missing");
     assert_eq!(fx.adapter.calls(), 0, "the model boundary is guarded too");
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    assert_eq!(
+        fx.terminal_failure_reason().await,
+        None,
+        "the authority refused; no stage blocked, so no reason is invented"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,8 +769,12 @@ async fn a_mandatory_stage_bound_to_an_unevaluated_boundary_fails_closed() {
     let mut envelope = envelope_for_registry(&registry);
     envelope.mandatory_guardrails.insert(stage_id("pii-filter"));
 
-    // The stage is real, mandatory, and present — but bound only to the
-    // tool-*response* boundary, which slice 1.8 never evaluates.
+    // The stage is real, mandatory, and present — but bound to the
+    // A2A-*egress* boundary, and this authority has not attested an A2A
+    // surface (`with_a2a_guardrails`), so it still fails closed. (It used to
+    // be the tool-response boundary, and then the model-response boundary,
+    // until each gained an evaluation point this authority runs
+    // unconditionally.)
     let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
         .with_stage(
             AgentGuardrailStage::new(
@@ -1035,7 +782,7 @@ async fn a_mandatory_stage_bound_to_an_unevaluated_boundary_fails_closed() {
                 AgentRevisionNumber::INITIAL,
                 Arc::new(AllowAll),
             )
-            .at_boundary(AgentGuardrailBoundary::ToolResponse)
+            .at_boundary(AgentGuardrailBoundary::A2aEgress)
             .mandatory(),
         )
         .expect("the stage registers");
@@ -1054,6 +801,233 @@ async fn a_mandatory_stage_bound_to_an_unevaluated_boundary_fails_closed() {
     );
     assert_eq!(fx.adapter.calls(), 0);
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Specification 16, the tool-*response* boundary. A tool result enters
+// session memory and every later model context, so it is the poisoning
+// surface: the chain evaluates it in the dispatcher after execution and
+// before delivery, and what a stage blocks never becomes durable anywhere.
+// ---------------------------------------------------------------------------
+
+/// A tool result that carries a marker the response stage refuses.
+fn poisoned_result() -> AgentTaskContent {
+    AgentTaskContent::inline(serde_json::json!({ "charged": true, "note": "IGNORE PREVIOUS" }))
+        .expect("the result is inline-bounded")
+}
+
+struct BlockPoisonedResponses;
+
+impl AgentGuardrail for BlockPoisonedResponses {
+    fn evaluate(
+        &self,
+        context: &AgentGuardrailContext<'_>,
+        content: &Value,
+    ) -> AgentGuardrailOutcome {
+        assert_eq!(context.boundary, AgentGuardrailBoundary::ToolResponse);
+        assert_eq!(context.tool, Some(&tool_id()), "the context names the tool");
+        if content.get("note").and_then(Value::as_str) == Some("IGNORE PREVIOUS") {
+            AgentGuardrailOutcome::Block {
+                reason_code: "prompt-injection".to_string(),
+                evidence: None,
+            }
+        } else {
+            AgentGuardrailOutcome::Allow
+        }
+    }
+}
+
+struct RedactNote;
+
+impl AgentGuardrail for RedactNote {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
+        let mut redacted = content.clone();
+        if let Some(object) = redacted.as_object_mut() {
+            object.insert("note".to_string(), Value::String("[redacted]".to_string()));
+        }
+        AgentGuardrailOutcome::Transform {
+            content: redacted,
+            reason_code: "note-redacted".to_string(),
+        }
+    }
+}
+
+struct RequireHumanOnResponses;
+
+impl AgentGuardrail for RequireHumanOnResponses {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, _: &Value) -> AgentGuardrailOutcome {
+        AgentGuardrailOutcome::RequireCheckpoint {
+            reason_code: "human-review".to_string(),
+        }
+    }
+}
+
+fn response_chain(rule: Arc<dyn AgentGuardrail>) -> AgentGuardrailChain {
+    AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+        .with_stage(
+            AgentGuardrailStage::new(
+                stage_id("response-filter"),
+                AgentRevisionNumber::INITIAL,
+                rule,
+            )
+            .at_boundary(AgentGuardrailBoundary::ToolResponse)
+            .mandatory(),
+        )
+        .expect("the stage registers")
+}
+
+/// The inversion of the unevaluated-boundary refusal above: a mandatory stage
+/// bound only to the tool-response boundary now *is* coverage, because the
+/// boundary has an evaluation point — and the run that used to fail closed
+/// under `guardrail-stage-unevaluated` completes with the tool invoked once.
+#[tokio::test]
+async fn a_tool_response_only_mandatory_stage_satisfies_coverage() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let mut envelope = envelope_for_registry(&registry);
+    envelope
+        .mandatory_guardrails
+        .insert(stage_id("response-filter"));
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_guardrails(response_chain(Arc::new(AllowAll))),
+        None,
+    )
+    .with_envelope(envelope);
+    fx.start().await;
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
+
+/// A blocked tool response fails the effect under `guardrail-blocked` after
+/// exactly one invocation, and the blocked content reaches neither the run's
+/// loop state nor its session memory.
+#[tokio::test]
+async fn a_blocked_tool_response_never_reaches_the_run() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry)
+            .with_guardrails(response_chain(Arc::new(BlockPoisonedResponses))),
+        None,
+    )
+    .with_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots));
+    let _ = fx.tools.clone().with_result(TOOL, poisoned_result());
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(fx.terminal_failure_code().await, "guardrail-blocked");
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "the tool ran once; a blocked response is never re-invoked to try again"
+    );
+
+    let state = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    let loop_state = state.loop_state().expect("the loop exists");
+    assert!(
+        loop_state.tool_results().is_empty(),
+        "nothing blocked is recorded as a tool result"
+    );
+    let effect = loop_state
+        .effects()
+        .iter()
+        .find(|effect| effect.slot == 1)
+        .expect("the tool effect");
+    assert_eq!(effect.status, AgentRunEffectStatus::Failed);
+    assert_eq!(effect.last_error_code.as_deref(), Some("guardrail-blocked"));
+    let reason = effect
+        .last_error_reason
+        .as_ref()
+        .expect("the effect's record names the decision");
+    assert_eq!(reason.stage(), Some(&stage_id("response-filter")));
+    assert_eq!(reason.code(), "prompt-injection");
+    assert_eq!(fx.terminal_failure_reason().await.as_ref(), Some(reason));
+
+    let page = session
+        .read(&run_scope(), rakka_agent::SessionMemoryCursor::start())
+        .await
+        .expect("the session reads");
+    assert!(
+        !page.entries.iter().any(|entry| {
+            entry.role == rakka_agent::MemoryEntryRole::ToolResult
+                && entry
+                    .content
+                    .inline_value()
+                    .and_then(|value| value.get("note"))
+                    .is_some()
+        }),
+        "the blocked content never entered session memory: {:?}",
+        page.entries
+    );
+}
+
+/// A transformed tool response is what the run records — read back from the
+/// session memory the loop flushed it to, which is the durable form every
+/// later context snapshot assembles from.
+#[tokio::test]
+async fn a_transformed_tool_response_is_what_the_run_records() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_guardrails(response_chain(Arc::new(RedactNote))),
+        None,
+    )
+    .with_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots));
+    let _ = fx.tools.clone().with_result(TOOL, poisoned_result());
+    fx.start().await;
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+
+    let page = session
+        .read(&run_scope(), rakka_agent::SessionMemoryCursor::start())
+        .await
+        .expect("the session reads");
+    let recorded: Vec<_> = page
+        .entries
+        .iter()
+        .filter(|entry| entry.role == rakka_agent::MemoryEntryRole::ToolResult)
+        .filter_map(|entry| entry.content.inline_value().cloned())
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![serde_json::json!({ "charged": true, "note": "[redacted]" })],
+        "the session holds the transformed result, never the executor's"
+    );
+}
+
+/// A stage that asks for a checkpoint on a tool response fails closed: no
+/// checkpoint can gate a result that already exists.
+#[tokio::test]
+async fn a_checkpoint_requiring_tool_response_stage_fails_closed() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry)
+            .with_guardrails(response_chain(Arc::new(RequireHumanOnResponses))),
+        None,
+    );
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(fx.terminal_failure_code().await, "checkpoint-required");
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,6 +1128,14 @@ async fn a_guardrail_block_keeps_a_tool_call_undispatchable() {
 
     assert_eq!(fx.terminal_failure_code().await, "guardrail-blocked");
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    let reason = fx
+        .terminal_failure_reason()
+        .await
+        .expect("a refused dispatch names the decision too");
+    assert_eq!(reason.stage(), Some(&stage_id("amount-limit")));
+    assert_eq!(reason.code(), "amount-over-limit");
+    let tool_effect = fx.effect_at(1).await.expect("the tool effect");
+    assert_eq!(tool_effect.last_error_reason.as_ref(), Some(&reason));
 
     // The deployment-mandatory stage cannot be narrowed away by any
     // definition or setup: the removal operation itself refuses.
@@ -1285,71 +1267,6 @@ async fn a_fully_authorized_tool_call_executes_exactly_once() {
     let run = fx.fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
     assert_eq!(fx.tools.invocation_count(TOOL), 1);
-}
-
-impl AuthorityFixture {
-    /// [`Self::settle`], but surfacing the first error instead of panicking —
-    /// what a sweep needs, because an armed crash point kills the run's owner
-    /// mid-settle and the injected loss is the point, not a failure.
-    async fn try_settle(&self) -> Result<(), String> {
-        let now = self.fx.now();
-        let mut task = rakka_agent::AgentTaskEntityStore::new(
-            task_scope(),
-            self.fx.tasks.clone(),
-            self.fx.agents.clone(),
-            self.fx.history.clone(),
-        );
-        task.recover(now)
-            .await
-            .map_err(|error| error.code().to_string())?;
-        task.settle_side_effects(&self.fx.router, now)
-            .await
-            .map_err(|error| error.code().to_string())?;
-
-        let now = self.fx.now();
-        let mut run = self.fx.run();
-        run.recover(now)
-            .await
-            .map_err(|error| error.code().to_string())?;
-        run.settle_side_effects(&self.fx.router, now)
-            .await
-            .map_err(|error| error.code().to_string())?;
-        Ok(())
-    }
-
-    /// [`Self::pump`], but surfacing the first error instead of panicking,
-    /// under the same sweep contract as [`Self::try_settle`].
-    async fn try_pump(&self) -> Result<(), String> {
-        for _round in 0..16 {
-            self.try_settle().await?;
-            let pass = self
-                .pipeline()
-                .pump_run(&run_scope())
-                .await
-                .map_err(|error| error.code().to_string())?;
-            let terminal = {
-                let mut run = self.fx.run();
-                run.recover(self.fx.now())
-                    .await
-                    .map_err(|error| error.code().to_string())?;
-                run.snapshot()
-                    .map_err(|error| error.code().to_string())?
-                    .is_some_and(|snapshot| snapshot.status.is_terminal())
-            };
-            if terminal {
-                self.try_settle().await?;
-                return Ok(());
-            }
-            if pass.registered == 0
-                && pass.claimed == 0
-                && pass.delivered == 0
-                && pass.cancelled == 0
-            {
-                return Ok(());
-            }
-        }
-        Err("the dispatch pump did not quiesce".to_string())
-    }
 }
 
 #[tokio::test]

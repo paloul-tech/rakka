@@ -9,7 +9,7 @@ This directory contains a reviewable Kubernetes example for running three Rakka 
 
 ## Application Image Contract
 
-The manifest is intentionally an application-image contract rather than a hosted demo image. Replace `ghcr.io/rakka-rs/rakka-node:0.1.0` with an image that runs a Rakka node and exposes:
+The manifest is intentionally an application-image contract rather than a hosted demo image. Replace `ghcr.io/paloul-tech/rakka-node:0.1.0` with an image that runs a Rakka node and exposes:
 
 - `GET /ready`: returns success only after cluster join, protocol compatibility acceptance, and required service registration.
 - `GET /live`: stays healthy during normal rebalance and drain, but fails for stuck runtime conditions.

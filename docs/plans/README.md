@@ -16,6 +16,8 @@ Use the product docs in `docs/` for current behavior, validation, examples, comp
   delivery slices.
 - `rakka-agent/spec.md`: emerging normative specification for durable,
   goal-driven Rakka Agents.
+- `rakka-agent/implementation-plan.md`: the slice-by-slice plan, amended as
+  each slice landed; the product doc for what shipped is `docs/rakka-agents.md`.
 - `rakka-v1-implementation-plan.md`: original v1 implementation plan.
 - `rakka-phase-3-continuation-plan.md`: Phase 3 remote, cluster, and sharding continuation plan.
 - `rakka-phase-4-continuation-plan.md`: Phase 4 process actor and durable workflow continuation plan.

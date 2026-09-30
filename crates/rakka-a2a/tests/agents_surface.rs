@@ -27,6 +27,7 @@ use rakka_agent::testkit::{
     sweep_crash_points, CrashingStateStore, DeferredExchangeRouter, InProcessRunEntityTransport,
     InProcessTaskEntityTransport, ScriptedDispatcher,
 };
+use rakka_agent::InMemoryAgentTeamHistoryStore;
 use rakka_agent::{
     run_id_for_assignment, AgentAssignmentGeneration, AgentAuthorityEnvelope,
     AgentClientManagementCommand, AgentClientManagementResponse, AgentClientTaskRequest,
@@ -47,7 +48,18 @@ use rakka_persistence::InMemoryDurableStateStore;
 type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = CrashingStateStore<AgentRunState>;
-type Service = RakkaAgentA2AService<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore, RunStore>;
+type Service = RakkaAgentA2AService<
+    TaskStore,
+    AgentStore,
+    InMemoryAgentTaskHistoryStore,
+    RunStore,
+    TeamStore,
+    InMemoryAgentTeamHistoryStore,
+    ConversationStore,
+    rakka_agent::InMemoryAgentConversationHistoryStore,
+>;
+type TeamStore = InMemoryDurableStateStore<rakka_agent::AgentTeamState>;
+type ConversationStore = InMemoryDurableStateStore<rakka_agent::AgentConversationState>;
 
 const TENANT: &str = "acme";
 const AGENT: &str = "support-agent";
@@ -135,6 +147,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(dispatcher: ScriptedDispatcher) -> Self {
+        Self::with_segments(dispatcher, None)
+    }
+
+    fn with_segments(
+        dispatcher: ScriptedDispatcher,
+        segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
+    ) -> Self {
         let tasks = TaskStore::new();
         let agents = AgentStore::new();
         let runs = RunStore::new();
@@ -169,6 +188,10 @@ impl Fixture {
                 agents.clone(),
                 history.clone(),
                 runs.clone(),
+                TeamStore::default(),
+                InMemoryAgentTeamHistoryStore::new(),
+                ConversationStore::default(),
+                rakka_agent::InMemoryAgentConversationHistoryStore::new(),
                 router.clone(),
                 Arc::new(catalog),
                 Arc::new(InMemoryA2ATaskProjectionStore::local()),
@@ -178,6 +201,14 @@ impl Fixture {
             .with_clock(Arc::new(TestClock(clock.clone())))
             .with_default_tenant(TENANT),
         );
+        let service = match segments {
+            Some(sink) => Arc::new(
+                Arc::try_unwrap(service)
+                    .unwrap_or_else(|_| unreachable!("the service is not yet shared"))
+                    .with_segments(sink),
+            ),
+            None => service,
+        };
 
         Self {
             tasks,
@@ -480,14 +511,14 @@ async fn duplicate_sends_create_one_task_one_run_one_turn() {
     // to it monotonically.
     let task = fixture
         .service
-        .get_task(&params(), Some(TENANT), &task_id, None)
+        .get_task(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("the task should read");
     assert_eq!(task.status.state, TaskState::Completed);
 
     let events = fixture
         .service
-        .replay_task_events(&params(), Some(TENANT), &task_id, None)
+        .replay_task_events(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("events should replay");
     assert!(!events.is_empty());
@@ -811,7 +842,7 @@ async fn cancellation_projects_the_authoritative_condition() {
 
     let final_view = fixture
         .service
-        .get_task(&params(), Some(TENANT), &task_id, None)
+        .get_task(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("the task should read");
     let mut task = fixture.task(&task_id);
@@ -826,6 +857,57 @@ async fn cancellation_projects_the_authoritative_condition() {
     } else {
         assert!(!final_view.status.state.is_terminal());
     }
+}
+
+/// A metadata refresh keeps the projection's stored identity. `tasks/get`
+/// and `tasks/cancel` normalize with a `context_id` *derived from the task
+/// id* — they carry no context of their own — so a refresh their sync path
+/// triggers must re-snapshot under the context the task was created with,
+/// never the caller's derived default.
+#[tokio::test]
+async fn a_metadata_refresh_preserves_the_created_context() {
+    let fixture = Fixture::new(ScriptedDispatcher::new());
+    fixture.instantiate_agent().await;
+
+    let mut message = task_message("msg-context");
+    message.context_id = Some("conv-42".to_string());
+    let created = fixture
+        .service
+        .send_message(&params(), &send_request(&message))
+        .await
+        .expect("the send should be accepted");
+    assert_eq!(created.context_id, "conv-42");
+    let task_id = created.id.clone();
+
+    // The cancellation changes the authoritative condition, so its sync pass
+    // refreshes the projection's metadata — normalized under the task-id
+    // context default.
+    let cancelled = fixture
+        .service
+        .cancel_task(
+            &params(),
+            &a2a::CancelTaskRequest {
+                id: task_id.clone(),
+                metadata: None,
+                tenant: Some(TENANT.to_string()),
+            },
+        )
+        .await
+        .expect("the cancel should be accepted");
+    assert_eq!(
+        cancelled.context_id, "conv-42",
+        "the refresh keeps the created context"
+    );
+
+    // The read path derives the same default; the projection still answers
+    // the created context, and the refreshed condition metadata rode the
+    // refresh rather than being lost with it.
+    let read = fixture
+        .service
+        .get_task(&params(), Some(TENANT), &task_id, None, None)
+        .await
+        .expect("the task should read");
+    assert_eq!(read.context_id, "conv-42");
 }
 
 /// Scenario 1 under the owner-kill sweep: kill the run's owner, then the
@@ -951,4 +1033,117 @@ async fn duplicate_sends_survive_any_owner_loss_with_one_task_one_run_one_turn()
 
     sweep("run", run_writes).await;
     sweep("task", task_writes).await;
+}
+
+/// The ingress `SERVER` span is closed on the path applications actually wire.
+///
+/// The segment was added to `send_message` only. But `send` is the routing
+/// entry point — routing `message/send` through it is mandatory, since
+/// `send_message` would misclassify a team or conversation envelope, and this
+/// repo's own coordination example calls it at six sites — and it dispatched
+/// straight to the normalized halves, closing nothing. So the span the slice
+/// exists to add was absent from the primary path, `AgentOtelSpanKind::Server`
+/// was constructed on no real request, and every run and dispatch span had no
+/// request span to root it.
+#[tokio::test]
+async fn every_ingress_entry_point_closes_its_server_segment() {
+    const TRACE_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fixture = Fixture::with_segments(
+        ScriptedDispatcher::new().with_turn(valid_turn("resolved")),
+        Some(segments.clone()),
+    );
+    fixture.instantiate_agent().await;
+
+    // A send carrying the caller's context in its message metadata.
+    let mut message = task_message("msg-trace-1");
+    message.metadata = Some(
+        [("traceparent".to_string(), json!(TRACE_PARENT))]
+            .into_iter()
+            .collect(),
+    );
+    let task = fixture
+        .service
+        .send(&params(), &send_request(&message))
+        .await
+        .expect("the routed send is accepted");
+    let task_id = match task {
+        a2a::SendMessageResponse::Task(task) => task.id,
+        a2a::SendMessageResponse::Message(_) => panic!("a typed task send answers with a task"),
+    };
+
+    let ingress: Vec<_> = segments
+        .segments()
+        .into_iter()
+        .filter(|segment| {
+            matches!(
+                segment.operation,
+                rakka_agent::AgentSegmentOperation::A2aIngress { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        ingress.len(),
+        1,
+        "the routing entry point closes exactly one ingress segment"
+    );
+    assert_eq!(
+        ingress[0].telemetry.trace_parent.as_deref(),
+        Some(TRACE_PARENT),
+        "and it belongs to the caller's trace"
+    );
+
+    // A read carries no message metadata at all, so its context comes from the
+    // W3C header map — which is where it travels for a method with no payload.
+    let mut headers = params();
+    headers.insert("traceparent".to_string(), vec![TRACE_PARENT.to_string()]);
+    fixture
+        .service
+        .get_task(&headers, None, &task_id, None, None)
+        .await
+        .expect("the read answers");
+
+    let reads: Vec<_> = segments
+        .segments()
+        .into_iter()
+        .filter(|segment| {
+            matches!(
+                &segment.operation,
+                rakka_agent::AgentSegmentOperation::A2aIngress { operation }
+                    if operation == "get-task"
+            )
+        })
+        .collect();
+    assert_eq!(reads.len(), 1, "a read closes its ingress segment too");
+    assert_eq!(
+        reads[0].telemetry.trace_parent.as_deref(),
+        Some(TRACE_PARENT),
+        "from the header carrier"
+    );
+
+    // A request refused before normalization still carried a context, and the
+    // span of a rejected call is the one an operator is looking for.
+    let refused = fixture
+        .service
+        .send(&headers, &send_request(&task_message("")))
+        .await;
+    assert!(refused.is_err(), "a blank message id is refused");
+    let rejected: Vec<_> = segments
+        .segments()
+        .into_iter()
+        .filter(|segment| {
+            matches!(
+                &segment.operation,
+                rakka_agent::AgentSegmentOperation::A2aIngress { operation }
+                    if operation == "send-message"
+            ) && segment.outcome == rakka_agent::AgentSegmentOutcome::Error
+        })
+        .collect();
+    assert_eq!(rejected.len(), 1, "the refusal closes a failed segment");
+    assert_eq!(
+        rejected[0].telemetry.trace_parent.as_deref(),
+        Some(TRACE_PARENT),
+        "answering the empty context here mapped every refusal to no span"
+    );
 }

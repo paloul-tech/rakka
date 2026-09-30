@@ -227,6 +227,32 @@ fn autonomy_classification_agrees_with_dispatch_classification() {
             ),
             AgentAutonomyTargetClass::Other,
         ),
+        // The agent domain's outbound A2A send (slice 4.3) rides the
+        // executor-routed tool family with target type `a2a-peer`.
+        (
+            effect(
+                "agent-a2a-send",
+                AgentEffectKind::ToolCall,
+                "a2a-peer",
+                "billing-agent",
+                [],
+                None,
+            ),
+            AgentAutonomyTargetClass::A2aPeer,
+        ),
+        // An agent-domain workflow-as-tool start (slice 4.5) rides the same
+        // tool family with target type `workflow-tool`.
+        (
+            effect(
+                "agent-workflow-start",
+                AgentEffectKind::ToolCall,
+                "workflow-tool",
+                "refund-flow",
+                [],
+                None,
+            ),
+            AgentAutonomyTargetClass::ChildWorkflow,
+        ),
     ];
 
     for (effect, expected) in cases {
@@ -240,6 +266,135 @@ fn autonomy_classification_agrees_with_dispatch_classification() {
             effect.effect_id
         );
     }
+}
+
+#[test]
+fn a_child_workflow_start_is_a_first_class_autonomy_target() {
+    // The classifier gap closed by agent-domain workflows-as-tools: a
+    // `ChildWorkflowCommand` no longer collapses into the fail-closed
+    // `Other`, and the default catalog admits it under the outbox
+    // deduplication key — the derived invocation identity the child run's
+    // own inbox deduplicates on.
+    let start = effect(
+        "child-workflow-start",
+        AgentEffectKind::ChildWorkflowCommand,
+        "child-workflow",
+        "refund-flow",
+        [],
+        Some(artifact("workflow-input")),
+    );
+    assert_eq!(
+        AgentAutonomyTargetClass::for_effect(&start),
+        AgentAutonomyTargetClass::ChildWorkflow
+    );
+    assert_eq!(
+        AgentAutonomyTargetClass::from_dispatch_class(AgentDispatchTargetClass::ChildWorkflow),
+        AgentAutonomyTargetClass::ChildWorkflow
+    );
+    assert_eq!(
+        AgentAutonomyTargetClass::from_label("child-workflow"),
+        Some(AgentAutonomyTargetClass::ChildWorkflow),
+        "the label parses, closing the asymmetry with the dispatcher and the query index"
+    );
+
+    let catalog = AgentEffectTargetCatalog::phase5_default();
+    let policy = AgentAutonomyPolicy::phase5_default("phase5.v1");
+    let allowed = catalog
+        .validate_effect(
+            &policy,
+            &AgentAutonomyUsage::new(),
+            &start,
+            None,
+            AgentTimestampMillis::new(100),
+        )
+        .expect("policy decision");
+    assert!(allowed.is_allowed(), "{allowed:?}");
+
+    // The remaining `Other` lump still fails closed: the widening was the
+    // one class, not the posture.
+    let other = effect(
+        "notify-ops",
+        AgentEffectKind::Notification,
+        "notification",
+        "ops-alert",
+        [],
+        None,
+    );
+    let denied = catalog
+        .validate_effect(
+            &policy,
+            &AgentAutonomyUsage::new(),
+            &other,
+            None,
+            AgentTimestampMillis::new(100),
+        )
+        .expect("policy decision");
+    assert_eq!(denied.reason_code, "unsupported-target-class");
+}
+
+#[test]
+fn agent_domain_tool_family_rides_are_admitted_and_governed_by_their_class() {
+    // The agent domain routes A2A sends and workflow-tool starts through the
+    // executor-routed tool family (`ToolCall` with a discriminating target
+    // type) and carries inline payloads, so the default catalog must admit
+    // that shape under the class the dispatcher routes it to — and denying
+    // the class must actually stop it.
+    let catalog = AgentEffectTargetCatalog::phase5_default();
+    let policy = AgentAutonomyPolicy::phase5_default("phase5.v1");
+    let usage = AgentAutonomyUsage::new();
+    let now = AgentTimestampMillis::new(100);
+
+    let a2a_send = effect(
+        "agent-a2a-send",
+        AgentEffectKind::ToolCall,
+        "a2a-peer",
+        "billing-agent",
+        [],
+        None,
+    );
+    let allowed = catalog
+        .validate_effect(&policy, &usage, &a2a_send, None, now)
+        .expect("policy decision");
+    assert!(allowed.is_allowed(), "{allowed:?}");
+
+    let workflow_start = effect(
+        "agent-workflow-start",
+        AgentEffectKind::ToolCall,
+        "workflow-tool",
+        "refund-flow",
+        [],
+        None,
+    );
+    let allowed = catalog
+        .validate_effect(&policy, &usage, &workflow_start, None, now)
+        .expect("policy decision");
+    assert!(allowed.is_allowed(), "{allowed:?}");
+
+    // A policy that denies ChildWorkflow blocks the workflow-tool start
+    // without touching ordinary tool calls.
+    let no_child_workflows = AgentAutonomyPolicy::fail_closed("phase5.v2")
+        .allow_target_class(AgentAutonomyTargetClass::Model)
+        .allow_target_class(AgentAutonomyTargetClass::Tool);
+    let denied = catalog
+        .validate_effect(&no_child_workflows, &usage, &workflow_start, None, now)
+        .expect("policy decision");
+    assert_eq!(denied.reason_code, "target-class-disallowed");
+    assert_eq!(
+        denied.target_class,
+        Some(AgentAutonomyTargetClass::ChildWorkflow)
+    );
+    let plain_tool = effect(
+        "plain-tool",
+        AgentEffectKind::ToolCall,
+        "tool",
+        "search",
+        [],
+        Some(artifact("tool-input")),
+    );
+    let allowed = catalog
+        .validate_effect(&no_child_workflows, &usage, &plain_tool, None, now)
+        .expect("policy decision");
+    assert!(allowed.is_allowed(), "{allowed:?}");
 }
 
 #[test]

@@ -7,10 +7,11 @@
 //! crates such as `rakka-core`, `rakka-sharding`, and `rakka-persistence` remain
 //! available for advanced users, tests, and implementation-specific wiring.
 //!
-//! Phase 0 of the Akka parity plan keeps the prelude intentionally curated. It
-//! exposes the common primitives needed by application code today while later
-//! phases add higher-level actor, cluster, sharding, persistence, and stream
-//! facades.
+//! The prelude is intentionally curated: it exposes the common actor,
+//! persistence, cluster, sharding, and stream primitives application code
+//! needs. The durable agent domain and the A2A adapter are reached through the
+//! feature-gated `agent`, `agent_workflow`, and `a2a` modules rather than the
+//! prelude; `docs/rakka-agents.md` describes that surface.
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -181,12 +182,23 @@ pub mod agent_workflow {
     pub use rakka_agent_workflow::*;
 }
 
+#[cfg(feature = "agent-mcp")]
+/// MCP client adapter: remote MCP servers as durable agent tools.
+///
+/// Enable with the `agent-mcp` facade feature, which brings `agent`.
+pub mod agent_mcp {
+    pub use rakka_agent_mcp::*;
+}
+
 #[cfg(feature = "a2a")]
 /// A2A protocol adapter for durable agent workflow runs.
 ///
 /// Enable with the `a2a` facade feature (plus `a2a-server`, `a2a-sharding`,
 /// `a2a-postgres`, `a2a-http`, `a2a-k8s`, `a2a-otel`, or `a2a-testkit` for the
-/// corresponding adapter surfaces).
+/// corresponding adapter surfaces). Under `a2a-server` or `a2a-agents` this
+/// also re-exports the SDK's `ServiceParams`, the one constructor input a
+/// request-observer callback needs, so an application names it here rather
+/// than through the SDK crate.
 pub mod a2a {
     pub use rakka_a2a::*;
 }

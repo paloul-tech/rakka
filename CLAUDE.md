@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Rakka is a Rust actor framework (Akka-inspired) shipped as a Cargo workspace. It provides typed local actors, durable state / event sourcing, cluster membership, Protobuf remoting, sharding, supervised child-process actors, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC edge adapters, and Kubernetes operation. The repository is a v1 release-candidate foundation plus active work on `rakka-agent-workflow` (a durable execution kernel for compiled agent workflows).
 
-MSRV is Rust 1.85 (`rust-toolchain.toml` pins stable + clippy + rustfmt). gRPC crates/examples require `protoc` (`protobuf-compiler`) on the build host.
+MSRV is Rust 1.88 (`rust-toolchain.toml` pins stable + clippy + rustfmt). gRPC crates/examples require `protoc` (`protobuf-compiler`) on the build host.
 
 ## Essential Commands
 
@@ -39,6 +39,8 @@ Examples are runnable and self-contained (most need no external services); each 
 ```sh
 cargo run -p rakka-example-minimal-system
 cargo run -p rakka-example-multi-node-sharding -- --networked-loopback
+cargo run -p rakka-example-multi-pod-agent-fault-soak      # multi-pod agent fault sweep, ~2 min
+cargo run -p rakka-example-agent-otlp-export-acceptance    # a real OTel SDK exporting one real run over OTLP
 ```
 
 ### Gated / optional tests
@@ -48,9 +50,20 @@ These are skipped by default and require env vars and/or external services:
 ```sh
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-postgres
-RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
+# The memory conformance suite's retriever clauses need the `vector` extension; without
+# it they announce the clauses they skipped. Set this to make that a failure instead:
+RAKKA_POSTGRES_TEST_DSN=... RAKKA_POSTGRES_PGVECTOR_REQUIRED=1 cargo test -p rakka-agent-postgres
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-knowledge-graph-postgres
+RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture   # both multi-process gates
 RAKKA_K8S_SCENARIO_DRY_RUN=1 examples/kubernetes/local-cluster-scenario.sh         # preview, no cluster touched
 RAKKA_K8S_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s optional_kubectl_manifest_validation_is_gated -- --nocapture
+# Agent Collector topology: kubectl objects, and the configs against the pinned
+# distribution (needs a container runtime). The second found two real defects.
+RAKKA_AGENT_OTEL_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s --test agent_otel_collector_topology -- --nocapture
+RAKKA_AGENT_OTEL_VALIDATE_COLLECTOR_CONFIG=1 cargo test -p rakka-k8s --test agent_otel_collector_topology -- --nocapture
+# Export to a live Collector rather than the in-process OTLP receiver.
+RAKKA_AGENT_OTEL_COLLECTOR_ENDPOINT=http://127.0.0.1:4317 cargo test -p rakka-example-agent-otlp-export-acceptance --test exporter_failure -- --nocapture
+RAKKA_MODEL_PROFILE=live RAKKA_MODEL_PROVIDER=anthropic RAKKA_MODEL_NAME=claude-sonnet-5 RAKKA_MODEL_API_KEY=... cargo test -p rakka-example-durable-agent-acceptance --test provider_walk -- --nocapture   # live model provider walk
 ```
 
 ## Architecture
@@ -71,6 +84,12 @@ rakka-core                      foundation: Actor/ActorRef/ActorContext, ActorSy
   ├─ rakka-k8s                  health, drain, DNS discovery, manifest helpers
   ├─ rakka-*-postgres           PostgreSQL adapters for persistence / sharding
   └─ rakka-agent-workflow       durable agent/compiled-workflow execution kernel (see below)
+       └─ rakka-agent           durable agent domain: entities, loop, model adapter, effects,
+                                budgets, checkpoints, memory (rakka-agent-postgres = PostgreSQL/
+                                pgvector adapters; rakka-agent-knowledge-graph = communal claims,
+                                trust transitions, promotion gate, portable graph SPI + conformance;
+                                rakka-agent-knowledge-graph-postgres = the graph's relational backend;
+                                rakka-agent-mcp = the MCP client adapter (optional; `agent-mcp`))
 
 rakka                          top-level facade crate + curated `rakka::prelude`; re-exports
                                component crates behind cargo features (default = all)

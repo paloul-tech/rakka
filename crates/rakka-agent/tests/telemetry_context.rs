@@ -9,20 +9,24 @@
 //! scenario 23). The write side is strict where the read side is permissive:
 //! malformed context is dropped at the boundary, never persisted.
 
+use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    AgentCheckpoint, AgentCheckpointKind, AgentEffectSpec, AgentEntityAddress,
-    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentId, AgentLoopState,
-    AgentOperationId, AgentOperationKind, AgentRecordKind, AgentRevisionNumber, AgentRunEffect,
-    AgentRunEffectRequest, AgentRunId, AgentRunScope, AgentSchemaPolicy, AgentTaskId,
-    AgentTaskScope, AgentToolCallId, AgentToolCallRequest, AgentToolId, TenantId,
-    ATTR_AGENT_TELEMETRY_LINK_KIND, LINK_KIND_SUPERSEDED_GENERATION,
+    AgentCheckpoint, AgentCheckpointKind, AgentContextSnapshotRef, AgentEffectSpec,
+    AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentId,
+    AgentLoopState, AgentModelRequest, AgentOperationId, AgentOperationKind, AgentRecordKind,
+    AgentRevisionNumber, AgentRunEffect, AgentRunEffectRequest, AgentRunId, AgentRunScope,
+    AgentRunStatus, AgentSchemaPolicy, AgentTaskId, AgentTaskScope, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, TenantId, ATTR_AGENT_TELEMETRY_LINK_KIND,
+    LINK_KIND_SUPERSEDED_GENERATION,
 };
 use rakka_agent_workflow::{
-    AgentCorrelationId, AgentTelemetryContext, AgentTimestampMillis, HumanCheckpointId,
-    PrincipalRef, StateSchemaVersion,
+    AgentAttributes, AgentCorrelationId, AgentSpanLink, AgentTelemetryContext,
+    AgentTimestampMillis, HumanCheckpointId, PrincipalRef, StateSchemaVersion,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+
+mod common;
 
 const TENANT: &str = "acme";
 const TRACE_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
@@ -230,8 +234,21 @@ fn the_dispatch_ticket_forwards_the_scheduling_segments_context() {
     );
 }
 
+/// A reconciled re-dispatch stays in the run's trace, as a sibling of the
+/// attempt it supersedes.
+///
+/// It used to start from `default()` — no `traceparent` at all — to express
+/// that the re-invocation is caused by the reconciliation decision rather than
+/// by the segment that scheduled the attempt an operator proved never ran.
+/// That expressed it by *leaving the trace*, and once a context's span id
+/// became a span's parent rather than its identity, a context with no
+/// `traceparent` belongs to nothing: every span of the re-invocation was
+/// refused by the mapper and counted `unmappable`, silently, for exactly the
+/// re-invocation an incident is about. Keeping the propagated parent says the
+/// same thing correctly — sibling, not child — and the link says which attempt
+/// it supersedes.
 #[test]
-fn a_new_generation_links_the_superseded_one_and_starts_parentless() {
+fn a_new_generation_stays_in_the_trace_and_links_the_superseded_one() {
     let mut effect = tool_effect();
     effect.telemetry = stamped_context();
 
@@ -239,9 +256,15 @@ fn a_new_generation_links_the_superseded_one_and_starts_parentless() {
         .begin_next_generation(&scope(), AgentTimestampMillis::new(2))
         .expect("the next generation begins");
 
-    assert!(
-        effect.telemetry.trace_parent.is_none(),
-        "a reconciled re-dispatch is caused by the decision, not the superseded segment"
+    assert_eq!(
+        effect.telemetry.trace_parent.as_deref(),
+        Some(TRACE_PARENT),
+        "a re-dispatch that leaves the trace exports no spans at all"
+    );
+    assert_eq!(
+        effect.telemetry.trace_state.as_deref(),
+        Some("vendor=value"),
+        "and it stays under the same vendor state"
     );
     assert_eq!(effect.telemetry.span_links.len(), 1);
     let link = &effect.telemetry.span_links[0];
@@ -281,4 +304,230 @@ fn the_write_gate_is_strict_where_the_read_is_permissive() {
 
     let checkpoint = checkpoint().with_telemetry(malformed);
     assert_eq!(checkpoint.telemetry, AgentTelemetryContext::default());
+}
+
+/// The durable write gate bounds a link's *attributes*, not only its ids.
+///
+/// The gate is strict on write so the read side never has to fail closed over
+/// telemetry — but it inspected only trace and span ids, so a link carrying an
+/// over-long or multi-line attribute was persisted, and then every span closed
+/// under that context copied it onto an export record that
+/// `AgentOtelSpanExport::validate` refuses. A durable write poisoning a
+/// telemetry read, for the life of the run, which is the inversion 17.1
+/// forbids.
+#[test]
+fn the_write_gate_bounds_a_span_links_attributes_too() {
+    let context = rakka_agent::sanitize_agent_telemetry_context(AgentTelemetryContext {
+        trace_parent: Some(TRACE_PARENT.to_string()),
+        span_links: vec![AgentSpanLink {
+            trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+            span_id: "c7ad6b7169203332".to_string(),
+            trace_state: None,
+            attributes: AgentAttributes::from([
+                ("link_kind".to_string(), "superseded-generation".to_string()),
+                ("multiline".to_string(), "two\nlines".to_string()),
+                (
+                    "oversized".to_string(),
+                    "x".repeat(rakka_agent_workflow::AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES + 1),
+                ),
+            ]),
+        }],
+        ..AgentTelemetryContext::default()
+    });
+
+    let link = &context.span_links[0];
+    assert_eq!(
+        link.attributes.get("link_kind").map(String::as_str),
+        Some("superseded-generation"),
+        "the causality the link carries survives"
+    );
+    assert!(
+        !link.attributes.contains_key("multiline") && !link.attributes.contains_key("oversized"),
+        "what an export could not carry is dropped at the write: {:?}",
+        link.attributes
+    );
+
+    rakka_agent_workflow::AgentOtelSpanExport::from_telemetry_context(
+        "rakka.agent.effect.dispatch",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &context,
+    )
+    .expect("the span builds")
+    .validate()
+    .expect("a persisted link must never make a record unexportable");
+}
+
+/// A durable span identity is a pure function of the context a record already
+/// holds and the record's own durable material, so two components holding the
+/// same record — the run entity that parks and the dispatcher that attempts,
+/// on different nodes — derive the same id without communicating. That is
+/// what lets one of them *link* to a span the other closed: a link needs a
+/// name, and every exported span id used to be minted at export time, where
+/// nobody else could know it.
+#[test]
+fn a_durable_span_identity_is_a_function_of_its_context_and_material() {
+    use rakka_agent::agent_durable_span_identity;
+
+    let parked = agent_durable_span_identity(&stamped_context(), &["checkpoint-open", "ck-1"])
+        .expect("a stamped context derives an identity");
+    assert_eq!(parked.trace_id, "0af7651916cd43dd8448eb211c80319c");
+    assert_ne!(
+        parked.span_id, "b7ad6b7169203331",
+        "the identity is a child of the context, never the context's own span"
+    );
+    assert_eq!(parked.trace_state.as_deref(), Some("vendor=value"));
+
+    let again = agent_durable_span_identity(&stamped_context(), &["checkpoint-open", "ck-1"])
+        .expect("derives again");
+    assert_eq!(
+        parked, again,
+        "the same record derives the same id anywhere"
+    );
+
+    let other = agent_durable_span_identity(&stamped_context(), &["checkpoint-open", "ck-2"])
+        .expect("derives");
+    assert_ne!(
+        parked.span_id, other.span_id,
+        "material tells siblings apart"
+    );
+
+    let resolve = agent_durable_span_identity(&stamped_context(), &["checkpoint-resolve", "ck-1"])
+        .expect("derives");
+    assert_ne!(parked.span_id, resolve.span_id);
+
+    assert!(
+        agent_durable_span_identity(&AgentTelemetryContext::default(), &["checkpoint-open"])
+            .is_none(),
+        "a record without a trace has no identity to derive, and no error either"
+    );
+}
+
+/// Every link kind this crate can write is catalogued, and every catalogued
+/// kind is written somewhere other than its own definition — the same
+/// bijection the error types get, and for the same reason: a link kind is the
+/// only attribute a span link carries, an operator walks a trace by it, and a
+/// kind that is declared and never written is the defect class slice 6.3a
+/// found three times.
+#[test]
+fn every_link_kind_is_catalogued_and_written() {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut defined: BTreeMap<String, String> = BTreeMap::new();
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(&src).expect("src is readable") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("source is readable");
+        for line in source.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("pub const LINK_KIND_") else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(": &str = \"") else {
+                continue;
+            };
+            let value = value.trim_end_matches("\";");
+            defined.insert(format!("LINK_KIND_{name}"), value.to_string());
+        }
+        sources.push((path, source));
+    }
+    assert!(
+        !defined.is_empty(),
+        "the scan found no link kinds, so it proves nothing"
+    );
+
+    let catalogued: std::collections::BTreeSet<&str> = rakka_agent::AGENT_TELEMETRY_LINK_KINDS
+        .iter()
+        .copied()
+        .collect();
+    for (name, value) in &defined {
+        assert!(
+            catalogued.contains(value.as_str()),
+            "`{name}` = `{value}` is defined but not in AGENT_TELEMETRY_LINK_KINDS"
+        );
+        let written = sources.iter().any(|(path, source)| {
+            path.file_name().and_then(|file| file.to_str()) != Some("lib.rs")
+                && source
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("pub const "))
+                    .filter(|line| !line.trim_start().starts_with("///"))
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    // The catalogue's own rows are not writes.
+                    .filter(|line| !line.trim().trim_end_matches(',').ends_with(name.as_str()))
+                    .any(|line| line.contains(name.as_str()))
+        });
+        assert!(
+            written,
+            "`{name}` is catalogued but this crate writes it nowhere"
+        );
+    }
+    for value in &catalogued {
+        assert!(
+            defined.values().any(|defined| defined == value),
+            "`{value}` is catalogued but no LINK_KIND_ constant defines it"
+        );
+    }
+}
+
+/// A model request encoded before it carried the run's trace context decodes
+/// to the empty context, inside the request's unchanged shape; one that
+/// carries it round-trips.
+#[test]
+fn a_pre_field_model_request_decodes_to_the_empty_context() {
+    let context = AgentContextSnapshotRef::for_turn(&scope(), 1).expect("the reference derives");
+    let plain = AgentModelRequest::new(context.clone(), 1);
+    assert_eq!(plain.telemetry, AgentTelemetryContext::default());
+
+    let stamped = AgentModelRequest::new(context, 1).with_telemetry(stamped_context());
+    let decoded = decode_pre_retrofit(&stamped);
+    assert_eq!(decoded, plain, "absent context reads as none recorded");
+    let round_tripped: AgentModelRequest =
+        serde_json::from_value(serde_json::to_value(&stamped).expect("serializes"))
+            .expect("decodes");
+    assert_eq!(round_tripped, stamped);
+}
+
+/// The bounded request the adapter receives carries the run's own trace
+/// context — the context the model effect was committed under, which is the
+/// run's — so an adapter can parent its provider span on the run's trace.
+/// Observability only: the scripted turn is produced exactly as before.
+#[tokio::test]
+async fn the_model_request_carries_the_runs_trace_context() {
+    let adapter = DeterministicModelAdapter::new().with_turn(common::proposing_turn());
+    let fx = common::Fixture::new(ScriptedDispatcher::with_adapter(adapter.clone()));
+    fx.instantiate_agent().await;
+    fx.create_task_traced(stamped_context()).await;
+    fx.pump().await.expect("the loop runs to completion");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+
+    let state = rakka_agent::load_agent_run_state(
+        &fx.runs,
+        &common::run_scope(),
+        &AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    let run_context = state
+        .loop_state()
+        .expect("the loop is started")
+        .telemetry()
+        .clone();
+    assert_eq!(
+        run_context.trace_parent.as_deref(),
+        Some(TRACE_PARENT),
+        "the run holds the ingress trace context"
+    );
+
+    let requests = adapter.requests();
+    assert_eq!(requests.len(), 1, "one model call");
+    assert_eq!(
+        requests[0].telemetry, run_context,
+        "the request's context is the run's"
+    );
 }

@@ -13,11 +13,16 @@
 //!
 //! # Where the chain is evaluated today
 //!
-//! Slice 1.8 evaluates the chain at exactly two boundaries: the dispatch
-//! authority runs [`AgentGuardrailBoundary::ToolRequest`] and
+//! The dispatch authority runs [`AgentGuardrailBoundary::ToolRequest`] and
 //! [`AgentGuardrailBoundary::ModelRequest`] before every attempt's durable
-//! `Started`. The remaining boundaries — model/tool response, A2A
-//! ingress/egress, memory ingress — are declared here so chains can be
+//! `Started` (slice 1.8) and [`AgentGuardrailBoundary::ToolResponse`] on every
+//! executed tool's result before it is delivered to the run
+//! ([`crate::tools::AgentToolAuthority::review_tool_response`]), and the
+//! snapshot-assembly retrieval path runs
+//! [`AgentGuardrailBoundary::MemoryIngress`] on every retrieved private memory
+//! before it enters a model context (slice 2.2,
+//! [`crate::retrieval::assemble_context`]). The remaining boundaries — model
+//! response, A2A ingress/egress — are declared here so chains can be
 //! configured for them, but their evaluation points arrive with the slices
 //! that own those flows.
 //!
@@ -66,7 +71,13 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::definition::{AgentGuardrailStageId, AgentPolicyRef, AgentRevisionNumber, AgentToolId};
-use crate::identity::AgentRunScope;
+use crate::identity::{
+    AgentConversationScope, AgentId, AgentRunScope, AgentTaskScope, AgentTeamScope,
+};
+use crate::task::AgentContentDigest;
+use crate::TenantId;
+
+pub mod builtin;
 
 /// Most stages one guardrail chain may hold.
 pub const AGENT_GUARDRAIL_MAX_STAGES: usize = 32;
@@ -77,6 +88,11 @@ pub const AGENT_GUARDRAIL_MAX_STAGES: usize = 32;
 /// evaluation: the chain is a pure function and has no error channel that
 /// would not itself become a policy decision.
 pub const AGENT_GUARDRAIL_REASON_MAX_LENGTH: usize = 128;
+
+/// The reason code the chain itself blocks under when a stage's transform
+/// grew the content past the boundary's bound. The one reason code a chain
+/// authors rather than a stage.
+pub const AGENT_GUARDRAIL_REASON_TRANSFORM_OVERSIZED: &str = "guardrail-transform-oversized";
 
 /// Largest content a guardrail transform may produce, in bytes, at a boundary
 /// that declares no tighter bound of its own.
@@ -89,7 +105,16 @@ pub const AGENT_GUARDRAIL_REASON_MAX_LENGTH: usize = 128;
 /// call larger than that could never be executed anyway. A transform that
 /// exceeds the effective bound is treated as a block with the stable reason
 /// code `guardrail-transform-oversized` — fail closed, deterministically.
-pub const AGENT_GUARDRAIL_CONTENT_MAX_BYTES: usize = 8 * 1024;
+///
+/// Equal to [`crate::model::AGENT_MODEL_TURN_MAX_BYTES`], so a whole model
+/// turn is evaluated at the `ModelResponse` boundary and may be transformed
+/// without truncation; the assertion below holds the two constants together.
+pub const AGENT_GUARDRAIL_CONTENT_MAX_BYTES: usize = 16 * 1024;
+
+const _: () = assert!(
+    AGENT_GUARDRAIL_CONTENT_MAX_BYTES == crate::model::AGENT_MODEL_TURN_MAX_BYTES,
+    "the guardrail content bound must equal the model turn bound"
+);
 
 /// Result type for guardrail chain construction.
 pub type AgentGuardrailResult<T> = Result<T, AgentGuardrailError>;
@@ -140,6 +165,66 @@ impl Display for AgentGuardrailBoundary {
     }
 }
 
+/// The identity of whatever is crossing a guardrail boundary.
+///
+/// Every boundary the dispatcher and the retrieval path evaluate is crossed
+/// by a run. An A2A ingress is crossed by a message addressed to a task, a
+/// team board, or a moderated conversation before any run of it exists, so
+/// the subject names what the message addresses rather than inventing a run.
+/// A stage keys policy off the tenant and, where one is addressed, the agent;
+/// the run is available exactly when there is one.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum AgentGuardrailSubject<'a> {
+    /// A run: the model-request, model-response, tool-request,
+    /// tool-response, memory-ingress, and A2A-egress boundaries.
+    Run(&'a AgentRunScope),
+    /// A task an inbound A2A message creates or continues; `agent` is the
+    /// addressed agent once the surface has resolved one.
+    Task {
+        /// The task the message addresses.
+        scope: &'a AgentTaskScope,
+        /// The agent the message addresses, when resolved.
+        agent: Option<&'a AgentId>,
+    },
+    /// A team board an inbound A2A command addresses.
+    Team(&'a AgentTeamScope),
+    /// A moderated conversation an inbound A2A command addresses.
+    Conversation(&'a AgentConversationScope),
+}
+
+impl<'a> AgentGuardrailSubject<'a> {
+    /// The tenant every subject belongs to.
+    #[must_use]
+    pub const fn tenant(&self) -> &'a TenantId {
+        match self {
+            Self::Run(scope) => scope.tenant(),
+            Self::Task { scope, .. } => scope.tenant(),
+            Self::Team(scope) => scope.tenant(),
+            Self::Conversation(scope) => scope.tenant(),
+        }
+    }
+
+    /// The agent the subject names, when it names one.
+    #[must_use]
+    pub const fn agent(&self) -> Option<&'a AgentId> {
+        match self {
+            Self::Run(scope) => Some(scope.agent()),
+            Self::Task { agent, .. } => *agent,
+            Self::Team(_) | Self::Conversation(_) => None,
+        }
+    }
+
+    /// The run scope, when the subject is a run.
+    #[must_use]
+    pub const fn run(&self) -> Option<&'a AgentRunScope> {
+        match self {
+            Self::Run(scope) => Some(scope),
+            Self::Task { .. } | Self::Team(_) | Self::Conversation(_) => None,
+        }
+    }
+}
+
 /// What one guardrail evaluation is about: the boundary being crossed, and the
 /// identity of whatever is crossing it.
 ///
@@ -161,28 +246,57 @@ impl Display for AgentGuardrailBoundary {
 pub struct AgentGuardrailContext<'a> {
     /// The boundary being evaluated.
     pub boundary: AgentGuardrailBoundary,
-    /// The run whose boundary is being crossed.
-    pub scope: &'a AgentRunScope,
+    /// Who or what is crossing it.
+    pub subject: AgentGuardrailSubject<'a>,
     /// The tool the call names, at the tool boundaries. `None` at boundaries
     /// that name no tool.
     pub tool: Option<&'a AgentToolId>,
+    /// The private memory being retrieved, at
+    /// [`AgentGuardrailBoundary::MemoryIngress`]. `None` at boundaries that
+    /// name no memory.
+    pub memory: Option<&'a crate::memory::AgentPrivateMemoryId>,
 }
 
 impl<'a> AgentGuardrailContext<'a> {
-    /// The context of one evaluation at the given boundary, naming no tool.
+    /// The context of one evaluation at the given boundary, for a run
+    /// crossing it, naming no tool or memory.
     #[must_use]
     pub const fn new(boundary: AgentGuardrailBoundary, scope: &'a AgentRunScope) -> Self {
+        Self::for_subject(boundary, AgentGuardrailSubject::Run(scope))
+    }
+
+    /// The context of one evaluation at the given boundary, for any subject
+    /// crossing it, naming no tool or memory.
+    #[must_use]
+    pub const fn for_subject(
+        boundary: AgentGuardrailBoundary,
+        subject: AgentGuardrailSubject<'a>,
+    ) -> Self {
         Self {
             boundary,
-            scope,
+            subject,
             tool: None,
+            memory: None,
         }
+    }
+
+    /// The run crossing the boundary, when the subject is a run.
+    #[must_use]
+    pub const fn scope(&self) -> Option<&'a AgentRunScope> {
+        self.subject.run()
     }
 
     /// Names the tool whose call is being evaluated.
     #[must_use]
     pub const fn with_tool(mut self, tool: &'a AgentToolId) -> Self {
         self.tool = Some(tool);
+        self
+    }
+
+    /// Names the private memory whose retrieval is being evaluated.
+    #[must_use]
+    pub const fn with_memory(mut self, memory: &'a crate::memory::AgentPrivateMemoryId) -> Self {
+        self.memory = Some(memory);
         self
     }
 }
@@ -484,6 +598,45 @@ impl AgentGuardrailChain {
         &self.stages
     }
 
+    /// A content-free fingerprint of what this chain *declares*: its
+    /// revision, its policy reference, and each stage's id, revision,
+    /// boundary set, and mandatory flag, in evaluation order.
+    ///
+    /// Two chains with equal digests declare the same evaluation. The rule
+    /// objects are deliberately not compared — `dyn AgentGuardrail` has no
+    /// equality, and could not have one — so a match is a *declaration*
+    /// match, not proof that two chains hold the same code.
+    ///
+    /// That is exactly the strength the wiring check it exists for needs. A
+    /// deployment that builds one chain and hands it to both enforcement
+    /// points passes. One that builds two differently declared chains —
+    /// including an empty chain at the same revision, which a revision
+    /// comparison alone would wave through — is refused.
+    #[must_use]
+    pub fn declaration_digest(&self) -> AgentContentDigest {
+        let declaration = serde_json::json!({
+            "revision": self.revision.get(),
+            "policy": self.policy.as_ref().map(AgentPolicyRef::as_str),
+            "stages": self
+                .stages
+                .iter()
+                .map(|stage| {
+                    serde_json::json!({
+                        "id": stage.id.as_str(),
+                        "revision": stage.revision.get(),
+                        "mandatory": stage.mandatory,
+                        "boundaries": stage
+                            .boundaries
+                            .iter()
+                            .map(|boundary| boundary.as_label())
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+        AgentContentDigest::of_json(&declaration)
+    }
+
     /// Accepts that every required stage is present *and* actually runs, or
     /// fails closed.
     ///
@@ -499,13 +652,19 @@ impl AgentGuardrailChain {
     /// boundary at all — that one is refused at registration
     /// ([`Self::with_stage`]), and this one can only be caught here, because
     /// whether a boundary has an evaluation point is a property of the caller,
-    /// not of the chain. A required stage that runs at none of them is refused
-    /// (`guardrail-stage-unevaluated`).
+    /// not of the chain.
     ///
     /// A stage that runs at *some* evaluated boundary satisfies coverage even
     /// when the evaluation in hand is at a different one: a stage bound to
     /// [`AgentGuardrailBoundary::ToolRequest`] is doing its job, and a model
     /// call that does not trigger it is not an escape.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentGuardrailError::MissingRequiredStage`] (`guardrail-stage-missing`)
+    /// when the chain does not hold a required stage, and
+    /// [`AgentGuardrailError::StageNotEvaluated`] (`guardrail-stage-unevaluated`)
+    /// when it holds one that runs at none of the evaluated boundaries.
     pub fn validate_covers(
         &self,
         required: &BTreeSet<AgentGuardrailStageId>,
@@ -648,7 +807,7 @@ impl AgentGuardrailChain {
                             chain_revision: self.revision,
                             disposition: AgentGuardrailDisposition::Blocked {
                                 stage: stage.id.clone(),
-                                reason_code: "guardrail-transform-oversized".to_string(),
+                                reason_code: AGENT_GUARDRAIL_REASON_TRANSFORM_OVERSIZED.to_string(),
                                 evidence: None,
                             },
                             content: current,
@@ -763,6 +922,37 @@ pub enum AgentGuardrailError {
         /// The revision both chains would have shared.
         revision: AgentRevisionNumber,
     },
+    /// Two enforcement points were wired with differently declared chains, so
+    /// a stage required at one would not run at the other.
+    ///
+    /// Either side may be absent, and absence is the more common
+    /// misconfiguration: an authority with no chain cannot attest anything,
+    /// and a run memory with no retrieval bundle evaluates the memory-ingress
+    /// boundary nowhere at all.
+    ChainMismatch {
+        /// The attesting authority's chain declaration, when it has a chain.
+        authority: Option<AgentContentDigest>,
+        /// The run memory's retrieval-bundle chain declaration, when it
+        /// carries a bundle.
+        retrieval: Option<AgentContentDigest>,
+    },
+    /// A deployment attested that its A2A surface evaluates the ingress and
+    /// egress boundaries under this authority's chain, and the two
+    /// declarations differ (or the authority carries no chain).
+    A2aChainMismatch {
+        /// The authority's declaration digest, when it carries a chain.
+        authority: Option<AgentContentDigest>,
+        /// The surface's declaration digest.
+        surface: AgentContentDigest,
+    },
+    /// A built-in rule was constructed with an empty, blank, or oversized
+    /// configuration.
+    InvalidRule {
+        /// The rule's stable name.
+        rule: &'static str,
+        /// Why the configuration is refused.
+        reason: String,
+    },
 }
 
 impl AgentGuardrailError {
@@ -777,6 +967,9 @@ impl AgentGuardrailError {
             Self::StageUnbound { .. } => "guardrail-stage-unbound",
             Self::StageNotEvaluated { .. } => "guardrail-stage-unevaluated",
             Self::NarrowedRevisionNotDistinct { .. } => "guardrail-narrowed-revision-not-distinct",
+            Self::ChainMismatch { .. } => "guardrail-chain-mismatch",
+            Self::A2aChainMismatch { .. } => "guardrail-chain-mismatch",
+            Self::InvalidRule { .. } => "guardrail-rule-invalid",
         }
     }
 }
@@ -812,6 +1005,44 @@ impl Display for AgentGuardrailError {
                 f,
                 "a narrowed chain must carry a revision distinct from its parent's ({revision}): \
                  a different stage set is a different evaluation"
+            ),
+            Self::ChainMismatch {
+                authority,
+                retrieval,
+            } => match (authority, retrieval) {
+                (Some(authority), Some(retrieval)) => write!(
+                    f,
+                    "the dispatch authority's guardrail chain ({authority}) and the retrieval \
+                     bundle's ({retrieval}) declare different evaluations, so a stage required at \
+                     one would not run at the other"
+                ),
+                (None, Some(retrieval)) => write!(
+                    f,
+                    "the dispatch authority carries no guardrail chain, so it cannot attest that \
+                     the retrieval bundle's ({retrieval}) is the same one"
+                ),
+                (_, None) => write!(
+                    f,
+                    "the run memory carries no retrieval bundle, so nothing evaluates the \
+                     memory-ingress boundary and there is no chain to attest"
+                ),
+            },
+            Self::A2aChainMismatch { authority, surface } => match authority {
+                Some(authority) => write!(
+                    f,
+                    "the dispatch authority's guardrail chain ({authority}) and the A2A surface's \
+                     ({surface}) declare different evaluations, so a stage required at one would \
+                     not run at the other"
+                ),
+                None => write!(
+                    f,
+                    "the dispatch authority carries no guardrail chain, so it cannot attest that \
+                     the A2A surface's ({surface}) is the same one"
+                ),
+            },
+            Self::InvalidRule { rule, reason } => write!(
+                f,
+                "the built-in guardrail rule {rule} is misconfigured: {reason}"
             ),
         }
     }
@@ -1041,8 +1272,9 @@ mod tests {
         assert_eq!(error.code(), "guardrail-stage-unevaluated");
 
         // The same stage satisfies coverage once the caller evaluates the
-        // boundary it runs at — this is exactly what a later slice landing its
-        // memory-ingress evaluation point changes.
+        // boundary it runs at — which slice 2.2's retrieval path did:
+        // `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` now carries MemoryIngress,
+        // and the snapshot-assembly flow evaluates it.
         chain
             .validate_covers(&required, &[AgentGuardrailBoundary::MemoryIngress])
             .expect("the stage runs at a boundary the caller evaluates");
@@ -1198,5 +1430,110 @@ mod tests {
             .with_stage(stage("one-too-many", AgentGuardrailOutcome::Allow))
             .expect_err("an overfull chain is refused");
         assert_eq!(error.code(), "guardrail-too-many-stages");
+    }
+
+    #[test]
+    fn a_run_subject_answers_the_run_scope_it_wraps() {
+        let scope = AgentRunScope::new(
+            crate::TenantId::new("acme"),
+            crate::identity::AgentId::new("support").expect("agent id"),
+            crate::identity::AgentRunId::new("run-1").expect("run id"),
+        )
+        .expect("run scope");
+        let context = AgentGuardrailContext::new(AgentGuardrailBoundary::ToolRequest, &scope);
+        assert_eq!(context.scope(), Some(&scope));
+        assert_eq!(context.subject.tenant(), scope.tenant());
+        assert_eq!(context.subject.agent(), Some(scope.agent()));
+        assert_eq!(context.subject.run(), Some(&scope));
+    }
+
+    #[test]
+    fn a_task_subject_names_tenant_task_and_addressed_agent_but_no_run() {
+        let task = crate::identity::AgentTaskScope::new(
+            crate::TenantId::new("acme"),
+            crate::identity::AgentTaskId::new("ticket-1").expect("task id"),
+        )
+        .expect("task scope");
+        let agent = crate::identity::AgentId::new("support").expect("agent id");
+        let context = AgentGuardrailContext::for_subject(
+            AgentGuardrailBoundary::A2aIngress,
+            AgentGuardrailSubject::Task {
+                scope: &task,
+                agent: Some(&agent),
+            },
+        );
+        assert_eq!(context.scope(), None);
+        assert_eq!(context.subject.tenant().as_str(), "acme");
+        assert_eq!(context.subject.agent(), Some(&agent));
+        assert_eq!(context.subject.run(), None);
+    }
+
+    #[test]
+    fn team_and_conversation_subjects_carry_only_their_tenant() {
+        let team = crate::identity::AgentTeamScope::new(
+            crate::TenantId::new("acme"),
+            crate::identity::AgentTeamId::new("billing").expect("team id"),
+        )
+        .expect("team scope");
+        let conversation = crate::identity::AgentConversationScope::new(
+            crate::TenantId::new("acme"),
+            crate::identity::AgentConversationId::new("thread-1").expect("conversation id"),
+        )
+        .expect("conversation scope");
+        for subject in [
+            AgentGuardrailSubject::Team(&team),
+            AgentGuardrailSubject::Conversation(&conversation),
+        ] {
+            let context =
+                AgentGuardrailContext::for_subject(AgentGuardrailBoundary::A2aIngress, subject);
+            assert_eq!(context.subject.tenant().as_str(), "acme");
+            assert_eq!(context.subject.agent(), None);
+            assert_eq!(context.scope(), None);
+        }
+    }
+
+    struct InflateTo(usize);
+
+    impl AgentGuardrail for InflateTo {
+        fn evaluate(&self, _: &AgentGuardrailContext<'_>, _: &Value) -> AgentGuardrailOutcome {
+            AgentGuardrailOutcome::Transform {
+                content: Value::String("x".repeat(self.0)),
+                reason_code: "inflate".to_string(),
+            }
+        }
+    }
+
+    fn one_stage_chain(rule: Arc<dyn AgentGuardrail>) -> AgentGuardrailChain {
+        AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+            .with_stage(
+                AgentGuardrailStage::new(stage_id("inflate"), AgentRevisionNumber::INITIAL, rule)
+                    .at_boundary(AgentGuardrailBoundary::ModelResponse),
+            )
+            .expect("the stage registers")
+    }
+
+    #[test]
+    fn a_twelve_kib_transform_fits_the_default_content_bound() {
+        let scope = scope();
+        let context = AgentGuardrailContext::new(AgentGuardrailBoundary::ModelResponse, &scope);
+        let decision = one_stage_chain(Arc::new(InflateTo(12 * 1024)))
+            .evaluate(&context, &serde_json::json!({ "text": "hi" }));
+        assert_eq!(decision.disposition, AgentGuardrailDisposition::Allowed);
+        assert!(decision.transformed);
+    }
+
+    #[test]
+    fn a_seventeen_kib_transform_is_blocked_even_under_a_wider_caller_bound() {
+        let scope = scope();
+        let context = AgentGuardrailContext::new(AgentGuardrailBoundary::ModelResponse, &scope);
+        let decision = one_stage_chain(Arc::new(InflateTo(17 * 1024))).evaluate_bounded(
+            &context,
+            &serde_json::json!({ "text": "hi" }),
+            32 * 1024,
+        );
+        assert!(matches!(
+            decision.disposition,
+            AgentGuardrailDisposition::Blocked { ref reason_code, .. } if reason_code == "guardrail-transform-oversized"
+        ));
     }
 }

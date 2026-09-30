@@ -97,6 +97,9 @@ fn distinct_identity_types_do_not_interchange_on_equal_values() {
     let task = AgentTaskId::new("work-1").expect("task id should be valid");
     let goal = AgentGoalId::new("work-1").expect("goal id should be valid");
     assert_eq!(task.as_str(), goal.as_str());
+    // Slice 4.1 formalizes the generation: the derived goal id carries the root
+    // task's value (open decision 14's resolved default).
+    assert_eq!(AgentGoalId::for_root_task(&task), goal);
 
     // The remaining identities exist from M1 so that M2 through M5 inherit stable
     // scope keys rather than migrating durable records.
@@ -105,6 +108,21 @@ fn distinct_identity_types_do_not_interchange_on_equal_values() {
     assert!(AgentWakeId::new("wake-1").is_ok());
     assert!(AgentEnvironmentRef::new("workspace-1").is_ok());
     assert!(KnowledgeSpaceId::new("space-1").is_ok());
+}
+
+#[test]
+fn goal_id_derivation_is_total_over_valid_task_ids() {
+    // `for_root_task` is infallible because both identities validate under the
+    // same segment rules; the boundary case is a task id at exactly the
+    // identity length limit, whose derived goal id must stay valid.
+    let value = "t".repeat(256);
+    let task = AgentTaskId::new(value.clone()).expect("a 256-byte task id is at the bound");
+    let goal = AgentGoalId::for_root_task(&task);
+    assert_eq!(goal.as_str(), value);
+    // The derived value round-trips through the fail-closed deserializer.
+    let encoded = serde_json::to_string(&goal).expect("goal id should serialize");
+    let decoded: AgentGoalId = serde_json::from_str(&encoded).expect("derived id should load");
+    assert_eq!(decoded, goal);
 }
 
 #[test]

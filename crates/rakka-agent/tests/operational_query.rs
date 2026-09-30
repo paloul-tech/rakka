@@ -1,7 +1,7 @@
 //! The authoritative operational snapshot and the session view.
 //!
-//! Specification: section 17.18; scenarios 21 and 56 of section 18. The
-//! snapshot is derived from the durable run record alone and returns the
+//! Specification: section 17.18; scenarios 21 and 56 of section 18, and the
+//! projection clause of scenario 57. The snapshot is derived from the durable run record alone and returns the
 //! durable state revision it read, so it stays correct — lifecycle, waits,
 //! budget, effects, cancellation — when telemetry is sampled, delayed,
 //! dropped, or entirely unavailable, and when the entity is passivated
@@ -52,6 +52,7 @@ fn proposing_turn(answer: &str) -> AgentModelTurn {
             input_tokens: 10,
             output_tokens: 5,
             cost_micros: 3,
+            ..Default::default()
         })
 }
 
@@ -102,7 +103,7 @@ impl AgentDecisionEventSink for UnavailableSink {
         _scope: &'a rakka_agent::AgentRunScope,
         _after: u64,
         _limit: usize,
-    ) -> AgentObservabilityFuture<'a, Vec<rakka_agent::AgentDecisionEvent>> {
+    ) -> AgentObservabilityFuture<'a, rakka_agent::AgentDecisionEventPage> {
         Box::pin(async {
             Err(AgentObservabilityError::Sink {
                 code: "unavailable".to_string(),
@@ -183,6 +184,48 @@ async fn the_snapshot_answers_from_durable_state_with_telemetry_unavailable() {
     .expect("the point query answers")
     .expect("the run exists");
     assert_eq!(again, snapshot);
+
+    // The additive-field compatibility posture the struct's own docs
+    // promise: a snapshot serialized before `has_accepted_result` existed
+    // still deserializes, loading the field unset — the same rule every
+    // other additive field in the family carries.
+    let mut before_field = serde_json::to_value(&snapshot).expect("the snapshot serializes");
+    before_field
+        .as_object_mut()
+        .expect("the snapshot serializes as an object")
+        .remove("has_accepted_result")
+        .expect("the field is present on a current snapshot");
+    let decoded: rakka_agent::AgentOperationalSnapshot =
+        serde_json::from_value(before_field).expect("a pre-field snapshot still deserializes");
+    assert!(
+        !decoded.has_accepted_result,
+        "a pre-field snapshot loads with the fact unset"
+    );
+
+    // The rule reaches the *nested* run projection too: `AgentRunSnapshot` is
+    // embedded here, so an operational answer serialized by an older peer is
+    // what a reader deserializes. `terminal_at` gets there by being an
+    // `Option`, which serde already loads as `None` when the field is absent
+    // — this pins that, so narrowing the field later fails here rather than
+    // in a rolling update.
+    let mut before_terminal_at = serde_json::to_value(&snapshot).expect("the snapshot serializes");
+    before_terminal_at
+        .get_mut("run")
+        .expect("the operational answer carries a run projection")
+        .as_object_mut()
+        .expect("the run projection serializes as an object")
+        .remove("terminal_at")
+        .expect("the field is present on a current run projection");
+    let decoded: rakka_agent::AgentOperationalSnapshot = serde_json::from_value(before_terminal_at)
+        .expect("a pre-field operational snapshot still deserializes");
+    assert!(
+        decoded
+            .run
+            .expect("the run projection loads")
+            .terminal_at
+            .is_none(),
+        "a pre-field run projection loads with the stamp unset"
+    );
 }
 
 /// A run parked behind an approval checkpoint reports the wait, the gated
@@ -488,6 +531,101 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
         "all four decisions are unprojected"
     );
     assert_eq!(degraded.snapshot, view.snapshot);
+
+    // A hole in the retained stream — the ring dropped an unflushed event —
+    // is not an outage: the view shows every decision the sink still retains,
+    // resuming past the declared gap, and only the missing one is absent.
+    // Blanking the whole view would turn one dropped record into "the sink is
+    // down" on every read for the rest of the run's life.
+    let holed = Arc::new(InMemoryAgentDecisionEventSink::new());
+    for event in sink
+        .events(&run_scope())
+        .iter()
+        .filter(|event| event.sequence != 3)
+    {
+        holed
+            .append(&run_scope(), event)
+            .await
+            .expect("the holed sink accepts the append");
+    }
+    let gapped = assemble_agent_session_view(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        Some(holed.as_ref()),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the view assembles")
+    .expect("the run exists");
+    assert!(
+        gapped.decisions_available,
+        "a retention hole is a declared loss, not a sink outage"
+    );
+    assert_eq!(
+        gapped
+            .decisions
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 4],
+        "every retained decision is shown; only the hole is absent"
+    );
+    assert_eq!(gapped.snapshot, view.snapshot);
+
+    // An event whose schema version this binary does not read is never
+    // interpreted with guessed semantics: the view treats the sink as
+    // unavailable and the authoritative half is untouched, while the replay
+    // entry point — the same load path — refuses it outright.
+    let current = rakka_agent::AgentRecordKind::DecisionEvent
+        .current_schema_version()
+        .get();
+    let ahead = Arc::new(InMemoryAgentDecisionEventSink::new());
+    for (index, event) in sink.events(&run_scope()).iter().enumerate() {
+        let event = if index == 1 {
+            let mut value = serde_json::to_value(event).expect("the event serializes");
+            assert_eq!(
+                value["schema_version"],
+                serde_json::json!(current),
+                "the doctored path must reach the event's schema version"
+            );
+            value["schema_version"] = serde_json::json!(current + 1);
+            serde_json::from_value(value).expect("the doctored event deserializes")
+        } else {
+            event.clone()
+        };
+        ahead
+            .append(&run_scope(), &event)
+            .await
+            .expect("the sink accepts the append");
+    }
+    let refused = assemble_agent_session_view(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        Some(ahead.as_ref()),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the view assembles")
+    .expect("the run exists");
+    assert!(
+        !refused.decisions_available,
+        "an event from a newer binary makes the projection unavailable"
+    );
+    assert!(refused.decisions.is_empty());
+    assert_eq!(refused.snapshot, view.snapshot);
+    let error = rakka_agent::replay_run_coordination_events(
+        Some(ahead.as_ref()),
+        &rakka_agent::AgentEntityAddress::Run(run_scope()),
+        None,
+        16,
+        0,
+        &AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect_err("the replay refuses an event from a newer binary");
+    assert_eq!(error.code(), "schema-version-ahead");
 }
 
 fn cancel_operation_id(label: &str) -> rakka_agent::AgentOperationId {
@@ -611,4 +749,400 @@ async fn the_snapshot_reports_the_reference_facts_after_any_owner_loss() {
         );
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Task-scoped operational query (M3)
+
+/// A legitimate epoch-result envelope for one admitted wake.
+fn epoch_result_envelope(
+    binding: &rakka_agent::AgentWakeBinding,
+    status: rakka_agent::AgentTaskStatus,
+) -> rakka_agent::AgentExchangeEnvelope {
+    let epoch_task =
+        rakka_agent::epoch_task_id_for_wake(binding.wake_id()).expect("the epoch derives");
+    let epoch_scope =
+        rakka_agent::AgentTaskScope::new(tenant(), epoch_task.clone()).expect("the scope is valid");
+    let operation_id =
+        rakka_agent::epoch_result_operation_id(&tenant(), &goal_id(), binding.wake_id())
+            .expect("the operation id derives");
+    let result = rakka_agent::AgentEpochResult {
+        wake: binding.wake_id().clone(),
+        task: epoch_task,
+        status,
+        consumed: rakka_agent::AgentBudgetConsumption::zero(),
+        result_digest: None,
+    };
+    rakka_agent::AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        rakka_agent::AgentExchangeKind::EpochResult,
+        rakka_agent::AgentEntityAddress::Task(epoch_scope),
+        rakka_agent::AgentEntityAddress::Task(task_scope()),
+        rakka_agent::AgentExchangePayload::encode(
+            rakka_agent::AGENT_EPOCH_RESULT_PAYLOAD_TYPE,
+            &result,
+        )
+        .expect("the payload encodes"),
+        rakka_agent_workflow::AgentCorrelationId::new(operation_id.as_str()),
+        AgentTimestampMillis::new(9_000),
+    )
+    .expect("the envelope builds")
+}
+
+/// The M3 operational facts, answered from the durable task record alone —
+/// no entity is resident when the query runs, which is exactly the
+/// passivated case — and the "next wake" joined purely from the wake-timer
+/// store's state.
+#[tokio::test]
+async fn the_task_snapshot_answers_the_continuous_checklist_while_passivated() {
+    use rakka_agent::ScheduleRevision;
+
+    let fx = Fixture::new(ScriptedDispatcher::new());
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+
+    // One occurrence admits and attaches its epoch; a second coalesces
+    // behind it.
+    let first = scheduled_wake_binding(5, ScheduleRevision::INITIAL);
+    fx.apply_task_command(
+        rakka_agent::wake_admission_command(first.clone()).expect("the command derives"),
+    )
+    .await
+    .expect("the first admission applies");
+    let second = scheduled_wake_binding(10, ScheduleRevision::INITIAL);
+    fx.apply_task_command(
+        rakka_agent::wake_admission_command(second.clone()).expect("the command derives"),
+    )
+    .await
+    .expect("the second delivery coalesces");
+
+    // Every entity store built by the fixture was dropped after its call:
+    // the answer below is derived from the durable record alone.
+    let snapshot = rakka_agent::agent_task_operational_snapshot(
+        &fx.tasks,
+        &task_scope(),
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the root exists");
+    assert_eq!(snapshot.observed_at, AgentTimestampMillis::new(9_999));
+    assert!(!snapshot.has_accepted_result);
+    let task = snapshot.task.as_ref().expect("the root is created");
+    let wake = task.wake.as_ref().expect("the goal has a wake view");
+    assert_eq!(wake.schedule_revision, ScheduleRevision::INITIAL);
+    assert_eq!(wake.active, vec![first.wake_id().clone()]);
+    assert_eq!(wake.pending, vec![second.wake_id().clone()]);
+    assert_eq!(wake.counters.admitted, 1);
+    assert_eq!(wake.counters.coalesced, 1);
+    let (epoch_task, epoch_run) = epoch_scopes_for(first.wake_id());
+    assert_eq!(
+        wake.epochs,
+        vec![rakka_agent::AgentEpochRef {
+            task: epoch_task.task().clone(),
+            run: epoch_run.run().clone(),
+        }],
+        "the active occurrence's epoch is the view's epoch"
+    );
+    let lifecycle = wake.lifecycle.as_ref().expect("the lifecycle view rides");
+    assert_eq!(
+        lifecycle.status(),
+        rakka_agent::AgentGoalLifecycleStatus::Active
+    );
+    assert_eq!(lifecycle.consecutive_failures(), 0);
+
+    // The epoch fails: the streak, the backoff, and the parked backoff
+    // re-wake all surface in the same one-read answer.
+    let mut root = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    )
+    .with_wake_timers(fx.rewake_parker.clone());
+    root.recover(fx.now()).await.expect("the root recovers");
+    let reply = root
+        .accept(
+            &epoch_result_envelope(&first, rakka_agent::AgentTaskStatus::Failed),
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .expect("the result is answered");
+    assert!(reply.result().is_accepted());
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("the root settles");
+    drop(root);
+
+    let snapshot = rakka_agent::agent_task_operational_snapshot(
+        &fx.tasks,
+        &task_scope(),
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(10_000),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the root exists");
+    assert_eq!(snapshot.owed_history, 0, "the settle pass flushed history");
+    let task = snapshot.task.as_ref().expect("the root is created");
+    let wake = task.wake.as_ref().expect("the goal has a wake view");
+    assert!(wake.active.is_empty(), "the failed wake released");
+    assert_eq!(wake.pending, vec![second.wake_id().clone()]);
+    assert!(wake.epochs.is_empty());
+    let lifecycle = wake.lifecycle.as_ref().expect("the lifecycle view rides");
+    assert_eq!(lifecycle.consecutive_failures(), 1);
+    let until = lifecycle.backoff_until().expect("the backoff is in force");
+    let slot = lifecycle
+        .rewakes()
+        .backoff
+        .expect("the backoff re-wake is owed");
+    assert!(slot.parked, "the settle pass parked it durably");
+    assert_eq!(slot.due_at, until);
+
+    // "Next wake" joins from the wake-timer store: the parked backoff
+    // re-wake is the earliest pending entry for this task.
+    let mut scanner = fx.wake_scanner();
+    let timer_state = scanner
+        .timers_mut()
+        .recover(AgentTimestampMillis::new(0))
+        .await
+        .expect("the timer store recovers")
+        .clone();
+    let (next_wake, next_due) =
+        rakka_agent::next_pending_wake_for_task(&timer_state, &tenant(), task_scope().task())
+            .expect("the parked re-wake is pending");
+    assert_eq!(next_due, until);
+    assert!(
+        next_wake.as_str().starts_with("wake-"),
+        "the joined id is a derived wake identity"
+    );
+
+    // A scope that was never created answers `None`, not an error.
+    let absent = rakka_agent::AgentTaskScope::new(
+        tenant(),
+        rakka_agent::AgentTaskId::new("task-operational-query-absent").expect("the id is valid"),
+    )
+    .expect("the scope is valid");
+    assert!(rakka_agent::agent_task_operational_snapshot(
+        &fx.tasks,
+        &absent,
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(10_001),
+    )
+    .await
+    .expect("the point query answers")
+    .is_none());
+}
+
+/// A blocked task whose dependency registration never settled is the documented
+/// stuck-dependency struggle signal
+/// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)) — but only
+/// once it has stayed that way. A registration is normally outstanding for the
+/// length of one settle pass, so a threshold-free derivation would report every
+/// freshly blocked task as stuck the instant it committed.
+#[tokio::test]
+async fn a_stuck_dependency_reports_only_after_the_edge_has_actually_stalled() {
+    use rakka_agent::{
+        agent_task_operational_snapshot, agent_task_struggle_signals, AgentStrugglePolicy,
+        AgentStruggleSignalKind, AgentTaskDependencyDeclaration, AgentTaskEntityCommand,
+        AgentTaskStatus,
+    };
+
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ));
+    fx.instantiate_agent().await;
+
+    // Created *with* an upstream that does not exist, so the task is born
+    // blocked and its registration exchange stays outstanding forever — which
+    // is exactly the shape a never-created upstream leaves behind.
+    fx.apply_task_command(AgentTaskEntityCommand::Create {
+        operation_id: rakka_agent::AgentOperationId::new(
+            rakka_agent::AgentOperationKind::TaskCreation,
+            [tenant().as_str(), "ticket-1", "1"],
+        )
+        .expect("the operation id derives"),
+        creation: Box::new(rakka_agent::AgentTaskCreation {
+            definition: task_definition(),
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: Some(agent_id()),
+            team: None,
+            goal: None,
+            goal_mode: Default::default(),
+            goal_spec: None,
+            parent: None,
+            dependencies: vec![AgentTaskDependencyDeclaration::new(
+                rakka_agent::AgentTaskId::new("never-created").expect("the task id is valid"),
+            )],
+            escrow: None,
+            wake: None,
+            delegation: None,
+            telemetry: Default::default(),
+        }),
+    })
+    .await
+    .expect("the dependent task creates");
+    let _ = fx.settle_task_at(&task_scope()).await;
+
+    let snapshot = agent_task_operational_snapshot(
+        &fx.tasks,
+        &task_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    )
+    .await
+    .expect("the task snapshot reads")
+    .expect("the task exists");
+    assert_eq!(
+        snapshot.task.as_ref().expect("the task").status,
+        AgentTaskStatus::Blocked,
+        "the late edge demoted the task"
+    );
+
+    // Under the default threshold the edge is young, so nothing is reported —
+    // the signal is not just "an unsettled registration exists".
+    let quiet = agent_task_struggle_signals(&snapshot, &AgentStrugglePolicy::new());
+    assert!(
+        quiet.is_empty(),
+        "a registration younger than the stall threshold is not a struggle: {quiet:?}"
+    );
+
+    // With the threshold at zero — an operator who wants every outstanding edge
+    // — the same snapshot reports it, so the derivation reads the edge and not
+    // merely the clock.
+    let mut eager = AgentStrugglePolicy::new();
+    eager.dependency_stall_millis = 0;
+    let reported = agent_task_struggle_signals(&snapshot, &eager);
+    assert_eq!(
+        reported
+            .iter()
+            .map(|signal| signal.kind)
+            .collect::<Vec<_>>(),
+        vec![AgentStruggleSignalKind::StuckDependency],
+        "the stalled edge is the signal: {reported:?}"
+    );
+
+    // Deriving twice from the same snapshot gives the same answer: these are
+    // projections, and they observe nothing they could change.
+    assert_eq!(reported, agent_task_struggle_signals(&snapshot, &eager));
+}
+
+/// A moderated conversation parked at its round ceiling names no next speaker,
+/// so nothing can advance it but the moderator's early end — the moderation
+/// exhaustion signal. Like every struggle signal it is a read-time projection:
+/// the conversation stays `Active` and nothing about it changes.
+#[tokio::test]
+async fn moderation_exhaustion_reports_a_conversation_nothing_can_advance() {
+    use rakka_agent::{
+        agent_conversation_struggle_signals, AgentConversationCompletionRule,
+        AgentConversationCreation, AgentConversationEntityCommand, AgentConversationId,
+        AgentConversationMode, AgentConversationScope, AgentConversationStatus, AgentId,
+        AgentModerationPolicy, AgentRevisionNumber, AgentStrugglePolicy, AgentStruggleSignalKind,
+        AgentTaskId,
+    };
+
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ));
+    let conversation = AgentConversationId::new("panel").expect("the conversation id is valid");
+    let scope = AgentConversationScope::new(tenant(), conversation.clone()).expect("the scope");
+    let agent = |name: &str| AgentId::new(name).expect("the agent id is valid");
+    // The turn door reads the speaker's definition, so the roster's members
+    // are instantiated with the `Moderation` capability their turns spend.
+    fx.instantiate_conversation_participants(&["moderator", "p1"])
+        .await;
+
+    // One round, one turn: the ceiling is reached the moment that turn lands,
+    // and `ModeratorDecides` parks rather than completing.
+    let policy = AgentModerationPolicy::new(AgentRevisionNumber::INITIAL)
+        .with_max_rounds(1)
+        .with_max_turns_per_round(1);
+    fx.apply_conversation_command_at(
+        &scope,
+        AgentConversationEntityCommand::Create {
+            operation_id: rakka_agent::conversation_create_operation_id(&tenant(), &conversation)
+                .expect("the operation id derives"),
+            creation: Box::new(AgentConversationCreation {
+                moderator: agent("moderator"),
+                participants: vec![agent("p1")],
+                mode: AgentConversationMode::RoundRobin,
+                completion: AgentConversationCompletionRule::ModeratorDecides,
+                policy,
+                task: AgentTaskId::new("debate-task").expect("the task id is valid"),
+                tokens: None,
+                max_wall_clock_millis: None,
+                transcript_ref: None,
+            }),
+        },
+    )
+    .await
+    .expect("the conversation creates");
+
+    let opening = fx
+        .conversation_snapshot_at(&scope)
+        .await
+        .expect("the conversation snapshots");
+    assert!(
+        agent_conversation_struggle_signals(&opening, &AgentStrugglePolicy::new(), fx.now())
+            .is_empty(),
+        "a conversation with a live speaker is not exhausted"
+    );
+
+    fx.apply_conversation_command_at(
+        &scope,
+        AgentConversationEntityCommand::SubmitTurn {
+            operation_id: rakka_agent::conversation_turn_operation_id(
+                &tenant(),
+                &conversation,
+                0,
+                0,
+                &agent("p1"),
+                &rakka_agent::conversation_turn_content_digest("a position", None),
+            )
+            .expect("the operation id derives"),
+            submit: Box::new(rakka_agent::AgentConversationTurnSubmit {
+                round: 0,
+                turn: 0,
+                participant: agent("p1"),
+                body: "a position".to_string(),
+                direction: None,
+                usage: rakka_agent::AgentBudgetConsumption::zero(),
+            }),
+        },
+    )
+    .await
+    .expect("the only admissible turn records");
+
+    let parked = fx
+        .conversation_snapshot_at(&scope)
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(
+        parked.status,
+        AgentConversationStatus::Active,
+        "the ceiling parks the cursor; it does not terminalize"
+    );
+    assert!(
+        parked.current_speaker.is_none(),
+        "a parked cursor names no next speaker"
+    );
+
+    let signals =
+        agent_conversation_struggle_signals(&parked, &AgentStrugglePolicy::new(), fx.now());
+    assert_eq!(
+        signals.iter().map(|signal| signal.kind).collect::<Vec<_>>(),
+        vec![AgentStruggleSignalKind::ModerationExhaustion],
+        "a conversation nothing can advance is reported: {signals:?}"
+    );
+
+    // The projection changed nothing it observed.
+    let after = fx
+        .conversation_snapshot_at(&scope)
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(parked, after, "a struggle signal mutates nothing");
 }

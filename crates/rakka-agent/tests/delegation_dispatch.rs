@@ -1,0 +1,460 @@
+//! The outbound A2A send at the dispatch boundary.
+//!
+//! Slice 4.3's executor-side proofs
+//! ([specification 14.4](../../docs/plans/rakka-agent/spec.md)): an absent
+//! executor fails the send closed under a stable code, an explicit conflict
+//! settles the cell as `Conflicted` — the "same child or an explicit
+//! conflict" of specification 6.6 — and either way the parent winds down
+//! rather than proceeding as if the child existed. The in-process driver
+//! reports through the same finding vocabulary the real pipeline's executor
+//! arm maps.
+
+mod common;
+
+use std::sync::Arc;
+
+use common::{
+    delegation_config, delegation_tool_id, goal_spec_draft, goal_spec_with_delegation,
+    goal_task_creation_command, run_scope, task_definition, AuthorityFixture, Fixture, AGENT,
+    SKILL, TENANT,
+};
+use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, ScriptedDispatcher};
+use rakka_agent::{
+    AgentA2aSendExecutor, AgentA2aSendFinding, AgentDelegationRecord, AgentDelegationStatus,
+    AgentDispatchFuture, AgentModelTurn, AgentOperationId, AgentOperationKind, AgentRunEffect,
+    AgentRunEffectKind, AgentRunEntityCommand, AgentRunScope, AgentRunStatus,
+    AgentRunTerminalReason, AgentToolCallId, AgentToolCallRequest,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+};
+use rakka_agent_workflow::AgentEphemeralCredential;
+use serde_json::json;
+
+fn delegating_turn() -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Delegating the translation.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("call-1").expect("call id should be valid"),
+                delegation_tool_id(),
+                json!({ "skill": SKILL, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        )
+}
+
+struct ConflictExecutor;
+
+impl AgentA2aSendExecutor for ConflictExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _delegation: &'a AgentDelegationRecord,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding> {
+        Box::pin(async move {
+            Ok(AgentA2aSendFinding::Conflict {
+                code: "delegation-child-conflict".to_string(),
+                message: "the peer holds a child this delegation does not own".to_string(),
+            })
+        })
+    }
+}
+
+/// Refuses every send as an egress guardrail would: the pipeline code, and
+/// the stage and reason code that decided.
+struct BlockedExecutor;
+
+fn blocking_reason() -> rakka_agent::AgentFailureReason {
+    rakka_agent::AgentFailureReason::guardrail(
+        rakka_agent::AgentGuardrailStageId::new("a2a-filter").expect("id"),
+        "prompt-injection",
+    )
+}
+
+impl AgentA2aSendExecutor for BlockedExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _delegation: &'a AgentDelegationRecord,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding> {
+        Box::pin(async move {
+            Ok(AgentA2aSendFinding::Refused {
+                code: "guardrail-blocked".to_string(),
+                message: "guardrail stage a2a-filter blocked the outbound A2A message".to_string(),
+                reason: Some(blocking_reason()),
+            })
+        })
+    }
+}
+
+/// A code longer than the run keeps: the detail bound and then some.
+fn oversized_refusal_code() -> String {
+    format!(
+        "peer-refused-{}",
+        "x".repeat(rakka_agent::AGENT_RUN_DETAIL_MAX_LENGTH)
+    )
+}
+
+/// Refuses every send under a code no stable-code contract would mint.
+struct OversizedCodeExecutor;
+
+impl AgentA2aSendExecutor for OversizedCodeExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _delegation: &'a AgentDelegationRecord,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding> {
+        Box::pin(async move {
+            Ok(AgentA2aSendFinding::Refused {
+                code: oversized_refusal_code(),
+                message: "the peer refused the send".to_string(),
+                reason: None,
+            })
+        })
+    }
+}
+
+async fn drive(fixture: &Fixture) -> (AgentDelegationStatus, Option<AgentRunStatus>) {
+    fixture.instantiate_agent().await;
+    fixture
+        .apply_task_command(goal_task_creation_command(
+            task_definition(),
+            goal_spec_draft(goal_spec_with_delegation(), true),
+        ))
+        .await
+        .expect("the goal task should create");
+    fixture.pump().await.expect("the loop should converge");
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let status = state.status();
+    let loop_state = state.loop_state().expect("loop state");
+    assert_eq!(loop_state.delegation_count(), 1);
+    let cell = loop_state
+        .delegations()
+        .values()
+        .next()
+        .expect("the cell exists");
+    (cell.status.clone(), status)
+}
+
+/// An unwired dispatcher fails the send closed: the cell settles `Failed`
+/// under the stable code and the parent winds down — a delegation whose send
+/// cannot execute is a failed effect, never a silently pending child.
+#[tokio::test]
+async fn an_absent_executor_fails_the_send_closed() {
+    let fixture = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new().with_turn(delegating_turn()),
+    ))
+    .with_delegation(delegation_config());
+
+    let (status, run_status) = drive(&fixture).await;
+    assert_eq!(
+        status,
+        AgentDelegationStatus::Failed {
+            code: "a2a-send-executor-missing".to_string(),
+            reason: None,
+        }
+    );
+    assert_eq!(run_status, Some(AgentRunStatus::Failed));
+}
+
+/// A send a guardrail blocked settles its cell under the pipeline code, with
+/// the stage and reason code beside it.
+///
+/// Since slice 4.4 a blocked send is a fan-in disposition the run survives,
+/// not a coordinator failure: the refusal reaches the model as the call's
+/// failed tool result, and the run finishes the task on its own terms. The
+/// send's failure never becomes the run's terminal reason, so the delegation
+/// cell is the record that carries the deciding stage.
+#[tokio::test]
+async fn a_blocked_send_records_the_deciding_stage_on_its_cell() {
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(delegating_turn())
+                .with_turn(
+                    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                        .with_text("Finishing without the specialist.")
+                        .with_proposal(
+                            rakka_agent::AgentTaskContent::inline(json!({ "answer": "solo" }))
+                                .expect("the proposal is inline-bounded"),
+                        ),
+                ),
+        )
+        .with_a2a_send_executor(Arc::new(BlockedExecutor)),
+    )
+    .with_delegation(delegation_config());
+
+    let (status, run_status) = drive(&fixture).await;
+    assert_eq!(
+        status,
+        AgentDelegationStatus::Failed {
+            code: "guardrail-blocked".to_string(),
+            reason: Some(blocking_reason()),
+        }
+    );
+    assert_eq!(
+        run_status,
+        Some(AgentRunStatus::Completed),
+        "the blocked send is a disposition the run survives"
+    );
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    assert_eq!(
+        state.run().expect("the record survives").terminal_reason,
+        Some(AgentRunTerminalReason::ResultAccepted),
+        "the run ends on its own result, not on the send's failure"
+    );
+}
+
+/// The code a failed send's cell keeps is bounded as the effect record's
+/// is: an executor's oversized code is cut at `AGENT_RUN_DETAIL_MAX_LENGTH`
+/// bytes on a character boundary, so the cell a run keeps past its turn
+/// cannot grow the record by whatever a deployment's executor answers.
+#[tokio::test]
+async fn a_failed_sends_cell_keeps_its_code_bounded() {
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(delegating_turn())
+                .with_turn(
+                    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                        .with_text("Finishing without the specialist.")
+                        .with_proposal(
+                            rakka_agent::AgentTaskContent::inline(json!({ "answer": "solo" }))
+                                .expect("the proposal is inline-bounded"),
+                        ),
+                ),
+        )
+        .with_a2a_send_executor(Arc::new(OversizedCodeExecutor)),
+    )
+    .with_delegation(delegation_config());
+
+    let (status, _) = drive(&fixture).await;
+    let AgentDelegationStatus::Failed { code, .. } = status else {
+        panic!("the refused send settles its cell failed: {status:?}");
+    };
+    let delivered = oversized_refusal_code();
+    assert!(delivered.len() > rakka_agent::AGENT_RUN_DETAIL_MAX_LENGTH);
+    assert!(
+        code.len() <= rakka_agent::AGENT_RUN_DETAIL_MAX_LENGTH,
+        "the cell keeps {} bytes",
+        code.len()
+    );
+    assert!(
+        !code.is_empty() && delivered.starts_with(&code),
+        "the cell keeps a prefix of the delivered code"
+    );
+}
+
+/// The same block through the production dispatcher: its send arm, not the
+/// scripted driver's copy, carries the deciding stage to the cell.
+///
+/// The send is a member of the turn's fan-in group, so its refusal is a
+/// disposition the coordinator survives, and its effect leaves the loop with
+/// its turn: the cell is the record that keeps the decision.
+#[tokio::test]
+async fn the_pipeline_records_a_blocked_sends_deciding_stage_on_its_cell() {
+    let fx = AuthorityFixture::over(
+        DeterministicModelAdapter::new().with_turn(delegating_turn()),
+        rakka_agent::AgentToolRegistry::new(),
+        None,
+    )
+    .with_delegation(delegation_config())
+    .with_a2a_send_executor(Arc::new(BlockedExecutor));
+    fx.fx
+        .instantiate_agent_with_envelope(fx.envelope.clone())
+        .await;
+    fx.fx
+        .apply_task_command(goal_task_creation_command(
+            task_definition(),
+            goal_spec_draft(goal_spec_with_delegation(), true),
+        ))
+        .await
+        .expect("the goal task should create");
+    fx.pump().await;
+
+    let state = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    let loop_state = state.loop_state().expect("loop state");
+    assert_eq!(loop_state.delegation_count(), 1);
+    let cell = loop_state
+        .delegations()
+        .values()
+        .next()
+        .expect("the cell exists");
+    assert_eq!(
+        cell.status,
+        AgentDelegationStatus::Failed {
+            code: "guardrail-blocked".to_string(),
+            reason: Some(blocking_reason()),
+        }
+    );
+}
+
+/// A cancellation that lands between the compare-and-set committing a
+/// delegation's send effect and the flush that would hand it to the sink
+/// fences the effect in place — and the fence settles the cell
+/// `Failed { run-winding-down }` in the same transition. A winding-down
+/// parent never leaves a `Pending` cell under a cancelled effect for the
+/// fan-in slice to misread as an in-flight child.
+///
+/// The sweep is self-checking: it requires at least one crash point to land
+/// in the committed-but-unsent window, so flow growth that pushes the window
+/// past the sweep fails loudly instead of eroding coverage.
+#[tokio::test]
+async fn a_cancellation_fence_settles_the_unsent_delegation_cell() {
+    let mut fence_observed = false;
+    for point in 1..24 {
+        for window in [CrashPoint::BeforeWrite, CrashPoint::AfterWrite] {
+            let fixture = Fixture::new(ScriptedDispatcher::with_adapter(
+                DeterministicModelAdapter::new().with_turn(delegating_turn()),
+            ))
+            .with_delegation(delegation_config());
+            fixture.instantiate_agent().await;
+            fixture
+                .apply_task_command(goal_task_creation_command(
+                    task_definition(),
+                    goal_spec_draft(goal_spec_with_delegation(), true),
+                ))
+                .await
+                .expect("the goal task should create");
+
+            fixture.runs.crash_at(point, window);
+            let _ = fixture.pump().await;
+            fixture.runs.survive();
+
+            // The operator cancels the crashed coordinator before any
+            // recovery sweep re-drives the flush.
+            let now = fixture.now();
+            let mut run = fixture.run();
+            if run.recover(now).await.is_err() {
+                continue;
+            }
+            let caught_window = {
+                let Ok(state) = run.state() else { continue };
+                state.loop_state().is_some_and(|loop_state| {
+                    loop_state.delegation_count() == 1
+                        && loop_state.effects().iter().any(|effect| {
+                            effect.kind() == AgentRunEffectKind::A2aSendCall && effect.is_pending()
+                        })
+                })
+            };
+            if run
+                .apply(
+                    AgentRunEntityCommand::Cancel {
+                        operation_id: AgentOperationId::new(
+                            AgentOperationKind::Cancellation,
+                            [TENANT, AGENT, "1"],
+                        )
+                        .expect("the operation id derives"),
+                        reason: "operator stopped the coordinator".to_string(),
+                    },
+                    &fixture.router,
+                    fixture.now(),
+                )
+                .await
+                .is_err()
+            {
+                // The crash point landed before acceptance or after the
+                // terminal settle; there is nothing to fence.
+                continue;
+            }
+            if caught_window {
+                fence_observed = true;
+                let state = run.state().expect("state");
+                let loop_state = state.loop_state().expect("loop state");
+                let cell = loop_state
+                    .delegations()
+                    .values()
+                    .next()
+                    .expect("the cell exists");
+                assert_eq!(
+                    cell.status,
+                    AgentDelegationStatus::Failed {
+                        code: "run-winding-down".to_string(),
+                        reason: None,
+                    },
+                    "the fence settles the unsent send's cell in the same transition"
+                );
+            }
+            drop(run);
+
+            // Whatever the window, a parent that reaches a terminal status
+            // leaves no delegation cell pending.
+            let _ = fixture.pump().await;
+            let mut run = fixture.run();
+            run.recover(fixture.now()).await.expect("recover");
+            let state = run.state().expect("state");
+            if state.status().is_some_and(AgentRunStatus::is_terminal) {
+                if let Some(loop_state) = state.loop_state() {
+                    assert!(
+                        loop_state
+                            .delegations()
+                            .values()
+                            .all(|cell| cell.status.is_settled()),
+                        "a terminal parent left a pending delegation cell (crash point {point})"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        fence_observed,
+        "no crash point produced the committed-but-unsent send window; widen the sweep"
+    );
+}
+
+/// The peer's explicit conflict settles the cell `Conflicted` — never a
+/// silent second child, and never an adoption. Since slice 4.4 the failed
+/// send is a fan-in disposition, not a coordinator failure
+/// ([specification 8.7](../../docs/plans/rakka-agent/spec.md): failed
+/// children are handled explicitly by policy): the conflict reaches the
+/// model as the call's failed tool result, and the coordinator survives to
+/// finish with the children it has.
+#[tokio::test]
+async fn a_peer_conflict_settles_the_cell_and_the_coordinator_survives() {
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(delegating_turn())
+                .with_turn(
+                    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                        .with_text("Correcting course without the specialist.")
+                        .with_proposal(
+                            rakka_agent::AgentTaskContent::inline(json!({ "answer": "solo" }))
+                                .expect("the proposal is inline-bounded"),
+                        ),
+                ),
+        )
+        .with_a2a_send_executor(Arc::new(ConflictExecutor)),
+    )
+    .with_delegation(delegation_config());
+
+    let (status, run_status) = drive(&fixture).await;
+    assert_eq!(
+        status,
+        AgentDelegationStatus::Conflicted {
+            code: "delegation-child-conflict".to_string()
+        }
+    );
+    assert_eq!(
+        run_status,
+        Some(AgentRunStatus::Completed),
+        "the conflicted delegation is a disposition the model corrects from"
+    );
+}

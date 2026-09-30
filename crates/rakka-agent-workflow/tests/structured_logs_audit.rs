@@ -248,3 +248,57 @@ fn artifact(artifact_id: &str, kind: ArtifactKind) -> ArtifactRef {
         metadata: BTreeMap::new(),
     }
 }
+
+/// An already-durable audit event can always derive an exportable log record.
+///
+/// The export side gained generic bounds — at most 64 attributes, values at
+/// most 1024 bytes, no line breaks — and the write side gained nothing, which
+/// is the right asymmetry: 17.1 makes telemetry never a correctness input, so
+/// an audit write must not fail over what a log record could carry. But the
+/// conversion copied the attributes verbatim, so an event already in the store
+/// derived a record `validate_agent_log_event` refuses — permanently, and (until
+/// the exporter stopped draining before it validated) taking the batch's spans
+/// and metrics with it. What cannot be exported is dropped from the projection;
+/// the durable audit event keeps all of it.
+#[test]
+fn an_unbounded_audit_event_still_derives_an_exportable_log_record() {
+    let mut event = audit_event("audit-unbounded", AgentAuditEventKind::RunCompleted);
+    event.attributes.insert(
+        "oversized".to_string(),
+        "x".repeat(rakka_agent_workflow::AGENT_EXPORT_ATTRIBUTE_VALUE_MAX_BYTES + 1),
+    );
+    event
+        .attributes
+        .insert("multiline".to_string(), "two\nlines".to_string());
+    for index in 0..rakka_agent_workflow::AGENT_EXPORT_MAX_ATTRIBUTES {
+        event
+            .attributes
+            .insert(format!("bulk-{index:03}"), "value".to_string());
+    }
+
+    let log = agent_log_event_from_audit_event(&event, AgentTimestampMillis::new(300))
+        .expect("the log event builds");
+    validate_agent_log_event(&log, AgentRedactionPolicy::new())
+        .expect("a durable audit event must always derive an exportable record");
+
+    assert!(
+        !log.attributes.contains_key("oversized"),
+        "an unbounded value is dropped from the projection"
+    );
+    assert!(
+        !log.attributes.contains_key("multiline"),
+        "so is a multi-line one"
+    );
+    // The correlation identities 17.13 asks a structured log to carry are the
+    // ones an over-full application set must never crowd out.
+    for key in [
+        rakka_agent_workflow::AGENT_LOG_ATTR_AUDIT_EVENT_ID,
+        rakka_agent_workflow::AGENT_LOG_ATTR_RUN_ID,
+        rakka_agent_workflow::AGENT_LOG_ATTR_CORRELATION_ID,
+        rakka_agent_workflow::AGENT_LOG_ATTR_TENANT_ID,
+    ] {
+        assert!(log.attributes.contains_key(key), "{key} must survive");
+    }
+    // And the durable record is untouched.
+    assert!(event.attributes.contains_key("oversized"));
+}

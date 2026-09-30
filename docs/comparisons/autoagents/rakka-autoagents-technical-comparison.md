@@ -92,7 +92,7 @@ validated as part of this evaluation.
 There is some release-documentation skew: the repository is `0.4.0`, while the
 published quick-start page reviewed during this evaluation still references
 `0.3.5`. The quick-start also requires Rust 1.91.1 or later. Rakka's MSRV is
-1.85, so a direct AutoAgents dependency would currently require either raising
+1.88, so a direct AutoAgents dependency would currently require either raising
 Rakka's MSRV, isolating the integration in a separate service/process, or
 pinning an older compatible AutoAgents version.
 
@@ -586,7 +586,7 @@ perform external I/O.
 
 ### MSRV Integration Decision
 
-AutoAgents' documented Rust requirement exceeds Rakka's 1.85 MSRV. Before
+AutoAgents' documented Rust requirement exceeds Rakka's 1.88 MSRV. Before
 adding a Rust dependency, choose explicitly among:
 
 - raising Rakka's MSRV and treating that as a public compatibility change;

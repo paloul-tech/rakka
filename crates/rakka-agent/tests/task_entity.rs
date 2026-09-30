@@ -22,24 +22,28 @@ use rakka_agent::testkit::{
 use rakka_agent::{
     init_agent_task_entity_sharding, load_agent_task_state, passivate_agent_task_entity,
     registered_agent_task_entity_ref, AgentAssignmentStatus, AgentAuthorityEnvelope,
-    AgentDefinition, AgentDefinitionId, AgentDependencyFailurePolicy, AgentEntityAddress,
-    AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore,
-    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter, AgentId,
-    AgentOperationId, AgentOperationKind, AgentRevisionNumber, AgentRevisionProvenance, AgentRunId,
-    AgentRunScope, AgentSchemaId, AgentSchemaPolicy, AgentSchemaRef, AgentScope, AgentSettings,
-    AgentTaskContent, AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId,
-    AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome, AgentTaskEntityCommand,
-    AgentTaskEntityMessage, AgentTaskEntityReply, AgentTaskEntityShardingSettings,
-    AgentTaskEntityStore, AgentTaskHistoryCursor, AgentTaskHistoryEntry, AgentTaskHistoryKind,
-    AgentTaskId, AgentTaskOutcome, AgentTaskOwnership, AgentTaskScope, AgentTaskSnapshot,
-    AgentTaskState, AgentTaskStatus, InMemoryAgentTaskHistoryStore, TenantId,
+    AgentBudgetAllocation, AgentBudgetDimension, AgentContinuousGoalSpec, AgentDefinition,
+    AgentDefinitionId, AgentDependencyFailurePolicy, AgentEntityAddress, AgentEntityClass,
+    AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentExchangeEnvelope,
+    AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter, AgentGoalId, AgentGoalMode,
+    AgentId, AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentRevisionNumber,
+    AgentRevisionProvenance, AgentRunId, AgentRunScope, AgentSchemaId, AgentSchemaPolicy,
+    AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent, AgentTaskCreation,
+    AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskDependencyDeclaration,
+    AgentTaskDependencyOutcome, AgentTaskEntityCommand, AgentTaskEntityMessage,
+    AgentTaskEntityReply, AgentTaskEntityShardingSettings, AgentTaskEntityStore,
+    AgentTaskHistoryCursor, AgentTaskHistoryEntry, AgentTaskHistoryKind, AgentTaskId,
+    AgentTaskOutcome, AgentTaskOwnership, AgentTaskScope, AgentTaskSnapshot, AgentTaskState,
+    AgentTaskStatus, AgentWakePolicy, AgentWakePolicyRevision, AgentWakeTriggerKind,
+    InMemoryAgentTaskHistoryStore, ScheduleRevision, TenantId,
     AGENT_TASK_CREATION_OUTCOME_PAYLOAD_TYPE, AGENT_TASK_CREATION_PAYLOAD_TYPE,
+    CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentCorrelationId, AgentTimestampMillis, PrincipalRef,
 };
 use rakka_core::ActorSystem;
-use rakka_persistence::InMemoryDurableStateStore;
+use rakka_persistence::{DurableStateStore, InMemoryDurableStateStore};
 use rakka_sharding::{ClusterSharding, EntityTypeKey};
 
 type TaskStore = CrashingStateStore<AgentTaskState>;
@@ -118,9 +122,15 @@ fn creation(dependencies: Vec<AgentTaskDependencyDeclaration>) -> AgentTaskCreat
         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
             .expect("the input is inline-bounded"),
         assignee: Some(agent_id()),
+        team: None,
         goal: None,
+        goal_mode: Default::default(),
+        goal_spec: None,
         parent: None,
         dependencies,
+        escrow: None,
+        wake: None,
+        delegation: None,
         telemetry: Default::default(),
     }
 }
@@ -301,7 +311,7 @@ impl Fixture {
     /// [`Self::settle`], but surfacing the first error instead of panicking —
     /// what a sweep needs, because an armed crash point kills the owner
     /// mid-settle and the injected loss is the point, not a failure.
-    async fn try_settle(&self) -> Result<(), String> {
+    async fn try_settle(&self) -> Result<rakka_agent::AgentTaskProgress, String> {
         let mut entity = AgentTaskEntityStore::new(
             task_scope(),
             self.tasks.clone(),
@@ -315,8 +325,7 @@ impl Fixture {
         entity
             .settle_side_effects(&self.router, self.now())
             .await
-            .map_err(|error| error.code().to_string())?;
-        Ok(())
+            .map_err(|error| error.code().to_string())
     }
 
     async fn snapshot(&self) -> AgentTaskSnapshot {
@@ -760,6 +769,111 @@ async fn a_run_that_refuses_its_assignment_retires_the_generation_and_leaves_the
     );
 }
 
+/// A delegated child that exhausts its assignments owes its delegation result
+/// from the terminating transition: each refused generation's escrow was
+/// released at its settle, so the terminal ledger is closed and the report is
+/// accurate — and under an owner that cannot answer the kind it stays
+/// outstanding for re-drive rather than vanishing.
+#[tokio::test]
+async fn an_assignments_exhausted_delegated_child_owes_its_delegation_result() {
+    let fx = Fixture::new(RunAcceptanceProbe::refusing());
+    fx.instantiate_agent().await;
+
+    let parent_run = AgentRunScope::new(
+        tenant(),
+        agent_id(),
+        AgentRunId::new("delegating-run").expect("run id should be valid"),
+    )
+    .expect("run scope should be valid");
+    let delegation =
+        rakka_agent::delegation_id_for(&parent_run, 1, 0).expect("the delegation id derives");
+    let mut delegated = creation(Vec::new());
+    delegated.delegation = Some(Box::new(rakka_agent::AgentTaskDelegationProvenance {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
+        delegation,
+        parent_task: AgentTaskId::new("parent-task").expect("task id should be valid"),
+        parent_run,
+        lineage: Vec::new(),
+        ancestors: Vec::new(),
+        depth: 1,
+        requested_skill: rakka_agent::AgentCapabilityId::new("summarize")
+            .expect("capability id should be valid"),
+        capability_scopes: Default::default(),
+        credential_bindings: Vec::new(),
+        result_schema: None,
+        budget: None,
+        deadline: None,
+    }));
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(delegated),
+        })
+        .await,
+    );
+
+    // The creation decided generation one; two sweeps decide the second and
+    // third refused generations, and the next decision exhausts the limit.
+    fx.settle().await;
+    fx.settle().await;
+    let deliveries_before = fx.run_transport.deliveries();
+    let exhausting = fx.try_settle().await;
+
+    let exhausted = fx.snapshot().await;
+    assert_eq!(exhausted.status, AgentTaskStatus::Failed);
+    assert_eq!(
+        exhausted
+            .terminal_reason
+            .as_ref()
+            .map(rakka_agent::AgentTaskTerminalReason::code),
+        Some("assignments-exhausted")
+    );
+
+    // Every refused generation's escrow was released at its settle: the
+    // terminal ledger holds nothing outstanding, which is exactly the gate
+    // the owed report reads its final consumption through.
+    let state = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the state loads")
+        .expect("the task exists");
+    assert_eq!(
+        state
+            .task()
+            .expect("the task was created")
+            .escrow
+            .outstanding()
+            .count(),
+        0,
+        "a refused generation must not leak its escrow"
+    );
+
+    // The terminating sweep owed and delivered the delegation result; the
+    // probe predates the kind, so its refusal is unsettleable — the sweep
+    // records the failed attempt on the outstanding exchange rather than
+    // erroring the pass, so one unanswerable envelope cannot wedge every
+    // other exchange the entity owes.
+    let progress = exhausting.expect("the sweep reports the inability without failing the pass");
+    assert_eq!(
+        progress.failed, 1,
+        "the owed report's refusal is the receiver's inability, recorded as a failed attempt"
+    );
+    assert_eq!(
+        fx.run_transport.deliveries(),
+        deliveries_before + 1,
+        "exactly the delegation result crossed after exhaustion"
+    );
+
+    // A later sweep re-drives the same exchange: still owed, still answered
+    // with the owner's inability, never dropped.
+    let progress = fx
+        .try_settle()
+        .await
+        .expect("the re-drive reports the inability without failing the pass");
+    assert_eq!(progress.failed, 1);
+    assert_eq!(fx.run_transport.deliveries(), deliveries_before + 2);
+}
+
 #[tokio::test]
 async fn a_dependency_declared_during_an_outstanding_assignment_blocks_the_refused_task() {
     let fx = Fixture::new(RunAcceptanceProbe::refusing());
@@ -826,6 +940,56 @@ async fn a_failed_dependency_cancels_its_dependents_by_default() {
     assert!(
         cancelled.assignment.is_none(),
         "a terminal task fences its run"
+    );
+}
+
+/// A dependency that fails while a run is live requests the cancellation
+/// rather than terminalizing over it.
+///
+/// The dependent is `InProgress` with an accepted run, which may hold a
+/// started effect whose outcome is unknown: terminalizing here would project
+/// terminal `Cancelled` over it, strand the escrow, and leave the run to
+/// discover the cancellation only if it ever proposed
+/// ([specification 8.7](../../docs/plans/rakka-agent/spec.md)).
+#[tokio::test]
+async fn a_failed_dependency_defers_while_its_dependents_run_is_live() {
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+    applied(fx.apply(create_command(Vec::new())).await);
+    let assigned = fx.snapshot().await;
+    assert_eq!(assigned.status, AgentTaskStatus::InProgress);
+    assert!(assigned.assignment.is_some(), "the run accepted");
+
+    applied(
+        fx.apply(AgentTaskEntityCommand::DeclareDependency {
+            operation_id: operation(AgentOperationKind::Command, "late-dependency"),
+            declaration: Box::new(dependency("upstream")),
+        })
+        .await,
+    );
+    applied(
+        fx.apply(AgentTaskEntityCommand::RecordDependencyOutcome {
+            operation_id: operation(AgentOperationKind::Command, "resolve"),
+            dependency: AgentTaskId::new("upstream").expect("task id should be valid"),
+            outcome: AgentTaskDependencyOutcome::Failed,
+        })
+        .await,
+    );
+
+    let deferred = fx.snapshot().await;
+    assert!(
+        !deferred.status.is_terminal(),
+        "the dependent defers to its live run, got {:?}",
+        deferred.status
+    );
+    let marker = deferred
+        .cancellation
+        .as_ref()
+        .expect("the cancellation request is durable");
+    assert_eq!(marker.reason.code(), "dependency-not-satisfied");
+    assert!(
+        deferred.outstanding_escrow > 0,
+        "the finalization gate is still closed"
     );
 }
 
@@ -907,7 +1071,22 @@ async fn a_human_owned_task_is_never_assigned_to_an_agent() {
 async fn a_cancelled_task_accepts_no_further_transition() {
     let fx = Fixture::new(RunAcceptanceProbe::accepting());
     fx.instantiate_agent().await;
-    applied(fx.apply(create_command(Vec::new())).await);
+    // Human-owned, so no run ever accepts and the cancel finalizes in its
+    // own transition — the no-active-run arm of specification 8.7. The
+    // deferred half, where an accepted run must wind down first, lives in
+    // `goal_contract.rs` and `cancellation_propagation.rs`.
+    let mut human = creation(Vec::new());
+    human.definition = human
+        .definition
+        .with_ownership(rakka_agent::AgentTaskOwnership::Human);
+    human.assignee = None;
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(human),
+        })
+        .await,
+    );
 
     applied(
         fx.apply(AgentTaskEntityCommand::Cancel {
@@ -1033,7 +1212,7 @@ async fn drive_dependency_flow(fx: &Fixture) -> Result<(), String> {
         })
         .await?)?;
     fx.try_settle().await?;
-    fx.try_settle().await
+    fx.try_settle().await.map(|_| ())
 }
 
 #[tokio::test]
@@ -1111,4 +1290,178 @@ async fn the_dependency_and_assignment_flow_survives_any_owner_loss() {
         }
     })
     .await;
+}
+
+/// A continuous goal mode for the root-control-task tests: a durable-timer
+/// wake with a bounded epoch, exactly what the slice 3.2 controller drives.
+fn continuous_mode() -> AgentGoalMode {
+    let mut epoch_budget = AgentBudgetAllocation::unbounded();
+    epoch_budget.set(AgentBudgetDimension::ModelCalls, Some(8));
+    let policy = AgentWakePolicy::new(
+        [AgentWakeTriggerKind::DurableTimer],
+        epoch_budget,
+        Some(60_000),
+    )
+    .expect("the wake policy is valid");
+    AgentGoalMode::Continuous(Box::new(AgentContinuousGoalSpec {
+        schedule_revision: ScheduleRevision::INITIAL,
+        wake_policy: AgentWakePolicyRevision::initial(policy, provenance(1))
+            .expect("the initial wake-policy revision is accepted"),
+        health_condition: AgentPolicyRef::new("nightly-health").expect("the policy ref is valid"),
+        epoch: None,
+    }))
+}
+
+#[tokio::test]
+async fn a_continuous_task_must_bind_its_goal() {
+    // A continuous root control task exists to admit epochs for a goal;
+    // without the binding there is nothing for the wake controller to fence,
+    // budget, or retire against, so the creation is refused closed.
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+
+    let mut untethered = creation(Vec::new());
+    untethered.goal_mode = continuous_mode();
+    let code = rejection_code(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(untethered),
+        })
+        .await,
+    );
+    assert_eq!(code, "task-continuous-without-goal");
+}
+
+#[tokio::test]
+async fn a_continuous_root_task_round_trips_its_mode() {
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+
+    let mut rooted = creation(Vec::new());
+    rooted.goal = Some(AgentGoalId::new(TASK).expect("the goal id is valid"));
+    rooted.goal_mode = continuous_mode();
+    let expected = rooted.goal_mode.clone();
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(rooted),
+        })
+        .await,
+    );
+
+    let state = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the task state loads")
+        .expect("the task state exists");
+    let task = state.task().expect("the task is created");
+    assert!(task.goal_mode.is_continuous());
+    assert_eq!(task.goal_mode, expected);
+}
+
+#[tokio::test]
+async fn a_wake_policy_revision_from_a_newer_binary_fails_closed_on_load() {
+    // The wake policy carries its own schema version so it can evolve
+    // independently of the task state's, which means the load gate must check
+    // it independently too: a task record whose embedded revision was written
+    // by a newer binary is unreadable even when the task state itself is not.
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+
+    let mut rooted = creation(Vec::new());
+    rooted.goal = Some(AgentGoalId::new(TASK).expect("the goal id is valid"));
+    rooted.goal_mode = continuous_mode();
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(rooted),
+        })
+        .await,
+    );
+
+    let persistence_id = task_scope().persistence_id();
+    let record = fx
+        .tasks
+        .load(&persistence_id)
+        .await
+        .expect("the task record loads")
+        .expect("the task record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the state serializes");
+    let stored = &mut value["task"]["goal_mode"]["continuous"]["wake_policy"]["schema_version"];
+    assert_eq!(
+        *stored,
+        serde_json::json!(CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION.get()),
+        "the doctored path must reach the embedded revision's schema version"
+    );
+    *stored = serde_json::json!(CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION.get() + 1);
+    let doctored: AgentTaskState =
+        serde_json::from_value(value).expect("the doctored state deserializes");
+    fx.tasks
+        .compare_and_set(&persistence_id, record.revision, doctored)
+        .await
+        .expect("the doctored state persists");
+
+    let error = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect_err("a wake policy from a newer binary must fail closed");
+    assert_eq!(error.code(), "schema-version-ahead");
+}
+
+#[tokio::test]
+async fn an_escrow_ledger_from_a_newer_binary_fails_closed_on_load() {
+    // The escrow ledger is a component of the task record with its own schema
+    // version, and every assignment, settlement, and return rewrites it. A
+    // ledger written by a newer binary must therefore be refused at load,
+    // not read with this binary's semantics and rewritten without the field
+    // it could not see.
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(creation(Vec::new())),
+        })
+        .await,
+    );
+
+    let persistence_id = task_scope().persistence_id();
+    let record = fx
+        .tasks
+        .load(&persistence_id)
+        .await
+        .expect("the task record loads")
+        .expect("the task record exists");
+    let current = rakka_agent::AgentRecordKind::EscrowLedger
+        .current_schema_version()
+        .get();
+    let mut value = serde_json::to_value(&record.state).expect("the state serializes");
+    let stored = &mut value["task"]["escrow"]["schema_version"];
+    assert_eq!(
+        *stored,
+        serde_json::json!(current),
+        "the doctored path must reach the ledger's schema version"
+    );
+    *stored = serde_json::json!(current + 1);
+    let doctored: AgentTaskState =
+        serde_json::from_value(value).expect("the doctored state deserializes");
+    fx.tasks
+        .compare_and_set(&persistence_id, record.revision, doctored)
+        .await
+        .expect("the doctored state persists");
+
+    let error = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect_err("an escrow ledger from a newer binary must fail closed");
+    assert_eq!(error.code(), "schema-version-ahead");
+}
+
+#[test]
+fn a_record_persisted_before_the_goal_mode_field_loads_as_finite() {
+    let mut value = serde_json::to_value(creation(Vec::new())).expect("the creation serializes");
+    value
+        .as_object_mut()
+        .expect("a creation is an object")
+        .remove("goal_mode");
+    let loaded: AgentTaskCreation =
+        serde_json::from_value(value).expect("a record without the field loads");
+    assert_eq!(loaded.goal_mode, AgentGoalMode::Finite);
 }

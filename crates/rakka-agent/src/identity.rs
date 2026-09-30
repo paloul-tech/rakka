@@ -186,6 +186,22 @@ validated_id! {
     pub AgentGoalId, "agent_goal_id"
 }
 
+impl AgentGoalId {
+    /// Derives the goal identity from the root task that coordinates it
+    /// ([specification 6.3](../../../docs/plans/rakka-agent/spec.md), open
+    /// decision 14's resolved default).
+    ///
+    /// Infallible by construction: both identities validate under the same
+    /// [`validate_identity_segment`] rules, and the task id already passed
+    /// them. The value coincides; the types and semantics stay distinct, so
+    /// goal coordination can later move to a dedicated entity without changing
+    /// the public contract.
+    #[must_use]
+    pub fn for_root_task(task: &AgentTaskId) -> Self {
+        Self(task.as_str().to_owned())
+    }
+}
+
 validated_id! {
     /// Identity of one durable, typed unit of work and its eventual public
     /// result ([specification 6.4](../../../docs/plans/rakka-agent/spec.md)).
@@ -223,6 +239,63 @@ validated_id! {
 }
 
 validated_id! {
+    /// Identity of one durable handoff of a task from a source run to a
+    /// target agent
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Derived by [`crate::coordination::handoff_id_for`] as a pure function
+    /// of the source run's `(turn, slot)` coordinate. It doubles verbatim as
+    /// the A2A message id and deduplication key of the handoff send, so
+    /// replaying one handoff resolves to the same recorded transfer or to an
+    /// explicit conflict, never to a second one.
+    pub AgentHandoffId, "agent_handoff_id"
+}
+
+validated_id! {
+    /// Identity of one durable agent team
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The sharding key of the team entity, whose durable state holds the
+    /// shared task board. A team is trusted application data: its id is
+    /// chosen by the wiring that creates it, never by model output.
+    pub AgentTeamId, "agent_team_id"
+}
+
+validated_id! {
+    /// Identity of one durable claim of a shared task-board item by a team
+    /// member ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Derived by [`crate::coordination::team_claim_id_for`] as a pure
+    /// function of the board entry's `(task, member, epoch)` coordinate at
+    /// the claiming transition, so replaying one claim resolves to the same
+    /// recorded arbitration, never to a second owner.
+    pub AgentTeamClaimId, "agent_team_claim_id"
+}
+
+validated_id! {
+    /// Identity of one durable moderated conversation
+    /// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The sharding key of the conversation entity, whose durable state holds
+    /// the ordered turn protocol. A conversation is trusted application data:
+    /// its id is chosen by the wiring that creates it, never by model output
+    /// or a wire send.
+    pub AgentConversationId, "agent_conversation_id"
+}
+
+validated_id! {
+    /// Identity of one durable workflow-tool invocation
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Derived by [`crate::workflow_tool::workflow_invocation_id_for`] as a
+    /// pure function of the parent run's `(turn, slot)` coordinate. It doubles
+    /// verbatim as the child workflow run id and the `StartRun` deduplication
+    /// key, so replaying one invocation creates or adopts the same durable
+    /// child run rather than a second one.
+    pub AgentWorkflowInvocationId, "agent_workflow_invocation_id"
+}
+
+validated_id! {
     /// Identity of one durable logical wake occurrence that may admit a
     /// continuous-goal epoch
     /// ([specification 6.9](../../../docs/plans/rakka-agent/spec.md)).
@@ -251,6 +324,16 @@ validated_id! {
     /// default space is tenant- or organization-scoped; cross-tenant sharing
     /// requires an explicit federation design.
     pub KnowledgeSpaceId, "knowledge_space_id"
+}
+
+validated_id! {
+    /// Identity of one appended communal claim, as the graph store recorded
+    /// it ([specification 13.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A mirror newtype: the graph crate owns the derived `ClaimId` and
+    /// depends on this crate, so the append receipt carries the id in this
+    /// crate's own validated form rather than importing the graph's.
+    pub AgentCommunalClaimId, "agent_communal_claim_id"
 }
 
 /// Durable scope of one agent entity: `(TenantId, AgentId)`
@@ -495,6 +578,153 @@ impl Display for AgentRunScope {
     }
 }
 
+/// Durable scope of one team entity: `(TenantId, AgentTeamId)`
+/// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// This is the sharding key of the team entity delivered by slice 5.2. Its
+/// durable state is the shared task board; the scope must not change once
+/// records exist.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentTeamScope {
+    tenant: TenantId,
+    team: AgentTeamId,
+}
+
+impl AgentTeamScope {
+    /// Creates a team scope, validating the tenant value.
+    pub fn new(tenant: TenantId, team: AgentTeamId) -> AgentIdentityResult<Self> {
+        validate_tenant(&tenant)?;
+        Ok(Self { tenant, team })
+    }
+
+    /// Tenant boundary of this team.
+    #[must_use]
+    pub const fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// Team identity within the tenant.
+    #[must_use]
+    pub const fn team(&self) -> &AgentTeamId {
+        &self.team
+    }
+
+    /// Flattened, injective key string for this scope.
+    #[must_use]
+    pub fn key(&self) -> String {
+        join_segments(&[self.tenant.as_str(), self.team.as_str()])
+    }
+
+    /// Sharded entity id addressing this team.
+    #[must_use]
+    pub fn entity_id(&self) -> EntityId {
+        EntityId::new(self.key())
+    }
+
+    /// Durable persistence id of this team's entity state.
+    #[must_use]
+    pub fn persistence_id(&self) -> PersistenceId {
+        PersistenceId::new(format!(
+            "{AGENT_TEAM_ENTITY_PERSISTENCE_PREFIX}:{}",
+            self.key()
+        ))
+    }
+
+    /// Parses a flattened scope key, failing closed on a malformed value.
+    pub fn parse(key: &str) -> AgentIdentityResult<Self> {
+        let [tenant, team] = split_segments(SCOPE_FIELD_TEAM, key)?;
+        Self::new(TenantId::new(tenant), AgentTeamId::new(team)?)
+    }
+
+    /// Parses the scope back out of a sharded entity id.
+    pub fn from_entity_id(entity_id: &EntityId) -> AgentIdentityResult<Self> {
+        Self::parse(entity_id.as_str())
+    }
+}
+
+impl Display for AgentTeamScope {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.key())
+    }
+}
+
+/// Durable scope of one moderated-conversation entity:
+/// `(TenantId, AgentConversationId)`
+/// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// This is the sharding key of the conversation entity delivered by slice
+/// 5.3. Its durable state is the ordered turn protocol; the scope must not
+/// change once records exist.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentConversationScope {
+    tenant: TenantId,
+    conversation: AgentConversationId,
+}
+
+impl AgentConversationScope {
+    /// Creates a conversation scope, validating the tenant value.
+    pub fn new(tenant: TenantId, conversation: AgentConversationId) -> AgentIdentityResult<Self> {
+        validate_tenant(&tenant)?;
+        Ok(Self {
+            tenant,
+            conversation,
+        })
+    }
+
+    /// Tenant boundary of this conversation.
+    #[must_use]
+    pub const fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// Conversation identity within the tenant.
+    #[must_use]
+    pub const fn conversation(&self) -> &AgentConversationId {
+        &self.conversation
+    }
+
+    /// Flattened, injective key string for this scope.
+    #[must_use]
+    pub fn key(&self) -> String {
+        join_segments(&[self.tenant.as_str(), self.conversation.as_str()])
+    }
+
+    /// Sharded entity id addressing this conversation.
+    #[must_use]
+    pub fn entity_id(&self) -> EntityId {
+        EntityId::new(self.key())
+    }
+
+    /// Durable persistence id of this conversation's entity state.
+    #[must_use]
+    pub fn persistence_id(&self) -> PersistenceId {
+        PersistenceId::new(format!(
+            "{AGENT_CONVERSATION_ENTITY_PERSISTENCE_PREFIX}:{}",
+            self.key()
+        ))
+    }
+
+    /// Parses a flattened scope key, failing closed on a malformed value.
+    pub fn parse(key: &str) -> AgentIdentityResult<Self> {
+        let [tenant, conversation] = split_segments(SCOPE_FIELD_CONVERSATION, key)?;
+        Self::new(
+            TenantId::new(tenant),
+            AgentConversationId::new(conversation)?,
+        )
+    }
+
+    /// Parses the scope back out of a sharded entity id.
+    pub fn from_entity_id(entity_id: &EntityId) -> AgentIdentityResult<Self> {
+        Self::parse(entity_id.as_str())
+    }
+}
+
+impl Display for AgentConversationScope {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.key())
+    }
+}
+
 /// The immutable binding of one run to the single task it serves
 /// ([specification 6.5](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -582,12 +812,20 @@ pub const AGENT_TASK_ENTITY_PERSISTENCE_PREFIX: &str = "agent-task-entity";
 /// Prefix of the durable persistence id of a run entity's state.
 pub const AGENT_RUN_ENTITY_PERSISTENCE_PREFIX: &str = "agent-run-entity";
 
+/// Prefix of the durable persistence id of a team entity's state.
+pub const AGENT_TEAM_ENTITY_PERSISTENCE_PREFIX: &str = "agent-team-entity";
+
+/// Prefix of the durable persistence id of a conversation entity's state.
+pub const AGENT_CONVERSATION_ENTITY_PERSISTENCE_PREFIX: &str = "agent-conversation-entity";
+
 /// Prefix of an agent-private memory namespace.
 pub const AGENT_MEMORY_NAMESPACE_PREFIX: &str = "agent-memory";
 
 const SCOPE_FIELD_AGENT: &str = "agent scope";
 const SCOPE_FIELD_TASK: &str = "task scope";
 const SCOPE_FIELD_RUN: &str = "run scope";
+const SCOPE_FIELD_TEAM: &str = "team scope";
+const SCOPE_FIELD_CONVERSATION: &str = "conversation scope";
 
 fn join_segments(segments: &[&str]) -> String {
     let mut key = String::new();
@@ -640,6 +878,8 @@ macro_rules! scope_serde {
 scope_serde!(AgentScope);
 scope_serde!(AgentTaskScope);
 scope_serde!(AgentRunScope);
+scope_serde!(AgentTeamScope);
+scope_serde!(AgentConversationScope);
 
 /// Class of durable operation a stable operation id names
 /// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md)).
@@ -665,6 +905,10 @@ pub enum AgentOperationKind {
     ResultProposal,
     /// A task's validation decision on a result proposal.
     ResultDecision,
+    /// An authenticated human or external service submitting a typed result
+    /// to a human-owned task
+    /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+    ResultSubmission,
     /// A parent-local escrow allocation debit.
     BudgetAllocation,
     /// A run-local dispatch-time budget reservation.
@@ -685,16 +929,35 @@ pub enum AgentOperationKind {
     WakeAdmission,
     /// Admission of one continuous-goal epoch.
     EpochAdmission,
+    /// A completed epoch returning its result to the controller.
+    EpochResult,
+    /// One goal evaluation: the committed effect, its record, and the
+    /// exchange that carries the record to the coordinating task.
+    GoalEvaluation,
     /// Append of one communal knowledge-graph claim.
     ClaimAppend,
     /// Durable delegation of work to a specialist agent.
     Delegation,
+    /// A delegated child task returning its terminal outcome to the parent
+    /// run that created it.
+    DelegationResult,
+    /// A child workflow run returning its terminal outcome to the parent run
+    /// that invoked it.
+    WorkflowResult,
     /// Durable handoff of a task to another agent.
     Handoff,
     /// A team member's claim on a shared task-board item.
     TeamClaim,
+    /// A mediated peer message appended to a team's durable message ring.
+    TeamMessage,
+    /// A team lifecycle or board operation other than a claim or message:
+    /// posting a task, joining, or leaving.
+    TeamOperation,
     /// One moderated conversation turn.
     ConversationTurn,
+    /// A conversation lifecycle operation other than a turn: creation, an
+    /// early end, or the lazy expiry observation.
+    ConversationOperation,
     /// Publication of a new agent definition revision.
     DefinitionUpdate,
     /// Acceptance of a settings update.
@@ -709,6 +972,12 @@ pub enum AgentOperationKind {
     LifecycleTerminate,
     /// A cancellation request or propagation step.
     Cancellation,
+    /// A dependent task registering itself with the upstream task it depends
+    /// on, so the upstream can notify it on terminalization.
+    DependencyRegistration,
+    /// An upstream task reporting its terminal outcome to one registered
+    /// dependent.
+    DependencyOutcome,
 }
 
 impl AgentOperationKind {
@@ -723,6 +992,7 @@ impl AgentOperationKind {
             Self::RunAcceptance => "run-acceptance",
             Self::ResultProposal => "result-proposal",
             Self::ResultDecision => "result-decision",
+            Self::ResultSubmission => "result-submission",
             Self::BudgetAllocation => "budget-allocation",
             Self::BudgetReservation => "budget-reservation",
             Self::BudgetSettlement => "budget-settlement",
@@ -733,11 +1003,18 @@ impl AgentOperationKind {
             Self::A2aSend => "a2a-send",
             Self::WakeAdmission => "wake-admission",
             Self::EpochAdmission => "epoch-admission",
+            Self::EpochResult => "epoch-result",
+            Self::GoalEvaluation => "goal-evaluation",
             Self::ClaimAppend => "claim-append",
             Self::Delegation => "delegation",
+            Self::DelegationResult => "delegation-result",
+            Self::WorkflowResult => "workflow-result",
             Self::Handoff => "handoff",
             Self::TeamClaim => "team-claim",
+            Self::TeamMessage => "team-message",
+            Self::TeamOperation => "team-operation",
             Self::ConversationTurn => "conversation-turn",
+            Self::ConversationOperation => "conversation-operation",
             Self::DefinitionUpdate => "definition-update",
             Self::SettingsUpdate => "settings-update",
             Self::LifecycleCommand => "lifecycle-command",
@@ -745,6 +1022,8 @@ impl AgentOperationKind {
             Self::LifecycleResume => "lifecycle-resume",
             Self::LifecycleTerminate => "lifecycle-terminate",
             Self::Cancellation => "cancellation",
+            Self::DependencyRegistration => "dependency-registration",
+            Self::DependencyOutcome => "dependency-outcome",
         }
     }
 }

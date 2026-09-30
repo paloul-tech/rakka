@@ -645,7 +645,12 @@ Acceptance of a cancellation request MUST immediately fence new model, tool,
 workflow, and delegation dispatch for the affected scope. Cancellation MUST
 track durable progress through request, propagation, quiescence, optional
 reconciliation, and terminal completion. It MUST NOT be represented only by a
-single in-memory flag or best-effort broadcast.
+single in-memory flag or best-effort broadcast. A memory promotion or a
+communal claim append is not new work in this sense — each copies work the run
+has already recorded into a longer-lived tier — so the fence does not apply to
+it: one committed on a live run that then winds down still dispatches, one MAY
+be accepted while the run winds down, and one MAY be accepted for a bounded
+window after the run ends (Sections 13.3 and 13.4).
 
 If any started consequential effect has an unknowable outcome, the task MUST
 remain nonterminal in `WaitingForReconciliation` with cancellation requested.
@@ -717,6 +722,12 @@ MUST NOT have two active claim owners unless its definition explicitly permits
 a replicated/quorum execution mode with separate runs and result policy. Team
 membership, backlog, and peer messages are correctness/coordination state and
 MUST NOT be implemented only as communal knowledge-graph claims.
+
+A board-governed task creation MAY defer its assignee, but the unclaimed wait
+MUST be bounded by a definition horizon observed lazily — a task whose team
+never produces a claim expires with a stable terminal reason and settles its
+escrow rather than parking silently — unless the definition explicitly opts
+into an unbounded wait.
 
 The team board does not grant access to member private memory. Shared artifacts
 and knowledge spaces remain explicitly authorized. An idle team or member MUST
@@ -872,6 +883,18 @@ enum AgentLoopPhase {
     Complete,
 }
 ```
+
+A turn rests on the turn's own effects. `AwaitingTools` holds exactly while an
+effect of the turn is outstanding — every outstanding effect except a memory
+promotion or a communal claim append (Sections 13.3 and 13.4) — and the last
+such result rests the turn whatever else the run holds: complete, or awaiting
+a closed fan-in group's children. A promotion or a claim append is outside
+the turn: committed by a command beside the turn's in-flight work, it is
+never among the effects a turn waits on, it never holds a turn open, and its
+own outcome never rests one. An implementation MUST NOT leave a run parked in
+`AwaitingTools` with no effect of the turn outstanding or ambiguous; a record
+in that shape is rested by the next settle pass that touches it, exactly as
+the last result would have rested it.
 
 The durable loop state MUST include at least:
 
@@ -1059,6 +1082,12 @@ model request and converts the provider response into a bounded Rakka
 result/artifact. The durable loop, effect model, and testkit MUST depend only
 on this trait.
 
+The trait's `call_with(request, credential)` is the per-attempt entry the
+dispatcher uses: the ephemeral credential it resolved for the model
+profile's binding is handed to the adapter for that attempt only and is
+dropped with it; `call(request)` remains for adapters that need none, and
+`call_with` defaults to it. (Phase 7 slice 7.1, 2026-09-21.)
+
 The Rig-backed implementation of the trait MUST live behind a `rig` cargo
 feature of `rakka-agent`. The feature SHOULD be enabled by default, but the
 crate MUST compile and pass its tests with `--no-default-features`, and the
@@ -1164,6 +1193,14 @@ enum AgentEffectStatus {
 terminal outcomes for one effect generation. Reconciliation of an
 indeterminate effect records evidence against that outcome; if a new invocation
 is authorized, it uses a new effect generation.
+
+A failed or exhausted effect is recorded under the stable code of the
+dispatch step that failed. Where one party decided the failure — a guardrail
+stage, a credential resolver, an executor — the record SHOULD also carry that
+party's own stable code, and for a guardrail its stage identity, as a bounded
+field beside the step's code. The field is observability: a dispatch,
+recovery, or resolution decision MUST NOT read it, and its absence MUST NOT change
+any outcome.
 
 ### 11.4 Dispatch Invariants
 
@@ -1381,6 +1418,14 @@ Entries SHOULD be ordered by a monotonic sequence and include:
 An append replay with the same operation ID MUST return the original logical
 result without creating another entry.
 
+A tool-result entry SHOULD additionally name the tool that produced it and the
+effect whose outcome it records, so that a reader deriving claims or
+promotions from tool output can select by tool without a second durable
+record. Both are provenance, never authority: they are outside the entry's
+content hash and every derived identity, nothing resolves or infers from
+them, and an entry persisted without them MUST decode as one that names
+neither.
+
 Short-term memory MAY retain a bounded recent window plus rolling summaries.
 Terminal-run retention is controlled by tenant policy.
 
@@ -1403,7 +1448,36 @@ A private memory SHOULD contain:
 
 Promotion, consolidation, or demotion from short-term memory MUST be an
 idempotent durable effect. Embeddings are rebuildable derived projections, not
-the only copy of memory content.
+the only copy of memory content. A promotion is outside the run's turn
+(Section 9.4): committed while a turn's effects are in flight, it never holds
+the turn open, and its outcome never rests one.
+
+A promotion MAY select by role within its sequence window: a request that
+names a role set promotes only the window's entries of those roles, and one
+that names none promotes every entry. The window's size bound applies at
+commit; the executor applies the filter to the durably read window and MUST
+refuse a window that selects nothing rather than succeed with an empty
+receipt. Identity is per source entry, so a filtered promotion and an
+unfiltered one converge on the same records.
+
+A run that has ended `Completed`, `Failed`, or `Cancelled` MUST still accept a
+promotion for a deployment-configured window after its terminal stamp, so
+that a run which started and ended inside one application sweep interval is
+promoted at all. The promotion is exempt from the wind-down fence (Section
+8.7), rides the run's ordinary outbox, and its outcome lands on the terminal
+record without moving the status, phase, terminal reason, or terminal stamp;
+the application keeps pumping the terminal run's outbox until it drains. Past
+the window, or when the terminal record carries no stamp, the request is
+refused with a stable code; a zero window restores the plain terminal
+refusal. A run that ended `HandedOff` or `Superseded` is refused as terminal
+whatever the window: responsibility moved, and the successor run promotes. An
+ambiguous post-terminal attempt is retried under the effect's idempotency key,
+and a run that has ended opens no reconciliation checkpoint — an ambiguous
+outcome that cannot be retried stays on the effect record, resolvable by an
+explicit decision, and the terminal status does not move. Effect identities
+are never reused within a turn, whatever the turn has since dropped, so a
+promotion committed after a turn's effects cleared cannot collide with one of
+them.
 
 ### 13.4 Communal Knowledge Graph
 
@@ -1431,6 +1505,23 @@ claim.
 Policy MAY require HITL or a verifier service before a claim becomes
 `Verified`, especially when it can authorize or materially influence a
 high-impact effect.
+
+A claim append is an idempotent durable effect of the run that requests it,
+and a definitively failed or exhausted append MUST NOT terminate that run. A
+claim is a record about the run's work, not the work: the failure stays on the
+effect record, and the initiator MAY re-issue the append under a new operation
+id. That a claim may later be read as evidence (Section 8.3) does not make a
+failed append correctness-bearing — an evaluation reads whatever the graph
+holds when it runs, and a claim that never landed is evidence the evaluator
+does not see, never evidence it sees wrongly. An append is outside the run's
+turn exactly as a promotion is (Section 9.4): it never holds a turn open, and
+its outcome never rests one.
+
+A claim append shares the promotion's post-terminal window (Section 13.3)
+under the same rules: exempt from the wind-down fence, accepted while the run
+winds down and for the window after it ends `Completed`, `Failed`, or
+`Cancelled`, refused past the window or on an unstamped terminal record, and
+retried rather than parked when an attempt is ambiguous.
 
 ### 13.5 Memory Context Snapshot
 
@@ -1493,6 +1584,13 @@ cluster traffic and MUST NOT become a public client transport.
 Incoming task messages, cancellations, settings commands, gate resolutions,
 and other state-changing operations MUST be durably accepted and deduplicated
 before successful acknowledgement.
+
+An inbound message MUST pass the deployment's `A2aIngress` guardrail chain,
+where one is installed, after the operation's authorization and before the
+command it carries is durably accepted; a blocked message is refused with
+`guardrail-blocked` and creates nothing, and a transformed message is what is
+accepted and projected. The chain is installed on the service
+(`with_ingress_guardrails`) and attested on the dispatch authority.
 
 ### 14.2 Task Identity and Projection
 
@@ -1641,9 +1739,26 @@ hold a thread or agent actor while waiting.
 - The runtime MUST apply versioned ordered guardrail stages, as configured, to
   A2A ingress/egress, retrieval/memory ingress, model request/response, and tool
   request/response boundaries.
+- Every one of those seven boundaries has an evaluation point: model request,
+  tool request, and model response at the dispatch authority (the model
+  response in the dispatcher's Model arm after the turn validates and before
+  its outcome exists; a blocked turn fails the effect once under
+  `guardrail-blocked` and a transformed turn is what the run records); tool
+  response in the dispatcher after execution; memory ingress on the retrieval
+  path; A2A ingress at the agents surface's authorized leaves, once per
+  request, directly after authorization and before any entity command; A2A
+  egress in the in-process delegation and handoff send executors before the
+  message reaches the surface. A deployment attests the memory and the A2A
+  chains on its authority (`with_memory_ingress`, `with_a2a_guardrails`);
+  unattested, the authority does not count those boundaries, so a mandatory
+  stage bound only there refuses dispatch `guardrail-stage-unevaluated`.
 - A guardrail outcome MUST be one of an explicit bounded set such as `allow`,
   `block`, `transform`, `report-only`, or `require-checkpoint`, with a stable
   reason code and protected evidence reference when required.
+- A durable record MAY carry a guardrail's stage identity and stable reason
+  code. It MUST NOT carry the refusal's message, the evaluated content, or a
+  protected evidence reference outside the bounded failure detail that
+  already holds one.
 - Deployment/tenant policy MAY add mandatory guardrails that an agent
   definition, setup, model, or later settings update MUST NOT remove or weaken.
 - A guardrail transformation MUST be deterministic under a recorded revision
@@ -1905,6 +2020,13 @@ logical GenAI span with retry events. Durable Rakka effect attempts MUST remain
 individually correlatable because they govern fencing, idempotency, and
 indeterminate outcomes.
 
+The bounded model request the adapter receives carries the run's durable trace
+context (Section 17.5) — the context the model effect was committed under —
+so the adapter MAY parent its provider span on the run's trace rather than
+root one of its own. The context is observability only: the adapter MUST NOT
+read it for inference, and a request built or encoded without it decodes to
+the empty context.
+
 ### 17.9 Tool and Effect Observability
 
 Every scheduled tool effect and dispatcher attempt MUST be traceable from
@@ -1963,6 +2085,12 @@ The span that opens a checkpoint MUST end after the durable wait and
 notification effect are accepted. No span object is held during passive wait.
 The later resolution/resume span MUST link to the parked span and the incoming
 human/service request span.
+
+The resolution span's subject is the resolving transition. It MUST be closed
+on the call whose transition committed the resolution, whether or not the
+work that followed the commit succeeded, and it MUST NOT be closed for a
+decision that left the checkpoint open, for a replay of an applied
+resolution, or for a refused one.
 
 Recovery spans MUST include bounded recovery cause and outcome, prior state,
 new owner/runtime component, recovered pending counts, stale-write conflicts,
@@ -2533,8 +2661,18 @@ without one remain open.
    runs' promotions derive disjoint memory identities (slice 2.1).*
 2. **What is the default communal boundary?** Recommended: tenant or
    organization `KnowledgeSpaceId`; no implicit cross-tenant global graph.
+   *Disposition (M2): accepted structurally — every graph operation is
+   addressed through `KnowledgeSpaceScope`, whose injective key includes the
+   tenant, so a cross-tenant graph is unrepresentable rather than merely
+   disallowed; federation would be an explicit later design (slice 2.3).*
 3. **Does every agent-written claim begin as `Proposed`?** Recommended: yes;
    policy or HITL promotes consequential claims to `Verified`.
+   *Disposition (M2): accepted — `Claim::new` takes no trust parameter, the
+   `Proposed ⇔ zero-transitions` coherence invariant is re-validated on every
+   load, the store's append door refuses anything else, and `Verified` is
+   reachable only through the append-only transition path, gated for
+   consequential claims by a slice 1.10 checkpoint grant bound to the exact
+   claim content and history ordinal (slice 2.3).*
 4. **Which model calls are safe to retry?** Recommended: an explicit
    deployment policy based on provider idempotency, cost, and replay tolerance.
    *Disposition (M1): accepted — the adapter declares an explicit
@@ -2569,6 +2707,17 @@ without one remain open.
    the database-agnostic SPI against at least two structurally different
    implementations or contract test doubles before choosing reference
    adapters.
+   *Disposition (M2): accepted — no reference backend is named in the domain
+   specification. The representative claim, traversal, tenancy, and
+   bounded-query families are captured as the conformance clauses themselves,
+   tabled in the `rakka-agent-knowledge-graph` conformance-module docs, and
+   the SPI is validated by running that suite unchanged against two
+   structurally different implementations: the in-memory reference store and
+   the relational `rakka-agent-knowledge-graph-postgres` adapter (scenario
+   20, with zero agent-domain change). Migration queries stay backend-owned —
+   the portable SPI deliberately has no migration surface, so each backend
+   crate owes its own idempotence and concurrent-migrator proofs
+   (slice 2.4).*
 9. **Can authorization be resolved by a service without a human?**
    Recommended: yes, if the resolver is authenticated, authorized, audited,
    and bound to the same exact effect intent.
@@ -2607,12 +2756,39 @@ without one remain open.
     underlying value for the goal/root task/initial run, but keep
     `AgentGoalId`, `AgentTaskId`, and `AgentRunId` as separate types and
     contracts.
+    *Disposition (M4): accepted as the resolved default —
+    `AgentGoalId::for_root_task` derives the goal id from the root
+    `AgentTaskId` value when a creation institutes a goal without an explicit
+    binding; the types, validation, and semantics stay distinct; the root
+    `AgentTaskEntity` coordinates the goal record inside its own
+    compare-and-set, so a dedicated goal entity can later take over without
+    changing the public contract (slice 4.1).*
 15. **Who selects a specialist agent?** Recommended: the model/planner requests
     a skill, while an application-owned authorized catalog resolves the
     concrete `AgentId`, endpoint, compatible contract, and scopes.
+    *Disposition (M4): accepted — model output can only name an
+    `AgentCapabilityId` skill through the one declared coordination tool the
+    loop intercepts (unknown fields fail the parse, so an agent id or
+    endpoint in model output is refused rather than ignored); the
+    application-wired `AgentDelegationCatalog` resolves the concrete agent,
+    logical endpoint, task definition, scopes, and compatibility inside the
+    same compare-and-set that persists the delegation record, replays reuse
+    the recorded resolution verbatim, and the resolved selection travels as
+    `io.rakka.agent.id`/`io.rakka.agent.task-definition` on the send
+    (slice 4.3).*
 16. **How does a compiled workflow appear as a tool?** Recommended: a versioned
     descriptor creates or adopts an independently durable child workflow run;
     never treat the whole workflow as one opaque retryable external effect.
+    *Disposition (M4): accepted — the versioned `AgentWorkflowToolDescriptor`
+    is trusted deployment wiring the loop intercepts by name; the derived
+    invocation id is the child workflow run id and the generation-free
+    `StartRun` deduplication key, so create-or-adopt is an identity property
+    (a replay deduplicates in the child run's own durable inbox and adopts);
+    only the start-or-adopt is an agent-side effect, the child's internal
+    effects keep their own durable boundaries, the parent waits as fan-in
+    membership, and the child's terminal outcome returns as the deduplicated
+    `RecordWorkflowResult` command the hosting application relays
+    (slice 4.5).*
 17. **What maps to A2A `Task.id`?** Recommended: `AgentTaskId`; preserve it
     across handoff while each assignee execution receives a new `AgentRunId`.
     *Disposition (M1): accepted as the equal mapping — A2A `Task.id` is the

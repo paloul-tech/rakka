@@ -8,7 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       run_postgres:
-        description: Run PostgreSQL integration tests.
+        description: >-
+          Run PostgreSQL integration tests on this manual run. They always run
+          on pull requests and pushes; this input only affects dispatch.
         type: boolean
         default: false
       run_local_cluster:
@@ -70,16 +72,18 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install MSRV Rust
-        uses: dtolnay/rust-toolchain@1.85.0
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Install Protobuf compiler
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@v2
-
+      # Deliberately uncached: a restored build cache let this job stay green
+      # for two months while rig-core 0.37.0 and the lockfile's tonic and icu
+      # pins no longer built on the declared MSRV, because cargo never
+      # recompiled the restored units. A cold check is the only one that can
+      # fail for the reason it exists (issue #73).
       - name: Check workspace on MSRV
         run: cargo check --workspace --all-targets
 
@@ -105,10 +109,21 @@ jobs:
   postgres:
     name: PostgreSQL Integration
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_postgres }}
+    # Runs on every pull request and push, not only on manual dispatch. What
+    # these suites prove cannot be proven any other way: the genuinely
+    # concurrent compare-and-set race, cross-scope invisibility, and the
+    # filter-before-ranking predicates are properties of live SQL, so gating
+    # them behind a dispatch input meant the DSN-gated tests effectively never
+    # ran. A service container is cheap next to a regression that reaches a
+    # release. The dispatch input remains, so a manual run can still skip this
+    # job when it only wants the other gated ones.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_postgres }}
     services:
       postgres:
-        image: postgres:16
+        # The pgvector image is a drop-in postgres:16 with the vector
+        # extension package installed, so the rakka-agent-postgres retrieval
+        # tests run instead of probe-skipping.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres
@@ -136,6 +151,8 @@ jobs:
         run: |
           cargo test -p rakka-persistence-postgres
           cargo test -p rakka-sharding-postgres
+          cargo test -p rakka-agent-postgres
+          cargo test -p rakka-agent-knowledge-graph-postgres
 
   kubernetes-dry-run:
     name: Kubernetes Scenario Dry Run

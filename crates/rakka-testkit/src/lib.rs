@@ -1064,6 +1064,9 @@ pub async fn expect_grpc_unary_status<T>(
 }
 
 /// Collects all successful items from a gRPC response stream.
+// The stream's items are `Result<_, tonic::Status>` by the protocol contract,
+// so the collector's error is not ours to box.
+#[allow(clippy::result_large_err)]
 pub async fn collect_grpc_stream<T>(mut stream: GrpcResponseStream<T>) -> GrpcResult<Vec<T>> {
     let mut values = Vec::new();
     while let Some(next) = stream.next().await {

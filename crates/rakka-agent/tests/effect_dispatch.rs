@@ -2,7 +2,9 @@
 //! injected at every durable boundary.
 //!
 //! Specification: sections 11.3 through 11.6; scenarios 5 through 9 of
-//! section 18, and the dispatch invariants of 11.4. The run's effects travel
+//! section 18, the generation half of scenario 10, the dispatcher-restart
+//! half of scenario 23, the effect half of scenario 57, and the dispatch
+//! invariants of 11.4. The run's effects travel
 //! the production path here: committed into the run's durable state, flushed
 //! as dispatch tickets into the agent-workflow outbox, leased and fenced by
 //! the dispatcher fleet, invoked through the model adapter and tool executor,
@@ -90,6 +92,8 @@ struct DispatchFixture {
     credentials: ScriptedCredentialResolver,
     probe: KillSwitchProbe,
     promotions: Option<Arc<dyn rakka_agent::AgentMemoryPromotionExecutor>>,
+    claim_appends: Option<Arc<dyn rakka_agent::AgentClaimAppendExecutor>>,
+    segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
 }
 
 impl DispatchFixture {
@@ -134,7 +138,20 @@ impl DispatchFixture {
             credentials: ScriptedCredentialResolver::new("live-secret-token"),
             probe: KillSwitchProbe::new(),
             promotions: None,
+            claim_appends: None,
+            segments: None,
         }
+    }
+
+    /// Wires the dispatch pipeline with a segment sink, so what the worker
+    /// closes is observable.
+    /// Wires the sink to the dispatch pipeline *and* the run entity: the park
+    /// and the resolution are run transitions, the attempt is the dispatcher's,
+    /// and 17.9 is about the links between them.
+    fn with_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
+        self.fx = self.fx.with_segments(sink.clone());
+        self.segments = Some(sink);
+        self
     }
 
     /// Wires the run with session memory and the pipeline with the promotion
@@ -149,11 +166,30 @@ impl DispatchFixture {
         self
     }
 
+    /// Wires the pipeline with a claim-append executor.
+    fn with_claim_appends(
+        mut self,
+        executor: Arc<dyn rakka_agent::AgentClaimAppendExecutor>,
+    ) -> Self {
+        self.claim_appends = Some(executor);
+        self
+    }
+
     async fn start(&self) {
         self.fx
             .instantiate_agent_with_envelope(envelope_for_registry(&self.registry))
             .await;
         self.fx.create_task().await;
+    }
+
+    /// [`Self::start`] with an ingress trace context on the task creation, so
+    /// every effect the run commits carries a context to derive identities
+    /// from.
+    async fn start_traced(&self, telemetry: rakka_agent_workflow::AgentTelemetryContext) {
+        self.fx
+            .instantiate_agent_with_envelope(envelope_for_registry(&self.registry))
+            .await;
+        self.fx.create_task_traced(telemetry).await;
     }
 
     /// A fresh dispatch worker over the shared durable stores.
@@ -170,15 +206,26 @@ impl DispatchFixture {
                 self.fx.agents.clone(),
                 AgentToolAuthority::new(self.registry.clone()),
             )),
-            Arc::new(
-                InProcessRunResultDelivery::new(
+            Arc::new({
+                let mut delivery = InProcessRunResultDelivery::new(
                     self.fx.runs.clone(),
                     self.fx.effects.clone(),
                     self.fx.router.clone(),
                     self.fx.clock.clone(),
                 )
-                .with_effect_policies(self.fx.policies.clone()),
-            ),
+                .with_effect_policies(self.fx.policies.clone());
+                if let Some(metrics) = &self.fx.metrics {
+                    delivery = delivery.with_metrics(metrics.clone());
+                }
+                // The delivery drives the run entity too, so it is a driver
+                // under the every-driver rule: a result it records closes
+                // the run's own segments (the reconciliation park among
+                // them) into the same sink.
+                if let Some(segments) = &self.segments {
+                    delivery = delivery.with_segments(segments.clone());
+                }
+                delivery
+            }),
         )
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
         .with_probe(Arc::new(self.probe.clone()))
@@ -186,6 +233,12 @@ impl DispatchFixture {
         .with_credential_resolver(Arc::new(self.credentials.clone()));
         if let Some(promotions) = &self.promotions {
             pipeline = pipeline.with_memory_promotion_executor(promotions.clone());
+        }
+        if let Some(claim_appends) = &self.claim_appends {
+            pipeline = pipeline.with_claim_append_executor(claim_appends.clone());
+        }
+        if let Some(segments) = &self.segments {
+            pipeline = pipeline.with_segments(segments.clone());
         }
         pipeline
     }
@@ -689,6 +742,339 @@ async fn an_unknown_reconciliation_finding_is_requeried_before_any_retry() {
     assert_eq!(run.status, AgentRunStatus::Completed);
 }
 
+/// The two ambiguous-recovery settlements that export nothing without this.
+///
+/// `park_indeterminate` was given a segment carrying
+/// `rakka.agent.effect.status = indeterminate`, but the arms that reach the
+/// *same* durable outcome by another route were not: the `NonIdempotent` arm
+/// of `recover_ambiguous` hand-rolled the delivery, the counter, and the ticket
+/// settlement without a segment, and `retry_ambiguous` closed none when the
+/// ambiguous losses spent the last of the generation's budget. Between them
+/// they cover the canonical case — a worker that dies after the durable
+/// `Started` write — so a tail-sampling policy keyed on the status attribute
+/// retained nothing for the outcome the attribute exists to select.
+#[tokio::test]
+async fn the_ambiguous_recovery_settlements_close_the_segments_that_select_them() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_segments(segments.clone());
+    fx.start().await;
+
+    fx.pump_until_tool_ticket().await;
+    fx.probe.arm(AgentDispatchWindow::AfterInvocation);
+    let _pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Indeterminate),
+        "the non-idempotent generation parks, or this proves nothing"
+    );
+    let parked: Vec<_> = segments
+        .segments()
+        .into_iter()
+        .filter(|segment| {
+            segment
+                .attributes
+                .get(rakka_agent::SEGMENT_ATTR_EFFECT_STATUS)
+                == Some(&AgentRunEffectStatus::Indeterminate.as_label().to_string())
+        })
+        .collect();
+    assert!(
+        !parked.is_empty(),
+        "the indeterminate park must close a segment a retention rule can select"
+    );
+    assert!(
+        parked
+            .iter()
+            .all(|segment| segment.outcome == rakka_agent::AgentSegmentOutcome::Error),
+        "an indeterminate outcome is an error event under 17.9"
+    );
+    assert!(
+        parked
+            .iter()
+            .all(|segment| segment.error_code.as_deref() == Some("dispatcher-lost-after-started")),
+        "and it names the stable code the loss produced: {parked:?}"
+    );
+}
+
+/// An indeterminate transition links the ambiguous dispatch attempt and the
+/// later reconciliation decision ([specification 17.9]), and the decision,
+/// when it arrives, exports under the identity the transition linked forward
+/// to and links the park and the request back.
+///
+/// Two components close these segments — the dispatcher parks, the run
+/// records the park, an operator resolves — and none of them ever sees
+/// another's segment. What they share is the effect record, so every identity
+/// is derived from it, and this asserts the derivations agree end to end.
+#[tokio::test]
+async fn an_indeterminate_transition_links_the_ambiguous_attempt_and_the_reconciliation_decision() {
+    use rakka_agent::{
+        AgentCheckpoint, AgentCheckpointKind, AgentSegmentOperation, AgentSegmentOutcome,
+        ATTR_AGENT_TELEMETRY_LINK_KIND, LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT,
+        LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST, SEGMENT_ATTR_CHECKPOINT_KIND,
+        SEGMENT_ATTR_EFFECT_STATUS,
+    };
+
+    const INGRESS_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    const REQUEST_PARENT: &str = "00-1bf7651916cd43dd8448eb211c80319d-c7ad6b7169203332-01";
+    fn context(trace_parent: &str) -> rakka_agent_workflow::AgentTelemetryContext {
+        rakka_agent_workflow::AgentTelemetryContext {
+            trace_parent: Some(trace_parent.to_string()),
+            ..rakka_agent_workflow::AgentTelemetryContext::default()
+        }
+    }
+    fn link_of<'a>(
+        segment: &'a rakka_agent::AgentTelemetrySegment,
+        kind: &str,
+    ) -> &'a rakka_agent_workflow::AgentSpanLink {
+        segment
+            .telemetry
+            .span_links
+            .iter()
+            .find(|link| {
+                link.attributes.get(ATTR_AGENT_TELEMETRY_LINK_KIND) == Some(&kind.to_string())
+            })
+            .unwrap_or_else(|| panic!("a `{kind}` link: {:?}", segment.telemetry.span_links))
+    }
+
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_segments(segments.clone());
+    fx.start_traced(context(INGRESS_PARENT)).await;
+
+    fx.pump_until_tool_ticket().await;
+    fx.probe.arm(AgentDispatchWindow::AfterInvocation);
+    let _pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    fx.expire_lease();
+    fx.pump().await;
+    assert_eq!(
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Indeterminate),
+        "the non-idempotent generation parks, or this proves nothing"
+    );
+
+    let (effect_id, generation) = fx.parked_effect().await;
+    let state = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    let loop_state = state.loop_state().expect("the loop exists");
+    let effect = loop_state
+        .effects()
+        .iter()
+        .find(|effect| effect.effect_id == effect_id)
+        .expect("the parked effect")
+        .clone();
+    let model = loop_state
+        .effects()
+        .iter()
+        .find(|effect| effect.slot == 0)
+        .expect("the model effect")
+        .clone();
+    let checkpoint_id = AgentCheckpoint::id_for_effect(
+        &effect_id,
+        generation,
+        AgentCheckpointKind::IndeterminateEffectReconciliation,
+    );
+    let attempt = effect
+        .attempt_span_identity(effect.attempts)
+        .expect("a traced effect derives its attempt identity");
+    let parked = AgentCheckpoint::parked_span_identity(&effect.telemetry, &checkpoint_id)
+        .expect("the parked identity derives");
+    let decision = AgentCheckpoint::resolve_span_identity(&effect.telemetry, &checkpoint_id)
+        .expect("the decision identity derives");
+
+    // A concluded attempt exports under its derived identity: the model
+    // effect's first attempt, which succeeded.
+    let all = segments.segments();
+    assert!(
+        all.iter().any(|segment| {
+            matches!(
+                segment.operation,
+                AgentSegmentOperation::EffectDispatch { .. }
+            ) && segment.span_id.as_deref()
+                == model
+                    .attempt_span_identity(1)
+                    .map(|identity| identity.span_id)
+                    .as_deref()
+        }),
+        "the dispatcher's attempt segment carries the identity the run can derive: {:?}",
+        segments.operations()
+    );
+
+    // The dispatcher's park: the decision that the outcome is unknowable.
+    let parks: Vec<_> = all
+        .iter()
+        .filter(|segment| {
+            matches!(
+                segment.operation,
+                AgentSegmentOperation::EffectDispatch { .. }
+            ) && segment.attributes.get(SEGMENT_ATTR_EFFECT_STATUS)
+                == Some(&AgentRunEffectStatus::Indeterminate.as_label().to_string())
+        })
+        .collect();
+    assert_eq!(parks.len(), 1, "{:?}", segments.operations());
+    assert_eq!(parks[0].outcome, AgentSegmentOutcome::Error);
+    assert_eq!(
+        link_of(parks[0], LINK_KIND_AMBIGUOUS_ATTEMPT).span_id,
+        attempt.span_id
+    );
+    assert_eq!(
+        link_of(parks[0], LINK_KIND_RECONCILIATION_DECISION).span_id,
+        decision.span_id,
+        "linked forward, before the decision exists"
+    );
+
+    // The run's park: the reconciliation checkpoint opening is the
+    // indeterminate transition, an error event under the checkpoint kind a
+    // retention rule selects.
+    let opens: Vec<_> = all
+        .iter()
+        .filter(|segment| {
+            matches!(segment.operation, AgentSegmentOperation::CheckpointOpen)
+                && segment.attributes.get(SEGMENT_ATTR_CHECKPOINT_KIND)
+                    == Some(&"indeterminate-effect-reconciliation".to_string())
+        })
+        .collect();
+    assert_eq!(opens.len(), 1, "{:?}", segments.operations());
+    assert_eq!(opens[0].outcome, AgentSegmentOutcome::Error);
+    assert_eq!(
+        opens[0].error_code.as_deref(),
+        Some("dispatcher-lost-after-started")
+    );
+    assert_eq!(opens[0].span_id.as_deref(), Some(parked.span_id.as_str()));
+    assert_eq!(
+        link_of(opens[0], LINK_KIND_AMBIGUOUS_ATTEMPT).span_id,
+        attempt.span_id
+    );
+    assert_eq!(
+        link_of(opens[0], LINK_KIND_RECONCILIATION_DECISION).span_id,
+        decision.span_id
+    );
+
+    // The operator's decision, carrying its request span.
+    let mut run = fx.fx.run();
+    let now = fx.fx.now();
+    run.recover(now).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::ResolveIndeterminateEffect {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::CheckpointResolution,
+                [TENANT, AGENT, "resolve-1"],
+            )
+            .expect("the operation id derives"),
+            effect_id: effect_id.clone(),
+            generation,
+            resolution: Box::new(AgentEffectResolution::ConfirmedNotExecuted),
+            telemetry: context(REQUEST_PARENT),
+        },
+        &fx.fx.router,
+        fx.fx.now(),
+    )
+    .await
+    .expect("the resolution applies");
+
+    let resolved: Vec<_> = segments
+        .segments()
+        .into_iter()
+        .filter(|segment| matches!(segment.operation, AgentSegmentOperation::CheckpointResolve))
+        .collect();
+    assert_eq!(resolved.len(), 1, "{:?}", segments.operations());
+    assert_eq!(
+        resolved[0].span_id.as_deref(),
+        Some(decision.span_id.as_str()),
+        "the decision exports under the identity the park linked forward to"
+    );
+    assert_eq!(
+        resolved[0].attributes.get(SEGMENT_ATTR_CHECKPOINT_KIND),
+        Some(&"indeterminate-effect-reconciliation".to_string())
+    );
+    assert_eq!(
+        link_of(&resolved[0], LINK_KIND_PARKED_CHECKPOINT).span_id,
+        parked.span_id
+    );
+    assert_eq!(
+        link_of(&resolved[0], LINK_KIND_RESUME_REQUEST).span_id,
+        "c7ad6b7169203332"
+    );
+}
+
+/// The other half: an ambiguous loss that spends the generation's last attempt
+/// settles `Exhausted`, and every attempt that could have described it was lost
+/// before it closed a segment.
+#[tokio::test]
+async fn an_ambiguous_loss_that_exhausts_the_budget_closes_a_segment() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_segments(segments.clone());
+    fx.start().await;
+    fx.settle().await;
+
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert!(pass.died, "the worker dies after the durable Started write");
+
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(
+        fx.effect_status(0).await,
+        Some(AgentRunEffectStatus::Exhausted),
+        "the single-attempt policy exhausts, or this proves nothing"
+    );
+    assert!(
+        segments.segments().iter().any(|segment| {
+            segment
+                .attributes
+                .get(rakka_agent::SEGMENT_ATTR_EFFECT_STATUS)
+                == Some(&AgentRunEffectStatus::Exhausted.as_label().to_string())
+                && segment.error_code.as_deref() == Some("dispatcher-lost-after-started")
+        }),
+        "the exhausting settlement must close a segment: {:?}",
+        segments.operations()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Scenario 9: dispatcher loss in the ambiguous non-idempotent window produces
 // exactly one durable Indeterminate outcome and no automatic re-invocation.
@@ -789,6 +1175,7 @@ async fn a_reconciliation_decision_resumes_the_run_and_not_executed_mints_a_new_
             effect_id: effect_id.clone(),
             generation,
             resolution: Box::new(AgentEffectResolution::ConfirmedNotExecuted),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
         },
         &fx.fx.router,
         fx.fx.now(),
@@ -870,6 +1257,7 @@ async fn a_reconciled_indeterminate_generation_settles_its_attempts_exactly_once
                         .expect("the content is inline-bounded"),
                 }),
             }),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
         },
         &fx.fx.router,
         fx.fx.now(),
@@ -953,6 +1341,7 @@ async fn a_redispatch_the_run_cannot_afford_is_refused() {
                 effect_id,
                 generation,
                 resolution: Box::new(AgentEffectResolution::ConfirmedNotExecuted),
+                telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
             },
             &fx.fx.router,
             fx.fx.now(),
@@ -1011,6 +1400,7 @@ async fn a_result_for_a_superseded_generation_is_refused() {
             effect_id: effect_id.clone(),
             generation,
             resolution: Box::new(AgentEffectResolution::ConfirmedNotExecuted),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
         },
         &fx.fx.router,
         fx.fx.now(),
@@ -1158,6 +1548,7 @@ async fn cancellation_with_an_ambiguous_consequential_effect_stays_in_reconcilia
                         .expect("the content is inline-bounded"),
                 }),
             }),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
         },
         &fx.fx.router,
         fx.fx.now(),
@@ -1775,6 +2166,7 @@ async fn a_promotion_survives_dispatcher_loss_mid_pass() {
                     principal_id: "memory-curator".to_string(),
                     display_name: None,
                 },
+                roles: None,
             }),
         },
         &fx.fx.router,
@@ -1823,4 +2215,315 @@ async fn a_promotion_survives_dispatcher_loss_mid_pass() {
         "the run settled despite the dispatcher loss: {:?}",
         snapshot.status
     );
+}
+
+// ---------------------------------------------------------------------------
+// The post-terminal window through the real pipeline: a promotion or claim
+// append accepted after the run ended is exempt from the dispatcher's
+// wind-down sweep, is claimed and executed by the ordinary pass, and an
+// ambiguous attempt on it retries under its idempotency key and converges
+// without a reconciliation checkpoint (specification 13.3 and 13.4).
+// ---------------------------------------------------------------------------
+
+/// A claim-append executor that counts its invocations and answers a derived
+/// claim id.
+struct CountingClaimAppendExecutor {
+    invocations: std::sync::atomic::AtomicUsize,
+}
+
+impl rakka_agent::AgentClaimAppendExecutor for CountingClaimAppendExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a rakka_agent::AgentRunScope,
+        _intent: &'a rakka_agent::AgentRunEffect,
+        _append: &'a rakka_agent::AgentClaimAppendRequest,
+        _provenance: &'a rakka_agent::AgentClaimAppendProvenance,
+        _now: rakka_agent_workflow::AgentTimestampMillis,
+    ) -> rakka_agent::AgentDispatchFuture<'a, rakka_agent::AgentClaimAppendFinding> {
+        let nth = self
+            .invocations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        Box::pin(async move {
+            Ok(rakka_agent::AgentClaimAppendFinding::Appended {
+                claim: rakka_agent::AgentCommunalClaimId::new(format!("claim-{nth}"))
+                    .expect("the claim id is valid"),
+            })
+        })
+    }
+}
+
+/// The post-terminal promotion request over the task input at sequence one.
+fn post_terminal_promotion_command(discriminator: &str) -> AgentRunEntityCommand {
+    use rakka_agent::{
+        promotion_operation_id, AgentMemoryPromotionRequest, AgentPrivateMemoryKind, MemorySequence,
+    };
+    use rakka_agent_workflow::PrincipalRef;
+
+    AgentRunEntityCommand::PromoteMemory {
+        operation_id: promotion_operation_id(&run_scope(), discriminator).expect("operation id"),
+        promotion: Box::new(AgentMemoryPromotionRequest {
+            from_sequence: MemorySequence::new(1),
+            to_sequence: MemorySequence::new(1),
+            kind: AgentPrivateMemoryKind::Semantic,
+            target: None,
+            confidence_bps: 9_000,
+            requested_by: PrincipalRef {
+                principal_type: "service".to_string(),
+                principal_id: "memory-curator".to_string(),
+                display_name: None,
+            },
+            roles: None,
+        }),
+    }
+}
+
+/// A dispatch fixture with session memory and the promotion executor wired,
+/// driven to `Completed`.
+async fn completed_promoting_fixture() -> (
+    DispatchFixture,
+    Arc<rakka_agent::InMemoryAgentPrivateMemoryStore>,
+) {
+    use rakka_agent::{
+        AgentRunMemory, InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore,
+        InMemorySessionMemoryStore, SessionMemoryPromotionExecutor,
+    };
+
+    let session = Arc::new(InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(InMemoryContextSnapshotStore::new());
+    let private = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_promotions(
+        AgentRunMemory::new(session.clone(), snapshots).with_private_store(private.clone()),
+        Arc::new(SessionMemoryPromotionExecutor::new(
+            session.clone(),
+            private.clone(),
+        )),
+    );
+    fx.start().await;
+    fx.pump().await;
+    let snapshot = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(snapshot.status, AgentRunStatus::Completed);
+    (fx, private)
+}
+
+/// Applies one command to the fixture's run entity.
+async fn apply_to_run(fx: &DispatchFixture, command: AgentRunEntityCommand) {
+    let mut run = fx.fx.run();
+    let now = fx.fx.now();
+    run.recover(now).await.expect("the run recovers");
+    run.apply(command, &fx.fx.router, now)
+        .await
+        .expect("the command applies inside the window");
+}
+
+/// The run's durable loop state, freshly loaded.
+async fn loop_state(fx: &DispatchFixture) -> rakka_agent::AgentLoopState {
+    rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists")
+    .loop_state()
+    .expect("the loop is started")
+    .clone()
+}
+
+/// A promotion committed after the run ended is exempt from the wind-down
+/// sweep the pipeline runs on every terminal run: the first pass claims,
+/// executes, and delivers it rather than cancelling its ticket, and the next
+/// pass neither cancels nor re-reads it. The memory lands and the terminal
+/// record does not move.
+#[tokio::test]
+async fn a_post_terminal_promotion_survives_the_wind_down_fence() {
+    let (fx, private) = completed_promoting_fixture().await;
+    let before = fx.fx.run_snapshot().await.expect("the run exists");
+    apply_to_run(&fx, post_terminal_promotion_command("post-1")).await;
+
+    fx.settle().await;
+    let first = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the first pass runs");
+    assert_eq!(first.cancelled, 0, "the sweep did not cancel the promotion");
+    assert_eq!(first.claimed, 1, "the pass claimed the promotion's ticket");
+    assert_eq!(first.delivered, 1, "and delivered its outcome");
+
+    fx.settle().await;
+    let second = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the second pass runs");
+    assert_eq!(second.cancelled, 0, "the next pass did not re-fence it");
+    assert_eq!(second.claimed, 0, "nothing was left to claim");
+
+    assert_eq!(private.len(&agent_scope()), 1, "the promotion landed");
+    let state = loop_state(&fx).await;
+    assert_eq!(state.memory_promotions().len(), 1, "one receipt");
+    let after = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.terminal_at, before.terminal_at);
+}
+
+/// A worker dying after the promotion's durable `Started` leaves an
+/// ambiguous attempt on a run that has ended. The promotion is idempotent,
+/// so the recovered worker retries it under the same generation's key and
+/// converges on one memory at its initial revision; the terminal run opens
+/// no reconciliation checkpoint and its status does not move.
+#[tokio::test]
+async fn an_ambiguous_post_terminal_promotion_retries_and_converges_without_a_checkpoint() {
+    let (fx, private) = completed_promoting_fixture().await;
+    apply_to_run(&fx, post_terminal_promotion_command("post-1")).await;
+    fx.settle().await;
+
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    let _ = fx.pipeline().pump_run(&run_scope()).await;
+    assert_eq!(fx.probe.deaths(), 1, "the armed window fired");
+
+    let mut converged = false;
+    for _round in 0..8 {
+        fx.expire_lease();
+        fx.settle().await;
+        let _pass = fx
+            .pipeline()
+            .pump_run(&run_scope())
+            .await
+            .expect("the recovery pass runs");
+        if private.len(&agent_scope()) == 1 {
+            converged = true;
+            break;
+        }
+    }
+    assert!(converged, "the ambiguous promotion never converged");
+    use rakka_agent::AgentPrivateMemoryStore as _;
+    let listed = private
+        .list(
+            &agent_scope(),
+            rakka_agent::PrivateMemoryCursor::start(),
+            rakka_agent_workflow::AgentTimestampMillis::new(1_000_000),
+        )
+        .await
+        .expect("list");
+    assert_eq!(listed.memories.len(), 1);
+    assert_eq!(
+        listed.memories[0].revision,
+        rakka_agent::AgentRevisionNumber::INITIAL,
+        "the retry replayed rather than re-wrote"
+    );
+    let state = loop_state(&fx).await;
+    assert!(
+        state.open_checkpoints().is_empty(),
+        "no reconciliation checkpoint opened on the terminal run"
+    );
+    assert!(
+        state.indeterminate_effects().next().is_none(),
+        "nothing parked indeterminate"
+    );
+    let after = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, AgentRunStatus::Completed);
+}
+
+/// The claim half of the same exemption: an append committed after the run
+/// ended reaches the executor through the ordinary pass, is never cancelled
+/// by the sweep, and leaves the terminal record untouched.
+#[tokio::test]
+async fn a_post_terminal_claim_append_survives_the_wind_down_fence() {
+    use rakka_agent::{
+        claim_append_operation_id, AgentClaimAppendRequest, AgentClaimObjectRequest,
+        KnowledgeSpaceId, MemoryClassification,
+    };
+    use rakka_agent_workflow::PrincipalRef;
+
+    let executor = Arc::new(CountingClaimAppendExecutor {
+        invocations: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_claim_appends(executor.clone());
+    // The dispatch authority re-checks the space against the agent's
+    // definition envelope on every attempt, so the envelope grants it.
+    let mut envelope = envelope_for_registry(&fx.registry);
+    envelope
+        .knowledge_spaces
+        .insert(KnowledgeSpaceId::new("space-alpha").expect("the space id is valid"));
+    fx.fx.instantiate_agent_with_envelope(envelope).await;
+    fx.fx.create_task().await;
+    fx.pump().await;
+    let before = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(before.status, AgentRunStatus::Completed);
+
+    apply_to_run(
+        &fx,
+        AgentRunEntityCommand::AppendClaim {
+            operation_id: claim_append_operation_id(&run_scope(), "post-1")
+                .expect("the operation id derives"),
+            append: Box::new(AgentClaimAppendRequest {
+                space: KnowledgeSpaceId::new("space-alpha").expect("the space id is valid"),
+                subject: "finding".to_string(),
+                predicate: "links".to_string(),
+                object: AgentClaimObjectRequest::Value(
+                    AgentTaskContent::inline(serde_json::json!({ "note": "observed" }))
+                        .expect("the object is inline-bounded"),
+                ),
+                confidence_bps: 5_000,
+                classification: MemoryClassification::Unclassified,
+                evidence: Vec::new(),
+                requested_by: PrincipalRef {
+                    principal_type: "service".to_string(),
+                    principal_id: "researcher".to_string(),
+                    display_name: None,
+                },
+            }),
+        },
+    )
+    .await;
+
+    fx.settle().await;
+    let first = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the first pass runs");
+    assert_eq!(first.cancelled, 0, "the sweep did not cancel the append");
+    assert_eq!(first.delivered, 1, "the pass delivered its outcome");
+    fx.settle().await;
+    let second = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the second pass runs");
+    assert_eq!(second.cancelled, 0);
+    assert_eq!(second.claimed, 0);
+
+    assert_eq!(
+        executor
+            .invocations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the append reached the store bridge once"
+    );
+    let state = loop_state(&fx).await;
+    assert!(state.effects().iter().any(|effect| {
+        effect.kind() == rakka_agent::AgentRunEffectKind::ClaimAppendCall
+            && effect.status == AgentRunEffectStatus::Succeeded
+    }));
+    let after = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.terminal_at, before.terminal_at);
 }

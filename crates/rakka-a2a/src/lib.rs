@@ -41,8 +41,13 @@
 //!   scheduler watermarks, and crate-owned idempotent migrations.
 //! - `http`: route composition with Rakka HTTP observability helpers.
 //! - `k8s`: Kubernetes drain/readiness integration helpers.
-//! - `otel`: trace-context propagation and OpenTelemetry-compatible
-//!   attribute helpers.
+//! - `otel`: the OpenTelemetry GenAI convention mapping for the A2A edge —
+//!   the ingress `SERVER` span the agent domain's adapter defers to the
+//!   protocol adapter, and the attribute helpers that go with it. It activates
+//!   `rakka-agent/otel`. Trace-context propagation is deliberately *not*
+//!   gated: extraction on ingress and injection on egress are unconditional on
+//!   every path, because gating them would remove trace continuity from a
+//!   default build.
 //! - `testkit`: in-memory stores, fixtures, and compatibility probes.
 //! - `agents`: typed Rakka Agent surface over `rakka-agent` entities —
 //!   `AgentTaskId` task identity, durable deduplicated ingress, the
@@ -59,8 +64,14 @@
 //! with `default-features = false`, so no TLS provider is forced on
 //! applications; enable one through your own `a2a-server-lf` dependency if
 //! you serve TLS in-process. The crate follows the workspace MSRV
-//! (Rust 1.85, pinned by `rust-toolchain.toml`); SDK upgrades that raise the
-//! MSRV are deferred until the workspace MSRV moves.
+//! (Rust 1.88, pinned by `rust-toolchain.toml`); SDK upgrades that raise the
+//! MSRV are deferred until the workspace MSRV moves. Both pins are declared
+//! once, in the workspace manifest's `[workspace.dependencies]`, and every
+//! consumer inherits them. The A2A wire protocol version the SDK implements is
+//! pinned separately as [`protocol::A2A_PROTOCOL_VERSION`], stamped on every
+//! interface of the card the adapter builds (a card handed to the service
+//! builder is stamped by whoever built it), and held equal to the SDK's own
+//! constant by a test; `docs/rakka-compatibility.md` records all three.
 
 pub mod auth;
 pub mod catalog;
@@ -68,6 +79,9 @@ pub mod dispatch;
 pub mod error;
 pub mod mapping;
 pub mod observability;
+/// The OpenTelemetry GenAI convention mapping for the A2A edge.
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod projection;
 pub mod protocol;
 pub mod push;
@@ -118,3 +132,20 @@ pub use crate::handler::{
     RakkaA2ABuildError, RakkaA2ARequestHandler, RakkaA2AService, RakkaA2AServiceBuilder,
     RakkaA2ASettings,
 };
+
+/// The A2A SDK's per-request service parameters, re-exported so an
+/// application can name the one constructor input a
+/// [`RakkaA2AServiceBuilder::request_observer`] callback receives without
+/// depending on the SDK crate itself. Reachable as `rakka::a2a::ServiceParams`
+/// through the facade under its `a2a-agents` feature.
+///
+/// ```
+/// use rakka_a2a::ServiceParams;
+///
+/// fn observer(params: &ServiceParams) {
+///     let _ = params;
+/// }
+/// observer(&ServiceParams::new());
+/// ```
+#[cfg(feature = "server")]
+pub use a2a_server::ServiceParams;

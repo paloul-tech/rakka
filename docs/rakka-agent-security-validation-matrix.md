@@ -1,0 +1,285 @@
+# Agent Domain Security Validation Matrix
+
+Status: implemented (slice 6.2).
+
+This document maps [specification 16](plans/rakka-agent/spec.md) and the
+memory clauses of [13.1](plans/rakka-agent/spec.md) to the code that enforces
+them and the tests that prove it. The goal is not to claim the agent domain is
+secure. It is to say precisely which security claims are *enforced*, which are
+*delegated* to the deployment, and which are currently *inferred* rather than
+demonstrated.
+
+The companion documents are
+[`rakka-agent-fault-injection-matrix.md`](rakka-agent-fault-injection-matrix.md),
+whose closing section named this validation as still owed,
+[`rakka-agent-telemetry-validation-matrix.md`](rakka-agent-telemetry-validation-matrix.md),
+which does the same for the telemetry claims, and
+[`rakka-v1-security-operational-defaults.md`](rakka-v1-security-operational-defaults.md),
+which states the framework-versus-operator split for the substrate.
+
+## What this slice found
+
+Four of the five things it fixed were **fail-opens**, not missing tests: paths
+where the code was wrong and no test would have noticed. Each is recorded here
+with the falsification that proves the test is load-bearing — reverting the fix
+and confirming the suite fails.
+
+| Fail-open | What it was | What closed it | Falsified by |
+| --- | --- | --- | --- |
+| The retriever decided what a model saw | `assemble_context` re-checked every property of a retrieved record except scope, and the trait doc called that unavoidable. A backend with a wrong predicate had its bytes embedded in the immutable snapshot. | Every ranked identity is resolved through the authoritative scope-addressed store; the record *it* holds is what is checked and embedded. The retriever supplies a ranking, nothing else. | Reverting to the retriever's payload fails all 7 `memory_scope_fence` tests |
+| The two guardrail chains were never compared | `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` unconditionally claimed memory-ingress was evaluated, so a mandatory ingress-only stage satisfied coverage at an authority that had never seen a retrieval bundle. | The deployment attests with `AgentToolAuthority::with_memory_ingress`, and the attestation is checked against a chain *declaration digest*. Unattested, the authority does not count the boundary and fails closed. | `an_empty_bundle_chain_at_the_same_revision_is_refused_at_wiring` — the case a revision comparison misses |
+| The attested chain was not the installed one | The attestation took a bare `AgentMemoryRetrieval`, compared digests and dropped the reference. Nothing bound it to the bundle the run assembles through, so a bundle attested and then not installed satisfied the check and ran no ingress stage — which is the shape the positive control itself had. | `with_memory_ingress` takes the `AgentRunMemory`, so the object attested is the object the run assembles through; a memory carrying no bundle is refused, and `AgentToolAuthority::attests` re-checks a memory assembled elsewhere. | `the_attested_memory_is_the_one_the_run_assembles_through` — dropping the run's memory leaves its ingress stage uncounted |
+| A resolver's words became durable state | `AgentCredentialError`'s `Display` reached `record_attempt_failure`, which writes into the workflow outbox row and the fleet index — both unbounded, both durable, both fleet-readable. | The attempt persists Rakka-authored text naming the logical binding; the resolver's own detail goes to a bounded `tracing::warn!` and nowhere else. Every persisted attempt detail is truncated at `AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`. | Reverting shows the sentinel in the fleet entry's `last_error_code` |
+| A general worker killed sandboxed work | One fleet, any worker claims any ticket, and a worker whose router rejects the class refuses *definitively*. In a heterogeneous fleet the race decided, and the wrong winner failed the effect permanently. | `AgentDispatchClaimFilter` skips a non-served entry **before taking the lease**, so the ticket stays claimable. Counted as `class_filtered`, which needs no durable write. | Reverting fails the 3 routing tests in `executor_isolation` |
+
+The fifth was softer: retention had no production caller anywhere, so
+`purge_run` was a capability nobody composed. It now has
+`discharge_run_memory_retention` and `AgentMemoryRetentionSweep`, and a
+`terminal_at` stamp to measure from — `updated_at` could not serve, because a
+terminal run keeps accepting settlement commands and the deadline would recede.
+
+### The pre-upgrade backlog, and the one-time repair
+
+The stamp is written at the single terminal transition, under the
+already-terminal guard that makes it once-only. That guard also puts an entire
+population out of reach: **a run that was already terminal when the field
+shipped never re-enters the one place that could stamp it.** Nothing in normal
+operation can, so `discharge_run_memory_retention` answers
+`TerminalTimeUnknown` for that run *for the life of the deployment*, and its
+session rows and context snapshots — the tier that embeds model-visible
+content — are never purged. The only signal was `terminal_time_unknown`, a
+counter climbing beside a healthy `discharged`, with no documented remediation.
+Refusing silently forever is the one option that leaves content past its
+window, so it is not the option taken.
+
+`backfill_run_terminal_stamp` repairs one scope and
+`AgentRunTerminalStampBackfill` is the bounded, deployment-invoked pass over
+many — the same shape as the retention sweep, and for the same reason: Rakka
+keeps no index of runs by terminal state, so enumeration belongs to the
+application. Four properties are what make it safe to run against a live
+fleet, and each is asserted:
+
+- **The clock is `updated_at`, and it is sound in one direction only.** It is
+  the time of the last accepted transition, so for a terminal run it is never
+  *earlier* than the true terminal time: the terminal transition sets both to
+  the same instant, and only transitions landing afterwards move it on. A
+  backfilled deadline therefore falls at or after the real one — the run is
+  retained at least as long as policy requires and never purged early. That
+  asymmetry is the argument for repairing at all: erring late is recoverable by
+  running the sweep again, erring early destroys a record no replay can
+  rebuild. It is an approximation, and it is written down rather than implied.
+- **It is opt-in, not something the discharge does on its own.** Re-dating a
+  retention clock is a decision a deployment makes; a sweep that did it
+  silently would turn "this run's window has elapsed" into "this run's window
+  elapsed relative to whenever the migration happened to run", with nothing in
+  the record saying so.
+- **It never moves a stamp that exists.** The guard is re-checked inside
+  `AgentRunState::backfill_terminal_at`, not trusted from the caller, so a
+  completed migration is safe to re-drive and a normally-stamped run is
+  untouched. `updated_at` itself is deliberately not moved either — a repair is
+  not an accepted transition, and moving it would push the clock the next pass
+  would read.
+- **It loses every race.** The write is a compare-and-set against the revision
+  it read, so a resident entity that wrote in between wins and the pass reports
+  `Conflicted` — the only retryable outcome — rather than clobbering it. In the
+  other direction the entity's own persist drops its cached record on a
+  revision conflict and recovers the authoritative one, so a backfill racing a
+  live terminal run costs that run one re-driven command, not a wedge.
+
+**Operational ordering: run it once the fleet is fully upgraded, never during
+the rolling update.** A repaired record carries run-state schema version 2,
+which a binary from before the bump fails closed on — correctly, since that
+binary would otherwise load it and drop the stamp again on the next settlement
+it applied. Repairing early therefore makes those records unreadable to peers
+still running, and nothing is gained by hurrying: an unstamped record is
+refused by the discharge, not deleted. A migration is complete when a pass over
+the same scopes reports `conflicted: 0` and `stamped: 0`.
+
+Proven in `tests/memory_retention.rs` (8 clauses), each falsified: removing
+both once-only guards, dropping the schema upgrade, taking the stamp from
+`accepted_at` instead of `updated_at`, propagating a revision conflict as an
+error, and reporting a stamp without writing one each fail their own test.
+Removing only the *caller's* guard does not — which is the point of re-checking
+inside the mutator, and is what that arrangement was verified for.
+
+## Specification 16, clause by clause
+
+| Clause | Enforced where | Proof | Status |
+| --- | --- | --- | --- |
+| Every request authenticated and tenant-authorized before data access | `A2AAuthorizer` hook per operation class; tenant is a *key* on every scoped read | `rakka-a2a` surface tests | **Authn delegated** — see "Delegated to the deployment" |
+| Policy checks before existence-revealing queries | `query.rs` goal-view owner wrapper; `runsync.rs`/`error.rs` map denial to not-found | `goal_view.rs`, `coordination_surface.rs` | Met |
+| Tool capabilities declared outside model output, enforced before scheduling and dispatch | `AgentToolRegistry` + `AgentToolAuthority` | `tool_authority.rs` | Met |
+| Descriptor ≠ dispatch authority; five layers each validated at its boundary | `tools.rs` authorize ladder | `tool_authority.rs`, `model_provider_dispatch.rs::a_revoked_tool_is_withheld_from_the_model_visible_list`, `tools::tests::a_model_grant_records_the_profile_record_and_the_visible_tools` | **Met, 5 of 5** — the model-visible descriptor rung is wired since Phase 7 slice 7.1: the authority computes `model_visible(envelope, settings)` onto the grant and the Rig adapter declares exactly that list |
+| A dispatcher lacks ambient authority beyond its declared trust/tool/tenant class | Claim-time `AgentDispatchClaimFilter` + the authority's `execution-policy-unroutable` gate, as two independent layers | `executor_isolation.rs` | Met for routing; the worker's *actual* isolation is the platform's |
+| Versioned ordered guardrail stages at all seven boundaries | `AgentGuardrailChain`, evaluated at model-request, tool-request, tool-response, model-response, memory-ingress, A2A ingress, and A2A egress. The two response points (`AgentToolAuthority::review_tool_response`, `review_model_response`) run in the dispatcher after the call and before the outcome exists — the last point at which the result is only in memory — so a blocked result or turn reaches neither the run, its session memory, nor a later context snapshot; each fails the effect as a determinate `guardrail-blocked` outcome of a call that did run, delivered once and never retried, and a transformed result or turn is what is delivered. A2A ingress runs at the agents surface's authorized leaves once per request; A2A egress runs in the two in-process send executors before the surface sees the message. The memory and A2A chains are attested on the authority (`with_memory_ingress`, `with_a2a_guardrails`) against a declaration digest, and count toward coverage only once attested | `tool_authority.rs`, `model_response_guardrails.rs` (`a_blocked_model_response_ends_the_run_once_and_never_reaches_memory`, `a_transformed_model_response_is_what_the_run_records`, `a_checkpoint_requiring_model_response_stage_fails_closed`, `a_model_response_only_mandatory_stage_satisfies_coverage`), `memory_ingress_guardrails.rs`, `memory_guardrail_chain_consistency.rs`, `rakka-a2a/tests/ingress_egress_guardrails.rs` (`an_ingress_block_refuses_the_send_and_creates_nothing`, `an_ingress_transform_is_what_the_task_records`, `an_ingress_block_reaches_an_in_process_executor_as_a_refused_finding`, `an_egress_block_refuses_the_delegation_send_before_the_service_sees_it`, `an_egress_transform_is_what_the_service_receives`) | **Met, 7 of 7** |
+| Bounded outcome set, stable reason code, protected evidence | `AgentGuardrailOutcome` | `guardrails.rs` unit tests | Met |
+| A failure's deciding identity is a bounded code and a stage id, never text | `AgentFailureReason`, bounded on construction and on decode; it carries a code and a stage id only, so a refusal's message and a collaborator's detail reach no record through it | `failure_reason_records.rs`, `secret_exclusion.rs::an_exhausted_resolution_records_the_resolvers_code_and_never_its_detail`, `model_response_guardrails.rs::a_built_in_stage_is_named_on_the_runs_records_and_its_message_is_not` | Met |
+| Deployment/tenant policy adds mandatory guardrails a definition cannot weaken | Deployment chain `mandatory()`; envelope `mandatory_guardrails` | `tool_authority.rs`, `definition_setup_envelope.rs` | Deployment-level met; **tenant-level does not exist** |
+| A transform is deterministic under a recorded revision; a retry reuses the accepted input | Synchronous rule trait + per-stage revision + the intent's chain-revision pin | `tool_authority.rs` | Met |
+| `report-only` grants nothing | Structural: the fold cannot set a disposition from it | `guardrails.rs`, `memory_ingress_guardrails.rs` | Met |
+| Immediate revocation re-checked before external invocation | `AgentEntityAuthority::authorize` re-loads durable state per attempt | `wait_invalidation.rs` (12 tests), `tool_authority.rs` | Met, **not atomic** with the invocation (below) |
+| Credentials resolved only for the bounded attempt, never logged or persisted | Resolution between durable `Started` and `invoke`, dropped after; `AgentEphemeralCredential` has no `Serialize` and a redacting `Debug` | `secret_exclusion.rs` (14 tests), incl. a kill *while the credential is live* | Met |
+| Memory retrieval enforces tenant, agent, classification before ranking | `MemoryRetrievalQuery::admits` as pre-ranking predicates, and — new — the authoritative store resolves every ranked identity | `memory_scope_fence.rs`, `private_memory_retrieval.rs` | Met; *purpose* restrictions remain unmodelled |
+| Communal memory treated as an injection source; provenance and trust available to the context builder | — | — | **Not applicable yet**: communal retrieval is unwired, so no claim reaches a model context |
+| Tool arguments, prompts, raw memory, credentials, high-cardinality ids never metric labels | `validate_agent_domain_metric_attributes` per observation | `agent_metrics.rs`, and `secret_exclusion.rs` over the whole emitted *series set* | Met |
+
+## MCP client, specification 16 (Phase 7 slice 7.7)
+
+| Clause | Enforced where | Proof | Status |
+| --- | --- | --- | --- |
+| MCP egress is a required policy hook: no client exists before `McpEgressCheck` passes; `McpAllowAllEgress` is the only opt-out | `client::connect`/`sync_mcp_descriptors` run the check before a transport or credential exists, for a publish-time sync and a dispatch attempt alike. The check judges the configured URL only: the injected client must be built with no proxy and no redirects (`testkit::hardened_reqwest_client`), since reqwest reads environment proxies whatever its features and a `307`/`308` would carry an API-key header to a host the check never saw | `crates/rakka-agent-mcp/tests/client_dispatch.rs::an_egress_refusal_fails_before_any_client_exists_and_never_touches_the_credential`, `crates/rakka-agent-mcp/tests/client_dispatch.rs::the_hardened_client_follows_no_redirect_so_a_307_cannot_carry_the_key_past_the_check`, `crates/rakka-agent-mcp/tests/descriptor_sync.rs::a_refusing_egress_rule_stops_the_sync_before_any_request_is_made`, `crates/rakka-agent/tests/mcp_client_dispatch.rs` scenario 3 (`an_egress_refusal_fails_the_attempt_under_the_deployments_code_after_the_credential_was_resolved_and_dropped`) | Met, for a client built as documented |
+| No child process without a deployment launcher; a launch the deadline cancels leaves no process behind | `McpDispatchToolExecutor::new` refuses a `ChildProcess` binding (`mcp-transport-unsupported`); only `with_launcher`, which takes the launcher together with the bindings, admits one | `crates/rakka-agent-mcp/tests/child_process.rs::a_child_process_binding_is_refused_without_a_launcher`, `crates/rakka-agent-mcp/tests/child_process.rs::an_elapsed_deadline_mid_launch_cancels_the_launch_future`, the gated `crates/rakka-agent-mcp/tests/child_process_launcher.rs::a_child_that_never_reads_its_input_is_killed_when_the_transport_drops` | Met |
+| MCP credentials only through the resolver, only for the attempt, never durable | The dispatcher resolves the effect's `credential_binding` — the tool's, or the server-level one the sync copied into it — inside the attempt and hands it to the executor, which sets the declared header and drops it after; an HTTP attempt whose binding names a credential that did not arrive is refused `mcp-credential-missing` before any client exists; server-chosen text the attempt keeps (the `isError` detail, the result, a refusal's reported name) has the credential's material replaced by `<redacted>`; a publish-time sync whose server-chosen text carries the credential it sent stores nothing (`mcp-descriptor-credential-echoed`); no Rakka path logs, serializes, or persists it (rmcp's own `DEBUG`/`TRACE` logging of a received response body is outside that claim) | `crates/rakka-agent/tests/mcp_client_dispatch.rs` scenarios 1–2 (`an_mcp_tool_call_dispatches_through_the_router_with_the_resolved_credential`, `the_credential_never_reaches_a_durable_record_or_the_fleet_index`), scenario 5 (`the_secret_exclusion_scan_covers_the_mcp_types`), scenario 6 (`a_server_level_credential_binding_alone_reaches_the_wire_through_the_dispatcher`), scenario 7 (`a_credential_the_server_echoes_into_its_error_text_is_redacted_before_it_is_persisted`), and `crates/rakka-agent-mcp/tests/client_dispatch.rs::an_http_binding_that_names_a_credential_fails_closed_without_one`, `::server_chosen_text_is_scrubbed_of_the_attempts_credential`, and `crates/rakka-agent-mcp/tests/sync_credential_echo.rs` (seven tests) | Met |
+| MCP is never an agent-to-agent channel (specification 14.4) | The server's reported `serverInfo.name` — from the `initialize` result, or from a `server/discover` result's `_meta` — is checked against `MCP_PEER_AGENT_SERVER_PREFIX` at sync and at dispatch alike; a match refuses `mcp-peer-agent-channel-refused`. A server that reports no `serverInfo` passes: the rule holds against a Rakka agent that identifies itself (a cooperative threat model), not one that hides | `crates/rakka-agent-mcp/tests/descriptor_sync.rs::a_server_that_identifies_as_a_rakka_agent_is_refused`, `crates/rakka-agent-mcp/tests/client_dispatch.rs::a_server_that_identifies_as_a_rakka_agent_is_refused_at_dispatch_as_well` | Met, for a self-identifying server |
+| Recovery never executes against a materially different schema (11.8) | The executor's dispatch-time recheck compares the live `tools/list` entry's schema digest against the descriptor's own, cached under an executor-chosen TTL (default 60 000 ms; `0` rechecks every attempt); a listing that has not ended after 64 pages is refused, not cached | `crates/rakka-agent-mcp/tests/client_dispatch.rs::the_recheck_is_cached_under_the_ttl_and_refuses_a_changed_schema`, `::a_listing_that_never_ends_is_refused_at_the_page_cap_by_the_sync_and_the_recheck` | Met within the recheck TTL, for MCP tools: a server that reshapes a tool inside the TTL is called under the cached listing until it expires |
+| A stored MCP result is written through a sink handed the run that produced it, and recorded only behind a reference the default policy accepts | `McpArtifactSink::put_result` is handed the run scope; the executor validates the returned reference (`validate_artifact_ref`) before it becomes the run's record, and a refused one fails the attempt `invalid-artifact-reference` | `crates/rakka-agent-mcp/tests/artifact_sink.rs` | Met. Filing the artifact under that run is the sink's contract; an `McpArtifactStore` converted into a sink drops the scope, because `put_artifact` has nowhere to take it |
+| A publish-time sync is bounded in time and leaves no session open | `sync_mcp_descriptors` and `sync_mcp_descriptors_over` apply `MCP_SYNC_TIMEOUT_DEFAULT_MS` over the handshake and the listing, and their `_within` twins the caller's bound; a session the sync opened is closed on every path, before the answer is judged, under its own fixed close bound | `crates/rakka-agent-mcp/tests/sync_deadline.rs` | Met for the bound. The close is structural: no test counts a server-side close |
+
+## Memory: specification 13.1
+
+| Clause | Session | Snapshots | Private | Communal graph |
+| --- | --- | --- | --- | --- |
+| Explicit tenant and ownership scope | Key | Key (record's own `scope` field) | Key | Key |
+| Authorize before revealing existence | Wrong scope ≡ absent | Wrong scope ≡ absent | Wrong scope ≡ absent, byte-identical | `authorization_isolation` conformance clause |
+| Stable idempotent operation ids | Yes | First-writer-wins | Operation ledger | Yes |
+| Provenance and classification preserved | Yes | Yes | Yes | Yes |
+| Retention, tombstone, deletion | `purge_run`, now with a caller and a conformance clause | `purge_run`, purged first | Retention, tombstone, delete, `purge_expired` | **None — owed** |
+| Resolved credentials excluded | `secret_exclusion.rs` | same | same | Not swept |
+| Authoritative records distinguished from derived indexes | n/a | n/a | The store answers; the index only ranks | n/a |
+
+## Delegated to the deployment, and named here so it is not assumed
+
+- **Authentication.** `rakka-a2a` performs none. `AllowAllAuthorizer` is the
+  default wired at `handler.rs`, and the crate's routers add no auth layer. A
+  deployment that mounts the surface without an authorizer has an open surface.
+- **The request-supplied tenant.** `A2AHeaderTenantResolver` accepts
+  `request.tenant` when no `x-rakka-tenant`/`x-tenant-id` header is present,
+  and `default_tenant` assigns one when nothing resolves. Both are documented
+  as appropriate only behind an ingress that authenticates and sets the header.
+  Behind a misconfigured ingress they are a tenant-spoofing door.
+- **What an execution class actually isolates.** Rakka routes by the class and
+  refuses to run an effect on a worker that does not serve it. The worker pool,
+  Kubernetes RBAC, NetworkPolicy, credential issuer, and sandbox behind the
+  reference are the platform's.
+- **What an executor puts in its error text.** Rakka bounds it and persists it;
+  it cannot know what is secret inside it. The contract is stated on all nine
+  executor traits and on the credential resolver.
+
+## Owed, and why
+
+- **Communal retrieval into a model context**, `SnapshotCommunalClaim`, and
+  per-claim read-capability enforcement. Deferred by slice 4.6;
+  `MemoryContextSnapshot::communal_claims` is a permanently empty placeholder.
+  Until it exists there is no communal poisoning surface to defend. Tracked as
+  [#69](https://github.com/paloul-tech/rakka/issues/69).
+- **Knowledge-graph retention, tombstone, and deletion** — an absolute
+  specification 13.1 requirement with no implementation on any backend.
+  `Retracted` is a trust transition that preserves content. Operational the
+  moment a consumer writes claims, which gap slice 2 made practical; tracked
+  as [#68](https://github.com/paloul-tech/rakka/issues/68).
+- **Descriptor/endpoint revision pinning across recovery.** Generic tool
+  intents record no descriptor digest; the workflow tool records one that
+  nothing compares.
+- **Tenant-scoped mandatory guardrails.** Deployment-level exists; nothing keys
+  a mandatory set to a `TenantId`.
+- **The revocation re-check is not atomic with the invocation.** Two durable
+  writes and a credential resolution sit between `authorize` and `invoke`. A
+  revocation landing in that window is honoured on the next attempt, not this
+  one.
+- **A cardinality oracle in `SessionPurgeOutcome::Purged { entries }`.** A
+  nonexistent scope answers zero and a populated one does not. Deliberately not
+  collapsed: the count is what makes a fleet sweep observable and a purge
+  auditable, and no memory surface is reachable from A2A or the operational
+  query. Any surface that ever exposes purge to a caller MUST authorize the
+  scope first and SHOULD collapse the count.
+- **Cross-tier erasure.** A private `delete` does not discharge an erasure
+  request on its own: the snapshots of every run that embedded the memory must
+  also be purged. Required by scenario 17's retry determinism — a store that
+  scrubbed embedded content would make the immutable tier mutable — and bounded
+  by the retention window, 30 days by default. Both the exposure and its bound
+  are proven in `memory_retention.rs` rather than left as a footnote.
+- **The generic workflow outbox still persists an unbounded failure
+  message.** The 512-byte bound this slice put on every persisted attempt
+  detail lives in the agent substrate
+  (`rakka_agent_workflow::AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH`, which
+  `AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH` aliases) and covers the fleet
+  index and every agent-domain outbox row. `rakka-workflow`'s own
+  `record_outbox_failure`, reached by `dispatch_due_outbox` on the non-agent
+  path, still stores the application's message as `last_error` unchanged.
+  Left deliberately: that path is a v1 compatibility surface shared by every
+  workflow consumer, and bounding it is a substrate decision with its own
+  compatibility note, not an agent-domain fix. Until it is taken, a non-agent
+  workflow's outbox row carries whatever its dispatcher chose to say.
+
+## One contract, every backend
+
+The three memory stores and the vector retriever now share one suite —
+`rakka_agent::memory_conformance` — instead of two hand-written copies that
+drift. The isolation clauses compare a foreign scope's answer to a *third
+genuinely-empty* scope's by **whole value**: `is_empty()` and `is_none()`,
+which the previous copies used, are satisfied by a backend that answers
+"empty" differently from how it answers an unknown scope, and that difference
+is the disclosure. Two clauses did not honour that rule and now do: the
+withdrawal arm aimed at an id that exists in no scope, which proved a
+not-found path exists and nothing about isolation, and the retriever clause
+compared answers by length. The withdrawal arm now targets a primary-owned
+record no outsider twins — comparing the outsider's refusal to an uninvolved
+scope's refusal for the *same* id, since `MemoryError::NotFound` echoes the id
+asked for and two different ids could never compare equal — and re-reads the
+record to prove it survives un-withdrawn. The retriever clause compares whole
+outcomes, and asserts the empty scope's own answer is empty, without which a
+retriever ignoring scope altogether would answer the primary's corpus to every
+scope, empty included, and match itself. Exhaustiveness is a compiler matter —
+one operation enum per trait, matched with no wildcard — so a method added to
+a trait fails to build until its isolation arm exists.
+
+| Clause | What a non-conformant backend does | Runners |
+| --- | --- | --- |
+| Session, snapshot, and private scope isolation | Answers an outsider differently from an empty scope | in-memory (ungated), PostgreSQL (DSN-gated) |
+| Snapshot isolation specifically | Keys on the reference rather than the record's own `scope` field — `persist` takes no scope argument, so that field is the whole fence | same |
+| Private write preconditions | Lets a stale expectation overwrite a concurrent write | same |
+| Tombstone and delete erasure | Lets a replayed pre-withdrawal write resurrect withdrawn content | same |
+| Retention purge | Ignores a legal hold, or purges before the window elapses | same |
+| Filters before ranking | Answers a *short* page, because it filtered after its `LIMIT` | in-memory, pgvector |
+| Ranked record matches the authoritative one | Returns a stale or synthesized copy | same |
+
+The pgvector arm needs the `vector` extension, which a stock `postgres` image
+does not carry. Without it the arm **announces** the three clauses it did not
+run rather than reporting a silent `ok`, and
+`RAKKA_POSTGRES_PGVECTOR_REQUIRED=1` turns that announcement into a failure —
+what a CI or release run should set, since a suite that quietly stops covering
+what its name claims is the failure mode this whole document exists to refuse.
+
+Verified against PostgreSQL 16 with pgvector 0.8.5: all thirteen clauses pass
+under `RAKKA_POSTGRES_PGVECTOR_REQUIRED=1` with no skips, so the shared suite
+holds on both backends unchanged — the acceptance shape slice 2.4 established
+for the knowledge graph.
+
+## Repeatable commands
+
+```sh
+cargo test -p rakka-agent --test memory_store_contract
+cargo test -p rakka-agent --test memory_scope_fence
+cargo test -p rakka-agent --test memory_guardrail_chain_consistency
+cargo test -p rakka-agent --test memory_retention
+cargo test -p rakka-agent --test secret_exclusion
+cargo test -p rakka-agent --test executor_isolation
+cargo test -p rakka-agent --test tenant_isolation
+
+# The store tiers, against any PostgreSQL:
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
+  cargo test -p rakka-agent-postgres --test memory_conformance
+
+# The whole contract, against a pgvector-enabled image, with no silent skips:
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5433/postgres \
+RAKKA_POSTGRES_PGVECTOR_REQUIRED=1 \
+  cargo test -p rakka-agent-postgres --test memory_conformance
+```
+
+## Production interpretation
+
+Passing these means each claim in the tables above is test-backed at the
+fidelity its row names. It does not remove the need for an authenticating
+ingress, a real worker-pool and sandbox implementation behind the execution
+classes, a credential issuer that does not echo secrets in its errors, or the
+telemetry and Collector validation slices 6.3a and 6.3b own.

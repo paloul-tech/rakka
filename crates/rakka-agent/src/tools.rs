@@ -25,13 +25,30 @@
 //! ([`AgentExecutionPolicyRouter`]) that lets an application place a tool
 //! executor in the isolation its trust class requires. Rakka persists and
 //! routes the reference; the application owns the worker pool, RBAC, network
-//! policy, credential issuer, and sandbox behind it. The
-//! `AgentEnvironmentRef` contract and concurrency rules for tool adapters
-//! sharing an environment arrive with slice 4.6.
+//! policy, credential issuer, and sandbox behind it.
 //!
-//! Specification: sections 11.7 and 11.8, with the enforcement clauses of 16
-//! and the envelope rules of 7.3. Filled by slice 1.8; the shared-environment
-//! rules by slice 4.6.
+//! # The shared-environment contract
+//!
+//! A tool that observes or mutates a shared environment declares the
+//! [`crate::identity::AgentEnvironmentRef`] set it touches on its
+//! [`crate::definition::AgentToolDeclaration`], and — when its safety class
+//! mutates — the class of external concurrency control its adapter applies
+//! ([`AgentEnvironmentConcurrencyProtocol`], validated at
+//! [`AgentToolRegistry::register`]). "Observe" versus "modify" is the safety
+//! class itself: `ReadOnly` observes; every other class mutates, and there is
+//! deliberately no second mode axis for the two to disagree on. The authority
+//! enforces the references per attempt — binding ⊆ declaration ⊆ definition
+//! envelope, narrowed by the setup and by the run's goal-scope envelope —
+//! while the *protocol* stays the adapter's obligation
+//! ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)): Rakka's
+//! per-run single writer never serializes different agents mutating the same
+//! external resource, so the adapter must apply the declared lease,
+//! compare-and-swap, reservation, transaction, idempotency-key, or
+//! reconciliation protocol of the external system, handing over the intent's
+//! derived external idempotency key unchanged where one exists.
+//!
+//! Specification: sections 11.7 and 11.8, with the enforcement clauses of 16,
+//! the envelope rules of 7.3, and the shared-environment rules of 8.5.
 //!
 //! # Where enforcement runs
 //!
@@ -50,7 +67,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
 
 use rakka_agent_workflow::{AgentEffectId, AgentTimestampMillis};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::{AgentEntityState, AgentLifecycleStatus};
@@ -61,17 +78,23 @@ use crate::definition::{
     AgentModelProfileId, AgentRevisionNumber, AgentSamplingSettings, AgentSettings,
     AgentSetupRevision, AgentToolDeclaration, AgentToolId, SettingsRevision,
 };
+use crate::effect::AGENT_TOOL_RESULT_MAX_BYTES;
 use crate::effect::{
     AgentEffectError, AgentEffectGeneration, AgentEffectResult, AgentEffectSpec,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectRequest,
 };
 use crate::guardrails::{
     AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailDisposition,
-    AgentGuardrailReport, AgentGuardrailTransform,
+    AgentGuardrailError, AgentGuardrailReport, AgentGuardrailTransform,
 };
 use crate::identity::{AgentGoalId, AgentRunScope, AgentTaskId};
-use crate::model::{AgentToolCallRequest, AGENT_TOOL_ARGUMENTS_MAX_BYTES};
-use crate::task::{AgentContentDigest, AgentSchemaRef};
+use crate::memory::AgentRunMemory;
+use crate::model::{
+    AgentModelTurn, AgentToolCallRequest, AGENT_MODEL_TURN_MAX_BYTES,
+    AGENT_TOOL_ARGUMENTS_MAX_BYTES,
+};
+use crate::model_profile::AgentModelProfileCatalog;
+use crate::task::{AgentContentDigest, AgentSchemaRef, AgentTaskContent};
 
 /// Largest model-visible tool description, in bytes.
 pub const AGENT_TOOL_DESCRIPTION_MAX_LENGTH: usize = 1024;
@@ -85,7 +108,7 @@ pub const AGENT_TOOL_REGISTRY_MAX_TOOLS: usize = 256;
 /// How long an issued dispatch grant stays valid, unless configured otherwise.
 pub const AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS: u64 = 60_000;
 
-/// The guardrail boundaries [`AgentToolAuthority`] has evaluation points for
+/// The guardrail boundaries the runtime has evaluation points for
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
 ///
 /// A required stage that runs at none of these is refused at dispatch
@@ -95,9 +118,102 @@ pub const AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS: u64 = 60_000;
 /// slices that own those flows — extending it is how a slice declares its new
 /// evaluation point, and doing so is what makes the stages bound to that
 /// boundary start satisfying coverage.
-pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 2] = [
+///
+/// Each boundary's evaluation point: [`AgentToolAuthority`] evaluates the
+/// model-request and tool-request boundaries before every attempt's durable
+/// `Started` (slice 1.8), and the tool-response and model-response boundaries
+/// in the dispatcher after the call returns —
+/// [`AgentToolAuthority::review_tool_response`] and
+/// [`AgentToolAuthority::review_model_response`] respectively, the latter in
+/// the dispatcher's Model arm, before the outcome exists. All four run
+/// against this authority's own chain, unconditionally. The memory-ingress
+/// boundary is evaluated by the snapshot-assembly retrieval path
+/// ([`crate::retrieval::assemble_context`], slice 2.2). The A2A-ingress
+/// boundary is evaluated at the agents surface's authorized leaves, and
+/// A2A-egress in the two in-process send executors that carry an outbound
+/// A2A message. None of these last three shares the authority's own
+/// evaluation point, which is why a deployment must wire the *same* chain
+/// into whichever it owns and attest it —
+/// [`AgentToolAuthority::with_memory_ingress`] for the retrieval bundle,
+/// [`AgentToolAuthority::with_a2a_guardrails`] for the A2A surface — before
+/// this authority's coverage check counts it: the check cannot see either
+/// chain directly. A deployment with no retrieval or no A2A surface wired is
+/// not fail-open — no memory or message ever crosses that boundary, so there
+/// is nothing a stage there could have protected.
+pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 7] = [
     AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ModelResponse,
     AgentGuardrailBoundary::ToolRequest,
+    AgentGuardrailBoundary::ToolResponse,
+    AgentGuardrailBoundary::MemoryIngress,
+    AgentGuardrailBoundary::A2aIngress,
+    AgentGuardrailBoundary::A2aEgress,
+];
+
+/// The boundaries [`AgentToolAuthority`] evaluates *on its own*, needing no
+/// attestation from anywhere else.
+///
+/// This is the honest core of [`AGENT_EVALUATED_GUARDRAIL_BOUNDARIES`], which
+/// names every boundary the runtime has an evaluation point for *somewhere*.
+/// The model-request and tool-request boundaries run before every attempt's
+/// durable `Started` (slice 1.8); the tool-response and model-response
+/// boundaries run in the dispatcher after the call returns —
+/// [`AgentToolAuthority::review_tool_response`] and
+/// [`AgentToolAuthority::review_model_response`], the latter in the
+/// dispatcher's Model arm, before the outcome exists. All four run against
+/// this authority's own chain, so none needs a deployment to attest
+/// anything: there is only the one object to be the same as.
+///
+/// An authority may only count the memory-ingress or A2A boundaries once a
+/// deployment has attested — through
+/// [`AgentToolAuthority::with_memory_ingress`] or
+/// [`AgentToolAuthority::with_a2a_guardrails`] — that the retrieval bundle or
+/// A2A surface carries the same declared chain. Until then a mandatory stage
+/// bound only to one of those boundaries fails closed as
+/// `guardrail-stage-unevaluated`, which is the correct answer: this authority
+/// cannot see a retrieval bundle or an A2A surface, so it cannot vouch for
+/// one it was never shown.
+pub const AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 4] = [
+    AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ModelResponse,
+    AgentGuardrailBoundary::ToolRequest,
+    AgentGuardrailBoundary::ToolResponse,
+];
+
+/// The boundaries an authority counts once a deployment has attested its
+/// retrieval bundle ([`AgentToolAuthority::with_memory_ingress`]) and nothing
+/// else.
+///
+/// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] plus the memory-ingress
+/// boundary, which is evaluated by the snapshot-assembly retrieval path
+/// ([`crate::retrieval::assemble_context`], slice 2.2) — a different
+/// evaluation point than the authority's own four, which is why the
+/// attestation exists at all: this coverage check cannot see the retrieval
+/// bundle's chain directly.
+pub const AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 5] = [
+    AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ModelResponse,
+    AgentGuardrailBoundary::ToolRequest,
+    AgentGuardrailBoundary::ToolResponse,
+    AgentGuardrailBoundary::MemoryIngress,
+];
+
+/// The boundaries an authority counts once a deployment has attested its A2A
+/// surface ([`AgentToolAuthority::with_a2a_guardrails`]) and nothing else.
+///
+/// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] plus the two A2A
+/// boundaries: A2A-ingress, evaluated at the agents surface's authorized
+/// leaves, and A2A-egress, evaluated in the two in-process send executors
+/// that carry an outbound A2A message — neither one the authority's own
+/// evaluation point, which is why the attestation exists at all: this
+/// coverage check cannot see the A2A surface's chain directly.
+pub const AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 6] = [
+    AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ModelResponse,
+    AgentGuardrailBoundary::ToolRequest,
+    AgentGuardrailBoundary::ToolResponse,
+    AgentGuardrailBoundary::A2aIngress,
+    AgentGuardrailBoundary::A2aEgress,
 ];
 
 /// Result type for tool registry operations.
@@ -105,7 +221,7 @@ pub type AgentToolResult<T> = Result<T, AgentToolError>;
 
 /// The kind of component behind a tool
 /// ([specification 11.7](../../../docs/plans/rakka-agent/spec.md)).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AgentToolKind {
@@ -153,7 +269,7 @@ impl Display for AgentToolKind {
 /// How a tool's result is bounded
 /// ([specification 11.7](../../../docs/plans/rakka-agent/spec.md): every
 /// descriptor declares bounded result/artifact behavior).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AgentToolResultBehavior {
@@ -189,7 +305,15 @@ impl Display for AgentToolResultBehavior {
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)): showing it
 /// to a model lets the model *ask*, and everything that decides whether the
 /// ask executes lives in the binding, the intent, and the grant.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// Decoding does **not** re-validate: `Deserialize` reconstructs the fields as
+/// written, while [`AgentToolDescriptor::new`] is what enforces the bounds. The
+/// descriptors a model is shown are validated where they enter — the registry
+/// builds them, and the dispatch authority validates the ones it puts on a
+/// grant — so a decoded descriptor from any other source is caller-checked
+/// input: call [`AgentToolDescriptor::validate`] on it before it is trusted,
+/// as the model-turn decode beside it does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentToolDescriptor {
     /// Stable tool name.
     pub tool: AgentToolId,
@@ -297,6 +421,59 @@ impl AgentToolDescriptor {
     }
 }
 
+/// The class of external concurrency control a tool adapter applies when its
+/// tool mutates a shared environment
+/// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Rakka's per-run single writer does not serialize different agents mutating
+/// the same external resource, so the *external system's* protocol is the
+/// only coordination there is — and this declaration is the deployment's
+/// durable statement of which class the adapter uses. Deliberately no
+/// "unprotected" variant exists: a mutating environment tool that declares no
+/// protocol is refused at registration, never silently admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentEnvironmentConcurrencyProtocol {
+    /// The adapter hands the external system the intent's derived idempotency
+    /// key, and the system deduplicates on it.
+    ExternalIdempotencyKey,
+    /// The adapter acquires an application-provided lease before mutating.
+    Lease,
+    /// The adapter mutates through a compare-and-swap on the resource's
+    /// version or state.
+    CompareAndSwap,
+    /// The adapter reserves the resource before mutating it.
+    Reservation,
+    /// The adapter mutates inside the external system's transaction.
+    Transaction,
+    /// The adapter relies on the reconciliation protocol the binding names —
+    /// legal only for a `Reconcileable` declaration, whose protocol reference
+    /// is then the system of record for what happened.
+    Reconciliation,
+}
+
+impl AgentEnvironmentConcurrencyProtocol {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::ExternalIdempotencyKey => "external-idempotency-key",
+            Self::Lease => "lease",
+            Self::CompareAndSwap => "compare-and-swap",
+            Self::Reservation => "reservation",
+            Self::Transaction => "transaction",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+}
+
+impl Display for AgentEnvironmentConcurrencyProtocol {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
 /// The deployment-authorized authority of one registered tool
 /// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md):
 /// `ToolBinding`).
@@ -308,12 +485,24 @@ impl AgentToolDescriptor {
 /// and fails safe: one non-idempotent attempt, no capabilities, no credential,
 /// so an ambiguous loss parks for reconciliation rather than guessing that a
 /// retry is harmless.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Decoding goes through a shadow record that re-validates: a binding can
+/// arrive from deployment configuration, so it crosses a trust boundary, and
+/// an out-of-bounds descriptor or an attempt bound of zero is refused where it
+/// enters rather than after a registry has been built around it.
+///
+/// Versioning: the decode ignores fields it does not know, so an older build
+/// reads a binding a newer build wrote. A restrictive field a later version
+/// adds is therefore dropped by an older reader, which then enforces less than
+/// the binding says — the decode fails open on a downgrade — so a binding must
+/// never be handed to a build older than the one that wrote it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentToolBinding {
     descriptor: AgentToolDescriptor,
     declaration: AgentToolDeclaration,
     max_attempts: u32,
     reconciliation_protocol: Option<AgentReconciliationProtocolRef>,
+    environment_concurrency: Option<AgentEnvironmentConcurrencyProtocol>,
     timeout_ms: Option<u64>,
     guardrails: BTreeSet<AgentGuardrailStageId>,
     checkpoint_required: bool,
@@ -330,6 +519,7 @@ impl AgentToolBinding {
             declaration: AgentToolDeclaration::new(AgentEffectSafetyClass::NonIdempotent),
             max_attempts: 1,
             reconciliation_protocol: None,
+            environment_concurrency: None,
             timeout_ms: None,
             guardrails: BTreeSet::new(),
             checkpoint_required: false,
@@ -355,6 +545,7 @@ impl AgentToolBinding {
             declaration,
             max_attempts,
             reconciliation_protocol: None,
+            environment_concurrency: None,
             timeout_ms: None,
             guardrails: BTreeSet::new(),
             checkpoint_required: false,
@@ -371,6 +562,26 @@ impl AgentToolBinding {
     ) -> Self {
         self.reconciliation_protocol = Some(protocol);
         self
+    }
+
+    /// Declares the class of external concurrency control the adapter applies
+    /// against the tool's declared environments
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md));
+    /// required exactly when the declaration names an environment and its
+    /// safety class mutates.
+    #[must_use]
+    pub const fn with_environment_concurrency(
+        mut self,
+        protocol: AgentEnvironmentConcurrencyProtocol,
+    ) -> Self {
+        self.environment_concurrency = Some(protocol);
+        self
+    }
+
+    /// The declared environment-concurrency class, when one is declared.
+    #[must_use]
+    pub const fn environment_concurrency(&self) -> Option<AgentEnvironmentConcurrencyProtocol> {
+        self.environment_concurrency
     }
 
     /// Sets the per-attempt timeout.
@@ -464,6 +675,65 @@ impl AgentToolBinding {
         spec.validate()?;
         Ok(spec)
     }
+
+    /// Rejects a binding whose descriptor is unbounded or whose attempt policy
+    /// the crash-and-timeout rules could not honor.
+    ///
+    /// This is the open part of the binding's validation — the part that needs
+    /// nothing but the binding itself. The closed part, which also weighs the
+    /// declaration against the environment contract, runs at
+    /// [`AgentToolRegistry::register`], where a binding becomes authoritative.
+    pub fn validate(&self) -> AgentToolResult<()> {
+        self.descriptor.validate()?;
+        self.effect_spec()?;
+        Ok(())
+    }
+}
+
+/// The wire and durable shape of [`AgentToolBinding`], validated on load.
+///
+/// Every field of the binding appears here, so a decode reconstructs it whole;
+/// [`AgentToolBinding::validate`] is then what refuses one that no
+/// construction path could have produced.
+#[derive(Deserialize)]
+struct AgentToolBindingRecord {
+    descriptor: AgentToolDescriptor,
+    declaration: AgentToolDeclaration,
+    max_attempts: u32,
+    #[serde(default)]
+    reconciliation_protocol: Option<AgentReconciliationProtocolRef>,
+    #[serde(default)]
+    environment_concurrency: Option<AgentEnvironmentConcurrencyProtocol>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    guardrails: BTreeSet<AgentGuardrailStageId>,
+    #[serde(default)]
+    checkpoint_required: bool,
+    #[serde(default)]
+    authorization_required: bool,
+}
+
+impl<'de> Deserialize<'de> for AgentToolBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let record = AgentToolBindingRecord::deserialize(deserializer)?;
+        let binding = Self {
+            descriptor: record.descriptor,
+            declaration: record.declaration,
+            max_attempts: record.max_attempts,
+            reconciliation_protocol: record.reconciliation_protocol,
+            environment_concurrency: record.environment_concurrency,
+            timeout_ms: record.timeout_ms,
+            guardrails: record.guardrails,
+            checkpoint_required: record.checkpoint_required,
+            authorization_required: record.authorization_required,
+        };
+        binding.validate().map_err(serde::de::Error::custom)?;
+        Ok(binding)
+    }
 }
 
 /// The deployment's registry of dispatchable tools
@@ -489,9 +759,42 @@ impl AgentToolRegistry {
     /// Registers one tool binding, refusing a duplicate or a binding whose
     /// failure policy the crash-and-timeout rules could not honor.
     pub fn register(mut self, binding: AgentToolBinding) -> AgentToolResult<Self> {
-        binding.descriptor.validate()?;
-        binding.effect_spec()?;
+        binding.validate()?;
         let tool = binding.descriptor.tool.clone();
+        // The environment contract ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)):
+        // a mutating environment tool must state the external coordination
+        // class its adapter uses — there is no fail-open default — while a
+        // protocol on a tool that touches no environment is a wiring mistake
+        // named at registration, not silently carried. An `Environment`-kind
+        // descriptor with no declared ref would escape all environment
+        // gating, so it is refused too; the converse — a `Function` tool
+        // naming an environment — stays legal, because the kind is category
+        // and the ref set is the contract.
+        let mutating_environment = !binding.declaration.environments.is_empty()
+            && binding.declaration.safety != AgentEffectSafetyClass::ReadOnly;
+        if mutating_environment && binding.environment_concurrency.is_none() {
+            return Err(AgentToolError::EnvironmentConcurrencyMissing { tool });
+        }
+        if binding.environment_concurrency.is_some() && binding.declaration.environments.is_empty()
+        {
+            return Err(AgentToolError::EnvironmentConcurrencyUnexpected { tool });
+        }
+        if binding.environment_concurrency
+            == Some(AgentEnvironmentConcurrencyProtocol::Reconciliation)
+            && binding.declaration.safety != AgentEffectSafetyClass::Reconcileable
+        {
+            return Err(AgentToolError::Policy {
+                message: format!(
+                    "the tool {tool} declares reconciliation as its environment concurrency, \
+                     which requires the reconcileable safety class"
+                ),
+            });
+        }
+        if binding.descriptor.kind == AgentToolKind::Environment
+            && binding.declaration.environments.is_empty()
+        {
+            return Err(AgentToolError::EnvironmentRefMissing { tool });
+        }
         // The duplicate check precedes the capacity check so a re-registration
         // at the cap names its real conflict, not a full registry.
         if self.tools.contains_key(&tool) {
@@ -598,6 +901,14 @@ pub struct AgentAuthorityContext<'a> {
     /// `CheckpointRequired` disposition; without a valid grant, either gate
     /// fails closed ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
     pub checkpoint_grant: Option<&'a AgentCheckpointGrant>,
+    /// The run's goal-scope delegation envelope, when the run serves one
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md): the
+    /// goal says which environment scopes an agent may reach). Its
+    /// environment narrowing binds every attempt — the immediate-safety
+    /// posture — and its knowledge-space grant is the claim-append door's
+    /// authority. Absent for a run with no envelope, which means no
+    /// goal-scope narrowing.
+    pub delegation: Option<&'a crate::delegation::AgentRunDelegationEnvelope>,
 }
 
 impl<'a> AgentAuthorityContext<'a> {
@@ -610,7 +921,19 @@ impl<'a> AgentAuthorityContext<'a> {
             settings: state.settings(),
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         }
+    }
+
+    /// Attaches the run's goal-scope delegation envelope, whose environment
+    /// and knowledge-space narrowing bind every attempt.
+    #[must_use]
+    pub const fn with_delegation_envelope(
+        mut self,
+        envelope: &'a crate::delegation::AgentRunDelegationEnvelope,
+    ) -> Self {
+        self.delegation = Some(envelope);
+        self
     }
 
     /// Attaches the run's setup revision.
@@ -691,6 +1014,13 @@ pub struct AgentDispatchGrant {
     pub credential_binding: Option<AgentCredentialBindingRef>,
     /// The execution policy the dispatch is routed through.
     pub execution_policy: Option<AgentExecutionPolicyRef>,
+    /// The revision of the model profile record that authorized a model
+    /// call, when a catalog resolved one.
+    #[serde(default)]
+    pub model_profile_revision: Option<AgentRevisionNumber>,
+    /// The digest of that record, for the attempt's audit trail.
+    #[serde(default)]
+    pub model_profile_digest: Option<AgentContentDigest>,
     /// When the grant was issued.
     pub issued_at: AgentTimestampMillis,
     /// When the grant expires.
@@ -763,6 +1093,14 @@ pub struct AgentGrantedDispatch {
     pub model_profile: Option<AgentModelProfileId>,
     /// The sampling parameters the current settings resolve for the turn.
     pub sampling: Option<AgentSamplingSettings>,
+    /// The credential binding the selected model profile names, when the
+    /// authority resolved one; the dispatcher resolves it when the intent
+    /// itself carries none.
+    pub model_credential_binding: Option<AgentCredentialBindingRef>,
+    /// The descriptors the model may be shown for this call: registered,
+    /// declared by the envelope, not revoked by the current settings, and
+    /// narrowed by the run's setup when one exists.
+    pub tools: Vec<AgentToolDescriptor>,
     /// Every guardrail transform applied to the call, with its reason. The
     /// dispatch pipeline surfaces these through its tracing span so an applied
     /// transform is observable, not silent.
@@ -770,6 +1108,11 @@ pub struct AgentGrantedDispatch {
     /// Report-only guardrail findings. The dispatch pipeline surfaces these
     /// through its tracing span, which is what makes "recorded" true.
     pub reports: Vec<AgentGuardrailReport>,
+    /// The validated checkpoint grant the attempt dispatches under, when one
+    /// binds the intent. In-memory only — never persisted — it is how the
+    /// human-review evaluation arm reads the resolver whose durable decision
+    /// is the evidence.
+    pub checkpoint: Option<Box<crate::checkpoints::AgentCheckpointGrant>>,
 }
 
 /// A dispatch the authority refused, with a stable reason code.
@@ -783,13 +1126,18 @@ pub struct AgentGrantedDispatch {
 /// requires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentAuthorityRefusal {
-    /// Stable machine-readable reason code.
+    /// Stable machine-readable reason code: the pipeline's.
     pub code: String,
     /// Human-readable detail.
     pub message: String,
     /// Whether the refusing condition may clear without a new definition,
     /// setup, or reconfiguration.
     pub retryable: bool,
+    /// Which decision refused, when one party decided: a guardrail's stage
+    /// and reason code. It reaches the failed effect's outcome and the run's
+    /// records beside `code`; the message does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<crate::failure::AgentFailureReason>,
 }
 
 impl AgentAuthorityRefusal {
@@ -800,6 +1148,7 @@ impl AgentAuthorityRefusal {
             code: code.into(),
             message: message.into(),
             retryable: false,
+            reason: None,
         }
     }
 
@@ -810,7 +1159,15 @@ impl AgentAuthorityRefusal {
             code: code.into(),
             message: message.into(),
             retryable: true,
+            reason: None,
         }
+    }
+
+    /// Names the decision that refused.
+    #[must_use]
+    pub fn with_reason(mut self, reason: Option<crate::failure::AgentFailureReason>) -> Self {
+        self.reason = reason;
+        self
     }
 }
 
@@ -848,11 +1205,328 @@ pub trait AgentExecutionPolicyRouter: Send + Sync {
 pub struct AgentToolAuthority {
     registry: AgentToolRegistry,
     guardrails: Option<AgentGuardrailChain>,
+    /// Whether a deployment attested that its retrieval bundle evaluates the
+    /// memory-ingress boundary under this authority's own declared chain.
+    memory_ingress_attested: bool,
+    /// Whether a deployment attested that its A2A surface evaluates the
+    /// ingress and egress boundaries under this authority's own declared
+    /// chain.
+    a2a_attested: bool,
     execution_router: Option<Arc<dyn AgentExecutionPolicyRouter>>,
+    /// The trust class every effect Rakka itself commits runs under, when the
+    /// deployment requires each intent to name one. `Some` *is* strict mode:
+    /// one declaration drives both the gate and the specs that satisfy it, so
+    /// the two cannot drift apart.
+    substrate_execution_policy: Option<AgentExecutionPolicyRef>,
+    /// The deployment's model profile catalog, when one is installed; without
+    /// it a profile is an opaque approved id, as before.
+    model_profiles: Option<Arc<dyn AgentModelProfileCatalog>>,
     grant_ttl_ms: u64,
 }
 
+/// What the `ToolResponse` boundary decided about one executed tool's result.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct AgentToolResponseReview {
+    /// The content the run receives: the result unchanged, or the chain's
+    /// deterministic transform of it.
+    pub content: AgentTaskContent,
+    /// Whether a stage replaced the content.
+    pub transformed: bool,
+    /// Every transform applied, with its reason, for the dispatch trace.
+    pub transforms: Vec<AgentGuardrailTransform>,
+    /// Every report-only finding, for the dispatch trace.
+    pub reports: Vec<AgentGuardrailReport>,
+}
+
+impl AgentToolResponseReview {
+    /// A review that changed nothing: no chain is configured, or every stage
+    /// allowed the result.
+    #[must_use]
+    pub fn unchanged(content: AgentTaskContent) -> Self {
+        Self {
+            content,
+            transformed: false,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+        }
+    }
+}
+
+/// What the `ModelResponse` boundary decided about one model turn.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct AgentModelResponseReview {
+    /// The turn the run records: the model's unchanged, or the chain's
+    /// deterministic transform of it.
+    pub turn: AgentModelTurn,
+    /// Whether a stage replaced the turn.
+    pub transformed: bool,
+    /// Every transform applied, with its reason, for the dispatch trace.
+    pub transforms: Vec<AgentGuardrailTransform>,
+    /// Every report-only finding, for the dispatch trace.
+    pub reports: Vec<AgentGuardrailReport>,
+}
+
+impl AgentModelResponseReview {
+    /// A review that changed nothing: no chain is configured, or every stage
+    /// allowed the turn.
+    #[must_use]
+    pub fn unchanged(turn: AgentModelTurn) -> Self {
+        Self {
+            turn,
+            transformed: false,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+        }
+    }
+}
+
 impl AgentToolAuthority {
+    /// Evaluates one executed tool's result at
+    /// [`AgentGuardrailBoundary::ToolResponse`], before the result becomes
+    /// durable anywhere.
+    ///
+    /// The tool already ran, so the boundary decides what the *run* receives,
+    /// never whether the tool executes: a blocked result is a determinate
+    /// failure of an effect that did run (`guardrail-blocked`), delivered once
+    /// and never retried, and a transformed result is what is delivered — so
+    /// a redelivery carries the same content and no retry re-evaluates
+    /// ([specification 16](../../../docs/plans/rakka-agent/spec.md): a
+    /// transformation is deterministic under a recorded revision, and the
+    /// accepted transformed input is reused). Nothing a stage blocks reaches
+    /// the run, its session memory, or a later context snapshot, which is the
+    /// poisoning surface this boundary exists to close.
+    ///
+    /// The content evaluated is the inline value, or the artifact reference
+    /// for reference content — the memory-ingress precedent. A transform is
+    /// honoured for inline content only, bounded at
+    /// [`AGENT_TOOL_RESULT_MAX_BYTES`]; a transform of reference content is
+    /// refused (`guardrail-transform-unsupported`), since replacing a
+    /// reference would fabricate an artifact. `RequireCheckpoint` fails closed
+    /// (`checkpoint-required`): no checkpoint can gate a response that already
+    /// exists, and a stage wanting a human on tool output should block and
+    /// report instead.
+    ///
+    /// # Errors
+    ///
+    /// The refusal the disposition maps to, with the stable code.
+    pub fn review_tool_response(
+        &self,
+        scope: &AgentRunScope,
+        tool: Option<&AgentToolId>,
+        content: AgentTaskContent,
+    ) -> Result<AgentToolResponseReview, AgentAuthorityRefusal> {
+        let Some(chain) = &self.guardrails else {
+            return Ok(AgentToolResponseReview::unchanged(content));
+        };
+        let value = match content.inline_value() {
+            Some(value) => value.clone(),
+            None => match content.artifact_ref() {
+                Some(artifact) => serde_json::to_value(artifact).map_err(|error| {
+                    AgentAuthorityRefusal::of(
+                        "guardrail-content-unencodable",
+                        format!("the tool result's artifact reference does not encode: {error}"),
+                    )
+                })?,
+                None => {
+                    return Err(AgentAuthorityRefusal::of(
+                        "guardrail-content-unencodable",
+                        "the tool result carries neither an inline value nor an artifact \
+                         reference",
+                    ))
+                }
+            },
+        };
+        let mut guardrail_context =
+            AgentGuardrailContext::new(AgentGuardrailBoundary::ToolResponse, scope);
+        if let Some(tool) = tool {
+            guardrail_context = guardrail_context.with_tool(tool);
+        }
+        let decision =
+            chain.evaluate_bounded(&guardrail_context, &value, AGENT_TOOL_RESULT_MAX_BYTES);
+        refuse_guardrail_disposition(&decision.disposition, "the tool response", false)?;
+        let mut review = AgentToolResponseReview::unchanged(content);
+        review.transforms = decision.transforms;
+        review.reports = decision.reports;
+        if decision.transformed {
+            if review.content.inline_value().is_none() {
+                return Err(AgentAuthorityRefusal::of(
+                    "guardrail-transform-unsupported",
+                    "a guardrail stage transformed a tool result held behind an artifact \
+                     reference; a reference cannot be rewritten into inline content",
+                ));
+            }
+            review.content = AgentTaskContent::inline(decision.content).map_err(|error| {
+                AgentAuthorityRefusal::of(
+                    "guardrail-transform-invalid",
+                    format!("the transformed tool result is not a bounded inline result: {error}"),
+                )
+            })?;
+            review.transformed = true;
+        }
+        Ok(review)
+    }
+
+    /// Evaluates one model turn at [`AgentGuardrailBoundary::ModelResponse`],
+    /// before the turn becomes durable anywhere.
+    ///
+    /// The model already answered, so the boundary decides what the *run*
+    /// records, never whether the model is called: a blocked turn is a
+    /// determinate failure of an effect that did run (`guardrail-blocked`),
+    /// delivered once and never retried, and a transformed turn is what the
+    /// run commits — so its session-memory entry and every later context
+    /// snapshot hold the transformed text. This is the `ToolResponse`
+    /// precedent ([`Self::review_tool_response`]) applied to the other
+    /// response boundary.
+    ///
+    /// The content evaluated is the turn's own serialization, bounded at
+    /// [`AGENT_MODEL_TURN_MAX_BYTES`]. A transform is decoded through the
+    /// turn's validating deserializer and refused (`guardrail-transform-invalid`)
+    /// when it does not form a bounded turn, when it rewrites the schema
+    /// version, adapter version, model profile, usage, response model, or
+    /// finish reason the provider reported, when it carries a tool call under
+    /// a call id the model did not produce, or when it carries two tool calls
+    /// under one call id; a stage
+    /// may rewrite text, drop, reorder, or rewrite the model's own tool calls,
+    /// and rewrite an inline proposal. A stage may drop the proposal. A
+    /// transform that adds a proposal to a turn that made none is refused
+    /// (`guardrail-transform-invalid`), and one that changes the proposal's
+    /// form — inline to artifact reference, reference to inline — or any
+    /// field of a reference is refused (`guardrail-transform-unsupported`),
+    /// the `ToolResponse` precedent that a reference cannot be rewritten: a
+    /// reference survives a transform only whole. `RequireCheckpoint` fails closed
+    /// (`checkpoint-required`): no checkpoint can gate a response that
+    /// already exists.
+    ///
+    /// # Errors
+    ///
+    /// The refusal the disposition maps to, with the stable code.
+    pub fn review_model_response(
+        &self,
+        scope: &AgentRunScope,
+        turn: AgentModelTurn,
+    ) -> Result<AgentModelResponseReview, AgentAuthorityRefusal> {
+        let Some(chain) = &self.guardrails else {
+            return Ok(AgentModelResponseReview::unchanged(turn));
+        };
+        let value = serde_json::to_value(&turn).map_err(|error| {
+            AgentAuthorityRefusal::of(
+                "guardrail-content-unencodable",
+                format!("the model turn does not encode: {error}"),
+            )
+        })?;
+        let guardrail_context =
+            AgentGuardrailContext::new(AgentGuardrailBoundary::ModelResponse, scope);
+        let decision =
+            chain.evaluate_bounded(&guardrail_context, &value, AGENT_MODEL_TURN_MAX_BYTES);
+        refuse_guardrail_disposition(&decision.disposition, "the model response", false)?;
+        let mut review = AgentModelResponseReview::unchanged(turn);
+        review.transforms = decision.transforms;
+        review.reports = decision.reports;
+        if decision.transformed {
+            let transformed: AgentModelTurn =
+                serde_json::from_value(decision.content).map_err(|error| {
+                    AgentAuthorityRefusal::of(
+                        "guardrail-transform-invalid",
+                        format!("the transformed model turn is not a bounded turn: {error}"),
+                    )
+                })?;
+            transformed.validate().map_err(|error| {
+                AgentAuthorityRefusal::of(
+                    "guardrail-transform-invalid",
+                    format!("the transformed model turn is out of bounds: {error}"),
+                )
+            })?;
+            // The schema version is provenance a stage can reach: it is a
+            // private field, so nothing but `AgentModelTurn::new` sets it in
+            // Rust, but it round-trips through the shadow record as a required
+            // field and `validate` does not check it — so a stage editing JSON
+            // could bump the turn into a version it was never written under,
+            // which the N+1 acceptance window would admit.
+            if crate::schema::VersionedAgentRecord::schema_version(&transformed)
+                != crate::schema::VersionedAgentRecord::schema_version(&review.turn)
+                || transformed.adapter_version != review.turn.adapter_version
+                || transformed.model_profile != review.turn.model_profile
+                || transformed.usage != review.turn.usage
+                || transformed.response_model != review.turn.response_model
+                || transformed.finish_reason != review.turn.finish_reason
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    "guardrail-transform-invalid",
+                    "a guardrail transform may rewrite a turn's text, tool calls, and proposal; \
+                     it may not rewrite its schema version, adapter version, model profile, \
+                     usage, response model, or finish reason",
+                ));
+            }
+            let invented = transformed.tool_calls.iter().any(|call| {
+                !review
+                    .turn
+                    .tool_calls
+                    .iter()
+                    .any(|original| original.call_id == call.call_id)
+            });
+            if invented {
+                return Err(AgentAuthorityRefusal::of(
+                    "guardrail-transform-invalid",
+                    "a guardrail transform may drop or rewrite a tool call the model made; it \
+                     may not add one under a call id the model did not produce",
+                ));
+            }
+            // A call id is the dispatch identity of the call it names, so two
+            // calls sharing one is not a rewrite of the model's call but a
+            // second call smuggled under its name. Dropping and reordering
+            // calls stay permitted.
+            let mut seen = BTreeSet::new();
+            if transformed
+                .tool_calls
+                .iter()
+                .any(|call| !seen.insert(&call.call_id))
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    "guardrail-transform-invalid",
+                    "a guardrail transform may not carry two tool calls under one call id",
+                ));
+            }
+            // The proposal is the model's, and a stage may only make it say
+            // less. It may rewrite an inline proposal or drop any proposal.
+            // It may not add one where the model proposed nothing — that is
+            // an invented task result, the twin of an invented tool call. And
+            // a reference is not a stage's to write at all, for the reason a
+            // reference-held tool result cannot be rewritten
+            // ([`Self::review_tool_response`]): it names an immutable
+            // artifact the run never loads here, so turning an inline
+            // proposal into one fabricates an artifact, turning one into
+            // inline invents the bytes it stood for, and changing any field
+            // of one — its `uri` and `checksum` are what the task
+            // fingerprints — proposes content nothing in this turn produced.
+            // A reference survives a transform only whole.
+            match (&review.turn.proposal, &transformed.proposal) {
+                (None, Some(_)) => {
+                    return Err(AgentAuthorityRefusal::of(
+                        "guardrail-transform-invalid",
+                        "a guardrail transform may rewrite or drop the proposal the model made; \
+                         it may not add one to a turn that proposed nothing",
+                    ));
+                }
+                (Some(original), Some(proposal))
+                    if original.artifact_ref() != proposal.artifact_ref() =>
+                {
+                    return Err(AgentAuthorityRefusal::of(
+                        "guardrail-transform-unsupported",
+                        "a guardrail transform may rewrite an inline proposal; it may not change \
+                         the proposal's form between inline and an artifact reference, nor \
+                         change any field of a reference",
+                    ));
+                }
+                _ => {}
+            }
+            review.turn = transformed;
+            review.transformed = true;
+        }
+        Ok(review)
+    }
+
     /// An authority over the given registry, with no guardrail chain and no
     /// execution-policy router.
     #[must_use]
@@ -860,22 +1534,257 @@ impl AgentToolAuthority {
         Self {
             registry,
             guardrails: None,
+            memory_ingress_attested: false,
+            a2a_attested: false,
             execution_router: None,
+            substrate_execution_policy: None,
+            model_profiles: None,
             grant_ttl_ms: AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS,
         }
     }
 
+    /// The same authority over another registry.
+    ///
+    /// A deployment that learns what a tool *is* after the authority was
+    /// configured — a remote MCP server's tool list is discovered, not
+    /// declared in the binary — widens the registry this way rather than
+    /// rebuilding the authority, which would silently drop its guardrail
+    /// chain, attestations, router, and grant policy. Widening authorizes
+    /// nothing on its own: a registered tool still needs the envelope to
+    /// declare it and every dispatch still needs a grant.
+    #[must_use]
+    pub fn with_registry(mut self, registry: AgentToolRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
     /// Uses the deployment's guardrail chain.
+    ///
+    /// Replacing the chain clears any memory-ingress and A2A attestation: an
+    /// attestation is about a *particular* declared chain, and a new one has
+    /// not been checked against the retrieval bundle or the A2A surface.
     #[must_use]
     pub fn with_guardrails(mut self, chain: AgentGuardrailChain) -> Self {
         self.guardrails = Some(chain);
+        self.memory_ingress_attested = false;
+        self.a2a_attested = false;
         self
+    }
+
+    /// Attests that the run memory this deployment assembles through
+    /// evaluates the memory-ingress boundary under the *same declared chain*
+    /// this authority carries.
+    ///
+    /// The two enforcement points are structurally separate — the authority
+    /// evaluates model and tool requests before dispatch, the run memory's
+    /// retrieval bundle evaluates retrieved memory during snapshot assembly —
+    /// and neither can see the other's chain at dispatch. So the deployment
+    /// that wires both says so here, and the claim is *checked* rather than
+    /// taken: the two [`AgentGuardrailChain::declaration_digest`]s must agree,
+    /// which catches a drifted revision and an empty bundle chain alike.
+    ///
+    /// It takes the [`AgentRunMemory`] rather than a bare
+    /// [`crate::retrieval::AgentMemoryRetrieval`], and that is the whole
+    /// point: the object attested must be the object the run assembles
+    /// through. Checking a bundle handed in for the occasion proves a
+    /// deployment *owns* a matching chain somewhere, not that the run will
+    /// ever evaluate it — a bundle attested and then not installed, or
+    /// installed alongside a different one, satisfied the check and ran no
+    /// ingress stage at all. Passing the memory narrows the mistake to one a
+    /// deployment has to work at: building a second `AgentRunMemory` for the
+    /// run entity. Since the type is `Clone` and cheap, the natural shape is
+    /// one value, attested here and handed to the run.
+    ///
+    /// A memory carrying no retrieval bundle is refused rather than treated as
+    /// an empty chain: nothing would evaluate the boundary, which is the
+    /// condition this attestation exists to rule out.
+    ///
+    /// Use [`Self::attests`] to re-check a memory assembled separately.
+    ///
+    /// Without this attestation the authority does not count `MemoryIngress`
+    /// among the boundaries it evaluates, so an envelope requiring a
+    /// memory-ingress-only stage refuses dispatch with the existing
+    /// `guardrail-stage-unevaluated`. A deployment that simply forgets to
+    /// attest therefore fails closed rather than silently losing the
+    /// protection ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentGuardrailError::ChainMismatch`] (`guardrail-chain-mismatch`)
+    /// when the two declarations differ, when this authority carries no chain
+    /// at all, or when the memory carries no retrieval bundle. The refusal
+    /// lands at wiring time, so a misconfigured deployment fails at startup
+    /// rather than at its first tool call.
+    pub fn with_memory_ingress(
+        mut self,
+        memory: &AgentRunMemory,
+    ) -> Result<Self, AgentGuardrailError> {
+        let installed = self.declared_by(memory);
+        let mine = self.declared_chain();
+        if installed.is_none() || installed != mine {
+            return Err(AgentGuardrailError::ChainMismatch {
+                authority: mine,
+                retrieval: installed,
+            });
+        }
+        self.memory_ingress_attested = true;
+        Ok(self)
+    }
+
+    /// Whether this authority's attestation holds for the given run memory.
+    ///
+    /// The attestation is checked once, at wiring time, against the memory it
+    /// was shown. A deployment that assembles its run memory somewhere else —
+    /// a second construction, a reload, a refactor — can re-check it here
+    /// rather than assume, and an assertion in a deployment's own startup
+    /// path is the cheapest place to catch a bundle that drifted from the
+    /// chain the dispatch gate enforces.
+    ///
+    /// `false` when this authority never attested, when it carries no chain,
+    /// when the memory carries no bundle, or when the two declarations differ.
+    #[must_use]
+    pub fn attests(&self, memory: &AgentRunMemory) -> bool {
+        if !self.memory_ingress_attested {
+            return false;
+        }
+        let installed = self.declared_by(memory);
+        installed.is_some() && installed == self.declared_chain()
+    }
+
+    /// Attests that the A2A surface this deployment serves evaluates the
+    /// ingress and egress boundaries under the *same declared chain* this
+    /// authority carries.
+    ///
+    /// The surface hands over its chain's declaration digest
+    /// (`RakkaAgentA2AService::ingress_guardrail_declaration` in
+    /// `rakka-a2a`); the comparison is the same declaration comparison
+    /// [`Self::with_memory_ingress`] makes, for the same reason. Unattested,
+    /// the authority does not count either A2A boundary, so an envelope
+    /// requiring a stage bound only there refuses dispatch with
+    /// `guardrail-stage-unevaluated`.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentGuardrailError::A2aChainMismatch`] (`guardrail-chain-mismatch`)
+    /// when the declarations differ or this authority carries no chain.
+    pub fn with_a2a_guardrails(
+        mut self,
+        declaration: AgentContentDigest,
+    ) -> Result<Self, AgentGuardrailError> {
+        let mine = self.declared_chain();
+        if mine.as_ref() != Some(&declaration) {
+            return Err(AgentGuardrailError::A2aChainMismatch {
+                authority: mine,
+                surface: declaration,
+            });
+        }
+        self.a2a_attested = true;
+        Ok(self)
+    }
+
+    /// Installs the deployment's model profile catalog.
+    ///
+    /// With a catalog, [`Self::authorize`] resolves the selected profile's
+    /// record for a model call: an unknown id refuses `model-profile-unknown`;
+    /// the record's credential binding passes the same envelope and revocation
+    /// checks a tool's binding does and is put on the grant, so the dispatcher
+    /// resolves it inside the attempt with no new path; the record's revision
+    /// and digest are recorded on the grant; and the record's binding, like a
+    /// binding the intent itself names, requires the effect's own
+    /// `timeout_ms`.
+    ///
+    /// That last rule holds with or without a catalog: a model call that
+    /// resolves any credential and carries no `timeout_ms` is refused
+    /// `model-timeout-unset`, because the resolver's only deadline input is
+    /// the effect's own timeout
+    /// ([Phase 7 design 4.2](../../../docs/superpowers/specs/2026-09-19-phase7-agent-surface-parity-design.md)).
+    #[must_use]
+    pub fn with_model_profiles(mut self, catalog: Arc<dyn AgentModelProfileCatalog>) -> Self {
+        self.model_profiles = Some(catalog);
+        self
+    }
+
+    /// Whether this authority has attested an A2A surface whose chain
+    /// declaration is `declaration`.
+    #[must_use]
+    pub fn attests_a2a(&self, declaration: &AgentContentDigest) -> bool {
+        self.a2a_attested && self.declared_chain().as_ref() == Some(declaration)
+    }
+
+    /// This authority's own chain declaration, when it carries a chain.
+    fn declared_chain(&self) -> Option<AgentContentDigest> {
+        self.guardrails
+            .as_ref()
+            .map(AgentGuardrailChain::declaration_digest)
+    }
+
+    /// The chain declaration the run memory's retrieval bundle carries, when
+    /// it carries one.
+    fn declared_by(&self, memory: &AgentRunMemory) -> Option<AgentContentDigest> {
+        memory
+            .retrieval()
+            .map(|retrieval| retrieval.guardrails().declaration_digest())
+    }
+
+    /// The boundaries this authority's coverage check treats as evaluated.
+    ///
+    /// One of four sets, depending on what this authority has attested:
+    /// [`AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES`] with neither
+    /// attestation, [`AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES`] with only
+    /// [`Self::with_memory_ingress`], [`AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES`]
+    /// with only [`Self::with_a2a_guardrails`], and
+    /// [`AGENT_EVALUATED_GUARDRAIL_BOUNDARIES`] with both.
+    #[must_use]
+    pub fn evaluated_boundaries(&self) -> &'static [AgentGuardrailBoundary] {
+        match (self.memory_ingress_attested, self.a2a_attested) {
+            (false, false) => &AGENT_AUTHORITY_EVALUATED_GUARDRAIL_BOUNDARIES,
+            (true, false) => &AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES,
+            (false, true) => &AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES,
+            (true, true) => &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
+        }
     }
 
     /// Routes execution-policy references through the given router.
     #[must_use]
     pub fn with_execution_router(mut self, router: Arc<dyn AgentExecutionPolicyRouter>) -> Self {
         self.execution_router = Some(router);
+        self
+    }
+
+    /// Refuses any intent that carries no execution-policy reference, and
+    /// names the class the substrate's own effects carry.
+    ///
+    /// Off by default, because
+    /// [specification 11.8](../../../docs/plans/rakka-agent/spec.md) says an
+    /// intent *SHOULD* carry one and most deployments have a single trust
+    /// class, for which unclassified is the honest description.
+    ///
+    /// A deployment that *claims* workload isolation cannot have unclassified
+    /// effects, though — an intent naming no class runs on whichever worker
+    /// claims it, which is exactly the shared universally-privileged worker
+    /// [specification 16](../../../docs/plans/rakka-agent/spec.md) forbids
+    /// claiming isolation from. This is the switch that makes the claim
+    /// checkable rather than asserted.
+    ///
+    /// The requirement is deliberately universal. A model call, a
+    /// compensation, an A2A send and a workflow start all reach a worker
+    /// exactly as a tool call does, so exempting them would relocate the hole
+    /// rather than close it — but only a *tool* intent carries a class of its
+    /// own, projected from its [`AgentToolBinding`] declaration. `substrate`
+    /// is therefore mandatory: it is the class stamped on every effect Rakka
+    /// itself commits, and [`Self::effect_policies`] applies it, so the gate
+    /// and the specs that satisfy it derive from this one declaration.
+    ///
+    /// A deployment that assembles [`crate::effect::AgentEffectPolicies`] by
+    /// hand must apply
+    /// [`crate::effect::AgentEffectPolicies::with_substrate_execution_policy`]
+    /// itself, or its very first model call is refused
+    /// `execution-policy-required` — the refusal names the knob. The
+    /// configured router must accept `substrate`, and some worker must serve
+    /// it, or the substrate has been classified onto a class nothing runs.
+    #[must_use]
+    pub fn with_required_execution_policy(mut self, substrate: AgentExecutionPolicyRef) -> Self {
+        self.substrate_execution_policy = Some(substrate);
         self
     }
 
@@ -894,18 +1803,25 @@ impl AgentToolAuthority {
 
     /// The commit-time effect policies this authority's configuration
     /// projects: the registry's bindings, pinned to the configured guardrail
-    /// chain's revision.
+    /// chain's revision, and — under
+    /// [`Self::with_required_execution_policy`] — stamped with the trust
+    /// class the substrate's own effects run under.
     ///
     /// Wire the run entity with *this* projection rather than
-    /// [`AgentToolRegistry::effect_policies`] whenever a chain is configured:
-    /// the pin it stamps on every committed intent is what the dispatch
-    /// pipeline holds guardrail transforms deterministic against, so one
-    /// external idempotency key can never carry two differently transformed
-    /// payloads across a chain change.
+    /// [`AgentToolRegistry::effect_policies`] whenever a chain or a required
+    /// execution policy is configured. The guardrail pin it stamps on every
+    /// committed intent is what the dispatch pipeline holds guardrail
+    /// transforms deterministic against, so one external idempotency key can
+    /// never carry two differently transformed payloads across a chain
+    /// change; and the substrate class is what makes the requirement this
+    /// same authority enforces satisfiable at all.
     pub fn effect_policies(&self) -> AgentEffectResult<crate::effect::AgentEffectPolicies> {
         let mut policies = self.registry.effect_policies()?;
         if let Some(chain) = &self.guardrails {
             policies = policies.with_guardrail_revision(chain.revision());
+        }
+        if let Some(substrate) = &self.substrate_execution_policy {
+            policies = policies.with_substrate_execution_policy(substrate.clone());
         }
         Ok(policies)
     }
@@ -979,6 +1895,24 @@ impl AgentToolAuthority {
             AgentRunEffectRequest::MemoryPromotion { .. } => {
                 self.authorize_memory_promotion(context, scope, task, goal, intent, now)
             }
+            AgentRunEffectRequest::Evaluation { evaluation } => self.authorize_goal_evaluation(
+                context, scope, task, goal, intent, evaluation, attempt, now,
+            ),
+            AgentRunEffectRequest::A2aSend { .. } => {
+                self.authorize_a2a_send(context, scope, task, goal, intent, now)
+            }
+            AgentRunEffectRequest::A2aHandoff { .. } => {
+                self.authorize_a2a_handoff(context, scope, task, goal, intent, now)
+            }
+            AgentRunEffectRequest::WorkflowStart { invocation } => {
+                self.authorize_workflow_start(context, scope, task, goal, intent, invocation, now)
+            }
+            AgentRunEffectRequest::WorkflowCancel { invocation, .. } => {
+                self.authorize_workflow_cancel(context, scope, task, goal, intent, invocation, now)
+            }
+            AgentRunEffectRequest::ClaimAppend { append, .. } => {
+                self.authorize_claim_append(context, scope, task, goal, intent, append, now)
+            }
         }
     }
 
@@ -1040,6 +1974,39 @@ impl AgentToolAuthority {
                 ),
             ));
         };
+        // A coordination tool is never a generic tool: its calls exist only
+        // as the loop's delegation interception, which converts them into
+        // durable records and outbound A2A effects before dispatch. A generic
+        // `Tool` intent naming one means the run was not wired for the
+        // coordination the registry declares — defense in depth behind the
+        // structural guarantee that model output cannot construct a peer
+        // send ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+        if binding.descriptor().kind == AgentToolKind::AgentCoordination {
+            return Err(AgentAuthorityRefusal::of(
+                "coordination-tool-not-intercepted",
+                format!(
+                    "the coordination tool {} reached generic dispatch; wire the run entity's \
+                     delegation configuration so the loop intercepts it",
+                    call.tool
+                ),
+            ));
+        }
+        // The same discipline for a workflow tool: its calls exist only as
+        // the loop's workflow interception, which converts them into durable
+        // invocation records and start effects before dispatch
+        // ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)). A
+        // kind-`Workflow` registration is model-visible toolset projection,
+        // never a generic dispatch path.
+        if binding.descriptor().kind == AgentToolKind::Workflow {
+            return Err(AgentAuthorityRefusal::of(
+                "workflow-tool-requires-interception",
+                format!(
+                    "the workflow tool {} reached generic dispatch; wire the run entity's \
+                     workflow-tool configuration so the loop intercepts it",
+                    call.tool
+                ),
+            ));
+        }
 
         // The definition must declare the tool, and the run's setup — a
         // narrowing — must not have excluded it. Checking both fails closed
@@ -1119,6 +2086,61 @@ impl AgentToolAuthority {
                     call.tool
                 ),
             ));
+        }
+
+        // The environment contract ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)),
+        // first failing layer named: the binding may not touch an environment
+        // the definition's declaration never named for this tool, every
+        // declared reference must sit inside the definition envelope, a
+        // setup must not have narrowed it away, and the goal-scope envelope
+        // — when it narrows at all — binds last, per attempt.
+        if let Some(environment) = binding
+            .declaration
+            .environments
+            .difference(&declared.environments)
+            .next()
+        {
+            return Err(AgentAuthorityRefusal::of(
+                AgentEnvelopeDimension::Environment.as_label(),
+                format!(
+                    "the deployment binds {} to the environment {environment}, which the \
+                     definition never declared for it",
+                    call.tool
+                ),
+            ));
+        }
+        for environment in &declared.environments {
+            if !context
+                .definition
+                .envelope()
+                .environments
+                .contains(environment)
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    AgentEnvelopeDimension::Environment.as_label(),
+                    format!(
+                        "the environment {environment} is not granted by the definition envelope"
+                    ),
+                ));
+            }
+            if let Some(setup) = context.setup {
+                if !setup.envelope().environments.contains(environment) {
+                    return Err(AgentAuthorityRefusal::of(
+                        "setup-excludes-environment",
+                        format!("the run's setup does not select the environment {environment}"),
+                    ));
+                }
+            }
+            if let Some(delegation) = context.delegation {
+                if !delegation.environments.is_empty()
+                    && !delegation.environments.contains(environment)
+                {
+                    return Err(AgentAuthorityRefusal::of(
+                        "goal-environment-not-allowed",
+                        format!("the goal's environment narrowing does not allow {environment}"),
+                    ));
+                }
+            }
         }
 
         // Layer 3, the intent: model output — or anything else — cannot have
@@ -1325,8 +2347,11 @@ impl AgentToolAuthority {
             tool_call,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms,
             reports,
+            checkpoint: None,
         })
     }
 
@@ -1359,7 +2384,13 @@ impl AgentToolAuthority {
                 AgentRunEffectRequest::Model { profile, .. } => profile.clone(),
                 AgentRunEffectRequest::Tool { .. }
                 | AgentRunEffectRequest::Compensation { .. }
-                | AgentRunEffectRequest::MemoryPromotion { .. } => None,
+                | AgentRunEffectRequest::MemoryPromotion { .. }
+                | AgentRunEffectRequest::Evaluation { .. }
+                | AgentRunEffectRequest::A2aSend { .. }
+                | AgentRunEffectRequest::A2aHandoff { .. }
+                | AgentRunEffectRequest::WorkflowStart { .. }
+                | AgentRunEffectRequest::WorkflowCancel { .. }
+                | AgentRunEffectRequest::ClaimAppend { .. } => None,
             });
 
         if let Some(profile) = &profile {
@@ -1384,8 +2415,53 @@ impl AgentToolAuthority {
             }
         }
 
+        // The profile record, when a catalog is installed: its binding is
+        // checked exactly as a tool's, and its revision and digest ride the
+        // grant.
+        let mut model_credential_binding = None;
+        let mut model_profile_revision = None;
+        let mut model_profile_digest = None;
+        if let (Some(catalog), Some(profile_id)) = (&self.model_profiles, &profile) {
+            let Some(record) = catalog.profile(profile_id) else {
+                return Err(AgentAuthorityRefusal::of(
+                    "model-profile-unknown",
+                    format!("the deployment's model profile catalog knows no profile {profile_id}"),
+                ));
+            };
+            if let Some(binding) = &record.credential_binding {
+                self.check_credential(context, binding)?;
+                model_credential_binding = Some(binding.clone());
+            }
+            model_profile_revision = Some(record.revision);
+            model_profile_digest = Some(record.digest());
+        }
+
         if let Some(credential) = &intent.credential_binding {
             self.check_credential(context, credential)?;
+        }
+
+        // A credential-bearing model call must carry the attempt bound the
+        // resolver derives its deadline from, whichever side names the
+        // binding. The intent's own binding — which a deployment sets on the
+        // model [`crate::effect::AgentEffectSpec`] — and the profile's both
+        // reach the dispatcher's resolver, and the effect's timeout is a
+        // resolver's only deadline input, so an unbounded attempt could hold
+        // a live secret open indefinitely.
+        if intent.timeout_ms.is_none() {
+            if let Some(binding) = intent
+                .credential_binding
+                .as_ref()
+                .or(model_credential_binding.as_ref())
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    "model-timeout-unset",
+                    format!(
+                        "the model call resolves the credential binding {binding} and its \
+                         effect spec carries no timeout_ms; a resolver's only deadline input \
+                         is the effect's own timeout"
+                    ),
+                ));
+            }
         }
         self.check_execution_policy(intent.execution_policy.as_ref())?;
 
@@ -1393,9 +2469,12 @@ impl AgentToolAuthority {
         self.check_guardrail_coverage(&required)?;
         let mut reports = Vec::new();
         if let Some(chain) = &self.guardrails {
-            // Until slice 1.11 gives context snapshots content, the
-            // model-request boundary evaluates a bounded request descriptor —
-            // enough for a kill-switch or checkpoint stage to act on.
+            // The model-request boundary evaluates a bounded request
+            // descriptor — enough for a kill-switch or checkpoint stage to
+            // act on. Snapshot *content* is evaluated where it is assembled:
+            // session entries ride the recording path, and retrieved private
+            // memory passes the memory-ingress boundary in the slice 2.2
+            // retrieval flow before it ever enters a snapshot.
             let content = serde_json::json!({
                 "kind": "model-call",
                 "profile": profile.as_ref().map(ToString::to_string),
@@ -1428,22 +2507,47 @@ impl AgentToolAuthority {
             reports = decision.reports;
         }
 
+        // Visibility is not authority: the model is shown only what this
+        // agent could actually dispatch under the current envelopes and
+        // settings, narrowed by the run's setup exactly as `authorize_tool`
+        // consults it.
+        let mut tools: Vec<AgentToolDescriptor> = self
+            .registry
+            .model_visible(context.definition.envelope(), settings)
+            .into_iter()
+            .cloned()
+            .collect();
+        if let Some(setup) = context.setup {
+            tools.retain(|descriptor| setup.envelope().tools.contains_key(&descriptor.tool));
+        }
+
         Ok(AgentGrantedDispatch {
-            grant: self.grant(
-                context,
-                scope,
-                task,
-                goal,
-                intent,
-                None,
-                BTreeSet::new(),
-                now,
-            ),
+            grant: {
+                let mut grant = self.grant(
+                    context,
+                    scope,
+                    task,
+                    goal,
+                    intent,
+                    None,
+                    BTreeSet::new(),
+                    now,
+                );
+                if grant.credential_binding.is_none() {
+                    grant.credential_binding = model_credential_binding.clone();
+                }
+                grant.model_profile_revision = model_profile_revision;
+                grant.model_profile_digest = model_profile_digest;
+                grant
+            },
             tool_call: None,
             model_profile: profile,
             sampling: Some(settings.sampling),
+            model_credential_binding,
+            tools,
             transforms: Vec::new(),
             reports,
+            checkpoint: None,
         })
     }
 
@@ -1482,8 +2586,11 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
+            checkpoint: None,
         })
     }
 
@@ -1524,8 +2631,447 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: None,
             sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
             transforms: Vec::new(),
             reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one outbound A2A send attempt
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the delegation record is
+    /// its authorization, as with a compensation or promotion: the loop's
+    /// interception already parsed the closed vocabulary, applied the goal's
+    /// skill narrowing, and recorded the catalog's resolution, all inside the
+    /// committing compare-and-set. What remains at dispatch time is the
+    /// immediate-safety layer every attempt passes — lifecycle, guardrail
+    /// policy, credential class, execution policy — under the revisions the
+    /// intent pinned.
+    fn authorize_a2a_send(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one outbound handoff send attempt
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the handoff record is its
+    /// authorization, as with a delegation send — plus the envelope door
+    /// re-checked per attempt, the workflow-start posture: dropping the
+    /// handoff capability from the definition revokes the very next attempt
+    /// ([specification 7.3](../../../docs/plans/rakka-agent/spec.md)) —
+    /// transferring responsibility for a task is a coordination transition,
+    /// not a routine send.
+    fn authorize_a2a_handoff(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if !context
+            .definition
+            .envelope()
+            .coordination_capabilities
+            .contains(&crate::definition::AgentCoordinationCapabilityKind::Handoff)
+        {
+            return Err(AgentAuthorityRefusal::of(
+                AgentEnvelopeDimension::CoordinationCapability.as_label(),
+                "the definition does not declare the handoff coordination capability",
+            ));
+        }
+        if let Some(setup) = context.setup {
+            if !setup
+                .envelope()
+                .coordination_capabilities
+                .contains(&crate::definition::AgentCoordinationCapabilityKind::Handoff)
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    AgentEnvelopeDimension::CoordinationCapability.as_label(),
+                    "the run's setup does not select the handoff coordination capability",
+                ));
+            }
+        }
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one workflow-start attempt
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the invocation record is
+    /// its authorization, as with an A2A send: the loop's interception
+    /// already resolved the descriptor and applied the goal's workflow
+    /// narrowing inside the committing compare-and-set. What remains at
+    /// dispatch time is the immediate-safety layer every attempt passes —
+    /// lifecycle, guardrail policy, credential class, execution policy — plus
+    /// the envelope door re-checked here per attempt, so dropping the
+    /// workflow tool from the definition or setup revokes the very next
+    /// attempt ([specification 7.3](../../../docs/plans/rakka-agent/spec.md)).
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_workflow_start(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        invocation: &crate::workflow_tool::AgentWorkflowInvocationRecord,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if !context
+            .definition
+            .envelope()
+            .workflow_tools
+            .contains(&invocation.workflow_tool)
+        {
+            return Err(AgentAuthorityRefusal::of(
+                AgentEnvelopeDimension::WorkflowTool.as_label(),
+                format!(
+                    "the workflow tool {} is not declared by the definition",
+                    invocation.workflow_tool
+                ),
+            ));
+        }
+        if let Some(setup) = context.setup {
+            if !setup
+                .envelope()
+                .workflow_tools
+                .contains(&invocation.workflow_tool)
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    AgentEnvelopeDimension::WorkflowTool.as_label(),
+                    format!(
+                        "the run's setup does not select the workflow tool {}",
+                        invocation.workflow_tool
+                    ),
+                ));
+            }
+        }
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            // The grant carries the capability surface the descriptor
+            // declared, copied onto the record at commit — the regular tool
+            // binding's discipline. The definition envelope declares workflow
+            // tools by id only, so the per-tool capability subset check
+            // awaits an envelope-side declaration (recorded follow-up work).
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                invocation.required_capabilities.clone(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one workflow-cancel attempt
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The wind-down that committed the effect is its authorization, the
+    /// compensation posture rather than the start's: a cancel exercises no
+    /// new capability against the world — it asks earlier-authorized work to
+    /// stop — so the envelope door is deliberately absent, and dropping the
+    /// workflow tool from the definition or setup mid-flight cannot strand a
+    /// winding-down parent on a request it may no longer send. The
+    /// immediate-safety layer every attempt passes — lifecycle, guardrail
+    /// policy, credential class, execution policy — still applies.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_workflow_cancel(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        invocation: &crate::workflow_tool::AgentWorkflowInvocationRecord,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                invocation.required_capabilities.clone(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one claim-append attempt
+    /// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the append is its
+    /// authorization, as with a promotion; what is re-checked here, per
+    /// attempt, is the space against current durable authority — the
+    /// definition envelope, the setup narrowing, and the run's delegated
+    /// grant — so dropping a space from any layer revokes the very next
+    /// attempt, the immediate-safety posture.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_claim_append(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        append: &crate::effect::AgentClaimAppendRequest,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if !context
+            .definition
+            .envelope()
+            .knowledge_spaces
+            .contains(&append.space)
+        {
+            return Err(AgentAuthorityRefusal::of(
+                AgentEnvelopeDimension::KnowledgeSpace.as_label(),
+                format!(
+                    "the knowledge space {} is not granted by the definition envelope",
+                    append.space
+                ),
+            ));
+        }
+        if let Some(setup) = context.setup {
+            if !setup.envelope().knowledge_spaces.contains(&append.space) {
+                return Err(AgentAuthorityRefusal::of(
+                    "setup-excludes-knowledge-space",
+                    format!(
+                        "the run's setup does not select the knowledge space {}",
+                        append.space
+                    ),
+                ));
+            }
+        }
+        if let Some(delegation) = context.delegation {
+            let granted = match delegation.knowledge_spaces.as_ref() {
+                Some(granted) => granted.contains(&append.space),
+                None => delegation.lineage.is_empty(),
+            };
+            if !granted {
+                return Err(AgentAuthorityRefusal::of(
+                    "claim-space-not-delegated",
+                    format!(
+                        "the communal space {} is not delegated to this run",
+                        append.space
+                    ),
+                ));
+            }
+        }
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one goal-evaluation attempt
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the evaluation is its
+    /// authorization, as with a compensation or promotion. What is distinct
+    /// here is the model profile: an evaluator model runs under the profile
+    /// the *request* pins — the "distinct policy" of specification 8.3 —
+    /// validated against the definition and setup envelopes, and the agent's
+    /// current settings profile never enters the resolution, so a worker's
+    /// turn-bound profile cannot silently stand in for the evaluator's. A
+    /// human review dispatches only under the effect-bound approval grant,
+    /// which the granted dispatch carries so the executor arm can record the
+    /// resolver.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_goal_evaluation(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        evaluation: &crate::evaluation::AgentGoalEvaluationRequest,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        let profile = match &evaluation.method {
+            crate::evaluation::AgentGoalEvaluationMethod::EvaluatorModel { profile } => {
+                profile.clone()
+            }
+            _ => None,
+        };
+        if let Some(profile) = &profile {
+            if !context
+                .definition
+                .envelope()
+                .model_profiles
+                .contains(profile)
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    AgentEnvelopeDimension::ModelProfile.as_label(),
+                    format!(
+                        "the evaluator model profile {profile} is not approved by the definition"
+                    ),
+                ));
+            }
+            if let Some(setup) = context.setup {
+                if !setup.envelope().model_profiles.contains(profile) {
+                    return Err(AgentAuthorityRefusal::of(
+                        AgentEnvelopeDimension::ModelProfile.as_label(),
+                        format!(
+                            "the run's setup does not select the evaluator model profile {profile}"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+
+        // The effect-bound checkpoint gate: a human review — or an evaluation
+        // the deployment gates — dispatches only under a digest-bound grant
+        // that binds this exact intent
+        // ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+        let (checkpoint_satisfied, checkpoint_grant_refusal) =
+            self.evaluate_checkpoint_grant(context, scope, intent, attempt, now);
+        if intent.checkpoint_required && !checkpoint_satisfied {
+            return Err(checkpoint_grant_refusal.unwrap_or_else(|| {
+                AgentAuthorityRefusal::of(
+                    "checkpoint-required",
+                    "the goal evaluation requires an effect-bound checkpoint grant, and none \
+                     exists",
+                )
+            }));
+        }
+        let checkpoint = if checkpoint_satisfied {
+            context.checkpoint_grant.cloned().map(Box::new)
+        } else {
+            None
+        };
+
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: profile,
+            sampling: None,
+            model_credential_binding: None,
+            tools: Vec::new(),
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint,
         })
     }
 
@@ -1600,6 +3146,20 @@ impl AgentToolAuthority {
         policy: Option<&AgentExecutionPolicyRef>,
     ) -> Result<(), AgentAuthorityRefusal> {
         let Some(policy) = policy else {
+            if self.substrate_execution_policy.is_some() {
+                // Definitive, not transient: no worker will ever accept a
+                // class that does not exist, and clearing the condition means
+                // re-declaring the tool.
+                return Err(AgentAuthorityRefusal::of(
+                    "execution-policy-required",
+                    "this deployment routes every effect by trust class and the intent names \
+                     none; it stays undispatchable rather than running with ambient authority. \
+                     A tool takes its class from its registered binding's declaration; every \
+                     effect Rakka itself commits takes it from \
+                     AgentEffectPolicies::with_substrate_execution_policy, which \
+                     AgentToolAuthority::effect_policies applies",
+                ));
+            }
             return Ok(());
         };
         let routable = self
@@ -1650,7 +3210,7 @@ impl AgentToolAuthority {
             ));
         };
         chain
-            .validate_covers(required, &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES)
+            .validate_covers(required, self.evaluated_boundaries())
             .map_err(|error| AgentAuthorityRefusal::of(error.code(), error.to_string()))
     }
 
@@ -1685,6 +3245,8 @@ impl AgentToolAuthority {
             capabilities,
             credential_binding: intent.credential_binding.clone(),
             execution_policy: intent.execution_policy.clone(),
+            model_profile_revision: None,
+            model_profile_digest: None,
             issued_at: now,
             expires_at: AgentTimestampMillis::new(
                 now.as_millis().saturating_add(self.grant_ttl_ms),
@@ -1710,9 +3272,23 @@ impl Debug for AgentToolAuthority {
 ///
 /// A `CheckpointRequired` disposition is satisfied by a valid checkpoint grant
 /// exactly as a `checkpoint_required` binding is: `checkpoint_satisfied` is the
-/// verdict of [`AgentToolAuthority::evaluate_checkpoint_grant`] against the same
-/// intent. Without a grant the disposition still fails closed.
-fn refuse_guardrail_disposition(
+/// verdict of `AgentToolAuthority::evaluate_checkpoint_grant` (private to
+/// this module) against the same intent. Without a grant the disposition
+/// still fails closed.
+///
+/// Public so `rakka-a2a`'s A2A-ingress and A2A-egress evaluation points map a
+/// disposition onto a refusal identically to every boundary this crate
+/// evaluates itself, rather than reimplementing the mapping.
+///
+/// The refusal names the deciding stage and its reason code in `reason`, so
+/// the identity survives to the failed effect's record; the message keeps
+/// them too, and the block's evidence reference stays in the message only.
+///
+/// # Errors
+///
+/// The refusal the disposition maps to: `guardrail-blocked` for a block,
+/// `checkpoint-required` for an unsatisfied checkpoint requirement.
+pub fn refuse_guardrail_disposition(
     disposition: &AgentGuardrailDisposition,
     what: &str,
     checkpoint_satisfied: bool,
@@ -1731,7 +3307,11 @@ fn refuse_guardrail_disposition(
             Err(AgentAuthorityRefusal::of(
                 "guardrail-blocked",
                 format!("guardrail stage {stage} blocked {what}: {reason_code}{evidence}"),
-            ))
+            )
+            .with_reason(Some(crate::failure::AgentFailureReason::guardrail(
+                stage.clone(),
+                reason_code,
+            ))))
         }
         AgentGuardrailDisposition::CheckpointRequired { stage, reason_code } => {
             if checkpoint_satisfied {
@@ -1743,7 +3323,11 @@ fn refuse_guardrail_disposition(
                     "guardrail stage {stage} requires a checkpoint grant, and none binds this \
                      intent: {reason_code}"
                 ),
-            ))
+            )
+            .with_reason(Some(crate::failure::AgentFailureReason::guardrail(
+                stage.clone(),
+                reason_code,
+            ))))
         }
     }
 }
@@ -1791,6 +3375,24 @@ pub enum AgentToolError {
         /// What made it unenforceable.
         message: String,
     },
+    /// A mutating environment tool declared no external concurrency class
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+    EnvironmentConcurrencyMissing {
+        /// The tool whose binding was refused.
+        tool: AgentToolId,
+    },
+    /// An environment-concurrency class was declared for a tool that touches
+    /// no environment.
+    EnvironmentConcurrencyUnexpected {
+        /// The tool whose binding was refused.
+        tool: AgentToolId,
+    },
+    /// An `Environment`-kind descriptor declared no environment reference,
+    /// which would escape all environment gating.
+    EnvironmentRefMissing {
+        /// The tool whose binding was refused.
+        tool: AgentToolId,
+    },
 }
 
 impl AgentToolError {
@@ -1804,6 +3406,9 @@ impl AgentToolError {
             Self::RegistryFull { .. } => "tool-registry-full",
             Self::DuplicateTool { .. } => "tool-already-registered",
             Self::Policy { .. } => "tool-policy-invalid",
+            Self::EnvironmentConcurrencyMissing { .. } => "environment-concurrency-missing",
+            Self::EnvironmentConcurrencyUnexpected { .. } => "environment-concurrency-unexpected",
+            Self::EnvironmentRefMissing { .. } => "environment-ref-missing",
         }
     }
 }
@@ -1844,6 +3449,20 @@ impl Display for AgentToolError {
             Self::Policy { message } => {
                 write!(f, "the tool binding's policy cannot be honored: {message}")
             }
+            Self::EnvironmentConcurrencyMissing { tool } => write!(
+                f,
+                "the tool {tool} mutates a declared environment but names no external \
+                 concurrency class"
+            ),
+            Self::EnvironmentConcurrencyUnexpected { tool } => write!(
+                f,
+                "the tool {tool} declares an environment concurrency class but touches no \
+                 environment"
+            ),
+            Self::EnvironmentRefMissing { tool } => write!(
+                f,
+                "the environment-kind tool {tool} declares no environment reference"
+            ),
         }
     }
 }
@@ -1880,8 +3499,14 @@ mod tests {
     use crate::guardrails::{
         AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailOutcome, AgentGuardrailStage,
     };
-    use crate::identity::{AgentId, AgentOperationId, AgentOperationKind, AgentRunId, TenantId};
+    use crate::identity::{
+        AgentEnvironmentRef, AgentId, AgentOperationId, AgentOperationKind, AgentRunId, TenantId,
+    };
     use crate::memory::AgentContextSnapshotRef;
+    use crate::model_profile::{
+        AgentModelCapabilities, AgentModelProfile, AgentModelProviderKind,
+        StaticAgentModelProfileCatalog,
+    };
     use crate::schema::{VersionedAgentRecord, CURRENT_AGENT_SETUP_SCHEMA_VERSION};
     use crate::task::AgentSchemaId;
     use rakka_agent_workflow::HumanCheckpointId;
@@ -1976,6 +3601,25 @@ mod tests {
         .expect("the effect derives")
     }
 
+    /// A model intent for turn 1, taking its profile from the current
+    /// settings exactly as the run's own model call does.
+    fn model_intent(spec: &AgentEffectSpec) -> AgentRunEffect {
+        let scope = scope();
+        AgentRunEffect::new(
+            &scope,
+            1,
+            0,
+            AgentRunEffectRequest::Model {
+                context: AgentContextSnapshotRef::for_turn(&scope, 1).expect("the ref derives"),
+                profile: None,
+            },
+            spec,
+            AgentRevisionNumber::INITIAL,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the effect derives")
+    }
+
     #[test]
     fn an_unclassified_binding_fails_safe_and_the_registry_projects_policies() {
         let registry = AgentToolRegistry::new()
@@ -1993,6 +3637,75 @@ mod tests {
         let policies = registry.effect_policies().expect("the policies derive");
         let intent = tool_intent("charge-card", &AgentEffectSpec::non_idempotent());
         assert_eq!(policies.spec_for(&intent.request), &spec);
+    }
+
+    #[test]
+    fn the_environment_contract_is_validated_at_registration() {
+        let environment = AgentEnvironmentRef::new("workspace-1").expect("the ref is valid");
+
+        // A mutating environment tool without a concurrency class is refused:
+        // there is no fail-open default.
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent)
+            .with_environment(environment.clone());
+        let refused = AgentToolRegistry::new()
+            .register(AgentToolBinding::new(
+                descriptor("sync-workspace"),
+                declaration.clone(),
+                1,
+            ))
+            .expect_err("a mutating environment tool must declare its protocol");
+        assert_eq!(refused.code(), "environment-concurrency-missing");
+
+        // A declared class admits it, and observation needs none.
+        AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(descriptor("sync-workspace"), declaration, 1)
+                    .with_environment_concurrency(
+                        AgentEnvironmentConcurrencyProtocol::CompareAndSwap,
+                    ),
+            )
+            .expect("the declared protocol admits the tool");
+        AgentToolRegistry::new()
+            .register(AgentToolBinding::new(
+                descriptor("watch-workspace"),
+                AgentToolDeclaration::new(AgentEffectSafetyClass::ReadOnly)
+                    .with_environment(environment),
+                1,
+            ))
+            .expect("observation is the read-only class and needs no protocol");
+
+        // A protocol on a tool that touches no environment is a wiring
+        // mistake named at registration.
+        let refused = AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(
+                    descriptor("plain-tool"),
+                    AgentToolDeclaration::new(AgentEffectSafetyClass::ReadOnly),
+                    1,
+                )
+                .with_environment_concurrency(AgentEnvironmentConcurrencyProtocol::Lease),
+            )
+            .expect_err("a protocol needs an environment");
+        assert_eq!(refused.code(), "environment-concurrency-unexpected");
+
+        // An environment-kind descriptor with no declared ref would escape
+        // all environment gating.
+        let environment_kind = AgentToolDescriptor::new(
+            tool_id("env-tool"),
+            AgentToolKind::Environment,
+            "Reads a workspace.",
+            schema("workspace-in"),
+            schema("workspace-out"),
+        )
+        .expect("the descriptor is valid");
+        let refused = AgentToolRegistry::new()
+            .register(AgentToolBinding::new(
+                environment_kind,
+                AgentToolDeclaration::new(AgentEffectSafetyClass::ReadOnly),
+                1,
+            ))
+            .expect_err("an environment-kind tool names its refs");
+        assert_eq!(refused.code(), "environment-ref-missing");
     }
 
     #[test]
@@ -2042,6 +3755,355 @@ mod tests {
     }
 
     #[test]
+    fn a_coordination_tool_never_dispatches_as_a_generic_tool() {
+        // A deployment that registers the delegation tool but does not wire
+        // the run's delegation configuration lets its calls fall through to
+        // the generic path — where this refusal is the defense in depth
+        // behind the structural guarantee that model output cannot construct
+        // a peer send ([specification 14.4]).
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent);
+        let coordination = AgentToolDescriptor::new(
+            tool_id("delegate"),
+            AgentToolKind::AgentCoordination,
+            "Delegates a skill to a specialist.",
+            schema("delegate-input"),
+            schema("delegate-output"),
+        )
+        .expect("the descriptor is valid");
+        let registry = AgentToolRegistry::new()
+            .register(AgentToolBinding::new(coordination, declaration.clone(), 1))
+            .expect("the tool registers");
+        let definition = definition_with(BTreeMap::from([(tool_id("delegate"), declaration)]));
+        let settings = settings_for(&definition);
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+            delegation: None,
+        };
+
+        let authority = AgentToolAuthority::new(registry);
+        let intent = tool_intent(
+            "delegate",
+            &AgentEffectSpec::idempotent(1).expect("the spec is valid"),
+        );
+        let refusal = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect_err("a coordination tool on the generic path is refused");
+        assert_eq!(refusal.code, "coordination-tool-not-intercepted");
+    }
+
+    /// The shared-environment doors, per attempt and in order: the binding may
+    /// not touch an environment the definition's own declaration for that tool
+    /// never named, the declaration must sit inside the definition envelope, a
+    /// setup may narrow it away, and the run's goal-scope envelope binds last.
+    #[test]
+    fn the_environment_doors_refuse_in_order_at_every_attempt() {
+        let environment = AgentEnvironmentRef::new("workspace-1").expect("the ref is valid");
+        let other = AgentEnvironmentRef::new("workspace-2").expect("the ref is valid");
+        let declared = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent)
+            .with_environment(environment.clone());
+        let registry = AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(descriptor("charge-card"), declared.clone(), 1)
+                    .with_environment_concurrency(AgentEnvironmentConcurrencyProtocol::Lease),
+            )
+            .expect("the tool registers");
+        let authority = AgentToolAuthority::new(registry);
+        let intent = tool_intent(
+            "charge-card",
+            &AgentEffectSpec::idempotent(1).expect("the spec is valid"),
+        );
+        let authorize = |context: &AgentAuthorityContext<'_>| {
+            authority.authorize(
+                context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                1,
+                AgentTimestampMillis::new(2),
+            )
+        };
+
+        // The definition declares the tool but grants no environment at all:
+        // the declared reference is outside the envelope.
+        let definition =
+            definition_with(BTreeMap::from([(tool_id("charge-card"), declared.clone())]));
+        let settings = settings_for(&definition);
+        let refusal = authorize(&AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+            delegation: None,
+        })
+        .expect_err("an ungranted environment is refused");
+        assert_eq!(refusal.code, AgentEnvelopeDimension::Environment.as_label());
+
+        // Granting it in the envelope opens the door.
+        let mut granted =
+            definition_with(BTreeMap::from([(tool_id("charge-card"), declared.clone())]));
+        let mut envelope = granted.envelope().clone();
+        envelope.environments.insert(environment.clone());
+        granted = AgentDefinitionRevision::initial(
+            AgentDefinition::new(
+                AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+                "Resolves tickets.",
+                envelope.clone(),
+            )
+            .expect("the definition is valid"),
+            provenance(),
+        );
+        let settings = settings_for(&granted);
+        let base = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &granted,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+            delegation: None,
+        };
+        authorize(&base).expect("the granted environment dispatches");
+
+        // A setup that narrows the environment away revokes the very next
+        // attempt, even though the definition still grants it.
+        let mut narrowed = envelope.clone();
+        narrowed.environments.clear();
+        let setup = AgentSetupRevision::new(
+            AgentRevisionNumber::INITIAL,
+            &granted,
+            narrowed,
+            provenance(),
+        )
+        .expect("the narrowing setup is valid");
+        let refusal = authorize(&AgentAuthorityContext {
+            setup: Some(&setup),
+            ..base
+        })
+        .expect_err("a setup may narrow the environment away");
+        assert_eq!(refusal.code, "setup-excludes-environment");
+
+        // The goal scope binds last: a non-empty narrowing that does not name
+        // the environment refuses, and one that names it passes.
+        let goal_scoped = crate::delegation::AgentRunDelegationEnvelope {
+            environments: BTreeSet::from([other]),
+            ..Default::default()
+        };
+        let refusal = authorize(&AgentAuthorityContext {
+            delegation: Some(&goal_scoped),
+            ..base
+        })
+        .expect_err("the goal's environment narrowing binds");
+        assert_eq!(refusal.code, "goal-environment-not-allowed");
+        let allowed = crate::delegation::AgentRunDelegationEnvelope {
+            environments: BTreeSet::from([environment]),
+            ..Default::default()
+        };
+        authorize(&AgentAuthorityContext {
+            delegation: Some(&allowed),
+            ..base
+        })
+        .expect("the goal narrowing that names the environment passes");
+    }
+
+    /// A binding may not reach an environment the definition's declaration for
+    /// that tool never named — the deployment is stricter than the definition
+    /// or equal to it, never wider.
+    #[test]
+    fn a_binding_cannot_widen_the_declarations_environments() {
+        let declared_ref = AgentEnvironmentRef::new("workspace-1").expect("the ref is valid");
+        let extra = AgentEnvironmentRef::new("workspace-2").expect("the ref is valid");
+        let declared = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent)
+            .with_environment(declared_ref.clone());
+        let bound = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent)
+            .with_environment(declared_ref.clone())
+            .with_environment(extra);
+        let registry = AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(descriptor("charge-card"), bound, 1)
+                    .with_environment_concurrency(AgentEnvironmentConcurrencyProtocol::Lease),
+            )
+            .expect("the tool registers");
+        let mut envelope = AgentAuthorityEnvelope::empty();
+        envelope.tools = BTreeMap::from([(tool_id("charge-card"), declared)]);
+        envelope.environments.insert(declared_ref);
+        let definition = AgentDefinitionRevision::initial(
+            AgentDefinition::new(
+                AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+                "Resolves tickets.",
+                envelope,
+            )
+            .expect("the definition is valid"),
+            provenance(),
+        );
+        let settings = settings_for(&definition);
+        let refusal = AgentToolAuthority::new(registry)
+            .authorize(
+                &AgentAuthorityContext {
+                    status: AgentLifecycleStatus::Active,
+                    definition: &definition,
+                    settings: &settings,
+                    setup: None,
+                    checkpoint_grant: None,
+                    delegation: None,
+                },
+                &scope(),
+                None,
+                None,
+                &tool_intent(
+                    "charge-card",
+                    &AgentEffectSpec::idempotent(1).expect("the spec is valid"),
+                ),
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect_err("the binding may not widen the declaration");
+        assert_eq!(refusal.code, AgentEnvelopeDimension::Environment.as_label());
+    }
+
+    /// The claim-append doors: the definition envelope grants the space, a
+    /// setup may narrow it away, and the run's delegated grant binds last —
+    /// with a chain that carries no grant statement failing closed.
+    #[test]
+    fn the_claim_append_doors_gate_the_knowledge_space() {
+        let space =
+            crate::identity::KnowledgeSpaceId::new("space-alpha").expect("the space id is valid");
+        let mut envelope = AgentAuthorityEnvelope::empty();
+        envelope.knowledge_spaces.insert(space.clone());
+        let definition = AgentDefinitionRevision::initial(
+            AgentDefinition::new(
+                AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+                "Resolves tickets.",
+                envelope.clone(),
+            )
+            .expect("the definition is valid"),
+            provenance(),
+        );
+        let settings = settings_for(&definition);
+        let append = crate::effect::AgentClaimAppendRequest {
+            space: space.clone(),
+            subject: "finding".to_string(),
+            predicate: "links".to_string(),
+            object: crate::effect::AgentClaimObjectRequest::Node("evidence".to_string()),
+            confidence_bps: 5_000,
+            classification: crate::memory::MemoryClassification::Unclassified,
+            evidence: Vec::new(),
+            requested_by: PrincipalRef {
+                principal_type: "service".to_string(),
+                principal_id: "researcher".to_string(),
+                display_name: None,
+            },
+        };
+        let provenance_record = crate::effect::AgentClaimAppendProvenance {
+            agent: AgentId::new("support").expect("the agent id is valid"),
+            goal: None,
+            task: crate::identity::AgentTaskId::new("t").expect("the task id is valid"),
+            run: AgentRunId::new("t-gen-1").expect("the run id is valid"),
+            delegation: None,
+        };
+        let intent = AgentRunEffect::new(
+            &scope(),
+            1,
+            0,
+            AgentRunEffectRequest::ClaimAppend {
+                append: Box::new(append),
+                provenance: Box::new(provenance_record),
+            },
+            &AgentEffectSpec::idempotent(1).expect("the spec is valid"),
+            AgentRevisionNumber::INITIAL,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the effect derives");
+        let authority = AgentToolAuthority::new(AgentToolRegistry::new());
+        let authorize = |context: &AgentAuthorityContext<'_>| {
+            authority.authorize(
+                context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                1,
+                AgentTimestampMillis::new(2),
+            )
+        };
+        let base = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+            delegation: None,
+        };
+        authorize(&base).expect("the granted space appends");
+
+        // A setup that narrows the space away revokes the next attempt.
+        let mut narrowed = envelope.clone();
+        narrowed.knowledge_spaces.clear();
+        let setup = AgentSetupRevision::new(
+            AgentRevisionNumber::INITIAL,
+            &definition,
+            narrowed,
+            provenance(),
+        )
+        .expect("the narrowing setup is valid");
+        let refusal = authorize(&AgentAuthorityContext {
+            setup: Some(&setup),
+            ..base
+        })
+        .expect_err("a setup may narrow the space away");
+        assert_eq!(refusal.code, "setup-excludes-knowledge-space");
+
+        // The delegated grant binds last: a grant that does not name the
+        // space refuses, and a delegated chain with no grant statement at all
+        // fails closed.
+        let ungranted = crate::delegation::AgentRunDelegationEnvelope {
+            knowledge_spaces: Some(BTreeSet::new()),
+            ..Default::default()
+        };
+        let refusal = authorize(&AgentAuthorityContext {
+            delegation: Some(&ungranted),
+            ..base
+        })
+        .expect_err("an ungranted space is refused");
+        assert_eq!(refusal.code, "claim-space-not-delegated");
+
+        let unstated = crate::delegation::AgentRunDelegationEnvelope {
+            lineage: vec![
+                crate::identity::AgentDelegationId::new("delegation-1").expect("the id is valid")
+            ],
+            ..Default::default()
+        };
+        let refusal = authorize(&AgentAuthorityContext {
+            delegation: Some(&unstated),
+            ..base
+        })
+        .expect_err("a delegated chain with no grant statement fails closed");
+        assert_eq!(refusal.code, "claim-space-not-delegated");
+
+        let granted = crate::delegation::AgentRunDelegationEnvelope {
+            knowledge_spaces: Some(BTreeSet::from([space])),
+            ..Default::default()
+        };
+        authorize(&AgentAuthorityContext {
+            delegation: Some(&granted),
+            ..base
+        })
+        .expect("the delegated grant that names the space passes");
+    }
+
+    #[test]
     fn an_intent_cannot_downgrade_the_bindings_safety_class() {
         // The binding declares the tool non-idempotent; an intent claiming a
         // read-only class — however it was produced — is refused. This is the
@@ -2062,6 +4124,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -2099,6 +4162,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
 
         let authority = AgentToolAuthority::new(registry).with_grant_ttl_ms(1_000);
@@ -2270,6 +4334,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2328,6 +4393,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2406,6 +4472,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: Some(&grant),
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2460,6 +4527,7 @@ mod tests {
             settings: &revoked,
             setup: None,
             checkpoint_grant: Some(&grant),
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2493,6 +4561,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: Some(&grant),
+            delegation: None,
         };
         authority
             .authorize(
@@ -2567,6 +4636,7 @@ mod tests {
             settings: &settings,
             setup: Some(&setup),
             checkpoint_grant: None,
+            delegation: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -2610,6 +4680,7 @@ mod tests {
             settings: &revoked,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -2642,6 +4713,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2663,6 +4735,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2701,6 +4774,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -2740,6 +4814,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let authority = AgentToolAuthority::new(registry);
 
@@ -2800,6 +4875,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let intent = tool_intent("charge-card", &AgentEffectSpec::non_idempotent());
 
@@ -2855,6 +4931,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
             .with_stage(
@@ -2897,5 +4974,223 @@ mod tests {
             .expect_err("a model-request transform cannot be applied, so it refuses");
         assert_eq!(refusal.code, "guardrail-transform-unsupported");
         assert!(!refusal.retryable);
+    }
+
+    /// The grant a model call is authorized under carries what the profile
+    /// record decided: its revision and digest, its credential binding when
+    /// the intent names none, and the descriptor list the model may be shown.
+    ///
+    /// Read from the returned [`AgentGrantedDispatch`] rather than inferred
+    /// from a refusal code, because a refusal proves only that a gate fired —
+    /// nothing about what rides a grant that was issued.
+    #[test]
+    fn a_model_grant_records_the_profile_record_and_the_visible_tools() {
+        let profile_id = AgentModelProfileId::new("anthropic-sonnet").expect("the id is valid");
+        let profile_binding =
+            AgentCredentialBindingRef::new("anthropic-key").expect("the binding is valid");
+        let intent_binding =
+            AgentCredentialBindingRef::new("tenant-key").expect("the binding is valid");
+        let record = AgentModelProfile {
+            profile_id: profile_id.clone(),
+            revision: AgentRevisionNumber::new(3),
+            provider: AgentModelProviderKind::Anthropic,
+            model: "claude-sonnet-5".to_string(),
+            base_url: None,
+            credential_binding: Some(profile_binding.clone()),
+            default_sampling: AgentSamplingSettings::default(),
+            capabilities: AgentModelCapabilities { tool_calls: true },
+            attributes: BTreeMap::new(),
+        };
+        let catalog: Arc<dyn AgentModelProfileCatalog> = Arc::new(
+            StaticAgentModelProfileCatalog::new()
+                .with_profile(record.clone())
+                .expect("the record is valid"),
+        );
+
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::NonIdempotent);
+        let registry = AgentToolRegistry::new()
+            .register(AgentToolBinding::new(
+                descriptor("charge-card"),
+                declaration.clone(),
+                1,
+            ))
+            .expect("the tool registers");
+        let mut envelope = AgentAuthorityEnvelope::empty();
+        envelope
+            .tools
+            .insert(tool_id("charge-card"), declaration.clone());
+        envelope.model_profiles.insert(profile_id.clone());
+        envelope.credential_bindings.insert(profile_binding.clone());
+        envelope.credential_bindings.insert(intent_binding.clone());
+        let definition = AgentDefinitionRevision::initial(
+            AgentDefinition::new(
+                AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+                "Resolves tickets.",
+                envelope.clone(),
+            )
+            .expect("the definition is valid"),
+            provenance(),
+        );
+        let selected = AgentSettings {
+            model_profile: Some(profile_id.clone()),
+            ..AgentSettings::default()
+        };
+        let settings = SettingsRevision::initial(&definition, selected, provenance())
+            .expect("the settings are valid");
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+            delegation: None,
+        };
+        let authority = AgentToolAuthority::new(registry).with_model_profiles(catalog);
+
+        // A credential-bearing model call carries the attempt bound, so the
+        // grant is issued and can be read.
+        let granted = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &model_intent(&AgentEffectSpec::read_only().with_timeout_ms(30_000)),
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect("the profiled model call is granted");
+        assert_eq!(
+            granted.grant.model_profile_revision,
+            Some(AgentRevisionNumber::new(3)),
+            "the record's revision rides the grant"
+        );
+        assert_eq!(
+            granted.grant.model_profile_digest,
+            Some(record.digest()),
+            "the record's digest rides the grant"
+        );
+        assert_eq!(
+            granted.model_credential_binding.as_ref(),
+            Some(&profile_binding)
+        );
+        assert_eq!(
+            granted.grant.credential_binding.as_ref(),
+            Some(&profile_binding),
+            "an intent naming no binding takes the profile's"
+        );
+        assert_eq!(
+            granted
+                .tools
+                .iter()
+                .map(|descriptor| descriptor.tool.clone())
+                .collect::<Vec<_>>(),
+            vec![tool_id("charge-card")],
+            "the model is shown the registered, declared, unrevoked tool"
+        );
+
+        // The other precedence arm: an intent that names its own binding keeps
+        // it, and the profile's binding is still reported separately.
+        let owned = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &model_intent(
+                    &AgentEffectSpec::read_only()
+                        .with_timeout_ms(30_000)
+                        .with_credential_binding(intent_binding.clone()),
+                ),
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect("the intent's own binding is authorized");
+        assert_eq!(
+            owned.grant.credential_binding.as_ref(),
+            Some(&intent_binding),
+            "the intent's own binding is never replaced by the profile's"
+        );
+        assert_eq!(
+            owned.model_credential_binding.as_ref(),
+            Some(&profile_binding)
+        );
+
+        // A setup that omits the tool narrows what the model is shown, even
+        // though the definition still declares it.
+        let mut narrowed = AgentAuthorityEnvelope::empty();
+        narrowed.model_profiles.insert(profile_id);
+        narrowed.credential_bindings.insert(profile_binding);
+        let setup = AgentSetupRevision::new(
+            AgentRevisionNumber::INITIAL,
+            &definition,
+            narrowed,
+            provenance(),
+        )
+        .expect("dropping a tool is a legal narrowing");
+        let narrowed_context = context.with_setup(&setup);
+        let narrowed_grant = authority
+            .authorize(
+                &narrowed_context,
+                &scope(),
+                None,
+                None,
+                &model_intent(&AgentEffectSpec::read_only().with_timeout_ms(30_000)),
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect("the model call is still granted");
+        assert!(
+            narrowed_grant.tools.is_empty(),
+            "the run's setup narrows the model-visible list, not just dispatch"
+        );
+    }
+
+    #[test]
+    fn a_disposition_maps_its_stage_and_reason_onto_the_refusal() {
+        let stage = AgentGuardrailStageId::new("pii-filter").expect("id");
+        let blocked = AgentGuardrailDisposition::Blocked {
+            stage: stage.clone(),
+            reason_code: "denied-substring".to_string(),
+            evidence: None,
+        };
+        let refusal =
+            refuse_guardrail_disposition(&blocked, "the call", false).expect_err("a block refuses");
+        assert_eq!(refusal.code, "guardrail-blocked");
+        let reason = refusal.reason.expect("named");
+        assert_eq!(reason.stage(), Some(&stage));
+        assert_eq!(reason.code(), "denied-substring");
+
+        let gated = AgentGuardrailDisposition::CheckpointRequired {
+            stage: stage.clone(),
+            reason_code: "needs-approval".to_string(),
+        };
+        let refusal = refuse_guardrail_disposition(&gated, "the call", false)
+            .expect_err("no grant binds the intent");
+        assert_eq!(refusal.code, "checkpoint-required");
+        assert_eq!(
+            refusal.reason.as_ref().map(|reason| reason.code()),
+            Some("needs-approval")
+        );
+        assert!(refuse_guardrail_disposition(&gated, "the call", true).is_ok());
+        assert!(refuse_guardrail_disposition(
+            &AgentGuardrailDisposition::Allowed,
+            "the call",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_refusal_without_a_reason_serializes_as_it_always_did() {
+        let refusal = AgentAuthorityRefusal::of("tool-undeclared", "no such tool");
+        assert_eq!(
+            serde_json::to_value(&refusal).expect("encodes"),
+            serde_json::json!({
+                "code": "tool-undeclared",
+                "message": "no such tool",
+                "retryable": false
+            })
+        );
     }
 }

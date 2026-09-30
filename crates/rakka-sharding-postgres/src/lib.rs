@@ -1345,10 +1345,13 @@ mod tests {
             Ok(dsn) => dsn,
             Err(_) => return,
         };
+        // Nothing in the round trip depends on expiry, so the duration is
+        // generous: a loaded CI runner pausing between the acquire and the
+        // renew must not expire the lease out from under the test.
         let lease = connect_lease(
             &dsn,
             unique_namespace("lease-round-trip"),
-            Duration::from_millis(100),
+            Duration::from_secs(30),
         )
         .await;
         let entity_type = EntityType::new("PostgresLeaseCart");
@@ -1374,14 +1377,17 @@ mod tests {
             Err(_) => return,
         };
         let namespace = unique_namespace("lease-conflict");
-        let lease_a = connect_lease(&dsn, namespace.clone(), Duration::from_millis(10)).await;
-        let lease_b = connect_lease(&dsn, namespace, Duration::from_millis(100)).await;
-        let entity_type = EntityType::new("PostgresLeaseConflictCart");
         let holder_a = NodeId::new("rakka-0", "uid-a");
         let holder_b = NodeId::new("rakka-1", "uid-b");
 
-        let token_a = lease_a.acquire(&entity_type, &holder_a).await.unwrap();
-        let rejected = lease_b.acquire(&entity_type, &holder_b).await.unwrap_err();
+        // An unexpired holder rejects a contender. The holding lease's
+        // duration is generous so the contender's acquire always lands
+        // inside it, however slowly CI schedules the round trips.
+        let held_type = EntityType::new("PostgresLeaseHeldCart");
+        let lease_a_held = connect_lease(&dsn, namespace.clone(), Duration::from_secs(30)).await;
+        let lease_b = connect_lease(&dsn, namespace.clone(), Duration::from_millis(100)).await;
+        lease_a_held.acquire(&held_type, &holder_a).await.unwrap();
+        let rejected = lease_b.acquire(&held_type, &holder_b).await.unwrap_err();
         assert!(matches!(
             rejected,
         ShardingError::CoordinatorLeaseRejected {
@@ -1389,13 +1395,33 @@ mod tests {
             holder_node,
             current_holder_node: Some(current_holder_node),
             ..
-        } if *entity_type == EntityType::new("PostgresLeaseConflictCart")
+        } if *entity_type == held_type
                 && *holder_node == holder_b
                 && *current_holder_node == holder_a
         ));
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let token_b = lease_b.acquire(&entity_type, &holder_b).await.unwrap();
+        // An expired holder is superseded with a bumped fencing token, and
+        // its stale renew is fenced. The first holder's duration is short so
+        // it expires; the contender polls until its acquire succeeds instead
+        // of racing a fixed sleep against the wall clock.
+        let entity_type = EntityType::new("PostgresLeaseConflictCart");
+        let lease_a = connect_lease(&dsn, namespace.clone(), Duration::from_millis(10)).await;
+        let token_a = lease_a.acquire(&entity_type, &holder_a).await.unwrap();
+        assert_eq!(token_a.fencing_token(), 1);
+        let mut acquired_b = None;
+        for _attempt in 0..200 {
+            match lease_b.acquire(&entity_type, &holder_b).await {
+                Ok(token) => {
+                    acquired_b = Some(token);
+                    break;
+                }
+                Err(ShardingError::CoordinatorLeaseRejected { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("the contender's acquire failed: {error}"),
+            }
+        }
+        let token_b = acquired_b.expect("the expired holder is eventually superseded");
         assert_eq!(token_b.fencing_token(), 2);
 
         let lost = lease_a.renew(&token_a).await.unwrap_err();

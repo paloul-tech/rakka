@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
-license-file.workspace = true
+license.workspace = true
 # Not yet in the release-candidate publishable set (scripts/package-check.sh,
 # docs/rakka-v1-release-packaging.md); remove this guard when it enters it.
 publish = false
@@ -21,7 +21,6 @@ default = []
 grpc = ["dep:rakka-grpc"]
 http = ["dep:rakka-http"]
 k8s = ["dep:rakka-k8s"]
-otel = []
 postgres = ["dep:rakka-persistence-postgres", "dep:rakka-sharding-postgres", "dep:tokio-postgres"]
 process-tools = ["dep:rakka-process"]
 sharding = ["dep:rakka-sharding"]

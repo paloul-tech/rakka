@@ -20,8 +20,8 @@ instructions. See the crate for the reusable public API and its own tests.
   not pull TLS server helpers. A2A gRPC and SLIMRPC crates are not enabled.
 - The current server SDK still pulls `a2a-pb` and `tonic` transitively for
   ProtoJSON conversion even though this example does not mount A2A gRPC.
-- The published A2A crates currently require Rust 1.85, so the Rakka workspace
-  MSRV is Rust 1.85.
+- The published A2A crates require Rust 1.85; the Rakka workspace MSRV is
+  Rust 1.88, set by the pinned Rig adapter dependency and the current `tonic`.
 
 ## Run
 

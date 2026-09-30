@@ -32,7 +32,7 @@ ok  5/18 budgets settled durably: 2 loop iterations, 2 model calls, 3 effect att
 ok  6/18 fully passivated (0 resident entities) and still addressable: the describe ask re-materialized the owner
 ok  7/18 both model turns executed through dispatcher worker-1
 ok  8/18 the session view assembled 1 correlated trace segments by run id
-ok  9/18 bounded metrics observed: rakka.agent.recovery.events, rakka.agent.run.transitions, rakka.agent.telemetry.flush.failures
+ok  9/18 bounded metrics observed: rakka.agent.effect.outcomes, rakka.agent.effect.outstanding.duration, rakka.agent.recovery.duration, rakka.agent.recovery.events, rakka.agent.run.transitions, rakka.agent.telemetry.flush.failures, rakka.agent.turn.duration
 ok 10/18 short-term session context persisted: 3 entries, 2 immutable snapshots
 ok 11/18 each effectful call is its own durable effect: model and tool ticketed separately
 ok 12/18 the checkpoint-required tool parked the run WaitingForApproval, passivated
@@ -105,3 +105,25 @@ cargo test -p rakka-agent --release --test effect_dispatch \
 
 A deliberate pipeline change that moves a count must re-derive the budget —
 update the test's constants and this table together.
+
+## Live provider walk (gated)
+
+The same world, task, tool, and envelope, driven through the real Rig
+provider adapter over an env-backed credential resolver that lives in this
+example. Skipped unless `RAKKA_MODEL_PROFILE` is set:
+
+```sh
+RAKKA_MODEL_PROFILE=live RAKKA_MODEL_PROVIDER=anthropic RAKKA_MODEL_NAME=claude-sonnet-5 \
+RAKKA_MODEL_API_KEY=... cargo run -p rakka-example-durable-agent-acceptance -- --provider
+RAKKA_MODEL_PROFILE=live RAKKA_MODEL_PROVIDER=openai-completions RAKKA_MODEL_NAME=gpt-5 \
+RAKKA_MODEL_API_KEY=... cargo test -p rakka-example-durable-agent-acceptance --test provider_walk -- --nocapture
+```
+
+`RAKKA_MODEL_PROVIDER` is one of `anthropic`, `openai-completions`,
+`openai-responses`, `openrouter`, `gemini`, `ollama`, `custom`;
+`RAKKA_MODEL_BASE_URL` overrides the provider's endpoint (required for
+`custom`); `ollama` needs no key. The walk asserts structure, not a
+transcript: the run terminates, the provider's response model is recorded on
+the turn for Anthropic, OpenAI-compatible, and custom endpoints — the kinds
+whose raw response type the adapter knows, the rest reporting none by design —
+and the key appears in no durable record and no line of output.

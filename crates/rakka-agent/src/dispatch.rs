@@ -107,16 +107,20 @@ use rakka_agent_workflow::{
     agent_effect_to_outbox_command, AgentDispatchClaim, AgentDispatcherError, AgentDispatcherFleet,
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorkerId, AgentEffect,
     AgentEphemeralCredential, AgentInboxError, AgentOutboxError, AgentRunId as WorkflowRunId,
-    AgentRunInbox, AgentTimestampMillis,
+    AgentRunInbox, AgentTelemetryContext, AgentTimestampMillis, PrincipalRef,
 };
 use rakka_persistence::DurableStateStore;
 
 use crate::agent::{load_agent_entity_state, AgentEntityError, AgentEntityState};
-use crate::definition::{AgentCredentialBindingRef, AgentEffectSafetyClass, AgentSetupRevision};
+use crate::checkpoints::{AgentCheckpoint, AgentCheckpointKind};
+use crate::definition::{
+    AgentCredentialBindingRef, AgentEffectSafetyClass, AgentSetupRevision, AgentToolId,
+};
 use crate::effect::{
     compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentMemoryPromotionRequest,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
-    AgentRunEffectSink, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
+    AgentRunEffectSink, AgentRunEffectStatus, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
+    ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
 };
 use crate::identity::{AgentIdentityError, AgentRunScope, AgentScope};
 use crate::memory::{
@@ -124,7 +128,15 @@ use crate::memory::{
     AgentPromotedMemoryRef, MemoryError, MemoryOperationId, MemorySequence,
     PrivateMemoryExpectation, SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
 };
-use crate::model::{AgentModelAdapter, AgentModelRequest, AgentToolCallRequest};
+use crate::model::{
+    AgentModelAdapter, AgentModelRequest, AgentModelResponseMetadata, AgentModelTurn,
+    AgentToolCallId, AgentToolCallRequest,
+};
+use crate::observability::{
+    agent_linked_telemetry_context, agent_span_link, AgentSegmentOperation, AgentSegmentTimer,
+    LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_RECONCILIATION_DECISION, SEGMENT_ATTR_EFFECT_ATTEMPT,
+    SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_SETTINGS_REVISION,
+};
 use crate::run::{
     load_agent_run_state, AgentRun, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError,
     AgentRunState,
@@ -132,7 +144,8 @@ use crate::run::{
 use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
 use crate::task::AgentTaskContent;
 use crate::tools::{
-    AgentAuthorityContext, AgentAuthorityRefusal, AgentGrantedDispatch, AgentToolAuthority,
+    AgentAuthorityContext, AgentAuthorityRefusal, AgentGrantedDispatch, AgentModelResponseReview,
+    AgentToolAuthority, AgentToolResponseReview,
 };
 
 /// Result type for dispatch pipeline operations.
@@ -142,6 +155,98 @@ pub type AgentDispatchResult<T> = Result<T, AgentDispatchError>;
 /// the pipeline could not resolve.
 const INDETERMINATE_OUTCOME_MESSAGE: &str =
     "the attempt's outcome could not be established; an explicit reconciliation decision is owed";
+
+/// The most bytes of failure detail one dispatch attempt persists.
+///
+/// A failed attempt's detail is written to the run's durable outbox row, to
+/// the generation-final outcome the run entity keeps, and — through the
+/// telemetry event — to the dispatcher fleet's index entry. A collaborator
+/// that returns a multi-kilobyte error body would otherwise become durable
+/// state readable by every worker in the fleet.
+///
+/// One bound, declared once: the fleet index is owned by the substrate, which
+/// bounds the field it keeps, so this is that same bound rather than a second
+/// number that could drift from it.
+pub const AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH: usize =
+    rakka_agent_workflow::AGENT_DISPATCH_LAST_ERROR_MAX_LENGTH;
+
+/// The most bytes of a stable *code* one dispatch attempt persists.
+///
+/// Rakka's own codes are far under this, but an application-implemented
+/// [`AgentDispatchAuthority`] supplies its own on every refusal, and a refusal
+/// code reaches the fleet index, the outbox row, and the run's durable
+/// outcome. Bounded separately from the detail, and tighter, so a verbose code
+/// cannot crowd the detail out of a record they share.
+///
+/// A code longer than this is truncated, which by construction leaves a string
+/// equal to no registered code — the honest outcome for something that was
+/// never a stable identifier.
+pub const AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH: usize = 128;
+
+/// Bounds one persisted attempt detail: single line, truncated on a character
+/// boundary at [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`].
+///
+/// This is *bounding*, not sanitizing. It cannot remove secret material a
+/// collaborator chose to put in its error text — that is the collaborator's
+/// own contract, documented on every executor trait in this module — but it
+/// does keep an unbounded body out of three durable records
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+fn bounded_failure_detail(detail: &str) -> String {
+    rakka_agent_workflow::bounded_dispatch_detail(detail)
+}
+
+/// Bounds one persisted stable code at
+/// [`AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH`], on a character boundary.
+fn bounded_failure_code(code: &str) -> String {
+    let bounded = bounded_failure_detail(code);
+    if bounded.len() <= AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH {
+        return bounded;
+    }
+    let mut end = AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH;
+    while end > 0 && !bounded.is_char_boundary(end) {
+        end -= 1;
+    }
+    bounded[..end].to_string()
+}
+
+/// Composes one persisted `code: detail` line and bounds the whole of it.
+///
+/// The code is bounded first so a verbose one cannot crowd out the detail
+/// beside it, and the composition is bounded again so the *record* — not each
+/// half of it — is what
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] describes.
+fn bounded_failure_line(prefix: &str, code: &str, detail: &str) -> String {
+    bounded_failure_detail(&format!(
+        "{prefix}{}: {}",
+        bounded_failure_code(code),
+        bounded_failure_detail(detail)
+    ))
+}
+
+/// The collaborator's own stable code, when the failure came from one.
+///
+/// [`AgentDispatchError::code`] answers `dispatch-collaborator-failed` for
+/// every collaborator failure, which is the right *pipeline* code but hides
+/// which condition the collaborator reported. Diagnostics want the inner code;
+/// it is bounded here because a collaborator supplies it.
+fn collaborator_code(error: &AgentDispatchError) -> String {
+    match error {
+        AgentDispatchError::Collaborator { code, .. } => bounded_failure_code(code),
+        other => other.code().to_string(),
+    }
+}
+
+/// Which decision failed an attempt, when a collaborator decided it: the
+/// collaborator's own code. `None` for every other failure, whose pipeline
+/// code already is the whole identity.
+fn collaborator_reason(error: &AgentDispatchError) -> Option<crate::failure::AgentFailureReason> {
+    match error {
+        AgentDispatchError::Collaborator { .. } => {
+            crate::failure::AgentFailureReason::new(collaborator_code(error))
+        }
+        _ => None,
+    }
+}
 
 /// Boxed future returned by the pipeline's pluggable collaborators.
 pub type AgentDispatchFuture<'a, T> =
@@ -306,6 +411,21 @@ pub trait AgentRunResultDelivery: Send + Sync {
 /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)), and the
 /// attempt's timeout. The resolved credential — when the intent names a
 /// binding — lives only for the call and is never persisted.
+///
+/// # The error text this returns becomes durable state
+///
+/// A failing attempt's error text is persisted — bounded to
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
+/// outbox row and echoed onto the dispatcher fleet's index entry, where
+/// every worker in the fleet can read it. Bounding is not sanitizing:
+/// what the text *contains* is this implementation's contract, and it
+/// MUST carry no credential, argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentDispatchToolExecutor: Send + Sync {
     /// Performs the call and returns its bounded result.
     fn execute<'a>(
@@ -324,6 +444,21 @@ pub trait AgentDispatchToolExecutor: Send + Sync {
 /// [`crate::checkpoints::AgentCompensationRef`]; the application owns the
 /// compensation behind it. The resolved credential — when the intent names a
 /// binding — lives only for the call and is never persisted.
+///
+/// # The error text this returns becomes durable state
+///
+/// A failing attempt's error text is persisted — bounded to
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
+/// outbox row and echoed onto the dispatcher fleet's index entry, where
+/// every worker in the fleet can read it. Bounding is not sanitizing:
+/// what the text *contains* is this implementation's contract, and it
+/// MUST carry no credential, argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentCompensationExecutor: Send + Sync {
     /// Performs the compensation and returns its bounded result.
     fn execute<'a>(
@@ -365,6 +500,21 @@ pub enum AgentMemoryPromotionFinding {
 /// An `Err` from `execute` is a *retryable* attempt failure under the
 /// effect's attempt bound; a [`AgentMemoryPromotionFinding::Refused`] is
 /// definitive. An absent executor fails closed at `invoke`.
+///
+/// # The error text this returns becomes durable state
+///
+/// A failing attempt's error text is persisted — bounded to
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
+/// outbox row and echoed onto the dispatcher fleet's index entry, where
+/// every worker in the fleet can read it. Bounding is not sanitizing:
+/// what the text *contains* is this implementation's contract, and it
+/// MUST carry no credential, argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
 pub trait AgentMemoryPromotionExecutor: Send + Sync {
     /// Performs the promotion and returns its bounded finding.
     fn execute<'a>(
@@ -374,6 +524,460 @@ pub trait AgentMemoryPromotionExecutor: Send + Sync {
         promotion: &'a AgentMemoryPromotionRequest,
         now: AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentMemoryPromotionFinding>;
+}
+
+/// What one bounded goal-evaluation attempt established
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentGoalEvaluationFinding {
+    /// The evaluation reached a verdict. The evidence is the *complete*
+    /// classed set the verdict rests on — the executor starts from the
+    /// request's evidence and may extend it — references and stable codes
+    /// only, never content.
+    ///
+    /// Both verdicts end the goal: `Satisfied` decides it satisfied,
+    /// `NotSatisfied` decides it unsatisfied, and neither is reversible. An
+    /// executor that means *not met yet, keep working* returns
+    /// [`Self::Refused`] instead, which leaves the goal `Active`.
+    Evaluated {
+        /// The verdict. Terminal either way — see the variant's own note.
+        outcome: crate::evaluation::AgentGoalEvaluationOutcome,
+        /// Bounded, stable reason code for the verdict.
+        reason_code: String,
+        /// The complete classed evidence the verdict rests on.
+        evidence: Vec<crate::evaluation::AgentGoalEvidenceRef>,
+        /// The human principal whose authorized decision produced the
+        /// verdict, when one did.
+        evaluated_by: Option<PrincipalRef>,
+    },
+    /// Definitively refused: no retry can change the answer. The generation
+    /// settles `Failed` under the stable code, the goal stays undecided, and
+    /// the caller re-evaluates.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one goal-evaluation effect inside a bounded dispatch attempt
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)): judges the
+/// request's criteria revision against durable evidence, as the deterministic
+/// assertion, authoritative query, or evaluator model the request names. The
+/// evaluator-model contract is the request's pinned profile — the authority
+/// resolved it from the request alone, so the agent's turn-bound settings
+/// profile never stands in for it.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the effect's
+/// read-only attempt bound; a [`AgentGoalEvaluationFinding::Refused`] is
+/// definitive. An absent executor fails closed at `invoke`. Human review never
+/// reaches this trait — the effect-bound approval grant is its verdict.
+///
+/// # The error text this returns becomes durable state
+///
+/// A failing attempt's error text is persisted — bounded to
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
+/// outbox row and echoed onto the dispatcher fleet's index entry, where
+/// every worker in the fleet can read it. Bounding is not sanitizing:
+/// what the text *contains* is this implementation's contract, and it
+/// MUST carry no credential, argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
+pub trait AgentGoalEvaluationExecutor: Send + Sync {
+    /// Performs the evaluation and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        evaluation: &'a crate::evaluation::AgentGoalEvaluationRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentGoalEvaluationFinding>;
+}
+
+/// What one outbound A2A send established
+/// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentA2aSendFinding {
+    /// The peer durably created — or replayed to — the delegation's one
+    /// logical child.
+    Sent {
+        /// The child task the peer reported.
+        child_task: crate::identity::AgentTaskId,
+        /// The child's initial run, when the peer reported one.
+        child_run: Option<crate::identity::AgentRunId>,
+        /// The peer's bounded task-state label.
+        peer_status: String,
+    },
+    /// The peer holds a child this delegation's identity does not own — the
+    /// explicit conflict of
+    /// [specification 6.6](../../../docs/plans/rakka-agent/spec.md). The
+    /// generation settles `Failed` under the code and the cell records the
+    /// conflict; recovery uses a new delegation, never this one.
+    Conflict {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// Definitively refused without creating a child: no retry can change
+    /// the answer.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+        /// Which decision refused, when one party decided: the guardrail
+        /// stage and reason code of an egress or ingress block.
+        reason: Option<crate::failure::AgentFailureReason>,
+    },
+}
+
+/// Executes one outbound A2A send inside a bounded dispatch attempt
+/// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)): carries
+/// the delegation record — verbatim, exactly as it was persisted — to the
+/// peer surface with the versioned collaboration metadata, the record's
+/// message id, and its deduplication key, so a retried attempt converges on
+/// the same logical child.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a [`AgentA2aSendFinding::Conflict`] or
+/// [`AgentA2aSendFinding::Refused`] is definitive. An absent executor fails
+/// closed at `invoke`. The `rakka-a2a` crate provides the in-process
+/// implementation over its agents surface; this crate deliberately has no
+/// A2A dependency, which is one half of why a generic tool cannot reach a
+/// peer.
+///
+/// # The error text this returns becomes durable state
+///
+/// A failing attempt's error text is persisted — bounded to
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
+/// outbox row and echoed onto the dispatcher fleet's index entry, where
+/// every worker in the fleet can read it. Bounding is not sanitizing:
+/// what the text *contains* is this implementation's contract, and it
+/// MUST carry no credential, argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record and the delegation's cell — and `EffectFailed`, when the failure
+/// ends the run — as the failure's reason, bounded at
+/// `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
+pub trait AgentA2aSendExecutor: Send + Sync {
+    /// Performs the send and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        delegation: &'a crate::delegation::AgentDelegationRecord,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding>;
+}
+
+/// What one outbound handoff send established
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentA2aHandoffFinding {
+    /// The task durably recorded — or replayed onto — the handoff's one
+    /// logical transfer and offered the target its assignment generation.
+    /// Never proof the target accepted: acceptance returns later through
+    /// the handoff-result exchange.
+    Recorded {
+        /// The assignment generation the task minted toward the target,
+        /// when the surface reported one.
+        target_generation: Option<crate::task::AgentAssignmentGeneration>,
+        /// The peer's bounded task-state label.
+        peer_status: String,
+    },
+    /// The task holds a transfer this handoff's identity does not own — the
+    /// explicit conflict of
+    /// [specification 14.4](../../../docs/plans/rakka-agent/spec.md). The
+    /// generation settles `Failed` under the code and the cell records the
+    /// conflict; recovery uses a new handoff, never this one.
+    Conflict {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// Definitively refused without recording a transfer: no retry can
+    /// change the answer, and the source run resumes with the failed tool
+    /// result.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+        /// Which decision refused, when one party decided: the guardrail
+        /// stage and reason code of an egress or ingress block.
+        reason: Option<crate::failure::AgentFailureReason>,
+    },
+}
+
+/// Executes one outbound handoff send inside a bounded dispatch attempt
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)): carries
+/// the handoff record — verbatim, exactly as it was persisted — to the
+/// task's surface with the versioned collaboration metadata, the record's
+/// message id, and its deduplication key, so a retried attempt converges on
+/// the same logical transfer.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. On an
+/// ambiguous transport loss the implementation probes the task's durable
+/// state before giving up: a recorded provenance echoing this handoff id
+/// proves delivery, while its *absence* stays retryable — a read cannot
+/// prove the ambiguously failed write will never land — so only a durable
+/// record held under a foreign, unresolved identity answers definitively in
+/// the negative. A retry budget that spends out without an answer parks the
+/// run for a reconciliation decision rather than resuming it beside a
+/// possibly-live transfer. An absent executor fails closed at `invoke`.
+///
+/// # The error text this returns becomes durable state
+///
+/// A failing attempt's error text is persisted — bounded to
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
+/// outbox row and echoed onto the dispatcher fleet's index entry, where
+/// every worker in the fleet can read it. Bounding is not sanitizing:
+/// what the text *contains* is this implementation's contract, and it
+/// MUST carry no credential, argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
+pub trait AgentA2aHandoffSendExecutor: Send + Sync {
+    /// Performs the send and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        handoff: &'a crate::coordination::AgentHandoffRecord,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aHandoffFinding>;
+}
+
+/// What one workflow start established
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentWorkflowStartFinding {
+    /// The derived `StartRun` was durably accepted by the child run's inbox:
+    /// the invocation's one logical child now exists.
+    Started,
+    /// The child already existed and the derived `StartRun` deduplicated
+    /// against its inbox or run state: adoption, not an error.
+    Adopted,
+    /// A child run exists that this invocation's identity does not own — a
+    /// deduplication-key match under a foreign command id, or an existing run
+    /// whose workflow type or definition version differs from what the record
+    /// pinned. The dispatch layer normalizes every conflict onto
+    /// [`crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE`] —
+    /// this code is detail folded into the failure message, so the executor
+    /// may report any code it likes and the cell still settles `Conflicted`;
+    /// recovery uses a new invocation, never this one.
+    Conflict {
+        /// Machine-readable detail code, preserved in the failure message.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// Definitively refused without reaching the child: no retry can change
+    /// the answer.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one workflow start inside a bounded dispatch attempt
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)): delivers
+/// the derived, generation-free `StartRun` command —
+/// [`crate::workflow_tool::workflow_start_command`] builds it verbatim from
+/// the persisted record — to the child workflow run's own durable inbox.
+///
+/// The hosting application owes this executor: resolving the record's pinned
+/// workflow type and definition version against its workflow registry,
+/// delivering the command to the sharded child `AgentRunInbox` entity,
+/// mapping acceptance to [`AgentWorkflowStartFinding::Started`] and duplicate
+/// acceptance to [`AgentWorkflowStartFinding::Adopted`], driving accepted
+/// `StartRun` entries into its workflow runner, and later relaying the
+/// child's terminal outcome back as the parent's deduplicated
+/// `RecordWorkflowResult` command. A deduplication-key match under a
+/// different command id — or an existing run whose pinned fields disagree —
+/// must return [`AgentWorkflowStartFinding::Conflict`], never adopt.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. An absent
+/// executor fails closed at `invoke`. The receipt is derived from the record,
+/// never from the acceptance, so `Started` and `Adopted` produce
+/// byte-identical outcomes apart from the adoption flag.
+///
+/// # The error text this returns becomes durable state
+///
+/// A failing attempt's error text is persisted — bounded to
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
+/// outbox row and echoed onto the dispatcher fleet's index entry, where
+/// every worker in the fleet can read it. Bounding is not sanitizing:
+/// what the text *contains* is this implementation's contract, and it
+/// MUST carry no credential, argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
+pub trait AgentWorkflowStartExecutor: Send + Sync {
+    /// Performs the start and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        invocation: &'a crate::workflow_tool::AgentWorkflowInvocationRecord,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentWorkflowStartFinding>;
+}
+
+/// What one workflow-cancel attempt established
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentWorkflowCancelFinding {
+    /// The derived `CancelRun` was durably accepted — or answered as a
+    /// duplicate — by the child run's inbox: the request exists in the
+    /// child's own durable record. Never proof its started internal effects
+    /// stopped.
+    Requested,
+    /// The child was already terminal when the request arrived; its result
+    /// relay carries — or already carried — the outcome.
+    AlreadyFinished,
+    /// Definitively refused without reaching the child: no retry can change
+    /// the answer. The parent then waits for the child's natural terminal
+    /// result.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one workflow cancel inside a bounded dispatch attempt
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): delivers
+/// the derived, generation-free `CancelRun` command —
+/// [`crate::workflow_tool::workflow_cancel_command`] builds it verbatim from
+/// the persisted record — to the child workflow run's own durable inbox.
+///
+/// The hosting application owes this executor, exactly as it owes the start's:
+/// delivering the command to the sharded child `AgentRunInbox` entity, driving
+/// the accepted `CancelRun` into its workflow runner's cancellation surface,
+/// mapping acceptance and duplicate acceptance to
+/// [`AgentWorkflowCancelFinding::Requested`], and still relaying the child's
+/// terminal outcome — `Cancelled` or otherwise — back as the parent's
+/// deduplicated `RecordWorkflowResult` command. Delivery is the whole claim:
+/// the child's scheduler quiesces under its own durable cancellation record,
+/// and its indeterminate internal effects stay in its own reconciliation.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. An absent
+/// executor fails closed at `invoke`.
+///
+/// # The error text this returns becomes durable state
+///
+/// A failing attempt's error text is persisted — bounded to
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
+/// outbox row and echoed onto the dispatcher fleet's index entry, where
+/// every worker in the fleet can read it. Bounding is not sanitizing:
+/// what the text *contains* is this implementation's contract, and it
+/// MUST carry no credential, argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
+pub trait AgentWorkflowCancelExecutor: Send + Sync {
+    /// Performs the cancel delivery and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        invocation: &'a crate::workflow_tool::AgentWorkflowInvocationRecord,
+        reason: &'a str,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentWorkflowCancelFinding>;
+}
+
+/// What one claim-append attempt established
+/// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentClaimAppendFinding {
+    /// The claim durably landed — or the derived operation replayed onto the
+    /// original claim, which is the same logical write.
+    Appended {
+        /// The appended claim's stable id, as the store recorded it.
+        claim: crate::identity::AgentCommunalClaimId,
+    },
+    /// Definitively refused without a durable write: no retry can change the
+    /// answer.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one communal claim append inside a bounded dispatch attempt
+/// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The graph-backed implementation lives beside the knowledge-graph store —
+/// the dependency runs graph → agent, so this crate declares only the trait —
+/// and derives the store's append operation id from the intent's external
+/// idempotency key: stable across every attempt of a generation, so the
+/// store's operation ledger answers a replay with the original claim. The
+/// provenance it writes is the transition-stamped record riding on the
+/// intent, never anything the executor invents.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. An absent
+/// executor fails closed at `invoke`.
+///
+/// # The error text this returns becomes durable state
+///
+/// A failing attempt's error text is persisted — bounded to
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
+/// outbox row and echoed onto the dispatcher fleet's index entry, where
+/// every worker in the fleet can read it. Bounding is not sanitizing:
+/// what the text *contains* is this implementation's contract, and it
+/// MUST carry no credential, argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Once the retry budget is spent, the code of an
+/// [`AgentDispatchError::Collaborator`] error also reaches the run's effect
+/// record — and `EffectFailed`, when the failure ends the run — as the
+/// failure's reason, bounded at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`.
+pub trait AgentClaimAppendExecutor: Send + Sync {
+    /// Performs the append and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        append: &'a crate::effect::AgentClaimAppendRequest,
+        provenance: &'a crate::effect::AgentClaimAppendProvenance,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentClaimAppendFinding>;
 }
 
 /// The runtime-provided promotion executor: the session store in, the private
@@ -395,12 +999,50 @@ pub struct SessionMemoryPromotionExecutor {
 
 impl SessionMemoryPromotionExecutor {
     /// Wires the executor over the two stores it bridges.
+    ///
+    /// Prefer [`Self::for_memory`] wherever an
+    /// [`crate::memory::AgentRunMemory`] exists: the
+    /// store named here must be the same one retrieval resolves through, and
+    /// naming it twice is a pairing nothing can check.
     #[must_use]
     pub fn new(
         session: Arc<dyn SessionMemoryStore>,
         private: Arc<dyn AgentPrivateMemoryStore>,
     ) -> Self {
         Self { session, private }
+    }
+
+    /// Wires the executor from one run-memory bundle, so promotions write the
+    /// store retrieval resolves through.
+    ///
+    /// This is the pairing that matters and the one nothing can verify after
+    /// the fact. An `Arc<dyn AgentPrivateMemoryStore>` carries no identity a
+    /// wiring check could compare, so a deployment that hands promotion one
+    /// store and retrieval another gets an agent whose every promoted memory
+    /// is written where nothing reads it: each ranked identity resolves to
+    /// `None`, the snapshot is byte-identical to one assembled from an empty
+    /// ranking, and the only signal is `RetrievalReport::unverified` — the
+    /// same counter a hostile retriever moves. Deriving both from one
+    /// declaration removes the question instead of answering it.
+    ///
+    /// Answers `None` when the bundle names no private store at all, which is
+    /// a deployment that does not promote.
+    #[must_use]
+    pub fn for_memory(memory: &crate::memory::AgentRunMemory) -> Option<Self> {
+        Some(Self {
+            session: Arc::clone(memory.session_handle()),
+            private: Arc::clone(memory.private()?),
+        })
+    }
+
+    /// The private store promotions are written to.
+    ///
+    /// The store retrieval resolves through must be this one; see
+    /// [`Self::for_memory`], which is how a deployment guarantees it rather
+    /// than asserting it.
+    #[must_use]
+    pub const fn private_store(&self) -> &Arc<dyn AgentPrivateMemoryStore> {
+        &self.private
     }
 
     /// Reads the selected session entries in one bounded page.
@@ -480,7 +1122,36 @@ impl AgentMemoryPromotionExecutor for SessionMemoryPromotionExecutor {
         now: AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentMemoryPromotionFinding> {
         Box::pin(async move {
-            let entries = self.read_selection(scope, promotion).await?;
+            let window = self.read_selection(scope, promotion).await?;
+            // The role filter applies to the durably read window. A window
+            // that selects nothing is refused definitively rather than
+            // succeeding silently with an empty receipt, and the selected
+            // set is held to the same bound the window met at commit — it
+            // cannot exceed it, and saying so here is what keeps that a
+            // checked invariant rather than an inferred one.
+            let entries: Vec<SessionMemoryEntry> = window
+                .into_iter()
+                .filter(|entry| promotion.selects_role(entry.role))
+                .collect();
+            if entries.is_empty() {
+                return Ok(AgentMemoryPromotionFinding::Refused {
+                    code: "memory-promotion-selection-empty".to_string(),
+                    message: format!(
+                        "the selection {}..={} holds no entry of the requested roles",
+                        promotion.from_sequence, promotion.to_sequence
+                    ),
+                });
+            }
+            if entries.len() > AGENT_MEMORY_PROMOTION_MAX_ENTRIES {
+                return Ok(AgentMemoryPromotionFinding::Refused {
+                    code: "memory-promotion-selection-invalid".to_string(),
+                    message: format!(
+                        "the selection names {} entries; at most {} may be promoted at once",
+                        entries.len(),
+                        AGENT_MEMORY_PROMOTION_MAX_ENTRIES
+                    ),
+                });
+            }
             let agent_scope = scope.agent_scope();
             let mut promoted = Vec::with_capacity(entries.len());
 
@@ -729,6 +1400,26 @@ fn consolidation_record(
 ///
 /// The resolver is consulted only after the attempt's durable `Started`, and
 /// the resolved value is dropped with the attempt.
+///
+/// The effect handed over carries two time fields: `timeout_ms`, the attempt
+/// bound its spec declared, and `deadline_at`, which the dispatcher stamps per
+/// attempt as the attempt's start plus that bound and never persists. A
+/// resolver derives the lease it asks for from `deadline_at`; when both are
+/// `None` the effect declared no bound, and a resolver may only ask for its
+/// minimum lease — which is why a credential-bearing model call without a
+/// timeout is refused at the authority.
+///
+/// # The error's code becomes durable state; its text does not
+///
+/// A failing resolution burns the attempt under the pipeline's
+/// `credential-resolution-failed` and a detail the dispatcher authors itself.
+/// The error's text is never persisted and never logged. Its **code** is: it
+/// is written on the dispatcher's log line and, once the retry budget is
+/// spent, recorded beside the pipeline code as the failure's reason, bounded
+/// at `AGENT_FAILURE_REASON_CODE_MAX_LENGTH`. A code is a stable identifier
+/// — `vault-unreachable`, `lease-too-short` — and MUST carry no credential,
+/// argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
 pub trait AgentEffectCredentialResolver: Send + Sync {
     /// Resolves the binding into an ephemeral in-memory credential.
     fn resolve<'a>(
@@ -756,6 +1447,16 @@ pub enum AgentReconciliationFinding {
 
 /// Queries the authoritative outcome of an ambiguous `Reconcileable` attempt
 /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// # The error text this returns becomes durable state
+///
+/// A failing attempt's error text is persisted — bounded to
+/// [`AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH`] — on the run's durable
+/// outbox row and echoed onto the dispatcher fleet's index entry, where
+/// every worker in the fleet can read it. Bounding is not sanitizing:
+/// what the text *contains* is this implementation's contract, and it
+/// MUST carry no credential, argument, or content material
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
 pub trait AgentEffectReconciler: Send + Sync {
     /// Runs the named protocol against the external system of record.
     fn reconcile<'a>(
@@ -788,6 +1489,37 @@ pub enum AgentDispatchDecision {
 /// because a dispatcher that skips the check is exactly the universally
 /// privileged worker [specification 16](../../../docs/plans/rakka-agent/spec.md)
 /// forbids claiming isolation from.
+///
+/// All three methods are required. A wrapping authority that forgot to forward
+/// [`Self::review_tool_response`] would silently drop the `ToolResponse`
+/// evaluation point, so every implementation states what it does at that
+/// boundary; [`accept_tool_response_unchanged`] is the one-line body for an
+/// authority that evaluates no response chain, and a wrapper forwards to the
+/// authority it wraps. An implementation without it does not build:
+///
+/// ```compile_fail,E0046
+/// use rakka_agent::{
+///     AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentRunEffect,
+///     AgentRunScope, AgentRunState,
+/// };
+/// use rakka_agent_workflow::AgentTimestampMillis;
+///
+/// struct Gate;
+///
+/// impl AgentDispatchAuthority for Gate {
+///     fn authorize<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _run: &'a AgentRunState,
+///         _intent: &'a AgentRunEffect,
+///         _attempt: u32,
+///         _now: AgentTimestampMillis,
+///     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+///         unimplemented!()
+///     }
+///     // `review_tool_response` and `review_model_response` are missing: the impl is incomplete.
+/// }
+/// ```
 pub trait AgentDispatchAuthority: Send + Sync {
     /// Authorizes one dispatch attempt of one effect intent, or refuses it.
     ///
@@ -803,6 +1535,137 @@ pub trait AgentDispatchAuthority: Send + Sync {
         attempt: u32,
         now: rakka_agent_workflow::AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentDispatchDecision>;
+
+    /// Reviews one executed tool's result at the `ToolResponse` boundary,
+    /// before the pipeline delivers it
+    /// ([`AgentToolAuthority::review_tool_response`]).
+    ///
+    /// Required, not defaulted: an authority that evaluates no response chain
+    /// says so with [`accept_tool_response_unchanged`], and one that wraps
+    /// another forwards to it — [`AgentEntityAuthority`] delegates to the tool
+    /// authority it wraps. A defaulted accept would let a wrapper drop the
+    /// boundary by omission.
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, AgentToolResponseDecision>;
+
+    /// Reviews one model turn at the `ModelResponse` boundary, before the
+    /// pipeline records it ([`AgentToolAuthority::review_model_response`]).
+    ///
+    /// Required, not defaulted, for the reason [`Self::review_tool_response`]
+    /// is: an authority that evaluates no response chain says so with
+    /// [`accept_model_response_unchanged`], and a wrapper forwards to the
+    /// authority it wraps. A defaulted accept would let a wrapper drop the
+    /// boundary by omission.
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, AgentModelResponseDecision>;
+}
+
+/// The accept-unchanged body of
+/// [`AgentDispatchAuthority::review_tool_response`]: the result is delivered
+/// exactly as the tool produced it, with no transform and no report.
+///
+/// For an authority that evaluates no `ToolResponse` chain. A wrapping
+/// authority does not use it — it forwards to the authority it wraps, or the
+/// wrapped chain is silently dropped.
+///
+/// ```
+/// use rakka_agent::{
+///     accept_model_response_unchanged, accept_tool_response_unchanged, AgentDispatchAuthority,
+///     AgentDispatchDecision, AgentDispatchFuture, AgentModelResponseDecision, AgentModelTurn,
+///     AgentRunEffect, AgentRunScope, AgentRunState, AgentTaskContent, AgentToolId,
+///     AgentToolResponseDecision,
+/// };
+/// use rakka_agent_workflow::AgentTimestampMillis;
+///
+/// struct Gate;
+///
+/// impl AgentDispatchAuthority for Gate {
+///     fn authorize<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _run: &'a AgentRunState,
+///         _intent: &'a AgentRunEffect,
+///         _attempt: u32,
+///         _now: AgentTimestampMillis,
+///     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+///         unimplemented!()
+///     }
+///
+///     fn review_tool_response<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _intent: &'a AgentRunEffect,
+///         _tool: Option<&'a AgentToolId>,
+///         content: AgentTaskContent,
+///     ) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
+///         accept_tool_response_unchanged(content)
+///     }
+///
+///     fn review_model_response<'a>(
+///         &'a self,
+///         _scope: &'a AgentRunScope,
+///         _intent: &'a AgentRunEffect,
+///         turn: AgentModelTurn,
+///     ) -> AgentDispatchFuture<'a, AgentModelResponseDecision> {
+///         accept_model_response_unchanged(turn)
+///     }
+/// }
+/// ```
+#[must_use]
+pub fn accept_tool_response_unchanged<'a>(
+    content: AgentTaskContent,
+) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
+    Box::pin(async move {
+        Ok(AgentToolResponseDecision::Accepted(Box::new(
+            AgentToolResponseReview::unchanged(content),
+        )))
+    })
+}
+
+/// What the `ToolResponse` boundary decided about an executed tool's result.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentToolResponseDecision {
+    /// The run receives the reviewed content.
+    Accepted(Box<AgentToolResponseReview>),
+    /// The result is refused: the effect fails under the refusal's code.
+    Refused(AgentAuthorityRefusal),
+}
+
+/// What the `ModelResponse` boundary decided about a model turn.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentModelResponseDecision {
+    /// The run records the reviewed turn.
+    Accepted(Box<AgentModelResponseReview>),
+    /// The turn is refused: the effect fails under the refusal's code.
+    Refused(AgentAuthorityRefusal),
+}
+
+/// The accept-unchanged body of
+/// [`AgentDispatchAuthority::review_model_response`]: the turn is recorded
+/// exactly as the model produced it, with no transform and no report.
+///
+/// For an authority that evaluates no `ModelResponse` chain. A wrapping
+/// authority does not use it — it forwards to the authority it wraps.
+#[must_use]
+pub fn accept_model_response_unchanged<'a>(
+    turn: AgentModelTurn,
+) -> AgentDispatchFuture<'a, AgentModelResponseDecision> {
+    Box::pin(async move {
+        Ok(AgentModelResponseDecision::Accepted(Box::new(
+            AgentModelResponseReview::unchanged(turn),
+        )))
+    })
 }
 
 /// Resolves the setup revision one run was created under, so the dispatch
@@ -953,6 +1816,17 @@ where
             {
                 context = context.with_checkpoint_grant(grant);
             }
+            // The goal-scope envelope binds per attempt
+            // ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)):
+            // its environment narrowing and knowledge grant are read from the
+            // run's own durable state, so a revised assignment reaches the
+            // very next dispatch.
+            if let Some(envelope) = run
+                .loop_state()
+                .and_then(|loop_state| loop_state.delegation_envelope())
+            {
+                context = context.with_delegation_envelope(envelope);
+            }
             let task = run.run().map(AgentRun::task);
             let goal = run.loop_state().and_then(|loop_state| loop_state.goal());
             let decision = match self
@@ -963,6 +1837,37 @@ where
                 Err(refusal) => AgentDispatchDecision::Refused(refusal),
             };
             Ok(decision)
+        })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        tool: Option<&'a AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
+        Box::pin(async move {
+            Ok(
+                match self.authority.review_tool_response(scope, tool, content) {
+                    Ok(review) => AgentToolResponseDecision::Accepted(Box::new(review)),
+                    Err(refusal) => AgentToolResponseDecision::Refused(refusal),
+                },
+            )
+        })
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, AgentModelResponseDecision> {
+        Box::pin(async move {
+            Ok(match self.authority.review_model_response(scope, turn) {
+                Ok(review) => AgentModelResponseDecision::Accepted(Box::new(review)),
+                Err(refusal) => AgentModelResponseDecision::Refused(refusal),
+            })
         })
     }
 }
@@ -987,6 +1892,14 @@ pub enum AgentDispatchWindow {
     BeforeStarted,
     /// Durable `Started` is written; the target has not been invoked.
     AfterStarted,
+    /// A credential has been resolved and is live in memory; the target has
+    /// not been invoked.
+    ///
+    /// Reached only by an attempt whose intent names a credential binding —
+    /// there is no window where a credential is live if none was resolved —
+    /// so an armed probe that never fires here is telling the caller its
+    /// intent carries no binding, not that the window is unreachable.
+    CredentialResolved,
     /// The target committed; no receipt has been recorded anywhere.
     AfterInvocation,
     /// The run durably holds the result; the outbox row is not yet settled.
@@ -1000,6 +1913,7 @@ impl AgentDispatchWindow {
         match self {
             Self::BeforeStarted => "before-started",
             Self::AfterStarted => "after-started",
+            Self::CredentialResolved => "credential-resolved",
             Self::AfterInvocation => "after-invocation",
             Self::AfterResultDelivery => "after-result-delivery",
         }
@@ -1032,6 +1946,18 @@ pub struct AgentDispatchPass {
     pub failed_attempts: usize,
     /// Claims deferred by a transient refusal, spending nothing durable.
     pub deferred: usize,
+    /// Due tickets this worker's claim filter refused, because they name an
+    /// execution class it does not serve.
+    ///
+    /// Never a failure: the ticket stays claimable for a worker that serves
+    /// the class. A value that stays non-zero across passes while work is due
+    /// is the signal that *no* worker serves it.
+    ///
+    /// Complete over the due tickets rather than over the ones a pass had room
+    /// to consider, so a busy fleet reports the same number an idle one would
+    /// — which matters because a busy fleet is when an unservable class is
+    /// most likely to be sitting behind work that keeps getting claimed.
+    pub class_filtered: usize,
     /// True when the probe killed the worker mid-pass.
     pub died: bool,
 }
@@ -1066,6 +1992,8 @@ where
     workflow_store: Flow,
     fleet_store: Fleet,
     fleet: AgentDispatcherFleet<Fleet, Clock>,
+    fleet_settings: AgentDispatcherFleetSettings,
+    claim_filter: rakka_agent_workflow::AgentDispatchClaimFilter,
     runs: Runs,
     clock: Clock,
     schema_policy: AgentSchemaPolicy,
@@ -1077,8 +2005,15 @@ where
     reconciler: Option<Arc<dyn AgentEffectReconciler>>,
     compensations: Option<Arc<dyn AgentCompensationExecutor>>,
     memory_promotions: Option<Arc<dyn AgentMemoryPromotionExecutor>>,
+    goal_evaluations: Option<Arc<dyn AgentGoalEvaluationExecutor>>,
+    a2a_sends: Option<Arc<dyn AgentA2aSendExecutor>>,
+    a2a_handoffs: Option<Arc<dyn AgentA2aHandoffSendExecutor>>,
+    workflow_starts: Option<Arc<dyn AgentWorkflowStartExecutor>>,
+    workflow_cancels: Option<Arc<dyn AgentWorkflowCancelExecutor>>,
+    claim_appends: Option<Arc<dyn AgentClaimAppendExecutor>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
+    segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
 }
 
 impl<Flow, Fleet, Runs, Clock> AgentRunEffectDispatcher<Flow, Fleet, Runs, Clock>
@@ -1109,18 +2044,23 @@ where
         authority: Arc<dyn AgentDispatchAuthority>,
         delivery: Arc<dyn AgentRunResultDelivery>,
     ) -> Self {
+        let fleet_settings = AgentDispatcherFleetSettings::default();
+        let claim_filter = rakka_agent_workflow::AgentDispatchClaimFilter::any();
         let fleet = AgentDispatcherFleet::with_clock_and_metrics(
             fleet_store.clone(),
             rakka_agent_workflow::agent_dispatcher_fleet_persistence_id(),
-            AgentDispatcherFleetSettings::default(),
+            fleet_settings.clone(),
             clock.clone(),
             Arc::new(rakka_core::NoopMetricsRecorder),
-        );
+        )
+        .with_claim_filter(claim_filter.clone());
         Self {
             worker_id,
             workflow_store,
             fleet_store,
             fleet,
+            fleet_settings,
+            claim_filter,
             runs,
             clock,
             schema_policy: AgentSchemaPolicy::default(),
@@ -1132,22 +2072,79 @@ where
             reconciler: None,
             compensations: None,
             memory_promotions: None,
+            goal_evaluations: None,
+            a2a_sends: None,
+            a2a_handoffs: None,
+            workflow_starts: None,
+            workflow_cancels: None,
+            claim_appends: None,
             delivery,
             probe: None,
+            segments: None,
         }
     }
 
     /// Uses explicit fleet settings (lease duration, batch size, concurrency).
     #[must_use]
     pub fn with_fleet_settings(mut self, settings: AgentDispatcherFleetSettings) -> Self {
+        self.fleet_settings = settings;
+        self.rebuild_fleet();
+        self
+    }
+
+    /// Serves only the execution classes this worker is trusted for.
+    ///
+    /// A ticket whose intent names a class outside this set is never *claimed*
+    /// by this worker — it stays claimable for one that serves it. That is the
+    /// whole routing mechanism, and it needs no durable schema change: the
+    /// intent's [`crate::definition::AgentExecutionPolicyRef`] already rides the
+    /// dispatch ticket's target attributes and into the fleet index
+    /// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Filtering at the claim, rather than refusing after it, is what makes a
+    /// heterogeneous fleet correct. A worker that claimed first and refused
+    /// afterwards would hold the lease while it did so — starving the worker
+    /// that can actually run the effect — and its refusal would settle the
+    /// effect as *failed*, permanently killing work merely because the wrong
+    /// worker won a race.
+    ///
+    /// A worker with no declared classes serves everything: the pre-existing
+    /// behaviour, and the right default for a homogeneous fleet. Unclassified
+    /// intents stay claimable by every worker; refusing *those* is a policy
+    /// decision belonging to
+    /// [`crate::tools::AgentToolAuthority::with_required_execution_policy`],
+    /// not to the fleet.
+    ///
+    /// The authority's own `execution-policy-unroutable` check remains the
+    /// backstop for a ticket retagged between claim and grant.
+    #[must_use]
+    pub fn with_execution_classes(
+        mut self,
+        classes: impl IntoIterator<Item = crate::definition::AgentExecutionPolicyRef>,
+    ) -> Self {
+        self.claim_filter = rakka_agent_workflow::AgentDispatchClaimFilter::by_target_attribute(
+            crate::effect::ATTR_AGENT_EFFECT_EXECUTION_POLICY,
+            classes.into_iter().map(|class| class.as_str().to_string()),
+        );
+        self.rebuild_fleet();
+        self
+    }
+
+    /// Rebuilds the fleet handle from the settings and filter this worker
+    /// currently holds.
+    ///
+    /// Both builders route through here so neither discards the other's
+    /// configuration — which the two independent constructions they used to
+    /// perform did, silently, depending on call order.
+    fn rebuild_fleet(&mut self) {
         self.fleet = AgentDispatcherFleet::with_clock_and_metrics(
             self.fleet_store.clone(),
             rakka_agent_workflow::agent_dispatcher_fleet_persistence_id(),
-            settings,
+            self.fleet_settings.clone(),
             self.clock.clone(),
             Arc::new(rakka_core::NoopMetricsRecorder),
-        );
-        self
+        )
+        .with_claim_filter(self.claim_filter.clone());
     }
 
     /// Uses an explicit schema-compatibility policy for the run states it
@@ -1202,11 +2199,127 @@ where
         self
     }
 
+    /// Executes goal-evaluation effects through the given application-owned
+    /// executor ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    /// Without one, an evaluation dispatch fails closed with a stable code —
+    /// except human review, whose effect-bound approval grant is its verdict.
+    #[must_use]
+    pub fn with_goal_evaluation_executor(
+        mut self,
+        goal_evaluations: Arc<dyn AgentGoalEvaluationExecutor>,
+    ) -> Self {
+        self.goal_evaluations = Some(goal_evaluations);
+        self
+    }
+
+    /// Executes outbound A2A sends through the given executor
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)) —
+    /// usually `rakka-a2a`'s in-process delegation-send executor over the
+    /// deployment's agents surface. Without one, a send dispatch fails
+    /// closed with a stable code.
+    #[must_use]
+    pub fn with_a2a_send_executor(mut self, a2a_sends: Arc<dyn AgentA2aSendExecutor>) -> Self {
+        self.a2a_sends = Some(a2a_sends);
+        self
+    }
+
+    /// Executes outbound handoff sends through the given executor
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)) —
+    /// usually `rakka-a2a`'s in-process handoff-send executor over the
+    /// deployment's agents surface. Without one, a handoff dispatch fails
+    /// closed with a stable code.
+    #[must_use]
+    pub fn with_a2a_handoff_executor(
+        mut self,
+        a2a_handoffs: Arc<dyn AgentA2aHandoffSendExecutor>,
+    ) -> Self {
+        self.a2a_handoffs = Some(a2a_handoffs);
+        self
+    }
+
+    /// Executes workflow starts through the given executor
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)) — the
+    /// application-owned bridge that delivers the derived `StartRun` to the
+    /// child workflow run's inbox. Without one, a workflow start dispatch
+    /// fails closed with a stable code.
+    #[must_use]
+    pub fn with_workflow_start_executor(
+        mut self,
+        workflow_starts: Arc<dyn AgentWorkflowStartExecutor>,
+    ) -> Self {
+        self.workflow_starts = Some(workflow_starts);
+        self
+    }
+
+    /// Executes workflow cancels through the given executor
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)) — the
+    /// application-owned bridge that delivers the derived `CancelRun` to the
+    /// child workflow run's inbox. Without one, a workflow cancel dispatch
+    /// fails closed with a stable code and the parent waits for the child's
+    /// natural terminal result.
+    #[must_use]
+    pub fn with_workflow_cancel_executor(
+        mut self,
+        workflow_cancels: Arc<dyn AgentWorkflowCancelExecutor>,
+    ) -> Self {
+        self.workflow_cancels = Some(workflow_cancels);
+        self
+    }
+
+    /// Executes communal claim appends through the given executor
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)) — the
+    /// graph-backed bridge the application wires. Without one, a claim
+    /// append dispatch fails closed with a stable code.
+    #[must_use]
+    pub fn with_claim_append_executor(
+        mut self,
+        claim_appends: Arc<dyn AgentClaimAppendExecutor>,
+    ) -> Self {
+        self.claim_appends = Some(claim_appends);
+        self
+    }
+
     /// Observes (and, in tests, kills) the worker at each durable boundary.
     #[must_use]
     pub fn with_probe(mut self, probe: Arc<dyn AgentDispatchProbe>) -> Self {
         self.probe = Some(probe);
         self
+    }
+
+    /// Closes the dispatcher's bounded operation segments into `sink`
+    /// ([specification 17.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The dispatcher is where the external world is actually touched — the
+    /// provider call, the tool call, the peer send — and it is the only
+    /// vantage point from which those latencies are visible. A run entity
+    /// sees the effect's durable acceptance and its durable result and
+    /// nothing in between, so a segment for the attempt itself can only be
+    /// closed here.
+    ///
+    /// Segments are closed on the worker holding the lease, after the durable
+    /// write that makes the attempt real, and never block or fail it.
+    #[must_use]
+    pub fn with_segments(mut self, sink: Arc<dyn crate::observability::AgentSegmentSink>) -> Self {
+        self.segments = Some(sink);
+        self
+    }
+
+    /// Closes one segment into the wired sink, attaching the run's identity
+    /// and the trace context the effect carried across the durable boundary.
+    fn close_segment(
+        &self,
+        scope: &AgentRunScope,
+        telemetry: &AgentTelemetryContext,
+        segment: crate::observability::AgentTelemetrySegment,
+    ) {
+        let Some(sink) = self.segments.as_ref() else {
+            return;
+        };
+        sink.record(
+            &segment
+                .identity(crate::observability::AgentSegmentIdentity::of_run(scope))
+                .telemetry(telemetry.clone()),
+        );
     }
 
     /// The sink runs served by this pipeline should flush through.
@@ -1222,6 +2335,11 @@ where
             self.workflow_store.clone(),
             self.clock.clone(),
         )
+    }
+
+    /// The dispatcher's own clock, as an agent-domain timestamp.
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.now().as_millis())
     }
 
     fn survives(&self, window: AgentDispatchWindow) -> bool {
@@ -1282,6 +2400,7 @@ where
         // whose re-claim under a fresh fencing token *is* the recovery path.
         let batch = self.fleet.claim_due(self.worker_id.clone()).await?;
         pass.claimed = batch.claims.len();
+        pass.class_filtered = batch.class_filtered;
         for claim in batch.claims {
             let claim_scope = AgentRunScope::parse(claim.run_id.as_str())?;
             match self.execute_claim(&claim_scope, claim, &mut pass).await? {
@@ -1388,9 +2507,14 @@ where
                 .await;
         }
 
-        if winding_down {
+        if winding_down && !intent.kind().exempt_from_wind_down_fence() {
             // The fence: a ticket that provably never started is cancelled and
-            // its intent settled, never dispatched after the cancellation.
+            // its intent settled, never dispatched after the cancellation. A
+            // compensation or workflow-cancel is exempt — it is exactly the
+            // work the wind-down authorized after the fence, and cancelling
+            // its ticket here would strand the wind-down on it forever — and
+            // so is a promotion or claim append, which copies work already
+            // recorded and may be accepted after the run has ended.
             self.settle_ticket_cancelled(scope, &claim, "run-cancelled", pass)
                 .await?;
             self.deliver_outcome(
@@ -1484,10 +2608,29 @@ where
         // an unroutable execution policy, a blocked guardrail — settles the
         // generation (scenario 54).
         let now = rakka_agent_workflow::AgentTimestampMillis::new(self.clock.now().as_millis());
-        let decision = self
+        // A distinct segment from the attempt below, because it is a distinct
+        // interval with a distinct meaning: it ends before the durable
+        // `Started` write, so a refusal here provably invoked nothing.
+        let authorize_timer = AgentSegmentTimer::start(now);
+        let authorized = self
             .authority
             .authorize(scope, state, intent, attempt, now)
-            .await?;
+            .await;
+        let authorize_segment = authorize_timer.close(AgentSegmentOperation::ToolAuthorize {
+            effect_kind: intent.kind().as_label(),
+        });
+        self.close_segment(
+            scope,
+            &intent.telemetry,
+            match &authorized {
+                Ok(AgentDispatchDecision::Granted(_)) => authorize_segment.ok(),
+                Ok(AgentDispatchDecision::Refused(refusal)) => {
+                    authorize_segment.failed("rakka.agent.authority", &refusal.code)
+                }
+                Err(error) => authorize_segment.failed("rakka.agent.authority", error.code()),
+            },
+        );
+        let decision = authorized?;
         let granted = match decision {
             AgentDispatchDecision::Granted(granted) => {
                 if let Err(refusal) = granted.grant.validate_for(scope, intent, attempt, now) {
@@ -1607,9 +2750,24 @@ where
             return Ok(ClaimConclusion::Died);
         }
 
+        // The attempt bound, stamped once per attempt and never persisted:
+        // a durable deadline would outlive the generation it bounds.
+        let attempt_started_at = self.now();
+        let mut attempt_intent = intent.clone();
+        attempt_intent.deadline_at = intent.timeout_ms.map(|timeout_ms| {
+            AgentTimestampMillis::new(attempt_started_at.as_millis().saturating_add(timeout_ms))
+        });
+        let attempt_intent = &attempt_intent;
+        // The binding: the intent's own, or the one the grant carries from
+        // the selected model profile.
+        let credential_binding = intent
+            .credential_binding
+            .clone()
+            .or_else(|| granted.grant.credential_binding.clone());
+
         // Dispatch-time credential resolution, inside the bounded attempt. The
         // resolved value never outlives `outcome` below.
-        let credential = match &intent.credential_binding {
+        let credential = match &credential_binding {
             None => None,
             Some(binding) => match &self.credentials {
                 None => {
@@ -1631,11 +2789,41 @@ where
                         )
                         .await;
                 }
-                Some(resolver) => match resolver.resolve(scope, binding, intent).await {
+                Some(resolver) => match resolver.resolve(scope, binding, attempt_intent).await {
                     Ok(credential) => Some(credential),
                     Err(error) => {
                         // Resolution failures may be transient: burn the
                         // attempt under the intent's policy.
+                        //
+                        // What the attempt *persists* is Rakka-authored, save
+                        // one identifier. A resolver's own failure text is
+                        // application-supplied and may quote a secret store's
+                        // response verbatim, and `record_attempt_failure` writes
+                        // what it is given into the durable outbox row and the
+                        // fleet index — two records every worker in the fleet
+                        // can read. The substrate already draws this line for
+                        // itself (`AgentCredentialError::to_outbox_dispatch_result`
+                        // emits its code alone), and
+                        // [specification 16](../../../docs/plans/rakka-agent/spec.md)
+                        // requires that credentials never be logged or
+                        // persisted. The resolver keeps its own detail; the
+                        // operator gets the logical binding, which is what
+                        // they act on. The one thing of the resolver's that is
+                        // persisted is its stable code: once the retry budget
+                        // is spent, it rides the `Exhausted` word as the
+                        // failure's reason. Its detail never does.
+                        tracing::warn!(
+                            effect_id = intent.effect_id.as_str(),
+                            generation = intent.generation.get(),
+                            attempt,
+                            credential_binding = binding.as_str(),
+                            resolver_code = collaborator_code(&error).as_str(),
+                            "credential resolution failed; the resolver's detail is not persisted"
+                        );
+                        let detail = format!(
+                            "the credential binding {binding} could not be resolved; the \
+                             resolver's detail is deliberately not persisted"
+                        );
                         return self
                             .record_attempt_failure(
                                 scope,
@@ -1643,7 +2831,11 @@ where
                                 intent,
                                 attempt,
                                 "credential-resolution-failed",
-                                &error.to_string(),
+                                &detail,
+                                // The resolver's own code, which the line
+                                // above already logs: a stable identifier,
+                                // never the resolver's words.
+                                crate::failure::AgentFailureReason::new(collaborator_code(&error)),
                                 pass,
                             )
                             .await;
@@ -1652,11 +2844,67 @@ where
             },
         };
 
+        // The only window at which a resolved credential is live in memory.
+        // A worker killed here abandons the value exactly as a crash does —
+        // it is dropped, never written — and the recovery attempt resolves
+        // again rather than reusing anything persisted
+        // ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+        if credential.is_some() && !self.survives(AgentDispatchWindow::CredentialResolved) {
+            return Ok(ClaimConclusion::Died);
+        }
+
         pass.invoked += 1;
+        // The attempt segment brackets the external call only. It begins after
+        // the durable `Started` write, so a segment exists exactly when an
+        // invocation may have happened — which is the window that decides
+        // whether an outcome is indeterminate.
+        let attempt_timer = AgentSegmentTimer::start(self.now());
         let invoked = self
-            .invoke(scope, intent, &granted, credential.as_ref())
+            .invoke(scope, attempt_intent, &granted, credential.as_ref())
             .await;
         drop(credential);
+        // The three attributes a retention policy selects on, and the reason
+        // each is here: the resolved status carries `indeterminate`, which
+        // specification 17.9 requires to be retainable; the attempt number is
+        // what "excessive retry" means; and the settings revision is what
+        // "a newly deployed version under investigation" means.
+        // The attempt exports under the identity the run can derive from the
+        // effect record alone, so an indeterminate transition recorded on
+        // another node can link to exactly this attempt
+        // ([specification 17.9](../../../docs/plans/rakka-agent/spec.md)).
+        let mut attempt_segment = attempt_timer
+            .close(AgentSegmentOperation::EffectDispatch {
+                effect_kind: intent.kind().as_label(),
+            })
+            .attribute(SEGMENT_ATTR_EFFECT_ATTEMPT, attempt.to_string())
+            .attribute(
+                SEGMENT_ATTR_SETTINGS_REVISION,
+                granted.grant.settings_revision.get().to_string(),
+            );
+        if let Some(identity) = intent.attempt_span_identity(attempt) {
+            attempt_segment = attempt_segment.span_id(identity.span_id);
+        }
+        let attempt_segment = match &invoked {
+            Ok(outcome) => attempt_segment
+                .attribute(
+                    SEGMENT_ATTR_EFFECT_STATUS,
+                    outcome.resolved_status().as_label(),
+                )
+                .ok(),
+            Err(error) => attempt_segment.failed("rakka.agent.dispatch", error.code()),
+        };
+        // Provider-reported usage rides the attempt that produced it, so a
+        // token count and the latency that produced it are one record.
+        let attempt_segment = match &invoked {
+            Ok(AgentRunEffectOutcome::Model { turn }) => attempt_segment
+                .usage(turn.usage)
+                .model_response(AgentModelResponseMetadata {
+                    model: turn.response_model.clone(),
+                    finish_reason: turn.finish_reason.clone(),
+                }),
+            _ => attempt_segment,
+        };
+        self.close_segment(scope, &intent.telemetry, attempt_segment);
 
         if !self.survives(AgentDispatchWindow::AfterInvocation) {
             return Ok(ClaimConclusion::Died);
@@ -1673,6 +2921,7 @@ where
                         attempt,
                         error.code(),
                         &error.to_string(),
+                        collaborator_reason(&error),
                         pass,
                     )
                     .await;
@@ -1753,24 +3002,24 @@ where
                 // deduplicated on the derived result operation id and fenced
                 // by the run's effect record, so a second recovery pass
                 // resolves to the same single outcome.
-                self.deliver_outcome(
+                //
+                // Through `park_indeterminate` rather than beside it. This arm
+                // used to hand-roll the same delivery, counter, and ticket
+                // settlement without the segment, so the *canonical* indeterminate
+                // — a non-idempotent effect whose worker died after the durable
+                // `Started` write — was the one case a retention policy keyed on
+                // `rakka.agent.effect.status = indeterminate` retained nothing
+                // for. One outcome, one code path.
+                self.park_indeterminate(
                     scope,
+                    claim,
                     intent,
                     attempt,
-                    claim.fencing_token,
-                    AgentRunEffectOutcome::Indeterminate {
-                        code: "dispatcher-lost-after-started".to_string(),
-                        message: "the attempt may have invoked the target; its outcome must be \
-                                  reconciled"
-                            .to_string(),
-                    },
+                    "dispatcher-lost-after-started",
+                    "the attempt may have invoked the target; its outcome must be reconciled",
                     pass,
                 )
-                .await?;
-                pass.parked_indeterminate += 1;
-                self.settle_ticket_cancelled(scope, &claim, "indeterminate", pass)
-                    .await?;
-                Ok(ClaimConclusion::Settled)
+                .await
             }
         }
     }
@@ -1785,6 +3034,7 @@ where
         intent: &AgentRunEffect,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
+        let timer = AgentSegmentTimer::start(self.now());
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
         let mut inbox = self.inbox(scope);
         inbox.recover().await?;
@@ -1798,18 +3048,29 @@ where
         if let WorkflowTelemetryEvent::OutboxDispatchExhausted { attempts, .. } = &event {
             let attempts = *attempts;
             self.fleet.record_claim_failure(&claim, &event).await?;
-            self.deliver_outcome(
+            let outcome = AgentRunEffectOutcome::exhausted(
+                "dispatcher-lost-after-started".to_string(),
+                "the retry budget was spent recovering ambiguous attempts".to_string(),
+            );
+            let status = outcome.resolved_status();
+            self.deliver_outcome(scope, intent, attempts, claim.fencing_token, outcome, pass)
+                .await?;
+            // Spending the last of a generation's budget on ambiguous losses
+            // is a terminal decision the attempt segments cannot describe:
+            // every attempt that reached this arm was lost before it could
+            // close one, and the invocation that would have closed the last
+            // never ran. Without this the generation ends with no span at all.
+            self.close_segment(
                 scope,
-                intent,
-                attempts,
-                claim.fencing_token,
-                AgentRunEffectOutcome::Exhausted {
-                    code: "dispatcher-lost-after-started".to_string(),
-                    message: "the retry budget was spent recovering ambiguous attempts".to_string(),
-                },
-                pass,
-            )
-            .await?;
+                &intent.telemetry,
+                timer
+                    .close(AgentSegmentOperation::EffectDispatch {
+                        effect_kind: intent.kind().as_label(),
+                    })
+                    .attribute(SEGMENT_ATTR_EFFECT_STATUS, status.as_label())
+                    .attribute(SEGMENT_ATTR_EFFECT_ATTEMPT, attempts.to_string())
+                    .failed("rakka.agent.effect", "dispatcher-lost-after-started"),
+            );
             return Ok(ClaimConclusion::Settled);
         }
 
@@ -1979,18 +3240,63 @@ where
         message: &str,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
+        let timer = AgentSegmentTimer::start(self.now());
         self.deliver_outcome(
             scope,
             intent,
             attempt,
             claim.fencing_token,
+            // Bounded here rather than at the callers: one of them composes
+            // this message from an application refusal, and a bound that
+            // depends on every caller remembering it is not a bound.
             AgentRunEffectOutcome::Indeterminate {
-                code: code.to_string(),
-                message: message.to_string(),
+                code: bounded_failure_code(code),
+                message: bounded_failure_detail(message),
             },
             pass,
         )
         .await?;
+        // An indeterminate outcome is an error event a retention policy must
+        // be able to keep ([specification 17.9]) — and it is the one outcome
+        // the dispatch attempt's own segment cannot describe, because the
+        // attempt did not conclude: this is the *decision* that its outcome is
+        // unknowable, taken after the fact and often on a different worker.
+        // The park links the attempt whose outcome could not be established
+        // and, forward, the reconciliation decision the run now waits for: the
+        // decision's identity is derived from the checkpoint id, which is a
+        // pure function of the effect and generation, so it can be named here
+        // before the run has even opened the checkpoint.
+        let mut links = Vec::new();
+        if let Some(ambiguous) = intent.attempt_span_identity(attempt) {
+            links.push(agent_span_link(&ambiguous, LINK_KIND_AMBIGUOUS_ATTEMPT));
+        }
+        let checkpoint_id = AgentCheckpoint::id_for_effect(
+            &intent.effect_id,
+            intent.generation,
+            AgentCheckpointKind::IndeterminateEffectReconciliation,
+        );
+        if let Some(decision) =
+            AgentCheckpoint::resolve_span_identity(&intent.telemetry, &checkpoint_id)
+        {
+            links.push(agent_span_link(
+                &decision,
+                LINK_KIND_RECONCILIATION_DECISION,
+            ));
+        }
+        self.close_segment(
+            scope,
+            &agent_linked_telemetry_context(&intent.telemetry, links),
+            timer
+                .close(AgentSegmentOperation::EffectDispatch {
+                    effect_kind: intent.kind().as_label(),
+                })
+                .attribute(
+                    SEGMENT_ATTR_EFFECT_STATUS,
+                    AgentRunEffectStatus::Indeterminate.as_label(),
+                )
+                .attribute(SEGMENT_ATTR_EFFECT_ATTEMPT, attempt.to_string())
+                .failed("rakka.agent.effect", bounded_failure_code(code)),
+        );
         pass.parked_indeterminate += 1;
         self.settle_ticket_cancelled(scope, &claim, "indeterminate", pass)
             .await?;
@@ -2053,7 +3359,7 @@ where
             let message = format!(
                 "a prior attempt may have invoked the target, and the recovery retry was \
                  refused ({}); an explicit reconciliation decision is owed",
-                refusal.message
+                bounded_failure_detail(&refusal.message)
             );
             return self
                 .park_indeterminate(
@@ -2089,7 +3395,11 @@ where
             message_id: OutboxMessageId::new(claim.effect_id.as_str()),
             attempt: attempt.saturating_sub(1),
             next_retry_at: self.clock.now().add_millis(self.retry_backoff_ms),
-            message: format!("deferred: {code}: {message}"),
+            // Both halves are application-supplied — an `AgentDispatchAuthority`
+            // authors the refusal this carries — and deferral is the *retry*
+            // path, so whatever lands here is re-persisted onto the shared
+            // fleet index every backoff interval until the condition clears.
+            message: bounded_failure_line("deferred: ", code, message),
         };
         self.fleet.record_claim_failure(claim, &event).await?;
         pass.deferred += 1;
@@ -2098,6 +3408,10 @@ where
 
     /// Records one failed attempt against the outbox's aligned retry budget,
     /// delivering the generation's `Exhausted` word when the budget is spent.
+    ///
+    /// `reason` is the collaborator's own code, when a collaborator failed the
+    /// attempt; it rides the `Exhausted` word to the run's record and is
+    /// written nowhere else.
     #[allow(clippy::too_many_arguments)]
     async fn record_attempt_failure(
         &mut self,
@@ -2107,14 +3421,22 @@ where
         attempt: u32,
         code: &str,
         message: &str,
+        reason: Option<crate::failure::AgentFailureReason>,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
+        // Bounded once, here, so the outbox row, the fleet index entry, and
+        // the `Exhausted` word all carry the same bounded code and detail —
+        // and so does the line composed from them, which is the record the
+        // documented bound actually describes.
+        let code = bounded_failure_code(code);
+        let detail = bounded_failure_detail(message);
+        let line = bounded_failure_line("", &code, &detail);
         let mut inbox = self.inbox(scope);
         inbox.recover().await?;
         let event = inbox
             .inner_mut()
-            .record_outbox_failure(&message_id, format!("{code}: {message}"), false)
+            .record_outbox_failure(&message_id, line, false)
             .await
             .map_err(AgentInboxError::from)?;
         pass.failed_attempts += 1;
@@ -2129,10 +3451,7 @@ where
                 intent,
                 attempt,
                 claim.fencing_token,
-                AgentRunEffectOutcome::Exhausted {
-                    code: code.to_string(),
-                    message: message.to_string(),
-                },
+                AgentRunEffectOutcome::exhausted(code.to_string(), detail).with_reason(reason),
                 pass,
             )
             .await?;
@@ -2151,6 +3470,151 @@ where
     /// generation — identically because the attempt was refused upstream
     /// unless the current chain revision matches the one the intent pinned at
     /// commit.
+    /// The outcome the run receives for an executed tool or compensation,
+    /// once the `ToolResponse` boundary has reviewed the result.
+    ///
+    /// The review sits here — after execution, before the outcome exists —
+    /// because this is the last point at which the result is in memory and
+    /// nothing durable has recorded it: the attempt segment, the delivery,
+    /// the run's effect record, its session memory, and every later context
+    /// snapshot all lie downstream. A refusal becomes a determinate `Failed`
+    /// outcome under the refusal's stable code: the tool ran, its result is
+    /// not admissible, and the effect fails exactly as a blocked request
+    /// does — delivered once, never retried, so the target is never invoked
+    /// again to produce a result the chain would refuse again.
+    async fn reviewed_tool_outcome(
+        &self,
+        scope: &AgentRunScope,
+        intent: &AgentRunEffect,
+        tool: Option<&AgentToolId>,
+        call_id: AgentToolCallId,
+        content: AgentTaskContent,
+    ) -> AgentDispatchResult<AgentRunEffectOutcome> {
+        match self
+            .authority
+            .review_tool_response(scope, intent, tool, content)
+            .await?
+        {
+            AgentToolResponseDecision::Accepted(review) => {
+                for transform in &review.transforms {
+                    tracing::info!(
+                        effect_id = intent.effect_id.as_str(),
+                        generation = %intent.generation,
+                        stage = %transform.stage,
+                        stage_revision = %transform.revision,
+                        reason_code = %transform.reason_code,
+                        "guardrail transform applied to the tool response"
+                    );
+                }
+                for report in &review.reports {
+                    tracing::info!(
+                        effect_id = intent.effect_id.as_str(),
+                        generation = %intent.generation,
+                        stage = %report.stage,
+                        stage_revision = %report.revision,
+                        reason_code = %report.reason_code,
+                        evidence = report
+                            .evidence
+                            .as_ref()
+                            .map(|artifact| artifact.artifact_id.as_str()),
+                        "guardrail report-only finding on the tool response"
+                    );
+                }
+                Ok(AgentRunEffectOutcome::Tool {
+                    call_id,
+                    content: review.content,
+                })
+            }
+            AgentToolResponseDecision::Refused(refusal) => {
+                tracing::warn!(
+                    effect_id = intent.effect_id.as_str(),
+                    generation = %intent.generation,
+                    code = %refusal.code,
+                    "guardrail refused the tool response; the effect fails"
+                );
+                Ok(AgentRunEffectOutcome::failed(
+                    bounded_failure_code(&refusal.code),
+                    bounded_failure_detail(&refusal.message),
+                )
+                .with_reason(refusal.reason.clone()))
+            }
+        }
+    }
+
+    /// The outcome the run receives for a model call, once the
+    /// `ModelResponse` boundary has reviewed the turn.
+    ///
+    /// The review sits here — after the call, after `validate`, before the
+    /// outcome exists — for the reason [`Self::reviewed_tool_outcome`] sits
+    /// where it does: this is the last point at which the turn is only in
+    /// memory. A refusal becomes a determinate `Failed` outcome under the
+    /// refusal's stable code: the model answered, its answer is not
+    /// admissible, and the effect fails once, never retried.
+    ///
+    /// A response is always reviewed under the chain the authority *currently*
+    /// holds, never one pinned at commit time: the intent's
+    /// `guardrail_revision` pin is enforced for `Tool` requests only, because
+    /// the pin exists to keep a transformed *request* payload identical across
+    /// attempts of one generation — something a response review, which
+    /// transforms nothing the outside world has already seen, never needs. So
+    /// a chain upgraded while a run was parked reviews the next model response
+    /// under the new chain by construction, with no dedicated proof.
+    async fn reviewed_model_outcome(
+        &self,
+        scope: &AgentRunScope,
+        intent: &AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchResult<AgentRunEffectOutcome> {
+        match self
+            .authority
+            .review_model_response(scope, intent, turn)
+            .await?
+        {
+            AgentModelResponseDecision::Accepted(review) => {
+                for transform in &review.transforms {
+                    tracing::info!(
+                        effect_id = intent.effect_id.as_str(),
+                        generation = %intent.generation,
+                        stage = %transform.stage,
+                        stage_revision = %transform.revision,
+                        reason_code = %transform.reason_code,
+                        "guardrail transform applied to the model response"
+                    );
+                }
+                for report in &review.reports {
+                    tracing::info!(
+                        effect_id = intent.effect_id.as_str(),
+                        generation = %intent.generation,
+                        stage = %report.stage,
+                        stage_revision = %report.revision,
+                        reason_code = %report.reason_code,
+                        evidence = report
+                            .evidence
+                            .as_ref()
+                            .map(|artifact| artifact.artifact_id.as_str()),
+                        "guardrail report-only finding on the model response"
+                    );
+                }
+                Ok(AgentRunEffectOutcome::Model {
+                    turn: Box::new(review.turn),
+                })
+            }
+            AgentModelResponseDecision::Refused(refusal) => {
+                tracing::warn!(
+                    effect_id = intent.effect_id.as_str(),
+                    generation = %intent.generation,
+                    code = %refusal.code,
+                    "guardrail refused the model response; the effect fails"
+                );
+                Ok(AgentRunEffectOutcome::failed(
+                    bounded_failure_code(&refusal.code),
+                    bounded_failure_detail(&refusal.message),
+                )
+                .with_reason(refusal.reason.clone()))
+            }
+        }
+    }
+
     async fn invoke(
         &self,
         scope: &AgentRunScope,
@@ -2161,7 +3625,8 @@ where
         match &intent.request {
             AgentRunEffectRequest::Model { context, profile } => {
                 let mut request = AgentModelRequest::new(context.clone(), intent.turn)
-                    .with_settings_revision(granted.grant.settings_revision);
+                    .with_settings_revision(granted.grant.settings_revision)
+                    .with_telemetry(intent.telemetry.clone());
                 if let Some(sampling) = granted.sampling {
                     request = request.with_sampling(sampling);
                 }
@@ -2169,58 +3634,95 @@ where
                 if let Some(profile) = profile {
                     request = request.with_profile(profile);
                 }
-                let turn = self.model.call(&request).await.map_err(|error| {
-                    AgentDispatchError::Invocation {
-                        code: error.code(),
-                        message: error.to_string(),
-                    }
+                request = request.with_tools(granted.tools.clone());
+                // No `unwrap_or_default`: an unprofiled deployment has no
+                // model profile, and an empty string is not the name of one.
+                let model_profile = request
+                    .profile
+                    .as_ref()
+                    .map(|profile| profile.as_str().to_string());
+                let timer = AgentSegmentTimer::start(self.now());
+                let called = self.model.call_with(&request, credential).await;
+                let segment = timer.close(AgentSegmentOperation::ModelInference { model_profile });
+                self.close_segment(
+                    scope,
+                    &intent.telemetry,
+                    match &called {
+                        Ok(_) => segment.ok(),
+                        Err(error) => segment.failed("rakka.agent.model", error.code()),
+                    },
+                );
+                let turn = called.map_err(|error| AgentDispatchError::Invocation {
+                    code: error.code(),
+                    message: error.to_string(),
                 })?;
                 turn.validate()
                     .map_err(|error| AgentDispatchError::Invocation {
                         code: error.code(),
                         message: error.to_string(),
                     })?;
-                Ok(AgentRunEffectOutcome::Model {
-                    turn: Box::new(turn),
-                })
+                self.reviewed_model_outcome(scope, intent, turn).await
             }
             AgentRunEffectRequest::Tool { call } => {
                 let call: &AgentToolCallRequest = granted.tool_call.as_deref().unwrap_or(call);
-                let content = self.tools.execute(scope, intent, call, credential).await?;
-                Ok(AgentRunEffectOutcome::Tool {
-                    call_id: call.call_id.clone(),
+                // The tool name is a bounded class from the configured
+                // registry, which 17.6 permits in a span name; the call's
+                // arguments are not, and never leave the dispatch path.
+                let timer = AgentSegmentTimer::start(self.now());
+                let executed = self.tools.execute(scope, intent, call, credential).await;
+                let segment = timer.close(AgentSegmentOperation::ExecuteTool {
+                    tool_name: call.tool.as_str().to_string(),
+                });
+                self.close_segment(
+                    scope,
+                    &intent.telemetry,
+                    match &executed {
+                        Ok(_) => segment.ok(),
+                        Err(error) => segment.failed("rakka.agent.tool", error.code()),
+                    },
+                );
+                let content = executed?;
+                self.reviewed_tool_outcome(
+                    scope,
+                    intent,
+                    Some(&call.tool),
+                    call.call_id.clone(),
                     content,
-                })
+                )
+                .await
             }
             AgentRunEffectRequest::Compensation { compensation, .. } => {
                 let Some(executor) = self.compensations.as_ref() else {
                     // Fail closed, definitively: nothing was invoked, an absent
                     // executor will not appear mid-generation, and the run's
                     // wind-down settles truthfully on the failure.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "compensation-executor-missing".to_string(),
-                        message: "no compensation executor is configured for this dispatcher"
-                            .to_string(),
-                    });
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "compensation-executor-missing".to_string(),
+                        "no compensation executor is configured for this dispatcher".to_string(),
+                    ));
                 };
                 let content = executor
                     .execute(scope, intent, compensation, credential)
                     .await?;
-                Ok(AgentRunEffectOutcome::Tool {
-                    call_id: compensation_call_id(intent),
+                self.reviewed_tool_outcome(
+                    scope,
+                    intent,
+                    None,
+                    compensation_call_id(intent),
                     content,
-                })
+                )
+                .await
             }
             AgentRunEffectRequest::MemoryPromotion { promotion } => {
                 let Some(executor) = self.memory_promotions.as_ref() else {
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
                     // appear mid-generation.
-                    return Ok(AgentRunEffectOutcome::Failed {
-                        code: "memory-promotion-executor-missing".to_string(),
-                        message: "no memory-promotion executor is configured for this dispatcher"
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "memory-promotion-executor-missing".to_string(),
+                        "no memory-promotion executor is configured for this dispatcher"
                             .to_string(),
-                    });
+                    ));
                 };
                 let now = AgentTimestampMillis::new(self.clock.now().as_millis());
                 match executor.execute(scope, intent, promotion, now).await? {
@@ -2228,9 +3730,300 @@ where
                         Ok(AgentRunEffectOutcome::MemoryPromotion { promoted })
                     }
                     AgentMemoryPromotionFinding::Refused { code, message } => {
-                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                        Ok(AgentRunEffectOutcome::failed(code, message))
                     }
                 }
+            }
+            AgentRunEffectRequest::Evaluation { evaluation } => {
+                self.invoke_goal_evaluation(scope, intent, granted, evaluation, credential)
+                    .await
+            }
+            AgentRunEffectRequest::A2aSend { delegation } => {
+                let Some(executor) = self.a2a_sends.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "a2a-send-executor-missing".to_string(),
+                        "no A2A send executor is configured for this dispatcher".to_string(),
+                    ));
+                };
+                match executor
+                    .execute(scope, intent, delegation, credential)
+                    .await?
+                {
+                    AgentA2aSendFinding::Sent {
+                        child_task,
+                        child_run,
+                        peer_status,
+                    } => Ok(AgentRunEffectOutcome::A2aSend {
+                        receipt: crate::delegation::AgentA2aSendReceipt {
+                            delegation: delegation.delegation.clone(),
+                            child_task,
+                            child_run,
+                            peer_status,
+                        },
+                    }),
+                    AgentA2aSendFinding::Conflict { code, message } => {
+                        Ok(AgentRunEffectOutcome::failed(code, message))
+                    }
+                    AgentA2aSendFinding::Refused {
+                        code,
+                        message,
+                        reason,
+                    } => Ok(AgentRunEffectOutcome::failed(code, message).with_reason(reason)),
+                }
+            }
+            AgentRunEffectRequest::A2aHandoff { handoff } => {
+                let Some(executor) = self.a2a_handoffs.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "a2a-handoff-executor-missing".to_string(),
+                        "no A2A handoff executor is configured for this dispatcher".to_string(),
+                    ));
+                };
+                match executor.execute(scope, intent, handoff, credential).await? {
+                    AgentA2aHandoffFinding::Recorded {
+                        target_generation,
+                        peer_status,
+                    } => Ok(AgentRunEffectOutcome::A2aHandoff {
+                        receipt: crate::coordination::AgentA2aHandoffReceipt {
+                            handoff: handoff.handoff.clone(),
+                            target_generation,
+                            peer_status,
+                        },
+                    }),
+                    AgentA2aHandoffFinding::Conflict { code, message } => {
+                        Ok(AgentRunEffectOutcome::failed(code, message))
+                    }
+                    AgentA2aHandoffFinding::Refused {
+                        code,
+                        message,
+                        reason,
+                    } => Ok(AgentRunEffectOutcome::failed(code, message).with_reason(reason)),
+                }
+            }
+            AgentRunEffectRequest::WorkflowStart { invocation } => {
+                let Some(executor) = self.workflow_starts.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "workflow-start-executor-missing".to_string(),
+                        "no workflow start executor is configured for this dispatcher".to_string(),
+                    ));
+                };
+                match executor
+                    .execute(scope, intent, invocation, credential)
+                    .await?
+                {
+                    // The receipt derives from the record, never from the
+                    // acceptance: started and adopted outcomes are identical
+                    // apart from the flag, which is what keeps a replayed
+                    // start's outcome convergent.
+                    finding @ (AgentWorkflowStartFinding::Started
+                    | AgentWorkflowStartFinding::Adopted) => {
+                        Ok(AgentRunEffectOutcome::WorkflowStart {
+                            receipt: crate::workflow_tool::AgentWorkflowStartReceipt {
+                                invocation: invocation.invocation.clone(),
+                                child_run: invocation.child_run.clone(),
+                                adopted: matches!(finding, AgentWorkflowStartFinding::Adopted),
+                            },
+                        })
+                    }
+                    // Conflict-ness is normalized onto the canonical code
+                    // here, so the run entity's `Conflicted` settlement never
+                    // depends on an executor picking the right string.
+                    AgentWorkflowStartFinding::Conflict { code, message } => {
+                        Ok(AgentRunEffectOutcome::failed(
+                            crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                                .to_string(),
+                            format!("{code}: {message}"),
+                        ))
+                    }
+                    AgentWorkflowStartFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::failed(code, message))
+                    }
+                }
+            }
+            AgentRunEffectRequest::WorkflowCancel { invocation, reason } => {
+                let Some(executor) = self.workflow_cancels.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation. The parent's wind-down then
+                    // waits for the child's natural terminal result.
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "workflow-cancel-executor-missing".to_string(),
+                        "no workflow cancel executor is configured for this dispatcher".to_string(),
+                    ));
+                };
+                match executor
+                    .execute(scope, intent, invocation, reason, credential)
+                    .await?
+                {
+                    AgentWorkflowCancelFinding::Requested => {
+                        Ok(AgentRunEffectOutcome::WorkflowCancel {
+                            already_finished: false,
+                        })
+                    }
+                    AgentWorkflowCancelFinding::AlreadyFinished => {
+                        Ok(AgentRunEffectOutcome::WorkflowCancel {
+                            already_finished: true,
+                        })
+                    }
+                    AgentWorkflowCancelFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::failed(code, message))
+                    }
+                }
+            }
+            AgentRunEffectRequest::ClaimAppend { append, provenance } => {
+                let Some(executor) = self.claim_appends.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "claim-append-executor-missing".to_string(),
+                        "no claim-append executor is configured for this dispatcher".to_string(),
+                    ));
+                };
+                let now = AgentTimestampMillis::new(self.clock.now().as_millis());
+                match executor
+                    .execute(scope, intent, append, provenance, now)
+                    .await?
+                {
+                    AgentClaimAppendFinding::Appended { claim } => {
+                        Ok(AgentRunEffectOutcome::ClaimAppend { claim })
+                    }
+                    AgentClaimAppendFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::failed(code, message))
+                    }
+                }
+            }
+        }
+    }
+
+    /// The goal-evaluation arm of [`Self::invoke`]
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Human review never calls an executor: the effect-bound approval grant
+    /// the authority validated *is* the verdict, and the record it produces
+    /// names the resolver and carries the durable human decision as its
+    /// evidence. Every other method runs through the application-owned
+    /// executor, or fails closed definitively when none is configured. A
+    /// verification workflow fails closed until the evaluation cell is
+    /// bridged to the workflow-tool invocation path — defense in depth
+    /// behind the commit-time refusal.
+    async fn invoke_goal_evaluation(
+        &self,
+        scope: &AgentRunScope,
+        intent: &AgentRunEffect,
+        granted: &AgentGrantedDispatch,
+        evaluation: &crate::evaluation::AgentGoalEvaluationRequest,
+        credential: Option<&AgentEphemeralCredential>,
+    ) -> AgentDispatchResult<AgentRunEffectOutcome> {
+        use crate::evaluation::{
+            goal_evaluation_record_id, AgentGoalEvaluationMethod, AgentGoalEvaluationOutcome,
+            AgentGoalEvaluationRecord, AgentGoalEvidenceRef,
+        };
+
+        let now = AgentTimestampMillis::new(self.clock.now().as_millis());
+        let evaluation_id =
+            goal_evaluation_record_id(scope, intent.turn, intent.slot, intent.generation).map_err(
+                |error| AgentDispatchError::Invocation {
+                    code: "evaluation-identity-invalid",
+                    message: error.to_string(),
+                },
+            )?;
+        let build = |outcome: AgentGoalEvaluationOutcome,
+                     reason_code: String,
+                     evidence: Vec<AgentGoalEvidenceRef>,
+                     evaluated_by| {
+            AgentGoalEvaluationRecord::new(
+                evaluation_id.clone(),
+                evaluation.goal.clone(),
+                evaluation.evaluator.clone(),
+                evaluation.method.kind(),
+                evaluation.criteria_revision,
+                outcome,
+                reason_code,
+                evidence,
+                evaluated_by,
+                intent.effect_id.clone(),
+                intent.generation,
+                now,
+            )
+        };
+        let finding = match &evaluation.method {
+            AgentGoalEvaluationMethod::HumanReview => {
+                let Some(grant) = granted.checkpoint.as_deref() else {
+                    // The commit marked the effect checkpoint-required, so an
+                    // approved dispatch always carries its grant; an absent
+                    // one is a definitive wiring failure, never a retry.
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "evaluation-grant-missing".to_string(),
+                        "a human-review evaluation dispatched without its approval \
+                                  grant"
+                            .to_string(),
+                    ));
+                };
+                // The commit door reserved this slot, so the append always
+                // fits ([`AgentGoalEvaluationMethod::evidence_reserve`]).
+                let mut evidence = evaluation.evidence.clone();
+                evidence.push(AgentGoalEvidenceRef {
+                    class: crate::evaluation::AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS
+                        .to_string(),
+                    artifact: None,
+                    digest: Some(grant.argument_digest.clone()),
+                });
+                AgentGoalEvaluationFinding::Evaluated {
+                    outcome: AgentGoalEvaluationOutcome::Satisfied,
+                    reason_code: "human-approved".to_string(),
+                    evidence,
+                    evaluated_by: Some(grant.resolver.clone()),
+                }
+            }
+            AgentGoalEvaluationMethod::VerificationWorkflow { .. } => {
+                return Ok(AgentRunEffectOutcome::failed(
+                    "evaluation-workflow-deferred".to_string(),
+                    "a verification-workflow evaluation cannot execute until the \
+                              evaluation cell is bridged to the workflow-tool invocation path"
+                        .to_string(),
+                ));
+            }
+            _ => {
+                let Some(executor) = self.goal_evaluations.as_ref() else {
+                    return Ok(AgentRunEffectOutcome::failed(
+                        "evaluation-executor-missing".to_string(),
+                        "no goal-evaluation executor is configured for this dispatcher".to_string(),
+                    ));
+                };
+                executor
+                    .execute(scope, intent, evaluation, credential, now)
+                    .await?
+            }
+        };
+        match finding {
+            AgentGoalEvaluationFinding::Evaluated {
+                outcome,
+                reason_code,
+                evidence,
+                evaluated_by,
+            } => {
+                let record =
+                    build(outcome, reason_code, evidence, evaluated_by).map_err(|error| {
+                        AgentDispatchError::Invocation {
+                            code: "evaluation-record-invalid",
+                            message: error.to_string(),
+                        }
+                    })?;
+                Ok(AgentRunEffectOutcome::Evaluation {
+                    record: Box::new(record),
+                })
+            }
+            AgentGoalEvaluationFinding::Refused { code, message } => {
+                Ok(AgentRunEffectOutcome::failed(code, message))
             }
         }
     }
@@ -2252,10 +4045,14 @@ where
             intent,
             attempt,
             claim.fencing_token,
-            AgentRunEffectOutcome::Failed {
-                code: refusal.code.clone(),
-                message: refusal.message.clone(),
-            },
+            // The refusal is authored by an application-implemented
+            // [`AgentDispatchAuthority`], and this outcome is durable run
+            // state.
+            AgentRunEffectOutcome::failed(
+                bounded_failure_code(&refusal.code),
+                bounded_failure_detail(&refusal.message),
+            )
+            .with_reason(refusal.reason.clone()),
             pass,
         )
         .await?;
@@ -2319,17 +4116,21 @@ where
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<()> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
+        // One caller passes an application refusal's code straight through,
+        // and this reason is written to the durable outbox row and echoed on
+        // the fleet index.
+        let reason = bounded_failure_code(reason);
         let mut inbox = self.inbox(scope);
         inbox.recover().await?;
         let event = inbox
             .inner_mut()
-            .record_outbox_cancelled(&message_id, reason)
+            .record_outbox_cancelled(&message_id, reason.clone())
             .await
             .map_err(AgentInboxError::from)?
             .unwrap_or_else(|| WorkflowTelemetryEvent::OutboxDispatchCancelled {
                 message_id: message_id.clone(),
                 at: self.clock.now(),
-                message: reason.to_string(),
+                message: reason,
             });
         self.fleet.record_claim_failure(claim, &event).await?;
         pass.cancelled += 1;
@@ -2365,6 +4166,15 @@ where
         };
 
         for intent in loop_state.ready_effects() {
+            if intent.kind().exempt_from_wind_down_fence() {
+                // The compensation and workflow-cancel the wind-down itself
+                // authorized, and the promotion or claim append that copies
+                // work already recorded — including one accepted after the
+                // run ended — stay dispatchable; the ordinary flush and claim
+                // paths own them, and this sweep neither reads nor re-fences
+                // them on any later pass.
+                continue;
+            }
             let ticket_id = intent.dispatch_ticket_id();
             let message_id = OutboxMessageId::new(ticket_id.as_str());
             let mut inbox = self.inbox(scope);

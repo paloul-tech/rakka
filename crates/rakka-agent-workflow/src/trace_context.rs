@@ -6,9 +6,11 @@
 //! human-checkpoint contracts so applications can attach spans at their chosen
 //! telemetry boundary.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
@@ -315,10 +317,56 @@ pub fn agent_durable_resume_telemetry_context(
     let parked = require_agent_trace_context(context)?;
     let mut resumed = parked.child(resume_span_id)?.to_telemetry_context();
     resumed.baggage = context.baggage.clone();
+    // Bounded here, at the write. The returned context is persisted, and every
+    // span later built under it copies these links onto its export record —
+    // where one over-long or multi-line attribute makes the record fail
+    // validation for the life of the run. A caller cannot be relied on to know
+    // the export bound, so the boundary that accepts its attributes applies it.
     resumed
         .span_links
-        .push(parked.to_span_link(link_attributes));
+        .push(parked.to_span_link(crate::bounded_export_attributes(
+            link_attributes,
+            crate::AGENT_EXPORT_MAX_ATTRIBUTES,
+        )));
     Ok(resumed)
+}
+
+/// Derives the span id of a span that runs *inside* the given trace context.
+///
+/// A span built from a durable context must not reuse the context's own span
+/// id. The id in a `traceparent` names the span the context was propagated
+/// *from* — the caller's, on ingress, or the run's, on a resume — so reusing
+/// it makes every operation of a run collide on one id and impersonate that
+/// span. The context's id is the *parent*; this is the child.
+///
+/// The id is derived rather than drawn from a random source: Rakka installs no
+/// OpenTelemetry SDK and owns no RNG on this path, and an id that is a
+/// function of its inputs is one a test can assert on.
+///
+/// Two spans in one trace whose `material` is byte-identical therefore derive
+/// the same id and merge, so `material` must carry whatever tells one span
+/// from its siblings. Content is not always enough — a run can close two
+/// genuinely different operations with the same name, the same attributes and
+/// the same millisecond, and no content distinguishes them — so an emitter
+/// that can produce such a pair passes something that does.
+/// [`AgentOtelSpanExport::with_derived_span_id`](crate::AgentOtelSpanExport::with_derived_span_id)
+/// takes that extra material as an argument, and
+/// `AgentGenAiSpanExporter` passes its own emission ordinal, which is
+/// exactly the fact that two indistinguishable records are two records.
+#[must_use]
+pub fn agent_derived_span_id(trace_id: &str, parent_span_id: &str, material: &[&str]) -> String {
+    let mut hasher = DefaultHasher::new();
+    trace_id.hash(&mut hasher);
+    parent_span_id.hash(&mut hasher);
+    for part in material {
+        part.hash(&mut hasher);
+    }
+    let derived = hasher.finish();
+    // A span id of all zeros is invalid; the single input that would produce
+    // one is mapped rather than rejected, because a derivation that can fail
+    // would put a telemetry error on a path 17.1 requires to be infallible.
+    let derived = if derived == 0 { u64::MAX } else { derived };
+    format!("{derived:016x}")
 }
 
 /// Converts the durable telemetry envelope to a parsed trace context.

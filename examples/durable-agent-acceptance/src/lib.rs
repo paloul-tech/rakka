@@ -9,12 +9,18 @@
 //! in-process and deterministic: real `ClusterSharding` over all three
 //! entity types, the in-process A2A service core (no HTTP), the production
 //! effect dispatcher, and in-memory durable stores.
+//!
+//! `tests/provider_walk.rs` and `--provider` drive the same world through a
+//! real model provider instead, over an env-backed credential resolver; that
+//! walk is skipped unless `RAKKA_MODEL_PROFILE` is set (see `provider`).
 
 #![forbid(unsafe_code)]
 
 pub mod flow;
+pub mod provider;
 pub mod report;
 pub mod wiring;
 
 pub use flow::{run_acceptance, CONTENT_SENTINELS};
+pub use provider::{run_provider_walk, ProviderWalkReport};
 pub use report::AcceptanceReport;

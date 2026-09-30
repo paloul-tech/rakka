@@ -249,7 +249,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: rakka-agent-workflow
-          image: ghcr.io/rakka-rs/rakka-agent-workflow:0.1.0
+          image: ghcr.io/paloul-tech/rakka-agent-workflow:0.1.0
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

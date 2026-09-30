@@ -44,7 +44,39 @@ pub const CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 
 /// Current schema version of the durable [`crate::run::AgentRunState`].
-pub const CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+///
+/// Version 2 adds [`crate::run::AgentRun::terminal_at`], the clock short-term
+/// retention is measured from. The bump is what stops a rolling update from
+/// *erasing* it. Serde drops a field it does not know; a terminal run keeps
+/// accepting settlement and return commands, so an older peer would apply one
+/// and re-persist the record without the stamp; and the stamp is written
+/// exactly once, under an already-terminal guard, so nothing could ever put it
+/// back. Under the N/N+1 policy a version-1 binary fails closed on a version-2
+/// record instead, which is the whole point of versioning a durable shape.
+///
+/// A record created before the bump keeps saying version 1 until the run
+/// terminalizes, which is the transition that gives it the version-2 field;
+/// [`crate::run::AgentRunState`] upgrades its own stamp there. Until then both
+/// generations round-trip it losslessly, so a live run is never stalled by the
+/// bump.
+pub const CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(2);
+
+/// Current schema version of the durable [`crate::team::AgentTeamState`].
+pub const CURRENT_AGENT_TEAM_STATE_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted [`crate::team::AgentTeamHistoryEntry`].
+pub const CURRENT_AGENT_TEAM_HISTORY_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
+/// Current schema version of the durable
+/// [`crate::conversation::AgentConversationState`].
+pub const CURRENT_AGENT_CONVERSATION_STATE_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted
+/// [`crate::conversation::AgentConversationHistoryEntry`].
+pub const CURRENT_AGENT_CONVERSATION_HISTORY_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
 
 /// Current schema version of a persisted [`crate::loop_runtime::AgentLoopState`].
 ///
@@ -112,7 +144,13 @@ pub const CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION: StateSchemaVersion =
 /// A snapshot is immutable and content-addressed, and a model-effect retry reads
 /// it back long after it was assembled
 /// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md)), so it carries
-/// its own version rather than the run state's.
+/// its own version rather than the run state's. Slice 2.2 reshaped the
+/// private-selection field from bare identities to content-embedding
+/// selections without bumping this version, under the unreleased-branch rule
+/// the slice 1.7 amendment recorded: no released writer has ever persisted
+/// the earlier shape, and every record written so far carries an empty
+/// selection, which the reshaped field still loads. The first reshape after a
+/// release must bump it.
 pub const CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 
@@ -148,6 +186,46 @@ pub const CURRENT_AGENT_PRIVATE_MEMORY_SCHEMA_VERSION: StateSchemaVersion =
 /// earlier binary must still be interpretable on resolution, or fail closed
 /// ([specification 12.2](../../../docs/plans/rakka-agent/spec.md)).
 pub const CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted
+/// [`crate::wake::AgentWakePolicyRevision`].
+///
+/// A wake-policy revision outlives every wake constructed under it — a wake
+/// binds the policy revision in force at construction, and an operator reads
+/// that contract back long after the policy moved on — so it carries its own
+/// version rather than the goal or task state's, and fails closed on one this
+/// binary cannot read.
+pub const CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted
+/// [`crate::goal::AgentGoalSpecRevision`].
+///
+/// A goal-spec revision outlives every decision made under it — a terminal
+/// decision names the criteria revision it evaluated, and an operator reads
+/// that contract back long after the goal ended — so it carries its own
+/// version rather than the coordinating task state's, and fails closed on one
+/// this binary cannot read.
+pub const CURRENT_AGENT_GOAL_SPEC_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted
+/// [`crate::evaluation::AgentGoalEvaluationRecord`].
+///
+/// An evaluation record outlives the transition that produced it — it crosses
+/// the goal-evaluation exchange, and the terminal decision derived from it is
+/// read back long after the run that held it ended — so it carries its own
+/// version rather than the run state's, and fails closed on one this binary
+/// cannot read.
+pub const CURRENT_AGENT_GOAL_EVALUATION_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
+/// Current schema version of the persisted
+/// [`crate::wake_timers::AgentWakeTimerStoreState`].
+///
+/// The wake-timer store is the shared scanner's durable index of parked
+/// occurrences. It is scanned by whichever pod hosts a scanner, so it
+/// versions independently of any entity's state and fails closed on a record
+/// this binary cannot read.
+pub const CURRENT_AGENT_WAKE_TIMER_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
 
 /// Result type for schema compatibility checks.
 pub type AgentSchemaResult<T> = Result<T, AgentSchemaError>;
@@ -205,11 +283,29 @@ pub enum AgentRecordKind {
     DecisionEvent,
     /// One agent-private long-term memory, scoped `(TenantId, AgentId)`.
     PrivateMemory,
+    /// One accepted revision of a continuous goal's wake policy.
+    WakePolicyRevision,
+    /// The shared scanner's durable index of parked wake occurrences.
+    WakeTimerState,
+    /// One accepted revision of a goal's spec.
+    GoalSpec,
+    /// One completed goal evaluation.
+    GoalEvaluation,
+    /// Durable state of the sharded team entity, whose shared task board it
+    /// holds.
+    TeamState,
+    /// One append-only team history entry.
+    TeamHistoryEntry,
+    /// Durable state of the sharded moderated-conversation entity, whose
+    /// ordered turn protocol it holds.
+    ConversationState,
+    /// One append-only conversation history entry.
+    ConversationHistoryEntry,
 }
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 29] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -231,6 +327,14 @@ impl AgentRecordKind {
         Self::MemoryContextSnapshot,
         Self::DecisionEvent,
         Self::PrivateMemory,
+        Self::WakePolicyRevision,
+        Self::WakeTimerState,
+        Self::GoalSpec,
+        Self::GoalEvaluation,
+        Self::TeamState,
+        Self::TeamHistoryEntry,
+        Self::ConversationState,
+        Self::ConversationHistoryEntry,
     ];
 
     /// Stable kebab-case label for errors, logs, and metrics.
@@ -258,6 +362,14 @@ impl AgentRecordKind {
             Self::MemoryContextSnapshot => "agent-memory-context-snapshot",
             Self::DecisionEvent => "agent-decision-event",
             Self::PrivateMemory => "agent-private-memory",
+            Self::WakePolicyRevision => "agent-wake-policy-revision",
+            Self::WakeTimerState => "agent-wake-timer-state",
+            Self::GoalSpec => "agent-goal-spec",
+            Self::GoalEvaluation => "agent-goal-evaluation",
+            Self::TeamState => "agent-team-state",
+            Self::TeamHistoryEntry => "agent-team-history-entry",
+            Self::ConversationState => "agent-conversation-state",
+            Self::ConversationHistoryEntry => "agent-conversation-history-entry",
         }
     }
 
@@ -286,6 +398,14 @@ impl AgentRecordKind {
             Self::MemoryContextSnapshot => CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
             Self::DecisionEvent => CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION,
             Self::PrivateMemory => CURRENT_AGENT_PRIVATE_MEMORY_SCHEMA_VERSION,
+            Self::WakePolicyRevision => CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION,
+            Self::WakeTimerState => CURRENT_AGENT_WAKE_TIMER_SCHEMA_VERSION,
+            Self::GoalSpec => CURRENT_AGENT_GOAL_SPEC_SCHEMA_VERSION,
+            Self::GoalEvaluation => CURRENT_AGENT_GOAL_EVALUATION_SCHEMA_VERSION,
+            Self::TeamState => CURRENT_AGENT_TEAM_STATE_SCHEMA_VERSION,
+            Self::TeamHistoryEntry => CURRENT_AGENT_TEAM_HISTORY_SCHEMA_VERSION,
+            Self::ConversationState => CURRENT_AGENT_CONVERSATION_STATE_SCHEMA_VERSION,
+            Self::ConversationHistoryEntry => CURRENT_AGENT_CONVERSATION_HISTORY_SCHEMA_VERSION,
         }
     }
 
@@ -312,6 +432,14 @@ impl AgentRecordKind {
             Self::MemoryContextSnapshot => 18,
             Self::DecisionEvent => 19,
             Self::PrivateMemory => 20,
+            Self::WakePolicyRevision => 21,
+            Self::WakeTimerState => 22,
+            Self::GoalSpec => 23,
+            Self::GoalEvaluation => 24,
+            Self::TeamState => 25,
+            Self::TeamHistoryEntry => 26,
+            Self::ConversationState => 27,
+            Self::ConversationHistoryEntry => 28,
         }
     }
 }

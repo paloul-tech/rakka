@@ -14,10 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
-    validate_agent_telemetry_context, AgentAttributes, AgentAuditEvent, AgentAuditEventId,
-    AgentAuditEventKind, AgentCorrelationId, AgentRunId, AgentTelemetryContext,
+    bounded_export_attributes, validate_agent_telemetry_context, AgentAttributes, AgentAuditEvent,
+    AgentAuditEventId, AgentAuditEventKind, AgentCorrelationId, AgentRunId, AgentTelemetryContext,
     AgentTimestampMillis, AgentTraceContext, AgentTraceError, AgentWorkflowId, ArtifactRef,
-    RedactionStatus, CRATE_NAME,
+    RedactionStatus, AGENT_EXPORT_MAX_ATTRIBUTES, CRATE_NAME,
 };
 
 /// Default instrumentation scope for agent workflow log events.
@@ -676,6 +676,14 @@ pub fn agent_audit_log_event_name(kind: AgentAuditEventKind) -> String {
     )
 }
 
+/// How many correlation attributes [`agent_log_event_from_audit_event`] adds of
+/// its own: eight always, and up to five more when the audit event carries the
+/// optional identities.
+///
+/// Reserved out of the export bound so an application's own attributes can
+/// never crowd out the identities the log record exists to carry.
+const AGENT_AUDIT_LOG_CORRELATION_ATTRIBUTES: usize = 13;
+
 /// Builds a structured log event from a durable audit event.
 pub fn agent_log_event_from_audit_event(
     audit_event: &AgentAuditEvent,
@@ -698,7 +706,22 @@ pub fn agent_log_event_from_audit_event(
     }));
 
     event.artifact_refs = audit_event.artifact_refs.clone();
-    event.attributes = audit_event.attributes.clone();
+    // Bounded on the way out, not refused on the way in. A durable audit event
+    // bounds no attribute value and counts no attributes — by design, since
+    // 17.1 makes telemetry never a correctness input and an audit write must
+    // not fail over what a log record could carry. Copying them verbatim
+    // therefore let an event already in the store derive a log record that
+    // `validate_agent_log_event` refuses, permanently. What cannot be exported
+    // is dropped here instead; the durable audit event keeps all of it.
+    //
+    // The reserve is the point of the arithmetic: the correlation identities
+    // `add_audit_attributes` writes are the ones 17.13 asks a structured log to
+    // carry, so they must never be the attributes an over-full application set
+    // crowds out.
+    event.attributes = bounded_export_attributes(
+        audit_event.attributes.clone(),
+        AGENT_EXPORT_MAX_ATTRIBUTES.saturating_sub(AGENT_AUDIT_LOG_CORRELATION_ATTRIBUTES),
+    );
     add_audit_attributes(&mut event.attributes, audit_event);
     Ok(event)
 }
@@ -728,6 +751,23 @@ pub fn validate_agent_log_event(
     }
     validate_log_trace_fields(event)?;
     validate_log_redaction(event, redaction_policy)?;
+    // The log record's attribute set had no guard at all, which made it the
+    // one export surface where an unbounded or multi-line value could ride
+    // out under a well-formed record. These are generic bounds, not a
+    // redaction policy: which keys a log may carry is the emitting domain's
+    // decision, made before the record is built.
+    crate::otlp::validate_export_attributes("log.attributes", &event.attributes).map_err(|_| {
+        AgentAuditError::InvalidLogEvent {
+            field: "attributes",
+            reason: "must be bounded, single-line, and non-blank keyed",
+        }
+    })?;
+    crate::otlp::validate_export_attributes("log.resource", &event.resource).map_err(|_| {
+        AgentAuditError::InvalidLogEvent {
+            field: "resource",
+            reason: "must be bounded, single-line, and non-blank keyed",
+        }
+    })?;
     Ok(())
 }
 

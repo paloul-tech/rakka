@@ -35,6 +35,9 @@ impl CounterGrpc {
         }
     }
 
+    // `tonic::Status` is the protocol's error type the generated service
+    // trait answers with, so the helper's error is not ours to box.
+    #[allow(clippy::result_large_err)]
     async fn apply(
         &self,
         operation: CounterOperation,
