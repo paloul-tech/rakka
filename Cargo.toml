@@ -59,7 +59,7 @@ repository = "https://github.com/rakka-rs/rakka"
 homepage = "https://github.com/rakka-rs/rakka"
 documentation = "https://docs.rs/rakka"
 readme = "README.md"
-license-file = "LICENSE"
+license = "MIT"
 
 [workspace.dependencies]
 # The A2A SDK crates, imported under the short names `a2a` and `a2a-server`.

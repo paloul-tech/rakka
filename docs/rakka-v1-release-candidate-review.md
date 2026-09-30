@@ -17,7 +17,6 @@ Expected required results:
 
 - `scripts/validate.sh` exits `0` after format, clippy, workspace tests, minimal feature checks, docs, and Kubernetes dry-run validation.
 - `scripts/package-check.sh` exits `0` while using Cargo offline mode only.
-- Cargo may warn that manifests have no license metadata. That warning is expected until the repository declares a license.
 - No command publishes crates, pushes images, creates releases, or uploads artifacts.
 
 Last local V1J verification on June 10, 2026:
@@ -83,9 +82,9 @@ Historical and active implementation plans live under `docs/plans/`.
 - Reliability boundaries document at-most-once actor delivery and opt-in workflow reliability.
 - Security docs state the trusted-cluster remoting boundary.
 - Release packaging docs state offline-only package checks and the no-publishing policy.
-- Known limitations include missing repository license declaration.
+- Known limitations record the MIT license declaration and state that it is not permission to publish.
 - Changelog contains release-candidate notes and validation expectations.
 
 ## Release Candidate Decision
 
-After review, the remaining decision is not technical packaging readiness alone. A public release also needs an explicit repository license, contribution policy, and a user-approved publishing action.
+After review, the remaining decision is not technical packaging readiness alone. The repository license is declared (MIT); a public release also needs a contribution policy and a user-approved publishing action.

@@ -164,6 +164,16 @@ fn publishable_crates_have_release_metadata_and_versioned_internal_deps() {
             manifest.contains("description.workspace = true"),
             "{manifest_path} should inherit workspace description"
         );
+        assert!(
+            manifest.contains("license.workspace = true"),
+            "{manifest_path} should inherit the workspace license"
+        );
+        assert!(
+            repo_root()
+                .join(format!("crates/{crate_name}/LICENSE"))
+                .is_file(),
+            "crates/{crate_name}/LICENSE should resolve to the root license so the packaged crate carries it"
+        );
 
         for line in manifest
             .lines()
@@ -314,6 +324,8 @@ fn release_docs_and_ignore_rules_are_present() {
 
     let root_manifest = read("Cargo.toml");
     assert!(root_manifest.contains("rust-version = "));
+    assert!(root_manifest.contains("license = \"MIT\""));
+    assert!(read("LICENSE").starts_with("MIT License"));
     assert!(root_manifest.contains("description = "));
 
     let release_docs = read("docs/rakka-v1-release-packaging.md");
