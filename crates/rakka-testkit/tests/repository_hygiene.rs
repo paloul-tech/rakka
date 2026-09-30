@@ -468,7 +468,11 @@ fn relative_links(relative: &str) -> Vec<(String, PathBuf)> {
 
 #[test]
 fn documentation_relative_links_resolve() {
-    let mut documents = vec!["README.md".to_string(), "examples/README.md".to_string()];
+    let mut documents = vec![
+        "README.md".to_string(),
+        "CONTRIBUTING.md".to_string(),
+        "examples/README.md".to_string(),
+    ];
     let mut docs: Vec<String> = fs::read_dir(repo_root().join("docs"))
         .expect("docs/ is readable")
         .map(|entry| entry.expect("a directory entry is readable").path())

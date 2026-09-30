@@ -156,17 +156,14 @@ for advanced wiring.
 
 ## Contributing
 
-Before you open a pull request, run the full validation suite: formatting, clippy with
-`-D warnings`, workspace tests, docs, and Kubernetes dry-runs:
+Contributions are welcome! [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the gated
+tests, and the conventions the codebase follows. Before you open a pull request, run
+the validation suite:
 
 ```sh
 scripts/validate.sh
 scripts/package-check.sh   # offline packaging check; never publishes
 ```
-
-Tests that need PostgreSQL, etcd, or a live Kubernetes cluster are gated behind
-environment variables. Each crate's tests document the variables they use. Changes are
-recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
