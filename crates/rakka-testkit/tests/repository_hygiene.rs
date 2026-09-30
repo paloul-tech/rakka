@@ -325,6 +325,7 @@ fn release_docs_and_ignore_rules_are_present() {
     let root_manifest = read("Cargo.toml");
     assert!(root_manifest.contains("rust-version = "));
     assert!(root_manifest.contains("license = \"MIT\""));
+    assert!(root_manifest.contains("repository = \"https://github.com/paloul-tech/rakka\""));
     assert!(read("LICENSE").starts_with("MIT License"));
     assert!(root_manifest.contains("description = "));
 

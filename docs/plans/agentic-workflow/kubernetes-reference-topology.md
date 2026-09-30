@@ -22,7 +22,7 @@ Helm-style templates later.
   `http://rakka-otel-collector.rakka-system.svc.cluster.local:4317`, backed by
   the gateway Collector in `kubernetes-otel-collector-topology.md`.
 - Default app image placeholder:
-  `ghcr.io/rakka-rs/rakka-agent-workflow:0.1.0`.
+  `ghcr.io/paloul-tech/rakka-agent-workflow:0.1.0`.
 
 ## Resource Shape
 

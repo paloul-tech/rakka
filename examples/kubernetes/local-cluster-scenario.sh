@@ -5,7 +5,7 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 MANIFEST="$ROOT_DIR/examples/kubernetes/rakka-node.yaml"
 NAMESPACE="${RAKKA_K8S_NAMESPACE:-rakka-system}"
 STATEFULSET="${RAKKA_K8S_STATEFULSET:-rakka-node}"
-IMAGE="${RAKKA_K8S_IMAGE:-ghcr.io/rakka-rs/rakka-node:0.1.0}"
+IMAGE="${RAKKA_K8S_IMAGE:-ghcr.io/paloul-tech/rakka-node:0.1.0}"
 NEXT_IMAGE="${RAKKA_K8S_NEXT_IMAGE:-}"
 TIMEOUT="${RAKKA_K8S_TIMEOUT:-180s}"
 DRY_RUN="${RAKKA_K8S_SCENARIO_DRY_RUN:-0}"
@@ -124,7 +124,7 @@ command -v kubectl >/dev/null 2>&1 || {
 TMP_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/rakka-k8s.XXXXXX.yaml")"
 trap 'rm -f "$TMP_MANIFEST"' EXIT
 
-sed "s#ghcr.io/rakka-rs/rakka-node:0.1.0#$IMAGE#g" "$MANIFEST" > "$TMP_MANIFEST"
+sed "s#ghcr.io/paloul-tech/rakka-node:0.1.0#$IMAGE#g" "$MANIFEST" > "$TMP_MANIFEST"
 
 kubectl apply -f "$TMP_MANIFEST"
 wait_ready
