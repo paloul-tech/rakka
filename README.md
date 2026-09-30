@@ -111,7 +111,7 @@ Every example runs from the workspace root with no external services unless note
 | `cargo run -p rakka-example-edge-gateway` | HTTP and gRPC in front of actors |
 | `cargo run -p rakka-example-durable-agent-acceptance` | A durable agent run from start to finish |
 
-See [`examples/`](examples/) for the rest, including Kubernetes and a multi-pod fault soak.
+The [examples index](examples/README.md) lists every example and how to run it, including the Kubernetes checks and a multi-pod fault soak.
 
 ## How delivery works
 

@@ -468,7 +468,7 @@ fn relative_links(relative: &str) -> Vec<(String, PathBuf)> {
 
 #[test]
 fn documentation_relative_links_resolve() {
-    let mut documents = vec!["README.md".to_string()];
+    let mut documents = vec!["README.md".to_string(), "examples/README.md".to_string()];
     let mut docs: Vec<String> = fs::read_dir(repo_root().join("docs"))
         .expect("docs/ is readable")
         .map(|entry| entry.expect("a directory entry is readable").path())
@@ -522,4 +522,26 @@ fn readme_links_the_agent_documentation_set() {
             );
         }
     }
+}
+
+#[test]
+fn examples_index_names_every_example_package() {
+    let index = read("examples/README.md");
+    let mut checked = 0;
+    for entry in fs::read_dir(repo_root().join("examples")).expect("examples/ is readable") {
+        let directory = entry.expect("a directory entry is readable").path();
+        if !directory.join("Cargo.toml").is_file() {
+            continue;
+        }
+        let name = directory.file_name().unwrap().to_string_lossy();
+        checked += 1;
+        assert!(
+            index.contains(&format!("| [`rakka-example-{name}`](")),
+            "examples/README.md has no index row for rakka-example-{name}"
+        );
+    }
+    assert!(
+        checked > 0,
+        "the example scan found nothing, so nothing is checked"
+    );
 }
