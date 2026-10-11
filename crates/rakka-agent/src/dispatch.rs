@@ -100,7 +100,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use rakka_agent_workflow::substrate::{
-    OutboxMessageId, OutboxStatus, RetryPolicy, WorkflowClock, WorkflowState,
+    OutboxCommand, OutboxMessageId, OutboxStatus, RetryPolicy, WorkflowClock, WorkflowState,
     WorkflowTelemetryEvent,
 };
 use rakka_agent_workflow::{
@@ -109,6 +109,7 @@ use rakka_agent_workflow::{
     AgentEphemeralCredential, AgentInboxError, AgentOutboxError, AgentRunId as WorkflowRunId,
     AgentRunInbox, AgentTelemetryContext, AgentTimestampMillis, PrincipalRef,
 };
+use rakka_core::{MetricsRecorder, NoopMetricsRecorder};
 use rakka_persistence::DurableStateStore;
 
 use crate::agent::{load_agent_entity_state, AgentEntityError, AgentEntityState};
@@ -133,9 +134,10 @@ use crate::model::{
     AgentToolCallId, AgentToolCallRequest,
 };
 use crate::observability::{
-    agent_linked_telemetry_context, agent_span_link, AgentSegmentOperation, AgentSegmentTimer,
-    LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_RECONCILIATION_DECISION, SEGMENT_ATTR_EFFECT_ATTEMPT,
-    SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_SETTINGS_REVISION,
+    agent_linked_telemetry_context, agent_span_link, record_agent_domain_counter,
+    AgentSegmentOperation, AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT,
+    LINK_KIND_RECONCILIATION_DECISION, SEGMENT_ATTR_EFFECT_ATTEMPT, SEGMENT_ATTR_EFFECT_STATUS,
+    SEGMENT_ATTR_SETTINGS_REVISION,
 };
 use crate::run::{
     load_agent_run_state, AgentRun, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError,
@@ -351,19 +353,7 @@ where
             );
             inbox.recover().await.map_err(sink_error)?;
 
-            let mut command = agent_effect_to_outbox_command(effect).map_err(sink_error)?;
-            let max_attempts = effect
-                .target
-                .attributes
-                .get(crate::effect::ATTR_AGENT_EFFECT_MAX_ATTEMPTS)
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(1)
-                .max(1);
-            command = command.retry_policy(RetryPolicy::new(
-                max_attempts,
-                self.retry_backoff_ms,
-                self.retry_backoff_ms.max(1),
-            ));
+            let command = ticket_outbox_command(effect, self.retry_backoff_ms)?;
 
             // Scheduling deduplicates on the ticket id, so a re-driven flush —
             // or two owners racing across a shard movement — lands one row.
@@ -379,6 +369,75 @@ where
             Ok(())
         })
     }
+}
+
+/// How many times one of the dispatcher's own inbox writes is re-read and
+/// re-applied after losing its compare-and-set before the pass gives up
+/// ([`AgentRunEffectDispatcher::write_outbox`]).
+const INBOX_WRITE_REAPPLICATIONS: u32 = 3;
+
+/// One of the dispatcher's own writes to a run's inbox store.
+///
+/// Each names what to write, never the record it is written against, so a
+/// write that lost its compare-and-set is recomputed from the record it is
+/// re-applied to.
+enum InboxWrite<'a> {
+    /// A ticket scheduled into the outbox: the wind-down fence's tombstone.
+    Scheduled(&'a OutboxCommand),
+    /// The durable `Dispatching` mark, before an invocation.
+    Dispatching,
+    /// The success record, after a result was delivered or reconciled.
+    Succeeded,
+    /// A failed attempt's record.
+    Failed {
+        /// The bounded failure line the row keeps.
+        line: &'a str,
+        /// Whether the attempt timed out.
+        timed_out: bool,
+    },
+    /// A ticket's settlement as cancelled.
+    Cancelled {
+        /// The bounded settle reason.
+        reason: &'a str,
+    },
+}
+
+impl InboxWrite<'_> {
+    /// The write's label on
+    /// [`crate::observability::METRIC_AGENT_DISPATCH_WRITE_RETRIES`].
+    const fn operation(&self) -> &'static str {
+        match self {
+            Self::Scheduled(_) => "scheduled",
+            Self::Dispatching => "dispatching",
+            Self::Succeeded => "succeeded",
+            Self::Failed { .. } => "failed",
+            Self::Cancelled { .. } => "cancelled",
+        }
+    }
+}
+
+/// The outbox command one dispatch ticket schedules: the ticket, under the
+/// retry policy its intent declared.
+///
+/// The sink's flush and the wind-down fence's tombstone both schedule a
+/// ticket, and they must schedule the same row.
+fn ticket_outbox_command(
+    effect: &AgentEffect,
+    retry_backoff_ms: u64,
+) -> Result<OutboxCommand, AgentEffectError> {
+    let command = agent_effect_to_outbox_command(effect).map_err(sink_error)?;
+    let max_attempts = effect
+        .target
+        .attributes
+        .get(crate::effect::ATTR_AGENT_EFFECT_MAX_ATTEMPTS)
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    Ok(command.retry_policy(RetryPolicy::new(
+        max_attempts,
+        retry_backoff_ms,
+        retry_backoff_ms.max(1),
+    )))
 }
 
 fn sink_error(error: impl Display) -> AgentEffectError {
@@ -2012,6 +2071,7 @@ where
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
     segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
+    metrics: Arc<dyn MetricsRecorder>,
 }
 
 impl<Flow, Fleet, Runs, Clock> AgentRunEffectDispatcher<Flow, Fleet, Runs, Clock>
@@ -2079,6 +2139,7 @@ where
             delivery,
             probe: None,
             segments: None,
+            metrics: Arc::new(NoopMetricsRecorder),
         }
     }
 
@@ -2302,6 +2363,15 @@ where
         self
     }
 
+    /// Records the dispatcher's own metrics
+    /// ([`crate::observability::METRIC_AGENT_DISPATCH_WRITE_RETRIES`]) into
+    /// `metrics`. Without it they are recorded nowhere.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Closes one segment into the wired sink, attaching the run's identity
     /// and the trace context the effect carried across the durable boundary.
     fn close_segment(
@@ -2333,6 +2403,85 @@ where
             self.workflow_store.clone(),
             self.clock.clone(),
         )
+    }
+
+    /// Applies one of the dispatcher's own writes to a run's inbox store,
+    /// re-reading and re-applying it when it loses the store's
+    /// compare-and-set.
+    ///
+    /// The store has a second writer in production — anything that schedules
+    /// an effect into a live run — so a write the dispatcher computed from
+    /// the record it just recovered can meet a revision that moved
+    /// microseconds later. Re-applying the same write against that stale
+    /// revision would lose again by construction, so every attempt recovers
+    /// first and the substrate recomputes the write from the record it is
+    /// applied to. A write that loses [`INBOX_WRITE_REAPPLICATIONS`] more
+    /// times fails the pass exactly as an unretried one did, and the claim's
+    /// lease carries the ticket: this is a convergence aid, never the fence.
+    ///
+    /// Only a lost compare-and-set is retried, recognized by its stable code
+    /// (`revision-conflict`) rather than by the error's shape, so it is
+    /// caught under whichever wrapper carries it. A store outage, a codec
+    /// fault, or an unrecovered record is a different answer, and asking
+    /// again would only ask it again. Each re-application counts once on
+    /// [`crate::observability::METRIC_AGENT_DISPATCH_WRITE_RETRIES`].
+    ///
+    /// Answers the substrate's telemetry event, where the write produces one.
+    async fn write_outbox(
+        &self,
+        scope: &AgentRunScope,
+        message_id: &OutboxMessageId,
+        write: InboxWrite<'_>,
+    ) -> AgentDispatchResult<Option<WorkflowTelemetryEvent>> {
+        let mut reapplied = 0;
+        loop {
+            let mut inbox = self.inbox(scope);
+            inbox.recover().await?;
+            let written = match &write {
+                InboxWrite::Scheduled(command) => inbox
+                    .inner_mut()
+                    .schedule_outbox((*command).clone())
+                    .await
+                    .map(|_| None),
+                InboxWrite::Dispatching => inbox
+                    .inner_mut()
+                    .mark_outbox_dispatching(message_id)
+                    .await
+                    .map(|_| None),
+                InboxWrite::Succeeded => inbox
+                    .inner_mut()
+                    .record_outbox_success(message_id)
+                    .await
+                    .map(Some),
+                InboxWrite::Failed { line, timed_out } => inbox
+                    .inner_mut()
+                    .record_outbox_failure(message_id, *line, *timed_out)
+                    .await
+                    .map(Some),
+                InboxWrite::Cancelled { reason } => {
+                    inbox
+                        .inner_mut()
+                        .record_outbox_cancelled(message_id, *reason)
+                        .await
+                }
+            };
+            match written.map_err(AgentInboxError::from) {
+                Err(error)
+                    if error.code() == "revision-conflict"
+                        && reapplied < INBOX_WRITE_REAPPLICATIONS =>
+                {
+                    reapplied += 1;
+                    record_agent_domain_counter(
+                        self.metrics.as_ref(),
+                        crate::observability::METRIC_AGENT_DISPATCH_WRITE_RETRIES,
+                        1,
+                        &[("operation", write.operation())],
+                    )
+                    .ok();
+                }
+                written => return Ok(written?),
+            }
+        }
     }
 
     /// The dispatcher's own clock, as an agent-domain timestamp.
@@ -2736,13 +2885,8 @@ where
         // Durable `Started`: the outbox row turns `Dispatching` under the
         // claim's lease and fence, before any external call
         // ([specification 11.4]).
-        let mut inbox = self.inbox(scope);
-        inbox.recover().await?;
-        inbox
-            .inner_mut()
-            .mark_outbox_dispatching(&message_id)
-            .await
-            .map_err(AgentInboxError::from)?;
+        self.write_outbox(scope, &message_id, InboxWrite::Dispatching)
+            .await?;
 
         if !self.survives(AgentDispatchWindow::AfterStarted) {
             return Ok(ClaimConclusion::Died);
@@ -2933,13 +3077,8 @@ where
             return Ok(ClaimConclusion::Died);
         }
 
-        let mut inbox = self.inbox(scope);
-        inbox.recover().await?;
-        inbox
-            .inner_mut()
-            .record_outbox_success(&message_id)
-            .await
-            .map_err(AgentInboxError::from)?;
+        self.write_outbox(scope, &message_id, InboxWrite::Succeeded)
+            .await?;
         self.fleet.complete_claim(&claim).await?;
         Ok(ClaimConclusion::Settled)
     }
@@ -3034,13 +3173,17 @@ where
     ) -> AgentDispatchResult<ClaimConclusion> {
         let timer = AgentSegmentTimer::start(self.now());
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
-        let mut inbox = self.inbox(scope);
-        inbox.recover().await?;
-        let event = inbox
-            .inner_mut()
-            .record_outbox_failure(&message_id, "dispatcher lost after started", true)
-            .await
-            .map_err(AgentInboxError::from)?;
+        let event = self
+            .write_outbox(
+                scope,
+                &message_id,
+                InboxWrite::Failed {
+                    line: "dispatcher lost after started",
+                    timed_out: true,
+                },
+            )
+            .await?
+            .expect("a failure record answers its event");
         pass.failed_attempts += 1;
 
         if let WorkflowTelemetryEvent::OutboxDispatchExhausted { attempts, .. } = &event {
@@ -3140,13 +3283,8 @@ where
                 self.deliver_outcome(scope, intent, attempt, claim.fencing_token, *outcome, pass)
                     .await?;
                 let message_id = OutboxMessageId::new(claim.effect_id.as_str());
-                let mut inbox = self.inbox(scope);
-                inbox.recover().await?;
-                inbox
-                    .inner_mut()
-                    .record_outbox_success(&message_id)
-                    .await
-                    .map_err(AgentInboxError::from)?;
+                self.write_outbox(scope, &message_id, InboxWrite::Succeeded)
+                    .await?;
                 self.fleet.complete_claim(&claim).await?;
                 Ok(ClaimConclusion::Settled)
             }
@@ -3194,13 +3332,17 @@ where
                 // later claim queries the protocol again rather than
                 // invoking; a spent budget parks the generation.
                 let message_id = OutboxMessageId::new(claim.effect_id.as_str());
-                let mut inbox = self.inbox(scope);
-                inbox.recover().await?;
-                let event = inbox
-                    .inner_mut()
-                    .record_outbox_failure(&message_id, "reconciliation outcome unknown", true)
-                    .await
-                    .map_err(AgentInboxError::from)?;
+                let event = self
+                    .write_outbox(
+                        scope,
+                        &message_id,
+                        InboxWrite::Failed {
+                            line: "reconciliation outcome unknown",
+                            timed_out: true,
+                        },
+                    )
+                    .await?
+                    .expect("a failure record answers its event");
                 pass.failed_attempts += 1;
                 if matches!(
                     event,
@@ -3430,13 +3572,17 @@ where
         let code = bounded_failure_code(code);
         let detail = bounded_failure_detail(message);
         let line = bounded_failure_line("", &code, &detail);
-        let mut inbox = self.inbox(scope);
-        inbox.recover().await?;
-        let event = inbox
-            .inner_mut()
-            .record_outbox_failure(&message_id, line, false)
-            .await
-            .map_err(AgentInboxError::from)?;
+        let event = self
+            .write_outbox(
+                scope,
+                &message_id,
+                InboxWrite::Failed {
+                    line: &line,
+                    timed_out: false,
+                },
+            )
+            .await?
+            .expect("a failure record answers its event");
         pass.failed_attempts += 1;
         self.fleet.record_claim_failure(claim, &event).await?;
 
@@ -4115,16 +4261,17 @@ where
     ) -> AgentDispatchResult<()> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
         // One caller passes an application refusal's code straight through,
-        // and this reason is written to the durable outbox row and echoed on
-        // the fleet index.
+        // so the reason is bounded here. The outbox row stores only the
+        // cancelled status; the reason rides the substrate's event to the
+        // fleet index entry, whose `last_error_code` is where it is durable.
         let reason = bounded_failure_code(reason);
-        let mut inbox = self.inbox(scope);
-        inbox.recover().await?;
-        let event = inbox
-            .inner_mut()
-            .record_outbox_cancelled(&message_id, reason.clone())
-            .await
-            .map_err(AgentInboxError::from)?
+        let event = self
+            .write_outbox(
+                scope,
+                &message_id,
+                InboxWrite::Cancelled { reason: &reason },
+            )
+            .await?
             .unwrap_or_else(|| WorkflowTelemetryEvent::OutboxDispatchCancelled {
                 message_id: message_id.clone(),
                 at: self.clock.now(),
@@ -4187,17 +4334,19 @@ where
             match status {
                 None => {
                     let ticket = intent.to_workflow_effect(scope);
-                    self.sink()
-                        .dispatch(scope, &ticket)
-                        .await
+                    let command = ticket_outbox_command(&ticket, self.retry_backoff_ms)
                         .map_err(|error| AgentDispatchError::Effect(Box::new(error)))?;
-                    let mut inbox = self.inbox(scope);
-                    inbox.recover().await?;
-                    let _event = inbox
-                        .inner_mut()
-                        .record_outbox_cancelled(&message_id, "run-cancelled")
-                        .await
-                        .map_err(AgentInboxError::from)?;
+                    self.write_outbox(scope, &message_id, InboxWrite::Scheduled(&command))
+                        .await?;
+                    let _event = self
+                        .write_outbox(
+                            scope,
+                            &message_id,
+                            InboxWrite::Cancelled {
+                                reason: "run-cancelled",
+                            },
+                        )
+                        .await?;
                     pass.cancelled += 1;
                     self.deliver_outcome(
                         scope,

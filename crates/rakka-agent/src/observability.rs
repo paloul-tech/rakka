@@ -1029,6 +1029,18 @@ pub const METRIC_AGENT_DEPENDENCY_OUTCOMES: &str = "rakka.agent.dependency.outco
 /// are on the journal's own pending record.
 pub const METRIC_AGENT_EXCHANGE_UNSETTLEABLE: &str = "rakka.agent.exchange.unsettleable";
 
+/// Counter for the dispatcher's own writes to a run's inbox that lost their
+/// compare-and-set and were re-read and re-applied inside the pass.
+///
+/// A run's inbox store has a second writer in production — anything that
+/// schedules an effect into a live run, a deployment's memory sweep among
+/// them — so the dispatcher's writes meet it. One count per re-application,
+/// labeled by the write that lost (`operation`, from a closed vocabulary):
+/// how often the two writers meet, never which run they met on. A write that
+/// is still losing after the bound fails the pass as before, and the lease
+/// carries the ticket.
+pub const METRIC_AGENT_DISPATCH_WRITE_RETRIES: &str = "rakka.agent.dispatch.write_retries";
+
 /// Emits one [`METRIC_AGENT_EXCHANGE_UNSETTLEABLE`] count per refusal a settle
 /// pass could not settle.
 ///
@@ -1512,6 +1524,14 @@ pub const AGENT_DOMAIN_METRIC_INSTRUMENTS: &[AgentDomainMetricInstrument] = &[
         &["operation", "error_code"],
         &[],
         "Exchange replies a settle pass could not settle, per pass.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_DISPATCH_WRITE_RETRIES,
+        MetricKind::Counter,
+        "{write}",
+        &["operation"],
+        &[],
+        "Dispatcher inbox writes re-applied after a lost compare-and-set.",
     ),
     AgentDomainMetricInstrument::new(
         crate::wake_scanner::METRIC_AGENT_WAKES,

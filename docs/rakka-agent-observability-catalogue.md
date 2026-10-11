@@ -68,6 +68,7 @@ without re-bucketing.
 | `rakka.agent.human.results` | Counter | `{result}` | `outcome` | — | Authenticated human-result submissions decided at the task entity. |
 | `rakka.agent.dependency.outcomes` | Counter | `{edge}` | `outcome` | — | Dependency outcomes durably applied at the dependent task. |
 | `rakka.agent.exchange.unsettleable` | Counter | `{refusal}` | `operation`, `error_code` | — | Exchange replies a settle pass could not settle, per pass. |
+| `rakka.agent.dispatch.write_retries` | Counter | `{write}` | `operation` | — | Dispatcher inbox writes re-applied after a lost compare-and-set. |
 
 Every label *value* comes from a closed `as_label()` vocabulary. Raw
 `TenantId`, `AgentId`, `AgentGoalId`, `AgentTaskId`, `AgentRunId`,

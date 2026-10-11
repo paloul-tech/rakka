@@ -136,9 +136,12 @@ leaves behind is the same either way.
 4. **Effects.** Each model call, tool call, A2A send, workflow start, and
    compensation is its own outbox ticket with a stable idempotency key. A
    dispatcher fleet claims tickets under a lease; workers may declare the
-   execution classes they serve and skip the rest before taking a lease. A tool
-   call is dispatched only when its binding, dispatch grant, credential
-   binding, checkpoint, execution policy, and immediate safety check all pass;
+   execution classes they serve and skip the rest before taking a lease. A
+   dispatcher write to a run's inbox that loses its compare-and-set to another
+   writer is recovered and re-applied, a bounded number of times, inside the
+   same pass. A tool call is dispatched only when its binding, dispatch
+   grant, credential binding, checkpoint, execution policy, and immediate
+   safety check all pass;
    credentials are resolved at dispatch and never outlive the attempt. Remote
    MCP tools are registered from stored descriptor sets synced ahead of time
    at publish, never discovered live inside a call, and are called per attempt

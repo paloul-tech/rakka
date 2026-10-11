@@ -5221,6 +5221,64 @@ only runs that had ended, the window gap slice 2 built.
   decision; no issue filed. Everything gap slice 2 carries forward is
   unchanged.
 
+### Gap slice 4 — A lost compare-and-set on the run inbox
+
+Spec: [11.4](spec.md#114-dispatch-invariants).
+
+Status: implemented (2026-10-11, branch `dispatch-inbox-write-retry`), from a
+consumer's brief (issue #81): with a memory sweep scheduling promotions into
+live runs, the run's inbox store has a second writer, and a dispatcher write
+that met it lost the store's compare-and-set and aborted the pass with the
+ticket still claimed. The consumer measured it on a pair as real, bounded,
+and harmless — nothing lost, parked, or invoked twice — at one lease of
+latency per conflict.
+
+- **The defect.** Each of the dispatcher's inbox writes was `recover()`
+  followed by the write and a `?`. A revision that moved between the two —
+  microseconds — failed the pass, and the ticket waited out its lease until a
+  re-claim re-read the ticket row and the run's effect record and converged.
+- **One helper for every write.** `AgentRunEffectDispatcher::write_outbox`
+  takes the write as data (`InboxWrite`: scheduled, dispatching, succeeded,
+  failed, cancelled), recovers before every attempt, and re-applies on
+  `revision-conflict` — matched on the code, never the error's shape — at
+  most three more times (`INBOX_WRITE_REAPPLICATIONS`). Exhaustion and every
+  other failure propagate exactly as before. Nine sites go through it: the
+  brief's eight, plus the wind-down fence's tombstone schedule, which the
+  brief did not list. That one used to go through the run's effect sink,
+  which reports a lost compare-and-set as `effect-sink-failed` with the
+  substrate's code only in its message, so the fence now schedules through
+  the helper with the sink's own command (`ticket_outbox_command`, shared by
+  both). The run's own sink and the result delivery's write to the same
+  store are the consumer's half of the race and are unchanged.
+- **The counter.** `rakka.agent.dispatch.write_retries`, one count per
+  re-application, labeled `operation` from the write's closed vocabulary,
+  recorded through `AgentRunEffectDispatcher::with_metrics`.
+- **The settle reason (the brief's §8).** `settle_ticket_cancelled`'s
+  comment said the reason was written to the outbox row; the row's
+  `mark_cancelled` stores only the status. The fleet index entry's existing
+  `last_error_code` now keeps it when the ticket is settled through
+  `record_claim_failure`, so `ticket-stale` and `intent-already-resolved` —
+  the two arms of the re-claim convergence — are told apart from durable
+  state. No new field.
+- **Held by:** `dispatch_inbox_write_retry.rs` — one test per write shape
+  (the `Dispatching` mark, the success record, a definitive failure record,
+  a stale-ticket settlement, and the fence tombstone's schedule and cancel),
+  each arming `CrashPoint::ConflictBeforeWrite` at that write and asserting
+  the pass completes with the counter at exactly one under the write's label;
+  at the pin the first four failed with `Inbox(Workflow { error:
+  RevisionConflict { .. } })`. The bound is held by
+  `a_store_that_loses_every_compare_and_set_exhausts_the_bound_and_fails_the_pass`
+  (four attempts, then `revision-conflict`, through the new
+  `CrashingStateStore::conflict_from`) and the predicate by
+  `a_write_the_store_refuses_for_another_reason_is_not_retried`; both were
+  falsified by mutation. `a_cancelled_tickets_settle_reason_is_readable_from_the_fleet_index`
+  holds §8's two arms. Documentation: specification 11.4;
+  `docs/rakka-compatibility.md`; `docs/rakka-agents.md`; the metric
+  catalogue.
+- **Owed onward:** the three recovery-path failure and success records
+  (an ambiguous loss, a reconciled success, an unknown reconciliation) go
+  through the same helper but have no conflict test of their own.
+
 ## Appendix — Scenario-to-Slice Coverage
 
 All scenario numbers refer to
