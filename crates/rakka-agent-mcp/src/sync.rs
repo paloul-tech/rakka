@@ -54,7 +54,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::binding::{
-    McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
+    derived_tool_id, McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
     MCP_DESCRIPTOR_SCHEMA_MAX_BYTES, MCP_LIST_PAGES_MAX, MCP_SERVER_NAME_MAX_BYTES,
     MCP_SYNC_TIMEOUT_DEFAULT_MS,
 };
@@ -161,11 +161,13 @@ pub const MCP_DESCRIPTOR_SET_SCHEMA_VERSION: u32 = 2;
 /// Release data a deployment stores, so it carries its own
 /// [`Self::schema_version`]: a set written by a newer build is refused on
 /// decode rather than read as whatever this build's fields make of it.
+/// Every decode checks the set against itself ([`Self::validate`]), whatever
+/// its version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "McpDescriptorSetRecord")]
 pub struct McpDescriptorSet {
     /// The stored shape's schema version: [`MCP_DESCRIPTOR_SET_SCHEMA_VERSION`]
     /// as the sync writes it. Decoding refuses a newer one.
-    #[serde(deserialize_with = "known_set_schema_version")]
     pub schema_version: u32,
     /// The server this set belongs to.
     pub server_id: McpServerId,
@@ -227,6 +229,78 @@ impl McpDescriptorSet {
             .iter()
             .find(|descriptor| descriptor.tool == tool)
     }
+
+    /// Refuses a set that disagrees with itself.
+    ///
+    /// A set is release data a client may author, so nothing about it is
+    /// trusted for having decoded: each tool is named once, and each
+    /// descriptor is a remote MCP tool registered under the id its server and
+    /// name derive, whose schema digest is its input schema's, whose inline
+    /// parameters (when it carries any) are its input schema, and — on a
+    /// version-2 set, which stores the raw output schema — whose output
+    /// schema digest is its output schema's. Decode runs this on every set,
+    /// and so does executor construction.
+    ///
+    /// # Errors
+    ///
+    /// [`McpRegistrationError::DescriptorSetInvalid`], stable code
+    /// `mcp-descriptor-set-invalid`, at the first check that fails.
+    pub fn validate(&self) -> Result<(), McpRegistrationError> {
+        let invalid =
+            |tool: &str, reason: &'static str| McpRegistrationError::DescriptorSetInvalid {
+                server: self.server_id.to_string(),
+                tool: Some(tool.to_string()),
+                reason,
+            };
+        let mut named = std::collections::BTreeSet::new();
+        for descriptor in &self.descriptors {
+            let tool = descriptor.tool.as_str();
+            if !named.insert(tool) {
+                return Err(invalid(tool, "the set names the tool twice"));
+            }
+            let declared = descriptor.binding.descriptor();
+            if declared.kind != AgentToolKind::RemoteMcp {
+                return Err(invalid(tool, "the descriptor is not a remote MCP tool"));
+            }
+            if declared.tool.as_str() != derived_tool_id(&self.server_id, tool) {
+                return Err(invalid(
+                    tool,
+                    "the tool id is not the one its server and name derive",
+                ));
+            }
+            if descriptor.schema_digest
+                != AgentContentDigest::sha256_of_json(&descriptor.input_schema)
+            {
+                return Err(invalid(
+                    tool,
+                    "the schema digest is not the digest of the input schema",
+                ));
+            }
+            if declared
+                .parameters
+                .as_ref()
+                .is_some_and(|parameters| parameters != &descriptor.input_schema)
+            {
+                return Err(invalid(
+                    tool,
+                    "the inline parameters differ from the input schema",
+                ));
+            }
+            if self.schema_version >= 2
+                && descriptor.output_schema_digest
+                    != descriptor
+                        .output_schema
+                        .as_ref()
+                        .map(AgentContentDigest::sha256_of_json)
+            {
+                return Err(invalid(
+                    tool,
+                    "the output schema digest is not the digest of the output schema",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Decodes a descriptor set's schema version, refusing one newer than this
@@ -243,6 +317,36 @@ where
         )));
     }
     Ok(version)
+}
+
+/// A descriptor set as it is read, before it checks itself.
+#[derive(Deserialize)]
+struct McpDescriptorSetRecord {
+    #[serde(deserialize_with = "known_set_schema_version")]
+    schema_version: u32,
+    server_id: McpServerId,
+    server_name: String,
+    protocol_version: String,
+    synced_at: AgentTimestampMillis,
+    descriptors: Vec<McpSyncedDescriptor>,
+}
+
+impl TryFrom<McpDescriptorSetRecord> for McpDescriptorSet {
+    type Error = String;
+
+    fn try_from(record: McpDescriptorSetRecord) -> Result<Self, Self::Error> {
+        let set = Self {
+            schema_version: record.schema_version,
+            server_id: record.server_id,
+            server_name: record.server_name,
+            protocol_version: record.protocol_version,
+            synced_at: record.synced_at,
+            descriptors: record.descriptors,
+        };
+        set.validate()
+            .map_err(|refusal| format!("{}: {refusal}", refusal.code()))?;
+        Ok(set)
+    }
 }
 
 /// Whether a stored descriptor set still matches what the server exposes.
@@ -678,22 +782,22 @@ pub fn mcp_descriptor_staleness(
     }
 }
 
-/// The comparable shape of every tool in a set: the two schema digests.
+/// The comparable shape of every tool in a set: the two schema digests of
+/// its first copy.
 fn shapes(
     set: &McpDescriptorSet,
 ) -> BTreeMap<&str, (&AgentContentDigest, Option<&AgentContentDigest>)> {
-    set.descriptors
-        .iter()
-        .map(|descriptor| {
-            (
-                descriptor.tool.as_str(),
-                (
-                    &descriptor.schema_digest,
-                    descriptor.output_schema_digest.as_ref(),
-                ),
-            )
-        })
-        .collect()
+    // The first copy of a tool, as `descriptor()` and the executor's routing
+    // table read it. A validated set holds one copy; an unvalidated one built
+    // in code is still read alike by every reader.
+    let mut shapes = BTreeMap::new();
+    for descriptor in &set.descriptors {
+        shapes.entry(descriptor.tool.as_str()).or_insert((
+            &descriptor.schema_digest,
+            descriptor.output_schema_digest.as_ref(),
+        ));
+    }
+    shapes
 }
 
 /// Turns the server's listing into the allow-listed descriptors.
