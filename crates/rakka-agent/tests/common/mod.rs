@@ -2916,6 +2916,14 @@ impl AuthorityFixture {
         self
     }
 
+    /// Wires one metrics recorder through the run entity, the result
+    /// delivery, and the dispatch pipeline the fixture builds, so a test reads
+    /// every recording site from one handle.
+    pub fn with_metrics(mut self, metrics: Arc<dyn rakka_core::MetricsRecorder>) -> Self {
+        self.fx = self.fx.with_metrics(metrics);
+        self
+    }
+
     pub async fn start(&self) {
         self.fx
             .instantiate_agent_with_envelope(self.envelope.clone())
@@ -3020,6 +3028,9 @@ impl AuthorityFixture {
         }
         if let Some(segments) = &self.dispatch_segments {
             pipeline = pipeline.with_segments(segments.clone());
+        }
+        if let Some(metrics) = &self.fx.metrics {
+            pipeline = pipeline.with_metrics(metrics.clone());
         }
         pipeline
     }

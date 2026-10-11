@@ -3833,6 +3833,9 @@ where
     crash_at: Arc<AtomicUsize>,
     crash_after: Arc<std::sync::atomic::AtomicBool>,
     conflict: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether an armed conflict repeats on every write after the armed one
+    /// ([`CrashingStateStore::conflict_from`]) rather than firing once.
+    persistent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S> Clone for CrashingStateStore<S>
@@ -3846,6 +3849,7 @@ where
             crash_at: self.crash_at.clone(),
             crash_after: self.crash_after.clone(),
             conflict: self.conflict.clone(),
+            persistent: self.persistent.clone(),
         }
     }
 }
@@ -3884,6 +3888,7 @@ where
             crash_at: Arc::new(AtomicUsize::new(0)),
             crash_after: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             conflict: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            persistent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -3905,6 +3910,20 @@ where
             matches!(point, CrashPoint::ConflictBeforeWrite),
             Ordering::SeqCst,
         );
+        self.persistent.store(false, Ordering::SeqCst);
+    }
+
+    /// Makes every write from the `nth` on lose its compare-and-set, each as
+    /// [`CrashPoint::ConflictBeforeWrite`] does once: a second writer moves the
+    /// record first, so the owner's write meets a genuine `RevisionConflict`.
+    /// Resets the write counter.
+    ///
+    /// This is the store a retry bound is proven against — a writer that
+    /// re-reads and re-applies on a lost compare-and-set must still give up,
+    /// because this store never lets it win. [`Self::survive`] ends it.
+    pub fn conflict_from(&self, nth: usize) {
+        self.crash_at(nth, CrashPoint::ConflictBeforeWrite);
+        self.persistent.store(true, Ordering::SeqCst);
     }
 
     /// Stops killing the owner. The next activation recovers whatever the last
@@ -3967,9 +3986,11 @@ where
         let crash_at = self.crash_at.load(Ordering::SeqCst);
         let after = self.crash_after.load(Ordering::SeqCst);
         let conflict = self.conflict.load(Ordering::SeqCst);
+        let persistent = self.persistent.load(Ordering::SeqCst);
 
         Box::pin(async move {
-            if crash_at != 0 && write == crash_at && conflict {
+            let conflicted = write == crash_at || (persistent && write > crash_at);
+            if crash_at != 0 && conflicted && conflict {
                 // The second writer: the record as it stands, written back
                 // at its own revision. Nothing about the state changes; the
                 // revision moves, which is all a lost compare-and-set is.
