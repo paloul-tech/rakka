@@ -126,7 +126,11 @@ leaves behind is the same either way.
    plain backend a deployment wires without taking a direct `reqwest`
    dependency), building the provider client per attempt from the credential
    the dispatcher resolved; a deterministic adapter in the testkit) returns a
-   bounded turn: text, tool-call *requests*, or a typed result proposal. Turns are
+   bounded turn: text, tool-call *requests*, or a typed result proposal. A
+   provider is shown each tool under a name inside the providers' tool-name
+   rule (`provider_tool_name`: `mcp.crm.lookup` is declared as
+   `mcp_crm_lookup_c41f30c9`), and each call is read back to its tool id; the
+   provider's name for a tool is never durable. Turns are
    recorded to session memory and dropped, so a run that iterates a hundred
    times persists no more state of its own than one that iterates once.
 4. **Effects.** Each model call, tool call, A2A send, workflow start, and

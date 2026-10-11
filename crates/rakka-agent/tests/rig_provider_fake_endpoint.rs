@@ -48,49 +48,143 @@ struct Seen {
     hits: Arc<AtomicUsize>,
 }
 
+/// The longest tool name Anthropic accepts: `^[a-zA-Z0-9_-]{1,128}$` (Claude
+/// API, "Define tools").
+const ANTHROPIC_TOOL_NAME_MAX_BYTES: usize = 128;
+
+/// The longest tool name OpenAI accepts: `[a-zA-Z0-9_-]`, at most 64
+/// (`openai/openai-openapi`, `FunctionObject.name`).
+const OPENAI_TOOL_NAME_MAX_BYTES: usize = 64;
+
+/// The tool names a request body declares, in either wire shape: Anthropic's
+/// `tools[].name` or Chat Completions' `tools[].function.name`.
+fn declared_tool_names(body: &Value) -> Vec<String> {
+    body["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool["name"]
+                        .as_str()
+                        .or_else(|| tool["function"]["name"].as_str())
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The first declared tool name outside a provider's rule.
+///
+/// Both real providers refuse the **whole request** with a `400` over one
+/// such name, so both fakes do too. A fake that took any name could never
+/// show the adapter declaring one a provider refuses, which is how an MCP
+/// tool id (`mcp.<server>.<tool>`) failed every first turn unseen.
+fn name_outside_the_rule(body: &Value, max_bytes: usize) -> Option<String> {
+    declared_tool_names(body).into_iter().find(|name| {
+        name.is_empty()
+            || name.len() > max_bytes
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    })
+}
+
+/// The name a fake model calls when asked for a tool: the first declared
+/// tool other than the result tool, exactly as it was declared — a real
+/// model can only call a name it was offered.
+fn offered_tool(body: &Value) -> String {
+    declared_tool_names(body)
+        .into_iter()
+        .find(|name| name != "submit_result")
+        .unwrap_or_default()
+}
+
 async fn anthropic_messages(
     State(seen): State<Seen>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     seen.hits.fetch_add(1, Ordering::SeqCst);
     seen.headers.lock().expect("not poisoned").push(headers);
+    let refused = name_outside_the_rule(&body, ANTHROPIC_TOOL_NAME_MAX_BYTES);
+    let wants_tool = body["messages"].to_string().contains(ASK_FOR_A_TOOL_CALL);
+    let called = offered_tool(&body);
     seen.bodies.lock().expect("not poisoned").push(body);
-    Json(json!({
-        "id": "msg_1",
-        "type": "message",
-        "role": "assistant",
-        "model": "claude-sonnet-5-20260901",
-        "content": [{ "type": "text", "text": "hello from the fake" }],
-        "stop_reason": "end_turn",
-        "stop_sequence": null,
-        "usage": { "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 0 }
-    }))
+    if let Some(name) = refused {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": format!("tools: {name:?} should match pattern '^[a-zA-Z0-9_-]{{1,128}}$'"),
+                }
+            })),
+        );
+    }
+    let content = if wants_tool {
+        json!([{ "type": "tool_use", "id": "toolu_1", "name": called, "input": { "q": "refunds" } }])
+    } else {
+        json!([{ "type": "text", "text": "hello from the fake" }])
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-5-20260901",
+            "content": content,
+            "stop_reason": if wants_tool { "tool_use" } else { "end_turn" },
+            "stop_sequence": null,
+            "usage": { "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 0 }
+        })),
+    )
 }
 
 async fn openai_chat_completions(
     State(seen): State<Seen>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     seen.hits.fetch_add(1, Ordering::SeqCst);
     seen.headers.lock().expect("not poisoned").push(headers);
+    let refused = name_outside_the_rule(&body, OPENAI_TOOL_NAME_MAX_BYTES);
     let wants_tool = body["messages"].to_string().contains(ASK_FOR_A_TOOL_CALL);
+    let called = offered_tool(&body);
     seen.bodies.lock().expect("not poisoned").push(body);
+    if let Some(name) = refused {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": format!("Invalid 'tools.function.name': string {name:?} does not match pattern. Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'."),
+                    "type": "invalid_request_error",
+                    "param": "tools.function.name",
+                    "code": "invalid_value",
+                }
+            })),
+        );
+    }
     let message = if wants_tool {
-        json!({ "role": "assistant", "content": null, "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": "search_kb", "arguments": "{\"q\":\"refunds\"}" } }] })
+        json!({ "role": "assistant", "content": null, "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": called, "arguments": "{\"q\":\"refunds\"}" } }] })
     } else {
         json!({ "role": "assistant", "content": "hello from the fake" })
     };
-    Json(json!({
-        "id": "chatcmpl-1",
-        "object": "chat.completion",
-        "created": 1,
-        "model": "gpt-fake-1",
-        "choices": [{ "index": 0, "message": message, "finish_reason": if wants_tool { "tool_calls" } else { "stop" } }],
-        "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
-                   "prompt_tokens_details": { "cached_tokens": 3 }, "completion_tokens_details": { "reasoning_tokens": 2 } }
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-fake-1",
+            "choices": [{ "index": 0, "message": message, "finish_reason": if wants_tool { "tool_calls" } else { "stop" } }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+                       "prompt_tokens_details": { "cached_tokens": 3 }, "completion_tokens_details": { "reasoning_tokens": 2 } }
+        })),
+    )
 }
 
 /// Azure OpenAI's chat-completions route: the Chat Completions request and
@@ -102,7 +196,7 @@ async fn azure_chat_completions(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     seen.queries
         .lock()
         .expect("not poisoned")
@@ -178,9 +272,14 @@ fn profile_with_attributes(
 }
 
 fn request(marker: &str) -> AgentModelRequest {
+    request_offering(marker, "search_kb", AgentToolKind::Function)
+}
+
+/// A request offering one model-visible tool, `tool`, beside the result tool.
+fn request_offering(marker: &str, tool: &str, kind: AgentToolKind) -> AgentModelRequest {
     let descriptor = AgentToolDescriptor::new(
-        AgentToolId::new("search_kb").expect("tool id"),
-        AgentToolKind::Function,
+        AgentToolId::new(tool).expect("tool id"),
+        kind,
         "Searches the knowledge base.",
         AgentSchemaRef::new(
             AgentSchemaId::new("kb-input").expect("schema"),
@@ -315,6 +414,66 @@ async fn the_openai_completions_round_trip_carries_the_bearer_and_maps_a_tool_ca
             .and_then(|v| v.to_str().ok()),
         Some("Bearer sk-openai-fake-sentinel")
     );
+}
+
+/// Issue #85 ask 16. An MCP tool id (`mcp.<server>.<tool>`) is outside both
+/// providers' name rules, and each refuses the whole request over it, so
+/// before the fix any run offering an MCP tool failed its first turn. The
+/// adapter declares it under its provider name, and reads the call the
+/// provider makes under that name back to the id, on both wire shapes.
+#[tokio::test]
+async fn an_mcp_tool_is_declared_under_a_name_the_provider_accepts_and_read_back_to_its_id() {
+    let seen = Seen::default();
+    let addr = serve(seen.clone()).await;
+    let routes = [
+        (
+            AgentModelProviderKind::Anthropic,
+            "claude-sonnet-5",
+            format!("http://{addr}"),
+            AgentEphemeralCredential::api_key("x-api-key", "sk-ant-fake-sentinel"),
+        ),
+        (
+            AgentModelProviderKind::OpenAiCompletions,
+            "gpt-fake-1",
+            format!("http://{addr}/v1"),
+            AgentEphemeralCredential::bearer_token("sk-openai-fake-sentinel"),
+        ),
+    ];
+    for (index, (kind, model, base_url, credential)) in routes.into_iter().enumerate() {
+        let adapter = RigProviderAdapter::new(
+            profile(kind.clone(), model, Some(base_url)),
+            ReqwestClient::new(),
+        )
+        .expect("valid");
+        let turn = adapter
+            .call_with(
+                &request_offering(
+                    ASK_FOR_A_TOOL_CALL,
+                    "mcp.crm.lookup",
+                    AgentToolKind::RemoteMcp,
+                ),
+                Some(&credential),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{kind:?} accepts every declared name: {error}"));
+        assert_eq!(turn.tool_calls.len(), 1, "{kind:?}");
+        assert_eq!(
+            turn.tool_calls[0].tool.as_str(),
+            "mcp.crm.lookup",
+            "{kind:?}: the call reads back to the tool id"
+        );
+        assert_eq!(turn.tool_calls[0].arguments["q"], "refunds");
+
+        // The name on the wire, a literal: `mcp_crm_lookup` plus `_` and
+        // the first eight hex characters of SHA-256("mcp.crm.lookup"),
+        // the name `rakka.host` declares the same tool under.
+        let body = &seen.bodies.lock().expect("not poisoned")[index];
+        assert_eq!(
+            declared_tool_names(body),
+            ["submit_result", "mcp_crm_lookup_c41f30c9"],
+            "{kind:?}"
+        );
+    }
 }
 
 #[tokio::test]
