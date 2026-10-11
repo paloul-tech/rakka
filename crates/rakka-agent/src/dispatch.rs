@@ -1620,7 +1620,6 @@ pub trait AgentDispatchAuthority: Send + Sync {
 ///     }
 /// }
 /// ```
-#[must_use]
 pub fn accept_tool_response_unchanged<'a>(
     content: AgentTaskContent,
 ) -> AgentDispatchFuture<'a, AgentToolResponseDecision> {
@@ -1657,7 +1656,6 @@ pub enum AgentModelResponseDecision {
 ///
 /// For an authority that evaluates no `ModelResponse` chain. A wrapping
 /// authority does not use it — it forwards to the authority it wraps.
-#[must_use]
 pub fn accept_model_response_unchanged<'a>(
     turn: AgentModelTurn,
 ) -> AgentDispatchFuture<'a, AgentModelResponseDecision> {

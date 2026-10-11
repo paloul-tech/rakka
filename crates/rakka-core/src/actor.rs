@@ -1614,6 +1614,9 @@ impl ActorCell {
     }
 
     fn mark_dequeued(&self) {
+        // Rust 1.99 deprecates `fetch_update` in favour of its rename,
+        // `try_update`, which is unstable on the 1.88 MSRV.
+        #[allow(deprecated)]
         let _previous =
             self.mailbox_depth
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
