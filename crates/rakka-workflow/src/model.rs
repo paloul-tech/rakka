@@ -665,6 +665,17 @@ impl OutboxEntry {
             }
         }
     }
+
+    /// Records a failed dispatch that retrying cannot change, exhausting the
+    /// entry whatever budget its retry policy has left.
+    pub(crate) fn record_definitive_failure(
+        &mut self,
+        now: WorkflowTimestamp,
+        message: impl Into<String>,
+    ) {
+        self.attempts = self.attempts.clone().record_exhaustion(message);
+        self.set_status(OutboxStatus::Exhausted, now);
+    }
 }
 
 /// Result of recording a failed outbox dispatch.

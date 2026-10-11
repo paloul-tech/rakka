@@ -1,0 +1,332 @@
+//! How the dispatcher settles an attempt whose executor answered a
+//! definitive refusal or an unknown outcome (issue #85, asks 7 and 14).
+//!
+//! A scripted executor answers every call with one error and counts the
+//! calls; the run, the outbox row, and the call count are the evidence.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedReconciler};
+use rakka_agent::{
+    AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor, AgentEffectSpec,
+    AgentFailureReason, AgentModelTurn, AgentReconciliationFinding, AgentReconciliationProtocolRef,
+    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunScope, AgentRunStatus,
+    AgentTaskContent, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+};
+use rakka_agent_workflow::substrate::OutboxStatus;
+use rakka_agent_workflow::AgentEphemeralCredential;
+
+mod common;
+
+use common::*;
+
+const TOOL: &str = "charge-card";
+
+fn tool_then_proposal() -> DeterministicModelAdapter {
+    DeterministicModelAdapter::new()
+        .with_turn_for(
+            1,
+            AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_tool_call(
+                AgentToolCallRequest::new(
+                    AgentToolCallId::new("call-1").expect("the call id is valid"),
+                    AgentToolId::new(TOOL).expect("the tool id is valid"),
+                    serde_json::json!({ "amount": 42 }),
+                )
+                .expect("the tool call is bounded"),
+            ),
+        )
+        .with_turn_for(
+            2,
+            AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_proposal(
+                AgentTaskContent::inline(serde_json::json!({ "answer": "charged" }))
+                    .expect("the proposal is inline-bounded"),
+            ),
+        )
+}
+
+/// A tool executor that answers every call with one scripted error and
+/// counts the calls.
+struct FailingExecutor {
+    error: fn() -> AgentDispatchError,
+    calls: Arc<AtomicUsize>,
+}
+
+impl AgentDispatchToolExecutor for FailingExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let error = (self.error)();
+        Box::pin(async move { Err(error) })
+    }
+}
+
+/// A run whose tool ticket, under `spec`, is ready to claim, behind an
+/// executor that answers `error`.
+fn fixture(
+    spec: &AgentEffectSpec,
+    error: fn() -> AgentDispatchError,
+) -> (AuthorityFixture, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(tool_registry_for_spec(TOOL, spec)),
+        None,
+    )
+    .with_tool_executor(Arc::new(FailingExecutor {
+        error,
+        calls: calls.clone(),
+    }));
+    (fx, calls)
+}
+
+async fn ready(fx: &AuthorityFixture) -> AgentRunEffect {
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    fx.effect_at(1).await.expect("the tool effect is committed")
+}
+
+fn definitive() -> AgentDispatchError {
+    AgentDispatchError::definitive("egress-denied", "the host refused the destination")
+}
+
+fn retryable() -> AgentDispatchError {
+    AgentDispatchError::collaborator("egress-denied", "the host refused the destination")
+}
+
+#[tokio::test]
+async fn a_definitive_refusal_exhausts_the_ticket_on_its_first_attempt() {
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let (fx, calls) = fixture(&spec, definitive);
+    let effect = ready(&fx).await;
+
+    let pass = fx.one_pass().await;
+
+    assert_eq!((pass.invoked, pass.failed_attempts), (1, 1), "{pass:?}");
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(
+        row.status(),
+        OutboxStatus::Exhausted,
+        "a definitive refusal spends the budget at once"
+    );
+    assert_eq!(row.attempts().attempts(), 1);
+    let resolved = fx
+        .effect_at(1)
+        .await
+        .expect("a failed run keeps its failed effect");
+    assert_eq!(resolved.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(
+        resolved.last_error_code.as_deref(),
+        Some("dispatch-collaborator-failed"),
+        "the pipeline code a spent retryable refusal records today"
+    );
+    assert_eq!(
+        resolved
+            .last_error_reason
+            .as_ref()
+            .map(AgentFailureReason::code),
+        Some("egress-denied")
+    );
+
+    fx.expire_lease();
+    fx.pump().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing invokes it again");
+}
+
+#[tokio::test]
+async fn a_retryable_refusal_still_spends_its_budget_one_attempt_at_a_time() {
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let (fx, calls) = fixture(&spec, retryable);
+    let effect = ready(&fx).await;
+
+    fx.one_pass().await;
+
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(row.status(), OutboxStatus::Failed, "a retry is scheduled");
+    assert_eq!(row.attempts().attempts(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+fn unknown() -> AgentDispatchError {
+    AgentDispatchError::outcome_unknown(
+        "scripted-outcome-unknown",
+        "the call was sent and no answer was read",
+    )
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_parks_a_non_idempotent_effect_for_reconciliation() {
+    let (fx, calls) = fixture(&AgentEffectSpec::non_idempotent(), unknown);
+    ready(&fx).await;
+
+    let pass = fx.one_pass().await;
+
+    assert_eq!(pass.parked_indeterminate, 1, "{pass:?}");
+    let parked = fx.effect_at(1).await.expect("the parked effect");
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    assert_eq!(
+        parked.last_error_code.as_deref(),
+        Some("scripted-outcome-unknown"),
+        "the executor's code, not the worker-loss code"
+    );
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run").status,
+        AgentRunStatus::WaitingForReconciliation
+    );
+
+    fx.expire_lease();
+    fx.pump().await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a non-idempotent target is never invoked again"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_retries_a_read_only_or_idempotent_effect_under_its_budget() {
+    for spec in [
+        AgentEffectSpec::read_only()
+            .with_max_attempts(3)
+            .expect("the spec is valid"),
+        AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+    ] {
+        let class = spec.safety_class;
+        let (fx, calls) = fixture(&spec, unknown);
+        let effect = ready(&fx).await;
+
+        let pass = fx.one_pass().await;
+
+        assert_eq!(pass.failed_attempts, 1, "{class:?}: {pass:?}");
+        let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+        assert_eq!(
+            row.status(),
+            OutboxStatus::Failed,
+            "{class:?}: retry scheduled"
+        );
+        assert!(
+            row.attempts()
+                .last_error()
+                .is_some_and(|line| line.starts_with("scripted-outcome-unknown")),
+            "{class:?}: the executor's code leads the line: {:?}",
+            row.attempts().last_error()
+        );
+        fx.expire_lease();
+        fx.one_pass().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "{class:?}: retried");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_on_an_idempotent_effects_last_attempt_exhausts_it() {
+    let spec = AgentEffectSpec::idempotent(1).expect("the spec is valid");
+    let (fx, _calls) = fixture(&spec, unknown);
+    ready(&fx).await;
+
+    fx.one_pass().await;
+
+    let resolved = fx.effect_at(1).await.expect("the failed effect");
+    assert_eq!(resolved.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(
+        resolved.last_error_code.as_deref(),
+        Some("scripted-outcome-unknown")
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_asks_the_reconciler_of_a_reconcileable_effect_in_the_same_pass() {
+    let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
+    let spec = AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid");
+    let reconciler = ScriptedReconciler::new();
+    let (fx, calls) = fixture(&spec, unknown);
+    let fx = fx.with_reconciler(Arc::new(reconciler.clone()));
+    ready(&fx).await;
+
+    fx.one_pass().await;
+
+    assert_eq!(
+        reconciler.queries(),
+        1,
+        "queried in the pass that saw the unknown outcome"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// A reconcileable effect whose reconciler answers `finding`, behind an
+/// executor whose every outcome is unknown.
+fn reconcileable_fixture(
+    finding: AgentReconciliationFinding,
+) -> (AuthorityFixture, Arc<AtomicUsize>, ScriptedReconciler) {
+    let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
+    let spec = AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid");
+    let reconciler = ScriptedReconciler::new().with_finding(finding);
+    let (fx, calls) = fixture(&spec, unknown);
+    (
+        fx.with_reconciler(Arc::new(reconciler.clone())),
+        calls,
+        reconciler,
+    )
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_the_reconciler_finds_not_executed_is_reinvoked_under_the_executors_code(
+) {
+    // The scripted reconciler repeats its last answer, so every lap of the
+    // recovery finds the effect not executed and spends an attempt.
+    let (fx, calls, reconciler) = reconcileable_fixture(AgentReconciliationFinding::NotExecuted);
+    let effect = ready(&fx).await;
+
+    fx.one_pass().await;
+
+    assert_eq!(
+        (calls.load(Ordering::SeqCst), reconciler.queries()),
+        (3, 3),
+        "re-invoked once per not-executed finding, until the budget of three is spent"
+    );
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(row.status(), OutboxStatus::Exhausted);
+    assert_eq!(row.attempts().attempts(), 3);
+    assert!(
+        row.attempts()
+            .last_error()
+            .is_some_and(|line| line.starts_with("scripted-outcome-unknown")),
+        "the executor's code, not a lost dispatcher: {:?}",
+        row.attempts().last_error()
+    );
+    let resolved = fx.effect_at(1).await.expect("the failed effect");
+    assert_eq!(resolved.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(
+        resolved.last_error_code.as_deref(),
+        Some("scripted-outcome-unknown"),
+        "the run's record names what happened"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_the_reconciler_finds_executed_delivers_the_established_outcome() {
+    let established = AgentTaskContent::inline(serde_json::json!({ "receipt": "r-77" }))
+        .expect("the content is inline-bounded");
+    let (fx, calls, reconciler) = reconcileable_fixture(AgentReconciliationFinding::Executed {
+        outcome: Box::new(AgentRunEffectOutcome::Tool {
+            call_id: AgentToolCallId::new("call-1").expect("the call id is valid"),
+            content: established,
+        }),
+    });
+    let effect = ready(&fx).await;
+
+    fx.one_pass().await;
+
+    assert_eq!((calls.load(Ordering::SeqCst), reconciler.queries()), (1, 1));
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(
+        row.status(),
+        OutboxStatus::Dispatched,
+        "the reconciled outcome settles the ticket without a second invocation"
+    );
+}

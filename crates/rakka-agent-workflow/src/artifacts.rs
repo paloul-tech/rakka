@@ -31,6 +31,7 @@ pub type AgentArtifactStoreFuture<'a, T> =
 
 /// Artifact policy, validation, and storage errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AgentArtifactError {
     /// Artifact reference metadata is invalid.
     InvalidReference {
@@ -65,6 +66,13 @@ pub enum AgentArtifactError {
         /// Stable bounded store failure message.
         message: String,
     },
+    /// The application-owned store refused the write and will refuse it
+    /// again: retrying cannot help. A store that may accept the same write
+    /// later answers [`Self::Store`].
+    Refused {
+        /// Stable bounded refusal message.
+        message: String,
+    },
 }
 
 impl AgentArtifactError {
@@ -77,6 +85,7 @@ impl AgentArtifactError {
             Self::InlineStateTooLarge { .. } => "inline-state-too-large",
             Self::ArtifactNotFound { .. } => "artifact-not-found",
             Self::Store { .. } => "artifact-store",
+            Self::Refused { .. } => "artifact-store-refused",
         }
     }
 }
@@ -111,6 +120,7 @@ impl Display for AgentArtifactError {
                 write!(f, "artifact {artifact_id} was not found")
             }
             Self::Store { message } => write!(f, "artifact store failed: {message}"),
+            Self::Refused { message } => write!(f, "artifact store refused the write: {message}"),
         }
     }
 }

@@ -60,6 +60,7 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, MetaObject,
     RequestMetaObject,
 };
+use rmcp::service::ServiceError;
 use rmcp::transport::streamable_http_client::StreamableHttpClient;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -413,14 +414,24 @@ where
         // echo back into anything it answers.
         let secrets = client::credential_secrets(credential);
         let session = within(deadline, self.open(scope, &server.binding, credential)).await??;
-        let outcome = within(
-            deadline,
-            self.call(
-                &session, scope, server, descriptor, policy, intent, call, &secrets,
-            ),
-        )
-        .await
-        .and_then(std::convert::identity);
+        // The recheck's listing runs before the send and the call from it on,
+        // both under the attempt's one deadline: what an elapsed deadline
+        // means depends on which side of the send it fired.
+        let outcome = async {
+            within(
+                deadline,
+                self.recheck(&session, server, descriptor, &call.tool),
+            )
+            .await??;
+            within_after_send(
+                deadline,
+                self.call(
+                    &session, scope, server, descriptor, policy, intent, call, &secrets,
+                ),
+            )
+            .await?
+        }
+        .await;
         // Unconditional, and outside the effect's deadline: a close is owed on
         // every path, including the one where the deadline just fired. It is
         // bounded on its own terms by `McpClientSession::close`.
@@ -491,8 +502,8 @@ where
         })
     }
 
-    /// The recheck, the request, and the mapping — everything after the
-    /// handshake that the attempt's deadline bounds.
+    /// The request and the mapping of its answer — everything from the send
+    /// on.
     #[allow(clippy::too_many_arguments)]
     async fn call(
         &self,
@@ -505,8 +516,6 @@ where
         call: &AgentToolCallRequest,
         secrets: &[&str],
     ) -> Result<AgentTaskContent, AgentDispatchError> {
-        self.recheck(session, server, descriptor, &call.tool)
-            .await?;
         let Some(arguments) = call.arguments.as_object().cloned() else {
             return Err(AgentDispatchError::collaborator(
                 "mcp-tool-error",
@@ -522,12 +531,7 @@ where
             .peer()
             .call_tool_once(params)
             .await
-            .map_err(|error| {
-                dispatch_error(client::service_error(
-                    server.binding.server_id.as_str(),
-                    &error,
-                ))
-            })?;
+            .map_err(|error| sent_call_error(server.binding.server_id.as_str(), &error))?;
         self.content(scope, policy, &call.tool, intent, call, answer, secrets)
             .await
     }
@@ -711,8 +715,14 @@ where
                     intent.generation.get(),
                     call.call_id
                 ));
-                let refused = |error: rakka_agent_workflow::AgentArtifactError| {
-                    AgentDispatchError::collaborator(error.code(), error.to_string())
+                // A store that refused the write will refuse it again, and a
+                // retry would invoke the remote tool again only to lose its
+                // result the same way: that refusal is definitive.
+                let refused = |error: rakka_agent_workflow::AgentArtifactError| match error {
+                    rakka_agent_workflow::AgentArtifactError::Refused { .. } => {
+                        AgentDispatchError::definitive(error.code(), error.to_string())
+                    }
+                    other => AgentDispatchError::collaborator(other.code(), other.to_string()),
                 };
                 let reference = self
                     .artifacts
@@ -859,11 +869,12 @@ fn attempt_deadline(intent: &AgentRunEffect, default_ms: u64) -> tokio::time::In
         .unwrap_or(now)
 }
 
-/// Runs one stage of the attempt under its deadline.
+/// Runs one stage of the attempt before `tools/call` is sent, under its
+/// deadline.
 ///
-/// Elapsed reads the same wherever it fired — the handshake, the listing, the
-/// call, or the mapping — because what the dispatcher learns is one fact: the
-/// attempt did not land inside the effect's window.
+/// Elapsed reads the same wherever it fired — the handshake or the recheck's
+/// listing — because the call was never sent: the attempt did not land, and
+/// nothing acted.
 async fn within<T>(
     deadline: tokio::time::Instant,
     work: impl Future<Output = T>,
@@ -874,6 +885,43 @@ async fn within<T>(
             code: "mcp-transport-failed",
             message: "the attempt exceeded the effect's timeout".to_string(),
         })
+}
+
+/// The stable code of an attempt whose `tools/call` was sent and whose
+/// answer was never read: the server may have acted.
+const MCP_OUTCOME_UNKNOWN: &str = "mcp-outcome-unknown";
+
+/// Runs the part of the attempt from the send of `tools/call` on, under the
+/// same deadline as [`within`].
+///
+/// Past the send the server may have acted, so a deadline that elapses here
+/// leaves the outcome unknown rather than failing the attempt.
+async fn within_after_send<T>(
+    deadline: tokio::time::Instant,
+    work: impl Future<Output = T>,
+) -> Result<T, AgentDispatchError> {
+    tokio::time::timeout_at(deadline, work).await.map_err(|_| {
+        AgentDispatchError::outcome_unknown(
+            MCP_OUTCOME_UNKNOWN,
+            "the attempt exceeded the effect's timeout after tools/call was sent",
+        )
+    })
+}
+
+/// Maps a failed `tools/call` onto the dispatch pipeline's error.
+///
+/// The request was sent, so a failure that left no answer to read leaves the
+/// outcome unknown. A JSON-RPC error is the server's own answer — it told us
+/// what it did — and keeps the mapping a failure before the send gets.
+fn sent_call_error(server: &str, error: &ServiceError) -> AgentDispatchError {
+    let mapped = client::service_error(server, error);
+    match error {
+        ServiceError::McpError(_) => dispatch_error(mapped),
+        _ => AgentDispatchError::outcome_unknown(
+            MCP_OUTCOME_UNKNOWN,
+            format!("tools/call was sent and no answer was read: {mapped}"),
+        ),
+    }
 }
 
 /// The `_meta` one call carries: the effect's idempotency key, and the trace
@@ -1053,7 +1101,9 @@ fn encoding_refused(error: serde_json::Error) -> AgentDispatchError {
 /// A transport or protocol failure is an *invocation* failure — the attempt
 /// ran and did not land — while every other variant is a collaborator refusal
 /// under its own stable code, including an egress refusal, which carries the
-/// host's code rather than one this crate invented.
+/// host's code rather than one this crate invented. An egress refusal the host
+/// declared not retryable is a definitive refusal, which exhausts the
+/// attempt's ticket at once.
 fn dispatch_error(error: McpClientError) -> AgentDispatchError {
     match &error {
         McpClientError::Transport { .. } | McpClientError::Protocol { .. } => {
@@ -1062,6 +1112,11 @@ fn dispatch_error(error: McpClientError) -> AgentDispatchError {
                 message: error.to_string(),
             }
         }
+        // The host declared the refusing condition permanent: retrying the
+        // attempt would only ask it again.
+        McpClientError::Egress {
+            retryable: false, ..
+        } => AgentDispatchError::definitive(error.code().to_string(), error.to_string()),
         other => AgentDispatchError::collaborator(other.code().to_string(), error.to_string()),
     }
 }

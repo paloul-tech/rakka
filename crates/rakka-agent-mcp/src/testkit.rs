@@ -97,6 +97,10 @@ pub enum FakeToolBehaviour {
         /// How long the tool takes before answering.
         millis: u64,
     },
+    /// Answers `tools/call` with a JSON-RPC error (internal error) carrying
+    /// this text, rather than with a result: the server answered, and what it
+    /// answered was an error.
+    RpcError(String),
 }
 
 /// One tool the fake server exposes.
@@ -209,6 +213,7 @@ struct FakeState {
     endless_pages: bool,
     calls: Vec<SeenCall>,
     last_headers: Vec<(String, String)>,
+    call_transport_failure: bool,
 }
 
 /// An in-process MCP server whose tools, identity, negotiated versions and
@@ -243,6 +248,7 @@ impl FakeMcpServer {
                 endless_pages: false,
                 calls: Vec::new(),
                 last_headers: Vec::new(),
+                call_transport_failure: false,
             })),
         }
     }
@@ -278,6 +284,17 @@ impl FakeMcpServer {
     #[must_use]
     pub fn with_list_delay(self, millis: u64) -> Self {
         self.lock().list_delay = Some(Duration::from_millis(millis));
+        self
+    }
+
+    /// Makes the transport fail on every `tools/call` after the tool has run:
+    /// the handler runs the call (it is counted in [`Self::seen_calls`] and
+    /// [`Self::call_count`]), and the HTTP response is replaced with
+    /// `502 Bad Gateway` — the shape of a connection or proxy that died after
+    /// the request arrived, leaving the client no answer to read.
+    #[must_use]
+    pub fn with_call_transport_failure(self) -> Self {
+        self.lock().call_transport_failure = true;
         self
     }
 
@@ -462,6 +479,9 @@ impl ServerHandler for FakeMcpServer {
                 None,
             ));
         };
+        if let FakeToolBehaviour::RpcError(text) = &behaviour {
+            return Err(McpError::internal_error(text.clone(), None));
+        }
         Ok(answer(behaviour, arguments).await)
     }
 }
@@ -497,6 +517,7 @@ async fn answer(behaviour: FakeToolBehaviour, arguments: Value) -> CallToolRespo
             tokio::time::sleep(Duration::from_millis(millis)).await;
             CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text("late")]))
         }
+        FakeToolBehaviour::RpcError(_) => unreachable!("answered as a JSON-RPC error by call_tool"),
     }
 }
 
@@ -573,7 +594,13 @@ async fn capture_headers(
         })
         .collect();
     server.record_headers(headers);
-    next.run(request).await
+    let calls_before = server.call_count();
+    let response = next.run(request).await;
+    let fail_the_answer = server.lock().call_transport_failure;
+    if fail_the_answer && server.call_count() > calls_before {
+        return axum::response::IntoResponse::into_response(axum::http::StatusCode::BAD_GATEWAY);
+    }
+    response
 }
 
 /// A [`StreamableHttpClient`] that counts every method it delegates.

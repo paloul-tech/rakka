@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rakka_agent::{
-    AgentAuthorityRefusal, AgentContentDigest, AgentDispatchToolExecutor, AgentEffectSafetyClass,
-    AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration, AgentToolId,
-    AgentToolResultBehavior,
+    AgentAuthorityRefusal, AgentContentDigest, AgentDispatchError, AgentDispatchToolExecutor,
+    AgentEffectSafetyClass, AgentTaskContent, AgentToolCallId, AgentToolCallRequest,
+    AgentToolDeclaration, AgentToolId, AgentToolResultBehavior,
 };
 use rakka_agent_mcp::testkit::{
     hardened_reqwest_client, serve_fake, CountingClient, FakeMcpServer, FakeTool,
@@ -880,7 +880,7 @@ async fn construction_is_offline_and_a_tool_without_a_descriptor_is_refused() {
 }
 
 #[tokio::test]
-async fn a_timeout_from_the_intent_bounds_the_call() {
+async fn a_timeout_after_the_call_was_sent_leaves_the_outcome_unknown() {
     let endpoint = serve_fake(FakeMcpServer::new().with_tool(FakeTool::new(
         "slow",
         "Slow.",
@@ -930,9 +930,19 @@ async fn a_timeout_from_the_intent_bounds_the_call() {
         "the timeout bounded the call"
     );
     assert!(
-        error.to_string().contains("mcp-transport-failed")
-            && error.to_string().contains(ATTEMPT_TIMED_OUT),
-        "{error}"
+        matches!(
+            &error,
+            AgentDispatchError::OutcomeUnknown {
+                code: "mcp-outcome-unknown",
+                ..
+            }
+        ),
+        "the call was sent and no answer was read: {error:?}"
+    );
+    assert_eq!(
+        endpoint.server.call_count(),
+        1,
+        "the server received the call"
     );
 }
 
@@ -1114,5 +1124,120 @@ async fn the_intents_timeout_bounds_a_handshake_that_is_never_answered() {
         error.to_string().contains("mcp-transport-failed")
             && error.to_string().contains(ATTEMPT_TIMED_OUT),
         "{error}"
+    );
+}
+
+struct RefuseTransiently;
+
+impl McpEgressCheck for RefuseTransiently {
+    fn check(&self, server: &McpServerId, _url: &str) -> Result<(), AgentAuthorityRefusal> {
+        Err(AgentAuthorityRefusal::transient(
+            "egress-temporarily-denied",
+            format!("{server} is not reachable right now"),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn an_egress_refusal_the_host_marks_definitive_is_definitive() {
+    let endpoint = serve_fake(fake()).await;
+    let (executor, _, _) = executor_over(binding(&endpoint.url), Arc::new(RefuseAll)).await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(5_000)),
+            &call("echo", json!({})),
+            None,
+        )
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(&error, AgentDispatchError::Definitive { code, .. } if code == "egress-denied-by-policy"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_egress_refusal_the_host_marks_retryable_stays_retryable() {
+    let endpoint = serve_fake(fake()).await;
+    let (executor, _, _) = executor_over(binding(&endpoint.url), Arc::new(RefuseTransiently)).await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(5_000)),
+            &call("echo", json!({})),
+            None,
+        )
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(&error, AgentDispatchError::Collaborator { code, .. } if code == "egress-temporarily-denied"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_transport_failure_after_the_call_was_sent_leaves_the_outcome_unknown() {
+    let endpoint = serve_fake(fake().with_call_transport_failure()).await;
+    let (executor, _, _) = executor_over(binding(&endpoint.url), Arc::new(McpAllowAllEgress)).await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(5_000)),
+            &call("echo", json!({})),
+            None,
+        )
+        .await
+        .expect_err("the answer was lost");
+    assert!(
+        matches!(
+            &error,
+            AgentDispatchError::OutcomeUnknown {
+                code: "mcp-outcome-unknown",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(endpoint.server.call_count(), 1, "the tool ran");
+}
+
+#[tokio::test]
+async fn a_json_rpc_error_answer_is_a_known_outcome() {
+    let endpoint = serve_fake(fake().with_tool(FakeTool::new(
+        "broken",
+        "Answers with a JSON-RPC error.",
+        json!({"type":"object"}),
+        FakeToolBehaviour::RpcError("the tool backend is down".to_string()),
+    )))
+    .await;
+    let binding = McpServerBinding::streamable_http(server_id(), &endpoint.url)
+        .with_tool(
+            "broken",
+            policy(
+                AgentEffectSafetyClass::NonIdempotent,
+                AgentToolResultBehavior::InlineBounded,
+            ),
+        )
+        .expect("t");
+    let (executor, _, _) = executor_over(binding, Arc::new(McpAllowAllEgress)).await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.broken", Some(5_000)),
+            &call("broken", json!({})),
+            None,
+        )
+        .await
+        .expect_err("the server answered with an error");
+    assert!(
+        matches!(
+            &error,
+            AgentDispatchError::Invocation {
+                code: "mcp-transport-failed",
+                ..
+            }
+        ),
+        "the server answered, so the outcome is known: {error:?}"
     );
 }

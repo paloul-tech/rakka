@@ -153,6 +153,10 @@ leaves behind is the same either way.
    (`McpArtifactSink`), handed the run it belongs to. A sync refuses a listing
    whose server text echoes the credential it sent, and runs under a time
    bound (`MCP_SYNC_TIMEOUT_DEFAULT_MS`, or the caller's own).
+   A call whose request was sent and whose answer was lost has an unknown
+   outcome and is settled by its safety class — a non-idempotent tool parks
+   for reconciliation — and a refusal the deployment declares definitive (a
+   non-retryable egress refusal, an artifact store's refusal) is not retried.
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect

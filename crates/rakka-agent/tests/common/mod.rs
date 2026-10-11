@@ -2685,6 +2685,9 @@ pub struct AuthorityFixture {
     /// authorize and attempt segments — when a test wires one; see
     /// [`AuthorityFixture::with_dispatch_segments`].
     pub dispatch_segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
+    /// The reconciler the pipeline asks about an ambiguous attempt, when a
+    /// test wires one — see [`AuthorityFixture::with_reconciler`].
+    pub reconciler: Option<Arc<dyn rakka_agent::AgentEffectReconciler>>,
 }
 
 impl AuthorityFixture {
@@ -2737,6 +2740,7 @@ impl AuthorityFixture {
             expire_grants: false,
             fixed_refusal: None,
             dispatch_segments: None,
+            reconciler: None,
         }
     }
 
@@ -2885,6 +2889,16 @@ impl AuthorityFixture {
     /// in a real deployment. The attempt segment is the one that brackets the
     /// external call with a resolved credential live, so a sweep that means
     /// to cover it wires this as well.
+    /// Wires the reconciler the dispatch pipeline queries for a
+    /// `Reconcileable` effect whose outcome is unknown.
+    pub fn with_reconciler(
+        mut self,
+        reconciler: Arc<dyn rakka_agent::AgentEffectReconciler>,
+    ) -> Self {
+        self.reconciler = Some(reconciler);
+        self
+    }
+
     pub fn with_dispatch_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
         self.dispatch_segments = Some(sink);
         self
@@ -3031,6 +3045,9 @@ impl AuthorityFixture {
         }
         if let Some(metrics) = &self.fx.metrics {
             pipeline = pipeline.with_metrics(metrics.clone());
+        }
+        if let Some(reconciler) = &self.reconciler {
+            pipeline = pipeline.with_reconciler(reconciler.clone());
         }
         pipeline
     }

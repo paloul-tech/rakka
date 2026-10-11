@@ -36,12 +36,16 @@ use rakka_agent_mcp::testkit::{
     FakeToolBehaviour, ReqwestClient,
 };
 use rakka_agent_mcp::{
-    mcp_artifact_store, sync_mcp_descriptors, McpAllowAllEgress, McpDescriptorSet,
-    McpDispatchToolExecutor, McpEgressCheck, McpServerBinding, McpServerId, McpToolPolicy,
-    MCP_INLINE_RESULT_MAX_BYTES, MCP_META_IDEMPOTENCY_KEY,
+    mcp_artifact_store, sync_mcp_descriptors, McpAllowAllEgress, McpArtifactFuture,
+    McpArtifactSink, McpArtifacts, McpDescriptorSet, McpDispatchToolExecutor, McpEgressCheck,
+    McpServerBinding, McpServerId, McpToolPolicy, MCP_INLINE_RESULT_MAX_BYTES,
+    MCP_META_IDEMPOTENCY_KEY,
 };
 use rakka_agent_workflow::substrate::OutboxStatus;
-use rakka_agent_workflow::{validate_artifact_ref, AgentEphemeralCredential, AgentTimestampMillis};
+use rakka_agent_workflow::{
+    validate_artifact_ref, AgentArtifactError, AgentArtifactWriteRequest, AgentEphemeralCredential,
+    AgentTimestampMillis,
+};
 use serde_json::{json, Value};
 
 mod common;
@@ -267,6 +271,29 @@ impl McpWorld {
         egress: Arc<dyn McpEgressCheck>,
         sync_credential: Option<&AgentEphemeralCredential>,
     ) -> Self {
+        let store = SharedArtifactStore::default();
+        Self::assemble_with_artifacts(
+            fake,
+            binding_of,
+            egress,
+            sync_credential,
+            mcp_artifact_store(store.clone()),
+            store,
+        )
+        .await
+    }
+
+    /// As [`Self::assemble`], writing over-large results through
+    /// `artifacts`; `store` is what [`Self::artifacts`] reads, so a caller
+    /// whose sink writes elsewhere passes an empty one.
+    async fn assemble_with_artifacts(
+        fake: FakeMcpServer,
+        binding_of: impl FnOnce(&str) -> McpServerBinding,
+        egress: Arc<dyn McpEgressCheck>,
+        sync_credential: Option<&AgentEphemeralCredential>,
+        artifacts: impl Into<McpArtifacts>,
+        store: SharedArtifactStore,
+    ) -> Self {
         let endpoint = serve_fake(fake).await;
         let binding = binding_of(&endpoint.url);
         let http = hardened_reqwest_client();
@@ -279,11 +306,10 @@ impl McpWorld {
         )
         .await
         .expect("the publish-time sync reads the fake");
-        let artifacts = SharedArtifactStore::default();
         let executor = McpDispatchToolExecutor::new(
             vec![set.clone()],
             vec![binding.clone()],
-            mcp_artifact_store(artifacts.clone()),
+            artifacts,
             http,
             egress,
         )
@@ -293,7 +319,7 @@ impl McpWorld {
             binding,
             set,
             executor: Arc::new(executor),
-            artifacts,
+            artifacts: store,
             session: Arc::new(InMemorySessionMemoryStore::new()),
         }
     }
@@ -1083,4 +1109,118 @@ async fn a_credential_the_server_echoes_into_its_error_text_is_redacted_before_i
     let surfaces = fx.durable_surfaces().await;
     assert_surface_holds(&surfaces, "fleet", "<redacted>");
     assert_absent_from(&surfaces, ECHOED);
+}
+
+// ---------------------------------------------------------------------------
+// Definitive refusals (issue #85, asks 14 and 15).
+// ---------------------------------------------------------------------------
+
+/// A deployment's artifact store that refuses every write and always will.
+struct RefusingSink;
+
+impl McpArtifactSink for RefusingSink {
+    fn put_result<'a>(
+        &'a self,
+        _scope: &'a rakka_agent::AgentRunScope,
+        _request: AgentArtifactWriteRequest,
+    ) -> McpArtifactFuture<'a> {
+        Box::pin(async move {
+            Err(AgentArtifactError::Refused {
+                message: "the result is larger than this store accepts".to_string(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_definitive_egress_refusal_exhausts_a_multi_attempt_budget_at_once() {
+    // An idempotent declaration carries two attempts in this suite, so a
+    // retryable refusal would be tried twice.
+    let world = McpWorld::build(AgentEffectSafetyClass::Idempotent, Arc::new(RefuseAll)).await;
+    let fx = world.fixture(ECHO, json!({ "q": "refunds" }));
+    let committed = start_and_commit_the_tool_call(&fx).await;
+    assert_eq!(committed.max_attempts, 2);
+
+    fx.one_pass().await;
+
+    let row = fx.outbox_row(&committed).await.expect("the ticket's row");
+    assert_eq!(row.status(), OutboxStatus::Exhausted);
+    assert_eq!(row.attempts().attempts(), 1, "one attempt, not two");
+    assert_eq!(world.endpoint.server.call_count(), 0, "no connection");
+}
+
+#[tokio::test]
+async fn a_refused_artifact_write_invokes_the_remote_tool_exactly_once() {
+    let world = McpWorld::assemble_with_artifacts(
+        fake_server(),
+        |url| server_binding(url, AgentEffectSafetyClass::Idempotent),
+        Arc::new(McpAllowAllEgress),
+        None,
+        McpArtifacts::sink(RefusingSink),
+        SharedArtifactStore::default(),
+    )
+    .await;
+    let fx = world.fixture(BIG, json!({}));
+    let committed = start_and_commit_the_tool_call(&fx).await;
+
+    fx.one_pass().await;
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(
+        world.endpoint.server.call_count(),
+        1,
+        "the store's refusal is definitive: the tool is not invoked again"
+    );
+    let row = fx.outbox_row(&committed).await.expect("the ticket's row");
+    assert_eq!(row.status(), OutboxStatus::Exhausted);
+    assert_eq!(row.attempts().attempts(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// An unknown outcome (issue #85, ask 7).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_non_idempotent_call_whose_answer_never_arrives_parks_for_reconciliation() {
+    let world = McpWorld::assemble(
+        fake_server().with_tool(FakeTool::new(
+            "slow",
+            "Answers after the attempt's deadline.",
+            json!({"type": "object"}),
+            FakeToolBehaviour::Sleep { millis: 10_000 },
+        )),
+        |url| {
+            server_binding(url, AgentEffectSafetyClass::NonIdempotent)
+                .with_tool(
+                    "slow",
+                    policy(
+                        AgentEffectSafetyClass::NonIdempotent,
+                        AgentToolResultBehavior::InlineBounded,
+                    )
+                    .with_timeout_ms(300),
+                )
+                .expect("the slow tool binds")
+        },
+        Arc::new(McpAllowAllEgress),
+        None,
+    )
+    .await;
+    let fx = world.fixture("mcp.crm.slow", json!({}));
+    start_and_commit_the_tool_call(&fx).await;
+
+    let pass = fx.one_pass().await;
+
+    assert_eq!(pass.parked_indeterminate, 1, "{pass:?}");
+    let parked = fx.effect_at(TOOL_SLOT).await.expect("the parked effect");
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    assert_eq!(
+        parked.last_error_code.as_deref(),
+        Some("mcp-outcome-unknown")
+    );
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run").status,
+        AgentRunStatus::WaitingForReconciliation
+    );
+    assert_eq!(world.endpoint.server.call_count(), 1);
 }

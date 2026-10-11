@@ -233,7 +233,8 @@ fn bounded_failure_line(prefix: &str, code: &str, detail: &str) -> String {
 /// it is bounded here because a collaborator supplies it.
 fn collaborator_code(error: &AgentDispatchError) -> String {
     match error {
-        AgentDispatchError::Collaborator { code, .. } => bounded_failure_code(code),
+        AgentDispatchError::Collaborator { code, .. }
+        | AgentDispatchError::Definitive { code, .. } => bounded_failure_code(code),
         other => other.code().to_string(),
     }
 }
@@ -243,7 +244,7 @@ fn collaborator_code(error: &AgentDispatchError) -> String {
 /// code already is the whole identity.
 fn collaborator_reason(error: &AgentDispatchError) -> Option<crate::failure::AgentFailureReason> {
     match error {
-        AgentDispatchError::Collaborator { .. } => {
+        AgentDispatchError::Collaborator { .. } | AgentDispatchError::Definitive { .. } => {
             crate::failure::AgentFailureReason::new(collaborator_code(error))
         }
         _ => None,
@@ -376,6 +377,22 @@ where
 /// ([`AgentRunEffectDispatcher::write_outbox`]).
 const INBOX_WRITE_REAPPLICATIONS: u32 = 3;
 
+/// Why an attempt's outcome is unknown, as the ambiguity recovery records it
+/// when it burns the attempt: the line the outbox row keeps, and the code the
+/// run's record carries if the burned attempts spend the budget.
+struct Ambiguity<'a> {
+    /// The stable code an exhausted generation is recorded under.
+    code: &'a str,
+    /// The failure line the burned attempt's outbox row keeps.
+    line: &'a str,
+}
+
+/// The ambiguity of an attempt whose worker was lost after `Started`.
+const WORKER_LOST: Ambiguity<'static> = Ambiguity {
+    code: "dispatcher-lost-after-started",
+    line: "dispatcher lost after started",
+};
+
 /// One of the dispatcher's own writes to a run's inbox store.
 ///
 /// Each names what to write, never the record it is written against, so a
@@ -395,6 +412,11 @@ enum InboxWrite<'a> {
         /// Whether the attempt timed out.
         timed_out: bool,
     },
+    /// A definitive failure's record, exhausting the entry on this attempt.
+    Exhausted {
+        /// The bounded failure line the row keeps.
+        line: &'a str,
+    },
     /// A ticket's settlement as cancelled.
     Cancelled {
         /// The bounded settle reason.
@@ -411,6 +433,7 @@ impl InboxWrite<'_> {
             Self::Dispatching => "dispatching",
             Self::Succeeded => "succeeded",
             Self::Failed { .. } => "failed",
+            Self::Exhausted { .. } => "exhausted",
             Self::Cancelled { .. } => "cancelled",
         }
     }
@@ -2458,6 +2481,11 @@ where
                     .record_outbox_failure(message_id, *line, *timed_out)
                     .await
                     .map(Some),
+                InboxWrite::Exhausted { line } => inbox
+                    .inner_mut()
+                    .record_outbox_exhausted(message_id, *line)
+                    .await
+                    .map(Some),
                 InboxWrite::Cancelled { reason } => {
                     inbox
                         .inner_mut()
@@ -2978,6 +3006,7 @@ where
                                 // above already logs: a stable identifier,
                                 // never the resolver's words.
                                 crate::failure::AgentFailureReason::new(collaborator_code(&error)),
+                                false,
                                 pass,
                             )
                             .await;
@@ -3054,6 +3083,11 @@ where
 
         let outcome = match invoked {
             Ok(outcome) => outcome,
+            Err(error @ AgentDispatchError::OutcomeUnknown { .. }) => {
+                return self
+                    .settle_unknown_outcome(scope, claim, state, intent, attempt, &error, pass)
+                    .await;
+            }
             Err(error) => {
                 return self
                     .record_attempt_failure(
@@ -3064,6 +3098,7 @@ where
                         error.code(),
                         &error.to_string(),
                         collaborator_reason(&error),
+                        matches!(error, AgentDispatchError::Definitive { .. }),
                         pass,
                     )
                     .await;
@@ -3117,7 +3152,7 @@ where
                     .await?;
                     return Ok(ClaimConclusion::Settled);
                 }
-                self.retry_ambiguous(scope, claim, state, intent, pass)
+                self.retry_ambiguous(scope, claim, state, intent, &WORKER_LOST, pass)
                     .await
             }
             AgentEffectSafetyClass::Idempotent => {
@@ -3126,12 +3161,21 @@ where
                 // generation hands the target the same one. Under a wind-down
                 // the retry still runs: it is the truthful way to learn what
                 // the ambiguous attempt did, and the target deduplicates it.
-                self.retry_ambiguous(scope, claim, state, intent, pass)
+                self.retry_ambiguous(scope, claim, state, intent, &WORKER_LOST, pass)
                     .await
             }
             AgentEffectSafetyClass::Reconcileable => {
-                self.reconcile_ambiguous(scope, claim, state, intent, attempt, winding_down, pass)
-                    .await
+                self.reconcile_ambiguous(
+                    scope,
+                    claim,
+                    state,
+                    intent,
+                    attempt,
+                    winding_down,
+                    &WORKER_LOST,
+                    pass,
+                )
+                .await
             }
             AgentEffectSafetyClass::NonIdempotent => {
                 // Exactly one durable Indeterminate, and no automatic
@@ -3161,14 +3205,81 @@ where
         }
     }
 
+    /// Settles an attempt whose executor reported that the target may have
+    /// acted and the outcome is unknown, by the intent's safety class
+    /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)): the
+    /// table [`Self::recover_ambiguous`] applies to an attempt whose worker
+    /// died after `Started`, with the executor's code in place of the
+    /// worker-loss code.
+    ///
+    /// A read-only or idempotent effect records a failed attempt and is
+    /// retried under its budget with the same idempotency key, exactly as an
+    /// invocation failure is; a reconcileable one asks the reconciler now; a
+    /// non-idempotent one parks for reconciliation and is never re-invoked.
+    /// This runs only from a fresh attempt, which the wind-down fence has
+    /// already admitted, so the worker-loss path's wind-down arm does not
+    /// apply.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_unknown_outcome(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: AgentDispatchClaim,
+        state: &AgentRunState,
+        intent: &AgentRunEffect,
+        attempt: u32,
+        error: &AgentDispatchError,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        let AgentDispatchError::OutcomeUnknown { code, message } = error else {
+            unreachable!("only an unknown outcome is settled here");
+        };
+        match intent.safety.class() {
+            AgentEffectSafetyClass::ReadOnly | AgentEffectSafetyClass::Idempotent => {
+                self.record_attempt_failure(
+                    scope,
+                    &claim,
+                    intent,
+                    attempt,
+                    code,
+                    &error.to_string(),
+                    None,
+                    false,
+                    pass,
+                )
+                .await
+            }
+            AgentEffectSafetyClass::Reconcileable => {
+                // An attempt the reconciliation finds not executed is burned
+                // under the executor's code, not a lost dispatcher's.
+                let line = bounded_failure_line("", code, message);
+                let ambiguity = Ambiguity { code, line: &line };
+                // Boxed: a reconciliation that finds the effect not executed
+                // re-invokes through `retry_ambiguous`, which reaches
+                // `attempt_invocation` and so this function again. Each lap
+                // spends an attempt first, so the depth is bounded by the
+                // effect's budget; the box only gives the future a size.
+                Box::pin(self.reconcile_ambiguous(
+                    scope, claim, state, intent, attempt, false, &ambiguity, pass,
+                ))
+                .await
+            }
+            AgentEffectSafetyClass::NonIdempotent => {
+                self.park_indeterminate(scope, claim, intent, attempt, code, message, pass)
+                    .await
+            }
+        }
+    }
+
     /// Burns one attempt for the ambiguous loss, then — if the intent's budget
-    /// still permits — re-invokes.
+    /// still permits — re-invokes. `ambiguity` names why the outcome was
+    /// unknown: the row's line, and the code an exhausted generation carries.
     async fn retry_ambiguous(
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
         state: &AgentRunState,
         intent: &AgentRunEffect,
+        ambiguity: &Ambiguity<'_>,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let timer = AgentSegmentTimer::start(self.now());
@@ -3178,7 +3289,7 @@ where
                 scope,
                 &message_id,
                 InboxWrite::Failed {
-                    line: "dispatcher lost after started",
+                    line: ambiguity.line,
                     timed_out: true,
                 },
             )
@@ -3190,7 +3301,7 @@ where
             let attempts = *attempts;
             self.fleet.record_claim_failure(&claim, &event).await?;
             let outcome = AgentRunEffectOutcome::exhausted(
-                "dispatcher-lost-after-started".to_string(),
+                ambiguity.code.to_string(),
                 "the retry budget was spent recovering ambiguous attempts".to_string(),
             );
             let status = outcome.resolved_status();
@@ -3210,7 +3321,7 @@ where
                     })
                     .attribute(SEGMENT_ATTR_EFFECT_STATUS, status.as_label())
                     .attribute(SEGMENT_ATTR_EFFECT_ATTEMPT, attempts.to_string())
-                    .failed("rakka.agent.effect", "dispatcher-lost-after-started"),
+                    .failed("rakka.agent.effect", ambiguity.code),
             );
             return Ok(ClaimConclusion::Settled);
         }
@@ -3245,6 +3356,7 @@ where
         intent: &AgentRunEffect,
         attempt: u32,
         winding_down: bool,
+        ambiguity: &Ambiguity<'_>,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let Some(protocol) = intent.safety.reconciliation_protocol().cloned() else {
@@ -3307,7 +3419,7 @@ where
                     return Ok(ClaimConclusion::Settled);
                 }
                 // Proven absent: a retry is a fresh invocation, under budget.
-                self.retry_ambiguous(scope, claim, state, intent, pass)
+                self.retry_ambiguous(scope, claim, state, intent, ambiguity, pass)
                     .await
             }
             AgentReconciliationFinding::Unknown => {
@@ -3552,6 +3664,10 @@ where
     /// `reason` is the collaborator's own code, when a collaborator failed the
     /// attempt; it rides the `Exhausted` word to the run's record and is
     /// written nowhere else.
+    ///
+    /// A `definitive` failure exhausts the entry on this attempt, whatever
+    /// budget remains; it then follows the exhausted branch below exactly as
+    /// a spent budget does.
     #[allow(clippy::too_many_arguments)]
     async fn record_attempt_failure(
         &mut self,
@@ -3562,6 +3678,7 @@ where
         code: &str,
         message: &str,
         reason: Option<crate::failure::AgentFailureReason>,
+        definitive: bool,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
@@ -3572,15 +3689,16 @@ where
         let code = bounded_failure_code(code);
         let detail = bounded_failure_detail(message);
         let line = bounded_failure_line("", &code, &detail);
+        let write = if definitive {
+            InboxWrite::Exhausted { line: &line }
+        } else {
+            InboxWrite::Failed {
+                line: &line,
+                timed_out: false,
+            }
+        };
         let event = self
-            .write_outbox(
-                scope,
-                &message_id,
-                InboxWrite::Failed {
-                    line: &line,
-                    timed_out: false,
-                },
-            )
+            .write_outbox(scope, &message_id, write)
             .await?
             .expect("a failure record answers its event");
         pass.failed_attempts += 1;
@@ -4421,6 +4539,34 @@ pub enum AgentDispatchError {
         /// The failure detail.
         message: String,
     },
+    /// A collaborator refused, and retrying cannot change its answer: the
+    /// attempt's ticket is exhausted on this attempt, whatever budget the
+    /// effect has left.
+    ///
+    /// The collaborator's own code rides the failure detail and the
+    /// failure's reason exactly as a [`Self::Collaborator`] code does, and
+    /// [`Self::code`] is the same pipeline code, so a definitive refusal ends
+    /// in the state a retryable one reaches once its budget is spent — only
+    /// sooner.
+    Definitive {
+        /// Stable machine-readable code: the collaborator's own.
+        code: String,
+        /// The failure detail. It becomes durable state: no credential,
+        /// argument, or content material.
+        message: String,
+    },
+    /// The attempt may have invoked the target and its outcome is unknown:
+    /// the request left and no answer was read. The dispatcher settles it by
+    /// the intent's safety class, as it settles an attempt whose worker died
+    /// after `Started`
+    /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
+    OutcomeUnknown {
+        /// Stable machine-readable code: the executor's own.
+        code: &'static str,
+        /// The failure detail. It becomes durable state: no credential,
+        /// argument, or content material.
+        message: String,
+    },
 }
 
 impl AgentDispatchError {
@@ -4436,8 +4582,8 @@ impl AgentDispatchError {
             Self::Run(error) => error.code(),
             Self::Effect(error) => error.code(),
             Self::TicketUndecodable { .. } => "dispatch-ticket-undecodable",
-            Self::Invocation { code, .. } => code,
-            Self::Collaborator { .. } => "dispatch-collaborator-failed",
+            Self::Invocation { code, .. } | Self::OutcomeUnknown { code, .. } => code,
+            Self::Collaborator { .. } | Self::Definitive { .. } => "dispatch-collaborator-failed",
         }
     }
 
@@ -4446,6 +4592,24 @@ impl AgentDispatchError {
     pub fn collaborator(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Collaborator {
             code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// A collaborator's definitive refusal: one retrying cannot change.
+    #[must_use]
+    pub fn definitive(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Definitive {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// An attempt that may have invoked the target, whose outcome is unknown.
+    #[must_use]
+    pub fn outcome_unknown(code: &'static str, message: impl Into<String>) -> Self {
+        Self::OutcomeUnknown {
+            code,
             message: message.into(),
         }
     }
@@ -4469,6 +4633,15 @@ impl Display for AgentDispatchError {
             }
             Self::Collaborator { code, message } => {
                 write!(f, "a dispatch collaborator failed ({code}): {message}")
+            }
+            Self::Definitive { code, message } => {
+                write!(
+                    f,
+                    "a dispatch collaborator refused definitively ({code}): {message}"
+                )
+            }
+            Self::OutcomeUnknown { code, message } => {
+                write!(f, "the invocation's outcome is unknown ({code}): {message}")
             }
         }
     }

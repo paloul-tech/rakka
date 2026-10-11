@@ -1258,6 +1258,14 @@ For a non-idempotent ambiguous attempt, the run MUST transition to
 `WaitingForReconciliation`, all automatic dispatch eligibility for that effect
 MUST be revoked, and a reconciliation checkpoint MUST be opened.
 
+An executor that knows an attempt may have invoked the target and could not
+read its outcome — a request sent and no answer read — reports the attempt's
+outcome as unknown, and the dispatcher MUST settle it by this table exactly as
+it settles an attempt whose worker was lost after `Started`. A collaborator
+MAY instead declare a failure definitive: the dispatcher then MUST NOT retry
+it, and the generation's budget is spent on that attempt. (Issue #85, asks 7
+and 14, 2026-10-11.)
+
 Cancellation does not prove that a started external effect was cancelled. An
 ambiguous non-idempotent effect remains subject to reconciliation even if the
 run has received a cancellation request.
