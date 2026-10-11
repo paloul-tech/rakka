@@ -214,8 +214,7 @@ async fn validate_answers_the_typed_refusal_and_the_executor_refuses_the_set() {
         hardened_reqwest_client(),
         Arc::new(McpAllowAllEgress),
     )
-    .err()
-    .expect("construction refuses a set built in code");
+    .expect_err("construction refuses a set built in code");
     assert_eq!(refused.code(), "mcp-descriptor-set-invalid");
 }
 
