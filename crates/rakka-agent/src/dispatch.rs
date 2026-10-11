@@ -233,7 +233,8 @@ fn bounded_failure_line(prefix: &str, code: &str, detail: &str) -> String {
 /// it is bounded here because a collaborator supplies it.
 fn collaborator_code(error: &AgentDispatchError) -> String {
     match error {
-        AgentDispatchError::Collaborator { code, .. } => bounded_failure_code(code),
+        AgentDispatchError::Collaborator { code, .. }
+        | AgentDispatchError::Definitive { code, .. } => bounded_failure_code(code),
         other => other.code().to_string(),
     }
 }
@@ -243,7 +244,7 @@ fn collaborator_code(error: &AgentDispatchError) -> String {
 /// code already is the whole identity.
 fn collaborator_reason(error: &AgentDispatchError) -> Option<crate::failure::AgentFailureReason> {
     match error {
-        AgentDispatchError::Collaborator { .. } => {
+        AgentDispatchError::Collaborator { .. } | AgentDispatchError::Definitive { .. } => {
             crate::failure::AgentFailureReason::new(collaborator_code(error))
         }
         _ => None,
@@ -395,6 +396,11 @@ enum InboxWrite<'a> {
         /// Whether the attempt timed out.
         timed_out: bool,
     },
+    /// A definitive failure's record, exhausting the entry on this attempt.
+    Exhausted {
+        /// The bounded failure line the row keeps.
+        line: &'a str,
+    },
     /// A ticket's settlement as cancelled.
     Cancelled {
         /// The bounded settle reason.
@@ -411,6 +417,7 @@ impl InboxWrite<'_> {
             Self::Dispatching => "dispatching",
             Self::Succeeded => "succeeded",
             Self::Failed { .. } => "failed",
+            Self::Exhausted { .. } => "exhausted",
             Self::Cancelled { .. } => "cancelled",
         }
     }
@@ -2458,6 +2465,11 @@ where
                     .record_outbox_failure(message_id, *line, *timed_out)
                     .await
                     .map(Some),
+                InboxWrite::Exhausted { line } => inbox
+                    .inner_mut()
+                    .record_outbox_exhausted(message_id, *line)
+                    .await
+                    .map(Some),
                 InboxWrite::Cancelled { reason } => {
                     inbox
                         .inner_mut()
@@ -2978,6 +2990,7 @@ where
                                 // above already logs: a stable identifier,
                                 // never the resolver's words.
                                 crate::failure::AgentFailureReason::new(collaborator_code(&error)),
+                                false,
                                 pass,
                             )
                             .await;
@@ -3064,6 +3077,7 @@ where
                         error.code(),
                         &error.to_string(),
                         collaborator_reason(&error),
+                        matches!(error, AgentDispatchError::Definitive { .. }),
                         pass,
                     )
                     .await;
@@ -3552,6 +3566,10 @@ where
     /// `reason` is the collaborator's own code, when a collaborator failed the
     /// attempt; it rides the `Exhausted` word to the run's record and is
     /// written nowhere else.
+    ///
+    /// A `definitive` failure exhausts the entry on this attempt, whatever
+    /// budget remains; it then follows the exhausted branch below exactly as
+    /// a spent budget does.
     #[allow(clippy::too_many_arguments)]
     async fn record_attempt_failure(
         &mut self,
@@ -3562,6 +3580,7 @@ where
         code: &str,
         message: &str,
         reason: Option<crate::failure::AgentFailureReason>,
+        definitive: bool,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
@@ -3572,15 +3591,16 @@ where
         let code = bounded_failure_code(code);
         let detail = bounded_failure_detail(message);
         let line = bounded_failure_line("", &code, &detail);
+        let write = if definitive {
+            InboxWrite::Exhausted { line: &line }
+        } else {
+            InboxWrite::Failed {
+                line: &line,
+                timed_out: false,
+            }
+        };
         let event = self
-            .write_outbox(
-                scope,
-                &message_id,
-                InboxWrite::Failed {
-                    line: &line,
-                    timed_out: false,
-                },
-            )
+            .write_outbox(scope, &message_id, write)
             .await?
             .expect("a failure record answers its event");
         pass.failed_attempts += 1;
@@ -4421,6 +4441,22 @@ pub enum AgentDispatchError {
         /// The failure detail.
         message: String,
     },
+    /// A collaborator refused, and retrying cannot change its answer: the
+    /// attempt's ticket is exhausted on this attempt, whatever budget the
+    /// effect has left.
+    ///
+    /// The collaborator's own code rides the failure detail and the
+    /// failure's reason exactly as a [`Self::Collaborator`] code does, and
+    /// [`Self::code`] is the same pipeline code, so a definitive refusal ends
+    /// in the state a retryable one reaches once its budget is spent — only
+    /// sooner.
+    Definitive {
+        /// Stable machine-readable code: the collaborator's own.
+        code: String,
+        /// The failure detail. It becomes durable state: no credential,
+        /// argument, or content material.
+        message: String,
+    },
 }
 
 impl AgentDispatchError {
@@ -4437,7 +4473,7 @@ impl AgentDispatchError {
             Self::Effect(error) => error.code(),
             Self::TicketUndecodable { .. } => "dispatch-ticket-undecodable",
             Self::Invocation { code, .. } => code,
-            Self::Collaborator { .. } => "dispatch-collaborator-failed",
+            Self::Collaborator { .. } | Self::Definitive { .. } => "dispatch-collaborator-failed",
         }
     }
 
@@ -4445,6 +4481,15 @@ impl AgentDispatchError {
     #[must_use]
     pub fn collaborator(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Collaborator {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// A collaborator's definitive refusal: one retrying cannot change.
+    #[must_use]
+    pub fn definitive(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Definitive {
             code: code.into(),
             message: message.into(),
         }
@@ -4469,6 +4514,12 @@ impl Display for AgentDispatchError {
             }
             Self::Collaborator { code, message } => {
                 write!(f, "a dispatch collaborator failed ({code}): {message}")
+            }
+            Self::Definitive { code, message } => {
+                write!(
+                    f,
+                    "a dispatch collaborator refused definitively ({code}): {message}"
+                )
             }
         }
     }
