@@ -279,7 +279,6 @@ impl<Req, Resp> GrpcBidiStreaming<Req, Resp> {
     }
 
     /// Consumes this bridge into its Rakka endpoints, response stream, and pump handle.
-    #[must_use]
     pub fn into_parts(
         mut self,
     ) -> (
