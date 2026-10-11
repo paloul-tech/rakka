@@ -48,6 +48,8 @@ enum SinkMode {
     HugeUri,
     /// The store refuses the write and always will.
     Refusing,
+    /// The store takes longer than any attempt's deadline.
+    Slow,
 }
 
 /// One write, as the sink saw it.
@@ -85,6 +87,9 @@ impl McpArtifactSink for RecordingSink {
         request: AgentArtifactWriteRequest,
     ) -> McpArtifactFuture<'a> {
         Box::pin(async move {
+            if self.mode == SinkMode::Slow {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
             self.seen.lock().expect("the sink's log").push(SeenWrite {
                 scope_key: scope.key(),
                 request: request.clone(),
@@ -458,5 +463,34 @@ async fn a_sink_that_is_down_fails_the_attempt_retryably() {
     assert!(
         matches!(&error, AgentDispatchError::Collaborator { code, .. } if code == "artifact-store"),
         "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_deadline_that_elapses_while_the_answer_is_stored_leaves_the_outcome_unknown() {
+    let endpoint = serve_fake(fake()).await;
+    let executor = executor_over(
+        &endpoint.url,
+        McpArtifacts::sink(RecordingSink::new(SinkMode::Slow)),
+    )
+    .await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.big", Some(300)),
+            &call("big"),
+            None,
+        )
+        .await
+        .expect_err("the deadline elapsed while the result was being stored");
+    assert!(
+        matches!(
+            &error,
+            AgentDispatchError::OutcomeUnknown {
+                code: "mcp-outcome-unknown",
+                ..
+            }
+        ),
+        "the server had answered: {error:?}"
     );
 }

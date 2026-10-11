@@ -1176,3 +1176,51 @@ async fn a_refused_artifact_write_invokes_the_remote_tool_exactly_once() {
     assert_eq!(row.status(), OutboxStatus::Exhausted);
     assert_eq!(row.attempts().attempts(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// An unknown outcome (issue #85, ask 7).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_non_idempotent_call_whose_answer_never_arrives_parks_for_reconciliation() {
+    let world = McpWorld::assemble(
+        fake_server().with_tool(FakeTool::new(
+            "slow",
+            "Answers after the attempt's deadline.",
+            json!({"type": "object"}),
+            FakeToolBehaviour::Sleep { millis: 10_000 },
+        )),
+        |url| {
+            server_binding(url, AgentEffectSafetyClass::NonIdempotent)
+                .with_tool(
+                    "slow",
+                    policy(
+                        AgentEffectSafetyClass::NonIdempotent,
+                        AgentToolResultBehavior::InlineBounded,
+                    )
+                    .with_timeout_ms(300),
+                )
+                .expect("the slow tool binds")
+        },
+        Arc::new(McpAllowAllEgress),
+        None,
+    )
+    .await;
+    let fx = world.fixture("mcp.crm.slow", json!({}));
+    start_and_commit_the_tool_call(&fx).await;
+
+    let pass = fx.one_pass().await;
+
+    assert_eq!(pass.parked_indeterminate, 1, "{pass:?}");
+    let parked = fx.effect_at(TOOL_SLOT).await.expect("the parked effect");
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    assert_eq!(
+        parked.last_error_code.as_deref(),
+        Some("mcp-outcome-unknown")
+    );
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run").status,
+        AgentRunStatus::WaitingForReconciliation
+    );
+    assert_eq!(world.endpoint.server.call_count(), 1);
+}
