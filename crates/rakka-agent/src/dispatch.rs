@@ -377,6 +377,22 @@ where
 /// ([`AgentRunEffectDispatcher::write_outbox`]).
 const INBOX_WRITE_REAPPLICATIONS: u32 = 3;
 
+/// Why an attempt's outcome is unknown, as the ambiguity recovery records it
+/// when it burns the attempt: the line the outbox row keeps, and the code the
+/// run's record carries if the burned attempts spend the budget.
+struct Ambiguity<'a> {
+    /// The stable code an exhausted generation is recorded under.
+    code: &'a str,
+    /// The failure line the burned attempt's outbox row keeps.
+    line: &'a str,
+}
+
+/// The ambiguity of an attempt whose worker was lost after `Started`.
+const WORKER_LOST: Ambiguity<'static> = Ambiguity {
+    code: "dispatcher-lost-after-started",
+    line: "dispatcher lost after started",
+};
+
 /// One of the dispatcher's own writes to a run's inbox store.
 ///
 /// Each names what to write, never the record it is written against, so a
@@ -3136,7 +3152,7 @@ where
                     .await?;
                     return Ok(ClaimConclusion::Settled);
                 }
-                self.retry_ambiguous(scope, claim, state, intent, pass)
+                self.retry_ambiguous(scope, claim, state, intent, &WORKER_LOST, pass)
                     .await
             }
             AgentEffectSafetyClass::Idempotent => {
@@ -3145,12 +3161,21 @@ where
                 // generation hands the target the same one. Under a wind-down
                 // the retry still runs: it is the truthful way to learn what
                 // the ambiguous attempt did, and the target deduplicates it.
-                self.retry_ambiguous(scope, claim, state, intent, pass)
+                self.retry_ambiguous(scope, claim, state, intent, &WORKER_LOST, pass)
                     .await
             }
             AgentEffectSafetyClass::Reconcileable => {
-                self.reconcile_ambiguous(scope, claim, state, intent, attempt, winding_down, pass)
-                    .await
+                self.reconcile_ambiguous(
+                    scope,
+                    claim,
+                    state,
+                    intent,
+                    attempt,
+                    winding_down,
+                    &WORKER_LOST,
+                    pass,
+                )
+                .await
             }
             AgentEffectSafetyClass::NonIdempotent => {
                 // Exactly one durable Indeterminate, and no automatic
@@ -3224,14 +3249,18 @@ where
                 .await
             }
             AgentEffectSafetyClass::Reconcileable => {
+                // An attempt the reconciliation finds not executed is burned
+                // under the executor's code, not a lost dispatcher's.
+                let line = bounded_failure_line("", code, message);
+                let ambiguity = Ambiguity { code, line: &line };
                 // Boxed: a reconciliation that finds the effect not executed
                 // re-invokes through `retry_ambiguous`, which reaches
                 // `attempt_invocation` and so this function again. Each lap
                 // spends an attempt first, so the depth is bounded by the
                 // effect's budget; the box only gives the future a size.
-                Box::pin(
-                    self.reconcile_ambiguous(scope, claim, state, intent, attempt, false, pass),
-                )
+                Box::pin(self.reconcile_ambiguous(
+                    scope, claim, state, intent, attempt, false, &ambiguity, pass,
+                ))
                 .await
             }
             AgentEffectSafetyClass::NonIdempotent => {
@@ -3242,13 +3271,15 @@ where
     }
 
     /// Burns one attempt for the ambiguous loss, then — if the intent's budget
-    /// still permits — re-invokes.
+    /// still permits — re-invokes. `ambiguity` names why the outcome was
+    /// unknown: the row's line, and the code an exhausted generation carries.
     async fn retry_ambiguous(
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
         state: &AgentRunState,
         intent: &AgentRunEffect,
+        ambiguity: &Ambiguity<'_>,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let timer = AgentSegmentTimer::start(self.now());
@@ -3258,7 +3289,7 @@ where
                 scope,
                 &message_id,
                 InboxWrite::Failed {
-                    line: "dispatcher lost after started",
+                    line: ambiguity.line,
                     timed_out: true,
                 },
             )
@@ -3270,7 +3301,7 @@ where
             let attempts = *attempts;
             self.fleet.record_claim_failure(&claim, &event).await?;
             let outcome = AgentRunEffectOutcome::exhausted(
-                "dispatcher-lost-after-started".to_string(),
+                ambiguity.code.to_string(),
                 "the retry budget was spent recovering ambiguous attempts".to_string(),
             );
             let status = outcome.resolved_status();
@@ -3290,7 +3321,7 @@ where
                     })
                     .attribute(SEGMENT_ATTR_EFFECT_STATUS, status.as_label())
                     .attribute(SEGMENT_ATTR_EFFECT_ATTEMPT, attempts.to_string())
-                    .failed("rakka.agent.effect", "dispatcher-lost-after-started"),
+                    .failed("rakka.agent.effect", ambiguity.code),
             );
             return Ok(ClaimConclusion::Settled);
         }
@@ -3325,6 +3356,7 @@ where
         intent: &AgentRunEffect,
         attempt: u32,
         winding_down: bool,
+        ambiguity: &Ambiguity<'_>,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let Some(protocol) = intent.safety.reconciliation_protocol().cloned() else {
@@ -3387,7 +3419,7 @@ where
                     return Ok(ClaimConclusion::Settled);
                 }
                 // Proven absent: a retry is a fresh invocation, under budget.
-                self.retry_ambiguous(scope, claim, state, intent, pass)
+                self.retry_ambiguous(scope, claim, state, intent, ambiguity, pass)
                     .await
             }
             AgentReconciliationFinding::Unknown => {

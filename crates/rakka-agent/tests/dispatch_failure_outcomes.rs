@@ -10,9 +10,10 @@ use std::sync::Arc;
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedReconciler};
 use rakka_agent::{
     AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor, AgentEffectSpec,
-    AgentFailureReason, AgentModelTurn, AgentReconciliationProtocolRef, AgentRunEffect,
-    AgentRunEffectStatus, AgentRunScope, AgentRunStatus, AgentTaskContent, AgentToolAuthority,
-    AgentToolCallId, AgentToolCallRequest, AgentToolId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentFailureReason, AgentModelTurn, AgentReconciliationFinding, AgentReconciliationProtocolRef,
+    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunScope, AgentRunStatus,
+    AgentTaskContent, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::OutboxStatus;
 use rakka_agent_workflow::AgentEphemeralCredential;
@@ -255,4 +256,77 @@ async fn an_unknown_outcome_asks_the_reconciler_of_a_reconcileable_effect_in_the
         "queried in the pass that saw the unknown outcome"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// A reconcileable effect whose reconciler answers `finding`, behind an
+/// executor whose every outcome is unknown.
+fn reconcileable_fixture(
+    finding: AgentReconciliationFinding,
+) -> (AuthorityFixture, Arc<AtomicUsize>, ScriptedReconciler) {
+    let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
+    let spec = AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid");
+    let reconciler = ScriptedReconciler::new().with_finding(finding);
+    let (fx, calls) = fixture(&spec, unknown);
+    (
+        fx.with_reconciler(Arc::new(reconciler.clone())),
+        calls,
+        reconciler,
+    )
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_the_reconciler_finds_not_executed_is_reinvoked_under_the_executors_code(
+) {
+    // The scripted reconciler repeats its last answer, so every lap of the
+    // recovery finds the effect not executed and spends an attempt.
+    let (fx, calls, reconciler) = reconcileable_fixture(AgentReconciliationFinding::NotExecuted);
+    let effect = ready(&fx).await;
+
+    fx.one_pass().await;
+
+    assert_eq!(
+        (calls.load(Ordering::SeqCst), reconciler.queries()),
+        (3, 3),
+        "re-invoked once per not-executed finding, until the budget of three is spent"
+    );
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(row.status(), OutboxStatus::Exhausted);
+    assert_eq!(row.attempts().attempts(), 3);
+    assert!(
+        row.attempts()
+            .last_error()
+            .is_some_and(|line| line.starts_with("scripted-outcome-unknown")),
+        "the executor's code, not a lost dispatcher: {:?}",
+        row.attempts().last_error()
+    );
+    let resolved = fx.effect_at(1).await.expect("the failed effect");
+    assert_eq!(resolved.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(
+        resolved.last_error_code.as_deref(),
+        Some("scripted-outcome-unknown"),
+        "the run's record names what happened"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_the_reconciler_finds_executed_delivers_the_established_outcome() {
+    let established = AgentTaskContent::inline(serde_json::json!({ "receipt": "r-77" }))
+        .expect("the content is inline-bounded");
+    let (fx, calls, reconciler) = reconcileable_fixture(AgentReconciliationFinding::Executed {
+        outcome: Box::new(AgentRunEffectOutcome::Tool {
+            call_id: AgentToolCallId::new("call-1").expect("the call id is valid"),
+            content: established,
+        }),
+    });
+    let effect = ready(&fx).await;
+
+    fx.one_pass().await;
+
+    assert_eq!((calls.load(Ordering::SeqCst), reconciler.queries()), (1, 1));
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(
+        row.status(),
+        OutboxStatus::Dispatched,
+        "the reconciled outcome settles the ticket without a second invocation"
+    );
 }
