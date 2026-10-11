@@ -632,6 +632,38 @@ where
         }
     }
 
+    /// Records a failed outbox dispatch that retrying cannot change: the entry
+    /// is exhausted on this attempt, whatever budget its retry policy has
+    /// left.
+    ///
+    /// For a failure its reporter declared definitive. In every other respect
+    /// it is [`Self::record_outbox_failure`]: the same recovered-record
+    /// compare-and-set, the same refusal of an unknown message id.
+    pub async fn record_outbox_exhausted(
+        &mut self,
+        message_id: &OutboxMessageId,
+        message: impl Into<String>,
+    ) -> WorkflowResult<WorkflowTelemetryEvent> {
+        let now = self.clock.now();
+        let message = message.into();
+        let record = self.recovered_record()?;
+        let mut next_state = record.state.clone();
+        let entry = next_state
+            .update_outbox(message_id, |entry| {
+                entry.record_definitive_failure(now, message.clone());
+            })
+            .ok_or_else(|| WorkflowError::OutboxEntryNotFound {
+                workflow_id: self.workflow_id.clone(),
+                message_id: message_id.clone(),
+            })?;
+        self.persist_state(record.revision, next_state).await?;
+        Ok(WorkflowTelemetryEvent::OutboxDispatchExhausted {
+            message_id: entry.message_id().clone(),
+            attempts: entry.attempts().attempts(),
+            message,
+        })
+    }
+
     /// Dispatches every currently due outbox entry through an application dispatcher.
     pub async fn dispatch_due_outbox<D>(
         &mut self,

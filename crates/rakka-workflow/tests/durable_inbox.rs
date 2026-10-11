@@ -753,3 +753,80 @@ async fn outbox_dispatching_status_is_persisted_before_external_effect() {
         InboxStatus::Pending
     );
 }
+
+#[tokio::test]
+async fn a_definitive_failure_exhausts_an_entry_with_budget_left() {
+    let store = InMemoryDurableStateStore::<WorkflowState>::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(900));
+    let workflow_id = WorkflowId::new("workflow-outbox-definitive");
+    let mut workflow = DurableInbox::with_clock(workflow_id.clone(), store.clone(), clock.clone());
+    workflow.recover().await.unwrap();
+    workflow
+        .schedule_outbox(
+            OutboxCommand::new(
+                "out-definitive",
+                OutboxTarget::application("payments"),
+                "Charge",
+                b"payload".to_vec(),
+            )
+            .retry_policy(RetryPolicy::new(3, 10, 10)),
+        )
+        .await
+        .unwrap();
+
+    let event = workflow
+        .record_outbox_exhausted(&OutboxMessageId::new("out-definitive"), "egress denied")
+        .await
+        .expect("the definitive failure is recorded");
+
+    assert_eq!(
+        event,
+        WorkflowTelemetryEvent::OutboxDispatchExhausted {
+            message_id: OutboxMessageId::new("out-definitive"),
+            attempts: 1,
+            message: "egress denied".to_string(),
+        }
+    );
+    let persisted = store
+        .load(&workflow_id.persistence_id())
+        .await
+        .unwrap()
+        .expect("workflow state should be persisted");
+    let entry = persisted
+        .state
+        .outbox_entry(&OutboxMessageId::new("out-definitive"))
+        .unwrap();
+    assert_eq!(entry.status(), OutboxStatus::Exhausted);
+    assert_eq!(entry.attempts().attempts(), 1);
+    assert_eq!(
+        entry.attempts().max_attempts_value(),
+        Some(3),
+        "two attempts of budget were left, and spent"
+    );
+    assert_eq!(entry.attempts().next_retry_at(), None);
+    assert_eq!(entry.attempts().last_error(), Some("egress denied"));
+    clock.advance_millis(1_000);
+    assert!(
+        workflow.due_outbox().unwrap().is_empty(),
+        "an exhausted entry is never due again"
+    );
+}
+
+#[tokio::test]
+async fn a_definitive_failure_for_an_unknown_message_is_refused() {
+    let store = InMemoryDurableStateStore::<WorkflowState>::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(900));
+    let mut workflow =
+        DurableInbox::with_clock(WorkflowId::new("workflow-outbox-missing"), store, clock);
+    workflow.recover().await.unwrap();
+
+    let error = workflow
+        .record_outbox_exhausted(&OutboxMessageId::new("missing"), "egress denied")
+        .await
+        .expect_err("no such entry");
+
+    assert!(
+        matches!(error, WorkflowError::OutboxEntryNotFound { .. }),
+        "{error:?}"
+    );
+}
