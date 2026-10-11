@@ -1254,6 +1254,9 @@ mod tests {
                         input_schema: schema,
                         output_schema_digest: None,
                         input_schema_artifact: None,
+                        output_schema: None,
+                        annotations: None,
+                        description_supplied: Some(true),
                     }
                 })
                 .collect(),

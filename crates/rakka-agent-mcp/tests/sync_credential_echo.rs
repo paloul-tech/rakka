@@ -15,6 +15,7 @@ use rakka_agent_mcp::{
     McpSyncError, McpToolPolicy, MCP_SERVER_NAME_MAX_BYTES,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
+use rmcp::model::ToolAnnotations;
 use serde_json::{json, Value};
 
 /// The credential the sync sends, and a hostile server echoes.
@@ -207,5 +208,20 @@ async fn a_server_name_is_cut_at_its_bound_on_a_character_boundary() {
         set.server_name,
         "n".repeat(MCP_SERVER_NAME_MAX_BYTES - 1),
         "cut before the character the bound would have split"
+    );
+}
+
+#[tokio::test]
+async fn an_annotation_title_that_carries_the_credential_is_refused() {
+    let credential = AgentEphemeralCredential::bearer_token(TOKEN);
+    let server = FakeMcpServer::new().with_tool(
+        search("Searches.", json!({"type":"object"}))
+            .with_annotations(ToolAnnotations::with_title(format!("SERVER-WORDS {TOKEN}"))),
+    );
+    assert_echo_refused(
+        sync(server, Some(&credential)).await,
+        "annotations title",
+        Some("search"),
+        TOKEN,
     );
 }

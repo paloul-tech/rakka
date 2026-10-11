@@ -64,6 +64,33 @@ use crate::client::{
 };
 use crate::launcher::McpChildTransport;
 
+/// The tool annotations an MCP server reported, as this adapter stores them.
+///
+/// Owned by this crate rather than rmcp's `ToolAnnotations`, so the stored
+/// format never moves with the SDK's serde shape. Every field is the server's
+/// claim, never a declaration: a hint is evidence only through the sync's own
+/// hint rule, and the title is server-chosen text, cut at
+/// [`AGENT_TOOL_DESCRIPTION_MAX_LENGTH`] and refused when it carries the
+/// credential the sync sent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct McpToolAnnotations {
+    /// A human-readable title for the tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The server's `readOnlyHint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    /// The server's `destructiveHint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    /// The server's `idempotentHint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    /// The server's `openWorldHint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
+}
+
 /// One tool as this adapter stored it at publish time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpSyncedDescriptor {
@@ -90,6 +117,19 @@ pub struct McpSyncedDescriptor {
     ///
     /// Always `None` as the sync returns it: the sync holds no artifact store.
     pub input_schema_artifact: Option<ArtifactRef>,
+    /// The server's raw output schema, when it declared one. Absent on a
+    /// version-1 set, which stored only its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// The tool annotations the server reported, when it reported any. Absent
+    /// on a version-1 set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<McpToolAnnotations>,
+    /// Whether the descriptor's description is the server's own (`true`) or
+    /// this adapter's fallback, `MCP tool {tool} on {server}` (`false`).
+    /// `None` on a version-1 set, which did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_supplied: Option<bool>,
 }
 
 impl McpSyncedDescriptor {
@@ -109,8 +149,12 @@ impl McpSyncedDescriptor {
 }
 
 /// The schema version of the stored [`McpDescriptorSet`] shape this build
-/// writes, and the newest it reads.
-pub const MCP_DESCRIPTOR_SET_SCHEMA_VERSION: u32 = 1;
+/// writes, and the newest it reads. Version 2 added each tool's raw
+/// [`McpSyncedDescriptor::output_schema`], its
+/// [`McpSyncedDescriptor::annotations`], and
+/// [`McpSyncedDescriptor::description_supplied`]; a version-1 set still
+/// decodes, with all three absent.
+pub const MCP_DESCRIPTOR_SET_SCHEMA_VERSION: u32 = 2;
 
 /// Everything one publish-time sync of one server produced.
 ///
@@ -261,8 +305,8 @@ pub enum McpSyncError {
         server: String,
         /// The tool whose text carried it, or `None` for the server's name.
         tool: Option<String>,
-        /// Which text: `server name`, `description`, `input schema`, or
-        /// `output schema`.
+        /// Which text: `server name`, `description`, `annotations title`,
+        /// `input schema`, or `output schema`.
         field: &'static str,
     },
 }
@@ -736,6 +780,14 @@ fn synced_descriptor(
     {
         return Err(echoed("output schema"));
     }
+    if listed
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.title.as_deref())
+        .is_some_and(|title| carries(title, secrets))
+    {
+        return Err(echoed("annotations title"));
+    }
     if policy.honor_hints {
         if let Some(hint) =
             hint_contradiction(listed.annotations.as_ref(), policy.declaration.safety)
@@ -752,6 +804,20 @@ fn synced_descriptor(
         tool: tool.to_string(),
         reason: error.to_string(),
     };
+    let description_supplied = listed
+        .description
+        .as_deref()
+        .is_some_and(|description| !description.is_empty());
+    let annotations = listed
+        .annotations
+        .as_ref()
+        .map(|annotations| McpToolAnnotations {
+            title: annotations.title.as_deref().map(bounded_description),
+            read_only_hint: annotations.read_only_hint,
+            destructive_hint: annotations.destructive_hint,
+            idempotent_hint: annotations.idempotent_hint,
+            open_world_hint: annotations.open_world_hint,
+        });
     let fallback = format!("MCP tool {tool} on {server}");
     let description = listed
         .description
@@ -797,6 +863,9 @@ fn synced_descriptor(
         input_schema,
         output_schema_digest,
         input_schema_artifact: None,
+        output_schema,
+        annotations,
+        description_supplied: Some(description_supplied),
     })
 }
 

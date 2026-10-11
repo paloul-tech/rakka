@@ -9,8 +9,8 @@
 
 use rakka_agent::AgentAuthorityRefusal;
 use rakka_agent::{
-    AgentEffectSafetyClass, AgentToolDeclaration, AgentToolKind, AgentToolRegistry,
-    AGENT_TOOL_PARAMETERS_MAX_BYTES,
+    AgentContentDigest, AgentEffectSafetyClass, AgentToolDeclaration, AgentToolKind,
+    AgentToolRegistry, AGENT_TOOL_DESCRIPTION_MAX_LENGTH, AGENT_TOOL_PARAMETERS_MAX_BYTES,
 };
 use rakka_agent_mcp::testkit::{
     serve_fake, CountingClient, FakeMcpEndpoint, FakeMcpServer, FakeTool,
@@ -18,8 +18,8 @@ use rakka_agent_mcp::testkit::{
 use rakka_agent_mcp::{
     mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over, McpAllowAllEgress,
     McpDescriptorSet, McpDescriptorStaleness, McpEgressCheck, McpServerBinding, McpServerId,
-    McpToolPolicy, MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
-    MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
+    McpToolAnnotations, McpToolPolicy, MCP_ATTEMPT_TIMEOUT_DEFAULT_MS,
+    MCP_DESCRIPTOR_SCHEMA_MAX_BYTES, MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
 use rmcp::model::ToolAnnotations;
@@ -728,4 +728,146 @@ async fn a_server_level_credential_binding_reaches_every_synced_declaration_that
     assert!(unbound
         .bindings()
         .all(|binding| binding.declaration().credential_binding.is_none()));
+}
+
+#[tokio::test]
+async fn a_synced_set_is_version_2_and_keeps_annotations_the_output_schema_and_the_description_origin(
+) {
+    let output = json!({ "type": "object", "properties": { "id": { "type": "string" } } });
+    let endpoint = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(
+                tool("search")
+                    .with_annotations(
+                        ToolAnnotations::with_title("Search the CRM")
+                            .read_only(true)
+                            .open_world(false),
+                    )
+                    .with_output_schema(output.clone()),
+            )
+            .with_tool(FakeTool::text("update", "", schema(1), "ok")),
+    )
+    .await;
+    let set = sync_mcp_descriptors(
+        &client(),
+        &binding(&endpoint.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("syncs");
+
+    assert_eq!(set.schema_version, 2);
+    let search = set.descriptor("search").expect("present");
+    assert_eq!(
+        search.annotations,
+        Some(McpToolAnnotations {
+            title: Some("Search the CRM".to_string()),
+            read_only_hint: Some(true),
+            destructive_hint: None,
+            idempotent_hint: None,
+            open_world_hint: Some(false),
+        })
+    );
+    assert_eq!(search.output_schema.as_ref(), Some(&output));
+    assert_eq!(
+        search.output_schema_digest,
+        Some(AgentContentDigest::sha256_of_json(&output))
+    );
+    assert_eq!(search.description_supplied, Some(true));
+
+    let update = set.descriptor("update").expect("present");
+    assert_eq!(
+        update.binding.descriptor().description,
+        "MCP tool update on crm"
+    );
+    assert_eq!(
+        update.description_supplied,
+        Some(false),
+        "an empty description is the fallback, and the set says so"
+    );
+    assert_eq!(update.annotations, None);
+    assert_eq!(update.output_schema, None);
+
+    let decoded: McpDescriptorSet =
+        serde_json::from_str(&serde_json::to_string(&set).expect("encodes")).expect("decodes");
+    assert_eq!(decoded, set);
+}
+
+#[tokio::test]
+async fn a_version_1_set_still_decodes_with_the_new_fields_absent_and_the_same_digest() {
+    let endpoint = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(
+                tool("search")
+                    .with_annotations(ToolAnnotations::with_title("Search the CRM"))
+                    .with_output_schema(json!({ "type": "object" })),
+            )
+            .with_tool(tool("update")),
+    )
+    .await;
+    let set = sync_mcp_descriptors(
+        &client(),
+        &binding(&endpoint.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("syncs");
+
+    // The shape a build before version 2 wrote.
+    let mut v1 = serde_json::to_value(&set).expect("encodes");
+    v1["schema_version"] = json!(1);
+    for descriptor in v1["descriptors"].as_array_mut().expect("descriptors") {
+        let object = descriptor.as_object_mut().expect("an object");
+        for field in ["output_schema", "annotations", "description_supplied"] {
+            object.remove(field);
+        }
+    }
+    let decoded: McpDescriptorSet = serde_json::from_value(v1).expect("a version-1 set decodes");
+
+    assert_eq!(decoded.schema_version, 1);
+    assert!(decoded.descriptors.iter().all(|descriptor| {
+        descriptor.output_schema.is_none()
+            && descriptor.annotations.is_none()
+            && descriptor.description_supplied.is_none()
+    }));
+    assert_eq!(
+        decoded.digest(),
+        set.digest(),
+        "version 2 pins the release digest version 1 pinned"
+    );
+}
+
+#[tokio::test]
+async fn an_annotation_title_over_the_bound_is_cut_on_a_character_boundary() {
+    let long = "é".repeat(AGENT_TOOL_DESCRIPTION_MAX_LENGTH);
+    let endpoint = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(tool("search").with_annotations(ToolAnnotations::with_title(long.clone())))
+            .with_tool(tool("update")),
+    )
+    .await;
+    let set = sync_mcp_descriptors(
+        &client(),
+        &binding(&endpoint.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("syncs");
+    let title = set
+        .descriptor("search")
+        .and_then(|descriptor| descriptor.annotations.as_ref())
+        .and_then(|annotations| annotations.title.clone())
+        .expect("a title");
+    assert!(
+        title.len() <= AGENT_TOOL_DESCRIPTION_MAX_LENGTH,
+        "{}",
+        title.len()
+    );
+    assert!(!title.is_empty() && long.starts_with(&title));
 }
