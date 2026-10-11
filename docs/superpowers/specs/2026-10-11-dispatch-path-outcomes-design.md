@@ -1,6 +1,6 @@
 # Dispatch-path outcomes — definitive refusals and unknown MCP outcomes
 
-Status: design, 2026-10-11. Branch `dispatch-path-outcomes` off `e2e7a29`.
+Status: implemented, 2026-10-11. Branch `dispatch-path-outcomes` off `e2e7a29`.
 Brief: issue #85 (rakka.host A16), asks 7, 14, and 15, drafted against
 `96a18b0`; the code was read at `e2e7a29`.
 
