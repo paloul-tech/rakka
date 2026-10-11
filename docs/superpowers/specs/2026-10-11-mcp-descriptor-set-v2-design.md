@@ -1,6 +1,6 @@
 # MCP descriptor set version 2 — a richer stored set that checks itself
 
-Status: design, 2026-10-11. Branch `mcp-descriptor-set-v2` off `a3e5c10`.
+Status: implemented, 2026-10-11. Branch `mcp-descriptor-set-v2` off `a3e5c10`.
 Brief: issue #85 (rakka.host A16), ask 3, ask 10, and the ask-10 addendum
 (A17), drafted against `96a18b0`; the code was read at `a3e5c10`.
 
