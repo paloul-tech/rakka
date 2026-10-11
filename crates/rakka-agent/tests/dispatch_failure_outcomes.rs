@@ -7,12 +7,12 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use rakka_agent::testkit::DeterministicModelAdapter;
+use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedReconciler};
 use rakka_agent::{
     AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor, AgentEffectSpec,
-    AgentFailureReason, AgentModelTurn, AgentRunEffect, AgentRunEffectStatus, AgentRunScope,
-    AgentTaskContent, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentFailureReason, AgentModelTurn, AgentReconciliationProtocolRef, AgentRunEffect,
+    AgentRunEffectStatus, AgentRunScope, AgentRunStatus, AgentTaskContent, AgentToolAuthority,
+    AgentToolCallId, AgentToolCallRequest, AgentToolId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::OutboxStatus;
 use rakka_agent_workflow::AgentEphemeralCredential;
@@ -149,5 +149,110 @@ async fn a_retryable_refusal_still_spends_its_budget_one_attempt_at_a_time() {
     let row = fx.outbox_row(&effect).await.expect("the ticket's row");
     assert_eq!(row.status(), OutboxStatus::Failed, "a retry is scheduled");
     assert_eq!(row.attempts().attempts(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+fn unknown() -> AgentDispatchError {
+    AgentDispatchError::outcome_unknown(
+        "scripted-outcome-unknown",
+        "the call was sent and no answer was read",
+    )
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_parks_a_non_idempotent_effect_for_reconciliation() {
+    let (fx, calls) = fixture(&AgentEffectSpec::non_idempotent(), unknown);
+    ready(&fx).await;
+
+    let pass = fx.one_pass().await;
+
+    assert_eq!(pass.parked_indeterminate, 1, "{pass:?}");
+    let parked = fx.effect_at(1).await.expect("the parked effect");
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    assert_eq!(
+        parked.last_error_code.as_deref(),
+        Some("scripted-outcome-unknown"),
+        "the executor's code, not the worker-loss code"
+    );
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run").status,
+        AgentRunStatus::WaitingForReconciliation
+    );
+
+    fx.expire_lease();
+    fx.pump().await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a non-idempotent target is never invoked again"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_retries_a_read_only_or_idempotent_effect_under_its_budget() {
+    for spec in [
+        AgentEffectSpec::read_only()
+            .with_max_attempts(3)
+            .expect("the spec is valid"),
+        AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+    ] {
+        let class = spec.safety_class;
+        let (fx, calls) = fixture(&spec, unknown);
+        let effect = ready(&fx).await;
+
+        let pass = fx.one_pass().await;
+
+        assert_eq!(pass.failed_attempts, 1, "{class:?}: {pass:?}");
+        let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+        assert_eq!(
+            row.status(),
+            OutboxStatus::Failed,
+            "{class:?}: retry scheduled"
+        );
+        assert!(
+            row.attempts()
+                .last_error()
+                .is_some_and(|line| line.starts_with("scripted-outcome-unknown")),
+            "{class:?}: the executor's code leads the line: {:?}",
+            row.attempts().last_error()
+        );
+        fx.expire_lease();
+        fx.one_pass().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "{class:?}: retried");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_on_an_idempotent_effects_last_attempt_exhausts_it() {
+    let spec = AgentEffectSpec::idempotent(1).expect("the spec is valid");
+    let (fx, _calls) = fixture(&spec, unknown);
+    ready(&fx).await;
+
+    fx.one_pass().await;
+
+    let resolved = fx.effect_at(1).await.expect("the failed effect");
+    assert_eq!(resolved.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(
+        resolved.last_error_code.as_deref(),
+        Some("scripted-outcome-unknown")
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_asks_the_reconciler_of_a_reconcileable_effect_in_the_same_pass() {
+    let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
+    let spec = AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid");
+    let reconciler = ScriptedReconciler::new();
+    let (fx, calls) = fixture(&spec, unknown);
+    let fx = fx.with_reconciler(Arc::new(reconciler.clone()));
+    ready(&fx).await;
+
+    fx.one_pass().await;
+
+    assert_eq!(
+        reconciler.queries(),
+        1,
+        "queried in the pass that saw the unknown outcome"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

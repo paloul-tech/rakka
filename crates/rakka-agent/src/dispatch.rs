@@ -3067,6 +3067,11 @@ where
 
         let outcome = match invoked {
             Ok(outcome) => outcome,
+            Err(error @ AgentDispatchError::OutcomeUnknown { .. }) => {
+                return self
+                    .settle_unknown_outcome(scope, claim, state, intent, attempt, &error, pass)
+                    .await;
+            }
             Err(error) => {
                 return self
                     .record_attempt_failure(
@@ -3171,6 +3176,67 @@ where
                     pass,
                 )
                 .await
+            }
+        }
+    }
+
+    /// Settles an attempt whose executor reported that the target may have
+    /// acted and the outcome is unknown, by the intent's safety class
+    /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)): the
+    /// table [`Self::recover_ambiguous`] applies to an attempt whose worker
+    /// died after `Started`, with the executor's code in place of the
+    /// worker-loss code.
+    ///
+    /// A read-only or idempotent effect records a failed attempt and is
+    /// retried under its budget with the same idempotency key, exactly as an
+    /// invocation failure is; a reconcileable one asks the reconciler now; a
+    /// non-idempotent one parks for reconciliation and is never re-invoked.
+    /// This runs only from a fresh attempt, which the wind-down fence has
+    /// already admitted, so the worker-loss path's wind-down arm does not
+    /// apply.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_unknown_outcome(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: AgentDispatchClaim,
+        state: &AgentRunState,
+        intent: &AgentRunEffect,
+        attempt: u32,
+        error: &AgentDispatchError,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        let AgentDispatchError::OutcomeUnknown { code, message } = error else {
+            unreachable!("only an unknown outcome is settled here");
+        };
+        match intent.safety.class() {
+            AgentEffectSafetyClass::ReadOnly | AgentEffectSafetyClass::Idempotent => {
+                self.record_attempt_failure(
+                    scope,
+                    &claim,
+                    intent,
+                    attempt,
+                    code,
+                    &error.to_string(),
+                    None,
+                    false,
+                    pass,
+                )
+                .await
+            }
+            AgentEffectSafetyClass::Reconcileable => {
+                // Boxed: a reconciliation that finds the effect not executed
+                // re-invokes through `retry_ambiguous`, which reaches
+                // `attempt_invocation` and so this function again. Each lap
+                // spends an attempt first, so the depth is bounded by the
+                // effect's budget; the box only gives the future a size.
+                Box::pin(
+                    self.reconcile_ambiguous(scope, claim, state, intent, attempt, false, pass),
+                )
+                .await
+            }
+            AgentEffectSafetyClass::NonIdempotent => {
+                self.park_indeterminate(scope, claim, intent, attempt, code, message, pass)
+                    .await
             }
         }
     }
@@ -4457,6 +4523,18 @@ pub enum AgentDispatchError {
         /// argument, or content material.
         message: String,
     },
+    /// The attempt may have invoked the target and its outcome is unknown:
+    /// the request left and no answer was read. The dispatcher settles it by
+    /// the intent's safety class, as it settles an attempt whose worker died
+    /// after `Started`
+    /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
+    OutcomeUnknown {
+        /// Stable machine-readable code: the executor's own.
+        code: &'static str,
+        /// The failure detail. It becomes durable state: no credential,
+        /// argument, or content material.
+        message: String,
+    },
 }
 
 impl AgentDispatchError {
@@ -4472,7 +4550,7 @@ impl AgentDispatchError {
             Self::Run(error) => error.code(),
             Self::Effect(error) => error.code(),
             Self::TicketUndecodable { .. } => "dispatch-ticket-undecodable",
-            Self::Invocation { code, .. } => code,
+            Self::Invocation { code, .. } | Self::OutcomeUnknown { code, .. } => code,
             Self::Collaborator { .. } | Self::Definitive { .. } => "dispatch-collaborator-failed",
         }
     }
@@ -4491,6 +4569,15 @@ impl AgentDispatchError {
     pub fn definitive(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Definitive {
             code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// An attempt that may have invoked the target, whose outcome is unknown.
+    #[must_use]
+    pub fn outcome_unknown(code: &'static str, message: impl Into<String>) -> Self {
+        Self::OutcomeUnknown {
+            code,
             message: message.into(),
         }
     }
@@ -4520,6 +4607,9 @@ impl Display for AgentDispatchError {
                     f,
                     "a dispatch collaborator refused definitively ({code}): {message}"
                 )
+            }
+            Self::OutcomeUnknown { code, message } => {
+                write!(f, "the invocation's outcome is unknown ({code}): {message}")
             }
         }
     }
