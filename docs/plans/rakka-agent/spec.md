@@ -1230,6 +1230,18 @@ any outcome.
 - A retry of an idempotent effect MUST reuse its external idempotency key.
 - A retry policy MUST NOT override the non-idempotent ambiguity rule.
 
+A run's durable inbox has other writers than the dispatcher — anything that
+schedules an effect into a live run — so a dispatcher write to it can lose its
+compare-and-set. The dispatcher MAY re-read the record and re-apply such a
+write, a small fixed number of times, inside the same pass; it MUST recognize
+the loss by its stable `revision-conflict` code rather than by the error's
+shape, MUST recover before every re-application, and MUST retry nothing else.
+A write still losing after the bound MUST fail the pass as an unretried one
+would, leaving the ticket to its lease: the retry shortens convergence and is
+never the fence. A ticket settled as cancelled keeps its settle reason on the
+dispatcher fleet's index entry; the outbox row keeps only the cancelled
+status. (Issue #81, 2026-10-11.)
+
 ### 11.5 Crash and Timeout Rules
 
 If an attempt is known not to have invoked the target, policy MAY return it to
