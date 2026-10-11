@@ -88,6 +88,7 @@ pub mod schema;
 pub mod task;
 pub mod team;
 pub mod testkit;
+pub mod tool_names;
 pub mod tool_router;
 pub mod tools;
 pub mod wake;
@@ -557,6 +558,10 @@ pub use team::{
     AGENT_TEAM_MATERIALIZED_MAX_BYTES, AGENT_TEAM_MAX_HISTORY_PER_TRANSITION,
     AGENT_TEAM_OPERATION_LOG_CAPACITY, AGENT_TEAM_PENDING_HISTORY_CAPACITY,
     AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES, DEFAULT_AGENT_TEAM_ENTITY_TYPE,
+};
+pub use tool_names::{
+    is_provider_safe_tool_name, provider_tool_name, AgentProviderToolNames, AgentToolNameCollision,
+    AGENT_PROVIDER_TOOL_NAME_MAX_BYTES, AGENT_PROVIDER_TOOL_NAME_SUFFIX_HEX,
 };
 pub use tool_router::AgentToolExecutorRouter;
 pub use tools::{

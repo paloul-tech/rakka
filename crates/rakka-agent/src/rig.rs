@@ -47,7 +47,11 @@
 //! a tool it was offered — and declares each model-visible descriptor the
 //! request carries beside it; slice 1.8's registry and the dispatch
 //! authority's `model_visible` derivation decide which descriptors a request
-//! carries, never this adapter.
+//! carries, never this adapter. Each tool is declared under its
+//! [`provider_tool_name`] and each call is read back to its tool id through
+//! the same request's names, so an MCP tool id (`mcp.<server>.<tool>`), which
+//! neither Anthropic nor OpenAI accepts as a name, never reaches the wire
+//! ([`crate::tool_names`]).
 //!
 //! A provider client, stream, open request, or credential value is never durable
 //! state ([specification 10.1](../../../docs/plans/rakka-agent/spec.md)): the
@@ -75,6 +79,7 @@ use crate::model::{
 };
 use crate::model_profile::{AgentModelProfile, AgentModelProfileError, AgentModelProviderKind};
 use crate::task::AgentTaskContent;
+use crate::tool_names::{provider_tool_name, AgentProviderToolNames};
 
 /// The default name of the tool a model calls to propose its typed task result.
 ///
@@ -293,6 +298,13 @@ where
     /// all: rig's `ToolDefinition::parameters` is a bare, schema-unenforced
     /// value, so a non-object would otherwise reach the wire verbatim.
     ///
+    /// Every tool, the result tool included, is declared under its
+    /// [`provider_tool_name`], never its id: Anthropic and OpenAI each refuse
+    /// the whole request over one name outside their rule, and an MCP tool id
+    /// (`mcp.<server>.<tool>`) is always outside both. The returned
+    /// [`AgentProviderToolNames`] maps each declared name back to its id, for
+    /// [`Self::turn_from_response`] to read this request's calls through.
+    ///
     /// # Errors
     ///
     /// The registry that decides `request.tools` is upstream of this adapter
@@ -302,8 +314,38 @@ where
     /// both would put two tool definitions under one name on the wire, and a
     /// provider call under that name would be routed into the result-proposal
     /// branch of [`Self::turn_from_response`], silently misinterpreting a
-    /// legitimate tool call as the run's typed result.
-    fn build_request(&self, request: &AgentModelRequest) -> AgentModelResult<CompletionRequest> {
+    /// legitimate tool call as the run's typed result. Two different tools —
+    /// the result tool among them — whose ids share a provider name are
+    /// refused the same way, under `model-tool-name-collision`.
+    fn build_request(
+        &self,
+        request: &AgentModelRequest,
+    ) -> AgentModelResult<(CompletionRequest, AgentProviderToolNames)> {
+        if let Some(descriptor) = request
+            .tools
+            .iter()
+            .find(|descriptor| descriptor.tool.as_str() == self.result_tool)
+        {
+            return Err(AgentModelError::Refused {
+                code: "model-result-tool-collision",
+                message: format!(
+                    "the model-visible tool {:?} collides with the adapter's result tool {:?}",
+                    descriptor.tool.as_str(),
+                    self.result_tool
+                ),
+            });
+        }
+        let names = AgentProviderToolNames::new(
+            request
+                .tools
+                .iter()
+                .map(|descriptor| descriptor.tool.as_str())
+                .chain([self.result_tool.as_str()]),
+        )
+        .map_err(|collision| AgentModelError::Refused {
+            code: collision.code(),
+            message: collision.to_string(),
+        })?;
         let mut builder = self
             .model
             .completion_request(Message::user(format!("context:{}", request.context)))
@@ -315,7 +357,7 @@ where
             )
             .max_tokens_opt(request.sampling.max_output_tokens.map(u64::from))
             .tool(ToolDefinition {
-                name: self.result_tool.clone(),
+                name: provider_tool_name(&self.result_tool).into_owned(),
                 description: "Propose the typed result that completes the task this run serves."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -324,19 +366,8 @@ where
                 }),
             });
         for descriptor in &request.tools {
-            let name = descriptor.tool.as_str();
-            if name == self.result_tool {
-                return Err(AgentModelError::Refused {
-                    code: "model-result-tool-collision",
-                    message: format!(
-                        "the model-visible tool {name:?} collides with the adapter's result \
-                         tool {:?}",
-                        self.result_tool
-                    ),
-                });
-            }
             builder = builder.tool(ToolDefinition {
-                name: name.to_string(),
+                name: provider_tool_name(descriptor.tool.as_str()).into_owned(),
                 description: descriptor.description.clone(),
                 parameters: descriptor
                     .parameters
@@ -355,14 +386,17 @@ where
                 "top_p": f64::from(top_p_milli) / 1000.0,
             }));
         }
-        Ok(builder.build())
+        Ok((builder.build(), names))
     }
 
-    /// Maps a provider response onto a bounded Rakka turn.
+    /// Maps a provider response onto a bounded Rakka turn, reading each call's
+    /// name back to its tool id through `names`, the declarations of the
+    /// request it answers.
     fn turn_from_response(
         &self,
         response: CompletionResponse<M::Response>,
         request: &AgentModelRequest,
+        names: &AgentProviderToolNames,
     ) -> AgentModelResult<AgentModelTurn> {
         let mut turn =
             AgentModelTurn::new(self.adapter_version).with_usage(model_usage(&response.usage));
@@ -390,7 +424,8 @@ where
                     text.push_str(&part.text);
                 }
                 AssistantContent::ToolCall(call) => {
-                    if call.function.name == self.result_tool {
+                    let tool = names.tool(&call.function.name);
+                    if tool == self.result_tool {
                         // Two proposals in one response is an ambiguity the run
                         // must not resolve by whichever the provider ordered
                         // last; the response is refused as a failed effect.
@@ -416,7 +451,7 @@ where
                         );
                         let requested = AgentToolCallRequest::new(
                             AgentToolCallId::new(call_id).map_err(mapping_error)?,
-                            AgentToolId::new(call.function.name).map_err(mapping_error)?,
+                            AgentToolId::new(tool).map_err(mapping_error)?,
                             call.function.arguments,
                         )?;
                         turn = turn.with_tool_call(requested);
@@ -545,13 +580,13 @@ where
 
     fn call<'a>(&'a self, request: &'a AgentModelRequest) -> AgentModelFuture<'a> {
         Box::pin(async move {
-            let rig_request = self.build_request(request)?;
+            let (rig_request, names) = self.build_request(request)?;
             let response = self
                 .model
                 .completion(rig_request)
                 .await
                 .map_err(completion_error)?;
-            self.turn_from_response(response, request)
+            self.turn_from_response(response, request, &names)
         })
     }
 }
@@ -969,8 +1004,10 @@ impl ScriptedCompletionModel {
     ///
     /// This is the [`Self::returning_result`] for an adapter whose result tool
     /// was renamed with [`RigModelAdapter::with_result_tool`]: the scripted name
-    /// must match the adapter's, or the call maps to a tool-call request rather
-    /// than a proposal.
+    /// must be the name the adapter declares it under, or the call maps to a
+    /// tool-call request rather than a proposal. That is the result tool
+    /// itself unless it is outside the providers' name rule, in which case it
+    /// is the tool's [`provider_tool_name`].
     #[must_use]
     pub fn returning_result_as(
         mut self,
@@ -986,6 +1023,11 @@ impl ScriptedCompletionModel {
     }
 
     /// Scripts a tool call the model requests.
+    ///
+    /// `tool` is the name a provider would call: the tool's
+    /// [`provider_tool_name`], which is its id unless the id is outside the
+    /// providers' name rule. A name the request never declared is read back
+    /// as itself, so scripting a declared tool's raw id also reaches it.
     #[must_use]
     pub fn requesting_tool(
         mut self,
@@ -1129,7 +1171,7 @@ mod tests {
             top_p_milli: Some(900),
             max_output_tokens: Some(64),
         });
-        let built = adapter.build_request(&request).expect("no collision");
+        let (built, _) = adapter.build_request(&request).expect("no collision");
 
         // The provider is offered the result tool; without the declaration no
         // real model could ever call it, and no run could complete.
@@ -1171,7 +1213,7 @@ mod tests {
         )
         .expect("parameters");
         let adapter = RigModelAdapter::new(ScriptedCompletionModel::new());
-        let built = adapter
+        let (built, _) = adapter
             .build_request(&request().with_tools(vec![descriptor]))
             .expect("no collision");
         let names: Vec<&str> = built.tools.iter().map(|tool| tool.name.as_str()).collect();
@@ -1212,7 +1254,7 @@ mod tests {
         .with_parameters(serde_json::Value::Null)
         .expect("a non-object value still validates");
         let adapter = RigModelAdapter::new(ScriptedCompletionModel::new());
-        let built = adapter
+        let (built, _) = adapter
             .build_request(&request().with_tools(vec![descriptor]))
             .expect("no collision");
         let declared = built
@@ -1260,6 +1302,80 @@ mod tests {
             .await
             .expect_err("a colliding tool name is refused before any request is built");
         assert_eq!(error.code(), "model-result-tool-collision");
+    }
+
+    /// A function-kind descriptor for `tool`, for the provider-name tests.
+    fn descriptor(tool: &str) -> crate::tools::AgentToolDescriptor {
+        use crate::task::{AgentSchemaId, AgentSchemaRef};
+        use crate::tools::{AgentToolDescriptor, AgentToolKind};
+
+        AgentToolDescriptor::new(
+            AgentToolId::new(tool).expect("tool id"),
+            AgentToolKind::Function,
+            "A tool.",
+            AgentSchemaRef::new(
+                AgentSchemaId::new("in").expect("schema id"),
+                AgentRevisionNumber::INITIAL,
+            ),
+            AgentSchemaRef::new(
+                AgentSchemaId::new("out").expect("schema id"),
+                AgentRevisionNumber::INITIAL,
+            ),
+        )
+        .expect("descriptor")
+    }
+
+    #[tokio::test]
+    async fn a_result_tool_outside_the_provider_rule_is_declared_and_read_back_by_its_rename() {
+        // `submit.result` is a legal result-tool name that neither Anthropic
+        // nor OpenAI accepts. Its rename is a literal: `printf %s
+        // submit.result | shasum -a 256` begins `631ca104`.
+        let adapter = RigModelAdapter::new(
+            ScriptedCompletionModel::new()
+                .returning_result_as("submit_result_631ca104", serde_json::json!({ "ok": true })),
+        )
+        .with_result_tool("submit.result");
+
+        let (built, _) = adapter.build_request(&request()).expect("no collision");
+        let names: Vec<&str> = built.tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, ["submit_result_631ca104"]);
+
+        let turn = adapter.call(&request()).await.expect("the turn maps");
+        assert_eq!(
+            turn.proposal
+                .expect("the call under the rename is the proposal")
+                .inline_value(),
+            Some(&serde_json::json!({ "ok": true }))
+        );
+        assert!(turn.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_tools_sharing_a_provider_name_are_refused_before_any_request() {
+        // `mcp.crm.lookup` is declared as `mcp_crm_lookup_c41f30c9`, which is
+        // also a legal id of its own: a call under that name could not be read
+        // back to one of them.
+        let adapter = RigModelAdapter::new(ScriptedCompletionModel::new().returning_text("hi"));
+        // `call` short-circuits on `build_request`'s `?` before the scripted
+        // model's `completion` is ever awaited.
+        let error = adapter
+            .call(&request().with_tools(vec![
+                descriptor("mcp.crm.lookup"),
+                descriptor("mcp_crm_lookup_c41f30c9"),
+            ]))
+            .await
+            .expect_err("a shared provider name is refused before any request is built");
+        assert_eq!(error.code(), "model-tool-name-collision");
+
+        // The result tool is one of the request's names: a descriptor spelled
+        // like its rename collides with it the same way.
+        let renamed = RigModelAdapter::new(ScriptedCompletionModel::new().returning_text("hi"))
+            .with_result_tool("submit.result");
+        let error = renamed
+            .call(&request().with_tools(vec![descriptor("submit_result_631ca104")]))
+            .await
+            .expect_err("a descriptor spelled like the result tool's rename is refused");
+        assert_eq!(error.code(), "model-tool-name-collision");
     }
 
     #[test]

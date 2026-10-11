@@ -1088,6 +1088,23 @@ profile's binding is handed to the adapter for that attempt only and is
 dropped with it; `call(request)` remains for adapters that need none, and
 `call_with` defaults to it. (Phase 7 slice 7.1, 2026-09-21.)
 
+An adapter that calls a model provider MUST declare each tool the request
+offers, the result tool included, under a name inside the provider's
+tool-name rule, and MUST read each call the provider makes back to its tool
+id through that same request's declarations. Providers refuse the whole
+request over one name outside their rule, and an `AgentToolId` admits far
+more than any of them does — every MCP tool id (`mcp.<server>.<tool>`) is
+outside both the Anthropic and the OpenAI rule. `rakka_agent::tool_names`
+provides the mapping for every adapter, Rig-backed or not: its target is the
+intersection of those two rules (`[A-Za-z0-9_-]`, 1 to 64 bytes); an id
+inside it is its own name, and any other is sanitized, cut to its tail, and
+suffixed with a prefix of the id's SHA-256, a pure function of the id, so a
+replayed turn declares the same names. Two offered tools that would share a
+name MUST be refused before the request is sent
+(`model-tool-name-collision`). The provider's name for a tool is never
+durable: turns, grants, records, and digests keep the tool id. (Issue #85,
+2026-10-11.)
+
 The Rig-backed implementation of the trait MUST live behind a `rig` cargo
 feature of `rakka-agent`. The feature SHOULD be enabled by default, but the
 crate MUST compile and pass its tests with `--no-default-features`, and the
