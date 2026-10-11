@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rakka_agent::{
-    AgentAuthorityRefusal, AgentContentDigest, AgentDispatchToolExecutor, AgentEffectSafetyClass,
-    AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration, AgentToolId,
-    AgentToolResultBehavior,
+    AgentAuthorityRefusal, AgentContentDigest, AgentDispatchError, AgentDispatchToolExecutor,
+    AgentEffectSafetyClass, AgentTaskContent, AgentToolCallId, AgentToolCallRequest,
+    AgentToolDeclaration, AgentToolId, AgentToolResultBehavior,
 };
 use rakka_agent_mcp::testkit::{
     hardened_reqwest_client, serve_fake, CountingClient, FakeMcpServer, FakeTool,
@@ -1114,5 +1114,54 @@ async fn the_intents_timeout_bounds_a_handshake_that_is_never_answered() {
         error.to_string().contains("mcp-transport-failed")
             && error.to_string().contains(ATTEMPT_TIMED_OUT),
         "{error}"
+    );
+}
+
+struct RefuseTransiently;
+
+impl McpEgressCheck for RefuseTransiently {
+    fn check(&self, server: &McpServerId, _url: &str) -> Result<(), AgentAuthorityRefusal> {
+        Err(AgentAuthorityRefusal::transient(
+            "egress-temporarily-denied",
+            format!("{server} is not reachable right now"),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn an_egress_refusal_the_host_marks_definitive_is_definitive() {
+    let endpoint = serve_fake(fake()).await;
+    let (executor, _, _) = executor_over(binding(&endpoint.url), Arc::new(RefuseAll)).await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(5_000)),
+            &call("echo", json!({})),
+            None,
+        )
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(&error, AgentDispatchError::Definitive { code, .. } if code == "egress-denied-by-policy"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_egress_refusal_the_host_marks_retryable_stays_retryable() {
+    let endpoint = serve_fake(fake()).await;
+    let (executor, _, _) = executor_over(binding(&endpoint.url), Arc::new(RefuseTransiently)).await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(5_000)),
+            &call("echo", json!({})),
+            None,
+        )
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(&error, AgentDispatchError::Collaborator { code, .. } if code == "egress-temporarily-denied"),
+        "{error:?}"
     );
 }

@@ -711,8 +711,14 @@ where
                     intent.generation.get(),
                     call.call_id
                 ));
-                let refused = |error: rakka_agent_workflow::AgentArtifactError| {
-                    AgentDispatchError::collaborator(error.code(), error.to_string())
+                // A store that refused the write will refuse it again, and a
+                // retry would invoke the remote tool again only to lose its
+                // result the same way: that refusal is definitive.
+                let refused = |error: rakka_agent_workflow::AgentArtifactError| match error {
+                    rakka_agent_workflow::AgentArtifactError::Refused { .. } => {
+                        AgentDispatchError::definitive(error.code(), error.to_string())
+                    }
+                    other => AgentDispatchError::collaborator(other.code(), other.to_string()),
                 };
                 let reference = self
                     .artifacts
@@ -1053,7 +1059,9 @@ fn encoding_refused(error: serde_json::Error) -> AgentDispatchError {
 /// A transport or protocol failure is an *invocation* failure — the attempt
 /// ran and did not land — while every other variant is a collaborator refusal
 /// under its own stable code, including an egress refusal, which carries the
-/// host's code rather than one this crate invented.
+/// host's code rather than one this crate invented. An egress refusal the host
+/// declared not retryable is a definitive refusal, which exhausts the
+/// attempt's ticket at once.
 fn dispatch_error(error: McpClientError) -> AgentDispatchError {
     match &error {
         McpClientError::Transport { .. } | McpClientError::Protocol { .. } => {
@@ -1062,6 +1070,11 @@ fn dispatch_error(error: McpClientError) -> AgentDispatchError {
                 message: error.to_string(),
             }
         }
+        // The host declared the refusing condition permanent: retrying the
+        // attempt would only ask it again.
+        McpClientError::Egress {
+            retryable: false, ..
+        } => AgentDispatchError::definitive(error.code().to_string(), error.to_string()),
         other => AgentDispatchError::collaborator(other.code().to_string(), error.to_string()),
     }
 }

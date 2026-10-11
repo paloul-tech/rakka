@@ -9,9 +9,9 @@
 use std::sync::{Arc, Mutex};
 
 use rakka_agent::{
-    AgentContentDigest, AgentDispatchToolExecutor, AgentEffectSafetyClass, AgentRunScope,
-    AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration, AgentToolId,
-    AgentToolResultBehavior, AGENT_TOOL_RESULT_MAX_BYTES,
+    AgentContentDigest, AgentDispatchError, AgentDispatchToolExecutor, AgentEffectSafetyClass,
+    AgentRunScope, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration,
+    AgentToolId, AgentToolResultBehavior, AGENT_TOOL_RESULT_MAX_BYTES,
 };
 use rakka_agent_mcp::testkit::{
     serve_fake, CountingClient, FakeMcpServer, FakeTool, FakeToolBehaviour,
@@ -46,6 +46,8 @@ enum SinkMode {
     Failing,
     /// A valid reference whose URI alone is larger than the run's bound.
     HugeUri,
+    /// The store refuses the write and always will.
+    Refusing,
 }
 
 /// One write, as the sink saw it.
@@ -90,6 +92,11 @@ impl McpArtifactSink for RecordingSink {
             if self.mode == SinkMode::Failing {
                 return Err(AgentArtifactError::Store {
                     message: "the artifact store is unavailable".to_string(),
+                });
+            }
+            if self.mode == SinkMode::Refusing {
+                return Err(AgentArtifactError::Refused {
+                    message: "the result is larger than this store accepts".to_string(),
                 });
             }
             let digest = AgentContentDigest::sha256_of_bytes(&request.bytes).value;
@@ -405,5 +412,51 @@ async fn a_store_handle_still_builds_an_executor() {
         store.len().await,
         1,
         "the store behind the handle was written"
+    );
+}
+
+#[tokio::test]
+async fn a_sink_that_refuses_the_write_fails_the_attempt_definitively() {
+    let endpoint = serve_fake(fake()).await;
+    let executor = executor_over(
+        &endpoint.url,
+        McpArtifacts::sink(RecordingSink::new(SinkMode::Refusing)),
+    )
+    .await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.big", Some(5_000)),
+            &call("big"),
+            None,
+        )
+        .await
+        .expect_err("the store refuses");
+    assert!(
+        matches!(&error, AgentDispatchError::Definitive { code, .. } if code == "artifact-store-refused"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_sink_that_is_down_fails_the_attempt_retryably() {
+    let endpoint = serve_fake(fake()).await;
+    let executor = executor_over(
+        &endpoint.url,
+        McpArtifacts::sink(RecordingSink::new(SinkMode::Failing)),
+    )
+    .await;
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.big", Some(5_000)),
+            &call("big"),
+            None,
+        )
+        .await
+        .expect_err("the store is down");
+    assert!(
+        matches!(&error, AgentDispatchError::Collaborator { code, .. } if code == "artifact-store"),
+        "{error:?}"
     );
 }
