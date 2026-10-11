@@ -191,7 +191,7 @@ Each test is written to fail first against `e2e7a29`.
   entry with budget left, and refuses an unknown message id.
 - **MCP executor** (`rakka-agent-mcp`, against the testkit's fake server):
   - an egress refusal with `retryable: false` exhausts on the first attempt
-    under a budget of three and opens no connection;
+    under a multi-attempt budget and opens no connection;
   - an artifact sink answering `Refused` invokes the remote tool exactly once
     across the passes that would otherwise retry it;
   - a `tools/call` answer slower than the deadline parks a non-idempotent run
@@ -200,9 +200,10 @@ Each test is written to fail first against `e2e7a29`.
   - a JSON-RPC error answer, and a slow listing (before the send), still
     record a retryable failure.
 
-  The fake server gains a call delay and a mid-call transport failure
-  (`with_call_delay`, `with_call_failure`) beside its existing
-  `with_list_delay`.
+  The slow call uses the fake server's existing `FakeToolBehaviour::Sleep`;
+  the fake gains a transport failure after the call runs
+  (`with_call_transport_failure`) and a JSON-RPC error answer
+  (`FakeToolBehaviour::RpcError`).
 
 Documentation: specification 11.5 (an executor-reported unknown outcome
 follows the table), `docs/rakka-compatibility.md` (the two variants, the
