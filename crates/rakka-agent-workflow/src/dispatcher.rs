@@ -568,7 +568,12 @@ pub struct AgentDispatchEntry {
     /// worker refresh and its outbox message is settled as cancelled.
     #[serde(default)]
     pub cancellation_requested: bool,
-    /// Stable error code or summary for the last failed dispatch.
+    /// Stable error code or summary for the last failed dispatch, or — on a
+    /// ticket settled as cancelled through
+    /// [`AgentDispatcherFleet::record_claim_failure`] — the reason it was
+    /// settled (`ticket-stale`, `intent-already-resolved`, `run-cancelled`,
+    /// or an application refusal's code). The outbox row keeps only the
+    /// cancelled status, so this is where a settle reason is durable.
     pub last_error_code: Option<String>,
     /// Creation timestamp.
     pub created_at: AgentTimestampMillis,
@@ -784,6 +789,14 @@ impl AgentDispatchEntry {
         self.updated_at = now;
         self.completed_at = Some(now);
         self
+    }
+
+    /// Settles a claimed ticket as cancelled and keeps why, bounded where
+    /// it is written like every other writer of the field.
+    fn mark_settled_cancelled(self, reason: &str, now: AgentTimestampMillis) -> Self {
+        let mut entry = self.mark_cancelled(now);
+        entry.last_error_code = Some(bounded_dispatch_detail(reason));
+        entry
     }
 
     fn validate(&self) -> AgentDispatcherResult<()> {
@@ -1625,7 +1638,9 @@ where
                 ..
             } => entry.mark_exhausted(*attempts, message.clone(), now),
             WorkflowTelemetryEvent::OutboxDispatchSucceeded { .. } => entry.mark_completed(now),
-            WorkflowTelemetryEvent::OutboxDispatchCancelled { .. } => entry.mark_cancelled(now),
+            WorkflowTelemetryEvent::OutboxDispatchCancelled { message, .. } => {
+                entry.mark_settled_cancelled(message, now)
+            }
         })
         .await
     }
