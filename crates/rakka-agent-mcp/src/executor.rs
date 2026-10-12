@@ -1106,6 +1106,12 @@ fn encoding_refused(error: serde_json::Error) -> AgentDispatchError {
 /// host's code rather than one this crate invented. An egress refusal the host
 /// declared not retryable is a definitive refusal, which exhausts the
 /// attempt's ticket at once.
+///
+/// An egress refusal's message is the host's own and nothing else, as its code
+/// is: the dispatcher persists it on the outbox row and echoes it across the
+/// fleet, and what a refusal discloses — a host digest rather than the
+/// destination, say — is the host's decision. The variant's `Display`, which
+/// names the server, stays for the sync's refusal.
 fn dispatch_error(error: McpClientError) -> AgentDispatchError {
     match &error {
         McpClientError::Transport { .. } | McpClientError::Protocol { .. } => {
@@ -1117,8 +1123,14 @@ fn dispatch_error(error: McpClientError) -> AgentDispatchError {
         // The host declared the refusing condition permanent: retrying the
         // attempt would only ask it again.
         McpClientError::Egress {
-            retryable: false, ..
-        } => AgentDispatchError::definitive(error.code().to_string(), error.to_string()),
+            code,
+            message,
+            retryable: false,
+            ..
+        } => AgentDispatchError::definitive(code.clone(), message.clone()),
+        McpClientError::Egress { code, message, .. } => {
+            AgentDispatchError::collaborator(code.clone(), message.clone())
+        }
         other => AgentDispatchError::collaborator(other.code().to_string(), error.to_string()),
     }
 }

@@ -1155,6 +1155,13 @@ async fn an_egress_refusal_the_host_marks_definitive_is_definitive() {
         matches!(&error, AgentDispatchError::Definitive { code, .. } if code == "egress-denied-by-policy"),
         "{error:?}"
     );
+    // What the dispatcher persists is the host's own message, whole and alone:
+    // the server id is the caller's choice, and the host decides what its
+    // refusal discloses.
+    assert!(
+        matches!(&error, AgentDispatchError::Definitive { message, .. } if message == "crm is not an allowed egress"),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -1172,6 +1179,10 @@ async fn an_egress_refusal_the_host_marks_retryable_stays_retryable() {
         .expect_err("refused");
     assert!(
         matches!(&error, AgentDispatchError::Collaborator { code, .. } if code == "egress-temporarily-denied"),
+        "{error:?}"
+    );
+    assert!(
+        matches!(&error, AgentDispatchError::Collaborator { message, .. } if message == "crm is not reachable right now"),
         "{error:?}"
     );
 }
