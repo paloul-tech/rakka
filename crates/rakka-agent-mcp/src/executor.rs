@@ -57,7 +57,7 @@ use rakka_agent_workflow::{
     ArtifactKind, RedactionStatus,
 };
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, MetaObject,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, MetaObject, RequestId,
     RequestMetaObject,
 };
 use rmcp::service::ServiceError;
@@ -416,6 +416,10 @@ where
         // echo back into anything it answers.
         let secrets = client::credential_secrets(credential);
         let session = within(deadline, self.open(scope, &server.binding, credential)).await??;
+        // The id of a sent `tools/call` still waiting for its answer. A
+        // deadline that drops the call while it waits leaves it here, so the
+        // server can be told the call was abandoned.
+        let mut in_flight = None;
         // The recheck's listing runs before the send and the call from it on,
         // both under the attempt's one deadline: what an elapsed deadline
         // means depends on which side of the send it fired.
@@ -428,7 +432,15 @@ where
             within_after_send(
                 deadline,
                 self.call(
-                    &session, scope, server, descriptor, policy, intent, call, &secrets,
+                    &session,
+                    scope,
+                    server,
+                    descriptor,
+                    policy,
+                    intent,
+                    call,
+                    &secrets,
+                    &mut in_flight,
                 ),
             )
             .await?
@@ -436,8 +448,17 @@ where
         .await;
         // Unconditional, and outside the effect's deadline: a close is owed on
         // every path, including the one where the deadline just fired. It is
-        // bounded on its own terms by `McpClientSession::close`.
-        session.close().await;
+        // bounded on its own terms by `McpClientSession::close`, and a call the
+        // deadline abandoned is cancelled inside that same bound first (issue
+        // #85, ask 6): the outcome stays unknown, but the server can stop.
+        match in_flight {
+            Some(request) => {
+                session
+                    .cancel_and_close(request, DEADLINE_CANCEL_REASON)
+                    .await;
+            }
+            None => session.close().await,
+        }
         outcome
     }
 
@@ -517,6 +538,7 @@ where
         intent: &AgentRunEffect,
         call: &AgentToolCallRequest,
         secrets: &[&str],
+        in_flight: &mut Option<RequestId>,
     ) -> Result<AgentTaskContent, AgentDispatchError> {
         let Some(arguments) = call.arguments.as_object().cloned() else {
             return Err(AgentDispatchError::collaborator(
@@ -530,8 +552,7 @@ where
         // No timeout of its own: the attempt's deadline wraps this whole
         // function, recheck included.
         let answer = session
-            .peer()
-            .call_tool_once(params)
+            .call_tool(params, in_flight)
             .await
             .map_err(|error| sent_call_error(server.binding.server_id.as_str(), &error))?;
         self.content(scope, policy, &call.tool, intent, call, answer, secrets)
@@ -892,6 +913,10 @@ async fn within<T>(
 /// The stable code of an attempt whose `tools/call` was sent and whose
 /// answer was never read: the server may have acted.
 const MCP_OUTCOME_UNKNOWN: &str = "mcp-outcome-unknown";
+
+/// The reason an attempt gives the server, with `notifications/cancelled`,
+/// for a `tools/call` its deadline stopped it waiting for.
+const DEADLINE_CANCEL_REASON: &str = "the attempt's deadline elapsed";
 
 /// Runs the part of the attempt from the send of `tools/call` on, under the
 /// same deadline as [`within`].

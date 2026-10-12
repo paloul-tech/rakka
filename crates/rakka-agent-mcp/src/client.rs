@@ -45,12 +45,13 @@ use http::{HeaderName, HeaderValue};
 use rakka_agent::AgentAuthorityRefusal;
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentEphemeralCredentialMaterial};
 use rmcp::model::{
-    ClientCapabilities, ClientConfig, ErrorCode, Implementation, PaginatedRequestParams,
-    ProtocolVersion, Tool,
+    CallToolRequest, CallToolRequestParams, CallToolResponse, CancelledNotificationParam,
+    ClientCapabilities, ClientConfig, ClientRequest, ErrorCode, Implementation,
+    PaginatedRequestParams, ProtocolVersion, RequestId, ServerResult, Tool,
 };
 use rmcp::service::{
-    serve_client_with_lifecycle, ClientInitializeError, ClientLifecycleMode, Peer, RoleClient,
-    RunningService, ServiceError,
+    serve_client_with_lifecycle, ClientInitializeError, ClientLifecycleMode, Peer,
+    PeerRequestOptions, RoleClient, RunningService, ServiceError,
 };
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClient, StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -357,6 +358,60 @@ impl McpClientSession {
     #[must_use]
     pub(crate) fn server_version(&self) -> Option<&str> {
         self.server_version.as_deref()
+    }
+
+    /// Sends one `tools/call` and waits for its answer, holding the request's
+    /// id in `in_flight` while it waits.
+    ///
+    /// The id is what a caller needs to tell the server the call was
+    /// abandoned: a deadline that drops this future while it waits leaves the
+    /// id behind, and any answer — a result, a JSON-RPC error, or a failure of
+    /// the transport — takes it away again. The answer is mapped as rmcp's own
+    /// `call_tool_once` maps it.
+    pub(crate) async fn call_tool(
+        &self,
+        params: CallToolRequestParams,
+        in_flight: &mut Option<RequestId>,
+    ) -> Result<CallToolResponse, ServiceError> {
+        let handle = self
+            .peer()
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                PeerRequestOptions::no_options(),
+            )
+            .await?;
+        *in_flight = Some(handle.id.clone());
+        let answer = handle.await_response().await;
+        *in_flight = None;
+        match answer? {
+            ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
+            ServerResult::InputRequiredResult(result) => {
+                Ok(CallToolResponse::InputRequired(result))
+            }
+            ServerResult::CreateTaskResult(result) => Ok(CallToolResponse::Task(result)),
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
+
+    /// Tells the server the request `request` will not be waited for, then
+    /// closes the session.
+    ///
+    /// rmcp carries the cancellation as the protocol revision asks: on a
+    /// legacy session (2025-11-25 and earlier, and a child process's stdio) it
+    /// sends `notifications/cancelled` with `reason`; on a modern HTTP session
+    /// it aborts the request's own HTTP exchange, which is the revision's
+    /// cancellation and which the close would abort anyway.
+    ///
+    /// Advisory: the server may already have acted, or may not stop. The
+    /// notification and the close share [`SESSION_CLOSE_BOUND`], so a session
+    /// that cancels is closed no later than one that does not, and a server
+    /// that never takes the notification costs the close's bound and no more.
+    pub(crate) async fn cancel_and_close(mut self, request: RequestId, reason: &str) {
+        let bound = tokio::time::Instant::now() + SESSION_CLOSE_BOUND;
+        let notice = CancelledNotificationParam::new(Some(request), Some(reason.to_string()));
+        let _ = tokio::time::timeout_at(bound, self.peer().notify_cancelled(notice)).await;
+        let left = bound.saturating_duration_since(tokio::time::Instant::now());
+        let _ = self.running.close_with_timeout(left).await;
     }
 
     /// Cancels the session and waits, for at most a few seconds, for its

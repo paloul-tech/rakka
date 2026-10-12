@@ -23,7 +23,7 @@ use rakka_agent_mcp::testkit::{
 use rakka_agent_mcp::{
     mcp_artifact_store, sync_mcp_descriptors, McpAllowAllEgress, McpDescriptorSet,
     McpDispatchToolExecutor, McpEgressCheck, McpRegistrationError, McpServerBinding, McpServerId,
-    McpToolPolicy, MCP_LIST_PAGES_MAX, MCP_META_IDEMPOTENCY_KEY,
+    McpToolPolicy, MCP_LIST_PAGES_MAX, MCP_META_IDEMPOTENCY_KEY, MCP_SESSION_CLOSE_BOUND_MS,
 };
 use rakka_agent_workflow::{
     validate_artifact_ref, AgentEphemeralCredential, AgentTimestampMillis,
@@ -1251,4 +1251,169 @@ async fn a_json_rpc_error_answer_is_a_known_outcome() {
         ),
         "the server answered, so the outcome is known: {error:?}"
     );
+}
+
+/// The reason an attempt gives the server for a call it stopped waiting for.
+const DEADLINE_CANCEL_REASON: &str = "the attempt's deadline elapsed";
+
+/// The cancellations `server` has recorded, once it has recorded `expected`
+/// of them or two seconds have passed: a notification is processed on the
+/// server's own time, after the client's send returned.
+async fn cancellations_settled(server: &FakeMcpServer, expected: usize) -> Vec<String> {
+    let started = Instant::now();
+    loop {
+        let seen = server.cancellations();
+        if seen.len() >= expected || started.elapsed() > Duration::from_secs(2) {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// No cancellation arrives, given the server a moment to process one.
+async fn assert_no_cancellation(server: &FakeMcpServer) {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.cancellations(), Vec::<String>::new());
+}
+
+/// A server whose one tool, `slow`, answers two seconds after it is called.
+fn slow_server() -> FakeMcpServer {
+    FakeMcpServer::new().with_tool(FakeTool::new(
+        "slow",
+        "Slow.",
+        json!({"type":"object"}),
+        FakeToolBehaviour::Sleep { millis: 2_000 },
+    ))
+}
+
+/// An executor over `slow` on the server at `url`.
+async fn slow_executor_at(url: &str) -> McpDispatchToolExecutor<ReqwestClient> {
+    let http = hardened_reqwest_client();
+    let binding = McpServerBinding::streamable_http(server_id(), url)
+        .with_tool(
+            "slow",
+            policy(
+                AgentEffectSafetyClass::ReadOnly,
+                AgentToolResultBehavior::InlineBounded,
+            ),
+        )
+        .expect("t");
+    let set = sync_mcp_descriptors(
+        &http,
+        &binding,
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("syncs");
+    McpDispatchToolExecutor::new(
+        vec![set],
+        vec![binding],
+        mcp_artifact_store(SharedArtifactStore::default()),
+        http,
+        Arc::new(McpAllowAllEgress),
+    )
+    .expect("builds")
+}
+
+/// Calls `slow` under a 200 ms timeout, asserts the attempt ended inside the
+/// timeout plus the close bound the cancellation shares, and that the outcome
+/// is still unknown — a cancellation is advisory.
+async fn abandon_slow_call(executor: &McpDispatchToolExecutor<ReqwestClient>) {
+    let started = Instant::now();
+    let error = executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.slow", Some(200)),
+            &call("slow", json!({})),
+            None,
+        )
+        .await
+        .expect_err("timed out");
+    assert!(
+        started.elapsed() < Duration::from_millis(200 + MCP_SESSION_CLOSE_BOUND_MS),
+        "the timeout, plus the close bound the cancellation shares: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            &error,
+            AgentDispatchError::OutcomeUnknown {
+                code: "mcp-outcome-unknown",
+                ..
+            }
+        ),
+        "a cancellation is advisory, so the outcome stays unknown: {error:?}"
+    );
+}
+
+/// Issue #85 ask 6: a deadline that fires while the attempt waits for the
+/// server's answer tells a legacy server, with `notifications/cancelled` for
+/// the call it sent, before the session closes.
+#[tokio::test]
+async fn a_deadline_after_the_send_tells_a_legacy_server_the_call_was_abandoned() {
+    let endpoint = serve_fake(slow_server().with_legacy_only()).await;
+    abandon_slow_call(&slow_executor_at(&endpoint.url).await).await;
+    assert_eq!(
+        cancellations_settled(&endpoint.server, 1).await,
+        vec![DEADLINE_CANCEL_REASON.to_string()],
+        "the server heard that the call it was working on was abandoned"
+    );
+}
+
+/// The modern protocol carries a cancellation as the aborted request itself,
+/// not as a message, and closing the session aborts it anyway: nothing new
+/// reaches a modern server's wire.
+#[tokio::test]
+async fn on_a_modern_server_the_aborted_request_is_the_cancellation() {
+    let endpoint = serve_fake(slow_server()).await;
+    abandon_slow_call(&slow_executor_at(&endpoint.url).await).await;
+    assert_no_cancellation(&endpoint.server).await;
+}
+
+#[tokio::test]
+async fn a_call_answered_in_time_sends_no_cancellation() {
+    let endpoint = serve_fake(
+        FakeMcpServer::new()
+            .with_legacy_only()
+            .with_tool(echo_tool()),
+    )
+    .await;
+    let executor = echo_executor_at(&endpoint.url).await;
+    executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(5_000)),
+            &call("echo", json!({})),
+            None,
+        )
+        .await
+        .expect("answered");
+    assert_no_cancellation(&endpoint.server).await;
+}
+
+#[tokio::test]
+async fn a_deadline_before_the_send_sends_no_cancellation() {
+    // The recheck's listing stalls past the effect's timeout, so `tools/call`
+    // is never sent and there is nothing to cancel.
+    let endpoint = serve_fake(
+        FakeMcpServer::new()
+            .with_legacy_only()
+            .with_tool(echo_tool())
+            .with_list_delay(2_000),
+    )
+    .await;
+    let executor = echo_executor_at(&endpoint.url).await;
+    executor
+        .execute(
+            &run_scope(),
+            &tool_intent_with_timeout("mcp.crm.echo", Some(200)),
+            &call("echo", json!({})),
+            None,
+        )
+        .await
+        .expect_err("the listing stalled past the effect's timeout");
+    assert_eq!(endpoint.server.call_count(), 0, "tools/call was never sent");
+    assert_no_cancellation(&endpoint.server).await;
 }
