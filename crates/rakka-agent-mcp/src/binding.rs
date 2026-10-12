@@ -101,7 +101,8 @@ pub const MCP_SYNC_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 /// A bound of its own, never charged to a sync's or an attempt's: a session
 /// is closed on every way out, including the one where that bound has just
 /// fired. So a sync returns within its bound plus this one, and an attempt
-/// within its timeout plus this one.
+/// within its timeout plus this one. An attempt whose deadline abandoned a
+/// sent `tools/call` cancels it first, inside this same bound.
 pub const MCP_SESSION_CLOSE_BOUND_MS: u64 = 3_000;
 
 /// The client name this adapter identifies itself with during MCP

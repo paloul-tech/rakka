@@ -244,6 +244,7 @@ struct FakeState {
     calls: Vec<SeenCall>,
     last_headers: Vec<(String, String)>,
     call_transport_failure: bool,
+    cancellations: Vec<String>,
 }
 
 /// An in-process MCP server whose tools, identity, negotiated versions and
@@ -281,6 +282,7 @@ impl FakeMcpServer {
                 calls: Vec::new(),
                 last_headers: Vec::new(),
                 call_transport_failure: false,
+                cancellations: Vec::new(),
             })),
         }
     }
@@ -375,6 +377,20 @@ impl FakeMcpServer {
     #[must_use]
     pub fn handshakes(&self) -> usize {
         self.lock().handshakes
+    }
+
+    /// The reason of every `notifications/cancelled` the server has received
+    /// on the wire, in order (an empty string for one that gave none).
+    ///
+    /// Read from the HTTP request rather than from the handler: rmcp's session
+    /// layer acts on a cancellation — the call's cancellation token trips —
+    /// without handing it to `on_cancelled`, and closing the session trips that
+    /// token too, so the wire is the one place a cancellation is told apart
+    /// from a close. Only a legacy session sends one: the modern protocol
+    /// cancels by aborting the request itself, which carries no message.
+    #[must_use]
+    pub fn cancellations(&self) -> Vec<String> {
+        self.lock().cancellations.clone()
     }
 
     /// How many `tools/call` requests the server has served.
@@ -661,14 +677,32 @@ pub async fn serve_fake(server: FakeMcpServer) -> FakeMcpEndpoint {
     }
 }
 
-/// Copies every inbound request's headers into the fake's state before the MCP
-/// service sees the request: the handler itself is given no access to the HTTP
-/// layer, so this is the only place the wire is observable.
+/// Copies every inbound request's headers into the fake's state, and records
+/// every `notifications/cancelled` it carries, before the MCP service sees the
+/// request: the handler itself is given no access to the HTTP layer, so this
+/// is the only place the wire is observable.
 async fn capture_headers(
     axum::extract::State(server): axum::extract::State<FakeMcpServer>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // The body is read whole and put back unchanged: a test server's requests
+    // are small, and the MCP service must see exactly what the client sent.
+    let (parts, body) = request.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return axum::response::IntoResponse::into_response(axum::http::StatusCode::BAD_REQUEST);
+    };
+    if let Ok(message) = serde_json::from_slice::<Value>(&bytes) {
+        if message.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+            let reason = message
+                .pointer("/params/reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            server.lock().cancellations.push(reason);
+        }
+    }
+    let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
     let headers = request
         .headers()
         .iter()
