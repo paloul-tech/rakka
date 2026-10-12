@@ -12,6 +12,11 @@
 //! [`MCP_DESCRIPTOR_SCHEMA_MAX_BYTES`], or a name that cannot form a tool id —
 //! is listed and marked [`McpListedTool::unusable`], its schemas withheld, so
 //! one such tool never hides the rest.
+//!
+//! Every piece of server text the listing received — the server's name and
+//! version, and each listed tool's name, description, title and schemas,
+//! withheld or not — is judged first, and one that carries the credential the
+//! call sent refuses the whole listing (`mcp-descriptor-credential-echoed`).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -20,16 +25,17 @@ use rakka_agent::{AgentContentDigest, AgentToolId, AGENT_IDENTITY_MAX_LENGTH};
 use rakka_agent_workflow::AgentEphemeralCredential;
 use rmcp::model::Tool;
 use rmcp::transport::streamable_http_client::StreamableHttpClient;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::binding::{
     McpRegistrationError, McpServerBinding, McpServerId, MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
     MCP_SYNC_TIMEOUT_DEFAULT_MS,
 };
-use crate::client::{connect, service_error, McpEgressCheck};
+use crate::client::{connect, credential_secrets, service_error, McpEgressCheck};
 use crate::sync::{
-    bounded_description, bounded_server_name, cut_at, pages_unended, stored_annotations,
-    sync_deadline, timed_out, McpSyncError, McpToolAnnotations,
+    bounded_description, bounded_server_name, carries, cut_at, judge_server_identity,
+    pages_unended, stored_annotations, sync_deadline, timed_out, value_carries, McpSyncError,
+    McpToolAnnotations,
 };
 
 /// What one MCP server lists, vetted but not bound.
@@ -157,16 +163,32 @@ where
     let session = tokio::time::timeout_at(deadline, connect(http, binding, credential, egress))
         .await
         .map_err(|_| timed_out(&server, timeout))??;
+    // The material the server now holds, and so could echo into anything it
+    // lists.
+    let secrets = credential_secrets(credential);
     let listed = tokio::time::timeout_at(deadline, session.list_all_tools()).await;
     let protocol_version = session.negotiated_version().as_str().to_string();
     let reported_name = session.server_name().to_string();
     let reported_version = session.server_version().map(str::to_string);
     // Closed before the answer is judged, as the sync closes its session.
     session.close().await;
+    // Judged first, as the sync judges it: a server that echoes the
+    // credential into its identity is refused for that, whatever else its
+    // answer got wrong.
+    judge_server_identity(
+        &server,
+        &reported_name,
+        reported_version.as_deref(),
+        &secrets,
+    )?;
     let listed = listed
         .map_err(|_| timed_out(&server, timeout))?
         .map_err(|error| McpSyncError::Client(service_error(&server, &error)))?
         .ok_or_else(|| pages_unended(&server))?;
+    // Every tool the server listed, every copy, before anything is built.
+    for tool in &listed {
+        judge_listed_tool(&server, tool, &secrets)?;
+    }
     Ok(McpToolListing {
         server_id: binding.server_id.clone(),
         server_name: bounded_server_name(&reported_name),
@@ -174,6 +196,61 @@ where
         protocol_version,
         tools: listed_tools(binding, &listed),
     })
+}
+
+/// Every piece of text the server listed for one tool, judged raw and whole —
+/// including a schema the listing would withhold and a duplicate's later
+/// copy. "Every byte the listing received" is the rule with no exceptions to
+/// reason about: a server that reflects the credential into any of its text
+/// is refused for that, whatever that text was going to be shown as.
+fn judge_listed_tool(server: &str, listed: &Tool, secrets: &[&str]) -> Result<(), McpSyncError> {
+    let name: &str = listed.name.as_ref();
+    if carries(name, secrets) {
+        // The name is the echo, so the refusal cannot quote it.
+        return Err(McpSyncError::CredentialEchoed {
+            server: server.to_string(),
+            tool: None,
+            field: "tool name",
+        });
+    }
+    let echoed = |field: &'static str| McpSyncError::CredentialEchoed {
+        server: server.to_string(),
+        tool: Some(cut_at(name, AGENT_IDENTITY_MAX_LENGTH)),
+        field,
+    };
+    if listed
+        .description
+        .as_deref()
+        .is_some_and(|description| carries(description, secrets))
+    {
+        return Err(echoed("description"));
+    }
+    if listed
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.title.as_deref())
+        .is_some_and(|title| carries(title, secrets))
+    {
+        return Err(echoed("annotations title"));
+    }
+    if object_carries(&listed.input_schema, secrets) {
+        return Err(echoed("input schema"));
+    }
+    if listed
+        .output_schema
+        .as_ref()
+        .is_some_and(|schema| object_carries(schema, secrets))
+    {
+        return Err(echoed("output schema"));
+    }
+    Ok(())
+}
+
+/// [`value_carries`] over a schema object, without copying it.
+fn object_carries(object: &Map<String, Value>, secrets: &[&str]) -> bool {
+    object
+        .iter()
+        .any(|(key, nested)| carries(key, secrets) || value_carries(nested, secrets))
 }
 
 /// One entry per name, from its first copy — as a sync matches an

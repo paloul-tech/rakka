@@ -427,10 +427,11 @@ pub enum McpSyncError {
         /// The server whose text carried it.
         server: String,
         /// The tool whose text carried it, or `None` for the server's name or
-        /// version.
+        /// version, and for a tool name, which the refusal cannot quote.
         tool: Option<String>,
-        /// Which text: `server name`, `server version`, `description`,
-        /// `annotations title`, `input schema`, or `output schema`.
+        /// Which text: `server name`, `server version`, `tool name`,
+        /// `description`, `annotations title`, `input schema`, or
+        /// `output schema`.
         field: &'static str,
     },
 }
@@ -691,7 +692,7 @@ pub async fn sync_mcp_descriptors_over_within(
 }
 
 /// Whether `text` carries any of `secrets`. An empty secret matches nothing.
-fn carries(text: &str, secrets: &[&str]) -> bool {
+pub(crate) fn carries(text: &str, secrets: &[&str]) -> bool {
     secrets
         .iter()
         .any(|secret| !secret.is_empty() && text.contains(secret))
@@ -703,7 +704,7 @@ fn carries(text: &str, secrets: &[&str]) -> bool {
 /// its own — one with a quote or a backslash in it — is found as itself. A
 /// number is compared whole rather than searched: a digit run inside a
 /// larger number is not the secret.
-fn value_carries(value: &Value, secrets: &[&str]) -> bool {
+pub(crate) fn value_carries(value: &Value, secrets: &[&str]) -> bool {
     match value {
         Value::String(text) => carries(text, secrets),
         Value::Array(items) => items.iter().any(|item| value_carries(item, secrets)),
