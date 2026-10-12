@@ -36,6 +36,8 @@ use rmcp::ServerHandler;
 use serde_json::{Map, Value};
 use tokio::task::JoinHandle;
 
+use crate::sync::McpToolAnnotations;
+
 /// The concrete HTTP client rmcp implements
 /// [`StreamableHttpClient`] for.
 ///
@@ -156,10 +158,12 @@ impl FakeTool {
         )
     }
 
-    /// Declares the tool's hints.
+    /// Declares the tool's hints — rmcp's own `ToolAnnotations`, or this
+    /// crate's [`McpToolAnnotations`], so a deployment's proofs need no rmcp
+    /// dependency of their own.
     #[must_use]
-    pub fn with_annotations(mut self, annotations: ToolAnnotations) -> Self {
-        self.annotations = Some(annotations);
+    pub fn with_annotations(mut self, annotations: impl Into<ToolAnnotations>) -> Self {
+        self.annotations = Some(annotations.into());
         self
     }
 
@@ -192,6 +196,20 @@ impl FakeTool {
             .map(|schema| Arc::new(object_of(schema)));
         tool.annotations = self.annotations.clone();
         tool
+    }
+}
+
+/// The stored hints as the fake lists them. rmcp's type is
+/// `#[non_exhaustive]`, so it is built through its own `from_raw`.
+impl From<McpToolAnnotations> for ToolAnnotations {
+    fn from(annotations: McpToolAnnotations) -> Self {
+        ToolAnnotations::from_raw(
+            annotations.title,
+            annotations.read_only_hint,
+            annotations.destructive_hint,
+            annotations.idempotent_hint,
+            annotations.open_world_hint,
+        )
     }
 }
 
