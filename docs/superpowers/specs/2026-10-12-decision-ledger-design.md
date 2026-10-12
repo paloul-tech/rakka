@@ -15,7 +15,7 @@ Past the window, the domain fence refuses the re-post. That is safe, because not
 | Command | Refusal a replay meets past the window |
 | --- | --- |
 | `ResolveCheckpoint` | `run-unknown-checkpoint` (every resolving outcome drops the checkpoint), or `run-terminal` after a Deny ended the run |
-| `ResolveIndeterminateEffect` | `run-terminal`, `run-stale-effect-generation`, `run-stale-effect-result` |
+| `ResolveIndeterminateEffect` | `run-terminal`, `run-stale-effect-generation`, `run-stale-effect-result`, or `run-unknown-effect` once the turn that held the effect has ended (the turn's resolved effects leave with it) |
 | `Create` | `task-already-created` |
 | `Cancel` | `task-terminal` (once the cancellation finished) |
 | `ActivateGoal`, `ResumeGoal` | `goal-stale-status-revision`, `goal-terminal` |
