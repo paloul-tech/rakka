@@ -25,9 +25,9 @@ use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     delegation_result_operation_id, AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeKind,
     AgentExchangePayload, AgentFanInPolicy, AgentLoopPhase, AgentModelTurn, AgentRunEffect,
-    AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEntityCommand, AgentRunStatus,
-    AgentTaskContent, AgentTaskId, AgentTaskScope, AgentTaskStatus, AgentToolCallId,
-    AgentToolCallRequest, TenantId, AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
+    AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEntityCommand, AgentRunEntityReply,
+    AgentRunStatus, AgentTaskContent, AgentTaskId, AgentTaskScope, AgentTaskStatus,
+    AgentToolCallId, AgentToolCallRequest, TenantId, AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentCorrelationId;
@@ -450,9 +450,14 @@ async fn the_deadline_marks_stragglers_and_resolves_timed_out() {
     // Not due yet: the fixture clock is far below the deadline.
     let mut run = fixture.run();
     run.recover(fixture.now()).await.expect("recover");
-    run.apply(fire("early"), &fixture.router, fixture.now())
+    let early = run
+        .apply(fire("early"), &fixture.router, fixture.now())
         .await
-        .expect("the early fire applies");
+        .expect("the early fire answers");
+    assert!(
+        matches!(early, AgentRunEntityReply::Unchanged { .. }),
+        "a deadline not yet due writes nothing, got {early:?}"
+    );
     let (phase, _, _) = parked_phase(&fixture).await;
     assert_eq!(phase, AgentLoopPhase::AwaitingChildren, "not due, no move");
 
@@ -466,9 +471,14 @@ async fn the_deadline_marks_stragglers_and_resolves_timed_out() {
     run.apply(fire("due"), &fixture.router, fixture.now())
         .await
         .expect("the due fire applies");
-    run.apply(fire("again"), &fixture.router, fixture.now())
+    let again = run
+        .apply(fire("again"), &fixture.router, fixture.now())
         .await
         .expect("a duplicate fire converges");
+    assert!(
+        matches!(again, AgentRunEntityReply::Unchanged { .. }),
+        "a group already resolved writes nothing, got {again:?}"
+    );
     fixture.pump().await.expect("the loop should converge");
 
     let mut run = fixture.run();
