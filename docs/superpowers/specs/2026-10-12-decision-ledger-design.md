@@ -1,6 +1,6 @@
 # A decision ledger: a resolution's key outlives the operation window
 
-Status: draft, 2026-10-12, for the owner's review.
+Status: implemented, 2026-10-12. Branch `a18-decision-ledger` off `06d2cc7`, rebased onto `ff16456`.
 Brief: issue #96 (rakka.host A18), ask 2, drafted against `96a18b0`. The code was read at `06d2cc7`; `run.rs`, `task.rs`, `goal.rs` and `wake.rs` are unchanged between the two.
 Owner rulings (2026-10-12):
 - the ledger holds 32 entries;
