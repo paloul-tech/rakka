@@ -20,8 +20,9 @@ use rakka_agent::{
     AgentTaskCreation, AgentTaskDefinition, AgentTaskDependencyDeclaration,
     AgentTaskDependencyOutcome, AgentTaskEntityCommand, AgentTaskEntityReply, AgentTaskError,
     AgentTaskId, AgentTaskOutcome, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId,
-    AgentTaskStatus,
+    AgentTaskStatus, AgentWakeLifecyclePolicy, ScheduleRevision,
 };
+use rakka_agent_workflow::AgentTimestampMillis;
 
 mod common;
 
@@ -330,4 +331,135 @@ async fn a_replayed_goal_resume_answers_duplicate_rather_than_a_stale_revision()
     forget_window(&fx, false).await;
 
     assert_replay_converges(&fx, resume, outcome).await;
+}
+
+// ---------------------------------------------------------------------------
+// Wake-lifecycle commands, fenced on the lifecycle revision, and the schedule
+// update, fenced on the schedule revision.
+// ---------------------------------------------------------------------------
+
+async fn lifecycle_revision(fx: &Fixture) -> AgentRevisionNumber {
+    load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the state loads")
+        .expect("the state exists")
+        .task()
+        .expect("the task is created")
+        .wake_controller
+        .as_ref()
+        .expect("the controller exists")
+        .lifecycle()
+        .lifecycle_revision()
+}
+
+fn lifecycle_operation(kind: AgentOperationKind, step: &str) -> AgentOperationId {
+    AgentOperationId::new(kind, [TENANT, TASK, step]).expect("the operation id derives")
+}
+
+fn suspend(revision: AgentRevisionNumber) -> AgentTaskEntityCommand {
+    AgentTaskEntityCommand::SuspendContinuousGoal {
+        operation_id: lifecycle_operation(AgentOperationKind::LifecycleSuspend, "suspend-1"),
+        expected_lifecycle_revision: revision,
+        reason: Some("maintenance window".to_string()),
+        provenance: Box::new(provenance(10)),
+    }
+}
+
+#[tokio::test]
+async fn a_replayed_suspension_answers_duplicate_rather_than_a_stale_lifecycle_revision() {
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+    let command = suspend(lifecycle_revision(&fx).await);
+    assert!(command.records_decision());
+    let outcome = applied(fx.apply_task_command(command.clone()).await);
+    forget_window(&fx, false).await;
+
+    assert_replay_converges(&fx, command, outcome).await;
+}
+
+#[tokio::test]
+async fn a_replayed_lifecycle_resume_answers_duplicate_rather_than_a_stale_lifecycle_revision() {
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+    applied(
+        fx.apply_task_command(suspend(lifecycle_revision(&fx).await))
+            .await,
+    );
+    let resume = AgentTaskEntityCommand::ResumeContinuousGoal {
+        operation_id: lifecycle_operation(AgentOperationKind::LifecycleResume, "resume-1"),
+        expected_lifecycle_revision: lifecycle_revision(&fx).await,
+        provenance: Box::new(provenance(11)),
+    };
+    assert!(resume.records_decision());
+    let outcome = applied(fx.apply_task_command(resume.clone()).await);
+    forget_window(&fx, false).await;
+
+    assert_replay_converges(&fx, resume, outcome).await;
+    assert_eq!(ledger_len(&fx).await, 3, "creation, suspension, resume");
+}
+
+#[tokio::test]
+async fn a_replayed_renewal_answers_duplicate_rather_than_a_stale_lifecycle_revision() {
+    // Renewal needs an effective expiry to extend; the default lifecycle
+    // policy has none, and requires no renewal window.
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    let policy = wake_policy()
+        .with_lifecycle(AgentWakeLifecyclePolicy {
+            expires_at: Some(AgentTimestampMillis::new(50_000)),
+            ..AgentWakeLifecyclePolicy::DEFAULT
+        })
+        .expect("the lifecycle policy is valid");
+    fx.create_continuous_control_task(continuous_goal_mode(policy))
+        .await;
+    let renew = AgentTaskEntityCommand::RenewContinuousGoal {
+        operation_id: lifecycle_operation(AgentOperationKind::Command, "renew-1"),
+        expected_lifecycle_revision: lifecycle_revision(&fx).await,
+        new_expires_at: AgentTimestampMillis::new(60_000),
+        provenance: Box::new(provenance(12)),
+    };
+    assert!(renew.records_decision());
+    let outcome = applied(fx.apply_task_command(renew.clone()).await);
+    forget_window(&fx, false).await;
+
+    assert_replay_converges(&fx, renew, outcome).await;
+}
+
+#[tokio::test]
+async fn a_replayed_retirement_answers_duplicate_rather_than_wake_lifecycle_terminal() {
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+    let retire = AgentTaskEntityCommand::RetireContinuousGoal {
+        operation_id: lifecycle_operation(AgentOperationKind::LifecycleTerminate, "retire-1"),
+        expected_lifecycle_revision: lifecycle_revision(&fx).await,
+        provenance: Box::new(provenance(13)),
+    };
+    assert!(retire.records_decision());
+    let outcome = applied(fx.apply_task_command(retire.clone()).await);
+    forget_window(&fx, false).await;
+
+    assert_replay_converges(&fx, retire, outcome).await;
+}
+
+#[tokio::test]
+async fn a_replayed_schedule_update_answers_duplicate_rather_than_not_monotonic() {
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    fx.create_continuous_task().await;
+    let update = AgentTaskEntityCommand::UpdateContinuousSchedule {
+        operation_id: lifecycle_operation(AgentOperationKind::SettingsUpdate, "rev-2"),
+        schedule_revision: ScheduleRevision::new(2),
+        wake_policy: None,
+    };
+    assert!(update.records_decision());
+    let outcome = applied(fx.apply_task_command(update.clone()).await);
+    forget_window(&fx, false).await;
+
+    assert_replay_converges(&fx, update, outcome).await;
 }

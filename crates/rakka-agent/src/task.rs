@@ -13945,7 +13945,9 @@ pub enum AgentTaskEntityCommand {
 
 impl AgentTaskEntityCommand {
     /// Whether the command is a decision the task remembers past its
-    /// operation window ([`AgentTaskState::decision_ledger`]). A replay of one
+    /// operation window ([`AgentTaskState::decision_ledger`]): its creation
+    /// and cancellation, and every command fenced on a goal status, criteria,
+    /// wake-lifecycle, or schedule revision. A replay of one
     /// answers [`AgentTaskEntityReply::Duplicate`] with its original outcome
     /// after any number of later non-decision operations, and up to
     /// [`crate::AGENT_DECISION_LEDGER_CAPACITY`] `- 1` later decisions.
@@ -13959,6 +13961,11 @@ impl AgentTaskEntityCommand {
                 | Self::RecordGoalDecision { .. }
                 | Self::ResumeGoal { .. }
                 | Self::ReviseGoalCriteria { .. }
+                | Self::SuspendContinuousGoal { .. }
+                | Self::ResumeContinuousGoal { .. }
+                | Self::RenewContinuousGoal { .. }
+                | Self::RetireContinuousGoal { .. }
+                | Self::UpdateContinuousSchedule { .. }
         )
     }
 
