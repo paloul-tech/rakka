@@ -300,8 +300,8 @@ const SESSION_CLOSE_BOUND: Duration = Duration::from_millis(MCP_SESSION_CLOSE_BO
 ///
 /// Crate-private, like every way to open one: rmcp's `Peer` is not part of
 /// this crate's public API, and the only public ways to reach a server are the
-/// descriptor syncs and the dispatch executor, each of which holds the rules a
-/// bare session would not.
+/// descriptor syncs, the tool listing, and the dispatch executor, each of
+/// which holds the rules a bare session would not.
 pub(crate) struct McpClientSession {
     running: RunningService<RoleClient, ClientConfig>,
     server_name: String,

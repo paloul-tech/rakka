@@ -1,6 +1,6 @@
 # MCP discovery — a public tool listing, every missing name, and the server's version
 
-Status: approved design, 2026-10-11. Branch `mcp-discovery` off `e117ac6`.
+Status: implemented, 2026-10-11. Branch `mcp-discovery` off `e117ac6`.
 Brief: issue #85 (rakka.host A16), asks 1, 2 and 4, drafted against
 `96a18b0`; the code was read at `e117ac6`. Folded in by the owner: an
 rmcp-free `FakeTool::with_annotations`, offered in the #85 status for asks 5,
