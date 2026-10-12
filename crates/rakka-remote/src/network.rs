@@ -445,6 +445,10 @@ impl TcpRemoteTransportSnapshot {
     }
 
     /// Last inbound failure, when known.
+    ///
+    /// Never a connection that ended before its first frame
+    /// ([`TcpRemoteTransportError::ClosedBeforeHandshake`]): that one counts in
+    /// [`Self::inbound_failures`] but leaves the last real fault in place.
     #[must_use]
     pub fn last_inbound_error(&self) -> Option<&str> {
         self.last_inbound_error.as_deref()
@@ -459,6 +463,7 @@ impl TcpRemoteTransportSnapshot {
 
 /// Failure returned by TCP remote transport setup and network loops.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TcpRemoteTransportError {
     /// TCP transport configuration is invalid.
     InvalidConfig {
@@ -485,6 +490,15 @@ pub enum TcpRemoteTransportError {
         /// Failure detail.
         message: String,
     },
+    /// An inbound connection ended before its first frame: the peer connected
+    /// and hung up without sending a handshake.
+    ///
+    /// That is the shape of a reachability probe rather than a remoting fault,
+    /// so the transport logs it at `DEBUG` and keeps it out of
+    /// [`TcpRemoteTransportSnapshot::last_inbound_error`]. It still counts in
+    /// [`TcpRemoteTransportSnapshot::inbound_failures`] and in the remote
+    /// failure metric, under its own `closed-before-handshake` code.
+    ClosedBeforeHandshake,
     /// Remote node was not registered as an allowed peer.
     UnknownPeer {
         /// Unknown node id.
@@ -530,6 +544,9 @@ impl Display for TcpRemoteTransportError {
                 write!(f, "tcp remote handshake is invalid: {message}")
             }
             Self::InvalidFrame { message } => write!(f, "tcp remote frame is invalid: {message}"),
+            Self::ClosedBeforeHandshake => {
+                write!(f, "tcp remote connection closed before handshake")
+            }
             Self::UnknownPeer { node_id } => {
                 write!(f, "tcp remote peer {node_id} is not registered")
             }
@@ -924,12 +941,24 @@ impl TcpRemoteTransportInner {
             .lock()
             .expect("tcp remote inbound state mutex poisoned");
         inbound.failures = inbound.failures.saturating_add(1);
-        inbound.last_error = Some(error.to_string());
         self.recorder.increment_counter(
             METRIC_REMOTE_FAILURES,
             1,
             &[("operation", "tcp-inbound"), ("error", error_code(error))],
         );
+        // A connection that ended before its first frame is a reachability
+        // probe's shape, not a fault. At a probe's cadence it would also
+        // replace the last real fault in the snapshot on every dial.
+        if matches!(error, TcpRemoteTransportError::ClosedBeforeHandshake) {
+            debug!(
+                target: "rakka.remote.tcp",
+                local_node = %self.local_node_id,
+                error = %error,
+                "tcp inbound remoting failure"
+            );
+            return;
+        }
+        inbound.last_error = Some(error.to_string());
         warn!(
             target: "rakka.remote.tcp",
             local_node = %self.local_node_id,
@@ -1291,9 +1320,7 @@ async fn handle_inbound_connection(
 ) -> TcpRemoteTransportResult<()> {
     let frame = read_frame(&mut stream, inner.config.max_frame_bytes)
         .await?
-        .ok_or_else(|| TcpRemoteTransportError::InvalidFrame {
-            message: "connection closed before handshake".to_string(),
-        })?;
+        .ok_or(TcpRemoteTransportError::ClosedBeforeHandshake)?;
     if frame.kind != FrameKind::Handshake {
         return Err(TcpRemoteTransportError::InvalidFrame {
             message: format!("expected handshake, got {:?}", frame.kind),
@@ -1456,6 +1483,7 @@ fn error_code(error: &TcpRemoteTransportError) -> &'static str {
         TcpRemoteTransportError::Decode { .. } => "decode-error",
         TcpRemoteTransportError::InvalidHandshake { .. } => "invalid-handshake",
         TcpRemoteTransportError::InvalidFrame { .. } => "invalid-frame",
+        TcpRemoteTransportError::ClosedBeforeHandshake => "closed-before-handshake",
         TcpRemoteTransportError::UnknownPeer { .. } => "unknown-peer",
         TcpRemoteTransportError::UnexpectedPeer { .. } => "unexpected-peer",
         TcpRemoteTransportError::IncompatibleProtocol { .. } => "incompatible-protocol",
@@ -1835,6 +1863,95 @@ mod tests {
         assert!(recorder.snapshot().counter_total(METRIC_REMOTE_FAILURES) >= 1.0);
     }
 
+    /// A reachability probe connects to the remoting port and hangs up
+    /// without a byte. That is not a remoting fault: it logs at `DEBUG` under
+    /// its own code, still counts, and never becomes the last inbound error.
+    #[tokio::test]
+    async fn inbound_close_before_the_first_frame_logs_at_debug_and_keeps_the_last_error() {
+        let capture = LogCapture::default();
+        let _scoped = tracing::subscriber::set_default(capture.clone());
+        let recorder = std::sync::Arc::new(InMemoryMetricsRecorder::new());
+        let node_b_id = NodeId::new("rakka-1", "uid-b");
+        let Some(transport_b) = try_bind_transport_with_metrics(
+            node_b_id.clone(),
+            ClusterProtocol::default(),
+            RemoteEndpoint::new(node_b_id),
+            test_config(),
+            recorder.clone(),
+        )
+        .await
+        else {
+            return;
+        };
+
+        let probe = TcpStream::connect(transport_b.local_addr())
+            .await
+            .expect("the probe should connect");
+        drop(probe);
+
+        wait_for(|| transport_b.snapshot().inbound_failures() > 0).await;
+        assert_eq!(transport_b.snapshot().last_inbound_error(), None);
+        let labels: Vec<String> = recorder
+            .snapshot()
+            .observations_named(METRIC_REMOTE_FAILURES)
+            .iter()
+            .flat_map(|observation| observation.attributes())
+            .filter(|attribute| attribute.key() == "error")
+            .map(|attribute| attribute.value().to_string())
+            .collect();
+        assert_eq!(labels, ["closed-before-handshake"]);
+        let events = capture.events_for("rakka.remote.tcp");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::DEBUG
+                    && event.message == "tcp inbound remoting failure"),
+            "the probe's close should log at DEBUG: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.level != tracing::Level::WARN),
+            "the probe's close should not warn: {events:?}"
+        );
+    }
+
+    /// Only a stream that ended before any frame is lowered: a peer that
+    /// sends something other than a handshake is a real fault and still warns.
+    #[tokio::test]
+    async fn inbound_frame_that_is_not_a_handshake_still_warns() {
+        let capture = LogCapture::default();
+        let _scoped = tracing::subscriber::set_default(capture.clone());
+        let node_b_id = NodeId::new("rakka-1", "uid-b");
+        let Some(transport_b) =
+            bind_transport(node_b_id.clone(), RemoteEndpoint::new(node_b_id)).await
+        else {
+            return;
+        };
+
+        let mut stream = TcpStream::connect(transport_b.local_addr())
+            .await
+            .expect("the peer should connect");
+        write_frame(&mut stream, FrameKind::Envelope, b"not a handshake")
+            .await
+            .expect("the frame should be written");
+
+        wait_for(|| transport_b.snapshot().inbound_failures() > 0).await;
+        assert!(transport_b
+            .snapshot()
+            .last_inbound_error()
+            .expect("the fault should be the last inbound error")
+            .contains("expected handshake"));
+        let events = capture.events_for("rakka.remote.tcp");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::WARN
+                    && event.message == "tcp inbound remoting failure"),
+            "a real inbound fault should warn: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn invalid_zero_queue_capacity_is_rejected_before_binding() {
         let error = TcpRemoteTransport::bind(
@@ -1956,6 +2073,82 @@ mod tests {
                 if message.contains("Operation not permitted")
                     || message.contains("Permission denied")
         )
+    }
+
+    /// One captured `tracing` event.
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        target: String,
+        level: tracing::Level,
+        message: String,
+    }
+
+    /// A `tracing` subscriber that keeps every event, for asserting a level.
+    ///
+    /// Installed with `set_default`, so it sees only this test's thread. A
+    /// `#[tokio::test]` runtime is current-thread, so that includes every
+    /// task the transport spawns.
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+        next_span: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl LogCapture {
+        fn events_for(&self, target: &str) -> Vec<CapturedEvent> {
+            self.events
+                .lock()
+                .expect("the capture should not be poisoned")
+                .iter()
+                .filter(|event| event.target == target)
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[derive(Default)]
+    struct MessageVisitor(String);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let next = self
+                .next_span
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tracing::span::Id::from_u64(next + 1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = MessageVisitor::default();
+            event.record(&mut message);
+            self.events
+                .lock()
+                .expect("the capture should not be poisoned")
+                .push(CapturedEvent {
+                    target: event.metadata().target().to_string(),
+                    level: *event.metadata().level(),
+                    message: message.0,
+                });
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 
     async fn wait_for(mut condition: impl FnMut() -> bool) {
