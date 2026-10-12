@@ -225,3 +225,17 @@ async fn an_annotation_title_that_carries_the_credential_is_refused() {
         TOKEN,
     );
 }
+
+#[tokio::test]
+async fn a_server_version_that_carries_the_credential_is_refused() {
+    let credential = AgentEphemeralCredential::bearer_token(TOKEN);
+    let server = FakeMcpServer::new()
+        .with_server_version(format!("1.0-SERVER-WORDS-{TOKEN}"))
+        .with_tool(search("Searches.", json!({"type":"object"})));
+    assert_echo_refused(
+        sync(server, Some(&credential)).await,
+        "server version",
+        None,
+        TOKEN,
+    );
+}

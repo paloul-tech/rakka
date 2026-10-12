@@ -1235,6 +1235,7 @@ mod tests {
             schema_version: crate::sync::MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
             server_id: server(name),
             server_name: "fake".to_string(),
+            server_version: None,
             protocol_version: "2026-07-28".to_string(),
             synced_at: AgentTimestampMillis::new(1),
             descriptors: tools

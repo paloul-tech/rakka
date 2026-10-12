@@ -216,6 +216,7 @@ pub struct SeenCall {
 struct FakeState {
     tools: Vec<FakeTool>,
     server_name: String,
+    server_version: String,
     versions: Vec<ProtocolVersion>,
     list_calls: usize,
     handshakes: usize,
@@ -252,6 +253,7 @@ impl FakeMcpServer {
             state: Arc::new(Mutex::new(FakeState {
                 tools: Vec::new(),
                 server_name: "fake-mcp-server".to_string(),
+                server_version: "fake".to_string(),
                 versions: ProtocolVersion::KNOWN_VERSIONS.to_vec(),
                 list_calls: 0,
                 handshakes: 0,
@@ -276,6 +278,13 @@ impl FakeMcpServer {
     #[must_use]
     pub fn with_server_name(self, name: impl Into<String>) -> Self {
         self.lock().server_name = name.into();
+        self
+    }
+
+    /// Sets the implementation version the server reports, `"fake"` until set.
+    #[must_use]
+    pub fn with_server_version(self, version: impl Into<String>) -> Self {
+        self.lock().server_version = version.into();
         self
     }
 
@@ -424,7 +433,7 @@ impl ServerHandler for FakeMcpServer {
             .with_protocol_version(newest)
             .with_server_info(rmcp::model::Implementation::new(
                 state.server_name.clone(),
-                "fake",
+                state.server_version.clone(),
             ))
     }
 

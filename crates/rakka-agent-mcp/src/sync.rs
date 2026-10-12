@@ -29,9 +29,10 @@
 //! - A server-reported hint never *changes* an operator's declaration. When
 //!   the binding opts into honoring hints, a hint that contradicts the
 //!   declaration refuses the sync; otherwise it is ignored.
-//! - The server's self-reported name is cut at [`MCP_SERVER_NAME_MAX_BYTES`].
-//! - Text that carries the credential the sync sent — in the server's name,
-//!   a description, or either schema — refuses the sync
+//! - The server's self-reported name and version are each cut at
+//!   [`MCP_SERVER_NAME_MAX_BYTES`].
+//! - Text that carries the credential the sync sent — in the server's name
+//!   or version, a description, or either schema — refuses the sync
 //!   (`mcp-descriptor-credential-echoed`). It is refused rather than
 //!   scrubbed because a scrubbed schema would no longer match the digest a
 //!   dispatch compares with the live server's.
@@ -173,6 +174,14 @@ pub struct McpDescriptorSet {
     pub server_id: McpServerId,
     /// The server's self-reported implementation name at sync time.
     pub server_name: String,
+    /// The server's self-reported implementation version at sync time, cut at
+    /// [`MCP_SERVER_NAME_MAX_BYTES`]; `None` when it reported none, or on a
+    /// set written before the field existed.
+    ///
+    /// Display data: not in [`Self::digest`], not checked by
+    /// [`Self::validate`], not compared by [`mcp_descriptor_staleness`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
     /// The protocol version the sync negotiated.
     pub protocol_version: String,
     /// When the sync ran.
@@ -326,6 +335,8 @@ struct McpDescriptorSetRecord {
     schema_version: u32,
     server_id: McpServerId,
     server_name: String,
+    #[serde(default)]
+    server_version: Option<String>,
     protocol_version: String,
     synced_at: AgentTimestampMillis,
     descriptors: Vec<McpSyncedDescriptor>,
@@ -339,6 +350,7 @@ impl TryFrom<McpDescriptorSetRecord> for McpDescriptorSet {
             schema_version: record.schema_version,
             server_id: record.server_id,
             server_name: record.server_name,
+            server_version: record.server_version,
             protocol_version: record.protocol_version,
             synced_at: record.synced_at,
             descriptors: record.descriptors,
@@ -407,10 +419,11 @@ pub enum McpSyncError {
     CredentialEchoed {
         /// The server whose text carried it.
         server: String,
-        /// The tool whose text carried it, or `None` for the server's name.
+        /// The tool whose text carried it, or `None` for the server's name or
+        /// version.
         tool: Option<String>,
-        /// Which text: `server name`, `description`, `annotations title`,
-        /// `input schema`, or `output schema`.
+        /// Which text: `server name`, `server version`, `description`,
+        /// `annotations title`, `input schema`, or `output schema`.
         field: &'static str,
     },
 }
@@ -695,7 +708,7 @@ fn value_carries(value: &Value, secrets: &[&str]) -> bool {
 
 /// The server's name as a set stores it: cut at
 /// [`MCP_SERVER_NAME_MAX_BYTES`], on a character boundary.
-fn bounded_server_name(name: &str) -> String {
+pub(crate) fn bounded_server_name(name: &str) -> String {
     if name.len() <= MCP_SERVER_NAME_MAX_BYTES {
         return name.to_string();
     }
@@ -704,6 +717,27 @@ fn bounded_server_name(name: &str) -> String {
         end -= 1;
     }
     name[..end].to_string()
+}
+
+/// The server's identity text, judged before anything else it said: a server
+/// that echoes the credential into its name or its version is refused for
+/// that, whatever else its answer got wrong.
+pub(crate) fn judge_server_identity(
+    server: &str,
+    name: &str,
+    version: Option<&str>,
+    secrets: &[&str],
+) -> Result<(), McpSyncError> {
+    for (field, text) in [("server name", Some(name)), ("server version", version)] {
+        if text.is_some_and(|text| carries(text, secrets)) {
+            return Err(McpSyncError::CredentialEchoed {
+                server: server.to_string(),
+                tool: None,
+                field,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Everything after the handshake that both syncs share: one listing, the
@@ -722,6 +756,7 @@ async fn sync_over_session(
     let listed = tokio::time::timeout_at(deadline, session.list_all_tools()).await;
     let protocol_version = session.negotiated_version().as_str().to_string();
     let reported_name = session.server_name().to_string();
+    let reported_version = session.server_version().map(str::to_string);
     // The session is closed before the answer is judged: a refusal must not
     // leave a transport (and its credential-bearing client, or its child
     // process) alive.
@@ -740,19 +775,14 @@ async fn sync_over_session(
         })
         .and_then(|listed| synced_descriptors(binding, server, &listed, secrets));
     session.close().await;
-    // Judged first: a server that echoes the credential is refused for that,
-    // whatever else its listing got wrong.
-    if carries(&reported_name, secrets) {
-        return Err(McpSyncError::CredentialEchoed {
-            server: server.to_string(),
-            tool: None,
-            field: "server name",
-        });
-    }
+    // Judged first: a server that echoes the credential into its name or
+    // version is refused for that, whatever else its listing got wrong.
+    judge_server_identity(server, &reported_name, reported_version.as_deref(), secrets)?;
     Ok(McpDescriptorSet {
         schema_version: MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
         server_id: binding.server_id.clone(),
         server_name: bounded_server_name(&reported_name),
+        server_version: reported_version.as_deref().map(bounded_server_name),
         protocol_version,
         synced_at,
         descriptors: built?,
