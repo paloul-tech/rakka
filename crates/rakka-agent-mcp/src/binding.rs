@@ -436,20 +436,15 @@ impl McpServerBinding {
     /// derived id is invalid, a tool whose declaration names a credential
     /// binding other than the server-level one, a tool policy with
     /// `max_attempts` of `0`, or an empty or malformed protocol version list.
+    /// [`Self::validate_endpoint`] makes the connection half of these checks
+    /// alone.
     ///
     /// # Errors
     ///
     /// [`McpRegistrationError`] with its stable code.
     pub fn validate(&self) -> Result<(), McpRegistrationError> {
         match &self.transport {
-            McpTransport::StreamableHttp { url } => {
-                check_streamable_http_url(url).map_err(|reason| {
-                    McpRegistrationError::InvalidUrl {
-                        server: self.server_id.to_string(),
-                        reason,
-                    }
-                })?;
-            }
+            McpTransport::StreamableHttp { url } => self.check_url(url)?,
             // Refused here, at the operator's gate, rather than on every
             // attempt: a binding that names a credential would have the
             // dispatcher resolve a real secret lease per attempt only for the
@@ -497,6 +492,45 @@ impl McpServerBinding {
                 });
             }
         }
+        self.check_protocol_versions()
+    }
+
+    /// Refuses a binding no connection can be made from: an endpoint URL
+    /// that fails the URL rule, a child-process binding that names a
+    /// server-level credential binding, or a protocol version list that is
+    /// empty, malformed, or names a version the pinned SDK does not know.
+    ///
+    /// The tool allow-list is not read, so a binding with no tools — what a
+    /// caller listing a server's tools holds — passes. [`Self::validate`]
+    /// makes every one of these checks and the allow-list's too.
+    ///
+    /// # Errors
+    ///
+    /// [`McpRegistrationError`] with stable code `mcp-binding-invalid`.
+    pub fn validate_endpoint(&self) -> Result<(), McpRegistrationError> {
+        match &self.transport {
+            McpTransport::StreamableHttp { url } => self.check_url(url)?,
+            McpTransport::ChildProcess { .. } => {
+                if self.credential_binding.is_some() {
+                    return Err(McpRegistrationError::CredentialOnChildProcess {
+                        server: self.server_id.to_string(),
+                    });
+                }
+            }
+        }
+        self.check_protocol_versions()
+    }
+
+    /// The endpoint URL rule, as a binding refusal.
+    fn check_url(&self, url: &str) -> Result<(), McpRegistrationError> {
+        check_streamable_http_url(url).map_err(|reason| McpRegistrationError::InvalidUrl {
+            server: self.server_id.to_string(),
+            reason,
+        })
+    }
+
+    /// The protocol version list: non-empty, each well-shaped and known.
+    fn check_protocol_versions(&self) -> Result<(), McpRegistrationError> {
         if self.protocol_versions.is_empty() {
             return Err(McpRegistrationError::ProtocolVersionsEmpty {
                 server: self.server_id.to_string(),
