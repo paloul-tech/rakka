@@ -952,6 +952,96 @@ async fn cancelled_in_flight_dispatch_is_not_reclaimed_after_lease_expiry() {
     .await;
 }
 
+/// The fleet index is one record every worker re-persists, so a registration
+/// that finds every due effect already indexed exactly as its outbox
+/// describes it writes nothing and counts nothing — a run whose call is in
+/// flight is re-registered on every pump, and each of those used to be a
+/// compare-and-set on the hottest shared record. A registration that does
+/// change an entry, such as one whose lease expired, still writes.
+#[tokio::test]
+async fn a_registration_that_changes_no_entry_writes_nothing() {
+    use rakka_agent_workflow::agent_dispatcher_fleet_persistence_id;
+    use rakka_persistence::DurableStateStore;
+
+    let workflow_store = WorkflowStore::new();
+    let fleet_store = FleetStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let run_id = AgentRunId::new("run-quiet-registration");
+    schedule_effect(
+        &workflow_store,
+        &clock,
+        run_id.clone(),
+        effect(
+            "effect-quiet-registration",
+            AgentEffectKind::HttpCall,
+            "http",
+            "callback",
+            100,
+        ),
+    )
+    .await;
+    let mut worker = worker(
+        "dispatcher-quiet",
+        fleet_store.clone(),
+        workflow_store,
+        clock.clone(),
+        Arc::new(InMemoryMetricsRecorder::new()),
+        AgentDispatcherFleetSettings::new(8, 10),
+    );
+    let revision = || async {
+        fleet_store
+            .load(&agent_dispatcher_fleet_persistence_id())
+            .await
+            .expect("the fleet loads")
+            .map(|record| record.revision)
+    };
+    worker.recover().await.expect("the fleet recovers");
+
+    let first = worker
+        .refresh_run(run_id.clone(), None)
+        .await
+        .expect("the due effect registers");
+    assert_eq!(
+        (first.observed_due_effects, first.registered_effects),
+        (1, 1)
+    );
+    let registered = revision().await;
+
+    let again = worker
+        .refresh_run(run_id.clone(), None)
+        .await
+        .expect("the registration repeats");
+    assert_eq!(
+        (again.observed_due_effects, again.registered_effects),
+        (1, 0)
+    );
+    assert_eq!(
+        revision().await,
+        registered,
+        "an unchanged entry writes nothing"
+    );
+
+    worker.claim_due().await.expect("the worker claims");
+    let claimed = revision().await;
+    let leased = worker
+        .refresh_run(run_id.clone(), None)
+        .await
+        .expect("a leased entry re-registers");
+    assert_eq!(leased.registered_effects, 0);
+    assert_eq!(revision().await, claimed, "a live lease is not rewritten");
+
+    clock.advance_millis(20);
+    let expired = worker
+        .refresh_run(run_id, None)
+        .await
+        .expect("an expired lease re-registers");
+    assert_eq!(
+        expired.registered_effects, 1,
+        "an expired lease is released"
+    );
+    assert_ne!(revision().await, claimed, "a changed entry still writes");
+}
+
 fn worker(
     worker_id: &str,
     fleet_store: FleetStore,
