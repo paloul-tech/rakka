@@ -108,3 +108,12 @@ The ledger sits outside `AgentTask` and `AgentRun`, beside the operation log. So
 - **Eviction:** the 33rd decision evicts the first, whose replay then meets today's refusal.
 - **Pre-upgrade record:** one decoded without the field answers as today.
 - **Stale cache:** a resident facade whose cache predates the decision answers `Duplicate` after its one re-read.
+
+### Amendments from planning (2026-10-12, approved spec unchanged in substance)
+
+- **How a test leaves the window.** A test rewrites the stored record with an empty `applied_operations`, which is exactly the state 64 later operations leave. It does not script 64 operations.
+  - `rakka-a2a`'s collaboration surface already ages a task's window this way.
+  - Scripting the traffic would need a run with 64 effect results, or a task with 64 non-decision commands.
+  - Dropping `decision_ledger` from the same rewrite is the record written before the ledger existed. It is also the state an evicted decision leaves for that id.
+- **Eviction by the 33rd decision** is proven on the ledger type itself. Proving it at an entity would mean 33 revision-fenced decisions on one task.
+- **The stale-cache case is a cache that predates the checkpoint.** A cache that still holds the open checkpoint would apply the replay against stale state and lose its compare-and-set. That is answered `revision-conflict`, and the caller's retry reads the ledger, as every committing command on a stale cache does today. A cache from before the checkpoint existed instead refuses the replay, re-reads once, and answers `Duplicate` from the ledger. That is the path Decision 2 adds.
