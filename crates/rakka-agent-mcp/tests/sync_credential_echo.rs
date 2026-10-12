@@ -239,3 +239,16 @@ async fn a_server_version_that_carries_the_credential_is_refused() {
         TOKEN,
     );
 }
+
+#[tokio::test]
+async fn an_echoed_server_name_is_refused_before_a_missing_tool() {
+    let credential = AgentEphemeralCredential::bearer_token(TOKEN);
+    // The server lists nothing the binding names, and echoes the credential.
+    let server = FakeMcpServer::new().with_server_name(format!("crm-{TOKEN}"));
+    assert_echo_refused(
+        sync(server, Some(&credential)).await,
+        "server name",
+        None,
+        TOKEN,
+    );
+}

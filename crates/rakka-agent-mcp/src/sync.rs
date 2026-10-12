@@ -409,6 +409,13 @@ pub enum McpSyncError {
         /// Why. A Rakka-side validation message, never server text.
         reason: String,
     },
+    /// The server does not list tools the binding's allow-list names.
+    ToolsNotListed {
+        /// The server listed.
+        server: String,
+        /// Every allow-listed tool the listing lacks, in tool-name order.
+        tools: Vec<String>,
+    },
     /// The server's own text carries the credential this sync sent it.
     ///
     /// Nothing is stored. A descriptor set is release data and its
@@ -451,7 +458,7 @@ impl McpSyncError {
             Self::SchemaTooLarge { .. } => "mcp-descriptor-schema-too-large",
             Self::HintContradictsDeclaration { .. } => "mcp-hint-contradicts-declaration",
             Self::Registration(error) => error.code(),
-            Self::Descriptor { .. } => "mcp-binding-invalid",
+            Self::Descriptor { .. } | Self::ToolsNotListed { .. } => "mcp-binding-invalid",
             Self::CredentialEchoed { .. } => "mcp-descriptor-credential-echoed",
         }
     }
@@ -482,6 +489,11 @@ impl Display for McpSyncError {
             } => write!(
                 f,
                 "the MCP server {server}'s tool {tool} could not be described: {reason}"
+            ),
+            Self::ToolsNotListed { server, tools } => write!(
+                f,
+                "the MCP server {server} does not list the tools {}",
+                tools.join(", ")
             ),
             Self::CredentialEchoed {
                 server,
@@ -835,26 +847,39 @@ fn shapes(
 ///
 /// `binding.tools` is a `BTreeMap`, so they come out in tool-name order rather
 /// than the order the operator wrote them in — which is what makes
-/// [`McpDescriptorSet::digest`] invariant under a reordered allow-list.
+/// [`McpDescriptorSet::digest`] invariant under a reordered allow-list. A
+/// binding naming tools the server lacks is refused
+/// [`McpSyncError::ToolsNotListed`] with every one of them.
 fn synced_descriptors(
     binding: &McpServerBinding,
     server: &str,
     listed: &[Tool],
     secrets: &[&str],
 ) -> Result<Vec<McpSyncedDescriptor>, McpSyncError> {
-    binding
-        .tools
-        .iter()
-        .map(|(tool, policy)| {
-            let found = listed
-                .iter()
-                .find(|candidate| candidate.name == tool.as_str())
-                .ok_or_else(|| McpSyncError::Descriptor {
-                    server: server.to_string(),
-                    tool: tool.clone(),
-                    reason: "the server does not list it".to_string(),
-                })?;
-            synced_descriptor(binding, server, tool, policy, found, secrets)
+    // Every allow-listed name is matched first, so a binding that names tools
+    // the server lacks hears about all of them at once rather than one per
+    // attempt; only then is each present tool judged, in tool-name order.
+    let mut found = Vec::with_capacity(binding.tools.len());
+    let mut missing = Vec::new();
+    for (tool, policy) in &binding.tools {
+        match listed
+            .iter()
+            .find(|candidate| candidate.name == tool.as_str())
+        {
+            Some(listed) => found.push((tool, policy, listed)),
+            None => missing.push(tool.clone()),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(McpSyncError::ToolsNotListed {
+            server: server.to_string(),
+            tools: missing,
+        });
+    }
+    found
+        .into_iter()
+        .map(|(tool, policy, listed)| {
+            synced_descriptor(binding, server, tool, policy, listed, secrets)
         })
         .collect()
 }

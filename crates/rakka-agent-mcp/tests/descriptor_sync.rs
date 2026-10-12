@@ -18,7 +18,7 @@ use rakka_agent_mcp::testkit::{
 use rakka_agent_mcp::{
     mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over, McpAllowAllEgress,
     McpDescriptorSet, McpDescriptorStaleness, McpEgressCheck, McpServerBinding, McpServerId,
-    McpToolAnnotations, McpToolPolicy, MCP_ATTEMPT_TIMEOUT_DEFAULT_MS,
+    McpSyncError, McpToolAnnotations, McpToolPolicy, MCP_ATTEMPT_TIMEOUT_DEFAULT_MS,
     MCP_DESCRIPTOR_SCHEMA_MAX_BYTES, MCP_DESCRIPTOR_SET_SCHEMA_VERSION, MCP_SERVER_NAME_MAX_BYTES,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
@@ -942,5 +942,69 @@ async fn the_server_version_is_display_data_outside_the_digest_and_optional_on_d
             .get("server_version")
             .is_none(),
         "an absent version is omitted, as an earlier build wrote the set"
+    );
+}
+
+/// A binding allow-listing `tools`, each read-only.
+fn binding_naming(url: &str, tools: &[&str]) -> McpServerBinding {
+    tools.iter().fold(
+        McpServerBinding::streamable_http(McpServerId::new("crm").expect("id"), url),
+        |binding, tool| {
+            binding
+                .with_tool(*tool, declared(AgentEffectSafetyClass::ReadOnly))
+                .expect("tool")
+        },
+    )
+}
+
+#[tokio::test]
+async fn every_allow_listed_tool_the_server_lacks_is_named_at_once_in_tool_name_order() {
+    let endpoint = serve_fake(FakeMcpServer::new().with_tool(tool("search"))).await;
+    let error = sync_mcp_descriptors(
+        &client(),
+        &binding_naming(&endpoint.url, &["update", "search", "archive"]),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("two named tools are missing");
+    assert_eq!(error.code(), "mcp-binding-invalid");
+    assert!(
+        matches!(
+            &error,
+            McpSyncError::ToolsNotListed { server, tools }
+                if server == "crm" && tools == &["archive".to_string(), "update".to_string()]
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("archive, update"),
+        "the message names both: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_tool_is_refused_before_a_present_tools_own_refusal() {
+    // `search` is over the 64 KiB line, and `update` is missing.
+    let endpoint = serve_fake(FakeMcpServer::new().with_tool(FakeTool::text(
+        "search",
+        "Big.",
+        schema(2_000),
+        "ok",
+    )))
+    .await;
+    let error = sync_mcp_descriptors(
+        &client(),
+        &binding(&endpoint.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("refused");
+    assert!(
+        matches!(&error, McpSyncError::ToolsNotListed { tools, .. } if tools == &["update".to_string()]),
+        "the binding's mismatch first, not the present tool's size: {error:?}"
     );
 }
