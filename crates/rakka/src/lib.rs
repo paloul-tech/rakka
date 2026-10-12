@@ -185,7 +185,8 @@ pub mod agent_workflow {
 #[cfg(feature = "agent-mcp")]
 /// MCP client adapter: remote MCP servers as durable agent tools.
 ///
-/// Enable with the `agent-mcp` facade feature, which brings `agent`.
+/// Enable with the `agent-mcp` facade feature, which brings `agent`;
+/// `agent-mcp-testkit` adds the adapter's test kit, `agent_mcp::testkit`.
 pub mod agent_mcp {
     pub use rakka_agent_mcp::*;
 }

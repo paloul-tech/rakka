@@ -14,7 +14,8 @@ use rakka_agent_mcp::testkit::{
 };
 use rakka_agent_mcp::{
     sync_mcp_descriptors, sync_mcp_descriptors_over_within, sync_mcp_descriptors_within,
-    McpAllowAllEgress, McpServerBinding, McpServerId, McpToolPolicy, MCP_SYNC_TIMEOUT_DEFAULT_MS,
+    McpAllowAllEgress, McpServerBinding, McpServerId, McpToolPolicy, MCP_SESSION_CLOSE_BOUND_MS,
+    MCP_SYNC_TIMEOUT_DEFAULT_MS,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 use serde_json::json;
@@ -107,9 +108,9 @@ async fn a_listing_that_stalls_ends_at_the_bound_and_the_session_is_closed() {
     )
     .await
     .expect_err("the listing never answered inside the bound");
-    // The bound, plus the session's own bounded close.
+    // The bound, plus the session's own bounded close, plus scheduling slack.
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_millis(300 + MCP_SESSION_CLOSE_BOUND_MS + 1_700),
         "{:?}",
         started.elapsed()
     );
@@ -145,6 +146,10 @@ async fn a_sync_inside_its_bound_is_unchanged() {
     .expect("syncs");
     assert_eq!(bounded, defaulted);
     assert_eq!(MCP_SYNC_TIMEOUT_DEFAULT_MS, 30_000);
+    assert_eq!(
+        MCP_SESSION_CLOSE_BOUND_MS, 3_000,
+        "a sync returns within its bound plus this one"
+    );
 }
 
 #[tokio::test]

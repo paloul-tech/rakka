@@ -5,7 +5,7 @@
 use rakka_agent::{AgentCredentialBindingRef, AgentEffectSafetyClass, AgentToolDeclaration};
 use rakka_agent_mcp::{
     McpDescriptorRefresh, McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
-    MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DEFAULT_PROTOCOL_VERSIONS,
+    MCP_ATTEMPT_TIMEOUT_DEFAULT_MS, MCP_DEFAULT_PROTOCOL_VERSIONS, MCP_KNOWN_PROTOCOL_VERSIONS,
 };
 use rakka_agent_workflow::{
     AgentAttributes, AgentTimestampMillis, ArtifactKind, ArtifactRef, RedactionStatus,
@@ -169,6 +169,36 @@ fn a_protocol_version_must_be_well_shaped_and_one_the_sdk_knows() {
         error.to_string().contains("2099-01-01"),
         "the refusal names the value: {error}"
     );
+}
+
+#[test]
+fn the_known_protocol_versions_are_exported_oldest_first_and_each_validates() {
+    assert_eq!(
+        MCP_KNOWN_PROTOCOL_VERSIONS,
+        [
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28"
+        ]
+    );
+    let binding = McpServerBinding::streamable_http(server("s"), "https://h/mcp")
+        .with_tool("t", policy())
+        .expect("tool");
+    for version in MCP_KNOWN_PROTOCOL_VERSIONS {
+        binding
+            .clone()
+            .with_protocol_versions(vec![version.to_string()])
+            .validate()
+            .unwrap_or_else(|error| panic!("{version} is known: {error}"));
+    }
+    for version in MCP_DEFAULT_PROTOCOL_VERSIONS {
+        assert!(
+            MCP_KNOWN_PROTOCOL_VERSIONS.contains(&version),
+            "a default is a known version: {version}"
+        );
+    }
 }
 
 #[test]

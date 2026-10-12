@@ -113,7 +113,8 @@ through crate-specific modules until higher-level facades replace direct wiring.
 
 The agent surface is reached through feature-gated facade modules rather than
 the prelude: `rakka::agent_workflow` (default feature `agent-workflow`),
-`rakka::agent` (`agent`, with `agent-rig` and `agent-otel` passthroughs), and
+`rakka::agent` (`agent`, with `agent-rig` and `agent-otel` passthroughs),
+`rakka::agent_mcp` (`agent-mcp`, with an `agent-mcp-testkit` passthrough), and
 `rakka::a2a` (`a2a`, with `a2a-server`, `a2a-sharding`, `a2a-postgres`,
 `a2a-http`, `a2a-k8s`, `a2a-otel`, `a2a-testkit`, and `a2a-agents`). No
 agent-domain type enters `rakka::prelude`; the A2A adapter's service types

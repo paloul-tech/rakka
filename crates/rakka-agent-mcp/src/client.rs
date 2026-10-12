@@ -59,7 +59,7 @@ use rmcp::transport::IntoTransport;
 
 use crate::binding::{
     is_protocol_version_shaped, McpServerBinding, McpServerId, McpTransport, MCP_CLIENT_NAME,
-    MCP_LIST_PAGES_MAX, MCP_PEER_AGENT_SERVER_PREFIX,
+    MCP_LIST_PAGES_MAX, MCP_PEER_AGENT_SERVER_PREFIX, MCP_SESSION_CLOSE_BOUND_MS,
 };
 use crate::launcher::{concrete_pair, McpChildTransport};
 
@@ -290,7 +290,7 @@ pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
 /// the wait, not the cleanup: the session is cancelled before the wait starts,
 /// and rmcp bounds its own session-delete request separately
 /// (`SESSION_CLEANUP_TIMEOUT`, `rmcp-3.4.0/src/transport/streamable_http_client.rs:42`).
-const SESSION_CLOSE_BOUND: Duration = Duration::from_secs(3);
+const SESSION_CLOSE_BOUND: Duration = Duration::from_millis(MCP_SESSION_CLOSE_BOUND_MS);
 
 /// One negotiated MCP client session.
 ///

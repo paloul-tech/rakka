@@ -19,9 +19,9 @@ use futures_util::stream::BoxStream;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage, ContentBlock,
-    CreateTaskResult, DiscoverRequestMethod, DiscoverResult, InputRequiredResult, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Task, TaskStatus,
-    Tool, ToolAnnotations,
+    CreateTaskResult, DiscoverRequestMethod, DiscoverResult, InitializeRequestParams,
+    InitializeResult, InputRequiredResult, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ServerCapabilities, ServerConfig, Task, TaskStatus, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_client::{
@@ -108,8 +108,9 @@ pub enum FakeToolBehaviour {
 pub struct FakeTool {
     /// The tool's name, as the server reports it.
     pub name: String,
-    /// The tool's description.
-    pub description: String,
+    /// The tool's description, or `None` for a tool the server lists with no
+    /// description at all — which is not the same listing as an empty one.
+    pub description: Option<String>,
     /// The tool's JSON Schema input.
     pub input_schema: Value,
     /// The tool's JSON Schema output, when it declares one.
@@ -131,7 +132,7 @@ impl FakeTool {
     ) -> Self {
         Self {
             name: name.into(),
-            description: description.into(),
+            description: Some(description.into()),
             input_schema,
             output_schema: None,
             annotations: None,
@@ -169,13 +170,22 @@ impl FakeTool {
         self
     }
 
+    /// Lists the tool with no description at all, as a server that gave none
+    /// does — the field absent from the listing, not an empty string.
+    #[must_use]
+    pub fn without_description(mut self) -> Self {
+        self.description = None;
+        self
+    }
+
     /// The rmcp model this tool is listed as.
     fn listed(&self) -> Tool {
         let mut tool = Tool::new(
             self.name.clone(),
-            self.description.clone(),
+            self.description.clone().unwrap_or_default(),
             Arc::new(object_of(&self.input_schema)),
         );
+        tool.description = self.description.clone().map(Into::into);
         tool.output_schema = self
             .output_schema
             .as_ref()
@@ -208,6 +218,7 @@ struct FakeState {
     server_name: String,
     versions: Vec<ProtocolVersion>,
     list_calls: usize,
+    handshakes: usize,
     list_delay: Option<Duration>,
     legacy_only: bool,
     endless_pages: bool,
@@ -243,6 +254,7 @@ impl FakeMcpServer {
                 server_name: "fake-mcp-server".to_string(),
                 versions: ProtocolVersion::KNOWN_VERSIONS.to_vec(),
                 list_calls: 0,
+                handshakes: 0,
                 list_delay: None,
                 legacy_only: false,
                 endless_pages: false,
@@ -327,6 +339,17 @@ impl FakeMcpServer {
         self.lock().list_calls
     }
 
+    /// How many handshakes the server has completed: a `server/discover` it
+    /// answered, or a legacy `initialize` it accepted.
+    ///
+    /// One session counts once on either lifecycle: a legacy-only server
+    /// refuses the `server/discover` probe before it accepts the `initialize`,
+    /// and the refusal is not a handshake.
+    #[must_use]
+    pub fn handshakes(&self) -> usize {
+        self.lock().handshakes
+    }
+
     /// How many `tools/call` requests the server has served.
     #[must_use]
     pub fn call_count(&self) -> usize {
@@ -360,6 +383,23 @@ impl FakeMcpServer {
             .find(|tool| tool.name == name)
             .unwrap_or_else(|| panic!("the fake server declares no tool named {name}"));
         tool.input_schema = input_schema;
+    }
+
+    /// Replaces one tool's output schema, or drops it with `None`, so a later
+    /// sync sees a server whose output alone was reshaped.
+    ///
+    /// # Panics
+    ///
+    /// When no tool of that name is declared, as [`Self::swap_tool_schema`]
+    /// does.
+    pub fn swap_tool_output_schema(&self, name: &str, output_schema: Option<Value>) {
+        let mut state = self.lock();
+        let tool = state
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("the fake server declares no tool named {name}"));
+        tool.output_schema = output_schema;
     }
 
     /// Records the headers of the request now being served.
@@ -396,14 +436,33 @@ impl ServerHandler for FakeMcpServer {
         &self,
         _context: RequestContext<RoleServer>,
     ) -> Result<DiscoverResult, McpError> {
-        if self.lock().legacy_only {
-            return Err(McpError::method_not_found::<DiscoverRequestMethod>());
+        {
+            let mut state = self.lock();
+            if state.legacy_only {
+                return Err(McpError::method_not_found::<DiscoverRequestMethod>());
+            }
+            state.handshakes += 1;
         }
         // rmcp's own default, restated: overriding the method replaces it.
         Ok(DiscoverResult::from_server_info(
             self.supported_protocol_versions().into_owned(),
             self.get_info(),
         ))
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        // rmcp's own default, restated as `discover`'s is, and counted only
+        // when the server accepts it.
+        context.peer.set_peer_info(request.clone());
+        let answer = self.negotiate_initialize(&request);
+        if answer.is_ok() {
+            self.lock().handshakes += 1;
+        }
+        answer
     }
 
     async fn list_tools(
@@ -730,6 +789,15 @@ mod tests {
         );
         assert_eq!(tool.annotations, None);
         assert_eq!(tool.output_schema, None);
+    }
+
+    #[test]
+    fn a_tool_without_a_description_is_listed_with_none_and_an_empty_one_is_sent() {
+        let absent = FakeTool::text("t", "d", json!({}), "ok").without_description();
+        assert_eq!(absent.description, None);
+        assert_eq!(absent.listed().description, None);
+        let empty = FakeTool::text("t", "", json!({}), "ok");
+        assert_eq!(empty.listed().description.as_deref(), Some(""));
     }
 
     #[test]
