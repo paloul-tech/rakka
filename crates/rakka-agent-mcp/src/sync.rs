@@ -534,7 +534,7 @@ impl From<McpRegistrationError> for McpSyncError {
 /// The instant a sync must be over by. `checked_add` rather than `+`: a bound
 /// the platform's clock cannot represent ends the sync at once, failing
 /// closed rather than panicking or waiting forever.
-fn sync_deadline(timeout: Duration) -> tokio::time::Instant {
+pub(crate) fn sync_deadline(timeout: Duration) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     now.checked_add(timeout).unwrap_or(now)
 }
@@ -542,7 +542,7 @@ fn sync_deadline(timeout: Duration) -> tokio::time::Instant {
 /// What a sync that ran out of time answers: one fact to the operator, the
 /// descriptors could not be refreshed, under the code a transport failure of
 /// the sync already has.
-fn timed_out(server: &str, timeout: Duration) -> McpSyncError {
+pub(crate) fn timed_out(server: &str, timeout: Duration) -> McpSyncError {
     McpSyncError::Client(McpClientError::Transport {
         server: server.to_string(),
         reason: format!("the sync exceeded its {} ms bound", timeout.as_millis()),
@@ -718,17 +718,43 @@ fn value_carries(value: &Value, secrets: &[&str]) -> bool {
     }
 }
 
-/// The server's name as a set stores it: cut at
-/// [`MCP_SERVER_NAME_MAX_BYTES`], on a character boundary.
-pub(crate) fn bounded_server_name(name: &str) -> String {
-    if name.len() <= MCP_SERVER_NAME_MAX_BYTES {
-        return name.to_string();
+/// `text` cut at `max` bytes, on a character boundary.
+pub(crate) fn cut_at(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
     }
-    let mut end = MCP_SERVER_NAME_MAX_BYTES;
-    while end > 0 && !name.is_char_boundary(end) {
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    name[..end].to_string()
+    text[..end].to_string()
+}
+
+/// The server's name or version as a set or a listing keeps it: cut at
+/// [`MCP_SERVER_NAME_MAX_BYTES`], on a character boundary.
+pub(crate) fn bounded_server_name(name: &str) -> String {
+    cut_at(name, MCP_SERVER_NAME_MAX_BYTES)
+}
+
+/// The server's hints as this adapter keeps them, the title cut as a
+/// description is.
+pub(crate) fn stored_annotations(annotations: &ToolAnnotations) -> McpToolAnnotations {
+    McpToolAnnotations {
+        title: annotations.title.as_deref().map(bounded_description),
+        read_only_hint: annotations.read_only_hint,
+        destructive_hint: annotations.destructive_hint,
+        idempotent_hint: annotations.idempotent_hint,
+        open_world_hint: annotations.open_world_hint,
+    }
+}
+
+/// What a `tools/list` that had not ended after [`MCP_LIST_PAGES_MAX`] pages
+/// answers.
+pub(crate) fn pages_unended(server: &str) -> McpSyncError {
+    McpSyncError::Client(McpClientError::Protocol {
+        server: server.to_string(),
+        reason: format!("tools/list did not end within {MCP_LIST_PAGES_MAX} pages"),
+    })
 }
 
 /// The server's identity text, judged before anything else it said: a server
@@ -777,14 +803,7 @@ async fn sync_over_session(
         .and_then(|listed| {
             listed.map_err(|error| McpSyncError::Client(service_error(server, &error)))
         })
-        .and_then(|listed| {
-            listed.ok_or_else(|| {
-                McpSyncError::Client(McpClientError::Protocol {
-                    server: server.to_string(),
-                    reason: format!("tools/list did not end within {MCP_LIST_PAGES_MAX} pages"),
-                })
-            })
-        })
+        .and_then(|listed| listed.ok_or_else(|| pages_unended(server)))
         .and_then(|listed| synced_descriptors(binding, server, &listed, secrets));
     session.close().await;
     // Judged first: a server that echoes the credential into its name or
@@ -968,16 +987,7 @@ fn synced_descriptor(
         .description
         .as_deref()
         .is_some_and(|description| !description.is_empty());
-    let annotations = listed
-        .annotations
-        .as_ref()
-        .map(|annotations| McpToolAnnotations {
-            title: annotations.title.as_deref().map(bounded_description),
-            read_only_hint: annotations.read_only_hint,
-            destructive_hint: annotations.destructive_hint,
-            idempotent_hint: annotations.idempotent_hint,
-            open_world_hint: annotations.open_world_hint,
-        });
+    let annotations = listed.annotations.as_ref().map(stored_annotations);
     let fallback = format!("MCP tool {tool} on {server}");
     let description = listed
         .description
@@ -1056,15 +1066,8 @@ fn schema_ref(server: &str, tool: &str, side: &str) -> Result<AgentSchemaRef, Mc
 /// Truncates a server-supplied description to the descriptor bound, at a
 /// character boundary: the server's text is untrusted input, and a descriptor
 /// that exceeds the bound would be refused wholesale instead.
-fn bounded_description(description: &str) -> String {
-    if description.len() <= AGENT_TOOL_DESCRIPTION_MAX_LENGTH {
-        return description.to_string();
-    }
-    let mut end = AGENT_TOOL_DESCRIPTION_MAX_LENGTH;
-    while end > 0 && !description.is_char_boundary(end) {
-        end -= 1;
-    }
-    description[..end].to_string()
+pub(crate) fn bounded_description(description: &str) -> String {
+    cut_at(description, AGENT_TOOL_DESCRIPTION_MAX_LENGTH)
 }
 
 /// Which server hint, if any, the operator's declared safety class denies.

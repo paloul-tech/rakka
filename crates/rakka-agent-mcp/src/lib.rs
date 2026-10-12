@@ -14,6 +14,8 @@
 //!   error mapping.
 //! - `sync`: `sync_mcp_descriptors` (and `sync_mcp_descriptors_over`, the
 //!   launcher path's), the stored descriptor set, hint narrowing, staleness.
+//! - `listing`: `list_mcp_tools`, every tool a server lists under the sync's
+//!   rules, marked where a sync would refuse it, stored nowhere.
 //! - `executor`: `McpDispatchToolExecutor`, the schema recheck, result
 //!   mapping.
 //! - `artifacts` — the `&self` sink an executor writes an over-large result
@@ -35,6 +37,7 @@ pub mod binding;
 pub mod client;
 pub mod executor;
 pub mod launcher;
+pub mod listing;
 pub mod sync;
 #[cfg(feature = "testkit")]
 pub mod testkit;
@@ -54,6 +57,9 @@ pub use executor::{mcp_artifact_store, McpArtifactStore, McpDispatchToolExecutor
 pub use launcher::{McpChildProcessLauncher, McpChildTransport, McpLaunchError, McpLaunchFuture};
 #[cfg(feature = "child-process")]
 pub use launcher::{TokioChildProcessLauncher, MCP_LAUNCH_SPEC_MAX_BYTES};
+pub use listing::{
+    list_mcp_tools, list_mcp_tools_within, McpListedTool, McpListedToolRefusal, McpToolListing,
+};
 pub use sync::{
     mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over,
     sync_mcp_descriptors_over_within, sync_mcp_descriptors_within, McpDescriptorSet,
