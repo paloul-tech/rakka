@@ -15,7 +15,6 @@ use rakka_agent::{
     AgentCredentialBindingRef, AgentToolDeclaration, AgentToolId, AgentToolResultBehavior,
 };
 use rakka_agent_workflow::ArtifactRef;
-use rmcp::model::ProtocolVersion;
 use serde::de::Error as DeserializeError;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -25,6 +24,20 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// Every entry is one the pinned rmcp SDK knows; [`McpServerBinding::validate`]
 /// holds that property for an operator-supplied list too.
 pub const MCP_DEFAULT_PROTOCOL_VERSIONS: [&str; 2] = ["2026-07-28", "2025-11-25"];
+
+/// Every MCP protocol version the pinned rmcp SDK knows, oldest first.
+///
+/// [`McpServerBinding::validate`] refuses a binding that lists any other, so
+/// this is the whole set a binding can name. A deployment reads it here to
+/// report what it can reach rather than pinning rmcp itself; it moves with
+/// this crate's rmcp pin, and a test holds it equal to the SDK's own list.
+pub const MCP_KNOWN_PROTOCOL_VERSIONS: [&str; 5] = [
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+    "2026-07-28",
+];
 
 /// Largest a synced tool's input or output JSON schema may be, in bytes.
 pub const MCP_DESCRIPTOR_SCHEMA_MAX_BYTES: usize = 64 * 1024;
@@ -81,6 +94,15 @@ pub const MCP_ATTEMPT_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 /// can spend ten of them waiting for a `server/discover` a pre-2026-07-28
 /// server never answers.
 pub const MCP_SYNC_TIMEOUT_DEFAULT_MS: u64 = 30_000;
+
+/// How long closing an MCP session waits, in milliseconds, for its transport
+/// to finish closing.
+///
+/// A bound of its own, never charged to a sync's or an attempt's: a session
+/// is closed on every way out, including the one where that bound has just
+/// fired. So a sync returns within its bound plus this one, and an attempt
+/// within its timeout plus this one.
+pub const MCP_SESSION_CLOSE_BOUND_MS: u64 = 3_000;
 
 /// The client name this adapter identifies itself with during MCP
 /// initialization.
@@ -769,14 +791,15 @@ fn check_streamable_http_url(url: &str) -> Result<(), &'static str> {
 
 /// Whether `value` names a protocol version the pinned rmcp SDK knows.
 ///
-/// [`ProtocolVersion`] has no public constructor from a string, so membership
-/// in [`ProtocolVersion::KNOWN_VERSIONS`] (`rmcp-3.4.0/src/model.rs:174`) is
-/// what decides it; a version outside that list is one `client::connect` could
-/// never put on the wire.
+/// [`ProtocolVersion`](rmcp::model::ProtocolVersion) has no public constructor
+/// from a string, so membership in
+/// [`ProtocolVersion::KNOWN_VERSIONS`](rmcp::model::ProtocolVersion::KNOWN_VERSIONS)
+/// (`rmcp-3.4.0/src/model.rs:181`),
+/// which [`MCP_KNOWN_PROTOCOL_VERSIONS`] restates, is what decides it; a
+/// version outside that list is one `client::connect` could never put on the
+/// wire.
 fn is_known_protocol_version(value: &str) -> bool {
-    ProtocolVersion::KNOWN_VERSIONS
-        .iter()
-        .any(|known| known.as_str() == value)
+    MCP_KNOWN_PROTOCOL_VERSIONS.contains(&value)
 }
 
 /// Whether `value` is exactly ten ASCII bytes shaped `YYYY-MM-DD`.
@@ -845,6 +868,21 @@ mod tests {
         assert_eq!(
             check_streamable_http_url("https://h /mcp"),
             Err("it carries whitespace")
+        );
+    }
+
+    #[test]
+    fn the_exported_known_versions_are_the_pinned_sdks() {
+        use rmcp::model::ProtocolVersion;
+
+        let sdk: Vec<&str> = ProtocolVersion::KNOWN_VERSIONS
+            .iter()
+            .map(ProtocolVersion::as_str)
+            .collect();
+        assert_eq!(
+            super::MCP_KNOWN_PROTOCOL_VERSIONS.to_vec(),
+            sdk,
+            "an rmcp bump that changes its list changes this constant with it"
         );
     }
 

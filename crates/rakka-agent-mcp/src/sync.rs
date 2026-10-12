@@ -572,7 +572,8 @@ where
 ///
 /// `timeout` covers the handshake and the listing together. The session's
 /// close is owed on every path and is bounded on its own terms, so the call
-/// returns within `timeout` plus that fixed few seconds.
+/// returns within `timeout` plus
+/// [`MCP_SESSION_CLOSE_BOUND_MS`](crate::MCP_SESSION_CLOSE_BOUND_MS).
 ///
 /// # Errors
 ///

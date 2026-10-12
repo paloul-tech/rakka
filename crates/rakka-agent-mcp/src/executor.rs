@@ -17,7 +17,7 @@
 //!   [`McpDispatchToolExecutor::with_attempt_timeout_default_ms`]). A server
 //!   that accepts a connection and then never answers holds a
 //!   credential-bearing client for at most that long, plus the close's own
-//!   few-second bound.
+//!   bound ([`MCP_SESSION_CLOSE_BOUND_MS`](crate::MCP_SESSION_CLOSE_BOUND_MS)).
 //! - **The destination is admitted before the credential is read.** The egress
 //!   rule fires inside the `client` module's own `connect`, so a refusal
 //!   happens before a transport, a header, or a request exists. A binding
