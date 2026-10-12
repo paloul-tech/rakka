@@ -10,7 +10,7 @@ use rakka_agent::{AgentEffectSafetyClass, AgentToolDeclaration};
 use rakka_agent_mcp::testkit::{hardened_reqwest_client, serve_fake, FakeMcpServer, FakeTool};
 use rakka_agent_mcp::{
     mcp_descriptor_staleness, sync_mcp_descriptors, McpAllowAllEgress, McpDescriptorSet,
-    McpDescriptorStaleness, McpServerBinding, McpServerId, McpToolPolicy,
+    McpDescriptorStaleness, McpServerBinding, McpServerId, McpToolAnnotations, McpToolPolicy,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 use serde_json::{json, Value};
@@ -112,4 +112,20 @@ async fn a_legacy_handshake_counts_once_though_discovery_was_refused_first() {
         1,
         "the refused server/discover probe is not a handshake; the initialize is"
     );
+}
+
+#[tokio::test]
+async fn annotations_set_without_rmcp_are_listed_and_stored() {
+    let annotations = McpToolAnnotations {
+        title: Some("Search".to_string()),
+        read_only_hint: Some(true),
+        destructive_hint: Some(false),
+        idempotent_hint: Some(true),
+        open_world_hint: Some(false),
+    };
+    let endpoint =
+        serve_fake(FakeMcpServer::new().with_tool(search().with_annotations(annotations.clone())))
+            .await;
+    let set = sync(&endpoint.url).await;
+    assert_eq!(set.descriptors[0].annotations, Some(annotations));
 }

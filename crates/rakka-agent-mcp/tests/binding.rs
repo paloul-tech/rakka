@@ -369,3 +369,60 @@ fn a_tool_credential_binding_must_agree_with_the_servers() {
         "{error:?}"
     );
 }
+
+#[test]
+fn validate_endpoint_reads_the_connection_half_and_ignores_the_allow_list() {
+    let tool_less = McpServerBinding::streamable_http(server("s"), "https://h/mcp");
+    tool_less
+        .validate_endpoint()
+        .expect("a binding with no tools has a valid endpoint");
+    assert!(
+        matches!(
+            tool_less
+                .validate()
+                .expect_err("validate still needs a tool"),
+            McpRegistrationError::NoTools { .. }
+        ),
+        "validate keeps its allow-list check"
+    );
+
+    let bad_url = McpServerBinding::streamable_http(server("s"), "ftp://h/mcp");
+    assert!(matches!(
+        bad_url.validate_endpoint().expect_err("the URL rule"),
+        McpRegistrationError::InvalidUrl { .. }
+    ));
+
+    let versions = |list: Vec<&str>| {
+        McpServerBinding::streamable_http(server("s"), "https://h/mcp")
+            .with_protocol_versions(list.into_iter().map(str::to_string).collect())
+    };
+    assert!(matches!(
+        versions(vec![]).validate_endpoint().expect_err("empty"),
+        McpRegistrationError::ProtocolVersionsEmpty { .. }
+    ));
+    assert!(matches!(
+        versions(vec!["2026-7-28"])
+            .validate_endpoint()
+            .expect_err("malformed"),
+        McpRegistrationError::ProtocolVersionInvalid { .. }
+    ));
+    assert!(matches!(
+        versions(vec!["2099-01-01"])
+            .validate_endpoint()
+            .expect_err("unknown"),
+        McpRegistrationError::ProtocolVersionUnknown { .. }
+    ));
+
+    let child = McpServerBinding::child_process(server("s"), launch_spec());
+    child
+        .clone()
+        .validate_endpoint()
+        .expect("a child-process endpoint with no credential");
+    assert!(matches!(
+        child
+            .with_credential_binding(credential())
+            .validate_endpoint()
+            .expect_err("a child process carries no credential"),
+        McpRegistrationError::CredentialOnChildProcess { .. }
+    ));
+}

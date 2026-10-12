@@ -18,8 +18,8 @@ use rakka_agent_mcp::testkit::{
 use rakka_agent_mcp::{
     mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over, McpAllowAllEgress,
     McpDescriptorSet, McpDescriptorStaleness, McpEgressCheck, McpServerBinding, McpServerId,
-    McpToolAnnotations, McpToolPolicy, MCP_ATTEMPT_TIMEOUT_DEFAULT_MS,
-    MCP_DESCRIPTOR_SCHEMA_MAX_BYTES, MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
+    McpSyncError, McpToolAnnotations, McpToolPolicy, MCP_ATTEMPT_TIMEOUT_DEFAULT_MS,
+    MCP_DESCRIPTOR_SCHEMA_MAX_BYTES, MCP_DESCRIPTOR_SET_SCHEMA_VERSION, MCP_SERVER_NAME_MAX_BYTES,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
 use rmcp::model::ToolAnnotations;
@@ -870,4 +870,141 @@ async fn an_annotation_title_over_the_bound_is_cut_on_a_character_boundary() {
         title.len()
     );
     assert!(!title.is_empty() && long.starts_with(&title));
+}
+
+/// `binding`'s two tools, from a server that reports `version`.
+async fn synced_with_version(version: &str) -> McpDescriptorSet {
+    let endpoint = serve_fake(
+        FakeMcpServer::new()
+            .with_tool(tool("search"))
+            .with_tool(tool("update"))
+            .with_server_version(version),
+    )
+    .await;
+    sync_mcp_descriptors(
+        &client(),
+        &binding(&endpoint.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("syncs")
+}
+
+#[tokio::test]
+async fn a_synced_set_carries_the_servers_version_cut_on_a_character_boundary() {
+    assert_eq!(
+        synced_with_version("4.2.0").await.server_version.as_deref(),
+        Some("4.2.0")
+    );
+    // 255 ASCII bytes, then a two-byte character straddling the bound.
+    let kept = "v".repeat(MCP_SERVER_NAME_MAX_BYTES - 1);
+    let long = format!("{kept}é-and-then-some");
+    assert_eq!(
+        synced_with_version(&long).await.server_version.as_deref(),
+        Some(kept.as_str()),
+        "the straddling character is dropped whole"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_server_version_reads_as_none() {
+    assert_eq!(synced_with_version("").await.server_version, None);
+}
+
+#[tokio::test]
+async fn the_server_version_is_display_data_outside_the_digest_and_optional_on_decode() {
+    let set = synced_with_version("4.2.0").await;
+    let encoded = serde_json::to_value(&set).expect("encodes");
+    assert_eq!(encoded["server_version"], json!("4.2.0"));
+    assert_eq!(
+        serde_json::from_value::<McpDescriptorSet>(encoded.clone()).expect("round-trips"),
+        set
+    );
+
+    let mut without = encoded;
+    without
+        .as_object_mut()
+        .expect("an object")
+        .remove("server_version");
+    let decoded = serde_json::from_value::<McpDescriptorSet>(without)
+        .expect("a set written before the field decodes");
+    assert_eq!(decoded.server_version, None);
+    assert_eq!(
+        decoded.digest(),
+        set.digest(),
+        "the version is not part of what a release pins"
+    );
+    assert!(
+        serde_json::to_value(&decoded)
+            .expect("encodes")
+            .get("server_version")
+            .is_none(),
+        "an absent version is omitted, as an earlier build wrote the set"
+    );
+}
+
+/// A binding allow-listing `tools`, each read-only.
+fn binding_naming(url: &str, tools: &[&str]) -> McpServerBinding {
+    tools.iter().fold(
+        McpServerBinding::streamable_http(McpServerId::new("crm").expect("id"), url),
+        |binding, tool| {
+            binding
+                .with_tool(*tool, declared(AgentEffectSafetyClass::ReadOnly))
+                .expect("tool")
+        },
+    )
+}
+
+#[tokio::test]
+async fn every_allow_listed_tool_the_server_lacks_is_named_at_once_in_tool_name_order() {
+    let endpoint = serve_fake(FakeMcpServer::new().with_tool(tool("search"))).await;
+    let error = sync_mcp_descriptors(
+        &client(),
+        &binding_naming(&endpoint.url, &["update", "search", "archive"]),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("two named tools are missing");
+    assert_eq!(error.code(), "mcp-binding-invalid");
+    assert!(
+        matches!(
+            &error,
+            McpSyncError::ToolsNotListed { server, tools }
+                if server == "crm" && tools == &["archive".to_string(), "update".to_string()]
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("archive, update"),
+        "the message names both: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_tool_is_refused_before_a_present_tools_own_refusal() {
+    // `search` is over the 64 KiB line, and `update` is missing.
+    let endpoint = serve_fake(FakeMcpServer::new().with_tool(FakeTool::text(
+        "search",
+        "Big.",
+        schema(2_000),
+        "ok",
+    )))
+    .await;
+    let error = sync_mcp_descriptors(
+        &client(),
+        &binding(&endpoint.url),
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect_err("refused");
+    assert!(
+        matches!(&error, McpSyncError::ToolsNotListed { tools, .. } if tools == &["update".to_string()]),
+        "the binding's mismatch first, not the present tool's size: {error:?}"
+    );
 }

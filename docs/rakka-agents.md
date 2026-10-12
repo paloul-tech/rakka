@@ -39,7 +39,7 @@ enforced row names the test behind it:
 | `rakka-agent-postgres` | PostgreSQL session memory, context snapshots, agent-private long-term records, the pgvector retriever, and their migrations. | — (depend on it directly) |
 | `rakka-agent-knowledge-graph` | The communal knowledge graph: provenance-bearing claims, the trust lattice, the promotion gate, the portable store SPI, an in-memory reference store, and the backend conformance harness. | — |
 | `rakka-agent-knowledge-graph-postgres` | The graph's relational backend. | — |
-| `rakka-agent-mcp` | The MCP client adapter: server bindings with operator-declared tool policies, publish-time descriptor sync, the dispatch executor over an injected transport client with a required egress check, and the child-process launcher seam. | `agent-mcp` |
+| `rakka-agent-mcp` | The MCP client adapter: server bindings with operator-declared tool policies, publish-time descriptor sync, a tool listing for choosing tools before any binding names them, the dispatch executor over an injected transport client with a required egress check, and the child-process launcher seam. | `agent-mcp` |
 | `rakka-a2a` (`agents` feature) | The typed A2A surface over the entities: ingress, the state projection, the agent-management and collaboration extensions, replay, and the goal view. | `a2a-agents`; `a2a-otel` adds the ingress span |
 
 Application code reaches the surface through `rakka::agent`,

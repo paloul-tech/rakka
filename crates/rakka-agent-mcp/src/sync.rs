@@ -29,9 +29,10 @@
 //! - A server-reported hint never *changes* an operator's declaration. When
 //!   the binding opts into honoring hints, a hint that contradicts the
 //!   declaration refuses the sync; otherwise it is ignored.
-//! - The server's self-reported name is cut at [`MCP_SERVER_NAME_MAX_BYTES`].
-//! - Text that carries the credential the sync sent — in the server's name,
-//!   a description, or either schema — refuses the sync
+//! - The server's self-reported name and version are each cut at
+//!   [`MCP_SERVER_NAME_MAX_BYTES`].
+//! - Text that carries the credential the sync sent — in the server's name
+//!   or version, a description, or either schema — refuses the sync
 //!   (`mcp-descriptor-credential-echoed`). It is refused rather than
 //!   scrubbed because a scrubbed schema would no longer match the digest a
 //!   dispatch compares with the live server's.
@@ -173,6 +174,14 @@ pub struct McpDescriptorSet {
     pub server_id: McpServerId,
     /// The server's self-reported implementation name at sync time.
     pub server_name: String,
+    /// The server's self-reported implementation version at sync time, cut at
+    /// [`MCP_SERVER_NAME_MAX_BYTES`]; `None` when it reported none, or on a
+    /// set written before the field existed.
+    ///
+    /// Display data: not in [`Self::digest`], not checked by
+    /// [`Self::validate`], not compared by [`mcp_descriptor_staleness`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
     /// The protocol version the sync negotiated.
     pub protocol_version: String,
     /// When the sync ran.
@@ -326,6 +335,8 @@ struct McpDescriptorSetRecord {
     schema_version: u32,
     server_id: McpServerId,
     server_name: String,
+    #[serde(default)]
+    server_version: Option<String>,
     protocol_version: String,
     synced_at: AgentTimestampMillis,
     descriptors: Vec<McpSyncedDescriptor>,
@@ -339,6 +350,7 @@ impl TryFrom<McpDescriptorSetRecord> for McpDescriptorSet {
             schema_version: record.schema_version,
             server_id: record.server_id,
             server_name: record.server_name,
+            server_version: record.server_version,
             protocol_version: record.protocol_version,
             synced_at: record.synced_at,
             descriptors: record.descriptors,
@@ -397,6 +409,13 @@ pub enum McpSyncError {
         /// Why. A Rakka-side validation message, never server text.
         reason: String,
     },
+    /// The server does not list tools the binding's allow-list names.
+    ToolsNotListed {
+        /// The server listed.
+        server: String,
+        /// Every allow-listed tool the listing lacks, in tool-name order.
+        tools: Vec<String>,
+    },
     /// The server's own text carries the credential this sync sent it.
     ///
     /// Nothing is stored. A descriptor set is release data and its
@@ -407,10 +426,12 @@ pub enum McpSyncError {
     CredentialEchoed {
         /// The server whose text carried it.
         server: String,
-        /// The tool whose text carried it, or `None` for the server's name.
+        /// The tool whose text carried it, or `None` for the server's name or
+        /// version, and for a tool name, which the refusal cannot quote.
         tool: Option<String>,
-        /// Which text: `server name`, `description`, `annotations title`,
-        /// `input schema`, or `output schema`.
+        /// Which text: `server name`, `server version`, `tool name`,
+        /// `description`, `annotations title`, `input schema`, or
+        /// `output schema`.
         field: &'static str,
     },
 }
@@ -438,7 +459,7 @@ impl McpSyncError {
             Self::SchemaTooLarge { .. } => "mcp-descriptor-schema-too-large",
             Self::HintContradictsDeclaration { .. } => "mcp-hint-contradicts-declaration",
             Self::Registration(error) => error.code(),
-            Self::Descriptor { .. } => "mcp-binding-invalid",
+            Self::Descriptor { .. } | Self::ToolsNotListed { .. } => "mcp-binding-invalid",
             Self::CredentialEchoed { .. } => "mcp-descriptor-credential-echoed",
         }
     }
@@ -469,6 +490,11 @@ impl Display for McpSyncError {
             } => write!(
                 f,
                 "the MCP server {server}'s tool {tool} could not be described: {reason}"
+            ),
+            Self::ToolsNotListed { server, tools } => write!(
+                f,
+                "the MCP server {server} does not list the tools {}",
+                tools.join(", ")
             ),
             Self::CredentialEchoed {
                 server,
@@ -509,7 +535,7 @@ impl From<McpRegistrationError> for McpSyncError {
 /// The instant a sync must be over by. `checked_add` rather than `+`: a bound
 /// the platform's clock cannot represent ends the sync at once, failing
 /// closed rather than panicking or waiting forever.
-fn sync_deadline(timeout: Duration) -> tokio::time::Instant {
+pub(crate) fn sync_deadline(timeout: Duration) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     now.checked_add(timeout).unwrap_or(now)
 }
@@ -517,7 +543,7 @@ fn sync_deadline(timeout: Duration) -> tokio::time::Instant {
 /// What a sync that ran out of time answers: one fact to the operator, the
 /// descriptors could not be refreshed, under the code a transport failure of
 /// the sync already has.
-fn timed_out(server: &str, timeout: Duration) -> McpSyncError {
+pub(crate) fn timed_out(server: &str, timeout: Duration) -> McpSyncError {
     McpSyncError::Client(McpClientError::Transport {
         server: server.to_string(),
         reason: format!("the sync exceeded its {} ms bound", timeout.as_millis()),
@@ -666,7 +692,7 @@ pub async fn sync_mcp_descriptors_over_within(
 }
 
 /// Whether `text` carries any of `secrets`. An empty secret matches nothing.
-fn carries(text: &str, secrets: &[&str]) -> bool {
+pub(crate) fn carries(text: &str, secrets: &[&str]) -> bool {
     secrets
         .iter()
         .any(|secret| !secret.is_empty() && text.contains(secret))
@@ -678,7 +704,7 @@ fn carries(text: &str, secrets: &[&str]) -> bool {
 /// its own — one with a quote or a backslash in it — is found as itself. A
 /// number is compared whole rather than searched: a digit run inside a
 /// larger number is not the secret.
-fn value_carries(value: &Value, secrets: &[&str]) -> bool {
+pub(crate) fn value_carries(value: &Value, secrets: &[&str]) -> bool {
     match value {
         Value::String(text) => carries(text, secrets),
         Value::Array(items) => items.iter().any(|item| value_carries(item, secrets)),
@@ -693,17 +719,64 @@ fn value_carries(value: &Value, secrets: &[&str]) -> bool {
     }
 }
 
-/// The server's name as a set stores it: cut at
-/// [`MCP_SERVER_NAME_MAX_BYTES`], on a character boundary.
-fn bounded_server_name(name: &str) -> String {
-    if name.len() <= MCP_SERVER_NAME_MAX_BYTES {
-        return name.to_string();
+/// `text` cut at `max` bytes, on a character boundary.
+pub(crate) fn cut_at(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
     }
-    let mut end = MCP_SERVER_NAME_MAX_BYTES;
-    while end > 0 && !name.is_char_boundary(end) {
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    name[..end].to_string()
+    text[..end].to_string()
+}
+
+/// The server's name or version as a set or a listing keeps it: cut at
+/// [`MCP_SERVER_NAME_MAX_BYTES`], on a character boundary.
+pub(crate) fn bounded_server_name(name: &str) -> String {
+    cut_at(name, MCP_SERVER_NAME_MAX_BYTES)
+}
+
+/// The server's hints as this adapter keeps them, the title cut as a
+/// description is.
+pub(crate) fn stored_annotations(annotations: &ToolAnnotations) -> McpToolAnnotations {
+    McpToolAnnotations {
+        title: annotations.title.as_deref().map(bounded_description),
+        read_only_hint: annotations.read_only_hint,
+        destructive_hint: annotations.destructive_hint,
+        idempotent_hint: annotations.idempotent_hint,
+        open_world_hint: annotations.open_world_hint,
+    }
+}
+
+/// What a `tools/list` that had not ended after [`MCP_LIST_PAGES_MAX`] pages
+/// answers.
+pub(crate) fn pages_unended(server: &str) -> McpSyncError {
+    McpSyncError::Client(McpClientError::Protocol {
+        server: server.to_string(),
+        reason: format!("tools/list did not end within {MCP_LIST_PAGES_MAX} pages"),
+    })
+}
+
+/// The server's identity text, judged before anything else it said: a server
+/// that echoes the credential into its name or its version is refused for
+/// that, whatever else its answer got wrong.
+pub(crate) fn judge_server_identity(
+    server: &str,
+    name: &str,
+    version: Option<&str>,
+    secrets: &[&str],
+) -> Result<(), McpSyncError> {
+    for (field, text) in [("server name", Some(name)), ("server version", version)] {
+        if text.is_some_and(|text| carries(text, secrets)) {
+            return Err(McpSyncError::CredentialEchoed {
+                server: server.to_string(),
+                tool: None,
+                field,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Everything after the handshake that both syncs share: one listing, the
@@ -722,6 +795,7 @@ async fn sync_over_session(
     let listed = tokio::time::timeout_at(deadline, session.list_all_tools()).await;
     let protocol_version = session.negotiated_version().as_str().to_string();
     let reported_name = session.server_name().to_string();
+    let reported_version = session.server_version().map(str::to_string);
     // The session is closed before the answer is judged: a refusal must not
     // leave a transport (and its credential-bearing client, or its child
     // process) alive.
@@ -730,29 +804,17 @@ async fn sync_over_session(
         .and_then(|listed| {
             listed.map_err(|error| McpSyncError::Client(service_error(server, &error)))
         })
-        .and_then(|listed| {
-            listed.ok_or_else(|| {
-                McpSyncError::Client(McpClientError::Protocol {
-                    server: server.to_string(),
-                    reason: format!("tools/list did not end within {MCP_LIST_PAGES_MAX} pages"),
-                })
-            })
-        })
+        .and_then(|listed| listed.ok_or_else(|| pages_unended(server)))
         .and_then(|listed| synced_descriptors(binding, server, &listed, secrets));
     session.close().await;
-    // Judged first: a server that echoes the credential is refused for that,
-    // whatever else its listing got wrong.
-    if carries(&reported_name, secrets) {
-        return Err(McpSyncError::CredentialEchoed {
-            server: server.to_string(),
-            tool: None,
-            field: "server name",
-        });
-    }
+    // Judged first: a server that echoes the credential into its name or
+    // version is refused for that, whatever else its listing got wrong.
+    judge_server_identity(server, &reported_name, reported_version.as_deref(), secrets)?;
     Ok(McpDescriptorSet {
         schema_version: MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
         server_id: binding.server_id.clone(),
         server_name: bounded_server_name(&reported_name),
+        server_version: reported_version.as_deref().map(bounded_server_name),
         protocol_version,
         synced_at,
         descriptors: built?,
@@ -805,26 +867,39 @@ fn shapes(
 ///
 /// `binding.tools` is a `BTreeMap`, so they come out in tool-name order rather
 /// than the order the operator wrote them in — which is what makes
-/// [`McpDescriptorSet::digest`] invariant under a reordered allow-list.
+/// [`McpDescriptorSet::digest`] invariant under a reordered allow-list. A
+/// binding naming tools the server lacks is refused
+/// [`McpSyncError::ToolsNotListed`] with every one of them.
 fn synced_descriptors(
     binding: &McpServerBinding,
     server: &str,
     listed: &[Tool],
     secrets: &[&str],
 ) -> Result<Vec<McpSyncedDescriptor>, McpSyncError> {
-    binding
-        .tools
-        .iter()
-        .map(|(tool, policy)| {
-            let found = listed
-                .iter()
-                .find(|candidate| candidate.name == tool.as_str())
-                .ok_or_else(|| McpSyncError::Descriptor {
-                    server: server.to_string(),
-                    tool: tool.clone(),
-                    reason: "the server does not list it".to_string(),
-                })?;
-            synced_descriptor(binding, server, tool, policy, found, secrets)
+    // Every allow-listed name is matched first, so a binding that names tools
+    // the server lacks hears about all of them at once rather than one per
+    // attempt; only then is each present tool judged, in tool-name order.
+    let mut found = Vec::with_capacity(binding.tools.len());
+    let mut missing = Vec::new();
+    for (tool, policy) in &binding.tools {
+        match listed
+            .iter()
+            .find(|candidate| candidate.name == tool.as_str())
+        {
+            Some(listed) => found.push((tool, policy, listed)),
+            None => missing.push(tool.clone()),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(McpSyncError::ToolsNotListed {
+            server: server.to_string(),
+            tools: missing,
+        });
+    }
+    found
+        .into_iter()
+        .map(|(tool, policy, listed)| {
+            synced_descriptor(binding, server, tool, policy, listed, secrets)
         })
         .collect()
 }
@@ -913,16 +988,7 @@ fn synced_descriptor(
         .description
         .as_deref()
         .is_some_and(|description| !description.is_empty());
-    let annotations = listed
-        .annotations
-        .as_ref()
-        .map(|annotations| McpToolAnnotations {
-            title: annotations.title.as_deref().map(bounded_description),
-            read_only_hint: annotations.read_only_hint,
-            destructive_hint: annotations.destructive_hint,
-            idempotent_hint: annotations.idempotent_hint,
-            open_world_hint: annotations.open_world_hint,
-        });
+    let annotations = listed.annotations.as_ref().map(stored_annotations);
     let fallback = format!("MCP tool {tool} on {server}");
     let description = listed
         .description
@@ -987,7 +1053,11 @@ fn encoded_len(schema: &Value, server: &str, tool: &str) -> Result<usize, McpSyn
 }
 
 /// The versioned schema reference a synced tool's input or output points at.
-fn schema_ref(server: &str, tool: &str, side: &str) -> Result<AgentSchemaRef, McpSyncError> {
+pub(crate) fn schema_ref(
+    server: &str,
+    tool: &str,
+    side: &str,
+) -> Result<AgentSchemaRef, McpSyncError> {
     let schema_id = AgentSchemaId::new(format!("mcp.{server}.{tool}.{side}")).map_err(|error| {
         McpSyncError::Descriptor {
             server: server.to_string(),
@@ -1001,15 +1071,8 @@ fn schema_ref(server: &str, tool: &str, side: &str) -> Result<AgentSchemaRef, Mc
 /// Truncates a server-supplied description to the descriptor bound, at a
 /// character boundary: the server's text is untrusted input, and a descriptor
 /// that exceeds the bound would be refused wholesale instead.
-fn bounded_description(description: &str) -> String {
-    if description.len() <= AGENT_TOOL_DESCRIPTION_MAX_LENGTH {
-        return description.to_string();
-    }
-    let mut end = AGENT_TOOL_DESCRIPTION_MAX_LENGTH;
-    while end > 0 && !description.is_char_boundary(end) {
-        end -= 1;
-    }
-    description[..end].to_string()
+pub(crate) fn bounded_description(description: &str) -> String {
+    cut_at(description, AGENT_TOOL_DESCRIPTION_MAX_LENGTH)
 }
 
 /// Which server hint, if any, the operator's declared safety class denies.

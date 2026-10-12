@@ -36,6 +36,8 @@ use rmcp::ServerHandler;
 use serde_json::{Map, Value};
 use tokio::task::JoinHandle;
 
+use crate::sync::McpToolAnnotations;
+
 /// The concrete HTTP client rmcp implements
 /// [`StreamableHttpClient`] for.
 ///
@@ -156,10 +158,12 @@ impl FakeTool {
         )
     }
 
-    /// Declares the tool's hints.
+    /// Declares the tool's hints — rmcp's own `ToolAnnotations`, or this
+    /// crate's [`McpToolAnnotations`], so a deployment's proofs need no rmcp
+    /// dependency of their own.
     #[must_use]
-    pub fn with_annotations(mut self, annotations: ToolAnnotations) -> Self {
-        self.annotations = Some(annotations);
+    pub fn with_annotations(mut self, annotations: impl Into<ToolAnnotations>) -> Self {
+        self.annotations = Some(annotations.into());
         self
     }
 
@@ -195,6 +199,20 @@ impl FakeTool {
     }
 }
 
+/// The stored hints as the fake lists them. rmcp's type is
+/// `#[non_exhaustive]`, so it is built through its own `from_raw`.
+impl From<McpToolAnnotations> for ToolAnnotations {
+    fn from(annotations: McpToolAnnotations) -> Self {
+        ToolAnnotations::from_raw(
+            annotations.title,
+            annotations.read_only_hint,
+            annotations.destructive_hint,
+            annotations.idempotent_hint,
+            annotations.open_world_hint,
+        )
+    }
+}
+
 /// One `tools/call` the fake server served.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeenCall {
@@ -216,6 +234,7 @@ pub struct SeenCall {
 struct FakeState {
     tools: Vec<FakeTool>,
     server_name: String,
+    server_version: String,
     versions: Vec<ProtocolVersion>,
     list_calls: usize,
     handshakes: usize,
@@ -252,6 +271,7 @@ impl FakeMcpServer {
             state: Arc::new(Mutex::new(FakeState {
                 tools: Vec::new(),
                 server_name: "fake-mcp-server".to_string(),
+                server_version: "fake".to_string(),
                 versions: ProtocolVersion::KNOWN_VERSIONS.to_vec(),
                 list_calls: 0,
                 handshakes: 0,
@@ -276,6 +296,13 @@ impl FakeMcpServer {
     #[must_use]
     pub fn with_server_name(self, name: impl Into<String>) -> Self {
         self.lock().server_name = name.into();
+        self
+    }
+
+    /// Sets the implementation version the server reports, `"fake"` until set.
+    #[must_use]
+    pub fn with_server_version(self, version: impl Into<String>) -> Self {
+        self.lock().server_version = version.into();
         self
     }
 
@@ -424,7 +451,7 @@ impl ServerHandler for FakeMcpServer {
             .with_protocol_version(newest)
             .with_server_info(rmcp::model::Implementation::new(
                 state.server_name.clone(),
-                "fake",
+                state.server_version.clone(),
             ))
     }
 

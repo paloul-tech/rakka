@@ -300,11 +300,12 @@ const SESSION_CLOSE_BOUND: Duration = Duration::from_millis(MCP_SESSION_CLOSE_BO
 ///
 /// Crate-private, like every way to open one: rmcp's `Peer` is not part of
 /// this crate's public API, and the only public ways to reach a server are the
-/// descriptor syncs and the dispatch executor, each of which holds the rules a
-/// bare session would not.
+/// descriptor syncs, the tool listing, and the dispatch executor, each of
+/// which holds the rules a bare session would not.
 pub(crate) struct McpClientSession {
     running: RunningService<RoleClient, ClientConfig>,
     server_name: String,
+    server_version: Option<String>,
     negotiated: ProtocolVersion,
 }
 
@@ -349,6 +350,13 @@ impl McpClientSession {
     #[must_use]
     pub(crate) fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    /// The server's self-reported implementation version, `None` when it
+    /// reported none or an empty one.
+    #[must_use]
+    pub(crate) fn server_version(&self) -> Option<&str> {
+        self.server_version.as_deref()
     }
 
     /// Cancels the session and waits, for at most a few seconds, for its
@@ -632,9 +640,17 @@ async fn finish(
             name: server_name,
         });
     }
+    // An empty version is no version: the field is required on the wire, so
+    // a server with nothing to say sends "".
+    let server_version = peer_info
+        .server_info
+        .as_ref()
+        .map(|info| info.version.clone())
+        .filter(|version| !version.is_empty());
     Ok(McpClientSession {
         running,
         server_name,
+        server_version,
         negotiated,
     })
 }
