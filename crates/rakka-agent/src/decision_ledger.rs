@@ -66,8 +66,6 @@ impl<O> AgentDecisionLedger<O> {
 
     /// Remembers one committed decision, evicting the oldest past
     /// [`AGENT_DECISION_LEDGER_CAPACITY`].
-    // The run and task entities record into it from Task 2 on.
-    #[allow(dead_code)]
     pub(crate) fn record(&mut self, operation_id: AgentOperationId, outcome: O) {
         self.entries.push_back(AgentDecisionLedgerEntry {
             operation_id,

@@ -91,6 +91,7 @@ use crate::choreography::{
     AgentExchangePayload, AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter,
     AgentExchangeState, AgentExchangeTransition,
 };
+use crate::decision_ledger::AgentDecisionLedger;
 use crate::definition::AgentRevisionNumber;
 use crate::effect::{
     effect_id_for, AgentEffectError, AgentEffectGeneration, AgentEffectPolicies,
@@ -145,7 +146,9 @@ pub const DEFAULT_AGENT_RUN_ENTITY_TYPE: &str = "RakkaAgentRun";
 /// The window is the fast path; every command transition is additionally fenced
 /// by the run's own durable state — an effect result for an effect the run does
 /// not hold, or holds as resolved, is refused — so a replay older than the
-/// window is still refused rather than applied twice.
+/// window is still refused rather than applied twice. A decision
+/// ([`AgentRunEntityCommand::records_decision`]) is answered past the window
+/// from the run's decision ledger instead, with its original outcome.
 pub const AGENT_RUN_OPERATION_LOG_CAPACITY: usize = 64;
 
 /// Largest materialized run record, in bytes, once serialized.
@@ -823,6 +826,11 @@ pub struct AgentRunState {
     scope: AgentRunScope,
     run: Option<AgentRun>,
     applied_operations: AgentRunOperationLog,
+    /// The decisions the run committed, kept past the operation window. A
+    /// record written before the ledger existed decodes with an empty one, and
+    /// an empty one is omitted, so a run that never decided encodes as before.
+    #[serde(default, skip_serializing_if = "AgentDecisionLedger::is_empty")]
+    decision_ledger: AgentDecisionLedger<AgentRunOutcome>,
     journal: AgentExchangeJournal,
     updated_at: AgentTimestampMillis,
 }
@@ -836,6 +844,7 @@ impl AgentRunState {
             scope,
             run: None,
             applied_operations: AgentRunOperationLog::default(),
+            decision_ledger: AgentDecisionLedger::default(),
             journal: AgentExchangeJournal::new(),
             updated_at: now,
         }
@@ -883,10 +892,26 @@ impl AgentRunState {
         &self.applied_operations
     }
 
+    /// The decisions the run committed, which answer a replay `Duplicate`
+    /// after the operation window has moved past it.
+    #[must_use]
+    pub const fn decision_ledger(&self) -> &AgentDecisionLedger<AgentRunOutcome> {
+        &self.decision_ledger
+    }
+
     /// The time of the last accepted transition.
     #[must_use]
     pub const fn updated_at(&self) -> AgentTimestampMillis {
         self.updated_at
+    }
+
+    /// The outcome an already-applied operation produced: from the window,
+    /// or, once the window has moved past a decision, from the decision
+    /// ledger.
+    fn replayed_outcome(&self, operation_id: &AgentOperationId) -> Option<&AgentRunOutcome> {
+        self.applied_operations
+            .outcome(operation_id)
+            .or_else(|| self.decision_ledger.outcome(operation_id))
     }
 
     /// The compact outcome describing the current state.
@@ -6840,12 +6865,11 @@ where
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentRunEntityReply> {
         if let Some(operation_id) = command.operation_id() {
-            if let Some(outcome) = self
-                .state()?
-                .applied_operations
-                .outcome(operation_id)
-                .cloned()
-            {
+            // The window answers a replay, and past it the decision ledger
+            // answers a decision's — before every guard below, the terminal
+            // one included, so a replayed Deny that ended the run converges
+            // rather than being refused `run-terminal`.
+            if let Some(outcome) = self.state()?.replayed_outcome(operation_id).cloned() {
                 // The retry contract sends the same operation id after a
                 // settlement failure, so the replay must re-drive the settle
                 // pass the committed transition still owes — answering from
@@ -6857,6 +6881,7 @@ where
             }
         }
 
+        let records_decision = command.records_decision();
         let reply = match command {
             AgentRunEntityCommand::Describe => {
                 return Ok(AgentRunEntityReply::Snapshot(
@@ -6898,7 +6923,7 @@ where
                     .and_then(|state| state.loop_state().map(segment_marks))
                     .unwrap_or_default();
                 let reply = self
-                    .transition(now, move |state| {
+                    .transition(now, records_decision, move |state| {
                         record_effect_result(
                             state, &effect_id, generation, attempt, fence, *outcome, &policy,
                             &policies, now,
@@ -6959,7 +6984,7 @@ where
             } => {
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
-                self.transition(now, move |state| {
+                self.transition(now, records_decision, move |state| {
                     resolve_indeterminate_effect(
                         state,
                         &effect_id,
@@ -6982,7 +7007,7 @@ where
             } => {
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
-                self.transition(now, move |state| {
+                self.transition(now, records_decision, move |state| {
                     resolve_checkpoint(
                         state,
                         &checkpoint_id,
@@ -7001,7 +7026,7 @@ where
                 if let Some(unchanged) = self.unchanged_by(fire_checkpoint_timers, now)? {
                     return Ok(unchanged);
                 }
-                self.transition(now, move |state| {
+                self.transition(now, records_decision, move |state| {
                     fire_checkpoint_timers(state, now)?;
                     Ok(operation_id)
                 })
@@ -7011,7 +7036,7 @@ where
                 if let Some(unchanged) = self.unchanged_by(fire_fan_in_deadline, now)? {
                     return Ok(unchanged);
                 }
-                self.transition(now, move |state| {
+                self.transition(now, records_decision, move |state| {
                     fire_fan_in_deadline(state, now)?;
                     Ok(operation_id)
                 })
@@ -7027,7 +7052,7 @@ where
                 result_digest,
             } => {
                 let reply = self
-                    .transition(now, move |state| {
+                    .transition(now, records_decision, move |state| {
                         record_workflow_result(
                             state,
                             &invocation,
@@ -7057,7 +7082,7 @@ where
                 operation_id,
                 reason,
             } => {
-                self.transition(now, move |state| {
+                self.transition(now, records_decision, move |state| {
                     cancel(state, reason, now)?;
                     Ok(operation_id)
                 })
@@ -7069,7 +7094,7 @@ where
             } => {
                 let policies = self.policies.clone();
                 let session_wired = self.memory.is_some();
-                self.transition(now, move |state| {
+                self.transition(now, records_decision, move |state| {
                     promote_memory(state, *promotion, session_wired, &policies, now)?;
                     Ok(operation_id)
                 })
@@ -7080,7 +7105,7 @@ where
                 append,
             } => {
                 let policies = self.policies.clone();
-                self.transition(now, move |state| {
+                self.transition(now, records_decision, move |state| {
                     append_claim(state, *append, &policies, now)?;
                     Ok(operation_id)
                 })
@@ -7092,7 +7117,7 @@ where
             } => {
                 let policies = self.policies.clone();
                 let decision_events = self.decisions.is_some();
-                self.transition(now, move |state| {
+                self.transition(now, records_decision, move |state| {
                     evaluate_goal(state, *evaluation, &policies, decision_events, now)?;
                     Ok(operation_id)
                 })
@@ -8262,10 +8287,12 @@ where
     ///
     /// A rejected transition never reaches the store, so it leaves no trace in the
     /// operation log and a corrected retry under the same operation id is still
-    /// accepted.
+    /// accepted. A decision ([`AgentRunEntityCommand::records_decision`]) is
+    /// also recorded in the decision ledger, in the same compare-and-set.
     async fn transition<F>(
         &mut self,
         now: AgentTimestampMillis,
+        decision: bool,
         transition: F,
     ) -> AgentRunResult<AgentRunEntityReply>
     where
@@ -8280,6 +8307,11 @@ where
                     |state: &mut AgentRunState| -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
                         let operation_id = transition(state)?;
                         let result = state.outcome();
+                        if decision {
+                            state
+                                .decision_ledger
+                                .record(operation_id.clone(), result.clone());
+                        }
                         state
                             .applied_operations
                             .record(operation_id, result.clone());
@@ -8561,6 +8593,20 @@ pub enum AgentRunEntityCommand {
 }
 
 impl AgentRunEntityCommand {
+    /// Whether the command is a decision the run remembers past its operation
+    /// window ([`AgentRunState::decision_ledger`]): a checkpoint resolution or
+    /// an indeterminate effect's resolution. A replay of one answers
+    /// [`AgentRunEntityReply::Duplicate`] with its original outcome after any
+    /// number of later non-decision operations, and up to
+    /// [`crate::AGENT_DECISION_LEDGER_CAPACITY`] `- 1` later decisions.
+    #[must_use]
+    pub const fn records_decision(&self) -> bool {
+        matches!(
+            self,
+            Self::ResolveCheckpoint { .. } | Self::ResolveIndeterminateEffect { .. }
+        )
+    }
+
     /// The operation id this command deduplicates on, when it mutates state.
     #[must_use]
     pub const fn operation_id(&self) -> Option<&AgentOperationId> {
