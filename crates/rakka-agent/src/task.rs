@@ -13951,7 +13951,15 @@ impl AgentTaskEntityCommand {
     /// [`crate::AGENT_DECISION_LEDGER_CAPACITY`] `- 1` later decisions.
     #[must_use]
     pub const fn records_decision(&self) -> bool {
-        matches!(self, Self::Create { .. } | Self::Cancel { .. })
+        matches!(
+            self,
+            Self::Create { .. }
+                | Self::Cancel { .. }
+                | Self::ActivateGoal { .. }
+                | Self::RecordGoalDecision { .. }
+                | Self::ResumeGoal { .. }
+                | Self::ReviseGoalCriteria { .. }
+        )
     }
 
     /// The operation id this command deduplicates on, when it mutates state.

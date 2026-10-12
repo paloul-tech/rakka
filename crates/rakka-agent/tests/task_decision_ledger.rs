@@ -14,16 +14,21 @@
 
 use rakka_agent::testkit::ScriptedDispatcher;
 use rakka_agent::{
-    load_agent_task_state, AgentOperationId, AgentOperationKind, AgentSchemaPolicy,
-    AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome, AgentTaskEntityCommand,
-    AgentTaskEntityReply, AgentTaskError, AgentTaskId, AgentTaskOutcome, AgentTaskStatus,
+    load_agent_task_state, AgentBudgetAllocation, AgentBudgetCeilings, AgentGoalCriteriaSource,
+    AgentGoalDecision, AgentGoalStatus, AgentGoalTerminalReason, AgentOperationId,
+    AgentOperationKind, AgentPolicyRef, AgentRevisionNumber, AgentSchemaPolicy, AgentTaskContent,
+    AgentTaskCreation, AgentTaskDefinition, AgentTaskDependencyDeclaration,
+    AgentTaskDependencyOutcome, AgentTaskEntityCommand, AgentTaskEntityReply, AgentTaskError,
+    AgentTaskId, AgentTaskOutcome, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId,
+    AgentTaskStatus,
 };
 
 mod common;
 
 use common::{
-    forget_operations, goal_spec, goal_spec_draft, goal_task_creation_command, task_definition,
-    task_scope, Fixture, TASK, TENANT,
+    agent_id, continuous_goal_mode, forget_operations, goal_id, goal_spec, goal_spec_draft,
+    goal_task_creation_command, provenance, schema, task_definition, task_definition_id,
+    task_scope, wake_policy, Fixture, TASK, TENANT,
 };
 
 fn fixture() -> Fixture {
@@ -152,4 +157,177 @@ fn only_decisions_are_remembered_past_the_window() {
         outcome: AgentTaskDependencyOutcome::Completed,
     }
     .records_decision());
+}
+
+// ---------------------------------------------------------------------------
+// Goal commands, fenced on the goal's status or criteria revision.
+// ---------------------------------------------------------------------------
+
+async fn create_goal_task(fx: &Fixture, activate: bool) {
+    fx.instantiate_agent().await;
+    fx.apply_task_command(goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(goal_spec(), activate),
+    ))
+    .await
+    .expect("the creation applies");
+}
+
+async fn goal_status_revision(fx: &Fixture) -> AgentRevisionNumber {
+    load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the state loads")
+        .expect("the state exists")
+        .task()
+        .expect("the task is created")
+        .goal_state
+        .as_deref()
+        .expect("the goal record exists")
+        .status_revision()
+}
+
+#[tokio::test]
+async fn a_replayed_goal_activation_answers_duplicate_rather_than_a_stale_revision() {
+    let fx = fixture();
+    create_goal_task(&fx, false).await;
+    let activate = AgentTaskEntityCommand::ActivateGoal {
+        operation_id: operation("activate"),
+        expected_status_revision: AgentRevisionNumber::INITIAL,
+        provenance: Box::new(provenance(10)),
+    };
+    assert!(activate.records_decision());
+    let outcome = applied(fx.apply_task_command(activate.clone()).await);
+    forget_window(&fx, false).await;
+
+    assert_replay_converges(&fx, activate, outcome).await;
+}
+
+#[tokio::test]
+async fn a_replayed_goal_decision_answers_duplicate_rather_than_goal_terminal() {
+    let fx = fixture();
+    create_goal_task(&fx, true).await;
+    let decide = AgentTaskEntityCommand::RecordGoalDecision {
+        operation_id: operation("cancel-goal"),
+        decision: Box::new(AgentGoalDecision {
+            reason: AgentGoalTerminalReason::CancellationRequested {
+                reason: "operator".to_string(),
+            },
+            evaluation: None,
+            provenance: Some(Box::new(provenance(21))),
+            expected_status_revision: AgentRevisionNumber::INITIAL,
+        }),
+    };
+    assert!(decide.records_decision());
+    let outcome = applied(fx.apply_task_command(decide.clone()).await);
+    assert_eq!(
+        outcome
+            .goal
+            .as_ref()
+            .expect("the goal outcome rides")
+            .status,
+        AgentGoalStatus::Cancelled
+    );
+    forget_window(&fx, false).await;
+
+    assert_replay_converges(&fx, decide, outcome).await;
+}
+
+#[tokio::test]
+async fn a_replayed_criteria_revision_answers_duplicate_rather_than_a_stale_revision() {
+    let fx = fixture();
+    create_goal_task(&fx, true).await;
+    let revise = AgentTaskEntityCommand::ReviseGoalCriteria {
+        operation_id: operation("revise"),
+        expected_criteria_revision: AgentRevisionNumber::INITIAL,
+        source: AgentGoalCriteriaSource::Policy(
+            AgentPolicyRef::new("ticket-resolved-v2").expect("the policy ref is valid"),
+        ),
+        digest: None,
+        provenance: Box::new(provenance(80)),
+    };
+    assert!(revise.records_decision());
+    let outcome = applied(fx.apply_task_command(revise.clone()).await);
+    forget_window(&fx, false).await;
+
+    assert_replay_converges(&fx, revise, outcome).await;
+}
+
+/// A definition whose ceilings leave headroom above the goal's allocation, so
+/// a resume's widening has room to grow into.
+fn roomy_definition() -> AgentTaskDefinition {
+    AgentTaskDefinition::new(
+        task_definition_id(),
+        "Resolve one customer support ticket under the goal's allocation.",
+        schema("ticket-input"),
+        schema("ticket-result"),
+    )
+    .expect("task definition should be valid")
+    .with_result_rule(AgentTaskResultRule::new(
+        AgentTaskRuleId::new("answer-present").expect("rule id should be valid"),
+        AgentTaskResultCheck::NonEmptyString {
+            pointer: "/answer".to_string(),
+        },
+    ))
+    .with_budgets(AgentBudgetCeilings {
+        max_loop_iterations: Some(10),
+        ..AgentBudgetCeilings::unbounded()
+    })
+}
+
+#[tokio::test]
+async fn a_replayed_goal_resume_answers_duplicate_rather_than_a_stale_revision() {
+    // An agent-owned continuous goal with no loop allocation parks `Waiting`
+    // at creation: the first assignment refusal is permanent.
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec();
+    spec.allocation = AgentBudgetAllocation {
+        loop_iterations: Some(0),
+        ..AgentBudgetAllocation::unbounded()
+    };
+    let parked = applied(
+        fx.apply_task_command(AgentTaskEntityCommand::Create {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::TaskCreation,
+                [TENANT, TASK, "1"],
+            )
+            .expect("operation id should be derivable"),
+            creation: Box::new(AgentTaskCreation {
+                definition: roomy_definition(),
+                input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                    .expect("the input is inline-bounded"),
+                assignee: Some(agent_id()),
+                team: None,
+                goal: Some(goal_id()),
+                goal_mode: continuous_goal_mode(wake_policy()),
+                goal_spec: Some(Box::new(goal_spec_draft(spec, true))),
+                parent: None,
+                dependencies: Vec::new(),
+                escrow: None,
+                wake: None,
+                delegation: None,
+                telemetry: Default::default(),
+            }),
+        })
+        .await,
+    );
+    assert_eq!(
+        parked.goal.expect("the goal outcome rides").status,
+        AgentGoalStatus::Waiting
+    );
+
+    let resume = AgentTaskEntityCommand::ResumeGoal {
+        operation_id: operation("resume"),
+        expected_status_revision: goal_status_revision(&fx).await,
+        top_up: Some(Box::new(AgentBudgetAllocation {
+            loop_iterations: Some(2),
+            ..AgentBudgetAllocation::unbounded()
+        })),
+        provenance: Box::new(provenance(91)),
+    };
+    assert!(resume.records_decision());
+    let outcome = applied(fx.apply_task_command(resume.clone()).await);
+    forget_window(&fx, false).await;
+
+    assert_replay_converges(&fx, resume, outcome).await;
 }
