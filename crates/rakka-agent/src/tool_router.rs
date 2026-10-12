@@ -11,6 +11,15 @@
 //! about whether it may be performed. Every dispatch still passes the
 //! [`crate::dispatch::AgentDispatchAuthority`] gate before it reaches this
 //! router.
+//!
+//! The dispatcher also holds one [`AgentCompensationExecutor`]. A compensation
+//! names no tool — it carries an application-defined
+//! [`AgentCompensationRef`] — so it is not routed by tool identity:
+//! [`AgentToolExecutorRouter::with_compensations`] pairs the router with the
+//! one executor every compensation goes to, as an [`AgentToolSlot`] that a
+//! deployment hands to both of the dispatcher's slots. The router's routes
+//! are dispatch-only by type, so no tool route — a remote MCP one included —
+//! can be handed a compensation.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -18,8 +27,9 @@ use std::sync::Arc;
 
 use rakka_agent_workflow::AgentEphemeralCredential;
 
+use crate::checkpoints::AgentCompensationRef;
 use crate::definition::AgentToolId;
-use crate::dispatch::{AgentDispatchFuture, AgentDispatchToolExecutor};
+use crate::dispatch::{AgentCompensationExecutor, AgentDispatchFuture, AgentDispatchToolExecutor};
 use crate::effect::AgentRunEffect;
 use crate::identity::AgentRunScope;
 use crate::model::AgentToolCallRequest;
@@ -117,6 +127,22 @@ impl AgentToolExecutorRouter {
         self
     }
 
+    /// Pairs this router with the executor every compensation goes to, as one
+    /// value that serves both of the dispatcher's slots.
+    ///
+    /// Tool calls keep routing exactly as this router routes them; a
+    /// compensation never reaches a tool route.
+    #[must_use]
+    pub fn with_compensations(
+        self,
+        compensations: Arc<dyn AgentCompensationExecutor>,
+    ) -> AgentToolSlot {
+        AgentToolSlot {
+            tools: self,
+            compensations,
+        }
+    }
+
     /// The executor one call reaches: exact id, then longest prefix, then
     /// declared kind, then the fallback.
     fn resolve(&self, tool: &AgentToolId) -> &Executor {
@@ -153,5 +179,54 @@ impl AgentDispatchToolExecutor for AgentToolExecutorRouter {
     ) -> AgentDispatchFuture<'a, AgentTaskContent> {
         self.resolve(&call.tool)
             .execute(scope, intent, call, credential)
+    }
+}
+
+/// The dispatcher's tool and compensation slots as one value: tool calls
+/// through an [`AgentToolExecutorRouter`], every compensation to one
+/// [`AgentCompensationExecutor`].
+///
+/// Built by [`AgentToolExecutorRouter::with_compensations`], so a slot always
+/// has somewhere to send a compensation. A deployment hands the same
+/// `Arc<AgentToolSlot>` to `AgentRunEffectDispatcher::with_tool_executor`'s
+/// slot and to `with_compensation_executor`, so a compensation runs beside the
+/// executors its tool calls ran under, with no composite of its own.
+pub struct AgentToolSlot {
+    tools: AgentToolExecutorRouter,
+    compensations: Arc<dyn AgentCompensationExecutor>,
+}
+
+impl fmt::Debug for AgentToolSlot {
+    // The router's route counts, and nothing of the compensation executor,
+    // which is opaque.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentToolSlot")
+            .field("tools", &self.tools)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentDispatchToolExecutor for AgentToolSlot {
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        call: &'a AgentToolCallRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        AgentDispatchToolExecutor::execute(&self.tools, scope, intent, call, credential)
+    }
+}
+
+impl AgentCompensationExecutor for AgentToolSlot {
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        compensation: &'a AgentCompensationRef,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        self.compensations
+            .execute(scope, intent, compensation, credential)
     }
 }

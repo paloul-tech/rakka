@@ -12,12 +12,12 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::RecordingToolExecutor;
 use rakka_agent::{
-    AgentDispatchToolExecutor, AgentToolBinding, AgentToolExecutorRouter, AgentToolId,
-    AgentToolKind, AgentToolRegistry,
+    AgentCompensationExecutor, AgentCompensationRef, AgentDispatchToolExecutor, AgentToolBinding,
+    AgentToolExecutorRouter, AgentToolId, AgentToolKind, AgentToolRegistry,
 };
 
 mod common;
-use common::{run_scope, tool_call, tool_descriptor_of_kind, tool_intent};
+use common::{run_scope, tool_call, tool_descriptor_of_kind, tool_intent, RecordingCompensations};
 
 async fn execute_via(router: &AgentToolExecutorRouter, id: &str) {
     router
@@ -140,4 +140,68 @@ async fn an_empty_prefix_route_is_ignored_rather_than_shadowing_the_fallback() {
         "the empty prefix routes nothing"
     );
     assert_eq!(fallback.invocations().len(), 1);
+}
+
+/// A tool slot pairs the router with one compensation executor: tool calls
+/// route exactly as the router routes them, and every compensation reaches
+/// the compensation executor — never a tool route, even one whose prefix the
+/// compensation's reference happens to share (issue #85, ask 12).
+#[tokio::test]
+async fn a_slot_routes_calls_as_its_router_does_and_every_compensation_to_its_compensation_executor(
+) {
+    let mcp = RecordingToolExecutor::new();
+    let fallback = RecordingToolExecutor::new();
+    let compensations = RecordingCompensations::default();
+    let slot = AgentToolExecutorRouter::new(Arc::new(fallback.clone()))
+        .with_prefix_route("mcp.", Arc::new(mcp.clone()))
+        .with_compensations(Arc::new(compensations.clone()));
+
+    for tool in ["mcp.crm.search", "charge-card"] {
+        AgentDispatchToolExecutor::execute(
+            &slot,
+            &run_scope(),
+            &tool_intent(tool),
+            &tool_call(tool),
+            None,
+        )
+        .await
+        .expect("the routed executor answers");
+    }
+    let refund = AgentCompensationRef::new("mcp.crm.refund").expect("the reference is valid");
+    AgentCompensationExecutor::execute(
+        &slot,
+        &run_scope(),
+        &tool_intent("mcp.crm.search"),
+        &refund,
+        None,
+    )
+    .await
+    .expect("the compensation executor answers");
+
+    let names = |executor: &RecordingToolExecutor| -> Vec<String> {
+        executor
+            .invocations()
+            .iter()
+            .map(|invocation| invocation.tool.clone())
+            .collect()
+    };
+    assert_eq!(names(&mcp), vec!["mcp.crm.search"]);
+    assert_eq!(names(&fallback), vec!["charge-card"]);
+    assert_eq!(compensations.seen(), vec!["mcp.crm.refund"]);
+}
+
+#[test]
+fn a_slot_debugs_its_route_counts_and_never_a_tool_id() {
+    let slot = AgentToolExecutorRouter::new(Arc::new(RecordingToolExecutor::new()))
+        .with_tool_route(
+            AgentToolId::new("mcp.crm.private-tool").expect("tool id"),
+            Arc::new(RecordingToolExecutor::new()),
+        )
+        .with_compensations(Arc::new(RecordingCompensations::default()));
+    let text = format!("{slot:?}");
+    assert!(
+        text.contains("AgentToolSlot") && text.contains("exact_routes: 1"),
+        "{text}"
+    );
+    assert!(!text.contains("private-tool"), "{text}");
 }

@@ -564,7 +564,7 @@ pub use tool_names::{
     is_provider_safe_tool_name, provider_tool_name, AgentProviderToolNames, AgentToolNameCollision,
     AGENT_PROVIDER_TOOL_NAME_MAX_BYTES, AGENT_PROVIDER_TOOL_NAME_SUFFIX_HEX,
 };
-pub use tool_router::AgentToolExecutorRouter;
+pub use tool_router::{AgentToolExecutorRouter, AgentToolSlot};
 pub use tools::{
     refuse_guardrail_disposition, AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant,
     AgentEnvironmentConcurrencyProtocol, AgentExecutionPolicyRouter, AgentGrantDescriptor,

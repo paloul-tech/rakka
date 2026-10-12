@@ -2688,6 +2688,9 @@ pub struct AuthorityFixture {
     /// The reconciler the pipeline asks about an ambiguous attempt, when a
     /// test wires one — see [`AuthorityFixture::with_reconciler`].
     pub reconciler: Option<Arc<dyn rakka_agent::AgentEffectReconciler>>,
+    /// The executor the pipeline hands scheduled compensations to, when a
+    /// test wires one — see [`AuthorityFixture::with_compensation_executor`].
+    pub compensation_executor: Option<Arc<dyn rakka_agent::AgentCompensationExecutor>>,
 }
 
 impl AuthorityFixture {
@@ -2741,6 +2744,7 @@ impl AuthorityFixture {
             fixed_refusal: None,
             dispatch_segments: None,
             reconciler: None,
+            compensation_executor: None,
         }
     }
 
@@ -2899,6 +2903,15 @@ impl AuthorityFixture {
         self
     }
 
+    /// Hands the pipeline's scheduled compensations to `executor`.
+    pub fn with_compensation_executor(
+        mut self,
+        executor: Arc<dyn rakka_agent::AgentCompensationExecutor>,
+    ) -> Self {
+        self.compensation_executor = Some(executor);
+        self
+    }
+
     pub fn with_dispatch_segments(mut self, sink: Arc<dyn rakka_agent::AgentSegmentSink>) -> Self {
         self.dispatch_segments = Some(sink);
         self
@@ -3048,6 +3061,9 @@ impl AuthorityFixture {
         }
         if let Some(reconciler) = &self.reconciler {
             pipeline = pipeline.with_reconciler(reconciler.clone());
+        }
+        if let Some(executor) = &self.compensation_executor {
+            pipeline = pipeline.with_compensation_executor(executor.clone());
         }
         pipeline
     }
@@ -3527,6 +3543,44 @@ impl rakka_agent_workflow::AgentArtifactStore for SharedArtifactStore {
                     },
                 )
                 .ok_or(rakka_agent_workflow::AgentArtifactError::ArtifactNotFound { artifact_id })
+        })
+    }
+}
+
+/// A compensation executor that records every reference it is handed and
+/// answers each with a small inline receipt.
+#[derive(Clone, Default)]
+pub struct RecordingCompensations {
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingCompensations {
+    /// Every compensation reference executed, in order.
+    pub fn seen(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .expect("the compensation log should not be poisoned")
+            .clone()
+    }
+}
+
+impl rakka_agent::AgentCompensationExecutor for RecordingCompensations {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        compensation: &'a rakka_agent::AgentCompensationRef,
+        _credential: Option<&'a rakka_agent_workflow::AgentEphemeralCredential>,
+    ) -> rakka_agent::AgentDispatchFuture<'a, AgentTaskContent> {
+        self.seen
+            .lock()
+            .expect("the compensation log should not be poisoned")
+            .push(compensation.as_str().to_string());
+        Box::pin(async {
+            Ok(
+                AgentTaskContent::inline(serde_json::json!({ "compensated": true }))
+                    .expect("the receipt is inline-bounded"),
+            )
         })
     }
 }
