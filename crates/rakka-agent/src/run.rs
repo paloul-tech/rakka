@@ -6763,6 +6763,14 @@ where
                 Ok(()) => self.apply_command(reverify, router, now).await,
                 Err(reread) => Err(reread),
             },
+            // A timer that found nothing due writes nothing either, so it is
+            // re-answered the same way: a cache the other writer moved past
+            // may be missing the very checkpoint or fan-in group now due, and
+            // an `Unchanged` from it would hold for the whole residency.
+            Ok(AgentRunEntityReply::Unchanged { .. }) => match self.rematerialize(now).await {
+                Ok(()) => self.apply_command(reverify, router, now).await,
+                Err(reread) => Err(reread),
+            },
             other => other,
         };
         let committed = self.committed.take().unwrap_or_default();
@@ -6990,6 +6998,9 @@ where
                 .await?
             }
             AgentRunEntityCommand::FireCheckpointTimers { operation_id } => {
+                if let Some(unchanged) = self.unchanged_by(fire_checkpoint_timers, now)? {
+                    return Ok(unchanged);
+                }
                 self.transition(now, move |state| {
                     fire_checkpoint_timers(state, now)?;
                     Ok(operation_id)
@@ -6997,6 +7008,9 @@ where
                 .await?
             }
             AgentRunEntityCommand::FireFanInDeadline { operation_id } => {
+                if let Some(unchanged) = self.unchanged_by(fire_fan_in_deadline, now)? {
+                    return Ok(unchanged);
+                }
                 self.transition(now, move |state| {
                     fire_fan_in_deadline(state, now)?;
                     Ok(operation_id)
@@ -8217,6 +8231,32 @@ where
         Ok(dispatchable.len())
     }
 
+    /// The [`AgentRunEntityReply::Unchanged`] answer of a timer command whose
+    /// firing would leave the run exactly as it is, or `None` when it would
+    /// change something.
+    ///
+    /// The firing runs on a copy of the cached record. A timer is a function
+    /// of the record and the clock alone, so a copy that comes out equal, but
+    /// for the `updated_at` the disposition settle stamps on every pass, is a
+    /// transition that would have changed nothing but that stamp and the
+    /// operation log: answering without it spends no write and no log entry,
+    /// and leaves the operation id free for a firing that finds something
+    /// due. A refusal the firing raises on the copy is the refusal the
+    /// transition would raise.
+    fn unchanged_by(
+        &self,
+        fire: fn(&mut AgentRunState, AgentTimestampMillis) -> AgentRunResult<()>,
+        now: AgentTimestampMillis,
+    ) -> AgentRunResult<Option<AgentRunEntityReply>> {
+        let current = self.state()?;
+        let mut fired = current.clone();
+        fire(&mut fired, now)?;
+        fired.updated_at = current.updated_at;
+        Ok((fired == *current).then(|| AgentRunEntityReply::Unchanged {
+            outcome: current.outcome(),
+        }))
+    }
+
     /// Runs one bounded command transition and records its resolved operation id
     /// in the same compare-and-set.
     ///
@@ -8376,7 +8416,9 @@ pub enum AgentRunEntityCommand {
     /// Fire the durable SLA and expiration timers on the run's open checkpoints
     /// ([specification 12.6](../../../docs/plans/rakka-agent/spec.md)). A
     /// scheduler delivers it at a checkpoint's due or expiration instant; it can
-    /// only escalate or expire a waiting checkpoint, never auto-approve one.
+    /// only escalate or expire a waiting checkpoint, never auto-approve one. A
+    /// firing with nothing due answers [`AgentRunEntityReply::Unchanged`] and
+    /// writes nothing, so its operation id stays free for a later firing.
     FireCheckpointTimers {
         /// The stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
@@ -8391,8 +8433,9 @@ pub enum AgentRunEntityCommand {
     /// lost parks until this fires. It marks the still-unresolved members
     /// timed out — a parent-side disposition, never a forged child result —
     /// and resolves the group deterministically. A deadline not yet due, a
-    /// group already resolved, or no group at all is a no-op, so the command
-    /// is safe to deliver early, late, or twice. The resolution itself then
+    /// group already resolved, or no group at all is a no-op, answered
+    /// [`AgentRunEntityReply::Unchanged`] without a write, so the command is
+    /// safe to deliver early, late, or twice. The resolution itself then
     /// chases the stragglers: a resolved group's unresolved members owe
     /// their delegation-cancel exchanges and workflow-cancel effects from
     /// this same transition's settle.
@@ -8576,6 +8619,18 @@ pub enum AgentRunEntityReply {
     /// second transition happened.
     Duplicate {
         /// The outcome the original application produced.
+        outcome: AgentRunOutcome,
+    },
+    /// A timer command found nothing due: it wrote nothing and did not record
+    /// its operation id.
+    ///
+    /// Answered by [`AgentRunEntityCommand::FireCheckpointTimers`] and
+    /// [`AgentRunEntityCommand::FireFanInDeadline`] when firing would leave the
+    /// run exactly as it is. Because the id is not recorded, the same id still
+    /// acts once something comes due, and a scheduler that fires blind costs
+    /// reads, not writes or operation-log entries.
+    Unchanged {
+        /// The run's current outcome.
         outcome: AgentRunOutcome,
     },
     /// The run's bounded durable projection, absent if it never accepted an
