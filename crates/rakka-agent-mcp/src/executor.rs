@@ -261,6 +261,8 @@ impl<C> McpDispatchToolExecutor<C> {
         }
         let mut sets: BTreeMap<McpServerId, McpDescriptorSet> = BTreeMap::new();
         for set in descriptors {
+            // A set built in code never went through decode's check.
+            set.validate()?;
             if sets.contains_key(&set.server_id) {
                 return Err(McpRegistrationError::DuplicateServer {
                     server: set.server_id.to_string(),
@@ -1254,6 +1256,9 @@ mod tests {
                         input_schema: schema,
                         output_schema_digest: None,
                         input_schema_artifact: None,
+                        output_schema: None,
+                        annotations: None,
+                        description_supplied: Some(true),
                     }
                 })
                 .collect(),

@@ -54,7 +54,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::binding::{
-    McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
+    derived_tool_id, McpRegistrationError, McpServerBinding, McpServerId, McpToolPolicy,
     MCP_DESCRIPTOR_SCHEMA_MAX_BYTES, MCP_LIST_PAGES_MAX, MCP_SERVER_NAME_MAX_BYTES,
     MCP_SYNC_TIMEOUT_DEFAULT_MS,
 };
@@ -63,6 +63,33 @@ use crate::client::{
     McpEgressCheck,
 };
 use crate::launcher::McpChildTransport;
+
+/// The tool annotations an MCP server reported, as this adapter stores them.
+///
+/// Owned by this crate rather than rmcp's `ToolAnnotations`, so the stored
+/// format never moves with the SDK's serde shape. Every field is the server's
+/// claim, never a declaration: a hint is evidence only through the sync's own
+/// hint rule, and the title is server-chosen text, cut at
+/// [`AGENT_TOOL_DESCRIPTION_MAX_LENGTH`] and refused when it carries the
+/// credential the sync sent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct McpToolAnnotations {
+    /// A human-readable title for the tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The server's `readOnlyHint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    /// The server's `destructiveHint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    /// The server's `idempotentHint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    /// The server's `openWorldHint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
+}
 
 /// One tool as this adapter stored it at publish time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,6 +117,19 @@ pub struct McpSyncedDescriptor {
     ///
     /// Always `None` as the sync returns it: the sync holds no artifact store.
     pub input_schema_artifact: Option<ArtifactRef>,
+    /// The server's raw output schema, when it declared one. Absent on a
+    /// version-1 set, which stored only its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// The tool annotations the server reported, when it reported any. Absent
+    /// on a version-1 set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<McpToolAnnotations>,
+    /// Whether the descriptor's description is the server's own (`true`) or
+    /// this adapter's fallback, `MCP tool {tool} on {server}` (`false`).
+    /// `None` on a version-1 set, which did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_supplied: Option<bool>,
 }
 
 impl McpSyncedDescriptor {
@@ -109,19 +149,25 @@ impl McpSyncedDescriptor {
 }
 
 /// The schema version of the stored [`McpDescriptorSet`] shape this build
-/// writes, and the newest it reads.
-pub const MCP_DESCRIPTOR_SET_SCHEMA_VERSION: u32 = 1;
+/// writes, and the newest it reads. Version 2 added each tool's raw
+/// [`McpSyncedDescriptor::output_schema`], its
+/// [`McpSyncedDescriptor::annotations`], and
+/// [`McpSyncedDescriptor::description_supplied`]; a version-1 set still
+/// decodes, with all three absent.
+pub const MCP_DESCRIPTOR_SET_SCHEMA_VERSION: u32 = 2;
 
 /// Everything one publish-time sync of one server produced.
 ///
 /// Release data a deployment stores, so it carries its own
 /// [`Self::schema_version`]: a set written by a newer build is refused on
 /// decode rather than read as whatever this build's fields make of it.
+/// Every decode checks the set against itself ([`Self::validate`]), whatever
+/// its version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "McpDescriptorSetRecord")]
 pub struct McpDescriptorSet {
     /// The stored shape's schema version: [`MCP_DESCRIPTOR_SET_SCHEMA_VERSION`]
     /// as the sync writes it. Decoding refuses a newer one.
-    #[serde(deserialize_with = "known_set_schema_version")]
     pub schema_version: u32,
     /// The server this set belongs to.
     pub server_id: McpServerId,
@@ -183,6 +229,78 @@ impl McpDescriptorSet {
             .iter()
             .find(|descriptor| descriptor.tool == tool)
     }
+
+    /// Refuses a set that disagrees with itself.
+    ///
+    /// A set is release data a client may author, so nothing about it is
+    /// trusted for having decoded: each tool is named once, and each
+    /// descriptor is a remote MCP tool registered under the id its server and
+    /// name derive, whose schema digest is its input schema's, whose inline
+    /// parameters (when it carries any) are its input schema, and — on a
+    /// version-2 set, which stores the raw output schema — whose output
+    /// schema digest is its output schema's. Decode runs this on every set,
+    /// and so does executor construction.
+    ///
+    /// # Errors
+    ///
+    /// [`McpRegistrationError::DescriptorSetInvalid`], stable code
+    /// `mcp-descriptor-set-invalid`, at the first check that fails.
+    pub fn validate(&self) -> Result<(), McpRegistrationError> {
+        let invalid =
+            |tool: &str, reason: &'static str| McpRegistrationError::DescriptorSetInvalid {
+                server: self.server_id.to_string(),
+                tool: Some(tool.to_string()),
+                reason,
+            };
+        let mut named = std::collections::BTreeSet::new();
+        for descriptor in &self.descriptors {
+            let tool = descriptor.tool.as_str();
+            if !named.insert(tool) {
+                return Err(invalid(tool, "the set names the tool twice"));
+            }
+            let declared = descriptor.binding.descriptor();
+            if declared.kind != AgentToolKind::RemoteMcp {
+                return Err(invalid(tool, "the descriptor is not a remote MCP tool"));
+            }
+            if declared.tool.as_str() != derived_tool_id(&self.server_id, tool) {
+                return Err(invalid(
+                    tool,
+                    "the tool id is not the one its server and name derive",
+                ));
+            }
+            if descriptor.schema_digest
+                != AgentContentDigest::sha256_of_json(&descriptor.input_schema)
+            {
+                return Err(invalid(
+                    tool,
+                    "the schema digest is not the digest of the input schema",
+                ));
+            }
+            if declared
+                .parameters
+                .as_ref()
+                .is_some_and(|parameters| parameters != &descriptor.input_schema)
+            {
+                return Err(invalid(
+                    tool,
+                    "the inline parameters differ from the input schema",
+                ));
+            }
+            if self.schema_version >= 2
+                && descriptor.output_schema_digest
+                    != descriptor
+                        .output_schema
+                        .as_ref()
+                        .map(AgentContentDigest::sha256_of_json)
+            {
+                return Err(invalid(
+                    tool,
+                    "the output schema digest is not the digest of the output schema",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Decodes a descriptor set's schema version, refusing one newer than this
@@ -199,6 +317,36 @@ where
         )));
     }
     Ok(version)
+}
+
+/// A descriptor set as it is read, before it checks itself.
+#[derive(Deserialize)]
+struct McpDescriptorSetRecord {
+    #[serde(deserialize_with = "known_set_schema_version")]
+    schema_version: u32,
+    server_id: McpServerId,
+    server_name: String,
+    protocol_version: String,
+    synced_at: AgentTimestampMillis,
+    descriptors: Vec<McpSyncedDescriptor>,
+}
+
+impl TryFrom<McpDescriptorSetRecord> for McpDescriptorSet {
+    type Error = String;
+
+    fn try_from(record: McpDescriptorSetRecord) -> Result<Self, Self::Error> {
+        let set = Self {
+            schema_version: record.schema_version,
+            server_id: record.server_id,
+            server_name: record.server_name,
+            protocol_version: record.protocol_version,
+            synced_at: record.synced_at,
+            descriptors: record.descriptors,
+        };
+        set.validate()
+            .map_err(|refusal| format!("{}: {refusal}", refusal.code()))?;
+        Ok(set)
+    }
 }
 
 /// Whether a stored descriptor set still matches what the server exposes.
@@ -261,8 +409,8 @@ pub enum McpSyncError {
         server: String,
         /// The tool whose text carried it, or `None` for the server's name.
         tool: Option<String>,
-        /// Which text: `server name`, `description`, `input schema`, or
-        /// `output schema`.
+        /// Which text: `server name`, `description`, `annotations title`,
+        /// `input schema`, or `output schema`.
         field: &'static str,
     },
 }
@@ -634,22 +782,22 @@ pub fn mcp_descriptor_staleness(
     }
 }
 
-/// The comparable shape of every tool in a set: the two schema digests.
+/// The comparable shape of every tool in a set: the two schema digests of
+/// its first copy.
 fn shapes(
     set: &McpDescriptorSet,
 ) -> BTreeMap<&str, (&AgentContentDigest, Option<&AgentContentDigest>)> {
-    set.descriptors
-        .iter()
-        .map(|descriptor| {
-            (
-                descriptor.tool.as_str(),
-                (
-                    &descriptor.schema_digest,
-                    descriptor.output_schema_digest.as_ref(),
-                ),
-            )
-        })
-        .collect()
+    // The first copy of a tool, as `descriptor()` and the executor's routing
+    // table read it. A validated set holds one copy; an unvalidated one built
+    // in code is still read alike by every reader.
+    let mut shapes = BTreeMap::new();
+    for descriptor in &set.descriptors {
+        shapes.entry(descriptor.tool.as_str()).or_insert((
+            &descriptor.schema_digest,
+            descriptor.output_schema_digest.as_ref(),
+        ));
+    }
+    shapes
 }
 
 /// Turns the server's listing into the allow-listed descriptors.
@@ -736,6 +884,14 @@ fn synced_descriptor(
     {
         return Err(echoed("output schema"));
     }
+    if listed
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.title.as_deref())
+        .is_some_and(|title| carries(title, secrets))
+    {
+        return Err(echoed("annotations title"));
+    }
     if policy.honor_hints {
         if let Some(hint) =
             hint_contradiction(listed.annotations.as_ref(), policy.declaration.safety)
@@ -752,6 +908,20 @@ fn synced_descriptor(
         tool: tool.to_string(),
         reason: error.to_string(),
     };
+    let description_supplied = listed
+        .description
+        .as_deref()
+        .is_some_and(|description| !description.is_empty());
+    let annotations = listed
+        .annotations
+        .as_ref()
+        .map(|annotations| McpToolAnnotations {
+            title: annotations.title.as_deref().map(bounded_description),
+            read_only_hint: annotations.read_only_hint,
+            destructive_hint: annotations.destructive_hint,
+            idempotent_hint: annotations.idempotent_hint,
+            open_world_hint: annotations.open_world_hint,
+        });
     let fallback = format!("MCP tool {tool} on {server}");
     let description = listed
         .description
@@ -797,6 +967,9 @@ fn synced_descriptor(
         input_schema,
         output_schema_digest,
         input_schema_artifact: None,
+        output_schema,
+        annotations,
+        description_supplied: Some(description_supplied),
     })
 }
 

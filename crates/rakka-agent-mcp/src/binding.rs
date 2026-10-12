@@ -98,6 +98,14 @@ pub const MCP_META_IDEMPOTENCY_KEY: &str = "io.rakka.idempotency-key";
 /// Prefix every derived MCP tool id carries: `mcp.<server>.<tool>`.
 pub const MCP_TOOL_ID_PREFIX: &str = "mcp.";
 
+/// The tool id one server's tool is registered under: `mcp.<server>.<tool>`.
+///
+/// The one derivation [`McpServerBinding::tool_id`] and a descriptor set's
+/// own check both use.
+pub(crate) fn derived_tool_id(server: &McpServerId, tool: &str) -> String {
+    format!("{MCP_TOOL_ID_PREFIX}{server}.{tool}")
+}
+
 /// Stable identity of one configured MCP server.
 ///
 /// A value that passes `rakka_agent::identity::validate_identity_segment` and
@@ -392,8 +400,7 @@ impl McpServerBinding {
     /// [`McpRegistrationError::ToolNameInvalid`], stable code
     /// `mcp-binding-invalid`.
     pub fn tool_id(&self, tool: &str) -> Result<AgentToolId, McpRegistrationError> {
-        let server = &self.server_id;
-        let candidate = format!("{MCP_TOOL_ID_PREFIX}{server}.{tool}");
+        let candidate = derived_tool_id(&self.server_id, tool);
         AgentToolId::new(candidate).map_err(|error| McpRegistrationError::ToolNameInvalid {
             server: self.server_id.to_string(),
             tool: tool.to_string(),
@@ -607,6 +614,17 @@ pub enum McpRegistrationError {
         /// Why the server id was refused.
         reason: String,
     },
+    /// A descriptor set disagrees with itself: a tool named twice, or a
+    /// descriptor whose kind, tool id, schema digests, or inline parameters
+    /// do not match what its own fields derive.
+    DescriptorSetInvalid {
+        /// The server the set belongs to.
+        server: String,
+        /// The tool the check failed on.
+        tool: Option<String>,
+        /// Which check failed: a fixed phrase, never the set's own text.
+        reason: &'static str,
+    },
 }
 
 impl McpRegistrationError {
@@ -614,6 +632,7 @@ impl McpRegistrationError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::DescriptorSetInvalid { .. } => "mcp-descriptor-set-invalid",
             Self::TransportUnsupported { .. } => "mcp-transport-unsupported",
             Self::InvalidUrl { .. }
             | Self::ToolNameInvalid { .. }
@@ -697,6 +716,22 @@ impl Display for McpRegistrationError {
             Self::InvalidServerId { reason } => {
                 write!(f, "the MCP server id is invalid: {reason}")
             }
+            Self::DescriptorSetInvalid {
+                server,
+                tool: Some(tool),
+                reason,
+            } => write!(
+                f,
+                "the MCP server {server}'s descriptor set is invalid at the tool {tool}: {reason}"
+            ),
+            Self::DescriptorSetInvalid {
+                server,
+                tool: None,
+                reason,
+            } => write!(
+                f,
+                "the MCP server {server}'s descriptor set is invalid: {reason}"
+            ),
         }
     }
 }

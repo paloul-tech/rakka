@@ -166,6 +166,13 @@ fn declared_schema_versions() -> BTreeMap<String, (String, u32)> {
             ("rakka-agent-workflow".to_string(), version),
         );
     }
+    declared.insert(
+        "MCP_DESCRIPTOR_SET_SCHEMA_VERSION".to_string(),
+        (
+            "rakka-agent-mcp".to_string(),
+            rakka_agent_mcp::MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
+        ),
+    );
     declared
 }
 
@@ -305,8 +312,8 @@ fn every_durable_record_schema_version_is_documented_and_current() {
     );
     assert_eq!(
         documented.len() - knowledge_graph_rows,
-        AgentRecordKind::ALL.len() + 3,
-        "the row count must equal every record kind the two crates declare"
+        declared.len(),
+        "the row count must equal every record kind the crates declare"
     );
 }
 

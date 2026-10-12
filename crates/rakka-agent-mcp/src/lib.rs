@@ -56,5 +56,6 @@ pub use launcher::{TokioChildProcessLauncher, MCP_LAUNCH_SPEC_MAX_BYTES};
 pub use sync::{
     mcp_descriptor_staleness, sync_mcp_descriptors, sync_mcp_descriptors_over,
     sync_mcp_descriptors_over_within, sync_mcp_descriptors_within, McpDescriptorSet,
-    McpDescriptorStaleness, McpSyncError, McpSyncedDescriptor, MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
+    McpDescriptorStaleness, McpSyncError, McpSyncedDescriptor, McpToolAnnotations,
+    MCP_DESCRIPTOR_SET_SCHEMA_VERSION,
 };
