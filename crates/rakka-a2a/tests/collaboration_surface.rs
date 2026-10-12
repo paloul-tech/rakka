@@ -770,7 +770,12 @@ async fn an_aged_out_replay_converges_on_its_own_child_instead_of_conflicting() 
     // durable shape after `AGENT_TASK_OPERATION_LOG_CAPACITY` later
     // operations is exactly this state — the task record intact, the log
     // without the create — produced here directly so the test does not have
-    // to manufacture sixty-four unrelated transitions.
+    // to manufacture sixty-four unrelated transitions. The child's decision
+    // ledger goes too: a child created before the ledger existed, or whose
+    // creation later decisions evicted from it, is the one that still meets
+    // `task-already-created` on a replay, and that refusal is this test's
+    // subject (the ledger's own answer is
+    // `an_aged_out_replay_the_child_still_remembers_converges_without_the_probe`).
     let child_scope =
         AgentTaskScope::new(tenant(), child_task.clone()).expect("the child scope is valid");
     let persistence_id = child_scope.persistence_id();
@@ -789,6 +794,7 @@ async fn an_aged_out_replay_converges_on_its_own_child_instead_of_conflicting() 
         "the create operation is in the window before eviction"
     );
     *log = json!([]);
+    forget_decision_ledger(&mut encoded);
     let evicted: AgentTaskState = serde_json::from_value(encoded).expect("the state decodes");
     fixture
         .tasks
@@ -822,6 +828,150 @@ async fn an_aged_out_replay_converges_on_its_own_child_instead_of_conflicting() 
     match answer {
         AgentA2aSendFinding::Conflict { code, .. } => {
             assert_eq!(code, "delegation-child-conflict");
+        }
+        other => {
+            panic!("a child this delegation does not own is an explicit conflict, got {other:?}")
+        }
+    }
+}
+
+/// Drops a child task's decision ledger from its encoded state: the record
+/// of a child created before the ledger existed, or whose creation later
+/// decisions evicted from it.
+fn forget_decision_ledger(encoded: &mut Value) {
+    encoded
+        .as_object_mut()
+        .expect("the task state encodes as an object")
+        .remove("decision_ledger");
+}
+
+/// Issue #96 ask 2: a child's creation is a decision, so it outlives the
+/// operation window in the child's decision ledger. An aged-out replay of
+/// this delegation's own send is answered `Duplicate` and converges on its
+/// child without the `task-already-created` probe, exactly as an in-window
+/// replay does; and a different delegation reusing the deduplication key is
+/// answered the original child, whose echo names another delegation, so it
+/// is the `delegation-child-mismatch` conflict an in-window send meets.
+#[tokio::test]
+async fn an_aged_out_replay_the_child_still_remembers_converges_without_the_probe() {
+    let fixture = Fixture::new(DeterministicModelAdapter::new());
+    fixture
+        .instantiate(&specialist(), "translator-v1", SPECIALIST_DEFINITION)
+        .await;
+
+    let parent_run = fixture.run_scope(&coordinator(), PARENT_TASK);
+    let original_key = delegation_id_for(&parent_run, 9, 0)
+        .expect("the delegation id derives")
+        .into_string();
+    let record_for = |slot: usize| {
+        let delegation =
+            delegation_id_for(&parent_run, 9, slot).expect("the delegation id derives");
+        AgentDelegationRecord {
+            environments: Default::default(),
+            knowledge_spaces: Default::default(),
+            a2a_message_id: delegation.as_str().to_string(),
+            deduplication_key: original_key.clone(),
+            delegation,
+            goal: None,
+            parent_task: AgentTaskId::new(PARENT_TASK).expect("task id should be valid"),
+            parent_run: parent_run.clone(),
+            lineage: Vec::new(),
+            ancestors: Vec::new(),
+            depth: 1,
+            requested_skill: AgentCapabilityId::new(SKILL).expect("capability id should be valid"),
+            resolved: AgentDelegationTarget::new(
+                specialist(),
+                AgentTaskDefinitionId::new(SPECIALIST_DEFINITION)
+                    .expect("definition id should be valid"),
+            ),
+            turn: 9,
+            slot,
+            effect: effect_id_for(&parent_run, 9, slot).expect("the effect id derives"),
+            call_id: AgentToolCallId::new("call-1").expect("call id should be valid"),
+            input: AgentTaskContent::inline(json!({ "text": "hello" }))
+                .expect("the input is inline-bounded"),
+            result_schema: None,
+            budget: None,
+            granted_descendants: None,
+            deadline: None,
+            definition_revision: AgentRevisionNumber::new(1),
+            settings_revision: AgentRevisionNumber::new(1),
+            telemetry: AgentTelemetryContext::default(),
+            created_at: AgentTimestampMillis::new(1),
+        }
+    };
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let intent_for = |record: &AgentDelegationRecord| {
+        AgentRunEffect::new(
+            &parent_run,
+            record.turn,
+            record.slot,
+            AgentRunEffectRequest::A2aSend {
+                delegation: Box::new(record.clone()),
+            },
+            &spec,
+            AgentRevisionNumber::new(1),
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the intent builds")
+    };
+    let executor = A2AAgentDelegationSendExecutor::new(fixture.service.clone());
+
+    let record = record_for(0);
+    let first = executor
+        .execute(&parent_run, &intent_for(&record), &record, None)
+        .await
+        .expect("the first send executes");
+    let AgentA2aSendFinding::Sent { child_task, .. } = first else {
+        panic!("the first send creates the child, got {first:?}");
+    };
+
+    // Only the window ages out; the ledger keeps the creation.
+    let child_scope =
+        AgentTaskScope::new(tenant(), child_task.clone()).expect("the child scope is valid");
+    let persistence_id = child_scope.persistence_id();
+    let held = fixture
+        .tasks
+        .load(&persistence_id)
+        .await
+        .expect("the child state loads")
+        .expect("the child exists");
+    assert_eq!(
+        held.state.decision_ledger().len(),
+        1,
+        "the child's creation is in its decision ledger"
+    );
+    let mut encoded = serde_json::to_value(&held.state).expect("the state encodes");
+    *encoded
+        .get_mut("applied_operations")
+        .expect("the operation log field exists") = json!([]);
+    let evicted: AgentTaskState = serde_json::from_value(encoded).expect("the state decodes");
+    fixture
+        .tasks
+        .compare_and_set(&persistence_id, held.revision, evicted)
+        .await
+        .expect("the evicted state stores");
+
+    let replay = executor
+        .execute(&parent_run, &intent_for(&record), &record, None)
+        .await
+        .expect("the aged-out replay executes");
+    match replay {
+        AgentA2aSendFinding::Sent {
+            child_task: replayed,
+            ..
+        } => assert_eq!(replayed, child_task),
+        other => panic!("the aged-out replay converges on its own child, got {other:?}"),
+    }
+
+    let foreign = record_for(1);
+    let answer = executor
+        .execute(&parent_run, &intent_for(&foreign), &foreign, None)
+        .await
+        .expect("the foreign send executes");
+    match answer {
+        AgentA2aSendFinding::Conflict { code, .. } => {
+            assert_eq!(code, "delegation-child-mismatch");
         }
         other => {
             panic!("a child this delegation does not own is an explicit conflict, got {other:?}")
@@ -916,8 +1066,8 @@ async fn an_aged_out_replay_converges_under_a_read_denying_authorizer() {
         panic!("the first send creates the child, got {first:?}");
     };
 
-    // Age the create operation out of the child's deduplication window,
-    // exactly as the sibling test does.
+    // Age the create operation out of the child's deduplication window and
+    // its decision ledger, exactly as the sibling test does.
     let child_scope =
         AgentTaskScope::new(tenant(), child_task.clone()).expect("the child scope is valid");
     let persistence_id = child_scope.persistence_id();
@@ -932,6 +1082,7 @@ async fn an_aged_out_replay_converges_under_a_read_denying_authorizer() {
         .get_mut("applied_operations")
         .expect("the operation log field exists");
     *log = json!([]);
+    forget_decision_ledger(&mut encoded);
     let evicted: AgentTaskState = serde_json::from_value(encoded).expect("the state decodes");
     fixture
         .tasks

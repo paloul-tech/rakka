@@ -115,6 +115,7 @@ use crate::choreography::{
     AgentExchangePayload, AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter,
     AgentExchangeState, AgentExchangeTransition, AGENT_EXCHANGE_PENDING_CAPACITY,
 };
+use crate::decision_ledger::AgentDecisionLedger;
 use crate::definition::{
     AgentBudgetCeilings, AgentCapabilityId, AgentCoordinationCapabilityKind, AgentOperationClass,
     AgentPolicyRefs, AgentRevisionNumber, AgentRevisionProvenance, AgentTaskDefinitionId,
@@ -251,7 +252,9 @@ pub const AGENT_TASK_MAX_EVIDENCE_ARTIFACTS: usize = 8;
 ///
 /// The window is the fast path; every command transition is additionally fenced
 /// by the task's own durable state, so a replay older than the window is still
-/// refused rather than applied twice.
+/// refused rather than applied twice. A decision
+/// ([`AgentTaskEntityCommand::records_decision`]) is answered past the window
+/// from the task's decision ledger instead, with its original outcome.
 pub const AGENT_TASK_OPERATION_LOG_CAPACITY: usize = 64;
 
 /// How many history entries the task may owe its sink at once.
@@ -4468,6 +4471,11 @@ pub struct AgentTaskState {
     scope: AgentTaskScope,
     task: Option<AgentTask>,
     applied_operations: AgentTaskOperationLog,
+    /// The decisions the task committed, kept past the operation window. A
+    /// record written before the ledger existed decodes with an empty one, and
+    /// an empty one is omitted, so a task that never decided encodes as before.
+    #[serde(default, skip_serializing_if = "AgentDecisionLedger::is_empty")]
+    decision_ledger: AgentDecisionLedger<AgentTaskOutcome>,
     pending_history: Vec<AgentTaskHistoryEntry>,
     next_history_sequence: AgentTaskHistorySequence,
     journal: AgentExchangeJournal,
@@ -4483,6 +4491,7 @@ impl AgentTaskState {
             scope,
             task: None,
             applied_operations: AgentTaskOperationLog::default(),
+            decision_ledger: AgentDecisionLedger::default(),
             pending_history: Vec::new(),
             next_history_sequence: AgentTaskHistorySequence::FIRST,
             journal: AgentExchangeJournal::new(),
@@ -4526,6 +4535,13 @@ impl AgentTaskState {
         &self.applied_operations
     }
 
+    /// The decisions the task committed, which answer a replay `Duplicate`
+    /// after the operation window has moved past it.
+    #[must_use]
+    pub const fn decision_ledger(&self) -> &AgentDecisionLedger<AgentTaskOutcome> {
+        &self.decision_ledger
+    }
+
     /// The history entries the task owes its sink.
     #[must_use]
     pub fn pending_history(&self) -> &[AgentTaskHistoryEntry] {
@@ -4543,6 +4559,15 @@ impl AgentTaskState {
     #[must_use]
     pub const fn updated_at(&self) -> AgentTimestampMillis {
         self.updated_at
+    }
+
+    /// The outcome an already-applied operation produced: from the window,
+    /// or, once the window has moved past a decision, from the decision
+    /// ledger.
+    fn replayed_outcome(&self, operation_id: &AgentOperationId) -> Option<&AgentTaskOutcome> {
+        self.applied_operations
+            .outcome(operation_id)
+            .or_else(|| self.decision_ledger.outcome(operation_id))
     }
 
     /// The compact outcome describing the current state.
@@ -11916,12 +11941,11 @@ where
         self.ensure_recovered(now).await?;
 
         if let Some(operation_id) = command.operation_id() {
-            if let Some(outcome) = self
-                .state()?
-                .applied_operations
-                .outcome(operation_id)
-                .cloned()
-            {
+            // The window answers a replay, and past it the decision ledger
+            // answers a decision's — before every guard below, so a replayed
+            // creation or cancellation converges rather than being refused
+            // `task-already-created` or `task-terminal`.
+            if let Some(outcome) = self.state()?.replayed_outcome(operation_id).cloned() {
                 // The command already ran. Its original outcome is returned, and
                 // no second transition happens — which is what makes a replayed
                 // creation, dependency, or cancellation converge on one task, one
@@ -11984,13 +12008,14 @@ where
             _ => None,
         };
 
+        let records_decision = command.records_decision();
         let reply = match command {
             AgentTaskEntityCommand::Describe => unreachable!("handled above"),
             AgentTaskEntityCommand::Create {
                 operation_id,
                 creation,
             } => {
-                self.transition(now, readiness, move |state| {
+                self.transition(now, readiness, records_decision, move |state| {
                     create_task(state, &operation_id, *creation, now)?;
                     // The declared forward edges register with their
                     // upstreams in this same compare-and-set.
@@ -12003,7 +12028,7 @@ where
                 operation_id,
                 declaration,
             } => {
-                self.transition(now, readiness, move |state| {
+                self.transition(now, readiness, records_decision, move |state| {
                     declare_dependency(state, &operation_id, &declaration, now)?;
                     // The late edge registers with its upstream in this same
                     // compare-and-set, exactly as a creation-time edge does.
@@ -12019,7 +12044,7 @@ where
             } => {
                 let resolved_before = self.dependency_outcome_totals();
                 let reply = self
-                    .transition(now, readiness, move |state| {
+                    .transition(now, readiness, records_decision, move |state| {
                         // A failed dependency requests the dependent's
                         // cancellation rather than terminalizing it: with no live
                         // generation that finalizes here, owing the terminal
@@ -12044,7 +12069,7 @@ where
                 operation_id,
                 reason,
             } => {
-                self.transition(now, None, move |state| {
+                self.transition(now, None, records_decision, move |state| {
                     // The request is absorbing and nonterminal: a task with no
                     // live generation finalizes in this same transition —
                     // owing its terminal reports upward — while a task whose
@@ -12067,7 +12092,7 @@ where
                 operation_id,
                 request,
             } => {
-                self.transition(now, readiness, move |state| {
+                self.transition(now, readiness, records_decision, move |state| {
                     // The transfer records, and — with the target's readiness
                     // read before the transition — the wrapper's inline
                     // assignment decision mints the target's generation in
@@ -12085,7 +12110,7 @@ where
             } => {
                 let decided_before = self.submission_decision_snapshot();
                 let reply = self
-                    .transition(now, None, move |state| {
+                    .transition(now, None, records_decision, move |state| {
                         // A terminal decision — acceptance, or an exhausting
                         // rejection — owes its child reports in this same
                         // compare-and-set; the derivations self-gate, so a
@@ -12102,14 +12127,14 @@ where
                 operation_id,
                 binding,
             } => {
-                self.transition(now, None, move |state| {
+                self.transition(now, None, records_decision, move |state| {
                     let (wake, owed) = admit_wake(state, &operation_id, *binding, now)?;
                     Ok((operation_id, AgentTaskOutcomeExtras::wake(wake), owed))
                 })
                 .await?
             }
             AgentTaskEntityCommand::CompleteWakeOccurrence { operation_id, wake } => {
-                self.transition(now, None, move |state| {
+                self.transition(now, None, records_decision, move |state| {
                     let (outcome, owed) =
                         complete_wake_occurrence(state, &operation_id, &wake, now)?;
                     Ok((operation_id, AgentTaskOutcomeExtras::wake(outcome), owed))
@@ -12121,7 +12146,7 @@ where
                 schedule_revision,
                 wake_policy,
             } => {
-                self.transition(now, None, move |state| {
+                self.transition(now, None, records_decision, move |state| {
                     let outcome = update_continuous_schedule(
                         state,
                         &operation_id,
@@ -12143,7 +12168,7 @@ where
                 reason,
                 provenance,
             } => {
-                self.transition(now, None, move |state| {
+                self.transition(now, None, records_decision, move |state| {
                     let outcome = suspend_continuous_goal(
                         state,
                         &operation_id,
@@ -12165,7 +12190,7 @@ where
                 expected_lifecycle_revision,
                 provenance,
             } => {
-                self.transition(now, None, move |state| {
+                self.transition(now, None, records_decision, move |state| {
                     let (outcome, owed) = resume_continuous_goal(
                         state,
                         &operation_id,
@@ -12183,7 +12208,7 @@ where
                 new_expires_at,
                 provenance,
             } => {
-                self.transition(now, None, move |state| {
+                self.transition(now, None, records_decision, move |state| {
                     let outcome = renew_continuous_goal(
                         state,
                         &operation_id,
@@ -12205,7 +12230,7 @@ where
                 expected_lifecycle_revision,
                 provenance,
             } => {
-                self.transition(now, None, move |state| {
+                self.transition(now, None, records_decision, move |state| {
                     let outcome = retire_continuous_goal(
                         state,
                         &operation_id,
@@ -12228,7 +12253,7 @@ where
             } => {
                 // Activation may make the task assignable, so the readiness
                 // read rides along and the assignment commits with it.
-                self.transition(now, readiness, move |state| {
+                self.transition(now, readiness, records_decision, move |state| {
                     let owed = activate_goal(
                         state,
                         &operation_id,
@@ -12244,7 +12269,7 @@ where
                 operation_id,
                 decision,
             } => {
-                self.transition(now, None, move |state| {
+                self.transition(now, None, records_decision, move |state| {
                     record_goal_decision(state, &operation_id, *decision, now)?;
                     Ok((operation_id, AgentTaskOutcomeExtras::NONE, Vec::new()))
                 })
@@ -12257,7 +12282,7 @@ where
                 digest,
                 provenance,
             } => {
-                self.transition(now, None, move |state| {
+                self.transition(now, None, records_decision, move |state| {
                     revise_goal_criteria(
                         state,
                         &operation_id,
@@ -12279,7 +12304,7 @@ where
             } => {
                 // Reactivation may make the task assignable again, so the
                 // readiness read rides along exactly as activation's does.
-                self.transition(now, readiness, move |state| {
+                self.transition(now, readiness, records_decision, move |state| {
                     let owed = resume_goal(
                         state,
                         &operation_id,
@@ -13378,11 +13403,14 @@ where
     /// the operation log and a corrected retry under the same operation id is
     /// still accepted. The domain rejection is carried out of the substrate's
     /// closure unchanged, so a caller sees the task's own stable code rather than
-    /// a choreography error that happened to transport it.
+    /// a choreography error that happened to transport it. A decision
+    /// ([`AgentTaskEntityCommand::records_decision`]) is also recorded in the
+    /// decision ledger, in the same compare-and-set.
     async fn transition<F>(
         &mut self,
         now: AgentTimestampMillis,
         readiness: Option<AgentAssignmentReadiness>,
+        decision: bool,
         transition: F,
     ) -> AgentTaskResult<AgentTaskEntityReply>
     where
@@ -13417,6 +13445,11 @@ where
                         let mut result = state.outcome();
                         result.wake = extras.wake;
                         result.submission = extras.submission;
+                        if decision {
+                            state
+                                .decision_ledger
+                                .record(operation_id.clone(), result.clone());
+                        }
                         state
                             .applied_operations
                             .record(operation_id, result.clone());
@@ -13911,6 +13944,31 @@ pub enum AgentTaskEntityCommand {
 }
 
 impl AgentTaskEntityCommand {
+    /// Whether the command is a decision the task remembers past its
+    /// operation window ([`AgentTaskState::decision_ledger`]): its creation
+    /// and cancellation, and every command fenced on a goal status, criteria,
+    /// wake-lifecycle, or schedule revision. A replay of one
+    /// answers [`AgentTaskEntityReply::Duplicate`] with its original outcome
+    /// after any number of later non-decision operations, and up to
+    /// [`crate::AGENT_DECISION_LEDGER_CAPACITY`] `- 1` later decisions.
+    #[must_use]
+    pub const fn records_decision(&self) -> bool {
+        matches!(
+            self,
+            Self::Create { .. }
+                | Self::Cancel { .. }
+                | Self::ActivateGoal { .. }
+                | Self::RecordGoalDecision { .. }
+                | Self::ResumeGoal { .. }
+                | Self::ReviseGoalCriteria { .. }
+                | Self::SuspendContinuousGoal { .. }
+                | Self::ResumeContinuousGoal { .. }
+                | Self::RenewContinuousGoal { .. }
+                | Self::RetireContinuousGoal { .. }
+                | Self::UpdateContinuousSchedule { .. }
+        )
+    }
+
     /// The operation id this command deduplicates on, when it mutates state.
     #[must_use]
     pub const fn operation_id(&self) -> Option<&AgentOperationId> {

@@ -59,6 +59,7 @@ pub mod choreography;
 pub mod client;
 pub mod conversation;
 pub mod coordination;
+pub mod decision_ledger;
 pub mod definition;
 pub mod delegation;
 pub mod dispatch;
@@ -148,6 +149,7 @@ pub use client::{
     AgentClientTaskRequest, AgentClientTaskResultRequest, AgentClientTaskState,
     AgentClientTaskView, AgentClientTransport, RakkaAgentClient,
 };
+pub use decision_ledger::{AgentDecisionLedger, AGENT_DECISION_LEDGER_CAPACITY};
 pub use dispatch::{
     accept_model_response_unchanged, accept_tool_response_unchanged, workflow_run_id,
     AgentA2aHandoffFinding, AgentA2aHandoffSendExecutor, AgentA2aSendExecutor, AgentA2aSendFinding,

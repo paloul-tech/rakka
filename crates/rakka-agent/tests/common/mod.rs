@@ -3584,3 +3584,41 @@ impl rakka_agent::AgentCompensationExecutor for RecordingCompensations {
         })
     }
 }
+
+/// Rewrites one durable entity record as if its operation window had moved
+/// past every id it holds — exactly the state 64 later operations leave — and,
+/// when `forget_ledger` is set, as if it had been written before the decision
+/// ledger existed (which is also what a decision evicted from the ledger
+/// leaves for its id). The same record surgery `rakka-a2a`'s collaboration
+/// surface uses to age a task's window, rather than 64 scripted operations.
+pub async fn forget_operations<S, Store>(
+    store: &Store,
+    id: &rakka_persistence::PersistenceId,
+    forget_ledger: bool,
+) where
+    S: serde::Serialize + serde::de::DeserializeOwned + rakka_persistence::DurableState,
+    Store: rakka_persistence::DurableStateStore<S>,
+{
+    let record = store
+        .load(id)
+        .await
+        .expect("the store loads")
+        .expect("the record exists");
+    let mut encoded = serde_json::to_value(&record.state).expect("the state encodes");
+    let fields = encoded
+        .as_object_mut()
+        .expect("an entity state encodes as an object");
+    assert!(
+        fields.contains_key("applied_operations"),
+        "the state has an operation log to forget"
+    );
+    fields.insert("applied_operations".to_string(), serde_json::json!([]));
+    if forget_ledger {
+        fields.remove("decision_ledger");
+    }
+    let state: S = serde_json::from_value(encoded).expect("the rewritten state decodes");
+    store
+        .compare_and_set(id, record.revision, state)
+        .await
+        .expect("the rewrite lands");
+}
