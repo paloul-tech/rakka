@@ -674,6 +674,14 @@ impl AgentDispatchEntry {
         })
     }
 
+    /// Whether this entry differs from `other` in anything but `updated_at`,
+    /// which nothing reads to decide anything.
+    fn differs_beyond_updated_at(&self, other: &Self) -> bool {
+        let mut probe = self.clone();
+        probe.updated_at = other.updated_at;
+        probe != *other
+    }
+
     fn upsert_from_due_effect(
         mut self,
         workflow_id: Option<AgentWorkflowId>,
@@ -1043,7 +1051,11 @@ pub struct AgentDispatcherRegistration {
     pub run_id: AgentRunId,
     /// Number of due effects observed from the run outbox.
     pub observed_due_effects: usize,
-    /// Number of fleet entries inserted or refreshed.
+    /// Number of fleet entries this registration inserted or changed.
+    ///
+    /// An entry already indexed exactly as the outbox describes it — a call
+    /// in flight under a live lease, say — is neither counted nor rewritten,
+    /// and a registration that changes no entry writes nothing.
     pub registered_effects: usize,
 }
 
@@ -1331,6 +1343,9 @@ where
     }
 
     /// Registers due effects observed from one run outbox into the fleet index.
+    ///
+    /// Writes only when an entry is inserted or changed; see
+    /// [`AgentDispatcherRegistration::registered_effects`].
     pub async fn register_due_effects(
         &mut self,
         run_id: AgentRunId,
@@ -1352,18 +1367,32 @@ where
                 AgentDispatchEntry::from_due_effect(run_id.clone(), workflow_id.clone(), &due, now);
             candidate.validate()?;
             let dispatch_id = candidate.dispatch_id.clone();
-            let entry = next
-                .entries
-                .remove(&dispatch_id)
-                .map_or(candidate, |existing| {
-                    existing.upsert_from_due_effect(workflow_id.clone(), &due, now)
-                });
+            let entry = match next.entries.get(&dispatch_id) {
+                None => candidate,
+                Some(existing) => {
+                    let upserted =
+                        existing
+                            .clone()
+                            .upsert_from_due_effect(workflow_id.clone(), &due, now);
+                    if upserted.differs_beyond_updated_at(existing) {
+                        upserted
+                    } else {
+                        // Indexed exactly as the outbox describes it — a call
+                        // in flight under a live lease, re-registered on every
+                        // pump of its run. Rewriting it would cost the hottest
+                        // shared record a compare-and-set for a timestamp.
+                        continue;
+                    }
+                }
+            };
             next.updated_at = now;
             next.entries.insert(dispatch_id, entry);
             registered_effects += 1;
         }
 
-        self.persist(record.revision, next).await?;
+        if registered_effects > 0 {
+            self.persist(record.revision, next).await?;
+        }
         self.record_metric(
             "register",
             "registered",

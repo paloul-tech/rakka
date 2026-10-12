@@ -78,8 +78,9 @@
 //!
 //! # Cancellation fencing
 //!
-//! When a run is winding down, [`AgentRunEffectDispatcher::pump_run`] fences
-//! at the dispatch layer: tickets that provably never started are cancelled
+//! When a run is winding down, [`AgentRunEffectDispatcher::pump_run`] (or its
+//! per-run half, [`AgentRunEffectDispatcher::register_run`]) fences at the
+//! dispatch layer: tickets that provably never started are cancelled
 //! (with a tombstone row planted for a ticket a laggard flush might still
 //! write), attempts under an active lease finish truthfully, and an ambiguous
 //! attempt is treated exactly as above — a cancelled run's ambiguous
@@ -141,7 +142,7 @@ use crate::observability::{
 };
 use crate::run::{
     load_agent_run_state, AgentRun, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError,
-    AgentRunState,
+    AgentRunState, AgentRunStatus,
 };
 use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
 use crate::task::AgentTaskContent;
@@ -2007,10 +2008,15 @@ pub trait AgentDispatchProbe: Send + Sync {
     fn survives(&self, window: AgentDispatchWindow) -> bool;
 }
 
-/// What one [`AgentRunEffectDispatcher::pump_run`] pass did.
+/// What one [`AgentRunEffectDispatcher::pump_run`] pass, or one of its halves
+/// ([`AgentRunEffectDispatcher::register_run`],
+/// [`AgentRunEffectDispatcher::claim_and_execute`]), did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AgentDispatchPass {
-    /// Dispatch tickets registered into the fleet from the run's outbox.
+    /// Dispatch tickets registration inserted into the fleet index from the
+    /// run's outbox, or changed there. A ticket already indexed exactly as
+    /// the outbox describes it — a call in flight under a live lease — is not
+    /// counted, and is not rewritten.
     pub registered: usize,
     /// Fleet claims taken.
     pub claimed: usize,
@@ -2040,6 +2046,17 @@ pub struct AgentDispatchPass {
     pub class_filtered: usize,
     /// True when the probe killed the worker mid-pass.
     pub died: bool,
+    /// The status of the run the pass was given, as the pass read it: `None`
+    /// when that run has no record, and on a pass that reads no run.
+    ///
+    /// Read once, before the wind-down fence, by
+    /// [`AgentRunEffectDispatcher::register_run`] and
+    /// [`AgentRunEffectDispatcher::pump_run`];
+    /// [`AgentRunEffectDispatcher::claim_and_execute`] serves the fleet rather
+    /// than one run and leaves it `None`. A terminal status is final. A
+    /// non-terminal one can be a pass behind, because the fence, and the
+    /// claims a pump executes, may move the run after the read.
+    pub run_status: Option<AgentRunStatus>,
 }
 
 /// How one claimed ticket was concluded.
@@ -2537,6 +2554,11 @@ where
     /// each claim re-derives its own run scope and is recovered under that
     /// run's intent.
     ///
+    /// It is [`Self::register_run`] then [`Self::claim_and_execute`] under one
+    /// report, reading the fleet record once between them. A deployment that
+    /// pumps every run from several workers can call the halves instead: the
+    /// per-run half once per run, and the per-worker half once per worker.
+    ///
     /// The pass reads only durable state, so calling it after a crash, after a
     /// clock advance past a lease, or twice in a row are all the same
     /// operation.
@@ -2545,13 +2567,66 @@ where
         scope: &AgentRunScope,
     ) -> AgentDispatchResult<AgentDispatchPass> {
         let mut pass = AgentDispatchPass::default();
-        self.fleet.recover().await?;
+        let fleet_current = self.register_run_into(scope, &mut pass).await?;
+        self.claim_into(fleet_current, &mut pass).await?;
+        Ok(pass)
+    }
 
+    /// The per-run half of a pass: registers the given run's due tickets into
+    /// the fleet and fences the run if it is winding down. Claims nothing.
+    ///
+    /// The report carries what registration added or changed
+    /// ([`AgentDispatchPass::registered`]), what the fence cancelled and
+    /// delivered, and the status it read
+    /// ([`AgentDispatchPass::run_status`]). Registration happens only here
+    /// and in [`Self::pump_run`], so a ticket the run's outbox holds is
+    /// claimable only once one of them has run for that run.
+    ///
+    /// It reads the run's outbox and the run, and reads and writes the fleet
+    /// record only when the outbox has a due ticket — and writes it only when
+    /// registration inserts or changes an entry.
+    pub async fn register_run(
+        &mut self,
+        scope: &AgentRunScope,
+    ) -> AgentDispatchResult<AgentDispatchPass> {
+        let mut pass = AgentDispatchPass::default();
+        self.register_run_into(scope, &mut pass).await?;
+        Ok(pass)
+    }
+
+    /// The per-worker half of a pass: reads the fleet record once, claims what
+    /// the fleet has due under this worker's class filter — including
+    /// expired-lease entries, whose re-claim under a fresh fencing token *is*
+    /// the recovery path — and executes each claim to a settled conclusion.
+    ///
+    /// It registers nothing and reads no run's outbox, so it claims only what
+    /// [`Self::register_run`] or [`Self::pump_run`] has registered, for any
+    /// run. It reads no run of its own, so its
+    /// [`AgentDispatchPass::run_status`] is `None`.
+    pub async fn claim_and_execute(&mut self) -> AgentDispatchResult<AgentDispatchPass> {
+        let mut pass = AgentDispatchPass::default();
+        self.claim_into(false, &mut pass).await?;
+        Ok(pass)
+    }
+
+    /// [`Self::register_run`] into `pass`. Answers whether it left the fleet
+    /// record current — read, and written if registration changed it — so a
+    /// claim right behind it need not read the record again.
+    async fn register_run_into(
+        &mut self,
+        scope: &AgentRunScope,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<bool> {
         // Register the run's due dispatch tickets into the fleet.
         let mut inbox = self.inbox(scope);
         inbox.recover().await?;
         let due = inbox.due_effects()?;
-        if !due.is_empty() {
+        let fleet_current = !due.is_empty();
+        if fleet_current {
+            // Read here, not once per worker: the registration's
+            // compare-and-set is fenced on the revision it read, and a
+            // long-lived worker's copy is whatever its last pass left.
+            self.fleet.recover().await?;
             let registration = self
                 .fleet
                 .register_due_effects(workflow_run_id(scope), None, due)
@@ -2562,15 +2637,28 @@ where
         // Fence a winding-down run at the dispatch layer before anything can
         // be claimed on its behalf.
         let run_state = self.run_state(scope).await?;
+        pass.run_status = run_state.as_ref().and_then(AgentRunState::status);
         if let Some(state) = &run_state {
             let winding_down = state
                 .run()
                 .is_some_and(|run| run.terminal_reason.is_some() || run.status.is_terminal());
             if winding_down {
-                self.fence_run(scope, state, &mut pass).await?;
+                self.fence_run(scope, state, pass).await?;
             }
         }
+        Ok(fleet_current)
+    }
 
+    /// [`Self::claim_and_execute`] into `pass`, reading the fleet record first
+    /// unless the caller just left it current.
+    async fn claim_into(
+        &mut self,
+        fleet_current: bool,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<()> {
+        if !fleet_current {
+            self.fleet.recover().await?;
+        }
         // Claim and execute what is due — including expired-lease entries,
         // whose re-claim under a fresh fencing token *is* the recovery path.
         let batch = self.fleet.claim_due(self.worker_id.clone()).await?;
@@ -2578,7 +2666,7 @@ where
         pass.class_filtered = batch.class_filtered;
         for claim in batch.claims {
             let claim_scope = AgentRunScope::parse(claim.run_id.as_str())?;
-            match self.execute_claim(&claim_scope, claim, &mut pass).await? {
+            match self.execute_claim(&claim_scope, claim, pass).await? {
                 ClaimConclusion::Settled => {}
                 ClaimConclusion::Died => {
                     pass.died = true;
@@ -2586,7 +2674,7 @@ where
                 }
             }
         }
-        Ok(pass)
+        Ok(())
     }
 
     /// Executes one claimed dispatch ticket to a settled conclusion.
