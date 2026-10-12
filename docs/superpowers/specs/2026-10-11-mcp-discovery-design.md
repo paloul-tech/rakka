@@ -152,10 +152,12 @@ pub enum McpListedToolRefusal {
         /// The larger offending schema's encoded size.
         bytes: usize,
     },
-    /// The name cannot form a valid tool id. `code()` is
+    /// The name cannot form a valid tool id, or a schema id a sync derives
+    /// from it (`mcp.<server>.<name>.input`, `.output`). `code()` is
     /// `mcp-binding-invalid`.
     NameInvalid {
-        /// The tool-id rule's own reason, never server text.
+        /// The identifier rule's own reason; it names at most one offending
+        /// character, escaped.
         reason: String,
     },
 }
@@ -351,3 +353,15 @@ the set field and its literal break, the listing's rules), a `CHANGELOG.md`
 entry, and the crate's module docs, including `McpClientSession`'s list of the
 public ways to reach a server. Validation: `scripts/validate.sh` and a cold
 `cargo +1.88.0 check --workspace --all-targets`.
+
+## Amendment after the final review
+
+The listing's name rule first named only the tool id, `mcp.<server>.<name>` at
+most 256 bytes. A sync also derives the schema ids
+`mcp.<server>.<name>.input` and `.output` under the same 256-byte identifier
+rule and refuses a name either one exceeds, so for server `crm` a name of
+242–248 bytes was listed bindable and then refused at publish. `NameInvalid`
+now covers all three derivations, through the sync's own `schema_ref`, and
+`tool_id` is `None` whenever a name is `NameInvalid`; for `crm` the last
+bindable length is 241 bytes, which the boundary test holds against both the
+listing and a real sync.

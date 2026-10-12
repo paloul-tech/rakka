@@ -30,7 +30,7 @@
 - **A credential-free listing of text that happens to contain a token-like string**: judges nothing and lists (Task 5, `the_same_text_lists_when_it_is_not_the_credential`).
 - **An empty server version**: reads as `None` in both the set and the listing (Task 2 `an_empty_server_version_reads_as_none`; Task 4 asserts the listing's).
 - **A child-process binding handed to the HTTP listing**: refused `mcp-descriptor-sync-failed` before any connection, never a panic (Task 4, `a_child_process_binding_is_refused_as_no_http_endpoint`).
-- **A tool name at the tool-id length boundary**: a name making `mcp.crm.<name>` exactly 256 bytes is bindable and returned whole; one byte longer is `NameInvalid` and still returned whole (≤ 256) (Task 4, `a_name_at_the_tool_id_boundary_is_bindable_and_one_byte_more_is_not`).
+- **A tool name at the schema-id length boundary** (amended after the final review: the plan first named only the tool id): a sync also derives `mcp.crm.<name>.output`, so a 241-byte name is the last bindable one and a 242-byte name is `NameInvalid`, returned whole; the test holds the listing and a real sync together (Task 4, `a_name_at_the_schema_id_boundary_is_bindable_and_one_byte_more_is_not`, rewritten in the review fix).
 
 ---
 

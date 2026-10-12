@@ -14,11 +14,12 @@ use rakka_agent_mcp::testkit::{
     hardened_reqwest_client, serve_fake, CountingClient, FakeMcpServer, FakeTool,
 };
 use rakka_agent_mcp::{
-    list_mcp_tools, list_mcp_tools_within, McpAllowAllEgress, McpEgressCheck, McpListedToolRefusal,
-    McpServerBinding, McpServerId, McpToolListing, McpToolPolicy, MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
+    list_mcp_tools, list_mcp_tools_within, sync_mcp_descriptors, McpAllowAllEgress,
+    McpDescriptorSet, McpEgressCheck, McpListedToolRefusal, McpServerBinding, McpServerId,
+    McpSyncError, McpToolListing, McpToolPolicy, MCP_DESCRIPTOR_SCHEMA_MAX_BYTES,
     MCP_SESSION_CLOSE_BOUND_MS,
 };
-use rakka_agent_workflow::AgentEphemeralCredential;
+use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
 use serde_json::{json, Value};
 
 mod support;
@@ -171,16 +172,25 @@ async fn a_listing_returns_every_tool_in_name_order_marking_the_ones_a_sync_woul
 }
 
 #[tokio::test]
-async fn a_name_at_the_tool_id_boundary_is_bindable_and_one_byte_more_is_not() {
-    // `mcp.crm.` is 8 bytes; a tool id is at most 256.
-    let fits = "a".repeat(248);
-    let over = "b".repeat(249);
-    let listing = listed(
+async fn a_name_at_the_schema_id_boundary_is_bindable_and_one_byte_more_is_not() {
+    // A sync derives `mcp.crm.<name>.output` as well as the tool id
+    // `mcp.crm.<name>`, and each is at most 256 bytes: 8 + 241 + 7.
+    let fits = "a".repeat(241);
+    let over = "b".repeat(242);
+    let endpoint = serve_fake(
         FakeMcpServer::new()
             .with_tool(FakeTool::text(fits.clone(), "Fits.", object(), "ok"))
             .with_tool(FakeTool::text(over.clone(), "Over.", object(), "ok")),
     )
     .await;
+    let listing = list_mcp_tools(
+        &hardened_reqwest_client(),
+        &tool_less(&endpoint.url),
+        None,
+        &McpAllowAllEgress,
+    )
+    .await
+    .expect("lists");
     assert_eq!(listing.tools[0].name, fits);
     assert!(listing.tools[0].tool_id.is_some());
     assert_eq!(listing.tools[0].unusable, None);
@@ -188,10 +198,42 @@ async fn a_name_at_the_tool_id_boundary_is_bindable_and_one_byte_more_is_not() {
         listing.tools[1].name, over,
         "under 256 bytes, returned whole"
     );
-    assert!(matches!(
-        listing.tools[1].unusable,
-        Some(McpListedToolRefusal::NameInvalid { .. })
-    ));
+    assert_eq!(listing.tools[1].tool_id, None);
+    assert!(
+        matches!(
+            listing.tools[1].unusable,
+            Some(McpListedToolRefusal::NameInvalid { .. })
+        ),
+        "{:?}",
+        listing.tools[1].unusable
+    );
+
+    // The sync agrees, on both sides of the line.
+    sync_one(&endpoint.url, &fits)
+        .await
+        .expect("a name the listing calls bindable syncs");
+    let refused = sync_one(&endpoint.url, &over)
+        .await
+        .expect_err("a name the listing marks is refused by a sync");
+    assert_eq!(refused.code(), "mcp-binding-invalid", "{refused}");
+}
+
+/// A sync of the one allow-listed tool `name`.
+async fn sync_one(url: &str, name: &str) -> Result<McpDescriptorSet, McpSyncError> {
+    let binding = tool_less(url)
+        .with_tool(
+            name,
+            McpToolPolicy::new(AgentToolDeclaration::new(AgentEffectSafetyClass::ReadOnly)),
+        )
+        .expect("the tool id itself is valid");
+    sync_mcp_descriptors(
+        &hardened_reqwest_client(),
+        &binding,
+        None,
+        AgentTimestampMillis::new(1),
+        &McpAllowAllEgress,
+    )
+    .await
 }
 
 #[tokio::test]

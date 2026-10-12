@@ -9,7 +9,8 @@
 //! and mints no binding: the sync stays the only producer of release data.
 //!
 //! A tool a sync would refuse for its own sake — a schema over
-//! [`MCP_DESCRIPTOR_SCHEMA_MAX_BYTES`], or a name that cannot form a tool id —
+//! [`MCP_DESCRIPTOR_SCHEMA_MAX_BYTES`], or a name that cannot form a tool id
+//! or the schema ids a sync derives from it —
 //! is listed and marked [`McpListedTool::unusable`], its schemas withheld, so
 //! one such tool never hides the rest.
 //!
@@ -34,8 +35,8 @@ use crate::binding::{
 use crate::client::{connect, credential_secrets, service_error, McpEgressCheck};
 use crate::sync::{
     bounded_description, bounded_server_name, carries, cut_at, judge_server_identity,
-    pages_unended, stored_annotations, sync_deadline, timed_out, value_carries, McpSyncError,
-    McpToolAnnotations,
+    pages_unended, schema_ref, stored_annotations, sync_deadline, timed_out, value_carries,
+    McpSyncError, McpToolAnnotations,
 };
 
 /// What one MCP server lists, vetted but not bound.
@@ -59,9 +60,10 @@ pub struct McpToolListing {
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpListedTool {
     /// The server's own name for the tool, cut at
-    /// [`AGENT_IDENTITY_MAX_LENGTH`] when it cannot form a tool id.
+    /// [`AGENT_IDENTITY_MAX_LENGTH`] when it cannot be bound.
     pub name: String,
-    /// `mcp.<server>.<name>`, when that forms a valid tool id.
+    /// `mcp.<server>.<name>`, when the name can be bound: it and the schema
+    /// ids a sync derives from it are all valid identifiers.
     pub tool_id: Option<AgentToolId>,
     /// The server's description, cut at the descriptor bound on a character
     /// boundary; `None` when it gave none or an empty one.
@@ -90,9 +92,11 @@ pub enum McpListedToolRefusal {
         /// The larger offending schema's encoded size.
         bytes: usize,
     },
-    /// The name cannot form a valid tool id.
+    /// The name cannot form a valid tool id, or one of the schema ids a sync
+    /// derives from it (`mcp.<server>.<name>.input` and `.output`).
     NameInvalid {
-        /// The tool-id rule's own reason.
+        /// The identifier rule's own reason, which names at most one
+        /// offending character, escaped.
         reason: String,
     },
 }
@@ -276,13 +280,9 @@ fn listed_tool(binding: &McpServerBinding, listed: &Tool) -> McpListedTool {
         .map(bounded_description);
     let annotations = listed.annotations.as_ref().map(stored_annotations);
     // The name first: a tool that cannot be bound makes its schemas moot.
-    let tool_id = match binding.tool_id(name) {
+    let tool_id = match bindable_tool_id(binding, name) {
         Ok(tool_id) => tool_id,
-        Err(refusal) => {
-            let reason = match refusal {
-                McpRegistrationError::ToolNameInvalid { reason, .. } => reason,
-                other => other.to_string(),
-            };
+        Err(reason) => {
             return unusable(
                 cut_at(name, AGENT_IDENTITY_MAX_LENGTH),
                 None,
@@ -320,6 +320,26 @@ fn listed_tool(binding: &McpServerBinding, listed: &Tool) -> McpListedTool {
         output_schema,
         unusable: None,
     }
+}
+
+/// The tool id a sync would register `name` under, or the identifier rule's
+/// reason a sync would refuse it for: its tool id, or either schema id the
+/// sync derives from it — `mcp.<server>.<name>.input` and `.output`, the
+/// longer of the three — is not a valid identifier. The same derivations the
+/// sync runs, so a name the listing calls bindable is one a sync accepts.
+fn bindable_tool_id(binding: &McpServerBinding, name: &str) -> Result<AgentToolId, String> {
+    let tool_id = binding.tool_id(name).map_err(|refusal| match refusal {
+        McpRegistrationError::ToolNameInvalid { reason, .. } => reason,
+        other => other.to_string(),
+    })?;
+    let server = binding.server_id.to_string();
+    for side in ["input", "output"] {
+        schema_ref(&server, name, side).map_err(|refusal| match refusal {
+            McpSyncError::Descriptor { reason, .. } => reason,
+            other => other.to_string(),
+        })?;
+    }
+    Ok(tool_id)
 }
 
 /// A tool listed with its schemas withheld.

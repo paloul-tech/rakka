@@ -1053,7 +1053,11 @@ fn encoded_len(schema: &Value, server: &str, tool: &str) -> Result<usize, McpSyn
 }
 
 /// The versioned schema reference a synced tool's input or output points at.
-fn schema_ref(server: &str, tool: &str, side: &str) -> Result<AgentSchemaRef, McpSyncError> {
+pub(crate) fn schema_ref(
+    server: &str,
+    tool: &str,
+    side: &str,
+) -> Result<AgentSchemaRef, McpSyncError> {
     let schema_id = AgentSchemaId::new(format!("mcp.{server}.{tool}.{side}")).map_err(|error| {
         McpSyncError::Descriptor {
             server: server.to_string(),
