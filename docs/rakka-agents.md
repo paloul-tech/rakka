@@ -157,6 +157,9 @@ leaves behind is the same either way.
    outcome and is settled by its safety class — a non-idempotent tool parks
    for reconciliation — and a refusal the deployment declares definitive (a
    non-retryable egress refusal, an artifact store's refusal) is not retried.
+   It settles `Exhausted`, as a spent budget does, and its failure reason is
+   marked definitive; a run that fails on an effect records how many attempts
+   it made and was allowed.
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect
