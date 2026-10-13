@@ -157,8 +157,8 @@ leaves behind is the same either way.
    outcome and is settled by its safety class — a non-idempotent tool parks
    for reconciliation, recording how far the call got, when it was handed
    over, and whether a cancellation was issued — and a refusal the
-   deployment declares definitive (a
-   non-retryable egress refusal, an artifact store's refusal) is not retried.
+   deployment declares definitive (a non-retryable egress refusal, an
+   artifact store's refusal) is not retried.
    It settles `Exhausted`, as a spent budget does, and its failure reason is
    marked definitive; a run that fails on an effect records how many attempts
    it made and was allowed.
