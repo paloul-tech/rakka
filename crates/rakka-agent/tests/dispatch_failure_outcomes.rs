@@ -228,6 +228,39 @@ async fn a_retryable_refusal_still_spends_its_budget_one_attempt_at_a_time() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+fn before_the_send() -> AgentDispatchError {
+    AgentDispatchError::Invocation {
+        code: "mcp-transport-failed",
+        message: "the attempt exceeded the effect's timeout before tools/call was handed over"
+            .to_string(),
+    }
+}
+
+/// Issue #103: what the MCP executor now answers for a call rmcp never
+/// accepted — a failure before the send — settles a non-idempotent effect as
+/// a spent budget, not a park: nothing was sent, so there is nothing for a
+/// person to reconcile. Under the default budget of one attempt the run
+/// fails on it, as on any other failure before the send.
+#[tokio::test]
+async fn a_failure_before_the_send_never_parks_a_non_idempotent_effect() {
+    let (fx, calls) = fixture(&AgentEffectSpec::non_idempotent(), before_the_send);
+    ready(&fx).await;
+
+    let pass = fx.one_pass().await;
+
+    assert_eq!(pass.parked_indeterminate, 0, "{pass:?}");
+    let failed = fx.effect_at(1).await.expect("the failed effect");
+    assert_eq!(failed.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(
+        failed.last_error_code.as_deref(),
+        Some("mcp-transport-failed")
+    );
+    assert_eq!(failed.unknown_outcome, None);
+    assert_eq!(fx.terminal_failure_code().await, "mcp-transport-failed");
+    assert_eq!(fx.terminal_failure_attempts().await, (Some(1), Some(1)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 fn unknown() -> AgentDispatchError {
     AgentDispatchError::outcome_unknown(
         "scripted-outcome-unknown",

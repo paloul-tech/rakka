@@ -158,7 +158,8 @@ leaves behind is the same either way.
    for reconciliation, recording how far the call got, when it was handed
    over, and whether a cancellation was issued — and a refusal the
    deployment declares definitive (a non-retryable egress refusal, an
-   artifact store's refusal) is not retried.
+   artifact store's refusal) is not retried. A call the client never handed
+   over never left, and fails like any other failure before the send.
    It settles `Exhausted`, as a spent budget does, and its failure reason is
    marked definitive; a run that fails on an effect records how many attempts
    it made and was allowed.
