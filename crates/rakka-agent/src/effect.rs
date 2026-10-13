@@ -1848,6 +1848,16 @@ pub struct AgentRunEffect {
     /// this field decodes with none, and no dispatch decision reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_reason: Option<crate::failure::AgentFailureReason>,
+    /// What is known about the current generation's unknown outcome, when it
+    /// parked with evidence (issue #100): when its request was handed over and
+    /// whether a cancellation was issued. It is the generation's history: a
+    /// decision that resolves the ambiguity — a confirmation or a
+    /// compensation — leaves it in place, because what it says about the
+    /// attempt stays true, and only a new generation clears it. Observability
+    /// only, never correctness: an effect persisted before this field decodes
+    /// with none, and no dispatch decision reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_outcome: Option<AgentUnknownOutcomeEvidence>,
     /// Whether the effect may dispatch only under a durable checkpoint grant
     /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)). Projected
     /// from the tool binding at commit time, so the run parks on an approval
@@ -1919,6 +1929,7 @@ impl AgentRunEffect {
             dispatched_at: None,
             last_error_code: None,
             last_error_reason: None,
+            unknown_outcome: None,
             checkpoint_required: spec.checkpoint_required,
             authorization_required: spec.authorization_required,
             telemetry: AgentTelemetryContext::default(),
@@ -2022,6 +2033,7 @@ impl AgentRunEffect {
         self.dispatched_at = None;
         self.last_error_code = None;
         self.last_error_reason = None;
+        self.unknown_outcome = None;
         self.created_at = now;
         self.telemetry = superseded_generation_telemetry(&self.telemetry);
         Ok(())
@@ -2264,6 +2276,44 @@ pub fn effect_result_operation_id(
     )
 }
 
+/// What is known about an attempt whose outcome is unknown, as the effect
+/// record keeps it: when its request was handed over, on the dispatcher's
+/// clock, and whether a cancellation was issued for it.
+///
+/// Observability only: no dispatch decision reads it. "Issued" means the
+/// client accepted the cancellation within its close bound — never that the
+/// target received or honoured it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentUnknownOutcomeEvidence {
+    /// When the request was handed over, on the dispatcher's clock: the
+    /// attempt's start plus the offset the executor measured. `None` when it
+    /// never was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<AgentTimestampMillis>,
+    /// Whether a cancellation was issued for the request.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancellation_issued: bool,
+}
+
+impl AgentUnknownOutcomeEvidence {
+    /// Evidence with the given send time and cancellation.
+    #[must_use]
+    pub const fn new(sent_at: Option<AgentTimestampMillis>, cancellation_issued: bool) -> Self {
+        Self {
+            sent_at,
+            cancellation_issued,
+        }
+    }
+}
+
+/// Keeps an unset flag off the record, so evidence without one encodes
+/// exactly as it would have before the flag existed.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// What a dispatcher returned for one effect generation — always final for
 /// that generation.
 ///
@@ -2367,11 +2417,23 @@ pub enum AgentRunEffectOutcome {
     /// An attempt may have invoked the target and its outcome cannot be
     /// established mechanically. The run must park for reconciliation
     /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Built with [`Self::indeterminate`]; the variant is `#[non_exhaustive]`
+    /// so a later observability field is not a source break.
+    #[non_exhaustive]
     Indeterminate {
         /// Stable machine-readable code describing the ambiguity.
         code: String,
         /// Human-readable detail.
         message: String,
+        /// Which situation made the outcome unknown, when the executor said:
+        /// its own stable code. Observability only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<crate::failure::AgentFailureReason>,
+        /// What is known about the attempt, when the executor reported it.
+        /// Observability only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<AgentUnknownOutcomeEvidence>,
     },
     /// The generation was fenced and settled without invocation.
     Cancelled {
@@ -2401,21 +2463,59 @@ impl AgentRunEffectOutcome {
         }
     }
 
-    /// Sets which decision failed a `Failed` or `Exhausted` outcome. Every
-    /// other outcome is returned unchanged: nothing failed it.
+    /// An unknown outcome with no reason and no evidence beyond its code.
+    #[must_use]
+    pub fn indeterminate(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Indeterminate {
+            code: code.into(),
+            message: message.into(),
+            reason: None,
+            evidence: None,
+        }
+    }
+
+    /// Sets which decision failed a `Failed` or `Exhausted` outcome, or which
+    /// situation made an `Indeterminate` one unknown. Every other outcome is
+    /// returned unchanged: nothing failed it.
     #[must_use]
     pub fn with_reason(mut self, deciding: Option<crate::failure::AgentFailureReason>) -> Self {
-        if let Self::Failed { reason, .. } | Self::Exhausted { reason, .. } = &mut self {
+        if let Self::Failed { reason, .. }
+        | Self::Exhausted { reason, .. }
+        | Self::Indeterminate { reason, .. } = &mut self
+        {
             *reason = deciding;
         }
         self
     }
 
-    /// Which decision failed the generation, when the outcome carries one.
+    /// Sets what is known about an `Indeterminate` outcome's attempt. Every
+    /// other outcome is returned unchanged.
+    #[must_use]
+    pub fn with_evidence(mut self, known: Option<AgentUnknownOutcomeEvidence>) -> Self {
+        if let Self::Indeterminate { evidence, .. } = &mut self {
+            *evidence = known;
+        }
+        self
+    }
+
+    /// Which decision failed the generation, or made its outcome unknown,
+    /// when the outcome carries one.
     #[must_use]
     pub fn failure_reason(&self) -> Option<&crate::failure::AgentFailureReason> {
         match self {
-            Self::Failed { reason, .. } | Self::Exhausted { reason, .. } => reason.as_ref(),
+            Self::Failed { reason, .. }
+            | Self::Exhausted { reason, .. }
+            | Self::Indeterminate { reason, .. } => reason.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// What is known about an `Indeterminate` outcome's attempt, when the
+    /// executor reported it.
+    #[must_use]
+    pub fn unknown_outcome_evidence(&self) -> Option<&AgentUnknownOutcomeEvidence> {
+        match self {
+            Self::Indeterminate { evidence, .. } => evidence.as_ref(),
             _ => None,
         }
     }
@@ -3165,11 +3265,12 @@ mod tests {
     }
 
     #[test]
-    fn a_reason_rides_a_failed_and_an_exhausted_outcome_and_nothing_else() {
+    fn a_reason_rides_a_failed_an_exhausted_and_an_indeterminate_outcome_and_nothing_else() {
         let reason = crate::failure::AgentFailureReason::new("egress_denied");
         for outcome in [
             AgentRunEffectOutcome::failed("c", "m"),
             AgentRunEffectOutcome::exhausted("c", "m"),
+            AgentRunEffectOutcome::indeterminate("c", "m"),
         ] {
             let carried = outcome.with_reason(reason.clone());
             assert_eq!(carried.failure_reason(), reason.as_ref());

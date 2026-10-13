@@ -53,6 +53,7 @@ use crate::delegation::{
 };
 use crate::effect::{
     AgentEffectGeneration, AgentRunEffectKind, AgentRunEffectRequest, AgentRunEffectStatus,
+    AgentUnknownOutcomeEvidence,
 };
 use crate::evaluation::{
     AgentGoalEvaluationMethodKind, AgentGoalEvaluationOutcome, AgentGoalEvidenceRef,
@@ -266,6 +267,11 @@ pub struct AgentPendingEffectView {
     /// and reason code, or a collaborator's own code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_reason: Option<AgentFailureReason>,
+    /// What is known about its unknown outcome, when it parked with
+    /// evidence: when its request was handed over and whether a cancellation
+    /// was issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_outcome: Option<AgentUnknownOutcomeEvidence>,
 }
 
 /// The effect an open checkpoint gates, as the authoritative snapshot reports
@@ -809,6 +815,7 @@ impl AgentOperationalSnapshot {
                         dispatched_at: effect.dispatched_at,
                         last_error_code: effect.last_error_code.clone(),
                         last_error_reason: effect.last_error_reason.clone(),
+                        unknown_outcome: effect.unknown_outcome.clone(),
                     })
                     .collect()
             })

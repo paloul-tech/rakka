@@ -1572,10 +1572,10 @@ async fn an_indeterminate_post_terminal_outcome_opens_no_checkpoint() {
     assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
     let parked = resolve_promotion(
         &fx,
-        AgentRunEffectOutcome::Indeterminate {
-            code: "dispatcher-lost-after-started".to_string(),
-            message: "the recovery retry was refused".to_string(),
-        },
+        AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the recovery retry was refused",
+        ),
     )
     .await;
     assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);

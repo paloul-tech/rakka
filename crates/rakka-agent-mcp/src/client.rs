@@ -293,6 +293,42 @@ pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
 /// (`SESSION_CLEANUP_TIMEOUT`, `rmcp-3.4.0/src/transport/streamable_http_client.rs:42`).
 const SESSION_CLOSE_BOUND: Duration = Duration::from_millis(MCP_SESSION_CLOSE_BOUND_MS);
 
+/// How far one `tools/call` got, as the attempt that sent it last saw it.
+///
+/// The executor reads it after the call settles, or after the attempt's
+/// deadline dropped the call, to name an unknown outcome and to cancel a
+/// call still in flight.
+#[derive(Debug, Clone)]
+pub(crate) enum CallProgress {
+    /// rmcp has not accepted the request: nothing left.
+    NotHandedOver,
+    /// rmcp accepted the request at `handed_over` and no answer has been
+    /// read. A deadline that drops the call here leaves `request` behind for
+    /// the cancellation.
+    AwaitingAnswer {
+        request: RequestId,
+        handed_over: tokio::time::Instant,
+    },
+    /// The wait ended. `answered` is whether the server answered — a result
+    /// or a JSON-RPC error — rather than the transport failing.
+    WaitEnded {
+        handed_over: tokio::time::Instant,
+        answered: bool,
+    },
+}
+
+impl CallProgress {
+    /// When rmcp accepted the request, once it did.
+    pub(crate) const fn handed_over(&self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::NotHandedOver => None,
+            Self::AwaitingAnswer { handed_over, .. } | Self::WaitEnded { handed_over, .. } => {
+                Some(*handed_over)
+            }
+        }
+    }
+}
+
 /// One negotiated MCP client session.
 ///
 /// Transport-agnostic on purpose: the Streamable HTTP path and the
@@ -360,18 +396,20 @@ impl McpClientSession {
         self.server_version.as_deref()
     }
 
-    /// Sends one `tools/call` and waits for its answer, holding the request's
-    /// id in `in_flight` while it waits.
+    /// Sends one `tools/call` and waits for its answer, recording in
+    /// `progress` how far it got.
     ///
-    /// The id is what a caller needs to tell the server the call was
-    /// abandoned: a deadline that drops this future while it waits leaves the
-    /// id behind, and any answer — a result, a JSON-RPC error, or a failure of
-    /// the transport — takes it away again. The answer is mapped as rmcp's own
+    /// The request is handed over when rmcp accepts it onto its own queue —
+    /// the closest point this client can observe; the wire write follows on
+    /// rmcp's worker. A deadline that drops this future while it waits leaves
+    /// `progress` at [`CallProgress::AwaitingAnswer`], with the id a
+    /// cancellation needs; any end of the wait moves it to
+    /// [`CallProgress::WaitEnded`]. The answer is mapped as rmcp's own
     /// `call_tool_once` maps it.
     pub(crate) async fn call_tool(
         &self,
         params: CallToolRequestParams,
-        in_flight: &mut Option<RequestId>,
+        progress: &mut CallProgress,
     ) -> Result<CallToolResponse, ServiceError> {
         let handle = self
             .peer()
@@ -380,9 +418,16 @@ impl McpClientSession {
                 PeerRequestOptions::no_options(),
             )
             .await?;
-        *in_flight = Some(handle.id.clone());
+        let handed_over = tokio::time::Instant::now();
+        *progress = CallProgress::AwaitingAnswer {
+            request: handle.id.clone(),
+            handed_over,
+        };
         let answer = handle.await_response().await;
-        *in_flight = None;
+        *progress = CallProgress::WaitEnded {
+            handed_over,
+            answered: matches!(answer, Ok(_) | Err(ServiceError::McpError(_))),
+        };
         match answer? {
             ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
             ServerResult::InputRequiredResult(result) => {
@@ -406,12 +451,16 @@ impl McpClientSession {
     /// notification and the close share [`SESSION_CLOSE_BOUND`], so a session
     /// that cancels is closed no later than one that does not, and a server
     /// that never takes the notification costs the close's bound and no more.
-    pub(crate) async fn cancel_and_close(mut self, request: RequestId, reason: &str) {
+    ///
+    /// Answers whether the cancellation was issued: rmcp accepted it within
+    /// the bound. Never that the server received or honoured it.
+    pub(crate) async fn cancel_and_close(mut self, request: RequestId, reason: &str) -> bool {
         let bound = tokio::time::Instant::now() + SESSION_CLOSE_BOUND;
         let notice = CancelledNotificationParam::new(Some(request), Some(reason.to_string()));
-        let _ = tokio::time::timeout_at(bound, self.peer().notify_cancelled(notice)).await;
+        let notified = tokio::time::timeout_at(bound, self.peer().notify_cancelled(notice)).await;
         let left = bound.saturating_duration_since(tokio::time::Instant::now());
         let _ = self.running.close_with_timeout(left).await;
+        matches!(notified, Ok(Ok(())))
     }
 
     /// Cancels the session and waits, for at most a few seconds, for its

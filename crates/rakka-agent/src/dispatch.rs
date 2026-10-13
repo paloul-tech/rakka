@@ -99,6 +99,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rakka_agent_workflow::substrate::{
     OutboxCommand, OutboxMessageId, OutboxStatus, RetryPolicy, WorkflowClock, WorkflowState,
@@ -121,8 +122,8 @@ use crate::definition::{
 use crate::effect::{
     compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentMemoryPromotionRequest,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
-    AgentRunEffectSink, AgentRunEffectStatus, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
-    ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
+    AgentRunEffectSink, AgentRunEffectStatus, AgentUnknownOutcomeEvidence,
+    AGENT_MEMORY_PROMOTION_MAX_ENTRIES, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
 };
 use crate::identity::{AgentIdentityError, AgentRunScope, AgentScope};
 use crate::memory::{
@@ -238,6 +239,22 @@ fn collaborator_code(error: &AgentDispatchError) -> String {
         | AgentDispatchError::Definitive { code, .. } => bounded_failure_code(code),
         other => other.code().to_string(),
     }
+}
+
+/// The durable evidence of a report, on the dispatcher's clock: the send
+/// time is the invocation's start plus the executor's offset, in whole
+/// milliseconds and saturating. `None` when the report knows neither a send
+/// time nor a cancellation, so a record gains no empty object.
+fn unknown_outcome_evidence(
+    report: &AgentUnknownOutcomeReport,
+    invoked_at: AgentTimestampMillis,
+) -> Option<AgentUnknownOutcomeEvidence> {
+    let sent_at = report.handed_over_after.map(|after| {
+        let after_ms = u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
+        AgentTimestampMillis::new(invoked_at.as_millis().saturating_add(after_ms))
+    });
+    (sent_at.is_some() || report.cancellation_issued)
+        .then(|| AgentUnknownOutcomeEvidence::new(sent_at, report.cancellation_issued))
 }
 
 /// Which decision failed an attempt, when a collaborator decided it: the
@@ -3121,7 +3138,14 @@ where
         // the durable `Started` write, so a segment exists exactly when an
         // invocation may have happened — which is the window that decides
         // whether an outcome is indeterminate.
-        let attempt_timer = AgentSegmentTimer::start(self.now());
+        // Read once, here, just before the executor runs: it anchors both the
+        // attempt segment and an unknown outcome's send time, which an
+        // executor reports as an offset from its own start of the call. It is
+        // deliberately not `attempt_started_at` above, the deadline stamp
+        // taken before credential resolution: anchoring there would move the
+        // recorded send time earlier by however long the resolver took.
+        let invoked_at = self.now();
+        let attempt_timer = AgentSegmentTimer::start(invoked_at);
         let invoked = self
             .invoke(scope, attempt_intent, &granted, credential.as_ref())
             .await;
@@ -3177,7 +3201,9 @@ where
             Ok(outcome) => outcome,
             Err(error @ AgentDispatchError::OutcomeUnknown { .. }) => {
                 return self
-                    .settle_unknown_outcome(scope, claim, state, intent, attempt, &error, pass)
+                    .settle_unknown_outcome(
+                        scope, claim, state, intent, attempt, invoked_at, &error, pass,
+                    )
                     .await;
             }
             Err(error) => {
@@ -3319,10 +3345,16 @@ where
         state: &AgentRunState,
         intent: &AgentRunEffect,
         attempt: u32,
+        invoked_at: AgentTimestampMillis,
         error: &AgentDispatchError,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
-        let AgentDispatchError::OutcomeUnknown { code, message } = error else {
+        let AgentDispatchError::OutcomeUnknown {
+            code,
+            message,
+            report,
+        } = error
+        else {
             unreachable!("only an unknown outcome is settled here");
         };
         match intent.safety.class() {
@@ -3356,8 +3388,20 @@ where
                 .await
             }
             AgentEffectSafetyClass::NonIdempotent => {
-                self.park_indeterminate(scope, claim, intent, attempt, code, message, pass)
-                    .await
+                // Only the park records what the executor knew: a retried
+                // attempt is replaced by the next one, and a reconciler's park
+                // records the reconciler's own code.
+                let (reason, evidence) = match report.as_deref() {
+                    Some(report) => (
+                        report.reason.clone(),
+                        unknown_outcome_evidence(report, invoked_at),
+                    ),
+                    None => (None, None),
+                };
+                self.park_indeterminate_with(
+                    scope, claim, intent, attempt, code, message, reason, evidence, pass,
+                )
+                .await
             }
         }
     }
@@ -3571,8 +3615,8 @@ where
         }
     }
 
-    /// Parks one generation as indeterminate and revokes its dispatch
-    /// eligibility.
+    /// Parks one generation as indeterminate, with nothing known beyond its
+    /// code, and revokes its dispatch eligibility.
     #[allow(clippy::too_many_arguments)]
     async fn park_indeterminate(
         &mut self,
@@ -3584,6 +3628,27 @@ where
         message: &str,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
+        self.park_indeterminate_with(
+            scope, claim, intent, attempt, code, message, None, None, pass,
+        )
+        .await
+    }
+
+    /// Parks one generation as indeterminate with what is known about it, and
+    /// revokes its dispatch eligibility.
+    #[allow(clippy::too_many_arguments)]
+    async fn park_indeterminate_with(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: AgentDispatchClaim,
+        intent: &AgentRunEffect,
+        attempt: u32,
+        code: &str,
+        message: &str,
+        reason: Option<crate::failure::AgentFailureReason>,
+        evidence: Option<AgentUnknownOutcomeEvidence>,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
         let timer = AgentSegmentTimer::start(self.now());
         self.deliver_outcome(
             scope,
@@ -3593,10 +3658,12 @@ where
             // Bounded here rather than at the callers: one of them composes
             // this message from an application refusal, and a bound that
             // depends on every caller remembering it is not a bound.
-            AgentRunEffectOutcome::Indeterminate {
-                code: bounded_failure_code(code),
-                message: bounded_failure_detail(message),
-            },
+            AgentRunEffectOutcome::indeterminate(
+                bounded_failure_code(code),
+                bounded_failure_detail(message),
+            )
+            .with_reason(reason)
+            .with_evidence(evidence),
             pass,
         )
         .await?;
@@ -4593,6 +4660,59 @@ where
     }
 }
 
+/// What an executor knows about an attempt whose outcome is unknown,
+/// attached to [`AgentDispatchError::OutcomeUnknown`] with
+/// [`AgentDispatchError::with_report`].
+///
+/// Observability only: the dispatcher settles the attempt by the intent's
+/// safety class exactly as it would without a report, and a non-idempotent
+/// park records the report — the reason as the effect's failure reason,
+/// the rest as [`crate::effect::AgentUnknownOutcomeEvidence`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct AgentUnknownOutcomeReport {
+    /// Which situation made the outcome unknown: the executor's own stable
+    /// code.
+    pub reason: Option<crate::failure::AgentFailureReason>,
+    /// How long after the attempt began the request was handed over,
+    /// measured on a monotonic clock. `None` when it never was. The
+    /// dispatcher adds it to the attempt's start on its own clock.
+    pub handed_over_after: Option<Duration>,
+    /// Whether a cancellation was issued for the request: accepted by the
+    /// client, never known to be received or honoured.
+    pub cancellation_issued: bool,
+}
+
+impl AgentUnknownOutcomeReport {
+    /// A report that knows nothing yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Names the situation. A blank code identifies nothing and sets no
+    /// reason.
+    #[must_use]
+    pub fn with_reason(mut self, code: impl AsRef<str>) -> Self {
+        self.reason = crate::failure::AgentFailureReason::new(code);
+        self
+    }
+
+    /// Records how long after the attempt began the request was handed over.
+    #[must_use]
+    pub fn with_handed_over_after(mut self, after: Duration) -> Self {
+        self.handed_over_after = Some(after);
+        self
+    }
+
+    /// Records whether a cancellation was issued for the request.
+    #[must_use]
+    pub fn with_cancellation_issued(mut self, issued: bool) -> Self {
+        self.cancellation_issued = issued;
+        self
+    }
+}
+
 /// Rejection of a dispatch pipeline operation.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -4650,16 +4770,20 @@ pub enum AgentDispatchError {
         message: String,
     },
     /// The attempt may have invoked the target and its outcome is unknown:
-    /// the request left and no answer was read. The dispatcher settles it by
+    /// no answer was read. The dispatcher settles it by
     /// the intent's safety class, as it settles an attempt whose worker died
     /// after `Started`
     /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
+    #[non_exhaustive]
     OutcomeUnknown {
         /// Stable machine-readable code: the executor's own.
         code: &'static str,
         /// The failure detail. It becomes durable state: no credential,
         /// argument, or content material.
         message: String,
+        /// What the executor knew about the attempt, when it said
+        /// ([`Self::with_report`]). Observability only.
+        report: Option<Box<AgentUnknownOutcomeReport>>,
     },
 }
 
@@ -4705,6 +4829,26 @@ impl AgentDispatchError {
         Self::OutcomeUnknown {
             code,
             message: message.into(),
+            report: None,
+        }
+    }
+
+    /// Attaches what the executor knew to an unknown outcome. Every other
+    /// error is returned unchanged.
+    #[must_use]
+    pub fn with_report(mut self, found: AgentUnknownOutcomeReport) -> Self {
+        if let Self::OutcomeUnknown { report, .. } = &mut self {
+            *report = Some(Box::new(found));
+        }
+        self
+    }
+
+    /// What the executor knew about an unknown outcome, when it said.
+    #[must_use]
+    pub fn unknown_outcome_report(&self) -> Option<&AgentUnknownOutcomeReport> {
+        match self {
+            Self::OutcomeUnknown { report, .. } => report.as_deref(),
+            _ => None,
         }
     }
 }
@@ -4734,7 +4878,7 @@ impl Display for AgentDispatchError {
                     "a dispatch collaborator refused definitively ({code}): {message}"
                 )
             }
-            Self::OutcomeUnknown { code, message } => {
+            Self::OutcomeUnknown { code, message, .. } => {
                 write!(f, "the invocation's outcome is unknown ({code}): {message}")
             }
         }

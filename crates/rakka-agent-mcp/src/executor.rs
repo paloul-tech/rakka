@@ -50,14 +50,14 @@ use std::time::{Duration, Instant};
 use rakka_agent::{
     AgentContentDigest, AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor,
     AgentRunEffect, AgentRunScope, AgentTaskContent, AgentToolCallRequest, AgentToolId,
-    AgentToolResultBehavior,
+    AgentToolResultBehavior, AgentUnknownOutcomeReport,
 };
 use rakka_agent_workflow::{
     validate_artifact_ref, AgentArtifactStore, AgentArtifactWriteRequest, AgentEphemeralCredential,
     ArtifactKind, RedactionStatus,
 };
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, MetaObject, RequestId,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, MetaObject,
     RequestMetaObject,
 };
 use rmcp::service::ServiceError;
@@ -72,7 +72,7 @@ use crate::binding::{
     MCP_INLINE_RESULT_MAX_BYTES, MCP_LIST_PAGES_MAX, MCP_META_IDEMPOTENCY_KEY,
     MCP_TOOL_ERROR_DETAIL_MAX_BYTES,
 };
-use crate::client::{self, McpClientError, McpClientSession, McpEgressCheck};
+use crate::client::{self, CallProgress, McpClientError, McpClientSession, McpEgressCheck};
 use crate::launcher::McpChildProcessLauncher;
 use crate::sync::{McpDescriptorSet, McpSyncedDescriptor};
 
@@ -411,15 +411,16 @@ where
         // the network: the handshake and the call (the recheck's listing runs
         // inside the call's window) spend the same budget rather than one
         // each.
+        let started = tokio::time::Instant::now();
         let deadline = attempt_deadline(intent, self.attempt_timeout_default_ms);
         // The material the server receives with this attempt, and so could
         // echo back into anything it answers.
         let secrets = client::credential_secrets(credential);
         let session = within(deadline, self.open(scope, &server.binding, credential)).await??;
-        // The id of a sent `tools/call` still waiting for its answer. A
-        // deadline that drops the call while it waits leaves it here, so the
-        // server can be told the call was abandoned.
-        let mut in_flight = None;
+        // How far the call got. A deadline that drops the call while it waits
+        // leaves it at `AwaitingAnswer`, so the server can be told the call
+        // was abandoned; every unknown outcome is named by it.
+        let mut progress = CallProgress::NotHandedOver;
         // The recheck's listing runs before the send and the call from it on,
         // both under the attempt's one deadline: what an elapsed deadline
         // means depends on which side of the send it fired.
@@ -429,7 +430,7 @@ where
                 self.recheck(&session, server, descriptor, &call.tool),
             )
             .await??;
-            within_after_send(
+            let called = tokio::time::timeout_at(
                 deadline,
                 self.call(
                     &session,
@@ -440,10 +441,23 @@ where
                     intent,
                     call,
                     &secrets,
-                    &mut in_flight,
+                    &mut progress,
+                    started,
                 ),
             )
-            .await?
+            .await;
+            match called {
+                Ok(result) => result,
+                // Past the recheck the request may have been handed over, so a
+                // deadline here leaves the outcome unknown rather than failing
+                // the attempt.
+                Err(_) => Err(unknown_outcome(
+                    UnknownCause::Deadline,
+                    &progress,
+                    started,
+                    "the attempt exceeded the effect's timeout during tools/call",
+                )),
+            }
         }
         .await;
         // Unconditional, and outside the effect's deadline: a close is owed on
@@ -451,15 +465,22 @@ where
         // bounded on its own terms by `McpClientSession::close`, and a call the
         // deadline abandoned is cancelled inside that same bound first (issue
         // #85, ask 6): the outcome stays unknown, but the server can stop.
-        match in_flight {
-            Some(request) => {
+        let cancellation_issued = match progress {
+            CallProgress::AwaitingAnswer { request, .. } => {
                 session
                     .cancel_and_close(request, DEADLINE_CANCEL_REASON)
-                    .await;
+                    .await
             }
-            None => session.close().await,
+            _ => {
+                session.close().await;
+                false
+            }
+        };
+        if cancellation_issued {
+            outcome.map_err(cancellation_issued_on)
+        } else {
+            outcome
         }
-        outcome
     }
 
     /// Opens the attempt's client.
@@ -538,7 +559,8 @@ where
         intent: &AgentRunEffect,
         call: &AgentToolCallRequest,
         secrets: &[&str],
-        in_flight: &mut Option<RequestId>,
+        progress: &mut CallProgress,
+        started: tokio::time::Instant,
     ) -> Result<AgentTaskContent, AgentDispatchError> {
         let Some(arguments) = call.arguments.as_object().cloned() else {
             return Err(AgentDispatchError::collaborator(
@@ -551,10 +573,10 @@ where
         params.meta = Some(call_meta(intent));
         // No timeout of its own: the attempt's deadline wraps this whole
         // function, recheck included.
-        let answer = session
-            .call_tool(params, in_flight)
-            .await
-            .map_err(|error| sent_call_error(server.binding.server_id.as_str(), &error))?;
+        let answer = session.call_tool(params, progress).await;
+        let answer = answer.map_err(|error| {
+            sent_call_error(server.binding.server_id.as_str(), &error, progress, started)
+        })?;
         self.content(scope, policy, &call.tool, intent, call, answer, secrets)
             .await
     }
@@ -914,39 +936,101 @@ async fn within<T>(
 /// answer was never read: the server may have acted.
 const MCP_OUTCOME_UNKNOWN: &str = "mcp-outcome-unknown";
 
+/// The reason an unknown outcome records when rmcp never accepted the
+/// request: it provably never left, yet the attempt still parks (issue #100
+/// ask 5 records it; changing that is a separate follow-up).
+const MCP_CALL_NOT_HANDED_OVER: &str = "mcp-call-not-handed-over";
+
+/// The reason when the deadline fired while the attempt waited for the
+/// answer to a request it handed over.
+const MCP_DEADLINE_AWAITING_ANSWER: &str = "mcp-deadline-awaiting-answer";
+
+/// The reason when the transport failed after the hand-off, with no answer
+/// read.
+const MCP_TRANSPORT_AWAITING_ANSWER: &str = "mcp-transport-awaiting-answer";
+
+/// The reason when the server answered and its answer was not recorded: the
+/// deadline fired while the answer was mapped or stored, or the answer was
+/// of a kind `tools/call` never returns.
+const MCP_ANSWER_NOT_RECORDED: &str = "mcp-answer-not-recorded";
+
+/// What ended an attempt whose outcome is unknown.
+#[derive(Debug, Clone, Copy)]
+enum UnknownCause {
+    /// The attempt's deadline.
+    Deadline,
+    /// Anything but the deadline that left no answer recorded: a failure of
+    /// the transport or the session, or an answer of a kind `tools/call`
+    /// never returns.
+    Transport,
+}
+
+/// The reason an unknown outcome records: decided by how far the call got,
+/// never by which wrapper noticed.
+fn unknown_reason(cause: UnknownCause, progress: &CallProgress) -> &'static str {
+    match progress {
+        CallProgress::NotHandedOver => MCP_CALL_NOT_HANDED_OVER,
+        CallProgress::AwaitingAnswer { .. } => match cause {
+            UnknownCause::Deadline => MCP_DEADLINE_AWAITING_ANSWER,
+            UnknownCause::Transport => MCP_TRANSPORT_AWAITING_ANSWER,
+        },
+        CallProgress::WaitEnded { answered: true, .. } => MCP_ANSWER_NOT_RECORDED,
+        CallProgress::WaitEnded {
+            answered: false, ..
+        } => MCP_TRANSPORT_AWAITING_ANSWER,
+    }
+}
+
+/// The unknown outcome of an attempt that got as far as `progress`, with
+/// the report a park records: the reason, and the hand-off's offset from
+/// `started` when there was one. The cancellation is the close's to add
+/// ([`cancellation_issued_on`]).
+fn unknown_outcome(
+    cause: UnknownCause,
+    progress: &CallProgress,
+    started: tokio::time::Instant,
+    message: impl Into<String>,
+) -> AgentDispatchError {
+    let mut report = AgentUnknownOutcomeReport::new().with_reason(unknown_reason(cause, progress));
+    if let Some(at) = progress.handed_over() {
+        report = report.with_handed_over_after(at.saturating_duration_since(started));
+    }
+    AgentDispatchError::outcome_unknown(MCP_OUTCOME_UNKNOWN, message).with_report(report)
+}
+
+/// Marks an unknown outcome's report with the cancellation the close issued.
+/// Every other error is returned unchanged.
+fn cancellation_issued_on(error: AgentDispatchError) -> AgentDispatchError {
+    match error.unknown_outcome_report().cloned() {
+        Some(report) => error.with_report(report.with_cancellation_issued(true)),
+        None => error,
+    }
+}
+
 /// The reason an attempt gives the server, with `notifications/cancelled`,
 /// for a `tools/call` its deadline stopped it waiting for.
 const DEADLINE_CANCEL_REASON: &str = "the attempt's deadline elapsed";
 
-/// Runs the part of the attempt from the send of `tools/call` on, under the
-/// same deadline as [`within`].
-///
-/// Past the send the server may have acted, so a deadline that elapses here
-/// leaves the outcome unknown rather than failing the attempt.
-async fn within_after_send<T>(
-    deadline: tokio::time::Instant,
-    work: impl Future<Output = T>,
-) -> Result<T, AgentDispatchError> {
-    tokio::time::timeout_at(deadline, work).await.map_err(|_| {
-        AgentDispatchError::outcome_unknown(
-            MCP_OUTCOME_UNKNOWN,
-            "the attempt exceeded the effect's timeout after tools/call was sent",
-        )
-    })
-}
-
 /// Maps a failed `tools/call` onto the dispatch pipeline's error.
 ///
-/// The request was sent, so a failure that left no answer to read leaves the
-/// outcome unknown. A JSON-RPC error is the server's own answer — it told us
-/// what it did — and keeps the mapping a failure before the send gets.
-fn sent_call_error(server: &str, error: &ServiceError) -> AgentDispatchError {
+/// A JSON-RPC error is the server's own answer — it told us what it did —
+/// and keeps the mapping a failure before the send gets. Every other failure
+/// left no answer recorded, so the outcome is unknown and named by how far
+/// the call got.
+fn sent_call_error(
+    server: &str,
+    error: &ServiceError,
+    progress: &CallProgress,
+    started: tokio::time::Instant,
+) -> AgentDispatchError {
     let mapped = client::service_error(server, error);
     match error {
         ServiceError::McpError(_) => dispatch_error(mapped),
-        _ => AgentDispatchError::outcome_unknown(
-            MCP_OUTCOME_UNKNOWN,
-            format!("tools/call was sent and no answer was read: {mapped}"),
+        _ => unknown_outcome(
+            UnknownCause::Transport,
+            progress,
+            started,
+            format!("tools/call ended without a recorded answer: {mapped}"),
         ),
     }
 }
@@ -1163,27 +1247,29 @@ fn dispatch_error(error: McpClientError) -> AgentDispatchError {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use rakka_agent::{
-        AgentContentDigest, AgentEffectSafetyClass, AgentRevisionNumber, AgentSchemaId,
-        AgentSchemaRef, AgentToolBinding, AgentToolDeclaration, AgentToolDescriptor, AgentToolId,
-        AgentToolKind,
+        AgentContentDigest, AgentDispatchError, AgentEffectSafetyClass, AgentFailureReason,
+        AgentRevisionNumber, AgentSchemaId, AgentSchemaRef, AgentToolBinding, AgentToolDeclaration,
+        AgentToolDescriptor, AgentToolId, AgentToolKind,
     };
     use rakka_agent_workflow::{
         AgentArtifactError, AgentArtifactRead, AgentArtifactStore, AgentArtifactStoreFuture,
         AgentArtifactWriteRequest, AgentTimestampMillis, ArtifactRef,
     };
-    use rmcp::model::{CallToolResult, ContentBlock};
+    use rmcp::model::{CallToolResult, ContentBlock, RequestId};
     use serde_json::json;
 
     use super::{
-        bounded_detail, candidate_of, error_detail, mcp_artifact_store, redact_json_text,
-        redact_value, McpArtifactStore, McpDispatchToolExecutor,
+        bounded_detail, cancellation_issued_on, candidate_of, error_detail, mcp_artifact_store,
+        redact_json_text, redact_value, unknown_outcome, McpArtifactStore, McpDispatchToolExecutor,
+        UnknownCause,
     };
     use crate::binding::{
         McpServerBinding, McpServerId, McpToolPolicy, MCP_TOOL_ERROR_DETAIL_MAX_BYTES,
     };
-    use crate::client::McpAllowAllEgress;
+    use crate::client::{CallProgress, McpAllowAllEgress};
     use crate::sync::{McpDescriptorSet, McpSyncedDescriptor};
 
     /// A store no construction proof ever writes to: every one of them refuses
@@ -1460,5 +1546,118 @@ mod tests {
             redact_json_text(&encoded, &[secret]),
             r#"{"text":"<redacted>"}"#
         );
+    }
+
+    /// Review focus 5 and the spec's table: every progress state against both
+    /// causes names the situation by how far the call got, reports the
+    /// hand-off offset when there was one, and never claims a cancellation.
+    #[test]
+    fn an_unknown_outcome_is_named_by_how_far_the_call_got() {
+        let started = tokio::time::Instant::now();
+        let handed_over = started + Duration::from_millis(40);
+        let awaiting = CallProgress::AwaitingAnswer {
+            request: RequestId::Number(7),
+            handed_over,
+        };
+        let cases = [
+            (
+                CallProgress::NotHandedOver,
+                UnknownCause::Deadline,
+                "mcp-call-not-handed-over",
+                None,
+            ),
+            (
+                CallProgress::NotHandedOver,
+                UnknownCause::Transport,
+                "mcp-call-not-handed-over",
+                None,
+            ),
+            (
+                awaiting.clone(),
+                UnknownCause::Deadline,
+                "mcp-deadline-awaiting-answer",
+                Some(40),
+            ),
+            (
+                awaiting,
+                UnknownCause::Transport,
+                "mcp-transport-awaiting-answer",
+                Some(40),
+            ),
+            (
+                CallProgress::WaitEnded {
+                    handed_over,
+                    answered: false,
+                },
+                UnknownCause::Transport,
+                "mcp-transport-awaiting-answer",
+                Some(40),
+            ),
+            (
+                CallProgress::WaitEnded {
+                    handed_over,
+                    answered: false,
+                },
+                UnknownCause::Deadline,
+                "mcp-transport-awaiting-answer",
+                Some(40),
+            ),
+            (
+                CallProgress::WaitEnded {
+                    handed_over,
+                    answered: true,
+                },
+                UnknownCause::Deadline,
+                "mcp-answer-not-recorded",
+                Some(40),
+            ),
+            (
+                CallProgress::WaitEnded {
+                    handed_over,
+                    answered: true,
+                },
+                UnknownCause::Transport,
+                "mcp-answer-not-recorded",
+                Some(40),
+            ),
+        ];
+        for (progress, cause, code, after_ms) in cases {
+            let error = unknown_outcome(cause, &progress, started, "detail");
+            assert_eq!(
+                error.code(),
+                "mcp-outcome-unknown",
+                "{progress:?} {cause:?}"
+            );
+            let report = error.unknown_outcome_report().expect("a report");
+            assert_eq!(
+                report.reason.as_ref().map(AgentFailureReason::code),
+                Some(code),
+                "{progress:?} {cause:?}"
+            );
+            assert_eq!(
+                report.handed_over_after,
+                after_ms.map(Duration::from_millis),
+                "{progress:?} {cause:?}"
+            );
+            assert!(!report.cancellation_issued, "{progress:?} {cause:?}");
+        }
+    }
+
+    /// The close's cancellation lands on the unknown outcome's report, and
+    /// nowhere else.
+    #[test]
+    fn an_issued_cancellation_marks_only_an_unknown_outcome() {
+        let started = tokio::time::Instant::now();
+        let marked = cancellation_issued_on(unknown_outcome(
+            UnknownCause::Deadline,
+            &CallProgress::NotHandedOver,
+            started,
+            "detail",
+        ));
+        assert!(marked
+            .unknown_outcome_report()
+            .is_some_and(|report| report.cancellation_issued));
+        let other = cancellation_issued_on(AgentDispatchError::collaborator("c", "m"));
+        assert_eq!(other.unknown_outcome_report(), None);
     }
 }

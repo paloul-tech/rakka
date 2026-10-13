@@ -7,9 +7,10 @@ mod common;
 use common::run_scope;
 use rakka_agent::{
     AgentDelegationStatus, AgentEffectSpec, AgentFailureReason, AgentGuardrailStageId,
-    AgentHandoffStatus, AgentRevisionNumber, AgentRunEffect, AgentRunEffectRequest,
-    AgentRunTerminalReason, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    AGENT_FAILURE_REASON_CODE_MAX_LENGTH, AGENT_IDENTITY_MAX_LENGTH,
+    AgentHandoffStatus, AgentRevisionNumber, AgentRunEffect, AgentRunEffectOutcome,
+    AgentRunEffectRequest, AgentRunTerminalReason, AgentToolCallId, AgentToolCallRequest,
+    AgentToolId, AgentUnknownOutcomeEvidence, AGENT_FAILURE_REASON_CODE_MAX_LENGTH,
+    AGENT_IDENTITY_MAX_LENGTH,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 use serde::de::DeserializeOwned;
@@ -241,4 +242,98 @@ fn a_maximal_reason_is_bounded() {
         bytes <= AGENT_IDENTITY_MAX_LENGTH + AGENT_FAILURE_REASON_CODE_MAX_LENGTH + 32,
         "a reason costs a record at most its two bounds and its keys: {bytes}"
     );
+}
+
+/// Issue #100 ask 5: the indeterminate outcome's reason and evidence are
+/// additive — an outcome encoded before them decodes with neither, an
+/// outcome without them encodes without the keys, and one with them
+/// round-trips.
+#[test]
+fn the_indeterminate_outcomes_evidence_is_additive() {
+    let before = json!({
+        "indeterminate": {"code": "mcp-outcome-unknown", "message": "lost"}
+    });
+    let decoded: AgentRunEffectOutcome =
+        serde_json::from_value(before.clone()).expect("an older encoding decodes");
+    assert_eq!(decoded.failure_reason(), None);
+    assert_eq!(decoded.unknown_outcome_evidence(), None);
+    assert_eq!(
+        serde_json::to_value(&decoded).expect("encodes"),
+        before,
+        "an outcome without the fields encodes exactly as before"
+    );
+
+    let with = AgentRunEffectOutcome::indeterminate("mcp-outcome-unknown", "lost")
+        .with_reason(AgentFailureReason::new("mcp-deadline-awaiting-answer"))
+        .with_evidence(Some(AgentUnknownOutcomeEvidence::new(
+            Some(AgentTimestampMillis::new(4_242)),
+            true,
+        )));
+    let encoded = serde_json::to_value(&with).expect("encodes");
+    assert_eq!(
+        body(&encoded, "indeterminate").get("reason"),
+        Some(&json!({"code": "mcp-deadline-awaiting-answer"}))
+    );
+    assert_eq!(
+        body(&encoded, "indeterminate").get("evidence"),
+        Some(&json!({"sent_at": 4_242, "cancellation_issued": true}))
+    );
+    assert_eq!(
+        serde_json::from_value::<AgentRunEffectOutcome>(encoded).expect("decodes"),
+        with
+    );
+}
+
+/// Issue #100 ask 5: evidence with nothing set writes neither key, and an
+/// unset cancellation is never written as `false`.
+#[test]
+fn unset_evidence_fields_are_left_out() {
+    let empty = serde_json::to_value(AgentUnknownOutcomeEvidence::default()).expect("encodes");
+    assert_eq!(empty, json!({}));
+    let sent_only = serde_json::to_value(AgentUnknownOutcomeEvidence::new(
+        Some(AgentTimestampMillis::new(7)),
+        false,
+    ))
+    .expect("encodes");
+    assert_eq!(sent_only, json!({"sent_at": 7}));
+}
+
+/// Issue #100 ask 5: the effect record's evidence is additive, and a new
+/// generation does not inherit the superseded generation's evidence.
+#[test]
+fn the_effect_records_evidence_is_additive_and_cleared_by_a_new_generation() {
+    let plain = effect();
+    let encoded = serde_json::to_value(&plain).expect("encodes");
+    assert!(
+        !encoded
+            .as_object()
+            .expect("an object")
+            .contains_key("unknown_outcome"),
+        "{encoded}"
+    );
+    assert_eq!(
+        serde_json::from_value::<AgentRunEffect>(encoded).expect("decodes"),
+        plain,
+        "an effect without evidence decodes back with none"
+    );
+
+    let mut parked = effect();
+    parked.unknown_outcome = Some(AgentUnknownOutcomeEvidence::new(
+        Some(AgentTimestampMillis::new(9)),
+        true,
+    ));
+    let encoded = serde_json::to_value(&parked).expect("encodes");
+    assert_eq!(
+        encoded.get("unknown_outcome"),
+        Some(&json!({"sent_at": 9, "cancellation_issued": true}))
+    );
+    assert_eq!(
+        serde_json::from_value::<AgentRunEffect>(encoded).expect("decodes"),
+        parked
+    );
+
+    parked
+        .begin_next_generation(&run_scope(), AgentTimestampMillis::new(10))
+        .expect("the next generation begins");
+    assert_eq!(parked.unknown_outcome, None);
 }

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use rakka_agent::{
     AgentAuthorityRefusal, AgentContentDigest, AgentDispatchError, AgentDispatchToolExecutor,
-    AgentEffectSafetyClass, AgentTaskContent, AgentToolCallId, AgentToolCallRequest,
-    AgentToolDeclaration, AgentToolId, AgentToolResultBehavior,
+    AgentEffectSafetyClass, AgentFailureReason, AgentTaskContent, AgentToolCallId,
+    AgentToolCallRequest, AgentToolDeclaration, AgentToolId, AgentToolResultBehavior,
 };
 use rakka_agent_mcp::testkit::{
     hardened_reqwest_client, serve_fake, CountingClient, FakeMcpServer, FakeTool,
@@ -944,6 +944,23 @@ async fn a_timeout_after_the_call_was_sent_leaves_the_outcome_unknown() {
         1,
         "the server received the call"
     );
+    let report = error
+        .unknown_outcome_report()
+        .expect("the executor said what it knew");
+    assert_eq!(
+        report.reason.as_ref().map(AgentFailureReason::code),
+        Some("mcp-deadline-awaiting-answer")
+    );
+    assert!(
+        report
+            .handed_over_after
+            .is_some_and(|after| after < Duration::from_millis(200)),
+        "handed over inside the timeout: {report:?}"
+    );
+    assert!(
+        report.cancellation_issued,
+        "a call the deadline abandoned is cancelled: {report:?}"
+    );
 }
 
 /// The echo tool alone, bound on `url`.
@@ -1211,6 +1228,18 @@ async fn a_transport_failure_after_the_call_was_sent_leaves_the_outcome_unknown(
         "{error:?}"
     );
     assert_eq!(endpoint.server.call_count(), 1, "the tool ran");
+    let report = error
+        .unknown_outcome_report()
+        .expect("the executor said what it knew");
+    assert_eq!(
+        report.reason.as_ref().map(AgentFailureReason::code),
+        Some("mcp-transport-awaiting-answer")
+    );
+    assert!(report.handed_over_after.is_some(), "{report:?}");
+    assert!(
+        !report.cancellation_issued,
+        "a broken transport has no session to cancel on"
+    );
 }
 
 #[tokio::test]
@@ -1345,6 +1374,23 @@ async fn abandon_slow_call(executor: &McpDispatchToolExecutor<ReqwestClient>) {
             }
         ),
         "a cancellation is advisory, so the outcome stays unknown: {error:?}"
+    );
+    let report = error
+        .unknown_outcome_report()
+        .expect("the executor said what it knew");
+    assert_eq!(
+        report.reason.as_ref().map(AgentFailureReason::code),
+        Some("mcp-deadline-awaiting-answer")
+    );
+    assert!(
+        report
+            .handed_over_after
+            .is_some_and(|after| after < Duration::from_millis(200)),
+        "handed over inside the timeout: {report:?}"
+    );
+    assert!(
+        report.cancellation_issued,
+        "the cancellation was issued, whatever the protocol revision carries it as: {report:?}"
     );
 }
 
