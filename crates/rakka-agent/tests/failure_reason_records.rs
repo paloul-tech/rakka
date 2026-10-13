@@ -89,15 +89,87 @@ fn the_terminal_reason_is_additive() {
             effect_id: effect_id.clone(),
             code: "guardrail-blocked".to_string(),
             reason: None,
+            attempts: None,
+            max_attempts: None,
         },
         &AgentRunTerminalReason::EffectFailed {
             effect_id,
             code: "guardrail-blocked".to_string(),
             reason: Some(reason()),
+            attempts: None,
+            max_attempts: None,
         },
         "effect-failed",
         "reason",
     );
+}
+
+/// Issue #100 ask 3: the failing effect's attempt counts are additive on the
+/// terminal reason — absent from a record written before them, and from one
+/// that has none, and round-tripping when present.
+#[test]
+fn the_terminal_reasons_attempt_counts_are_additive() {
+    let effect_id = effect().effect_id;
+    let without = AgentRunTerminalReason::EffectFailed {
+        effect_id: effect_id.clone(),
+        code: "dispatch-collaborator-failed".to_string(),
+        reason: None,
+        attempts: None,
+        max_attempts: None,
+    };
+    let with = AgentRunTerminalReason::EffectFailed {
+        effect_id,
+        code: "dispatch-collaborator-failed".to_string(),
+        reason: None,
+        attempts: Some(1),
+        max_attempts: Some(3),
+    };
+    let encoded = serde_json::to_value(&without).expect("encodes");
+    for field in ["attempts", "max_attempts"] {
+        assert!(
+            !body(&encoded, "effect-failed").contains_key(field),
+            "{field} is not written when it is absent: {encoded}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_value::<AgentRunTerminalReason>(encoded).expect("decodes"),
+        without
+    );
+    let encoded = serde_json::to_value(&with).expect("encodes");
+    assert_eq!(
+        body(&encoded, "effect-failed").get("attempts"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        body(&encoded, "effect-failed").get("max_attempts"),
+        Some(&json!(3))
+    );
+    assert_eq!(
+        serde_json::from_value::<AgentRunTerminalReason>(encoded).expect("decodes"),
+        with
+    );
+}
+
+/// Issue #100 ask 4: the definitive marker is additive on the reason — never
+/// written when unset, so every reason recorded before it encodes and
+/// decodes exactly as it did, and round-tripping when set.
+#[test]
+fn the_definitive_marker_is_additive() {
+    let plain = AgentFailureReason::new("egress-denied").expect("a reason");
+    let encoded = serde_json::to_value(&plain).expect("encodes");
+    assert_eq!(encoded, json!({"code": "egress-denied"}));
+    let decoded: AgentFailureReason = serde_json::from_value(encoded).expect("decodes");
+    assert!(!decoded.is_definitive());
+
+    let definitive = AgentFailureReason::definitive("egress-denied");
+    let encoded = serde_json::to_value(&definitive).expect("encodes");
+    assert_eq!(
+        encoded,
+        json!({"code": "egress-denied", "definitive": true})
+    );
+    let decoded: AgentFailureReason = serde_json::from_value(encoded).expect("decodes");
+    assert!(decoded.is_definitive());
+    assert_eq!(decoded, definitive);
 }
 
 #[test]

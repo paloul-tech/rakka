@@ -483,6 +483,14 @@ pub enum AgentRunTerminalReason {
         /// only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<crate::failure::AgentFailureReason>,
+        /// Dispatch attempts the failing generation made. Observability
+        /// only; `None` on a record written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempts: Option<u32>,
+        /// Most attempts the failing generation was allowed. Observability
+        /// only; `None` on a record written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_attempts: Option<u32>,
     },
     /// An ambiguous effect was closed by an explicitly scheduled compensation
     /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)); the run
@@ -4481,6 +4489,7 @@ fn apply_effect_outcome(
             effect.last_error_code = Some(bounded_detail(code.clone()));
             effect.last_error_reason = outcome.failure_reason().cloned();
             let failed_kind = effect.kind();
+            let (attempts, max_attempts) = (effect.attempts, effect.max_attempts);
             let code = code.clone();
             // A handoff send resolves before the shared wind-down logic: the
             // run *survives* its definitive failure — the transfer was never
@@ -4728,6 +4737,8 @@ fn apply_effect_outcome(
                         effect_id: effect_id.clone(),
                         code: bounded_detail(code),
                         reason: outcome.failure_reason().cloned(),
+                        attempts: Some(attempts),
+                        max_attempts: Some(max_attempts),
                     });
                 }
             }
@@ -10532,6 +10543,8 @@ mod tests {
                 .expect("the effect id derives"),
             code: "c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH),
             reason: Some(maximal_reason.clone()),
+            attempts: Some(u32::MAX),
+            max_attempts: Some(u32::MAX),
         });
 
         let growth = run.materialized_size_bytes().saturating_sub(baseline);

@@ -241,13 +241,17 @@ fn collaborator_code(error: &AgentDispatchError) -> String {
 }
 
 /// Which decision failed an attempt, when a collaborator decided it: the
-/// collaborator's own code. `None` for every other failure, whose pipeline
-/// code already is the whole identity.
+/// collaborator's own code, marked definitive when the collaborator said
+/// retrying cannot change its answer. `None` for every other failure, whose
+/// pipeline code already is the whole identity.
 fn collaborator_reason(error: &AgentDispatchError) -> Option<crate::failure::AgentFailureReason> {
     match error {
-        AgentDispatchError::Collaborator { .. } | AgentDispatchError::Definitive { .. } => {
+        AgentDispatchError::Collaborator { .. } => {
             crate::failure::AgentFailureReason::new(collaborator_code(error))
         }
+        AgentDispatchError::Definitive { .. } => Some(
+            crate::failure::AgentFailureReason::definitive(collaborator_code(error)),
+        ),
         _ => None,
     }
 }
@@ -4635,7 +4639,9 @@ pub enum AgentDispatchError {
     /// failure's reason exactly as a [`Self::Collaborator`] code does, and
     /// [`Self::code`] is the same pipeline code, so a definitive refusal ends
     /// in the state a retryable one reaches once its budget is spent — only
-    /// sooner.
+    /// sooner. What tells the two apart is the reason's marker
+    /// ([`crate::failure::AgentFailureReason::is_definitive`]), which only a
+    /// definitive refusal sets, even under a blank code.
     Definitive {
         /// Stable machine-readable code: the collaborator's own.
         code: String,
