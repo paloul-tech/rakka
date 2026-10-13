@@ -1,8 +1,8 @@
 # Unknown-outcome evidence: what a parked MCP effect knows about its call
 
-Status: design approved in conversation, 2026-10-13. Branch `run-evidence-unknown-outcome` off `2c9e919`. It lands after #101 (batch A), whose `AgentPendingEffectView` it extends.
+Status: spec approved, 2026-10-13. Branch `run-evidence-unknown-outcome`, rebased onto `9215a26`. That `main` carries #101 (batch A, merged as `09c6f1f`), whose `AgentPendingEffectView` this extends, and #102 (batch B, merged as `9215a26`).
 
-Brief: issue #100 (the rakka.host run-evidence brief), ask 5, drafted against `2c9e919`. Batch A (asks 1 and 2) is #101 and batch B (asks 3 and 4) is #102.
+Brief: issue #100 (the rakka.host run-evidence brief), ask 5, drafted against `2c9e919`. Batch A (asks 1 and 2) landed as #101 and batch B (asks 3 and 4) as #102.
 
 Owner rulings (2026-10-13):
 - The send time is stamped by the dispatcher, from an offset the executor reports. The MCP executor holds no clock (`rakka-agent-mcp/src/executor.rs:723`), and this keeps it that way.
@@ -94,7 +94,7 @@ The close runs after the attempt's outcome is computed (`executor.rs:449-461`), 
   - The run's indeterminate arm (`run.rs:4735-4746`) already copies `outcome.failure_reason()` into `last_error_reason`. It now also copies the evidence into `unknown_outcome`.
   - A new generation clears it, beside `last_error_code` and `last_error_reason` (`effect.rs:2012-2014`).
   - A park with no report records neither: a lost worker, the reconciler's codes, or an executor that attaches none.
-- **`AgentPendingEffectView`**, as #101 extends it, gains `unknown_outcome`, left out while unset.
+- **`AgentPendingEffectView`**, as #101 extended it, gains `unknown_outcome`, left out while unset.
 - **The run-state growth-reserve test** (`run.rs`, the maximal working set) puts maximal evidence on every effect.
 
 ## Durable and wire compatibility
@@ -139,4 +139,4 @@ Each new test is watched failing before the code exists. A falsification pass th
 
 **Validation:** `scripts/validate.sh` exits 0.
 
-**Delivery:** one PR against `main` once #101 has merged. The changelog and compatibility entries go with it. The follow-up issue for the never-sent case is filed before the PR, so the PR can link to it.
+**Delivery:** one PR against `main`. The changelog and compatibility entries go with it. The follow-up issue for the never-sent case is filed before the PR, so the PR can link to it.
