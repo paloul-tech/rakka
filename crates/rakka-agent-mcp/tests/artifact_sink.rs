@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use rakka_agent::{
     AgentContentDigest, AgentDispatchError, AgentDispatchToolExecutor, AgentEffectSafetyClass,
-    AgentRunScope, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration,
-    AgentToolId, AgentToolResultBehavior, AGENT_TOOL_RESULT_MAX_BYTES,
+    AgentFailureReason, AgentRunScope, AgentTaskContent, AgentToolCallId, AgentToolCallRequest,
+    AgentToolDeclaration, AgentToolId, AgentToolResultBehavior, AGENT_TOOL_RESULT_MAX_BYTES,
 };
 use rakka_agent_mcp::testkit::{
     serve_fake, CountingClient, FakeMcpServer, FakeTool, FakeToolBehaviour,
@@ -492,5 +492,18 @@ async fn a_deadline_that_elapses_while_the_answer_is_stored_leaves_the_outcome_u
             }
         ),
         "the server had answered: {error:?}"
+    );
+    let report = error
+        .unknown_outcome_report()
+        .expect("the executor said what it knew");
+    assert_eq!(
+        report.reason.as_ref().map(AgentFailureReason::code),
+        Some("mcp-answer-not-recorded"),
+        "the server answered; storing its answer overran the deadline"
+    );
+    assert!(report.handed_over_after.is_some(), "{report:?}");
+    assert!(
+        !report.cancellation_issued,
+        "nothing was in flight to cancel"
     );
 }
