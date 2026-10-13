@@ -6,17 +6,19 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedReconciler};
 use rakka_agent::{
-    AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor, AgentEffectSpec,
-    AgentFailureReason, AgentModelTurn, AgentReconciliationFinding, AgentReconciliationProtocolRef,
-    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunScope, AgentRunStatus,
-    AgentTaskContent, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    agent_operational_snapshot, AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor,
+    AgentEffectSpec, AgentFailureReason, AgentModelTurn, AgentReconciliationFinding,
+    AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectStatus,
+    AgentRunScope, AgentRunStatus, AgentSchemaPolicy, AgentTaskContent, AgentToolAuthority,
+    AgentToolCallId, AgentToolCallRequest, AgentToolId, AgentUnknownOutcomeEvidence,
+    AgentUnknownOutcomeReport, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::OutboxStatus;
-use rakka_agent_workflow::AgentEphemeralCredential;
+use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
 
 mod common;
 
@@ -402,4 +404,204 @@ async fn an_unknown_outcome_the_reconciler_finds_executed_delivers_the_establish
         OutboxStatus::Dispatched,
         "the reconciled outcome settles the ticket without a second invocation"
     );
+}
+
+/// An executor that answers every call with an unknown outcome carrying
+/// `report`, and records the shared clock when it is called. The fixture's
+/// dispatcher reads that clock without advancing it, and nothing advances it
+/// between the attempt's start and the call, so the recorded value is the
+/// attempt's start.
+struct ReportingExecutor {
+    clock: Arc<std::sync::atomic::AtomicU64>,
+    called_at: Arc<std::sync::atomic::AtomicU64>,
+    report: fn() -> AgentUnknownOutcomeReport,
+}
+
+impl AgentDispatchToolExecutor for ReportingExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        self.called_at
+            .store(self.clock.load(Ordering::SeqCst), Ordering::SeqCst);
+        let error = AgentDispatchError::outcome_unknown(
+            "scripted-outcome-unknown",
+            "the call was handed over and no answer was read",
+        )
+        .with_report((self.report)());
+        Box::pin(async move { Err(error) })
+    }
+}
+
+/// A run whose tool ticket, under `spec`, is ready to claim, behind an
+/// executor that reports `report`; and the cell its call time lands in.
+fn reporting_fixture(
+    spec: &AgentEffectSpec,
+    report: fn() -> AgentUnknownOutcomeReport,
+) -> (AuthorityFixture, Arc<std::sync::atomic::AtomicU64>) {
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(tool_registry_for_spec(TOOL, spec)),
+        None,
+    );
+    let called_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let executor = ReportingExecutor {
+        clock: fx.fx.clock.clone(),
+        called_at: called_at.clone(),
+        report,
+    };
+    (fx.with_tool_executor(Arc::new(executor)), called_at)
+}
+
+fn deadline_report() -> AgentUnknownOutcomeReport {
+    AgentUnknownOutcomeReport::new()
+        .with_reason("scripted-deadline-awaiting-answer")
+        .with_handed_over_after(Duration::from_millis(250))
+        .with_cancellation_issued(true)
+}
+
+/// Issue #100 ask 5: a non-idempotent park records the executor's reason, a
+/// send time on the dispatcher's clock (the attempt's start plus the
+/// reported offset), and the cancellation; the snapshot reports them.
+#[tokio::test]
+async fn a_parked_effect_records_what_its_executor_knew() {
+    let (fx, called_at) = reporting_fixture(&AgentEffectSpec::non_idempotent(), deadline_report);
+    ready(&fx).await;
+
+    let pass = fx.one_pass().await;
+
+    assert_eq!(pass.parked_indeterminate, 1, "{pass:?}");
+    let started = called_at.load(Ordering::SeqCst);
+    assert!(started > 0, "the executor ran and read the clock");
+    let parked = fx.effect_at(1).await.expect("the parked effect");
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    assert_eq!(
+        parked.last_error_code.as_deref(),
+        Some("scripted-outcome-unknown"),
+        "the pipeline code is unchanged"
+    );
+    assert_eq!(
+        parked
+            .last_error_reason
+            .as_ref()
+            .map(AgentFailureReason::code),
+        Some("scripted-deadline-awaiting-answer")
+    );
+    let expected =
+        AgentUnknownOutcomeEvidence::new(Some(AgentTimestampMillis::new(started + 250)), true);
+    assert_eq!(parked.unknown_outcome, Some(expected));
+
+    let snapshot = agent_operational_snapshot(
+        &fx.fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(started + 1_000),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists");
+    let view = snapshot
+        .pending_effects
+        .iter()
+        .find(|effect| effect.effect_id == parked.effect_id)
+        .expect("the parked effect is reported");
+    assert_eq!(view.unknown_outcome, Some(expected));
+}
+
+fn reason_only_report() -> AgentUnknownOutcomeReport {
+    AgentUnknownOutcomeReport::new().with_reason("scripted-call-not-handed-over")
+}
+
+/// Review focus 1: a report that knows only why records the reason and
+/// writes no evidence object.
+#[tokio::test]
+async fn a_report_with_only_a_reason_records_no_evidence() {
+    let (fx, _) = reporting_fixture(&AgentEffectSpec::non_idempotent(), reason_only_report);
+    ready(&fx).await;
+    fx.one_pass().await;
+
+    let parked = fx.effect_at(1).await.expect("the parked effect");
+    assert_eq!(
+        parked
+            .last_error_reason
+            .as_ref()
+            .map(AgentFailureReason::code),
+        Some("scripted-call-not-handed-over")
+    );
+    assert_eq!(parked.unknown_outcome, None);
+}
+
+fn absurd_offset_report() -> AgentUnknownOutcomeReport {
+    AgentUnknownOutcomeReport::new().with_handed_over_after(Duration::MAX)
+}
+
+/// Review focus 2: an offset past any representable time saturates.
+#[tokio::test]
+async fn an_absurd_offset_saturates_rather_than_panicking() {
+    let (fx, _) = reporting_fixture(&AgentEffectSpec::non_idempotent(), absurd_offset_report);
+    ready(&fx).await;
+    fx.one_pass().await;
+
+    let parked = fx.effect_at(1).await.expect("the parked effect");
+    assert_eq!(
+        parked.unknown_outcome,
+        Some(AgentUnknownOutcomeEvidence::new(
+            Some(AgentTimestampMillis::new(u64::MAX)),
+            false
+        ))
+    );
+}
+
+fn blank_reason_report() -> AgentUnknownOutcomeReport {
+    AgentUnknownOutcomeReport::new()
+        .with_reason("   ")
+        .with_cancellation_issued(true)
+}
+
+/// Review focus 3: a blank reason identifies nothing, so none is recorded;
+/// the pipeline code and the evidence still are.
+#[tokio::test]
+async fn a_blank_reason_code_records_no_reason_but_keeps_the_evidence() {
+    let (fx, _) = reporting_fixture(&AgentEffectSpec::non_idempotent(), blank_reason_report);
+    ready(&fx).await;
+    fx.one_pass().await;
+
+    let parked = fx.effect_at(1).await.expect("the parked effect");
+    assert_eq!(
+        parked.last_error_code.as_deref(),
+        Some("scripted-outcome-unknown")
+    );
+    assert_eq!(parked.last_error_reason, None);
+    assert_eq!(
+        parked.unknown_outcome,
+        Some(AgentUnknownOutcomeEvidence::new(None, true))
+    );
+}
+
+/// Issue #100 ask 5: only the park records evidence. An idempotent effect
+/// whose last attempt's outcome is unknown exhausts as before, carrying
+/// neither the reason nor the evidence.
+#[tokio::test]
+async fn an_exhausted_idempotent_effect_records_no_evidence() {
+    let spec = AgentEffectSpec::idempotent(1).expect("the spec is valid");
+    let (fx, _) = reporting_fixture(&spec, deadline_report);
+    ready(&fx).await;
+    fx.one_pass().await;
+
+    let resolved = fx.effect_at(1).await.expect("the failed effect");
+    assert_eq!(resolved.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(resolved.last_error_reason, None);
+    assert_eq!(resolved.unknown_outcome, None);
+}
+
+/// The report rides only an unknown outcome, and reads back as set.
+#[test]
+fn a_report_attaches_only_to_an_unknown_outcome() {
+    let unknown = AgentDispatchError::outcome_unknown("c", "m").with_report(deadline_report());
+    assert_eq!(unknown.unknown_outcome_report(), Some(&deadline_report()));
+    let other = AgentDispatchError::collaborator("c", "m").with_report(deadline_report());
+    assert_eq!(other.unknown_outcome_report(), None);
 }

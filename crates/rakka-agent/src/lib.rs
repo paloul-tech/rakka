@@ -160,9 +160,9 @@ pub use dispatch::{
     AgentEntityAuthority, AgentGoalEvaluationExecutor, AgentGoalEvaluationFinding,
     AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentModelResponseDecision,
     AgentReconciliationFinding, AgentRunEffectDispatcher, AgentRunResultDelivery,
-    AgentRunSetupResolver, AgentToolResponseDecision, AgentWorkflowCancelExecutor,
-    AgentWorkflowCancelFinding, AgentWorkflowStartExecutor, AgentWorkflowStartFinding,
-    SessionMemoryPromotionExecutor, WorkflowAgentRunEffectSink,
+    AgentRunSetupResolver, AgentToolResponseDecision, AgentUnknownOutcomeReport,
+    AgentWorkflowCancelExecutor, AgentWorkflowCancelFinding, AgentWorkflowStartExecutor,
+    AgentWorkflowStartFinding, SessionMemoryPromotionExecutor, WorkflowAgentRunEffectSink,
     AGENT_DISPATCH_FAILURE_CODE_MAX_LENGTH, AGENT_DISPATCH_FAILURE_DETAIL_MAX_LENGTH,
 };
 pub use effect::{
