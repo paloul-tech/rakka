@@ -34,7 +34,7 @@ That covers four steps:
 | The deadline fired, or the transport closed, before rmcp accepted the request | **No.** It provably never left | `mcp-call-not-handed-over` |
 | The deadline fired while waiting for the answer | Maybe | `mcp-deadline-awaiting-answer` |
 | The transport failed while waiting, with no answer read | Maybe | `mcp-transport-awaiting-answer` |
-| The answer arrived, and mapping or storing it overran the deadline | **Yes.** The server answered | `mcp-deadline-after-answer` |
+| The answer arrived, and mapping or storing it overran the deadline (or the answer was of a kind `tools/call` never returns) | **Yes.** The server answered | `mcp-answer-not-recorded` (amended; see below) |
 
 The first row parks a non-idempotent effect today although nothing was sent. That predates this work, and it is the follow-up the owner approved. It is not changed here.
 
@@ -52,7 +52,7 @@ The MCP executor's `in_flight: Option<RequestId>` becomes a private `CallProgres
 `execute` records `tokio::time::Instant::now()` when the attempt starts, beside the deadline it already computes (`attempt_deadline`, `executor.rs:887`). The offset reported is the hand-off instant minus that start. Both are monotonic, so the executor still reads no wall clock.
 
 The reason code comes from the progress state, never from which wrapper fired:
-- **`within_after_send`'s deadline arm:** `NotHandedOver` maps to `mcp-call-not-handed-over`, `AwaitingAnswer` to `mcp-deadline-awaiting-answer`, and `Answered` to `mcp-deadline-after-answer`.
+- **`within_after_send`'s deadline arm:** `NotHandedOver` maps to `mcp-call-not-handed-over`, `AwaitingAnswer` to `mcp-deadline-awaiting-answer`, and a wait that ended with an answer to `mcp-answer-not-recorded` (amended).
 - **`sent_call_error`:** a failure while `NotHandedOver` maps to `mcp-call-not-handed-over`, and any other non-`McpError` failure to `mcp-transport-awaiting-answer`. A JSON-RPC error is the server's own answer, and stays the ordinary failure it is today.
 
 The mapping is one pure function of the progress state and the cause, so it can be tested without a server.
@@ -127,7 +127,7 @@ Each new test is watched failing before the code exists. A falsification pass th
 - **A deadline while waiting, on a legacy session** (`with_legacy_only`): the reason is `mcp-deadline-awaiting-answer`, there is an offset, the cancellation was issued, and `cancellations()` holds the notice.
 - **The same on a modern session:** the cancellation was issued, and `cancellations()` is empty (the HTTP exchange was aborted instead).
 - **A transport failure while waiting** (`with_call_transport_failure`): the reason is `mcp-transport-awaiting-answer`, there is an offset, and no cancellation was issued.
-- **The existing slow-artifact-sink staging** (`tests/artifact_sink.rs`): the reason is `mcp-deadline-after-answer`, there is an offset, and no cancellation was issued.
+- **The existing slow-artifact-sink staging** (`tests/artifact_sink.rs`): the reason is `mcp-answer-not-recorded`, there is an offset, and no cancellation was issued.
 - **The classifier**, as an inline unit test: every progress state against every cause, including both never-sent cases. Those are not reliably stageable end to end.
 
 **`rakka-agent`**, with a scripted executor:
@@ -140,3 +140,13 @@ Each new test is watched failing before the code exists. A falsification pass th
 **Validation:** `scripts/validate.sh` exits 0.
 
 **Delivery:** one PR against `main`. The changelog and compatibility entries go with it. The follow-up issue for the never-sent case is filed before the PR, so the PR can link to it.
+
+### Amendments from planning (2026-10-13)
+
+**The fourth reason code is `mcp-answer-not-recorded`, not `mcp-deadline-after-answer`.**
+- `McpClientSession::call_tool` maps an answer of a kind `tools/call` never returns to `ServiceError::UnexpectedResponse`, after the server has answered.
+- `sent_call_error` makes that an unknown outcome, through the transport path, not the deadline path.
+
+Both that case and a deadline that fires while the answer is mapped or stored share the fact a person needs: the server answered, and its answer was not recorded. One code names both, and the name no longer claims a deadline. The table's last row, Decision 1's mapping and the proof's artifact-sink line read `mcp-answer-not-recorded`.
+
+**`CallProgress` is three states, one of them carrying a flag.** Its third state is `WaitEnded { handed_over, answered }`, not `Answered { handed_over }`. A wait can end without an answer, when the transport fails, and the cancellation must not be sent then. So the classifier reads `answered` and does not infer it from the state.
