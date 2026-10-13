@@ -16,9 +16,10 @@ use std::sync::Arc;
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     agent_operational_snapshot, assemble_agent_session_view, AgentCancellationProgress,
-    AgentCheckpointKind, AgentDecisionEventSink, AgentDecisionKind, AgentEffectPolicies,
-    AgentEffectSpec, AgentModelTurn, AgentModelUsage, AgentObservabilityError,
-    AgentObservabilityFuture, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunStatus,
+    AgentCheckpointDecisionOption, AgentCheckpointKind, AgentDecisionEventSink, AgentDecisionKind,
+    AgentEffectPolicies, AgentEffectSafetyClass, AgentEffectSpec, AgentFailureReason,
+    AgentModelTurn, AgentModelUsage, AgentObservabilityError, AgentObservabilityFuture,
+    AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunStatus,
     AgentSchemaPolicy, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
     InMemoryAgentDecisionEventSink, InMemoryAgentRunEffectSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
@@ -269,14 +270,322 @@ async fn a_parked_run_reports_its_wait_effects_and_checkpoint() {
     assert!(!gated.granted, "no grant exists before the decision");
 
     assert_eq!(snapshot.open_checkpoints.len(), 1);
+    let checkpoint = &snapshot.open_checkpoints[0];
+    assert_eq!(checkpoint.kind, AgentCheckpointKind::Approval);
+    // Issue #100 ask 2: the checkpoint names the effect it gates, the
+    // decisions a resolver may choose, and its summary — so a reader never
+    // has to parse the checkpoint id to find the effect.
+    assert_eq!(checkpoint.bound_effect.effect_id, gated.effect_id);
+    assert_eq!(checkpoint.bound_effect.generation, gated.generation);
+    assert_eq!(checkpoint.bound_effect.target, "tool:charge-card");
     assert_eq!(
-        snapshot.open_checkpoints[0].kind,
-        AgentCheckpointKind::Approval
+        checkpoint.bound_effect.safety_class,
+        AgentEffectSafetyClass::NonIdempotent
+    );
+    assert_eq!(
+        decision_values(&checkpoint.allowed_decisions),
+        ["approve", "deny"]
+    );
+    assert_eq!(
+        checkpoint.summary,
+        "Approve tool call charge-card on turn 1"
     );
     assert_eq!(
         snapshot.cancellation,
         AgentCancellationProgress::NotRequested
     );
+}
+
+/// The values of a checkpoint's allowed decisions, in the order it lists them.
+fn decision_values(options: &[AgentCheckpointDecisionOption]) -> Vec<&str> {
+    options.iter().map(|option| option.value.as_str()).collect()
+}
+
+/// A fixture whose non-idempotent tool dispatches without a gate, so an
+/// ambiguous loss parks the run for reconciliation.
+fn reconcilable_fixture() -> Fixture {
+    let policies = AgentEffectPolicies::new()
+        .with_tool_spec(
+            AgentToolId::new("charge-card").expect("tool id"),
+            AgentEffectSpec::non_idempotent(),
+        )
+        .expect("the tool spec is valid");
+    Fixture::with_sink(
+        ScriptedDispatcher::new()
+            .with_turn(tool_calling_turn("charge-card"))
+            .with_turn(proposing_turn("charged")),
+        InMemoryAgentRunEffectSink::new(),
+        policies,
+        Arc::new(AtomicU64::new(1)),
+    )
+}
+
+/// Drives the run until its tool effect is handed to the sink, then reports
+/// the attempt ambiguous, which parks the run `WaitingForReconciliation`.
+async fn park_on_reconciliation(fx: &Fixture) {
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    let now = fx.now();
+    let mut run = fx.run();
+    run.recover(now).await.expect("the run recovers");
+    run.settle_side_effects(&fx.router, now)
+        .await
+        .expect("the run settles");
+    fx.dispatcher
+        .drive(&mut run, &fx.router, fx.now())
+        .await
+        .expect("the model call is answered");
+    let tool_effect = run
+        .state()
+        .expect("state reads")
+        .loop_state()
+        .expect("the loop exists")
+        .effects()
+        .iter()
+        .find(|effect| effect.request.tool_call().is_some())
+        .expect("the tool effect exists")
+        .clone();
+    run.apply(
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: tool_effect
+                .result_operation_id(&run_scope())
+                .expect("the operation id derives"),
+            effect_id: tool_effect.effect_id.clone(),
+            generation: tool_effect.generation,
+            attempt: 1,
+            fence: 1,
+            outcome: Box::new(AgentRunEffectOutcome::Indeterminate {
+                code: "connection-lost".to_string(),
+                message: "the worker died mid-invocation".to_string(),
+            }),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the ambiguity records");
+}
+
+/// The snapshot a test reads after staging, at a fixed observation time.
+async fn snapshot_of(fx: &Fixture) -> rakka_agent::AgentOperationalSnapshot {
+    agent_operational_snapshot(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists")
+}
+
+/// The durable record of the run's one tool effect.
+async fn stored_tool_effect(fx: &Fixture) -> rakka_agent::AgentRunEffect {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.state()
+        .expect("state reads")
+        .loop_state()
+        .expect("the loop exists")
+        .effects()
+        .iter()
+        .find(|effect| effect.request.tool_call().is_some())
+        .expect("the tool effect exists")
+        .clone()
+}
+
+/// Rewrites one field of the stored run record's effect `effect_id`, as an
+/// older or newer writer could have left it.
+async fn set_effect_field(
+    fx: &Fixture,
+    effect_id: &rakka_agent_workflow::AgentEffectId,
+    field: &str,
+    value: serde_json::Value,
+) {
+    fn rewrite(
+        node: &mut serde_json::Value,
+        effect_id: &str,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> usize {
+        match node {
+            serde_json::Value::Object(fields) => {
+                // An effect record, not a checkpoint's binding: only the record
+                // carries its slot.
+                let hit = fields.get("effect_id").and_then(serde_json::Value::as_str)
+                    == Some(effect_id)
+                    && fields.contains_key("slot");
+                if hit {
+                    fields.insert(field.to_string(), value.clone());
+                }
+                usize::from(hit)
+                    + fields
+                        .values_mut()
+                        .map(|child| rewrite(child, effect_id, field, value))
+                        .sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items
+                .iter_mut()
+                .map(|child| rewrite(child, effect_id, field, value))
+                .sum(),
+            _ => 0,
+        }
+    }
+    use rakka_persistence::DurableStateStore;
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the store loads")
+        .expect("the record exists");
+    let mut encoded = serde_json::to_value(&record.state).expect("the state encodes");
+    assert_eq!(
+        rewrite(&mut encoded, effect_id.as_str(), field, &value),
+        1,
+        "exactly one effect record matches"
+    );
+    let state = serde_json::from_value(encoded).expect("the rewritten state decodes");
+    fx.runs
+        .compare_and_set(&id, record.revision, state)
+        .await
+        .expect("the rewrite lands");
+}
+
+/// Issue #100 ask 1: a parked effect says which tool's call is in doubt, why
+/// its outcome is unknown, and when it was handed to the sink — the three
+/// facts the record kept and the view used to drop.
+#[tokio::test]
+async fn a_parked_effect_names_its_target_its_last_error_and_its_hand_off() {
+    let fx = reconcilable_fixture();
+    park_on_reconciliation(&fx).await;
+
+    let snapshot = snapshot_of(&fx).await;
+    assert_eq!(
+        snapshot.run.as_ref().map(|run| run.status),
+        Some(AgentRunStatus::WaitingForReconciliation)
+    );
+    let parked = snapshot
+        .pending_effects
+        .iter()
+        .find(|effect| effect.status == AgentRunEffectStatus::Indeterminate)
+        .expect("the ambiguous effect is still reported");
+    assert_eq!(parked.target, "tool:charge-card");
+    assert_eq!(parked.last_error_code.as_deref(), Some("connection-lost"));
+    assert_eq!(
+        parked.last_error_reason, None,
+        "an indeterminate outcome carries no reason today"
+    );
+    let handed_off = stored_tool_effect(&fx)
+        .await
+        .dispatched_at
+        .expect("the parked effect was handed to the sink");
+    assert_eq!(parked.dispatched_at, Some(handed_off));
+}
+
+/// Issue #100 ask 1: the view reports the failure reason the record carries.
+/// No path writes one onto a still-pending effect yet (ask 5 will, for an
+/// unknown MCP outcome), so the record is rewritten to hold one.
+#[tokio::test]
+async fn a_pending_effect_reports_the_failure_reason_its_record_carries() {
+    let fx = reconcilable_fixture();
+    park_on_reconciliation(&fx).await;
+    let parked = stored_tool_effect(&fx).await;
+    set_effect_field(
+        &fx,
+        &parked.effect_id,
+        "last_error_reason",
+        serde_json::json!({ "code": "mcp-deadline-awaiting-answer" }),
+    )
+    .await;
+
+    let snapshot = snapshot_of(&fx).await;
+    let reported = snapshot
+        .pending_effects
+        .iter()
+        .find(|effect| effect.effect_id == parked.effect_id)
+        .expect("the parked effect is reported");
+    assert_eq!(
+        reported
+            .last_error_reason
+            .as_ref()
+            .map(AgentFailureReason::code),
+        Some("mcp-deadline-awaiting-answer")
+    );
+}
+
+/// Issue #100 ask 2: a reconciliation checkpoint names its effect, offers the
+/// full specification 12.5 decision set, and carries its summary.
+#[tokio::test]
+async fn a_reconciliation_checkpoint_names_its_effect_decisions_and_summary() {
+    let fx = reconcilable_fixture();
+    park_on_reconciliation(&fx).await;
+    let parked = stored_tool_effect(&fx).await;
+
+    let snapshot = snapshot_of(&fx).await;
+    assert_eq!(snapshot.open_checkpoints.len(), 1);
+    let checkpoint = &snapshot.open_checkpoints[0];
+    assert_eq!(
+        checkpoint.kind,
+        AgentCheckpointKind::IndeterminateEffectReconciliation
+    );
+    assert_eq!(checkpoint.bound_effect.effect_id, parked.effect_id);
+    assert_eq!(checkpoint.bound_effect.generation, parked.generation);
+    assert_eq!(checkpoint.bound_effect.target, "tool:charge-card");
+    assert_eq!(
+        checkpoint.bound_effect.safety_class,
+        AgentEffectSafetyClass::NonIdempotent
+    );
+    assert_eq!(
+        decision_values(&checkpoint.allowed_decisions),
+        [
+            "confirmed-completed",
+            "confirmed-not-executed",
+            "compensate",
+            "escalate",
+            "abandon-and-fail",
+        ]
+    );
+    assert_eq!(
+        checkpoint.summary,
+        "Reconcile indeterminate tool call charge-card on turn 1"
+    );
+}
+
+/// Issue #100 asks 1 and 2: the new fields are additive on the wire. The
+/// argument digest and credential binding stay off the checkpoint view, and
+/// an effect with no error and no hand-off omits those fields.
+#[tokio::test]
+async fn the_new_view_fields_serialize_additively() {
+    let fx = checkpointed_fixture();
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the run parks on its checkpoint");
+
+    let snapshot = snapshot_of(&fx).await;
+    let body = serde_json::to_value(&snapshot).expect("the snapshot serializes");
+    let gated = body["pending_effects"]
+        .as_array()
+        .expect("pending effects serialize as a list")
+        .iter()
+        .find(|effect| effect["checkpoint_required"] == true)
+        .expect("the gated effect serializes");
+    assert_eq!(gated["target"], "tool:charge-card");
+    for absent in ["dispatched_at", "last_error_code", "last_error_reason"] {
+        assert!(
+            gated.get(absent).is_none(),
+            "an effect never handed off and never failed omits {absent}"
+        );
+    }
+    let bound = &body["open_checkpoints"][0]["bound_effect"];
+    let mut keys: Vec<&str> = bound
+        .as_object()
+        .expect("the bound effect serializes as an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["effect_id", "generation", "safety_class", "target"]);
 }
 
 /// Cancellation progress follows section 8.7: an ambiguous consequential
