@@ -207,7 +207,10 @@ does.
 
 An operator asking what a goal or run is doing gets an **authoritative
 operational snapshot** from the durable record, with the revision it read,
-correct while every telemetry path is down. The session view by `AgentRunId`
+correct while every telemetry path is down. Each pending effect names its
+target (`tool:{tool id}` for a tool call), when it was handed to the sink, and
+its last error code and reason; each open checkpoint names the effect it gates,
+the decisions it allows, and its summary. The session view by `AgentRunId`
 joins that snapshot with retained decision events and trace segments, exposes
 its own lag, and is a projection, never a second state machine.
 

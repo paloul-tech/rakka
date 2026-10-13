@@ -39,7 +39,9 @@ use rakka_persistence::{DurableStateStore, Revision};
 use serde::{Deserialize, Serialize};
 
 use crate::budget::{AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetDimension};
-use crate::checkpoints::{AgentCheckpoint, AgentCheckpointKind, AgentCheckpointStatus};
+use crate::checkpoints::{
+    AgentCheckpoint, AgentCheckpointDecisionOption, AgentCheckpointKind, AgentCheckpointStatus,
+};
 use crate::choreography::AgentExchangeState;
 use crate::definition::{
     AgentCapabilityId, AgentEffectSafetyClass, AgentPolicyRef, AgentRevisionNumber,
@@ -55,6 +57,7 @@ use crate::effect::{
 use crate::evaluation::{
     AgentGoalEvaluationMethodKind, AgentGoalEvaluationOutcome, AgentGoalEvidenceRef,
 };
+use crate::failure::AgentFailureReason;
 use crate::fan_in::{
     unreported_members, AgentFanInCell, AgentFanInMemberId, AgentFanInPolicy, AgentFanInResolution,
 };
@@ -245,6 +248,40 @@ pub struct AgentPendingEffectView {
     pub authorization_required: bool,
     /// Whether a digest-bound grant is currently held for it.
     pub granted: bool,
+    /// Where it dispatches, as `"{target_type}:{name}"` — `tool:{tool id}`
+    /// for a tool call. The same string a checkpoint's
+    /// [`AgentCheckpointBoundEffectView::target`] carries, so the two compare
+    /// by equality. Bodies serialized before this field decode it empty.
+    #[serde(default)]
+    pub target: String,
+    /// When the current generation was handed to the sink, once it was. This
+    /// is the hand-off, not the moment a dispatch attempt reached its target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_at: Option<AgentTimestampMillis>,
+    /// Stable code of the generation's last dispatch or execution failure —
+    /// for an indeterminate effect, the code that made its outcome unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
+    /// Which decision failed it, when one party decided: a guardrail's stage
+    /// and reason code, or a collaborator's own code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_reason: Option<AgentFailureReason>,
+}
+
+/// The effect an open checkpoint gates, as the authoritative snapshot reports
+/// it: enough to name the effect, never the argument digest or the
+/// credential binding the durable binding also keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCheckpointBoundEffectView {
+    /// The gated effect's derived identity.
+    pub effect_id: AgentEffectId,
+    /// The generation the checkpoint gates.
+    pub generation: AgentEffectGeneration,
+    /// Where it dispatches, as `"{target_type}:{name}"`: the same string the
+    /// pending effect's [`AgentPendingEffectView::target`] carries.
+    pub target: String,
+    /// The safety class the checkpoint gates.
+    pub safety_class: AgentEffectSafetyClass,
 }
 
 /// One open checkpoint, as the authoritative snapshot reports it
@@ -266,6 +303,18 @@ pub struct AgentCheckpointView {
     pub due_at: Option<AgentTimestampMillis>,
     /// When it hard-expires, when set.
     pub expires_at: Option<AgentTimestampMillis>,
+    /// The effect it gates. The checkpoint id's format is not a contract;
+    /// this is the link from a checkpoint to its effect.
+    pub bound_effect: AgentCheckpointBoundEffectView,
+    /// The decisions a resolver may choose, as the checkpoint records them.
+    /// What a deployment offers a person may be narrower. Bodies serialized
+    /// before this field decode it empty.
+    #[serde(default)]
+    pub allowed_decisions: Vec<AgentCheckpointDecisionOption>,
+    /// Its bounded, non-secret prompt/decision summary. Bodies serialized
+    /// before this field decode it empty.
+    #[serde(default)]
+    pub summary: String,
 }
 
 /// One delegation edge of the delegation graph, as a run's durable cell
@@ -756,6 +805,10 @@ impl AgentOperationalSnapshot {
                         checkpoint_required: effect.checkpoint_required,
                         authorization_required: effect.authorization_required,
                         granted: loop_state.grant_for(effect).is_some(),
+                        target: effect.request.target_label(),
+                        dispatched_at: effect.dispatched_at,
+                        last_error_code: effect.last_error_code.clone(),
+                        last_error_reason: effect.last_error_reason.clone(),
                     })
                     .collect()
             })
@@ -778,6 +831,14 @@ impl AgentOperationalSnapshot {
                         required_capabilities: checkpoint.required_capabilities.len(),
                         due_at: checkpoint.due_at,
                         expires_at: checkpoint.expires_at,
+                        bound_effect: AgentCheckpointBoundEffectView {
+                            effect_id: checkpoint.bound_effect.effect_id.clone(),
+                            generation: checkpoint.bound_effect.generation,
+                            target: checkpoint.bound_effect.target.clone(),
+                            safety_class: checkpoint.bound_effect.safety_class,
+                        },
+                        allowed_decisions: checkpoint.allowed_decisions.clone(),
+                        summary: checkpoint.summary.clone(),
                     })
                     .collect()
             })

@@ -1662,6 +1662,16 @@ impl AgentRunEffectRequest {
         Ok(AgentContentDigest::sha256_of_json(&value))
     }
 
+    /// The dispatch target as one bounded string, `"{target_type}:{name}"`
+    /// (`tool:{tool id}` for a tool call). A checkpoint's bound effect and the
+    /// operational snapshot both report this form, so a reader can match an
+    /// effect to the checkpoint gating it by equality.
+    #[must_use]
+    pub(crate) fn target_label(&self) -> String {
+        let target = self.target();
+        format!("{}:{}", target.target_type, target.name)
+    }
+
     /// The dispatch target this request names.
     #[must_use]
     pub fn target(&self) -> AgentEffectTarget {
