@@ -242,16 +242,16 @@ fn collaborator_code(error: &AgentDispatchError) -> String {
 }
 
 /// The durable evidence of a report, on the dispatcher's clock: the send
-/// time is the attempt's start plus the executor's offset, in whole
+/// time is the invocation's start plus the executor's offset, in whole
 /// milliseconds and saturating. `None` when the report knows neither a send
 /// time nor a cancellation, so a record gains no empty object.
 fn unknown_outcome_evidence(
     report: &AgentUnknownOutcomeReport,
-    attempt_started_at: AgentTimestampMillis,
+    invoked_at: AgentTimestampMillis,
 ) -> Option<AgentUnknownOutcomeEvidence> {
     let sent_at = report.handed_over_after.map(|after| {
         let after_ms = u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
-        AgentTimestampMillis::new(attempt_started_at.as_millis().saturating_add(after_ms))
+        AgentTimestampMillis::new(invoked_at.as_millis().saturating_add(after_ms))
     });
     (sent_at.is_some() || report.cancellation_issued)
         .then(|| AgentUnknownOutcomeEvidence::new(sent_at, report.cancellation_issued))
@@ -3138,8 +3138,14 @@ where
         // the durable `Started` write, so a segment exists exactly when an
         // invocation may have happened — which is the window that decides
         // whether an outcome is indeterminate.
-        let attempt_started_at = self.now();
-        let attempt_timer = AgentSegmentTimer::start(attempt_started_at);
+        // Read once, here, just before the executor runs: it anchors both the
+        // attempt segment and an unknown outcome's send time, which an
+        // executor reports as an offset from its own start of the call. It is
+        // deliberately not `attempt_started_at` above, the deadline stamp
+        // taken before credential resolution: anchoring there would move the
+        // recorded send time earlier by however long the resolver took.
+        let invoked_at = self.now();
+        let attempt_timer = AgentSegmentTimer::start(invoked_at);
         let invoked = self
             .invoke(scope, attempt_intent, &granted, credential.as_ref())
             .await;
@@ -3196,14 +3202,7 @@ where
             Err(error @ AgentDispatchError::OutcomeUnknown { .. }) => {
                 return self
                     .settle_unknown_outcome(
-                        scope,
-                        claim,
-                        state,
-                        intent,
-                        attempt,
-                        attempt_started_at,
-                        &error,
-                        pass,
+                        scope, claim, state, intent, attempt, invoked_at, &error, pass,
                     )
                     .await;
             }
@@ -3346,7 +3345,7 @@ where
         state: &AgentRunState,
         intent: &AgentRunEffect,
         attempt: u32,
-        attempt_started_at: AgentTimestampMillis,
+        invoked_at: AgentTimestampMillis,
         error: &AgentDispatchError,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
@@ -3395,7 +3394,7 @@ where
                 let (reason, evidence) = match report.as_deref() {
                     Some(report) => (
                         report.reason.clone(),
-                        unknown_outcome_evidence(report, attempt_started_at),
+                        unknown_outcome_evidence(report, invoked_at),
                     ),
                     None => (None, None),
                 };

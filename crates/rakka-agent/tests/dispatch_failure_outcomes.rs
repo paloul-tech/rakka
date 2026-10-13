@@ -409,8 +409,10 @@ async fn an_unknown_outcome_the_reconciler_finds_executed_delivers_the_establish
 /// An executor that answers every call with an unknown outcome carrying
 /// `report`, and records the shared clock when it is called. The fixture's
 /// dispatcher reads that clock without advancing it, and nothing advances it
-/// between the attempt's start and the call, so the recorded value is the
-/// attempt's start.
+/// between the invocation's start and the call, so the recorded value is the
+/// invocation's start. The call then takes ten seconds of that clock, so a
+/// send time anchored anywhere after the invocation began — at the park, say
+/// — reads later than the start plus the reported offset.
 struct ReportingExecutor {
     clock: Arc<std::sync::atomic::AtomicU64>,
     called_at: Arc<std::sync::atomic::AtomicU64>,
@@ -427,6 +429,7 @@ impl AgentDispatchToolExecutor for ReportingExecutor {
     ) -> AgentDispatchFuture<'a, AgentTaskContent> {
         self.called_at
             .store(self.clock.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.clock.fetch_add(10_000, Ordering::SeqCst);
         let error = AgentDispatchError::outcome_unknown(
             "scripted-outcome-unknown",
             "the call was handed over and no answer was read",
