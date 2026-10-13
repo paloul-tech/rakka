@@ -3593,10 +3593,10 @@ where
             // Bounded here rather than at the callers: one of them composes
             // this message from an application refusal, and a bound that
             // depends on every caller remembering it is not a bound.
-            AgentRunEffectOutcome::Indeterminate {
-                code: bounded_failure_code(code),
-                message: bounded_failure_detail(message),
-            },
+            AgentRunEffectOutcome::indeterminate(
+                bounded_failure_code(code),
+                bounded_failure_detail(message),
+            ),
             pass,
         )
         .await?;

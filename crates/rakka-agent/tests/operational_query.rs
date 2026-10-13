@@ -21,7 +21,8 @@ use rakka_agent::{
     AgentModelTurn, AgentModelUsage, AgentObservabilityError, AgentObservabilityFuture,
     AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunStatus,
     AgentSchemaPolicy, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    InMemoryAgentDecisionEventSink, InMemoryAgentRunEffectSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentUnknownOutcomeEvidence, InMemoryAgentDecisionEventSink, InMemoryAgentRunEffectSink,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -322,7 +323,7 @@ fn reconcilable_fixture() -> Fixture {
 
 /// Drives the run until its tool effect is handed to the sink, then reports
 /// the attempt ambiguous, which parks the run `WaitingForReconciliation`.
-async fn park_on_reconciliation(fx: &Fixture) {
+async fn park_on_reconciliation(fx: &Fixture, outcome: AgentRunEffectOutcome) {
     fx.instantiate_agent().await;
     fx.create_task().await;
     let now = fx.now();
@@ -354,10 +355,7 @@ async fn park_on_reconciliation(fx: &Fixture) {
             generation: tool_effect.generation,
             attempt: 1,
             fence: 1,
-            outcome: Box::new(AgentRunEffectOutcome::Indeterminate {
-                code: "connection-lost".to_string(),
-                message: "the worker died mid-invocation".to_string(),
-            }),
+            outcome: Box::new(outcome),
         },
         &fx.router,
         fx.now(),
@@ -458,7 +456,11 @@ async fn set_effect_field(
 #[tokio::test]
 async fn a_parked_effect_names_its_target_its_last_error_and_its_hand_off() {
     let fx = reconcilable_fixture();
-    park_on_reconciliation(&fx).await;
+    park_on_reconciliation(
+        &fx,
+        AgentRunEffectOutcome::indeterminate("connection-lost", "the worker died mid-invocation"),
+    )
+    .await;
 
     let snapshot = snapshot_of(&fx).await;
     assert_eq!(
@@ -489,7 +491,11 @@ async fn a_parked_effect_names_its_target_its_last_error_and_its_hand_off() {
 #[tokio::test]
 async fn a_pending_effect_reports_the_failure_reason_its_record_carries() {
     let fx = reconcilable_fixture();
-    park_on_reconciliation(&fx).await;
+    park_on_reconciliation(
+        &fx,
+        AgentRunEffectOutcome::indeterminate("connection-lost", "the worker died mid-invocation"),
+    )
+    .await;
     let parked = stored_tool_effect(&fx).await;
     set_effect_field(
         &fx,
@@ -519,7 +525,11 @@ async fn a_pending_effect_reports_the_failure_reason_its_record_carries() {
 #[tokio::test]
 async fn a_reconciliation_checkpoint_names_its_effect_decisions_and_summary() {
     let fx = reconcilable_fixture();
-    park_on_reconciliation(&fx).await;
+    park_on_reconciliation(
+        &fx,
+        AgentRunEffectOutcome::indeterminate("connection-lost", "the worker died mid-invocation"),
+    )
+    .await;
     let parked = stored_tool_effect(&fx).await;
 
     let snapshot = snapshot_of(&fx).await;
@@ -571,7 +581,12 @@ async fn the_new_view_fields_serialize_additively() {
         .find(|effect| effect["checkpoint_required"] == true)
         .expect("the gated effect serializes");
     assert_eq!(gated["target"], "tool:charge-card");
-    for absent in ["dispatched_at", "last_error_code", "last_error_reason"] {
+    for absent in [
+        "dispatched_at",
+        "last_error_code",
+        "last_error_reason",
+        "unknown_outcome",
+    ] {
         assert!(
             gated.get(absent).is_none(),
             "an effect never handed off and never failed omits {absent}"
@@ -635,10 +650,10 @@ async fn cancellation_progress_follows_the_durable_record() {
             generation,
             attempt: 1,
             fence: 1,
-            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::Indeterminate {
-                code: "connection-lost".to_string(),
-                message: "the worker died mid-invocation".to_string(),
-            }),
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::indeterminate(
+                "connection-lost",
+                "the worker died mid-invocation",
+            )),
         },
         &fx.router,
         fx.now(),
@@ -1454,4 +1469,51 @@ async fn moderation_exhaustion_reports_a_conversation_nothing_can_advance() {
         .await
         .expect("the conversation snapshots");
     assert_eq!(parked, after, "a struggle signal mutates nothing");
+}
+
+/// Issue #100 ask 5: a park that carries a reason and evidence reports both
+/// on the pending effect, and the evidence serializes additively.
+#[tokio::test]
+async fn a_parked_effect_reports_what_is_known_about_its_unknown_outcome() {
+    let fx = reconcilable_fixture();
+    park_on_reconciliation(
+        &fx,
+        AgentRunEffectOutcome::indeterminate("mcp-outcome-unknown", "the answer was lost")
+            .with_reason(AgentFailureReason::new("mcp-deadline-awaiting-answer"))
+            .with_evidence(Some(AgentUnknownOutcomeEvidence::new(
+                Some(AgentTimestampMillis::new(4_242)),
+                true,
+            ))),
+    )
+    .await;
+
+    let snapshot = snapshot_of(&fx).await;
+    let parked = snapshot
+        .pending_effects
+        .iter()
+        .find(|effect| effect.status == AgentRunEffectStatus::Indeterminate)
+        .expect("the ambiguous effect is reported");
+    assert_eq!(
+        parked.last_error_code.as_deref(),
+        Some("mcp-outcome-unknown")
+    );
+    assert_eq!(
+        parked
+            .last_error_reason
+            .as_ref()
+            .map(AgentFailureReason::code),
+        Some("mcp-deadline-awaiting-answer")
+    );
+    assert_eq!(
+        parked.unknown_outcome,
+        Some(AgentUnknownOutcomeEvidence::new(
+            Some(AgentTimestampMillis::new(4_242)),
+            true
+        ))
+    );
+    let body = serde_json::to_value(parked).expect("the view serializes");
+    assert_eq!(
+        body["unknown_outcome"],
+        serde_json::json!({"sent_at": 4_242, "cancellation_issued": true})
+    );
 }

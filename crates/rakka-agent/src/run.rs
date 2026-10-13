@@ -4754,6 +4754,7 @@ fn apply_effect_outcome(
             effect.status = AgentRunEffectStatus::Indeterminate;
             effect.last_error_code = Some(bounded_detail(code.clone()));
             effect.last_error_reason = outcome.failure_reason().cloned();
+            effect.unknown_outcome = outcome.unknown_outcome_evidence().copied();
         }
         AgentRunEffectOutcome::Cancelled { .. } => {
             // The dispatch layer fenced and settled the generation without
@@ -10448,6 +10449,10 @@ mod tests {
         model_effect.status = AgentRunEffectStatus::Succeeded;
         model_effect.last_error_code = Some("c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH));
         model_effect.last_error_reason = Some(maximal_reason.clone());
+        model_effect.unknown_outcome = Some(crate::effect::AgentUnknownOutcomeEvidence::new(
+            Some(AgentTimestampMillis::new(u64::MAX)),
+            true,
+        ));
         run.loop_state
             .record_effect(model_effect)
             .expect("the model effect records");
@@ -10494,6 +10499,10 @@ mod tests {
             .expect("the tool effect derives");
             effect.last_error_code = Some("c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH));
             effect.last_error_reason = Some(maximal_reason.clone());
+            effect.unknown_outcome = Some(crate::effect::AgentUnknownOutcomeEvidence::new(
+                Some(AgentTimestampMillis::new(u64::MAX)),
+                true,
+            ));
             run.loop_state
                 .record_effect(effect)
                 .expect("the tool effect records");

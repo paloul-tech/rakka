@@ -157,10 +157,10 @@ async fn park_indeterminate(
             generation,
             attempt: 1,
             fence: 1,
-            outcome: Box::new(AgentRunEffectOutcome::Indeterminate {
-                code: "connection-lost".to_string(),
-                message: "the worker died mid-invocation".to_string(),
-            }),
+            outcome: Box::new(AgentRunEffectOutcome::indeterminate(
+                "connection-lost",
+                "the worker died mid-invocation",
+            )),
         },
         &fx.router,
         fx.now(),
@@ -751,10 +751,10 @@ async fn a_confirmed_not_executed_gated_effect_reparks_behind_a_fresh_approval()
             generation,
             attempt: 1,
             fence: 1,
-            outcome: Box::new(AgentRunEffectOutcome::Indeterminate {
-                code: "connection-lost".to_string(),
-                message: "the worker died mid-invocation".to_string(),
-            }),
+            outcome: Box::new(AgentRunEffectOutcome::indeterminate(
+                "connection-lost",
+                "the worker died mid-invocation",
+            )),
         },
         &fx.router,
         fx.now(),
@@ -916,10 +916,10 @@ async fn drive_reconciliation_flow(
                 generation: effect.generation,
                 attempt: 1,
                 fence: 1,
-                outcome: Box::new(AgentRunEffectOutcome::Indeterminate {
-                    code: "connection-lost".to_string(),
-                    message: "the worker died mid-invocation".to_string(),
-                }),
+                outcome: Box::new(AgentRunEffectOutcome::indeterminate(
+                    "connection-lost",
+                    "the worker died mid-invocation",
+                )),
             },
             &fx.router,
             fx.now(),
