@@ -3330,6 +3330,20 @@ impl AuthorityFixture {
         }
     }
 
+    /// How many attempts the effect that stopped the run made, and how many
+    /// it was allowed, as its terminal reason records them.
+    pub async fn terminal_failure_attempts(&self) -> (Option<u32>, Option<u32>) {
+        let run = self.fx.run_snapshot().await.expect("the run exists");
+        match run.terminal_reason {
+            Some(AgentRunTerminalReason::EffectFailed {
+                attempts,
+                max_attempts,
+                ..
+            }) => (attempts, max_attempts),
+            other => panic!("expected an effect failure, found {other:?}"),
+        }
+    }
+
     /// Applies a settings update to the agent entity — an immediate-safety
     /// change once it carries a revocation.
     pub async fn apply_settings(&self, discriminator: &str, changes: Vec<AgentSettingsChange>) {

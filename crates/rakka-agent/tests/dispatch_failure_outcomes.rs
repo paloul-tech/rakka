@@ -133,10 +133,83 @@ async fn a_definitive_refusal_exhausts_the_ticket_on_its_first_attempt() {
             .map(AgentFailureReason::code),
         Some("egress-denied")
     );
+    // Issue #100 ask 4: the effect settles `Exhausted` exactly as a spent
+    // budget does, and the reason says the collaborator refused for good.
+    assert!(
+        resolved
+            .last_error_reason
+            .as_ref()
+            .is_some_and(AgentFailureReason::is_definitive),
+        "the effect record marks the refusal definitive"
+    );
+    assert!(
+        fx.terminal_failure_reason()
+            .await
+            .is_some_and(|reason| reason.is_definitive()),
+        "so does the run's terminal reason"
+    );
+    // Issue #100 ask 3: one attempt made of the three allowed.
+    assert_eq!(fx.terminal_failure_attempts().await, (Some(1), Some(3)));
 
     fx.expire_lease();
     fx.pump().await;
     assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing invokes it again");
+}
+
+/// Issue #100 asks 3 and 4: a retryable refusal that spends its whole budget
+/// ends in the same `Exhausted` status, under the same reason code, without
+/// the marker — and its terminal reason counts every attempt.
+#[tokio::test]
+async fn a_spent_budget_is_not_marked_definitive() {
+    let spec = AgentEffectSpec::idempotent(2).expect("the spec is valid");
+    let (fx, calls) = fixture(&spec, retryable);
+    ready(&fx).await;
+
+    fx.one_pass().await;
+    fx.expire_lease();
+    fx.one_pass().await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "both attempts ran");
+    let resolved = fx.effect_at(1).await.expect("the failed effect");
+    assert_eq!(resolved.status, AgentRunEffectStatus::Exhausted);
+    let reason = resolved
+        .last_error_reason
+        .expect("the collaborator's code is the reason");
+    assert_eq!(reason.code(), "egress-denied");
+    assert!(!reason.is_definitive(), "a spent budget is not definitive");
+    assert!(
+        fx.terminal_failure_reason()
+            .await
+            .is_some_and(|reason| !reason.is_definitive()),
+        "nor is the run's terminal reason"
+    );
+    assert_eq!(fx.terminal_failure_attempts().await, (Some(2), Some(2)));
+}
+
+fn definitive_without_a_code() -> AgentDispatchError {
+    AgentDispatchError::definitive("", "the host refused the destination")
+}
+
+/// Issue #100 ask 4: a blank code identifies nothing, but a definitive
+/// refusal under one still says it was definitive.
+#[tokio::test]
+async fn a_definitive_refusal_under_a_blank_code_still_carries_the_marker() {
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let (fx, _calls) = fixture(&spec, definitive_without_a_code);
+    ready(&fx).await;
+
+    fx.one_pass().await;
+
+    let resolved = fx.effect_at(1).await.expect("the failed effect");
+    assert_eq!(resolved.status, AgentRunEffectStatus::Exhausted);
+    assert!(
+        resolved
+            .last_error_reason
+            .as_ref()
+            .is_some_and(AgentFailureReason::is_definitive),
+        "the marker survives a blank code: {:?}",
+        resolved.last_error_reason
+    );
 }
 
 #[tokio::test]

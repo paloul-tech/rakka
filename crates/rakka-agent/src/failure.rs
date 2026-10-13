@@ -20,6 +20,11 @@
 //!   record without one serializes exactly as before.
 //! - **Never a metric label.** A deployment's own codes are length-bounded,
 //!   not value-bounded.
+//!
+//! A reason may also be **definitive**: the collaborator declared that
+//! retrying cannot change its answer ([`AgentFailureReason::definitive`]).
+//! Such a failure settles exactly as a spent retry budget does, on its first
+//! attempt, so the marker is the one fact that tells the two apart.
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -42,6 +47,8 @@ pub struct AgentFailureReason {
     code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stage: Option<AgentGuardrailStageId>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    definitive: bool,
 }
 
 impl AgentFailureReason {
@@ -53,7 +60,23 @@ impl AgentFailureReason {
         if code.trim().is_empty() {
             return None;
         }
-        Some(Self { code, stage: None })
+        Some(Self {
+            code,
+            stage: None,
+            definitive: false,
+        })
+    }
+
+    /// The reason a collaborator gives when it refused and retrying cannot
+    /// change its answer. Always a reason, even under a blank code: the
+    /// marker alone says the failure was not a spent budget.
+    #[must_use]
+    pub fn definitive(code: impl AsRef<str>) -> Self {
+        Self {
+            code: bounded(code.as_ref()),
+            stage: None,
+            definitive: true,
+        }
     }
 
     /// The reason a guardrail stage gives. Always a reason, even under a
@@ -63,6 +86,7 @@ impl AgentFailureReason {
         Self {
             code: bounded(reason_code.as_ref()),
             stage: Some(stage),
+            definitive: false,
         }
     }
 
@@ -84,6 +108,21 @@ impl AgentFailureReason {
     pub fn stage(&self) -> Option<&AgentGuardrailStageId> {
         self.stage.as_ref()
     }
+
+    /// Whether the collaborator declared the failure definitive: it was not
+    /// retried, whatever budget the effect had left. A reason recorded before
+    /// the marker existed reads `false`.
+    #[must_use]
+    pub const fn is_definitive(&self) -> bool {
+        self.definitive
+    }
+}
+
+/// Keeps an unset marker off the record, so a reason without one encodes
+/// exactly as it did before the marker existed.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One line, with every character [`breaks_the_line`] names turned into a
