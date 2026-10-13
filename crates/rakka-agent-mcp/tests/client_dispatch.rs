@@ -1383,6 +1383,12 @@ async fn abandon_slow_call(executor: &McpDispatchToolExecutor<ReqwestClient>) {
         Some("mcp-deadline-awaiting-answer")
     );
     assert!(
+        report
+            .handed_over_after
+            .is_some_and(|after| after < Duration::from_millis(200)),
+        "handed over inside the timeout: {report:?}"
+    );
+    assert!(
         report.cancellation_issued,
         "the cancellation was issued, whatever the protocol revision carries it as: {report:?}"
     );

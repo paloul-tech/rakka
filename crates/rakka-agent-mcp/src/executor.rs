@@ -959,7 +959,9 @@ const MCP_ANSWER_NOT_RECORDED: &str = "mcp-answer-not-recorded";
 enum UnknownCause {
     /// The attempt's deadline.
     Deadline,
-    /// A failure of the transport or the session, not the server's answer.
+    /// Anything but the deadline that left no answer recorded: a failure of
+    /// the transport or the session, or an answer of a kind `tools/call`
+    /// never returns.
     Transport,
 }
 
@@ -1013,8 +1015,8 @@ const DEADLINE_CANCEL_REASON: &str = "the attempt's deadline elapsed";
 ///
 /// A JSON-RPC error is the server's own answer — it told us what it did —
 /// and keeps the mapping a failure before the send gets. Every other failure
-/// left no answer to read, so the outcome is unknown and named by how far the
-/// call got.
+/// left no answer recorded, so the outcome is unknown and named by how far
+/// the call got.
 fn sent_call_error(
     server: &str,
     error: &ServiceError,
@@ -1028,7 +1030,7 @@ fn sent_call_error(
             UnknownCause::Transport,
             progress,
             started,
-            format!("no answer to tools/call was read: {mapped}"),
+            format!("tools/call ended without a recorded answer: {mapped}"),
         ),
     }
 }

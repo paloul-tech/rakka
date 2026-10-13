@@ -4754,7 +4754,7 @@ fn apply_effect_outcome(
             effect.status = AgentRunEffectStatus::Indeterminate;
             effect.last_error_code = Some(bounded_detail(code.clone()));
             effect.last_error_reason = outcome.failure_reason().cloned();
-            effect.unknown_outcome = outcome.unknown_outcome_evidence().copied();
+            effect.unknown_outcome = outcome.unknown_outcome_evidence().cloned();
         }
         AgentRunEffectOutcome::Cancelled { .. } => {
             // The dispatch layer fenced and settled the generation without
@@ -10136,6 +10136,11 @@ mod tests {
             effect.last_error_reason.is_some(),
             "the fixture holds a reason"
         );
+        let evidence = crate::effect::AgentUnknownOutcomeEvidence::new(
+            Some(AgentTimestampMillis::new(4_242)),
+            true,
+        );
+        effect.unknown_outcome = Some(evidence.clone());
         let effect_id = effect.effect_id.clone();
         let generation = effect.generation;
         loop_state
@@ -10182,6 +10187,12 @@ mod tests {
         assert_eq!(
             compensated.last_error_reason, None,
             "no reason outlives the code it explained"
+        );
+        assert_eq!(
+            compensated.unknown_outcome,
+            Some(evidence),
+            "the evidence is the generation's history: what it says about the attempt \
+             stays true, and only a new generation clears it"
         );
     }
 

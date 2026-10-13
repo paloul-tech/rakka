@@ -311,6 +311,11 @@ fn the_effect_records_evidence_is_additive_and_cleared_by_a_new_generation() {
             .contains_key("unknown_outcome"),
         "{encoded}"
     );
+    assert_eq!(
+        serde_json::from_value::<AgentRunEffect>(encoded).expect("decodes"),
+        plain,
+        "an effect without evidence decodes back with none"
+    );
 
     let mut parked = effect();
     parked.unknown_outcome = Some(AgentUnknownOutcomeEvidence::new(

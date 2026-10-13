@@ -495,7 +495,7 @@ async fn a_parked_effect_records_what_its_executor_knew() {
     );
     let expected =
         AgentUnknownOutcomeEvidence::new(Some(AgentTimestampMillis::new(started + 250)), true);
-    assert_eq!(parked.unknown_outcome, Some(expected));
+    assert_eq!(parked.unknown_outcome, Some(expected.clone()));
 
     let snapshot = agent_operational_snapshot(
         &fx.fx.runs,

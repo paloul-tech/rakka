@@ -1850,9 +1850,12 @@ pub struct AgentRunEffect {
     pub last_error_reason: Option<crate::failure::AgentFailureReason>,
     /// What is known about the current generation's unknown outcome, when it
     /// parked with evidence (issue #100): when its request was handed over and
-    /// whether a cancellation was issued. Observability only, never
-    /// correctness: an effect persisted before this field decodes with none,
-    /// and no dispatch decision reads it.
+    /// whether a cancellation was issued. It is the generation's history: a
+    /// decision that resolves the ambiguity — a confirmation or a
+    /// compensation — leaves it in place, because what it says about the
+    /// attempt stays true, and only a new generation clears it. Observability
+    /// only, never correctness: an effect persisted before this field decodes
+    /// with none, and no dispatch decision reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unknown_outcome: Option<AgentUnknownOutcomeEvidence>,
     /// Whether the effect may dispatch only under a durable checkpoint grant
@@ -2280,7 +2283,7 @@ pub fn effect_result_operation_id(
 /// Observability only: no dispatch decision reads it. "Issued" means the
 /// client accepted the cancellation within its close bound — never that the
 /// target received or honoured it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AgentUnknownOutcomeEvidence {
     /// When the request was handed over, on the dispatcher's clock: the
@@ -3262,11 +3265,12 @@ mod tests {
     }
 
     #[test]
-    fn a_reason_rides_a_failed_and_an_exhausted_outcome_and_nothing_else() {
+    fn a_reason_rides_a_failed_an_exhausted_and_an_indeterminate_outcome_and_nothing_else() {
         let reason = crate::failure::AgentFailureReason::new("egress_denied");
         for outcome in [
             AgentRunEffectOutcome::failed("c", "m"),
             AgentRunEffectOutcome::exhausted("c", "m"),
+            AgentRunEffectOutcome::indeterminate("c", "m"),
         ] {
             let carried = outcome.with_reason(reason.clone());
             assert_eq!(carried.failure_reason(), reason.as_ref());

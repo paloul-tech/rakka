@@ -815,7 +815,7 @@ impl AgentOperationalSnapshot {
                         dispatched_at: effect.dispatched_at,
                         last_error_code: effect.last_error_code.clone(),
                         last_error_reason: effect.last_error_reason.clone(),
-                        unknown_outcome: effect.unknown_outcome,
+                        unknown_outcome: effect.unknown_outcome.clone(),
                     })
                     .collect()
             })

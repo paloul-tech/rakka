@@ -16,15 +16,17 @@ use std::sync::Arc;
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     agent_operational_snapshot, assemble_agent_session_view, AgentCancellationProgress,
-    AgentCheckpointDecisionOption, AgentCheckpointKind, AgentDecisionEventSink, AgentDecisionKind,
-    AgentEffectPolicies, AgentEffectSafetyClass, AgentEffectSpec, AgentFailureReason,
-    AgentModelTurn, AgentModelUsage, AgentObservabilityError, AgentObservabilityFuture,
-    AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunStatus,
-    AgentSchemaPolicy, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    AgentCheckpointDecision, AgentCheckpointDecisionOption, AgentCheckpointKind,
+    AgentDecisionEventSink, AgentDecisionKind, AgentEffectGeneration, AgentEffectPolicies,
+    AgentEffectSafetyClass, AgentEffectSpec, AgentFailureReason, AgentModelTurn, AgentModelUsage,
+    AgentObservabilityError, AgentObservabilityFuture, AgentOperationId, AgentOperationKind,
+    AgentPendingEffectView, AgentReconciliationDecision, AgentRunEffectOutcome,
+    AgentRunEffectStatus, AgentRunEntityCommand, AgentRunStatus, AgentSchemaPolicy,
+    AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
     AgentUnknownOutcomeEvidence, InMemoryAgentDecisionEventSink, InMemoryAgentRunEffectSink,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
-use rakka_agent_workflow::AgentTimestampMillis;
+use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 
 mod common;
 
@@ -1516,4 +1518,62 @@ async fn a_parked_effect_reports_what_is_known_about_its_unknown_outcome() {
         body["unknown_outcome"],
         serde_json::json!({"sent_at": 4_242, "cancellation_issued": true})
     );
+    assert_eq!(
+        &serde_json::from_value::<AgentPendingEffectView>(body).expect("the view decodes"),
+        parked,
+        "the view round-trips with its evidence"
+    );
+}
+
+/// Issue #100 ask 5: a `ConfirmedNotExecuted` decision mints a new
+/// generation, and the new generation does not inherit the superseded
+/// generation's evidence — it has not been sent.
+#[tokio::test]
+async fn a_redispatch_does_not_inherit_the_superseded_generations_evidence() {
+    let fx = reconcilable_fixture();
+    park_on_reconciliation(
+        &fx,
+        AgentRunEffectOutcome::indeterminate("mcp-outcome-unknown", "the answer was lost")
+            .with_reason(AgentFailureReason::new("mcp-deadline-awaiting-answer"))
+            .with_evidence(Some(AgentUnknownOutcomeEvidence::new(
+                Some(AgentTimestampMillis::new(4_242)),
+                true,
+            ))),
+    )
+    .await;
+    let checkpoint_id = snapshot_of(&fx).await.open_checkpoints[0]
+        .checkpoint_id
+        .clone();
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "not-executed",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id,
+            resolver: PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(AgentCheckpointDecision::Reconciliation(
+                AgentReconciliationDecision::ConfirmedNotExecuted,
+            )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the reconciliation applies");
+
+    let redispatched = stored_tool_effect(&fx).await;
+    assert_eq!(redispatched.generation, AgentEffectGeneration::FIRST.next());
+    assert_eq!(redispatched.unknown_outcome, None);
+    assert_eq!(redispatched.last_error_reason, None);
 }
