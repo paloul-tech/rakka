@@ -448,15 +448,10 @@ where
             .await;
             match called {
                 Ok(result) => result,
-                // Past the recheck the request may have been handed over, so a
-                // deadline here leaves the outcome unknown rather than failing
-                // the attempt.
-                Err(_) => Err(unknown_outcome(
-                    UnknownCause::Deadline,
-                    &progress,
-                    started,
-                    "the attempt exceeded the effect's timeout during tools/call",
-                )),
+                // Past the recheck the request may have been handed over: a
+                // deadline here fails the attempt only when it provably was
+                // not, and otherwise leaves the outcome unknown.
+                Err(_) => Err(call_ended(CallEnd::Deadline, &progress, started)),
             }
         }
         .await;
@@ -927,7 +922,7 @@ async fn within<T>(
     tokio::time::timeout_at(deadline, work)
         .await
         .map_err(|_| AgentDispatchError::Invocation {
-            code: "mcp-transport-failed",
+            code: MCP_TRANSPORT_FAILED,
             message: "the attempt exceeded the effect's timeout".to_string(),
         })
 }
@@ -936,10 +931,9 @@ async fn within<T>(
 /// answer was never read: the server may have acted.
 const MCP_OUTCOME_UNKNOWN: &str = "mcp-outcome-unknown";
 
-/// The reason an unknown outcome records when rmcp never accepted the
-/// request: it provably never left, yet the attempt still parks (issue #100
-/// ask 5 records it; changing that is a separate follow-up).
-const MCP_CALL_NOT_HANDED_OVER: &str = "mcp-call-not-handed-over";
+/// The stable code of an attempt that failed before `tools/call` left: its
+/// transport, its deadline, or a session that could not carry it.
+const MCP_TRANSPORT_FAILED: &str = "mcp-transport-failed";
 
 /// The reason when the deadline fired while the attempt waited for the
 /// answer to a request it handed over.
@@ -954,47 +948,64 @@ const MCP_TRANSPORT_AWAITING_ANSWER: &str = "mcp-transport-awaiting-answer";
 /// of a kind `tools/call` never returns.
 const MCP_ANSWER_NOT_RECORDED: &str = "mcp-answer-not-recorded";
 
-/// What ended an attempt whose outcome is unknown.
-#[derive(Debug, Clone, Copy)]
-enum UnknownCause {
+/// How an attempt's `tools/call` ended without a recorded answer.
+#[derive(Debug)]
+enum CallEnd {
     /// The attempt's deadline.
     Deadline,
-    /// Anything but the deadline that left no answer recorded: a failure of
-    /// the transport or the session, or an answer of a kind `tools/call`
-    /// never returns.
-    Transport,
+    /// Anything but the deadline: a failure of the transport or the session,
+    /// or an answer of a kind `tools/call` never returns — as
+    /// `client::service_error` maps it.
+    Failed(McpClientError),
 }
 
-/// The reason an unknown outcome records: decided by how far the call got,
-/// never by which wrapper noticed.
-fn unknown_reason(cause: UnknownCause, progress: &CallProgress) -> &'static str {
-    match progress {
-        CallProgress::NotHandedOver => MCP_CALL_NOT_HANDED_OVER,
-        CallProgress::AwaitingAnswer { .. } => match cause {
-            UnknownCause::Deadline => MCP_DEADLINE_AWAITING_ANSWER,
-            UnknownCause::Transport => MCP_TRANSPORT_AWAITING_ANSWER,
-        },
-        CallProgress::WaitEnded { answered: true, .. } => MCP_ANSWER_NOT_RECORDED,
-        CallProgress::WaitEnded {
-            answered: false, ..
-        } => MCP_TRANSPORT_AWAITING_ANSWER,
-    }
-}
-
-/// The unknown outcome of an attempt that got as far as `progress`, with
-/// the report a park records: the reason, and the hand-off's offset from
-/// `started` when there was one. The cancellation is the close's to add
-/// ([`cancellation_issued_on`]).
-fn unknown_outcome(
-    cause: UnknownCause,
+/// The error of an attempt whose `tools/call` ended without a recorded
+/// answer, decided by how far the call got — never by which wrapper noticed.
+///
+/// A call rmcp never accepted provably never left (issue #103): rmcp 3.4.0's
+/// `send_cancellable_request` returns as soon as its cancel-safe channel send
+/// queues the request, with no await after it, so a deadline that drops the
+/// call before then, or a failure the send itself returns, means nothing was
+/// queued. That is a failure before the send, and it fails exactly as one —
+/// retryable under the effect's budget, never parked. Re-check that claim
+/// whenever the rmcp pin moves. Past the hand-over the server may have acted,
+/// so the outcome is unknown, with the report a park records: the reason and
+/// the hand-off's offset from `started`. The cancellation is the close's to
+/// add ([`cancellation_issued_on`]).
+fn call_ended(
+    end: CallEnd,
     progress: &CallProgress,
     started: tokio::time::Instant,
-    message: impl Into<String>,
 ) -> AgentDispatchError {
-    let mut report = AgentUnknownOutcomeReport::new().with_reason(unknown_reason(cause, progress));
-    if let Some(at) = progress.handed_over() {
-        report = report.with_handed_over_after(at.saturating_duration_since(started));
-    }
+    let handed_over = match progress {
+        CallProgress::NotHandedOver => {
+            return match end {
+                CallEnd::Deadline => AgentDispatchError::Invocation {
+                    code: MCP_TRANSPORT_FAILED,
+                    message: "the attempt exceeded the effect's timeout before tools/call was \
+                              handed over"
+                        .to_string(),
+                },
+                CallEnd::Failed(error) => dispatch_error(error),
+            };
+        }
+        CallProgress::AwaitingAnswer { handed_over, .. }
+        | CallProgress::WaitEnded { handed_over, .. } => *handed_over,
+    };
+    let reason = match (progress, &end) {
+        (CallProgress::AwaitingAnswer { .. }, CallEnd::Deadline) => MCP_DEADLINE_AWAITING_ANSWER,
+        (CallProgress::WaitEnded { answered: true, .. }, _) => MCP_ANSWER_NOT_RECORDED,
+        _ => MCP_TRANSPORT_AWAITING_ANSWER,
+    };
+    let message = match end {
+        CallEnd::Deadline => {
+            "the attempt exceeded the effect's timeout during tools/call".to_string()
+        }
+        CallEnd::Failed(error) => format!("tools/call ended without a recorded answer: {error}"),
+    };
+    let report = AgentUnknownOutcomeReport::new()
+        .with_reason(reason)
+        .with_handed_over_after(handed_over.saturating_duration_since(started));
     AgentDispatchError::outcome_unknown(MCP_OUTCOME_UNKNOWN, message).with_report(report)
 }
 
@@ -1015,8 +1026,8 @@ const DEADLINE_CANCEL_REASON: &str = "the attempt's deadline elapsed";
 ///
 /// A JSON-RPC error is the server's own answer — it told us what it did —
 /// and keeps the mapping a failure before the send gets. Every other failure
-/// left no answer recorded, so the outcome is unknown and named by how far
-/// the call got.
+/// left no answer recorded, and [`call_ended`] decides by how far the call
+/// got.
 fn sent_call_error(
     server: &str,
     error: &ServiceError,
@@ -1026,12 +1037,7 @@ fn sent_call_error(
     let mapped = client::service_error(server, error);
     match error {
         ServiceError::McpError(_) => dispatch_error(mapped),
-        _ => unknown_outcome(
-            UnknownCause::Transport,
-            progress,
-            started,
-            format!("tools/call ended without a recorded answer: {mapped}"),
-        ),
+        _ => call_ended(CallEnd::Failed(mapped), progress, started),
     }
 }
 
@@ -1225,7 +1231,7 @@ fn dispatch_error(error: McpClientError) -> AgentDispatchError {
     match &error {
         McpClientError::Transport { .. } | McpClientError::Protocol { .. } => {
             AgentDispatchError::Invocation {
-                code: "mcp-transport-failed",
+                code: MCP_TRANSPORT_FAILED,
                 message: error.to_string(),
             }
         }
@@ -1262,14 +1268,14 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        bounded_detail, cancellation_issued_on, candidate_of, error_detail, mcp_artifact_store,
-        redact_json_text, redact_value, unknown_outcome, McpArtifactStore, McpDispatchToolExecutor,
-        UnknownCause,
+        bounded_detail, call_ended, cancellation_issued_on, candidate_of, error_detail,
+        mcp_artifact_store, redact_json_text, redact_value, CallEnd, McpArtifactStore,
+        McpDispatchToolExecutor,
     };
     use crate::binding::{
         McpServerBinding, McpServerId, McpToolPolicy, MCP_TOOL_ERROR_DETAIL_MAX_BYTES,
     };
-    use crate::client::{CallProgress, McpAllowAllEgress};
+    use crate::client::{CallProgress, McpAllowAllEgress, McpClientError};
     use crate::sync::{McpDescriptorSet, McpSyncedDescriptor};
 
     /// A store no construction proof ever writes to: every one of them refuses
@@ -1548,9 +1554,42 @@ mod tests {
         );
     }
 
-    /// Review focus 5 and the spec's table: every progress state against both
-    /// causes names the situation by how far the call got, reports the
-    /// hand-off offset when there was one, and never claims a cancellation.
+    /// A transport failure as `service_error` maps one: what a call that ends
+    /// without an answer carries.
+    fn transport_closed() -> McpClientError {
+        McpClientError::Transport {
+            server: "crm".to_string(),
+            reason: "TransportClosed".to_string(),
+        }
+    }
+
+    /// Issue #103: a call rmcp never accepted provably never left, so it
+    /// fails as an attempt that ends before the send does — retryable under
+    /// the effect's budget, with no unknown-outcome report — whether the
+    /// deadline or the transport ended it.
+    #[test]
+    fn a_call_never_handed_over_fails_as_one_before_the_send() {
+        let started = tokio::time::Instant::now();
+        for end in [CallEnd::Deadline, CallEnd::Failed(transport_closed())] {
+            let label = format!("{end:?}");
+            let error = call_ended(end, &CallProgress::NotHandedOver, started);
+            assert!(
+                matches!(
+                    &error,
+                    AgentDispatchError::Invocation {
+                        code: "mcp-transport-failed",
+                        ..
+                    }
+                ),
+                "{label}: {error:?}"
+            );
+            assert_eq!(error.unknown_outcome_report(), None, "{label}");
+        }
+    }
+
+    /// The spec's table, past the hand-over: every progress state against
+    /// both ends names the situation by how far the call got, reports the
+    /// hand-off offset, and never claims a cancellation.
     #[test]
     fn an_unknown_outcome_is_named_by_how_far_the_call_got() {
         let started = tokio::time::Instant::now();
@@ -1559,87 +1598,54 @@ mod tests {
             request: RequestId::Number(7),
             handed_over,
         };
+        let ended = |answered| CallProgress::WaitEnded {
+            handed_over,
+            answered,
+        };
         let cases = [
             (
-                CallProgress::NotHandedOver,
-                UnknownCause::Deadline,
-                "mcp-call-not-handed-over",
-                None,
-            ),
-            (
-                CallProgress::NotHandedOver,
-                UnknownCause::Transport,
-                "mcp-call-not-handed-over",
-                None,
-            ),
-            (
                 awaiting.clone(),
-                UnknownCause::Deadline,
+                CallEnd::Deadline,
                 "mcp-deadline-awaiting-answer",
-                Some(40),
             ),
             (
                 awaiting,
-                UnknownCause::Transport,
+                CallEnd::Failed(transport_closed()),
                 "mcp-transport-awaiting-answer",
-                Some(40),
             ),
             (
-                CallProgress::WaitEnded {
-                    handed_over,
-                    answered: false,
-                },
-                UnknownCause::Transport,
+                ended(false),
+                CallEnd::Failed(transport_closed()),
                 "mcp-transport-awaiting-answer",
-                Some(40),
             ),
             (
-                CallProgress::WaitEnded {
-                    handed_over,
-                    answered: false,
-                },
-                UnknownCause::Deadline,
+                ended(false),
+                CallEnd::Deadline,
                 "mcp-transport-awaiting-answer",
-                Some(40),
             ),
+            (ended(true), CallEnd::Deadline, "mcp-answer-not-recorded"),
             (
-                CallProgress::WaitEnded {
-                    handed_over,
-                    answered: true,
-                },
-                UnknownCause::Deadline,
+                ended(true),
+                CallEnd::Failed(transport_closed()),
                 "mcp-answer-not-recorded",
-                Some(40),
-            ),
-            (
-                CallProgress::WaitEnded {
-                    handed_over,
-                    answered: true,
-                },
-                UnknownCause::Transport,
-                "mcp-answer-not-recorded",
-                Some(40),
             ),
         ];
-        for (progress, cause, code, after_ms) in cases {
-            let error = unknown_outcome(cause, &progress, started, "detail");
-            assert_eq!(
-                error.code(),
-                "mcp-outcome-unknown",
-                "{progress:?} {cause:?}"
-            );
+        for (progress, end, code) in cases {
+            let label = format!("{progress:?} {end:?}");
+            let error = call_ended(end, &progress, started);
+            assert_eq!(error.code(), "mcp-outcome-unknown", "{label}");
             let report = error.unknown_outcome_report().expect("a report");
             assert_eq!(
                 report.reason.as_ref().map(AgentFailureReason::code),
                 Some(code),
-                "{progress:?} {cause:?}"
+                "{label}"
             );
             assert_eq!(
                 report.handed_over_after,
-                after_ms.map(Duration::from_millis),
-                "{progress:?} {cause:?}"
+                Some(Duration::from_millis(40)),
+                "{label}"
             );
-            assert!(!report.cancellation_issued, "{progress:?} {cause:?}");
+            assert!(!report.cancellation_issued, "{label}");
         }
     }
 
@@ -1648,11 +1654,13 @@ mod tests {
     #[test]
     fn an_issued_cancellation_marks_only_an_unknown_outcome() {
         let started = tokio::time::Instant::now();
-        let marked = cancellation_issued_on(unknown_outcome(
-            UnknownCause::Deadline,
-            &CallProgress::NotHandedOver,
+        let marked = cancellation_issued_on(call_ended(
+            CallEnd::Deadline,
+            &CallProgress::AwaitingAnswer {
+                request: RequestId::Number(7),
+                handed_over: started,
+            },
             started,
-            "detail",
         ));
         assert!(marked
             .unknown_outcome_report()

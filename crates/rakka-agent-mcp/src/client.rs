@@ -300,7 +300,8 @@ const SESSION_CLOSE_BOUND: Duration = Duration::from_millis(MCP_SESSION_CLOSE_BO
 /// call still in flight.
 #[derive(Debug, Clone)]
 pub(crate) enum CallProgress {
-    /// rmcp has not accepted the request: nothing left.
+    /// rmcp has not accepted the request: nothing left, and an attempt that
+    /// ends here failed before the send (issue #103).
     NotHandedOver,
     /// rmcp accepted the request at `handed_over` and no answer has been
     /// read. A deadline that drops the call here leaves `request` behind for
@@ -315,18 +316,6 @@ pub(crate) enum CallProgress {
         handed_over: tokio::time::Instant,
         answered: bool,
     },
-}
-
-impl CallProgress {
-    /// When rmcp accepted the request, once it did.
-    pub(crate) const fn handed_over(&self) -> Option<tokio::time::Instant> {
-        match self {
-            Self::NotHandedOver => None,
-            Self::AwaitingAnswer { handed_over, .. } | Self::WaitEnded { handed_over, .. } => {
-                Some(*handed_over)
-            }
-        }
-    }
 }
 
 /// One negotiated MCP client session.
