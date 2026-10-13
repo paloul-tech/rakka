@@ -303,11 +303,10 @@ impl AgentCheckpointEffectBinding {
             .map_err(|error| AgentCheckpointError::InvalidBinding {
                 message: format!("the effect arguments could not be digested: {error}"),
             })?;
-        let target = effect.request.target();
         Ok(Self {
             effect_id: effect.effect_id.clone(),
             generation: effect.generation,
-            target: format!("{}:{}", target.target_type, target.name),
+            target: effect.request.target_label(),
             argument_digest,
             safety_class: effect.safety.class(),
             credential_binding: effect.credential_binding.clone(),
