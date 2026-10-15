@@ -174,7 +174,7 @@ A record heals on the first settle pass that touches it: any `settle_side_effect
 - The five default decisions on the checkpoint, and that a reconciliation checkpoint never hard-expires.
 - **The credential-resolution park** (ruling 5): a handoff send whose credential can't be resolved still parks. The follow-up issue is filed before the PR.
 - **Telemetry for the release:** a notice that settles a parked send drops the checkpoint inside an exchange acceptance, which closes no `checkpoint-resolve` segment. That segment belongs to the `ResolveCheckpoint` and `ResolveIndeterminateEffect` commands, and adding one for an exchange is out of scope. The `checkpoint-open` segment for the new park and for the repair needs no new code.
-- **Late decisions:** an operator decision that arrives after the notice settled the send is refused as usual: `run-unknown-checkpoint` through the checkpoint, `run-stale-effect-result` through the effect-layer command.
+- **Late decisions:** an operator decision that arrives after the notice settled the send is refused as usual. On a run that handed off, both paths answer `run-terminal`. On a run that resumed, the checkpoint path answers `run-unknown-checkpoint` and the effect-layer command answers `run-stale-effect-result`.
 
 ## What rakka.host sees at the pin bump
 
