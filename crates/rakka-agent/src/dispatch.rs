@@ -841,8 +841,11 @@ pub enum AgentA2aHandoffFinding {
 /// prove the ambiguously failed write will never land — so only a durable
 /// record held under a foreign, unresolved identity answers definitively in
 /// the negative. A retry budget that spends out without an answer parks the
-/// run for a reconciliation decision rather than resuming it beside a
-/// possibly-live transfer. An absent executor fails closed at `invoke`.
+/// run behind an indeterminate-effect reconciliation checkpoint rather than
+/// resuming it beside a possibly-live transfer. The task's handoff result
+/// settles the parked send as executed when it arrives, since the task owes
+/// one only for a transfer it recorded. An absent executor fails closed at
+/// `invoke`.
 ///
 /// # The error text this returns becomes durable state
 ///

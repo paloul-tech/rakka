@@ -737,6 +737,32 @@ impl AgentRun {
                 .any(|effect| !effect.kind().outside_the_turn())
     }
 
+    /// Whether the record holds a park a binary before issue #106 left
+    /// unresolvable:
+    /// - a live run whose handoff cell the task already answered while the
+    ///   cell's send stayed `Indeterminate`, because the old notice path left
+    ///   the effect parked;
+    /// - a live run holding an `Indeterminate` effect with no reconciliation
+    ///   checkpoint bound to its generation, because the old exhausted-send
+    ///   path opened none.
+    ///
+    /// Under the fixed transitions neither shape is reachable: every
+    /// transition that parks a live run's effect opens its checkpoint, and
+    /// every notice settles a parked send. The settle pass repairs such a
+    /// record on the first pass that touches it (`repair_park`), as the gap
+    /// slice 3 repair rests an unrested turn. A terminal run is excluded: its
+    /// checkpoint-less `Indeterminate` promotion or claim append is the
+    /// deliberate shape `record_effect_result` documents.
+    pub(crate) fn needs_park_repair(&self) -> bool {
+        if self.status.is_terminal() {
+            return false;
+        }
+        self.loop_state.indeterminate_effects().any(|effect| {
+            handoff_send(&self.loop_state, &effect.effect_id) == HandoffSend::ResolvedByTask
+                || !has_reconciliation_checkpoint(&self.loop_state, effect)
+        })
+    }
+
     /// Serialized size of the materialized record, in bytes.
     #[must_use]
     pub fn materialized_size_bytes(&self) -> usize {
@@ -1763,6 +1789,65 @@ fn accept_run_cancel(
     )
 }
 
+/// The receipt a task's handoff answer stands in for when it settles a
+/// parked send ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The send reached the task, and the task's own durable record is the proof.
+/// The receipt is never persisted (the A2aHandoff arm reads only its handoff
+/// id and generation), so its status label names the answer it was built
+/// from.
+fn handoff_answer_receipt(
+    handoff: &crate::identity::AgentHandoffId,
+    target_generation: Option<AgentAssignmentGeneration>,
+    accepted: bool,
+) -> crate::coordination::AgentA2aHandoffReceipt {
+    crate::coordination::AgentA2aHandoffReceipt {
+        handoff: handoff.clone(),
+        target_generation,
+        peer_status: if accepted { "accepted" } else { "refused" }.to_string(),
+    }
+}
+
+/// Resolves the run's parked handoff send as executed, from the task's
+/// answer, and drops the reconciliation checkpoint parked on it
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md),
+/// [11.5](../../../docs/plans/rakka-agent/spec.md),
+/// [12.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The resolution is exactly the one a `ConfirmedExecuted` decision carrying
+/// the receipt would apply. The generation's attempts were billed when it
+/// parked, so nothing is billed again, and the evidence the park recorded
+/// stays as the generation's history. Answers whether there was a parked send
+/// to settle: a live run whose handoff cell holds an `Indeterminate` send
+/// (issue #106).
+fn settle_parked_handoff_send(
+    state: &mut AgentRunState,
+    receipt: crate::coordination::AgentA2aHandoffReceipt,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<bool> {
+    let parked = state.run().and_then(|run| {
+        if run.status.is_terminal() {
+            return None;
+        }
+        let cell = run.loop_state.handoff()?;
+        run.loop_state
+            .indeterminate_effects()
+            .find(|effect| effect.effect_id == cell.record.effect)
+            .map(|effect| (effect.effect_id.clone(), effect.generation))
+    });
+    let Some((effect_id, generation)) = parked else {
+        return Ok(false);
+    };
+    apply_effect_outcome(
+        state,
+        &effect_id,
+        &AgentRunEffectOutcome::A2aHandoff { receipt },
+        now,
+    )?;
+    drop_reconciliation_checkpoint(state, &effect_id, generation)?;
+    Ok(true)
+}
+
 /// Applies the task's [`AgentExchangeKind::HandoffResult`] notice
 /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)): the
 /// receiving half of the task → source-run resolution leg.
@@ -1903,6 +1988,22 @@ fn accept_handoff_result(
     let target = cell.record.resolved.agent.clone();
     let winding_down = run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling;
     let apply = || -> AgentRunResult<()> {
+        // A send parked `Indeterminate`, because its probe could not read the
+        // transfer, is settled first. This notice is the task's durable record
+        // of the transfer, which is exactly what the reconciliation checkpoint
+        // waits for. Both answers prove the send executed (a refusal is owed
+        // only for a transfer the task recorded), so the generation resolves
+        // as executed and its checkpoint drops, in this same compare-and-set
+        // (issue #106).
+        let receipt = match &notice.resolution {
+            crate::task::AgentHandoffResolutionNotice::Accepted { generation, .. } => {
+                handoff_answer_receipt(&notice.handoff, Some(*generation), true)
+            }
+            crate::task::AgentHandoffResolutionNotice::Refused { .. } => {
+                handoff_answer_receipt(&notice.handoff, None, false)
+            }
+        };
+        settle_parked_handoff_send(state, receipt, now)?;
         match &notice.resolution {
             crate::task::AgentHandoffResolutionNotice::Accepted {
                 target_run,
@@ -1942,6 +2043,15 @@ fn accept_handoff_result(
                     handoff: notice.handoff.clone(),
                     target,
                 });
+                // A handed-off run dispatches nothing further, so whatever it
+                // committed and never sent is fenced here, as any wind-down
+                // fences it. The case is a re-send that a `ConfirmedNotExecuted`
+                // decision authorized and this notice beat to the dispatch
+                // pass: the winding-down run may not dispatch it, and left
+                // `Pending` it would hold the wind-down open forever. The
+                // fence's own cell settle is first-writer-wins, so the
+                // acceptance above stands (issue #106).
+                run.loop_state.fence_unsent_effects(now);
                 Ok(())
             }
             crate::task::AgentHandoffResolutionNotice::Refused { code } => {
@@ -2517,6 +2627,14 @@ fn advance_once(
     let Some(run) = state.run.as_ref() else {
         return Ok(Vec::new());
     };
+    if run.needs_park_repair() {
+        // A park a binary before issue #106 left unresolvable: give it its
+        // checkpoint, or settle the send its task already answered. A repair
+        // that terminalizes the run owes what any terminalization owes, in
+        // this same compare-and-set ([`AgentRun::needs_park_repair`]).
+        repair_park(state, policies, now)?;
+        return owed_run_exchanges(state, now);
+    }
     if run.needs_turn_rest() {
         // A record a binary before gap slice 3 left wedged: its turn is
         // over and nothing will ever rest it. Rest it here, as the tool arm
@@ -3925,6 +4043,56 @@ fn rest_unrested_turn(state: &mut AgentRunState, now: AgentTimestampMillis) -> A
     Ok(())
 }
 
+/// Repairs a park a binary before issue #106 left unresolvable, in one
+/// compare-and-set: the repair of [`AgentRun::needs_park_repair`].
+///
+/// A send whose cell the task already answered settles as executed, exactly
+/// as the fixed notice path settles it. That terminalizes an accepted
+/// transfer `HandedOff` and leaves a refused one resumed. Every remaining
+/// `Indeterminate` effect without its reconciliation checkpoint gets the one
+/// `record_effect_result` opens. The disposition is then re-settled.
+fn repair_park(
+    state: &mut AgentRunState,
+    policies: &AgentEffectPolicies,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let answered = state.run().and_then(|run| {
+        let cell = run.loop_state.handoff()?;
+        match &cell.status {
+            crate::coordination::AgentHandoffStatus::Accepted { generation, .. } => Some(
+                handoff_answer_receipt(&cell.record.handoff, Some(*generation), true),
+            ),
+            crate::coordination::AgentHandoffStatus::Refused { .. } => {
+                Some(handoff_answer_receipt(&cell.record.handoff, None, false))
+            }
+            _ => None,
+        }
+    });
+    if let Some(receipt) = answered {
+        settle_parked_handoff_send(state, receipt, now)?;
+    }
+    let unbound: Vec<AgentEffectId> = state
+        .run()
+        .map(|run| {
+            run.loop_state
+                .indeterminate_effects()
+                .filter(|effect| !has_reconciliation_checkpoint(&run.loop_state, effect))
+                .map(|effect| effect.effect_id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for effect_id in &unbound {
+        open_effect_checkpoint(
+            state,
+            policies,
+            effect_id,
+            AgentCheckpointKind::IndeterminateEffectReconciliation,
+            now,
+        )?;
+    }
+    settle_run_disposition(state, now)
+}
+
 /// The status of a run whose next step is dispatch: parked on whichever
 /// approval-family checkpoint wait it holds, or waiting on its effects.
 fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
@@ -4201,12 +4369,15 @@ fn record_effect_result(
     effect.record_attempt(attempt, fence);
 
     apply_effect_outcome(state, effect_id, &outcome, now)?;
-    // An ambiguous outcome parks the run behind a durable reconciliation
-    // checkpoint in the same transition that recorded it, so the wait carries
-    // the full record surface — decision set, dedup key, SLA escalation,
-    // roles — a bare indeterminate effect could not
+    // A transition that leaves the generation `Indeterminate` parks the run
+    // behind a durable reconciliation checkpoint in the same transition, so
+    // the wait carries the full record surface — decision set, dedup key,
+    // SLA escalation, roles — a bare indeterminate effect could not
     // ([specification 12.1](../../../docs/plans/rakka-agent/spec.md),
-    // [12.2](../../../docs/plans/rakka-agent/spec.md)).
+    // [12.2](../../../docs/plans/rakka-agent/spec.md)). The generation's status
+    // decides, not the outcome. An `Indeterminate` outcome parks it, and so
+    // does a handoff send's `Exhausted` one, whose probe could not establish
+    // the transfer; a park with no checkpoint was the defect of issue #106.
     //
     // Not on a run that has already ended: there is no run to park, and the
     // only effect a terminal run can owe a result for is a promotion or claim
@@ -4217,7 +4388,12 @@ fn record_effect_result(
     // resolvable by `ResolveIndeterminateEffect`, and the terminal status
     // untouched ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
     let live = state.run().is_some_and(|run| !run.status.is_terminal());
-    if live && matches!(outcome, AgentRunEffectOutcome::Indeterminate { .. }) {
+    let parked = state.run().is_some_and(|run| {
+        run.loop_state
+            .indeterminate_effects()
+            .any(|effect| effect.effect_id == *effect_id && effect.generation == generation)
+    });
+    if live && parked {
         open_effect_checkpoint(
             state,
             policies,
@@ -4227,6 +4403,47 @@ fn record_effect_result(
         )?;
     }
     settle_run_disposition(state, now)
+}
+
+/// How the run's handoff cell stands toward one send effect
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every site that settles a handoff send's generation asks this one
+/// question:
+/// - an effect the cell does not hold is not a handoff send;
+/// - a transfer still awaiting the target is the slice 5.1 arm;
+/// - a transfer the task already answered proves the send executed,
+///   whatever the dispatcher reports;
+/// - a cell the run settled itself takes the shared wind-down (issue #106).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffSend {
+    /// The effect is not the run's handoff send.
+    NotHeld,
+    /// The cell holds the effect, and the transfer awaits the target.
+    Unresolved,
+    /// The task's handoff result settled the cell `Accepted` or `Refused`:
+    /// the task owes one only for a transfer it recorded, so the send reached
+    /// it.
+    ResolvedByTask,
+    /// The run settled the cell `Failed` on its own decision.
+    SettledLocally,
+}
+
+/// Classifies one effect against the run's handoff cell.
+fn handoff_send(loop_state: &AgentLoopState, effect_id: &AgentEffectId) -> HandoffSend {
+    let Some(cell) = loop_state.handoff() else {
+        return HandoffSend::NotHeld;
+    };
+    if cell.record.effect != *effect_id {
+        return HandoffSend::NotHeld;
+    }
+    match &cell.status {
+        crate::coordination::AgentHandoffStatus::Pending
+        | crate::coordination::AgentHandoffStatus::Sent { .. } => HandoffSend::Unresolved,
+        crate::coordination::AgentHandoffStatus::Accepted { .. }
+        | crate::coordination::AgentHandoffStatus::Refused { .. } => HandoffSend::ResolvedByTask,
+        crate::coordination::AgentHandoffStatus::Failed { .. } => HandoffSend::SettledLocally,
+    }
 }
 
 /// Applies one established outcome to the effect that owes it and to the loop.
@@ -4247,6 +4464,11 @@ fn apply_effect_outcome(
         let run = state.run_mut()?;
         run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling
     };
+    // How the run's handoff cell stands toward this effect, read before the
+    // effect is borrowed (issue #106).
+    let handoff_standing = state.run().map_or(HandoffSend::NotHeld, |run| {
+        handoff_send(&run.loop_state, effect_id)
+    });
 
     let run = state.run_mut()?;
     let Some(effect) = run.loop_state.effect_mut(effect_id) else {
@@ -4262,6 +4484,26 @@ fn apply_effect_outcome(
     let first_resolution = effect.is_outstanding();
 
     match outcome {
+        // The task's handoff result already settled the cell. The send reached
+        // the task, and the task's durable record is the proof the attempt's
+        // own answer could not give. Whatever the attempt reported (a failure,
+        // a spent budget, an unknown outcome), the generation executed: it
+        // settles `Succeeded`, and the cell and terminal reason the notice set
+        // stand. A live run that is not winding down rests its turn, as the
+        // A2aHandoff arm does (issue #106).
+        AgentRunEffectOutcome::Failed { .. }
+        | AgentRunEffectOutcome::Exhausted { .. }
+        | AgentRunEffectOutcome::Indeterminate { .. }
+            if handoff_standing == HandoffSend::ResolvedByTask =>
+        {
+            effect.status = AgentRunEffectStatus::Succeeded;
+            let run = state.run_mut()?;
+            if !winding_down && !run.loop_state.awaits_turn_effect() {
+                let (phase, status) = turn_rest(&run.loop_state);
+                run.loop_state.set_phase(phase);
+                run.status = status;
+            }
+        }
         AgentRunEffectOutcome::Model { turn } => {
             effect.status = AgentRunEffectStatus::Succeeded;
             let turn = (**turn).clone();
@@ -4500,13 +4742,15 @@ fn apply_effect_outcome(
             // transfer, and resuming beside a possibly-live transfer is the
             // ambiguity the specification forbids — the generation parks
             // `Indeterminate` for a reconciliation decision instead, with
-            // the cell still holding the fence.
-            let handoff_held = failed_kind == AgentRunEffectKind::A2aSendCall
-                && state.run().is_some_and(|run| {
-                    run.loop_state
-                        .handoff()
-                        .is_some_and(|cell| cell.record.effect == *effect_id)
-                });
+            // the cell still holding the fence, and `record_effect_result`
+            // opens the generation's reconciliation checkpoint.
+            //
+            // The branch is for a transfer still awaiting the target
+            // (issue #106). A cell the task already answered settled the send
+            // as executed in the arm above. A cell the run settled itself (an
+            // abandoned transfer) takes the shared wind-down below, so the run
+            // fails as the decision says.
+            let handoff_held = handoff_standing == HandoffSend::Unresolved;
             if handoff_held {
                 let exhausted = matches!(outcome, AgentRunEffectOutcome::Exhausted { .. });
                 let run = state.run_mut()?;
@@ -4916,6 +5160,16 @@ fn resolve_indeterminate_effect(
     settle_run_disposition(state, now)
 }
 
+/// Whether the loop holds the reconciliation checkpoint bound to one parked
+/// effect generation.
+fn has_reconciliation_checkpoint(loop_state: &AgentLoopState, effect: &AgentRunEffect) -> bool {
+    loop_state.open_checkpoints().iter().any(|checkpoint| {
+        checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
+            && checkpoint.bound_effect.effect_id == effect.effect_id
+            && checkpoint.bound_effect.generation == effect.generation
+    })
+}
+
 /// Drops the reconciliation checkpoint parked on one resolved effect
 /// generation, when the run holds one: the wait is over, however its decision
 /// arrived.
@@ -4971,6 +5225,8 @@ fn apply_indeterminate_resolution(
         return Err(AgentRunError::Terminal { status: run.status });
     }
     let winding_down = run.terminal_reason.is_some();
+    // Read before the effect is borrowed (issue #106).
+    let handoff_standing = handoff_send(&run.loop_state, effect_id);
 
     let Some(effect) = run.loop_state.effect_mut(effect_id) else {
         return Err(AgentRunError::UnknownEffect {
@@ -4992,6 +5248,24 @@ fn apply_indeterminate_resolution(
             effect_id: effect_id.clone(),
             status: effect.status,
         });
+    }
+    // An exhausted outcome is what parked a handoff send: the probe could not
+    // establish the transfer. Confirming it establishes nothing, and applying
+    // it would re-park the generation with its checkpoint already dropped, so
+    // it is refused, as a confirmation of an indeterminate outcome is
+    // (issue #106).
+    let confirms_exhaustion = matches!(
+        &resolution,
+        AgentEffectResolution::ConfirmedExecuted { outcome }
+            if matches!(outcome.as_ref(), AgentRunEffectOutcome::Exhausted { .. })
+    );
+    if confirms_exhaustion && handoff_standing != HandoffSend::NotHeld {
+        return Err(AgentEffectError::InvalidPolicy {
+            message: "an exhausted outcome is what parked this handoff send; a reconciliation \
+                      decision must establish what happened to the transfer"
+                .to_string(),
+        }
+        .into());
     }
 
     match resolution {
@@ -5324,6 +5598,20 @@ fn resolve_checkpoint(
         }
         AgentCheckpointOutcome::Abandoned => {
             state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
+            // A handoff send's transfer is abandoned with it. The cell settles
+            // failed under the decision's code first, so the failure below takes
+            // the shared wind-down rather than the survivable refusal path: the
+            // decision's contract is that the run fails, and an unresolved cell
+            // would hold the wind-down open on a notice that may never come
+            // (issue #106).
+            {
+                let run = state.run_mut()?;
+                if handoff_send(&run.loop_state, &bound_effect_id) == HandoffSend::Unresolved {
+                    if let Some(cell) = run.loop_state.handoff_mut() {
+                        cell.settle_failed("reconciliation-abandoned", now);
+                    }
+                }
+            }
             // The operator abandoned the ambiguity: the generation fails under
             // a truthful code and the run winds down — or finishes the
             // wind-down a cancellation already began, under that earlier
@@ -5421,6 +5709,16 @@ fn schedule_compensation(
         effect.status = AgentRunEffectStatus::Compensated;
         effect.last_error_code = Some(bounded_detail("compensated".to_string()));
         effect.last_error_reason = None;
+    }
+    // A compensated handoff send's transfer settles failed in this same
+    // compare-and-set. The decision closes the ambiguity, and an unresolved
+    // cell would hold the wind-down open on a notice that may never come. A
+    // notice that does come still corrects the cell, and `HandedOff` wins over
+    // the compensating wind-down (issue #106).
+    if handoff_send(&run.loop_state, effect_id) == HandoffSend::Unresolved {
+        if let Some(cell) = run.loop_state.handoff_mut() {
+            cell.settle_failed("compensated", now);
+        }
     }
 
     // Wind down first, then commit the compensation: the fence cancels only
@@ -7623,11 +7921,12 @@ where
         for _step in 0..AGENT_RUN_MAX_LOOP_STEPS_PER_PASS {
             // A record wedged by a binary before gap slice 3 cannot advance,
             // but one step rests its turn and it can thereafter
-            // ([`AgentRun::needs_turn_rest`]).
-            let can_advance = self
-                .state()?
-                .run()
-                .is_some_and(|run| run.can_advance() || run.needs_turn_rest());
+            // ([`AgentRun::needs_turn_rest`]). A park a binary before issue
+            // #106 left unresolvable is repaired the same way
+            // ([`AgentRun::needs_park_repair`]).
+            let can_advance = self.state()?.run().is_some_and(|run| {
+                run.can_advance() || run.needs_turn_rest() || run.needs_park_repair()
+            });
             if !can_advance {
                 break;
             }
@@ -10048,6 +10347,7 @@ impl From<AgentRunError> for AgentChoreographyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::AgentHandoffStatus;
     use crate::definition::{AgentCredentialBindingRef, AgentTaskDefinitionId};
     use crate::effect::{AgentEffectSpec, AgentReconciliationProtocolRef};
     use crate::loop_runtime::CURRENT_AGENT_LOOP_ADAPTER_VERSION;
@@ -10972,5 +11272,931 @@ mod tests {
             duplicate.run().expect("the run survives").status,
             AgentRunStatus::HandedOff
         );
+    }
+
+    /// A run whose handoff cell holds its send: the shape every issue #106
+    /// proof starts from. The run serves `ticket-1` as generation 1, its turn
+    /// rests `AwaitingTools` on the send, and the send's three attempts are
+    /// reserved, exactly as the turn that committed it left them.
+    struct HandoffSendFixture {
+        state: AgentRunState,
+        scope: AgentRunScope,
+        task: AgentTaskId,
+        effect_id: AgentEffectId,
+        generation: AgentEffectGeneration,
+        handoff: crate::identity::AgentHandoffId,
+        now: AgentTimestampMillis,
+    }
+
+    impl HandoffSendFixture {
+        fn run(&self) -> &AgentRun {
+            self.state.run().expect("the run exists")
+        }
+
+        fn send(&self) -> &AgentRunEffect {
+            self.run()
+                .loop_state
+                .effects()
+                .iter()
+                .find(|effect| effect.effect_id == self.effect_id)
+                .expect("the send is held")
+        }
+
+        fn cell(&self) -> &crate::coordination::AgentHandoffCell {
+            self.run().loop_state.handoff().expect("the cell is held")
+        }
+
+        fn checkpoint_id(&self) -> HumanCheckpointId {
+            AgentCheckpoint::id_for_effect(
+                &self.effect_id,
+                self.generation,
+                AgentCheckpointKind::IndeterminateEffectReconciliation,
+            )
+        }
+
+        /// Records the terminal reason an accepted handoff result leaves.
+        fn hand_off(&mut self) {
+            let handoff = self.handoff.clone();
+            self.state
+                .run_mut()
+                .expect("the run exists")
+                .terminal_reason = Some(AgentRunTerminalReason::HandedOff {
+                handoff,
+                target: AgentId::new("billing-agent").expect("the agent id is valid"),
+            });
+        }
+
+        /// Records the result the dispatcher returns once the executor's
+        /// probe has failed on every attempt: a spent budget.
+        fn exhaust(&mut self, policies: &AgentEffectPolicies) -> AgentRunResult<()> {
+            let (effect_id, generation, now) = (self.effect_id.clone(), self.generation, self.now);
+            record_effect_result(
+                &mut self.state,
+                &effect_id,
+                generation,
+                3,
+                0,
+                AgentRunEffectOutcome::exhausted(
+                    "a2a-handoff-attempt-failed",
+                    "the probe could not read the task's handoff record",
+                ),
+                &AgentSchemaPolicy::default(),
+                policies,
+                now,
+            )
+        }
+
+        /// The handoff-result exchange the task owes this run.
+        fn notice(
+            &self,
+            resolution: crate::task::AgentHandoffResolutionNotice,
+        ) -> AgentExchangeEnvelope {
+            let task_scope = AgentTaskScope::new(self.scope.tenant().clone(), self.task.clone())
+                .expect("the task scope is valid");
+            let operation_id = crate::coordination::handoff_result_operation_id(
+                self.scope.tenant(),
+                &self.handoff,
+            )
+            .expect("the operation id derives");
+            let notice = crate::task::AgentHandoffResultNotice {
+                task: task_scope.clone(),
+                handoff: self.handoff.clone(),
+                resolution,
+            };
+            AgentExchangeEnvelope::new(
+                operation_id.clone(),
+                AgentExchangeKind::HandoffResult,
+                AgentEntityAddress::Task(task_scope),
+                AgentEntityAddress::Run(self.scope.clone()),
+                AgentExchangePayload::encode(
+                    crate::task::AGENT_HANDOFF_RESULT_PAYLOAD_TYPE,
+                    &notice,
+                )
+                .expect("the payload encodes"),
+                rakka_agent_workflow::AgentCorrelationId::new(operation_id.as_str()),
+                self.now,
+            )
+            .expect("the envelope builds")
+        }
+    }
+
+    fn handoff_send_fixture(
+        status: AgentRunStatus,
+        cell_status: AgentHandoffStatus,
+        effect_status: AgentRunEffectStatus,
+    ) -> HandoffSendFixture {
+        use crate::coordination::{AgentHandoffCell, AgentHandoffRecord};
+
+        let now = AgentTimestampMillis::new(10);
+        let scope = AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support-agent").expect("the agent id is valid"),
+            AgentRunId::new("ticket-1-gen-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let task = AgentTaskId::new("ticket-1").expect("the task id is valid");
+        let schema = AgentSchemaRef::new(
+            AgentSchemaId::new("result").expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        );
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("resolve-ticket").expect("the definition id is valid"),
+            "The handoff-park fixture.",
+            schema.clone(),
+            schema,
+        )
+        .expect("the definition is valid");
+        let budget = AgentRunBudget::allocate(
+            crate::budget::AgentBudgetGrant::from_ceilings(&definition.budgets),
+            now,
+        );
+        let mut loop_state = AgentLoopState::started(
+            task.clone(),
+            None,
+            AgentRevisionNumber::INITIAL,
+            AgentRevisionNumber::INITIAL,
+            definition.version,
+            budget,
+        );
+        let turn = loop_state.turn();
+        let effect_id = effect_id_for(&scope, turn, 0).expect("the effect id derives");
+        let handoff =
+            crate::coordination::handoff_id_for(&scope, turn, 0).expect("the handoff id derives");
+        let record = AgentHandoffRecord {
+            handoff: handoff.clone(),
+            goal: None,
+            task: task.clone(),
+            source_run: scope.clone(),
+            source_generation: AgentAssignmentGeneration::new(1),
+            requested_skill: crate::AgentCapabilityId::new("billing")
+                .expect("the skill id is valid"),
+            resolved: crate::delegation::AgentDelegationTarget::new(
+                AgentId::new("billing-agent").expect("the agent id is valid"),
+                AgentTaskDefinitionId::new("resolve-ticket").expect("the definition id is valid"),
+            ),
+            reason: "needs billing authority".to_string(),
+            policy_revision: AgentRevisionNumber::INITIAL,
+            definition_revision: AgentRevisionNumber::INITIAL,
+            settings_revision: AgentRevisionNumber::INITIAL,
+            context: Vec::new(),
+            a2a_message_id: handoff.as_str().to_string(),
+            deduplication_key: handoff.as_str().to_string(),
+            turn,
+            slot: 0,
+            effect: effect_id.clone(),
+            call_id: AgentToolCallId::new("call-1").expect("the call id is valid"),
+            telemetry: Default::default(),
+            created_at: now,
+        };
+        let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+        let mut effect = AgentRunEffect::new(
+            &scope,
+            turn,
+            0,
+            AgentRunEffectRequest::A2aHandoff {
+                handoff: Box::new(record.clone()),
+            },
+            &spec,
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the send derives");
+        effect.status = effect_status;
+        let generation = effect.generation;
+        loop_state
+            .budget_mut()
+            .reserve_attempts(spec.max_attempts)
+            .expect("the send's attempts are affordable");
+        loop_state.record_effect(effect).expect("the send records");
+        let mut cell = AgentHandoffCell::pending(Box::new(record));
+        if cell_status.is_settled() {
+            cell.settled_at = Some(now);
+        }
+        cell.status = cell_status;
+        loop_state.record_handoff(cell);
+        loop_state.set_phase(AgentLoopPhase::AwaitingTools);
+        let mut state = AgentRunState::unassigned(scope.clone(), now);
+        state.run = Some(AgentRun {
+            binding: AgentRunBinding::new(scope.clone(), task.clone()),
+            generation: AgentAssignmentGeneration::new(1),
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            status,
+            loop_state,
+            terminal_reason: None,
+            settlement: AgentRunSettlementStatus::Owed,
+            accepted_at: now,
+            terminal_at: None,
+        });
+        HandoffSendFixture {
+            state,
+            scope,
+            task,
+            effect_id,
+            generation,
+            handoff,
+            now,
+        }
+    }
+
+    /// A deployment SLA: escalate a minute after opening, to `on-call`.
+    fn sla_policies() -> AgentEffectPolicies {
+        AgentEffectPolicies::default().with_checkpoint_sla(crate::checkpoints::AgentCheckpointSla {
+            due_after_ms: Some(60_000),
+            expire_after_ms: Some(120_000),
+            escalation_target: Some("on-call".to_string()),
+        })
+    }
+
+    /// Issue #106, Ask 1: an exhausted handoff send parks behind the same
+    /// reconciliation checkpoint an ambiguous outcome opens: the same id,
+    /// summary, decision set, record surface, and SLA.
+    #[test]
+    fn an_exhausted_handoff_send_parks_behind_its_reconciliation_checkpoint() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForEffect,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        fx.exhaust(&sla_policies())
+            .expect("the exhausted result records");
+
+        assert_eq!(fx.run().status, AgentRunStatus::WaitingForReconciliation);
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Indeterminate);
+        assert!(
+            matches!(fx.cell().status, AgentHandoffStatus::Pending),
+            "the cell still holds the fence"
+        );
+        let open = fx.run().loop_state.open_checkpoints();
+        assert_eq!(open.len(), 1, "the park carries its checkpoint: {open:?}");
+        let checkpoint = &open[0];
+        assert_eq!(checkpoint.checkpoint_id, fx.checkpoint_id());
+        assert_eq!(
+            checkpoint.kind,
+            AgentCheckpointKind::IndeterminateEffectReconciliation
+        );
+        assert_eq!(checkpoint.bound_effect.effect_id, fx.effect_id);
+        assert_eq!(checkpoint.bound_effect.generation, fx.generation);
+        assert_eq!(checkpoint.scope, fx.scope);
+        assert_eq!(checkpoint.task, Some(fx.task.clone()));
+        assert_eq!(
+            checkpoint.summary,
+            "Reconcile indeterminate effect on turn 1"
+        );
+        assert_eq!(
+            checkpoint.allowed_decisions.len(),
+            5,
+            "the five default reconciliation decisions"
+        );
+        assert_eq!(
+            checkpoint.due_at,
+            Some(AgentTimestampMillis::new(fx.now.as_millis() + 60_000))
+        );
+        assert_eq!(
+            checkpoint.expires_at, None,
+            "a reconciliation checkpoint never hard-expires"
+        );
+    }
+
+    /// The SLA the brief found silent: the park's checkpoint escalates at its
+    /// due date, and the run keeps waiting for a decision.
+    #[test]
+    fn a_parked_handoff_sends_checkpoint_escalates_on_its_sla() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForEffect,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        fx.exhaust(&sla_policies())
+            .expect("the exhausted result records");
+
+        let due = AgentTimestampMillis::new(fx.now.as_millis() + 60_000);
+        fire_checkpoint_timers(&mut fx.state, due).expect("the timers fire");
+
+        assert_eq!(fx.run().status, AgentRunStatus::WaitingForReconciliation);
+        let open = fx.run().loop_state.open_checkpoints();
+        assert_eq!(open.len(), 1, "an escalation keeps the wait: {open:?}");
+        assert_eq!(
+            open[0].status,
+            crate::checkpoints::AgentCheckpointStatus::Escalated
+        );
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Indeterminate);
+    }
+
+    /// Issue #106: a send result that arrives after the task's handoff result
+    /// settled the cell proves nothing new. The task's record says the send
+    /// executed, so it settles `Succeeded` whatever the dispatcher reported,
+    /// and nothing parks.
+    #[test]
+    fn a_send_result_after_an_accepted_notice_settles_the_send_executed() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Cancelling,
+            AgentHandoffStatus::Accepted {
+                target_run: AgentRunId::new("ticket-1-gen-2").expect("the run id is valid"),
+                generation: AgentAssignmentGeneration::new(2),
+            },
+            AgentRunEffectStatus::Ready,
+        );
+        fx.hand_off();
+        fx.exhaust(&AgentEffectPolicies::default())
+            .expect("the exhausted result records");
+
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Succeeded);
+        assert!(fx.run().loop_state.open_checkpoints().is_empty());
+        assert_eq!(fx.run().status, AgentRunStatus::HandedOff);
+    }
+
+    #[test]
+    fn a_send_result_after_a_refused_notice_settles_the_send_executed() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForEffect,
+            AgentHandoffStatus::Refused {
+                code: "agent-not-instantiated".to_string(),
+            },
+            AgentRunEffectStatus::Ready,
+        );
+        fx.exhaust(&AgentEffectPolicies::default())
+            .expect("the exhausted result records");
+
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Succeeded);
+        assert!(fx.run().loop_state.open_checkpoints().is_empty());
+        assert_eq!(fx.run().status, AgentRunStatus::Running);
+        assert_eq!(
+            fx.run().loop_state.phase(),
+            AgentLoopPhase::RecordingTurn,
+            "the turn rests and the run resumes"
+        );
+        assert!(fx.run().terminal_reason.is_none());
+    }
+
+    /// The same holds for an unknown outcome: a refusal the task already
+    /// recorded proves the send reached it.
+    #[test]
+    fn an_ambiguous_send_result_after_a_refused_notice_parks_nothing() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForEffect,
+            AgentHandoffStatus::Refused {
+                code: "agent-not-instantiated".to_string(),
+            },
+            AgentRunEffectStatus::Ready,
+        );
+        let (effect_id, generation, now) = (fx.effect_id.clone(), fx.generation, fx.now);
+        record_effect_result(
+            &mut fx.state,
+            &effect_id,
+            generation,
+            1,
+            0,
+            AgentRunEffectOutcome::indeterminate("connection-lost", "the worker died mid-send"),
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            now,
+        )
+        .expect("the ambiguous result records");
+
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Succeeded);
+        assert!(fx.run().loop_state.open_checkpoints().is_empty());
+        assert_eq!(fx.run().status, AgentRunStatus::Running);
+    }
+
+    /// A run whose handoff send parked on exhaustion, behind its checkpoint.
+    fn parked() -> HandoffSendFixture {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForEffect,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        fx.exhaust(&AgentEffectPolicies::default())
+            .expect("the exhausted result records");
+        assert_eq!(
+            fx.run().loop_state.open_checkpoints().len(),
+            1,
+            "the park carries its checkpoint"
+        );
+        fx
+    }
+
+    fn accepted() -> crate::task::AgentHandoffResolutionNotice {
+        crate::task::AgentHandoffResolutionNotice::Accepted {
+            target_run: AgentRunId::new("ticket-1-gen-2").expect("the run id is valid"),
+            generation: AgentAssignmentGeneration::new(2),
+        }
+    }
+
+    fn refused() -> crate::task::AgentHandoffResolutionNotice {
+        crate::task::AgentHandoffResolutionNotice::Refused {
+            code: "agent-not-instantiated".to_string(),
+        }
+    }
+
+    fn operator() -> PrincipalRef {
+        PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "operator".to_string(),
+            display_name: None,
+        }
+    }
+
+    fn decision_key(discriminator: &str) -> crate::AgentOperationId {
+        crate::AgentOperationId::new(
+            crate::AgentOperationKind::CheckpointResolution,
+            ["acme", "support-agent", discriminator],
+        )
+        .expect("the decision key derives")
+    }
+
+    fn reconcile(
+        decision: crate::checkpoints::AgentReconciliationDecision,
+    ) -> AgentCheckpointDecision {
+        AgentCheckpointDecision::Reconciliation(decision)
+    }
+
+    /// Issue #106, Ask 2: the task's acceptance is the proof the parked
+    /// send's checkpoint waits for. The send settles executed, the checkpoint
+    /// drops, and the run hands off, all in the notice's compare-and-set.
+    #[test]
+    fn an_accepted_notice_settles_a_parked_send_and_hands_off() {
+        let mut fx = parked();
+        let envelope = fx.notice(accepted());
+        let result = accept_handoff_result(&mut fx.state, &envelope, fx.now);
+
+        assert!(result.is_accepted(), "the notice settles the exchange");
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Succeeded);
+        assert!(fx.run().loop_state.open_checkpoints().is_empty());
+        assert!(matches!(
+            fx.cell().status,
+            AgentHandoffStatus::Accepted { .. }
+        ));
+        assert_eq!(fx.run().status, AgentRunStatus::HandedOff);
+        assert!(matches!(
+            fx.run().terminal_reason,
+            Some(AgentRunTerminalReason::HandedOff { .. })
+        ));
+    }
+
+    /// Ruling 1: a refusal is owed only for a transfer the task recorded, so
+    /// it too proves the send executed. The send settles `Succeeded` (never
+    /// "not executed", which would send the handoff again), and the run
+    /// resumes as a refused handoff does.
+    #[test]
+    fn a_refused_notice_settles_a_parked_send_and_the_run_resumes() {
+        let mut fx = parked();
+        let envelope = fx.notice(refused());
+        let result = accept_handoff_result(&mut fx.state, &envelope, fx.now);
+
+        assert!(result.is_accepted(), "the notice settles the exchange");
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Succeeded);
+        assert!(fx.run().loop_state.open_checkpoints().is_empty());
+        assert!(matches!(
+            fx.cell().status,
+            AgentHandoffStatus::Refused { .. }
+        ));
+        assert_eq!(fx.run().status, AgentRunStatus::Running);
+        assert_eq!(fx.run().loop_state.phase(), AgentLoopPhase::RecordingTurn);
+        assert!(fx.run().terminal_reason.is_none());
+        assert!(!fx.run().loop_state.handoff_fenced(), "the fence released");
+    }
+
+    /// Review focus 1: a parked run whose cancellation was requested while it
+    /// waited ends as an unparked one would. An acceptance wins with
+    /// `HandedOff`; a refusal releases it into its cancellation.
+    #[test]
+    fn a_notice_to_a_parked_cancelled_run_ends_it_as_an_unparked_one_would() {
+        let mut fx = parked();
+        cancel(&mut fx.state, "operator".to_string(), fx.now).expect("the cancellation records");
+        assert_eq!(fx.run().status, AgentRunStatus::WaitingForReconciliation);
+        let envelope = fx.notice(refused());
+        assert!(accept_handoff_result(&mut fx.state, &envelope, fx.now).is_accepted());
+        assert_eq!(fx.run().status, AgentRunStatus::Cancelled);
+
+        let mut fx = parked();
+        cancel(&mut fx.state, "operator".to_string(), fx.now).expect("the cancellation records");
+        let envelope = fx.notice(accepted());
+        assert!(accept_handoff_result(&mut fx.state, &envelope, fx.now).is_accepted());
+        assert_eq!(fx.run().status, AgentRunStatus::HandedOff);
+    }
+
+    /// Review focus 2: the courier delivering the same notice again after it
+    /// released the park changes nothing. The settled cell absorbs it.
+    #[test]
+    fn a_replayed_notice_after_the_release_changes_nothing() {
+        let mut fx = parked();
+        let envelope = fx.notice(refused());
+        assert!(accept_handoff_result(&mut fx.state, &envelope, fx.now).is_accepted());
+        let (status, phase) = (fx.run().status, fx.run().loop_state.phase());
+
+        assert!(accept_handoff_result(&mut fx.state, &envelope, fx.now).is_accepted());
+        assert_eq!(fx.run().status, status);
+        assert_eq!(fx.run().loop_state.phase(), phase);
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Succeeded);
+        assert!(fx.run().loop_state.open_checkpoints().is_empty());
+    }
+
+    /// Review focus 3: a decision submitted after the notice released the
+    /// park is refused under the ordinary codes, never applied twice.
+    #[test]
+    fn a_decision_after_the_release_is_refused() {
+        let policy = AgentSchemaPolicy::default();
+        let policies = AgentEffectPolicies::default();
+
+        // A run that resumed: the checkpoint is gone, and the send resolved.
+        let mut fx = parked();
+        let checkpoint_id = fx.checkpoint_id();
+        let envelope = fx.notice(refused());
+        assert!(accept_handoff_result(&mut fx.state, &envelope, fx.now).is_accepted());
+        let error = resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            reconcile(crate::checkpoints::AgentReconciliationDecision::ConfirmedNotExecuted),
+            decision_key("late"),
+            &policy,
+            &policies,
+            fx.now,
+        )
+        .expect_err("the checkpoint is gone");
+        assert_eq!(error.code(), "run-unknown-checkpoint");
+        let (effect_id, generation, now) = (fx.effect_id.clone(), fx.generation, fx.now);
+        let error = resolve_indeterminate_effect(
+            &mut fx.state,
+            &effect_id,
+            generation,
+            AgentEffectResolution::ConfirmedNotExecuted,
+            &policy,
+            &policies,
+            now,
+        )
+        .expect_err("the send is resolved");
+        assert_eq!(error.code(), "run-stale-effect-result");
+
+        // A run that handed off: it is terminal.
+        let mut fx = parked();
+        let checkpoint_id = fx.checkpoint_id();
+        let envelope = fx.notice(accepted());
+        assert!(accept_handoff_result(&mut fx.state, &envelope, fx.now).is_accepted());
+        let error = resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            reconcile(crate::checkpoints::AgentReconciliationDecision::ConfirmedNotExecuted),
+            decision_key("late"),
+            &policy,
+            &policies,
+            fx.now,
+        )
+        .expect_err("the run is terminal");
+        assert_eq!(error.code(), "run-terminal");
+    }
+
+    /// An exhausted outcome is what parked the send. Confirming it resolves
+    /// nothing, and applying it re-parked the send with its checkpoint
+    /// already dropped, so both paths that carry it refuse it.
+    #[test]
+    fn confirming_an_exhausted_handoff_send_is_refused() {
+        let exhausted = || AgentEffectResolution::ConfirmedExecuted {
+            outcome: Box::new(AgentRunEffectOutcome::exhausted(
+                "a2a-handoff-attempt-failed",
+                "the operator saw the budget spend out",
+            )),
+        };
+        let policy = AgentSchemaPolicy::default();
+        let policies = AgentEffectPolicies::default();
+
+        let mut fx = parked();
+        let (effect_id, generation, now) = (fx.effect_id.clone(), fx.generation, fx.now);
+        let error = resolve_indeterminate_effect(
+            &mut fx.state,
+            &effect_id,
+            generation,
+            exhausted(),
+            &policy,
+            &policies,
+            now,
+        )
+        .expect_err("an exhausted confirmation resolves nothing");
+        assert_eq!(error.code(), "effect-policy-invalid");
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Indeterminate);
+        assert_eq!(
+            fx.run().loop_state.open_checkpoints().len(),
+            1,
+            "the wait is untouched"
+        );
+
+        let mut fx = parked();
+        let checkpoint_id = fx.checkpoint_id();
+        let error = resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            reconcile(
+                crate::checkpoints::AgentReconciliationDecision::ConfirmedCompleted {
+                    resolution: Box::new(exhausted()),
+                },
+            ),
+            decision_key("confirm"),
+            &policy,
+            &policies,
+            fx.now,
+        )
+        .expect_err("an exhausted confirmation resolves nothing");
+        assert_eq!(error.code(), "effect-policy-invalid");
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Indeterminate);
+    }
+
+    /// Ruling 2: abandoning the transfer fails the run, as the decision's
+    /// contract says. Before, the handoff arm's survivable path resumed the
+    /// run under the false claim that no transfer was recorded.
+    #[test]
+    fn abandoning_a_parked_handoff_send_fails_the_run() {
+        let mut fx = parked();
+        let checkpoint_id = fx.checkpoint_id();
+        resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            reconcile(crate::checkpoints::AgentReconciliationDecision::AbandonAndFail),
+            decision_key("abandon"),
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            fx.now,
+        )
+        .expect("the abandonment applies");
+
+        assert_eq!(fx.run().status, AgentRunStatus::Failed);
+        match &fx.run().terminal_reason {
+            Some(AgentRunTerminalReason::EffectFailed { code, .. }) => {
+                assert_eq!(code, "reconciliation-abandoned");
+            }
+            other => panic!("expected the abandoned send to fail the run, found {other:?}"),
+        }
+        assert!(
+            matches!(&fx.cell().status, AgentHandoffStatus::Failed { code, .. } if code == "reconciliation-abandoned"),
+            "the transfer is abandoned with the send, got {:?}",
+            fx.cell().status
+        );
+        assert!(fx.run().loop_state.open_checkpoints().is_empty());
+    }
+
+    /// Ruling 3: compensating the send settles the transfer in the same
+    /// compare-and-set, so the wind-down never waits on a handoff result
+    /// that may not come. The run ends once the compensation's outcome lands.
+    #[test]
+    fn compensating_a_parked_handoff_send_settles_its_cell() {
+        let mut fx = parked();
+        let checkpoint_id = fx.checkpoint_id();
+        resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            reconcile(
+                crate::checkpoints::AgentReconciliationDecision::Compensate {
+                    compensation: AgentCompensationRef::new("recall-transfer")
+                        .expect("the ref is valid"),
+                },
+            ),
+            decision_key("compensate"),
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            fx.now,
+        )
+        .expect("the compensation schedules");
+
+        assert!(
+            matches!(&fx.cell().status, AgentHandoffStatus::Failed { code, .. } if code == "compensated"),
+            "got {:?}",
+            fx.cell().status
+        );
+        assert!(
+            !fx.run().loop_state.awaits_children(),
+            "the transfer no longer holds the wind-down"
+        );
+        assert_eq!(fx.run().status, AgentRunStatus::Cancelling);
+
+        let compensation = fx
+            .run()
+            .loop_state
+            .effects()
+            .iter()
+            .find(|effect| effect.kind() == AgentRunEffectKind::CompensationCall)
+            .expect("the compensation is committed")
+            .clone();
+        record_effect_result(
+            &mut fx.state,
+            &compensation.effect_id,
+            compensation.generation,
+            1,
+            0,
+            AgentRunEffectOutcome::Tool {
+                call_id: crate::effect::compensation_call_id(&compensation),
+                content: AgentTaskContent::inline(serde_json::json!({ "recalled": true }))
+                    .expect("the content is inline-bounded"),
+            },
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            fx.now,
+        )
+        .expect("the compensation's result records");
+        assert!(
+            fx.run().status.is_terminal(),
+            "the run ended, got {:?}",
+            fx.run().status
+        );
+        assert_eq!(
+            fx.run()
+                .terminal_reason
+                .as_ref()
+                .map(AgentRunTerminalReason::code),
+            Some("effect-compensated")
+        );
+    }
+
+    /// Review focus 5: `ConfirmedNotExecuted` through the new checkpoint
+    /// re-sends under a new generation and the same deduplication key, so a
+    /// send that did land converges at the task, and the cell keeps the
+    /// fence meanwhile. This behaviour is unchanged; the checkpoint makes it
+    /// reachable.
+    #[test]
+    fn a_not_executed_decision_resends_the_handoff_under_the_fence() {
+        let mut fx = parked();
+        let checkpoint_id = fx.checkpoint_id();
+        resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            reconcile(crate::checkpoints::AgentReconciliationDecision::ConfirmedNotExecuted),
+            decision_key("resend"),
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            fx.now,
+        )
+        .expect("the decision applies");
+
+        let send = fx.send();
+        assert_eq!(send.generation.get(), fx.generation.get() + 1);
+        assert_eq!(send.status, AgentRunEffectStatus::Pending);
+        match &send.request {
+            AgentRunEffectRequest::A2aHandoff { handoff } => {
+                assert_eq!(handoff.deduplication_key, fx.handoff.as_str());
+            }
+            other => panic!("expected the handoff send, found {other:?}"),
+        }
+        assert!(matches!(fx.cell().status, AgentHandoffStatus::Pending));
+        assert!(fx.run().loop_state.handoff_fenced());
+        assert!(fx.run().loop_state.open_checkpoints().is_empty());
+    }
+
+    /// Shape (b): a park a binary before issue #106 left with no checkpoint.
+    /// The settle pass opens the ordinary one.
+    #[test]
+    fn a_park_without_its_checkpoint_is_repaired_by_the_settle_pass() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForReconciliation,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Indeterminate,
+        );
+        assert!(
+            fx.run().needs_park_repair(),
+            "the pre-fix park needs its checkpoint"
+        );
+
+        let now = fx.now;
+        advance_once(
+            &mut fx.state,
+            &AgentEffectPolicies::default(),
+            false,
+            false,
+            None,
+            None,
+            now,
+        )
+        .expect("the repair applies");
+
+        let open = fx.run().loop_state.open_checkpoints();
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].checkpoint_id, fx.checkpoint_id());
+        assert_eq!(fx.run().status, AgentRunStatus::WaitingForReconciliation);
+        assert!(!fx.run().needs_park_repair(), "nothing is left to repair");
+    }
+
+    /// Shape (a), accepted: the old binary applied the task's acceptance but
+    /// left the send parked. The repair settles the send executed, and the
+    /// run hands off.
+    #[test]
+    fn an_accepted_park_is_released_by_the_settle_pass() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForReconciliation,
+            AgentHandoffStatus::Accepted {
+                target_run: AgentRunId::new("ticket-1-gen-2").expect("the run id is valid"),
+                generation: AgentAssignmentGeneration::new(2),
+            },
+            AgentRunEffectStatus::Indeterminate,
+        );
+        fx.hand_off();
+        assert!(fx.run().needs_park_repair());
+
+        let now = fx.now;
+        advance_once(
+            &mut fx.state,
+            &AgentEffectPolicies::default(),
+            false,
+            false,
+            None,
+            None,
+            now,
+        )
+        .expect("the repair applies");
+
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Succeeded);
+        assert_eq!(fx.run().status, AgentRunStatus::HandedOff);
+        assert!(fx.run().loop_state.open_checkpoints().is_empty());
+    }
+
+    /// Shape (a), refused: the old binary applied the refusal and rested the
+    /// turn, but the parked send kept the run in reconciliation. The repair
+    /// settles the send, and the run resumes.
+    #[test]
+    fn a_refused_park_is_released_by_the_settle_pass() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForReconciliation,
+            AgentHandoffStatus::Refused {
+                code: "agent-not-instantiated".to_string(),
+            },
+            AgentRunEffectStatus::Indeterminate,
+        );
+        assert!(fx.run().needs_park_repair());
+
+        let now = fx.now;
+        advance_once(
+            &mut fx.state,
+            &AgentEffectPolicies::default(),
+            false,
+            false,
+            None,
+            None,
+            now,
+        )
+        .expect("the repair applies");
+
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Succeeded);
+        assert_eq!(fx.run().status, AgentRunStatus::Running);
+        assert_eq!(fx.run().loop_state.phase(), AgentLoopPhase::RecordingTurn);
+        assert!(!fx.run().needs_park_repair());
+    }
+
+    /// A terminal run is never repaired. Its checkpoint-less `Indeterminate`
+    /// effect is the deliberate shape `record_effect_result` documents.
+    #[test]
+    fn a_terminal_run_needs_no_park_repair() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Cancelled,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Indeterminate,
+        );
+        fx.state.run_mut().expect("the run exists").terminal_reason =
+            Some(AgentRunTerminalReason::CancellationRequested {
+                reason: "operator".to_string(),
+            });
+        assert!(!fx.run().needs_park_repair());
+    }
+
+    /// Final review of issue #106: a hand-off fences a re-send its decision
+    /// authorized but never dispatched. `ConfirmedNotExecuted` mints
+    /// generation 2 `Pending`, and the task's acceptance of generation 1's
+    /// transfer lands before the dispatch pass: a courier racing the
+    /// decision's two writes, or a crash between them. The winding-down run
+    /// may not dispatch it, so an unfenced re-send would hold the wind-down
+    /// open forever.
+    #[test]
+    fn an_accepted_notice_fences_a_resend_that_never_left() {
+        let mut fx = parked();
+        let checkpoint_id = fx.checkpoint_id();
+        resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            reconcile(crate::checkpoints::AgentReconciliationDecision::ConfirmedNotExecuted),
+            decision_key("resend"),
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            fx.now,
+        )
+        .expect("the decision applies");
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Pending);
+
+        let envelope = fx.notice(accepted());
+        assert!(accept_handoff_result(&mut fx.state, &envelope, fx.now).is_accepted());
+
+        assert_eq!(
+            fx.send().status,
+            AgentRunEffectStatus::Cancelled,
+            "the unsent re-send is fenced"
+        );
+        assert!(
+            matches!(fx.cell().status, AgentHandoffStatus::Accepted { .. }),
+            "the fence leaves the task's acceptance standing, got {:?}",
+            fx.cell().status
+        );
+        assert_eq!(fx.run().status, AgentRunStatus::HandedOff);
     }
 }
