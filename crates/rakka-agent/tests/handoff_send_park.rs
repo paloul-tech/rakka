@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use common::{
     agent_scope, goal_spec_draft, goal_spec_with_handoff, goal_task_creation_command,
-    handoff_config, handoff_target_scope, handoff_tool_id, task_definition, task_scope,
+    handoff_config, handoff_target_scope, handoff_tool_id, run_scope, task_definition, task_scope,
     ApplyingHandoffExecutor, Fixture, HANDOFF_SKILL,
 };
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
@@ -31,6 +31,7 @@ use rakka_agent::{
     InMemoryAgentSegmentSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, PrincipalRef};
+use rakka_persistence::DurableStateStore;
 use serde_json::json;
 
 fn handoff_turn() -> AgentModelTurn {
@@ -346,4 +347,64 @@ async fn abandoning_a_send_that_never_reached_the_task_fails_the_run() {
         "got {:?}",
         cell.status
     );
+}
+
+/// Rewrites the stored record as a binary before issue #106 left a park: the
+/// send `Indeterminate`, and no reconciliation checkpoint. The fixed code can
+/// no longer write this shape, so it is written through the state store.
+async fn unbind_checkpoints(fixture: &Fixture) {
+    let id = run_scope().persistence_id();
+    let record = fixture
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    let loop_state = value["run"]["loop_state"]
+        .as_object_mut()
+        .expect("the loop state is an object");
+    loop_state.insert("open_checkpoints".to_string(), json!([]));
+    loop_state.insert("pending_checkpoint".to_string(), serde_json::Value::Null);
+    let unbound = serde_json::from_value(value).expect("the pre-fix record deserializes");
+    fixture
+        .runs
+        .compare_and_set(&id, record.revision, unbound)
+        .await
+        .expect("the pre-fix record persists");
+}
+
+/// Ruling 4: a park left without its checkpoint heals on the first settle
+/// pass that touches it. This is the proof that `advance_loop`'s gate is
+/// wired, which a unit test of `advance_once` cannot give.
+#[tokio::test]
+async fn a_park_left_without_its_checkpoint_heals_on_the_next_settle_pass() {
+    let (fixture, _segments) = parking_world(false, true).await;
+    settle(&fixture).await;
+    unbind_checkpoints(&fixture).await;
+    let wedged = run_record(&fixture).await;
+    assert_eq!(wedged.status, AgentRunStatus::WaitingForReconciliation);
+    assert!(
+        wedged.loop_state.open_checkpoints().is_empty(),
+        "the record is the pre-fix park"
+    );
+
+    fixture
+        .pump()
+        .await
+        .expect("the settle pass repairs the park");
+
+    let healed = run_record(&fixture).await;
+    let send = send_effect(&healed);
+    let open = healed.loop_state.open_checkpoints();
+    assert_eq!(open.len(), 1, "the repair opened the checkpoint: {open:?}");
+    assert_eq!(
+        open[0].checkpoint_id,
+        AgentCheckpoint::id_for_effect(
+            &send.effect_id,
+            send.generation,
+            AgentCheckpointKind::IndeterminateEffectReconciliation,
+        )
+    );
+    assert_eq!(healed.status, AgentRunStatus::WaitingForReconciliation);
 }

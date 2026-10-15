@@ -737,6 +737,32 @@ impl AgentRun {
                 .any(|effect| !effect.kind().outside_the_turn())
     }
 
+    /// Whether the record holds a park a binary before issue #106 left
+    /// unresolvable:
+    /// - a live run whose handoff cell the task already answered while the
+    ///   cell's send stayed `Indeterminate`, because the old notice path left
+    ///   the effect parked;
+    /// - a live run holding an `Indeterminate` effect with no reconciliation
+    ///   checkpoint bound to its generation, because the old exhausted-send
+    ///   path opened none.
+    ///
+    /// Under the fixed transitions neither shape is reachable: every
+    /// transition that parks a live run's effect opens its checkpoint, and
+    /// every notice settles a parked send. The settle pass repairs such a
+    /// record on the first pass that touches it (`repair_park`), as the gap
+    /// slice 3 repair rests an unrested turn. A terminal run is excluded: its
+    /// checkpoint-less `Indeterminate` promotion or claim append is the
+    /// deliberate shape `record_effect_result` documents.
+    pub(crate) fn needs_park_repair(&self) -> bool {
+        if self.status.is_terminal() {
+            return false;
+        }
+        self.loop_state.indeterminate_effects().any(|effect| {
+            handoff_send(&self.loop_state, &effect.effect_id) == HandoffSend::ResolvedByTask
+                || !has_reconciliation_checkpoint(&self.loop_state, effect)
+        })
+    }
+
     /// Serialized size of the materialized record, in bytes.
     #[must_use]
     pub fn materialized_size_bytes(&self) -> usize {
@@ -2592,6 +2618,14 @@ fn advance_once(
     let Some(run) = state.run.as_ref() else {
         return Ok(Vec::new());
     };
+    if run.needs_park_repair() {
+        // A park a binary before issue #106 left unresolvable: give it its
+        // checkpoint, or settle the send its task already answered. A repair
+        // that terminalizes the run owes what any terminalization owes, in
+        // this same compare-and-set ([`AgentRun::needs_park_repair`]).
+        repair_park(state, policies, now)?;
+        return owed_run_exchanges(state, now);
+    }
     if run.needs_turn_rest() {
         // A record a binary before gap slice 3 left wedged: its turn is
         // over and nothing will ever rest it. Rest it here, as the tool arm
@@ -4000,6 +4034,56 @@ fn rest_unrested_turn(state: &mut AgentRunState, now: AgentTimestampMillis) -> A
     Ok(())
 }
 
+/// Repairs a park a binary before issue #106 left unresolvable, in one
+/// compare-and-set: the repair of [`AgentRun::needs_park_repair`].
+///
+/// A send whose cell the task already answered settles as executed, exactly
+/// as the fixed notice path settles it. That terminalizes an accepted
+/// transfer `HandedOff` and leaves a refused one resumed. Every remaining
+/// `Indeterminate` effect without its reconciliation checkpoint gets the one
+/// `record_effect_result` opens. The disposition is then re-settled.
+fn repair_park(
+    state: &mut AgentRunState,
+    policies: &AgentEffectPolicies,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let answered = state.run().and_then(|run| {
+        let cell = run.loop_state.handoff()?;
+        match &cell.status {
+            crate::coordination::AgentHandoffStatus::Accepted { generation, .. } => Some(
+                handoff_answer_receipt(&cell.record.handoff, Some(*generation), true),
+            ),
+            crate::coordination::AgentHandoffStatus::Refused { .. } => {
+                Some(handoff_answer_receipt(&cell.record.handoff, None, false))
+            }
+            _ => None,
+        }
+    });
+    if let Some(receipt) = answered {
+        settle_parked_handoff_send(state, receipt, now)?;
+    }
+    let unbound: Vec<AgentEffectId> = state
+        .run()
+        .map(|run| {
+            run.loop_state
+                .indeterminate_effects()
+                .filter(|effect| !has_reconciliation_checkpoint(&run.loop_state, effect))
+                .map(|effect| effect.effect_id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for effect_id in &unbound {
+        open_effect_checkpoint(
+            state,
+            policies,
+            effect_id,
+            AgentCheckpointKind::IndeterminateEffectReconciliation,
+            now,
+        )?;
+    }
+    settle_run_disposition(state, now)
+}
+
 /// The status of a run whose next step is dispatch: parked on whichever
 /// approval-family checkpoint wait it holds, or waiting on its effects.
 fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
@@ -5065,6 +5149,16 @@ fn resolve_indeterminate_effect(
     )?;
     drop_reconciliation_checkpoint(state, effect_id, generation)?;
     settle_run_disposition(state, now)
+}
+
+/// Whether the loop holds the reconciliation checkpoint bound to one parked
+/// effect generation.
+fn has_reconciliation_checkpoint(loop_state: &AgentLoopState, effect: &AgentRunEffect) -> bool {
+    loop_state.open_checkpoints().iter().any(|checkpoint| {
+        checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
+            && checkpoint.bound_effect.effect_id == effect.effect_id
+            && checkpoint.bound_effect.generation == effect.generation
+    })
 }
 
 /// Drops the reconciliation checkpoint parked on one resolved effect
@@ -7818,11 +7912,12 @@ where
         for _step in 0..AGENT_RUN_MAX_LOOP_STEPS_PER_PASS {
             // A record wedged by a binary before gap slice 3 cannot advance,
             // but one step rests its turn and it can thereafter
-            // ([`AgentRun::needs_turn_rest`]).
-            let can_advance = self
-                .state()?
-                .run()
-                .is_some_and(|run| run.can_advance() || run.needs_turn_rest());
+            // ([`AgentRun::needs_turn_rest`]). A park a binary before issue
+            // #106 left unresolvable is repaired the same way
+            // ([`AgentRun::needs_park_repair`]).
+            let can_advance = self.state()?.run().is_some_and(|run| {
+                run.can_advance() || run.needs_turn_rest() || run.needs_park_repair()
+            });
             if !can_advance {
                 break;
             }
@@ -11940,5 +12035,119 @@ mod tests {
         assert!(matches!(fx.cell().status, AgentHandoffStatus::Pending));
         assert!(fx.run().loop_state.handoff_fenced());
         assert!(fx.run().loop_state.open_checkpoints().is_empty());
+    }
+
+    /// Shape (b): a park a binary before issue #106 left with no checkpoint.
+    /// The settle pass opens the ordinary one.
+    #[test]
+    fn a_park_without_its_checkpoint_is_repaired_by_the_settle_pass() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForReconciliation,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Indeterminate,
+        );
+        assert!(
+            fx.run().needs_park_repair(),
+            "the pre-fix park needs its checkpoint"
+        );
+
+        let now = fx.now;
+        advance_once(
+            &mut fx.state,
+            &AgentEffectPolicies::default(),
+            false,
+            false,
+            None,
+            None,
+            now,
+        )
+        .expect("the repair applies");
+
+        let open = fx.run().loop_state.open_checkpoints();
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].checkpoint_id, fx.checkpoint_id());
+        assert_eq!(fx.run().status, AgentRunStatus::WaitingForReconciliation);
+        assert!(!fx.run().needs_park_repair(), "nothing is left to repair");
+    }
+
+    /// Shape (a), accepted: the old binary applied the task's acceptance but
+    /// left the send parked. The repair settles the send executed, and the
+    /// run hands off.
+    #[test]
+    fn an_accepted_park_is_released_by_the_settle_pass() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForReconciliation,
+            AgentHandoffStatus::Accepted {
+                target_run: AgentRunId::new("ticket-1-gen-2").expect("the run id is valid"),
+                generation: AgentAssignmentGeneration::new(2),
+            },
+            AgentRunEffectStatus::Indeterminate,
+        );
+        fx.hand_off();
+        assert!(fx.run().needs_park_repair());
+
+        let now = fx.now;
+        advance_once(
+            &mut fx.state,
+            &AgentEffectPolicies::default(),
+            false,
+            false,
+            None,
+            None,
+            now,
+        )
+        .expect("the repair applies");
+
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Succeeded);
+        assert_eq!(fx.run().status, AgentRunStatus::HandedOff);
+        assert!(fx.run().loop_state.open_checkpoints().is_empty());
+    }
+
+    /// Shape (a), refused: the old binary applied the refusal and rested the
+    /// turn, but the parked send kept the run in reconciliation. The repair
+    /// settles the send, and the run resumes.
+    #[test]
+    fn a_refused_park_is_released_by_the_settle_pass() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForReconciliation,
+            AgentHandoffStatus::Refused {
+                code: "agent-not-instantiated".to_string(),
+            },
+            AgentRunEffectStatus::Indeterminate,
+        );
+        assert!(fx.run().needs_park_repair());
+
+        let now = fx.now;
+        advance_once(
+            &mut fx.state,
+            &AgentEffectPolicies::default(),
+            false,
+            false,
+            None,
+            None,
+            now,
+        )
+        .expect("the repair applies");
+
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Succeeded);
+        assert_eq!(fx.run().status, AgentRunStatus::Running);
+        assert_eq!(fx.run().loop_state.phase(), AgentLoopPhase::RecordingTurn);
+        assert!(!fx.run().needs_park_repair());
+    }
+
+    /// A terminal run is never repaired. Its checkpoint-less `Indeterminate`
+    /// effect is the deliberate shape `record_effect_result` documents.
+    #[test]
+    fn a_terminal_run_needs_no_park_repair() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Cancelled,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Indeterminate,
+        );
+        fx.state.run_mut().expect("the run exists").terminal_reason =
+            Some(AgentRunTerminalReason::CancellationRequested {
+                reason: "operator".to_string(),
+            });
+        assert!(!fx.run().needs_park_repair());
     }
 }
