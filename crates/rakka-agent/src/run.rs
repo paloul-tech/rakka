@@ -4752,7 +4752,21 @@ fn apply_effect_outcome(
             // fails as the decision says.
             let handoff_held = handoff_standing == HandoffSend::Unresolved;
             if handoff_held {
-                let exhausted = matches!(outcome, AgentRunEffectOutcome::Exhausted { .. });
+                // A spent budget parks only when an attempt may have delivered
+                // the transfer. One that provably delivered nothing is a
+                // refusal like any other (issue #107). That proof needs the
+                // generation's *first* attempt: a definitive refusal or a
+                // credential that never resolved speaks only for its own
+                // attempt, and on any later one an earlier attempt may have
+                // reached the task. That is the dispatcher's own
+                // `possibly_executed` rule.
+                let undelivered = attempts == 1
+                    && (outcome
+                        .failure_reason()
+                        .is_some_and(crate::failure::AgentFailureReason::is_definitive)
+                        || code == crate::dispatch::CREDENTIAL_RESOLUTION_FAILED);
+                let exhausted =
+                    matches!(outcome, AgentRunEffectOutcome::Exhausted { .. }) && !undelivered;
                 let run = state.run_mut()?;
                 if exhausted {
                     if let Some(effect) = run.loop_state.effect_mut(effect_id) {
@@ -11329,17 +11343,31 @@ mod tests {
         /// Records the result the dispatcher returns once the executor's
         /// probe has failed on every attempt: a spent budget.
         fn exhaust(&mut self, policies: &AgentEffectPolicies) -> AgentRunResult<()> {
+            self.exhaust_with(
+                3,
+                AgentRunEffectOutcome::exhausted(
+                    "a2a-handoff-attempt-failed",
+                    "the probe could not read the task's handoff record",
+                ),
+                policies,
+            )
+        }
+
+        /// Records a spent budget the dispatcher reports on `attempt`.
+        fn exhaust_with(
+            &mut self,
+            attempt: u32,
+            outcome: AgentRunEffectOutcome,
+            policies: &AgentEffectPolicies,
+        ) -> AgentRunResult<()> {
             let (effect_id, generation, now) = (self.effect_id.clone(), self.generation, self.now);
             record_effect_result(
                 &mut self.state,
                 &effect_id,
                 generation,
-                3,
+                attempt,
                 0,
-                AgentRunEffectOutcome::exhausted(
-                    "a2a-handoff-attempt-failed",
-                    "the probe could not read the task's handoff record",
-                ),
+                outcome,
                 &AgentSchemaPolicy::default(),
                 policies,
                 now,
@@ -12198,5 +12226,151 @@ mod tests {
             fx.cell().status
         );
         assert_eq!(fx.run().status, AgentRunStatus::HandedOff);
+    }
+
+    /// A definitive refusal, as the dispatcher delivers it: a spent budget
+    /// whose reason carries the marker (issue #85 ask 7, issue #100 ask 4).
+    fn definitive_refusal() -> AgentRunEffectOutcome {
+        AgentRunEffectOutcome::exhausted(
+            "dispatch-collaborator-failed",
+            "the peer surface refused the transfer",
+        )
+        .with_reason(Some(crate::failure::AgentFailureReason::definitive(
+            "peer-refused",
+        )))
+    }
+
+    /// A credential that could not be resolved, as the dispatcher delivers
+    /// the spent budget: the attempt never reached the executor.
+    fn credential_failure() -> AgentRunEffectOutcome {
+        AgentRunEffectOutcome::exhausted(
+            crate::dispatch::CREDENTIAL_RESOLUTION_FAILED,
+            "the credential binding could not be resolved",
+        )
+        .with_reason(crate::failure::AgentFailureReason::new("vault-unreachable"))
+    }
+
+    /// Asserts the handoff failed as a refused one does: the cell settled
+    /// failed under the send's code, the fence released, the run resumed, and
+    /// nothing parked.
+    fn assert_handoff_failed_and_run_resumed(fx: &HandoffSendFixture, code: &str) {
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Exhausted);
+        assert!(
+            fx.run().loop_state.open_checkpoints().is_empty(),
+            "nothing parked: {:?}",
+            fx.run().loop_state.open_checkpoints()
+        );
+        assert!(
+            matches!(&fx.cell().status, AgentHandoffStatus::Failed { code: failed, .. } if failed == code),
+            "the cell settles failed under the send's code, got {:?}",
+            fx.cell().status
+        );
+        assert!(!fx.run().loop_state.handoff_fenced(), "the fence released");
+        assert_eq!(fx.run().status, AgentRunStatus::Running);
+        assert!(fx.run().terminal_reason.is_none(), "the run survives");
+    }
+
+    /// Asserts the send parked behind its reconciliation checkpoint.
+    fn assert_parked(fx: &HandoffSendFixture) {
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Indeterminate);
+        assert_eq!(fx.run().status, AgentRunStatus::WaitingForReconciliation);
+        assert_eq!(
+            fx.run().loop_state.open_checkpoints().len(),
+            1,
+            "the park carries its checkpoint"
+        );
+        assert!(matches!(fx.cell().status, AgentHandoffStatus::Pending));
+    }
+
+    /// Issue #107: a definitive refusal on the generation's first attempt
+    /// proves no attempt delivered the transfer, so the handoff fails as a
+    /// refused one does and the run survives, instead of parking.
+    #[test]
+    fn a_definitive_refusal_on_the_first_attempt_fails_the_handoff_and_the_run_survives() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForEffect,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        fx.exhaust_with(1, definitive_refusal(), &AgentEffectPolicies::default())
+            .expect("the refusal records");
+
+        assert_handoff_failed_and_run_resumed(&fx, "dispatch-collaborator-failed");
+        match &fx.cell().status {
+            AgentHandoffStatus::Failed { reason, .. } => assert!(
+                reason
+                    .as_ref()
+                    .is_some_and(crate::failure::AgentFailureReason::is_definitive),
+                "the cell keeps the definitive reason"
+            ),
+            other => panic!("expected a failed cell, found {other:?}"),
+        }
+    }
+
+    /// Issue #107: a credential that could not be resolved on the
+    /// generation's only attempt means the send never reached the executor.
+    #[test]
+    fn a_credential_failure_on_the_first_attempt_fails_the_handoff_and_the_run_survives() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForEffect,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        fx.exhaust_with(1, credential_failure(), &AgentEffectPolicies::default())
+            .expect("the failure records");
+
+        assert_handoff_failed_and_run_resumed(&fx, crate::dispatch::CREDENTIAL_RESOLUTION_FAILED);
+    }
+
+    /// The dispatcher's own doctrine (`possibly_executed`): on any attempt
+    /// after the first, an earlier attempt may have delivered the transfer,
+    /// and a refusal speaks only for its own attempt. The send still parks.
+    #[test]
+    fn a_definitive_refusal_after_an_earlier_attempt_still_parks() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForEffect,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        fx.exhaust_with(2, definitive_refusal(), &AgentEffectPolicies::default())
+            .expect("the refusal records");
+
+        assert_parked(&fx);
+    }
+
+    #[test]
+    fn a_credential_failure_after_an_earlier_attempt_still_parks() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForEffect,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        fx.exhaust_with(3, credential_failure(), &AgentEffectPolicies::default())
+            .expect("the failure records");
+
+        assert_parked(&fx);
+    }
+
+    /// A first-attempt exhaustion that is neither definitive nor a
+    /// pre-invocation failure is the ambiguity the park exists for: the
+    /// attempt reached the executor and its probe could not answer.
+    #[test]
+    fn an_ordinary_exhaustion_on_the_first_attempt_still_parks() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForEffect,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        fx.exhaust_with(
+            1,
+            AgentRunEffectOutcome::exhausted(
+                "handoff-unrecorded",
+                "the probe could not read the task's handoff record",
+            ),
+            &AgentEffectPolicies::default(),
+        )
+        .expect("the exhaustion records");
+
+        assert_parked(&fx);
     }
 }

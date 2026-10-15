@@ -2848,6 +2848,19 @@ impl AuthorityFixture {
         self
     }
 
+    /// Wires a credential resolver that refuses every binding definitively,
+    /// as one whose binding was revoked does.
+    pub fn with_definitively_failing_credential_resolver(
+        mut self,
+        code: &str,
+        message: &str,
+    ) -> Self {
+        self.credentials = Some(Arc::new(ScriptedCredentialResolver::failing_definitively(
+            code, message,
+        )));
+        self
+    }
+
     /// Refuses every intent with the given refusal, so a test can choose the
     /// application-authored code and message the settlement paths persist.
     pub fn with_fixed_refusal(mut self, refusal: AgentAuthorityRefusal) -> Self {

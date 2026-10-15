@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedReconciler};
 use rakka_agent::{
-    agent_operational_snapshot, AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor,
-    AgentEffectSpec, AgentFailureReason, AgentModelTurn, AgentReconciliationFinding,
-    AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectStatus,
-    AgentRunScope, AgentRunStatus, AgentSchemaPolicy, AgentTaskContent, AgentToolAuthority,
-    AgentToolCallId, AgentToolCallRequest, AgentToolId, AgentUnknownOutcomeEvidence,
-    AgentUnknownOutcomeReport, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    agent_operational_snapshot, AgentCredentialBindingRef, AgentDispatchError, AgentDispatchFuture,
+    AgentDispatchToolExecutor, AgentEffectSpec, AgentFailureReason, AgentModelTurn,
+    AgentReconciliationFinding, AgentReconciliationProtocolRef, AgentRunEffect,
+    AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunScope, AgentRunStatus, AgentSchemaPolicy,
+    AgentTaskContent, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    AgentUnknownOutcomeEvidence, AgentUnknownOutcomeReport, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::OutboxStatus;
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
@@ -640,4 +640,96 @@ fn a_report_attaches_only_to_an_unknown_outcome() {
     assert_eq!(unknown.unknown_outcome_report(), Some(&deadline_report()));
     let other = AgentDispatchError::collaborator("c", "m").with_report(deadline_report());
     assert_eq!(other.unknown_outcome_report(), None);
+}
+
+/// A tool whose spec names a credential binding under a three-attempt budget,
+/// behind a resolver that fails: definitively when `definitive` is set,
+/// retryably otherwise. The executor counts its calls, and none should come.
+fn credentialed_fixture(definitive: bool) -> (AuthorityFixture, Arc<AtomicUsize>) {
+    let spec = AgentEffectSpec::idempotent(3)
+        .expect("the spec is valid")
+        .with_credential_binding(
+            AgentCredentialBindingRef::new("payments-api").expect("the binding is valid"),
+        );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &spec),
+        None,
+    )
+    .with_tool_executor(Arc::new(FailingExecutor {
+        error: retryable,
+        calls: calls.clone(),
+    }));
+    let fx = if definitive {
+        fx.with_definitively_failing_credential_resolver(
+            "binding-revoked",
+            "the binding was revoked",
+        )
+    } else {
+        fx.with_failing_credential_resolver("vault-unreachable", "the vault did not answer")
+    };
+    (fx, calls)
+}
+
+/// Issue #107: a resolver that refuses definitively, as one whose binding was
+/// revoked does, ends the generation on the attempt it refused, as every
+/// other collaborator's definitive refusal does since issue #85 ask 7. The
+/// marker on the reason says so, and nothing reached the executor.
+#[tokio::test]
+async fn a_definitive_resolver_refusal_exhausts_the_ticket_on_its_first_attempt() {
+    let (fx, calls) = credentialed_fixture(true);
+    let effect = ready(&fx).await;
+
+    fx.one_pass().await;
+
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(
+        row.status(),
+        OutboxStatus::Exhausted,
+        "a definitive refusal spends the budget of three at once"
+    );
+    assert_eq!(row.attempts().attempts(), 1);
+    let resolved = fx
+        .effect_at(1)
+        .await
+        .expect("a failed run keeps its failed effect");
+    assert_eq!(resolved.status, AgentRunEffectStatus::Exhausted);
+    assert_eq!(
+        resolved.last_error_code.as_deref(),
+        Some("credential-resolution-failed"),
+        "the pipeline code is unchanged"
+    );
+    let reason = resolved
+        .last_error_reason
+        .expect("the resolver's code is the reason");
+    assert_eq!(reason.code(), "binding-revoked");
+    assert!(
+        reason.is_definitive(),
+        "the marker tells a definitive refusal from a spent budget"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the executor was never reached"
+    );
+}
+
+/// A retryable resolver failure keeps spending its budget one attempt at a
+/// time: only a definitive refusal ends the generation early.
+#[tokio::test]
+async fn a_retryable_resolver_failure_still_spends_its_budget_one_attempt_at_a_time() {
+    let (fx, calls) = credentialed_fixture(false);
+    let effect = ready(&fx).await;
+
+    fx.one_pass().await;
+
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(row.status(), OutboxStatus::Failed, "a retry is scheduled");
+    assert_eq!(row.attempts().attempts(), 1);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the executor was never reached"
+    );
 }
