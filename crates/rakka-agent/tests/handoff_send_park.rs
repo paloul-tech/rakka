@@ -22,9 +22,10 @@ use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     AgentA2aHandoffFinding, AgentA2aHandoffSendExecutor, AgentBudgetAllocation,
     AgentBudgetCeilings, AgentBudgetDimension, AgentCheckpoint, AgentCheckpointKind,
-    AgentDispatchError, AgentDispatchFuture, AgentHandoffRecord, AgentModelTurn, AgentRun,
-    AgentRunEffect, AgentRunEffectKind, AgentRunEffectStatus, AgentRunScope, AgentRunStatus,
-    AgentSegmentOperation, AgentTaskContent, AgentTaskDefinition, AgentToolCallId,
+    AgentDispatchError, AgentDispatchFuture, AgentHandoffRecord, AgentHandoffStatus,
+    AgentModelTurn, AgentRun, AgentRunEffect, AgentRunEffectKind, AgentRunEffectStatus,
+    AgentRunScope, AgentRunStatus, AgentRunTerminalReason, AgentSegmentOperation, AgentTaskContent,
+    AgentTaskDefinition, AgentTaskHandoffStatus, AgentTaskStatus, AgentToolCallId,
     AgentToolCallRequest, InMemoryAgentSegmentSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentEphemeralCredential;
@@ -214,4 +215,73 @@ async fn an_exhausted_send_that_never_reached_the_task_waits_behind_its_checkpoi
         task.handoff.is_none(),
         "the transfer never reached the task"
     );
+}
+
+/// Issue #106, Ask 2: the transfer landed and only the answer was lost. The
+/// run parks behind its checkpoint, and the task's acceptance (its durable
+/// record of the transfer) releases it into `HandedOff` with no decision.
+#[tokio::test]
+async fn a_lost_answer_whose_transfer_landed_hands_off_once_the_task_answers() {
+    let (fixture, segments) = parking_world(true, true).await;
+    settle(&fixture).await;
+
+    let run = run_record(&fixture).await;
+    assert_eq!(
+        run.status,
+        AgentRunStatus::HandedOff,
+        "the task's acceptance released the park"
+    );
+    assert!(matches!(
+        run.terminal_reason,
+        Some(AgentRunTerminalReason::HandedOff { .. })
+    ));
+    assert_eq!(
+        send_effect(&run).status,
+        AgentRunEffectStatus::Succeeded,
+        "the task's record proved the send executed"
+    );
+    assert!(
+        run.loop_state.open_checkpoints().is_empty(),
+        "the release dropped the checkpoint"
+    );
+    assert_eq!(
+        checkpoint_opens(&segments),
+        1,
+        "the send parked behind its checkpoint first"
+    );
+    let task = fixture.task_snapshot().await;
+    let provenance = task
+        .handoff
+        .as_deref()
+        .expect("the task recorded the transfer");
+    assert!(matches!(
+        provenance.status,
+        AgentTaskHandoffStatus::Accepted
+    ));
+}
+
+/// Ruling 1, end to end: the target refused, so the task restored the source,
+/// and its refusal releases the park. The source resumes and finishes the
+/// task itself.
+#[tokio::test]
+async fn a_lost_answer_the_target_refused_resumes_the_source() {
+    let (fixture, segments) = parking_world(true, false).await;
+    settle(&fixture).await;
+
+    let run = run_record(&fixture).await;
+    assert_eq!(
+        run.status,
+        AgentRunStatus::Completed,
+        "the source resumed past the refusal and finished the task"
+    );
+    let cell = run.loop_state.handoff().expect("the cell survives");
+    assert!(
+        matches!(&cell.status, AgentHandoffStatus::Refused { code } if code == "agent-not-instantiated"),
+        "the cell settles under the target's refusal, got {:?}",
+        cell.status
+    );
+    assert!(run.loop_state.open_checkpoints().is_empty());
+    assert_eq!(checkpoint_opens(&segments), 1, "the send parked first");
+    let task = fixture.task_snapshot().await;
+    assert_eq!(task.status, AgentTaskStatus::Completed);
 }
