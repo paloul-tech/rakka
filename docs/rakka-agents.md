@@ -97,9 +97,13 @@ eighteen kinds: `creation`, `assignment`, `result-proposal`,
 `conversation-terminal-notice` (`AgentExchangeKind::ALL`, held to this list by
 a test). Run acceptance and the result decision are the replies to assignment
 and proposal, not exchanges of their own. A delegation or handoff *send* is not
-an exchange either: it is an A2A outbox effect claimed by the dispatcher, whose
-exhaustion becomes a fan-in disposition or a handoff refusal rather than a
-courier re-drive, and only its result comes back as an exchange. An exchange is
+an exchange either: it is an A2A outbox effect claimed by the dispatcher, never
+a courier re-drive, and only its result comes back as an exchange. A delegation
+send's exhaustion becomes a fan-in disposition, and a handoff send the task
+definitively refused fails its call while the run survives; a handoff send that
+exhausts its budget without an answer parks the run behind a reconciliation
+checkpoint until the task's handoff result settles it or a decision does. An
+exchange is
 a journal entry on the sender, re-driven by a courier
 until the receiver answers from its own record; acceptance makes local
 progress only and never drives an owed exchange of its own, which is what
