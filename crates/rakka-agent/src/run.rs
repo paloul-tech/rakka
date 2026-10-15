@@ -2043,6 +2043,15 @@ fn accept_handoff_result(
                     handoff: notice.handoff.clone(),
                     target,
                 });
+                // A handed-off run dispatches nothing further, so whatever it
+                // committed and never sent is fenced here, as any wind-down
+                // fences it. The case is a re-send that a `ConfirmedNotExecuted`
+                // decision authorized and this notice beat to the dispatch
+                // pass: the winding-down run may not dispatch it, and left
+                // `Pending` it would hold the wind-down open forever. The
+                // fence's own cell settle is first-writer-wins, so the
+                // acceptance above stands (issue #106).
+                run.loop_state.fence_unsent_effects(now);
                 Ok(())
             }
             crate::task::AgentHandoffResolutionNotice::Refused { code } => {
@@ -12149,5 +12158,45 @@ mod tests {
                 reason: "operator".to_string(),
             });
         assert!(!fx.run().needs_park_repair());
+    }
+
+    /// Final review of issue #106: a hand-off fences a re-send its decision
+    /// authorized but never dispatched. `ConfirmedNotExecuted` mints
+    /// generation 2 `Pending`, and the task's acceptance of generation 1's
+    /// transfer lands before the dispatch pass: a courier racing the
+    /// decision's two writes, or a crash between them. The winding-down run
+    /// may not dispatch it, so an unfenced re-send would hold the wind-down
+    /// open forever.
+    #[test]
+    fn an_accepted_notice_fences_a_resend_that_never_left() {
+        let mut fx = parked();
+        let checkpoint_id = fx.checkpoint_id();
+        resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            reconcile(crate::checkpoints::AgentReconciliationDecision::ConfirmedNotExecuted),
+            decision_key("resend"),
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            fx.now,
+        )
+        .expect("the decision applies");
+        assert_eq!(fx.send().status, AgentRunEffectStatus::Pending);
+
+        let envelope = fx.notice(accepted());
+        assert!(accept_handoff_result(&mut fx.state, &envelope, fx.now).is_accepted());
+
+        assert_eq!(
+            fx.send().status,
+            AgentRunEffectStatus::Cancelled,
+            "the unsent re-send is fenced"
+        );
+        assert!(
+            matches!(fx.cell().status, AgentHandoffStatus::Accepted { .. }),
+            "the fence leaves the task's acceptance standing, got {:?}",
+            fx.cell().status
+        );
+        assert_eq!(fx.run().status, AgentRunStatus::HandedOff);
     }
 }
