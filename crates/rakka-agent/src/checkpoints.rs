@@ -559,7 +559,9 @@ pub enum AgentReconciliationDecision {
     /// The invocation provably never happened; a new effect generation is
     /// authorized where the run still wants the work.
     ConfirmedNotExecuted,
-    /// Schedule an explicitly defined compensation effect.
+    /// Schedule an explicitly defined compensation effect. On a handoff send,
+    /// the handoff cell settles failed in the same transition, so the
+    /// wind-down never waits on a handoff result that may not come.
     Compensate {
         /// The application-defined compensation to schedule.
         compensation: AgentCompensationRef,
@@ -567,7 +569,8 @@ pub enum AgentReconciliationDecision {
     /// Escalate to the checkpoint's escalation target; the checkpoint stays
     /// nonterminal and a later decision resolves it.
     Escalate,
-    /// Abandon the ambiguous effect; the run fails terminally.
+    /// Abandon the ambiguous effect; the run fails terminally. A handoff
+    /// send's cell settles failed with it, under `reconciliation-abandoned`.
     AbandonAndFail,
 }
 

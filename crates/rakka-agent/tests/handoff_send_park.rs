@@ -14,21 +14,23 @@ mod common;
 use std::sync::Arc;
 
 use common::{
-    goal_spec_draft, goal_spec_with_handoff, goal_task_creation_command, handoff_config,
-    handoff_target_scope, handoff_tool_id, task_definition, task_scope, ApplyingHandoffExecutor,
-    Fixture, HANDOFF_SKILL,
+    agent_scope, goal_spec_draft, goal_spec_with_handoff, goal_task_creation_command,
+    handoff_config, handoff_target_scope, handoff_tool_id, task_definition, task_scope,
+    ApplyingHandoffExecutor, Fixture, HANDOFF_SKILL,
 };
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     AgentA2aHandoffFinding, AgentA2aHandoffSendExecutor, AgentBudgetAllocation,
-    AgentBudgetCeilings, AgentBudgetDimension, AgentCheckpoint, AgentCheckpointKind,
-    AgentDispatchError, AgentDispatchFuture, AgentHandoffRecord, AgentHandoffStatus,
-    AgentModelTurn, AgentRun, AgentRunEffect, AgentRunEffectKind, AgentRunEffectStatus,
-    AgentRunScope, AgentRunStatus, AgentRunTerminalReason, AgentSegmentOperation, AgentTaskContent,
-    AgentTaskDefinition, AgentTaskHandoffStatus, AgentTaskStatus, AgentToolCallId,
-    AgentToolCallRequest, InMemoryAgentSegmentSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentBudgetCeilings, AgentBudgetDimension, AgentCheckpoint, AgentCheckpointDecision,
+    AgentCheckpointKind, AgentDispatchError, AgentDispatchFuture, AgentHandoffRecord,
+    AgentHandoffStatus, AgentModelTurn, AgentOperationId, AgentOperationKind,
+    AgentReconciliationDecision, AgentRun, AgentRunEffect, AgentRunEffectKind,
+    AgentRunEffectStatus, AgentRunEntityCommand, AgentRunScope, AgentRunStatus,
+    AgentRunTerminalReason, AgentSegmentOperation, AgentTaskContent, AgentTaskDefinition,
+    AgentTaskHandoffStatus, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest,
+    InMemoryAgentSegmentSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
-use rakka_agent_workflow::AgentEphemeralCredential;
+use rakka_agent_workflow::{AgentEphemeralCredential, PrincipalRef};
 use serde_json::json;
 
 fn handoff_turn() -> AgentModelTurn {
@@ -284,4 +286,64 @@ async fn a_lost_answer_the_target_refused_resumes_the_source() {
     assert_eq!(checkpoint_opens(&segments), 1, "the send parked first");
     let task = fixture.task_snapshot().await;
     assert_eq!(task.status, AgentTaskStatus::Completed);
+}
+
+/// Ruling 2, end to end: a send that never reached the task parks, and the
+/// operator's `AbandonAndFail` through the checkpoint fails the run instead of
+/// resuming it.
+#[tokio::test]
+async fn abandoning_a_send_that_never_reached_the_task_fails_the_run() {
+    let (fixture, _segments) = parking_world(false, true).await;
+    settle(&fixture).await;
+    let checkpoint_id = run_record(&fixture)
+        .await
+        .loop_state
+        .open_checkpoints()
+        .first()
+        .expect("the park carries its checkpoint")
+        .checkpoint_id
+        .clone();
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "abandon",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id,
+            resolver: PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(AgentCheckpointDecision::Reconciliation(
+                AgentReconciliationDecision::AbandonAndFail,
+            )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+        &fixture.router,
+        fixture.now(),
+    )
+    .await
+    .expect("the abandonment applies");
+    settle(&fixture).await;
+
+    let run = run_record(&fixture).await;
+    assert_eq!(run.status, AgentRunStatus::Failed);
+    match &run.terminal_reason {
+        Some(AgentRunTerminalReason::EffectFailed { code, .. }) => {
+            assert_eq!(code, "reconciliation-abandoned");
+        }
+        other => panic!("expected the abandoned send to fail the run, found {other:?}"),
+    }
+    let cell = run.loop_state.handoff().expect("the cell survives");
+    assert!(
+        matches!(&cell.status, AgentHandoffStatus::Failed { code, .. } if code == "reconciliation-abandoned"),
+        "got {:?}",
+        cell.status
+    );
 }
