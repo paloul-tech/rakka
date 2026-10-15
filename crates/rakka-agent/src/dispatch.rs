@@ -155,6 +155,12 @@ use crate::tools::{
 /// Result type for dispatch pipeline operations.
 pub type AgentDispatchResult<T> = Result<T, AgentDispatchError>;
 
+/// The pipeline code of an attempt whose credential binding could not be
+/// resolved: the attempt failed before it reached the executor. The run reads
+/// it too, to tell a handoff send that never left from one that may have
+/// (issue #107).
+pub(crate) const CREDENTIAL_RESOLUTION_FAILED: &str = "credential-resolution-failed";
+
 /// The detail carried by an `Indeterminate` outcome parked for an ambiguity
 /// the pipeline could not resolve.
 const INDETERMINATE_OUTCOME_MESSAGE: &str =
@@ -833,8 +839,9 @@ pub enum AgentA2aHandoffFinding {
 /// message id, and its deduplication key, so a retried attempt converges on
 /// the same logical transfer.
 ///
-/// An `Err` from `execute` is a *retryable* attempt failure under the
-/// effect's idempotent attempt bound; a finding is definitive. On an
+/// An [`AgentDispatchError::Invocation`] or [`AgentDispatchError::Collaborator`]
+/// error from `execute` is a *retryable* attempt failure under the effect's
+/// idempotent attempt bound; a finding is definitive. On an
 /// ambiguous transport loss the implementation probes the task's durable
 /// state before giving up: a recorded provenance echoing this handoff id
 /// proves delivery, while its *absence* stays retryable — a read cannot
@@ -844,8 +851,23 @@ pub enum AgentA2aHandoffFinding {
 /// run behind an indeterminate-effect reconciliation checkpoint rather than
 /// resuming it beside a possibly-live transfer. The task's handoff result
 /// settles the parked send as executed when it arrives, since the task owes
-/// one only for a transfer it recorded. An absent executor fails closed at
-/// `invoke`.
+/// one only for a transfer it recorded. A send whose budget is spent on the
+/// generation's first attempt by a definitive refusal, or by a credential
+/// that could not be resolved, provably delivered nothing, so it fails the
+/// call as a refusal does instead of parking. An absent executor fails closed
+/// at `invoke`.
+///
+/// # What a definitive error claims
+///
+/// An [`AgentDispatchError::Definitive`] error ends the generation on the
+/// attempt that returns it. On the generation's first attempt the run takes
+/// it as proof that no transfer was recorded: the handoff fails and the run
+/// continues (issue #107). An implementation MUST therefore return
+/// `Definitive` only when no transfer could have been recorded, such as a
+/// refusal before the request was sent. Anything that happens after the send
+/// is an `Invocation` or `Collaborator` error, or an `OutcomeUnknown`. Nor
+/// may it answer under a pipeline code, such as `credential-resolution-failed`:
+/// the run reads that code as a failure before the executor was reached.
 ///
 /// # The error text this returns becomes durable state
 ///
@@ -1520,6 +1542,10 @@ fn consolidation_record(
 ///
 /// A failing resolution burns the attempt under the pipeline's
 /// `credential-resolution-failed` and a detail the dispatcher authors itself.
+/// An [`AgentDispatchError::Definitive`] refusal (a revoked binding, say)
+/// also ends the generation on that attempt, whatever budget remains, and
+/// marks the failure's reason definitive; any other error is retried under
+/// the effect's budget.
 /// The error's text is never persisted and never logged. Its **code** is: it
 /// is written on the dispatcher's log line and, once the retry budget is
 /// spent, recorded beside the pipeline code as the failure's reason, bounded
@@ -3106,19 +3132,33 @@ where
                             "the credential binding {binding} could not be resolved; the \
                              resolver's detail is deliberately not persisted"
                         );
+                        // A resolver that refuses definitively (a revoked
+                        // binding) ends the generation on this attempt, as
+                        // every collaborator's definitive refusal does, and
+                        // its reason carries the marker that says so
+                        // (issue #107).
+                        let definitive = matches!(error, AgentDispatchError::Definitive { .. });
+                        // The resolver's own code, which the line above
+                        // already logs: a stable identifier, never the
+                        // resolver's words.
+                        let resolver_code = collaborator_code(&error);
+                        let reason = if definitive {
+                            Some(crate::failure::AgentFailureReason::definitive(
+                                resolver_code,
+                            ))
+                        } else {
+                            crate::failure::AgentFailureReason::new(resolver_code)
+                        };
                         return self
                             .record_attempt_failure(
                                 scope,
                                 &claim,
                                 intent,
                                 attempt,
-                                "credential-resolution-failed",
+                                CREDENTIAL_RESOLUTION_FAILED,
                                 &detail,
-                                // The resolver's own code, which the line
-                                // above already logs: a stable identifier,
-                                // never the resolver's words.
-                                crate::failure::AgentFailureReason::new(collaborator_code(&error)),
-                                false,
+                                reason,
+                                definitive,
                                 pass,
                             )
                             .await;

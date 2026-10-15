@@ -3439,6 +3439,7 @@ impl AgentEffectReconciler for ScriptedReconciler {
 pub struct ScriptedCredentialResolver {
     token: String,
     failure: Option<(String, String)>,
+    definitive: bool,
     resolutions: Arc<AtomicUsize>,
     deadlines: Arc<Mutex<Vec<Option<AgentTimestampMillis>>>>,
 }
@@ -3450,6 +3451,7 @@ impl ScriptedCredentialResolver {
         Self {
             token: token.into(),
             failure: None,
+            definitive: false,
             resolutions: Arc::new(AtomicUsize::new(0)),
             deadlines: Arc::new(Mutex::new(Vec::new())),
         }
@@ -3467,8 +3469,21 @@ impl ScriptedCredentialResolver {
         Self {
             token: String::new(),
             failure: Some((code.into(), message.into())),
+            definitive: false,
             resolutions: Arc::new(AtomicUsize::new(0)),
             deadlines: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// A resolver that always refuses definitively with `code` and `message`:
+    /// the binding cannot be resolved and no retry can change that, as when a
+    /// binding was revoked. The dispatcher ends the generation on the attempt
+    /// it refused, with the definitive marker on the failure's reason.
+    #[must_use]
+    pub fn failing_definitively(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            definitive: true,
+            ..Self::failing(code, message)
         }
     }
 
@@ -3516,6 +3531,12 @@ impl AgentEffectCredentialResolver for ScriptedCredentialResolver {
                 .expect("the deadline log should not be poisoned")
                 .push(effect.deadline_at);
             if let Some((code, message)) = self.failure.as_ref() {
+                if self.definitive {
+                    return Err(crate::dispatch::AgentDispatchError::definitive(
+                        code.clone(),
+                        message.clone(),
+                    ));
+                }
                 return Err(crate::dispatch::AgentDispatchError::collaborator(
                     code.clone(),
                     message.clone(),
