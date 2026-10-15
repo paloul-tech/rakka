@@ -4785,10 +4785,18 @@ fn apply_effect_outcome(
                         );
                     }
                     if let Some(call_id) = call_id {
+                        // A spent budget that provably delivered nothing is not
+                        // necessarily permanent (a resolver's failure may clear),
+                        // so the model is told only what is certain (issue #107).
+                        let message = if matches!(outcome, AgentRunEffectOutcome::Exhausted { .. })
+                        {
+                            "the handoff send failed before any transfer was recorded"
+                        } else {
+                            "the handoff send failed definitively; no transfer was recorded"
+                        };
                         let content = AgentTaskContent::inline(serde_json::json!({
                             "error": bounded_detail(code.clone()),
-                            "message": "the handoff send failed definitively; no transfer was \
-                                        recorded",
+                            "message": message,
                         }))
                         .map_err(|error| AgentRunError::Task(Box::new(error)))?;
                         run.loop_state.record_tool_result(AgentToolResult {
@@ -12268,6 +12276,21 @@ mod tests {
         assert!(!fx.run().loop_state.handoff_fenced(), "the fence released");
         assert_eq!(fx.run().status, AgentRunStatus::Running);
         assert!(fx.run().terminal_reason.is_none(), "the run survives");
+        // The model is told what is true: nothing was recorded, and nothing
+        // says the failure is permanent, since a resolver's may not be.
+        let message = fx
+            .run()
+            .loop_state
+            .tool_results()
+            .iter()
+            .find_map(|result| result.content.inline_value())
+            .and_then(|value| value.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        assert_eq!(
+            message.as_deref(),
+            Some("the handoff send failed before any transfer was recorded")
+        );
     }
 
     /// Asserts the send parked behind its reconciliation checkpoint.

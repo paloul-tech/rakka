@@ -839,8 +839,9 @@ pub enum AgentA2aHandoffFinding {
 /// message id, and its deduplication key, so a retried attempt converges on
 /// the same logical transfer.
 ///
-/// An `Err` from `execute` is a *retryable* attempt failure under the
-/// effect's idempotent attempt bound; a finding is definitive. On an
+/// An [`AgentDispatchError::Invocation`] or [`AgentDispatchError::Collaborator`]
+/// error from `execute` is a *retryable* attempt failure under the effect's
+/// idempotent attempt bound; a finding is definitive. On an
 /// ambiguous transport loss the implementation probes the task's durable
 /// state before giving up: a recorded provenance echoing this handoff id
 /// proves delivery, while its *absence* stays retryable — a read cannot
@@ -855,6 +856,18 @@ pub enum AgentA2aHandoffFinding {
 /// that could not be resolved, provably delivered nothing, so it fails the
 /// call as a refusal does instead of parking. An absent executor fails closed
 /// at `invoke`.
+///
+/// # What a definitive error claims
+///
+/// An [`AgentDispatchError::Definitive`] error ends the generation on the
+/// attempt that returns it. On the generation's first attempt the run takes
+/// it as proof that no transfer was recorded: the handoff fails and the run
+/// continues (issue #107). An implementation MUST therefore return
+/// `Definitive` only when no transfer could have been recorded, such as a
+/// refusal before the request was sent. Anything that happens after the send
+/// is an `Invocation` or `Collaborator` error, or an `OutcomeUnknown`. Nor
+/// may it answer under a pipeline code, such as `credential-resolution-failed`:
+/// the run reads that code as a failure before the executor was reached.
 ///
 /// # The error text this returns becomes durable state
 ///

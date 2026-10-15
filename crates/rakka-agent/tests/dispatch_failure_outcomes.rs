@@ -715,10 +715,10 @@ async fn a_definitive_resolver_refusal_exhausts_the_ticket_on_its_first_attempt(
     );
 }
 
-/// A retryable resolver failure keeps spending its budget one attempt at a
-/// time: only a definitive refusal ends the generation early.
+/// A retryable resolver failure does not end the generation on the attempt
+/// it failed: only a definitive refusal ends it early.
 #[tokio::test]
-async fn a_retryable_resolver_failure_still_spends_its_budget_one_attempt_at_a_time() {
+async fn a_retryable_resolver_failure_does_not_end_the_generation_on_its_first_attempt() {
     let (fx, calls) = credentialed_fixture(false);
     let effect = ready(&fx).await;
 

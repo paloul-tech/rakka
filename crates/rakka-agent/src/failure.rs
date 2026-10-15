@@ -14,10 +14,15 @@
 //! - **A code, never text.** The value is whatever the deciding party
 //!   already answers under its own stable-code contract. No message, no
 //!   detail, no evidence reference.
-//! - **Observability, never correctness.** Nothing reads a reason to decide
-//!   anything, which is why the records that gain one keep their schema
-//!   versions: a record written before the field decodes with none, and a
-//!   record without one serializes exactly as before.
+//! - **Observability, with one guarded exception.** Nothing reads a stored
+//!   reason to decide anything, which is why the records that gain one keep
+//!   their schema versions: a record written before the field decodes with
+//!   none, and a record without one serializes exactly as before. One
+//!   decision reads the definitive marker of a *live* outcome: a handoff send
+//!   whose budget a definitive refusal spends on the generation's first
+//!   attempt fails the call instead of parking (issue #107). It reads the
+//!   outcome the dispatcher delivers, never a stored record, and a missing
+//!   marker falls to the park, so a record written without one stays safe.
 //! - **Never a metric label.** A deployment's own codes are length-bounded,
 //!   not value-bounded.
 //!
