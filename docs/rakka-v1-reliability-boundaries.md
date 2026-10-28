@@ -82,10 +82,22 @@ Guarantees:
 - Remembered entities can record successfully activated ids and restart them
   after local ownership refresh or shard acquisition when the entity type opts
   in.
+- A message delivered through a region to a local entity while that entity
+  passivates is either refused with a typed error at the call, or accepted and
+  then handled by the entity's next incarnation in arrival order, except in
+  three cases where an accepted message is dropped with a warning: the entity's
+  shard leaves this node before the next incarnation starts, the actor system
+  is terminating, or the next incarnation stops in `started` before taking it.
+  An entity that stops itself by returning `ActorAction::Stop` also publishes
+  whatever was already queued in its mailbox as `MailboxClosed` dead letters.
+  Callers that must not lose a message in those cases keep their own retry.
 
 Non-guarantees:
 
 - Remote actor/entity delivery is still at-most-once by default.
+- No wiring gives one activation per entity during a join; see "One Activation
+  Per Entity Is Not Guaranteed" in
+  `docs/rakka-akka-parity-phase-4-cluster-sharding.md`.
 - Remembered entities are liveness metadata, not durable entity state or
   exactly-once delivery.
 - Rakka internal remoting is not a public client protocol.

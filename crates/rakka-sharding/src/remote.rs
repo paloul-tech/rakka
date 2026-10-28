@@ -11,7 +11,8 @@ use rakka_cluster::NodeId;
 use rakka_core::{Message, ReplyTo};
 use rakka_remote::{
     RemoteDestination, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeHandler, RemoteError,
-    RemoteRequestError, RemoteRequestRegistry, RemoteTransport, SerializationRegistry,
+    RemoteFailure, RemoteRequestError, RemoteRequestRegistry, RemoteTransport,
+    SerializationRegistry,
 };
 
 use crate::identity::{EntityId, EntityRef, EntityType};
@@ -204,6 +205,23 @@ impl<M> Display for RemoteEntityAskInboundError<M> {
                     write!(f, "remote ask delivery failed: {failure}")
                 }
             },
+        }
+    }
+}
+
+impl<M> RemoteEntityAskInboundError<M> {
+    /// Stable code carried back to the requester when the owner answers this
+    /// failure with a rejection.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::UnexpectedDestination { .. } => "remote-ask-unexpected-destination",
+            Self::EntityTypeMismatch { .. } => "remote-ask-entity-type-mismatch",
+            Self::MissingRequestId => "remote-ask-missing-request-id",
+            Self::MissingSource => "remote-ask-missing-source",
+            Self::InvalidSource { .. } => "remote-ask-invalid-source",
+            Self::Decode { .. } => "remote-ask-decode",
+            Self::Delivery { error } => error.code(),
         }
     }
 }
@@ -572,6 +590,13 @@ where
     }
 
     /// Handles one remote entity ask envelope.
+    ///
+    /// Once the request id and the requester are known, a failure to handle the
+    /// request is answered with a failure reply carrying the failure's stable
+    /// code, and this returns `Ok`: the envelope was handled and the requester has
+    /// its answer at once instead of waiting out its timeout. The failure is
+    /// returned only when the request id or requester is missing, or when the
+    /// failure reply itself could not be sent.
     pub fn handle(&self, envelope: RemoteEnvelope) -> Result<(), RemoteEntityAskInboundError<M>> {
         let request_id = envelope
             .request_id
@@ -583,6 +608,54 @@ where
             .ok_or(RemoteEntityAskInboundError::MissingSource)?;
         let requester = NodeId::from_str(&source)
             .map_err(|_error| RemoteEntityAskInboundError::InvalidSource { source })?;
+        let destination = envelope.destination.clone();
+
+        let Err(error) = self.handle_request(envelope, &request_id, &requester) else {
+            return Ok(());
+        };
+        let code = error.code();
+        let failure_reply = RemoteEnvelope::failure_reply(
+            request_id.clone(),
+            RemoteFailure::new(code, error.to_string()),
+        )
+        .with_source(self.local_node_id.to_string());
+        if self.transport.send(&requester, failure_reply).is_err() {
+            return Err(error);
+        }
+        // The entity id and the request id are deliberately not logged: entity ids
+        // carry application identity that operators keep out of logs, and the
+        // request id is the requester's correlation key, not the owner's. The entity
+        // type, shard id, code and requester node locate the rejection.
+        let (entity_type, shard_id) = match &destination {
+            RemoteDestination::Entity {
+                entity_type,
+                entity_id,
+            } => {
+                let entity_type = EntityType::new(entity_type.clone());
+                let shard_id =
+                    EntityRef::<M>::new(entity_type.clone(), EntityId::new(entity_id.clone()))
+                        .shard_id(self.region.config())
+                        .as_u32();
+                (entity_type.to_string(), Some(shard_id))
+            }
+            _ => (String::new(), None),
+        };
+        tracing::warn!(
+            code = %code,
+            entity_type = %entity_type,
+            shard_id,
+            %requester,
+            "remote ask rejected"
+        );
+        Ok(())
+    }
+
+    fn handle_request(
+        &self,
+        envelope: RemoteEnvelope,
+        request_id: &str,
+        requester: &NodeId,
+    ) -> Result<(), RemoteEntityAskInboundError<M>> {
         let (entity_type, entity_id) = match &envelope.destination {
             RemoteDestination::Entity {
                 entity_type,
@@ -619,6 +692,8 @@ where
         let local_node_id = self.local_node_id.clone();
         let registry = self.registry.clone();
         let transport = self.transport.clone();
+        let request_id = request_id.to_string();
+        let requester = requester.clone();
         tokio::spawn(async move {
             if let Ok(reply) = receiver.await {
                 if let Ok(encoded_payload) = registry.encode(&reply) {

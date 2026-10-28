@@ -159,6 +159,18 @@ fn entity_ask_error(error: EntityAskError) -> RakkaA2AHandlerError {
     }
 }
 
+/// Rejection codes that say the request never entered an entity mailbox at the
+/// owner, so a retry can succeed once the owner settles.
+const RETRYABLE_REMOTE_REJECTION_CODES: [&str; 7] = [
+    "entity-no-route",
+    "entity-not-local",
+    "entity-shard-handoff",
+    "entity-mailbox-full",
+    "entity-shard-buffer-full",
+    "entity-mailbox-closed",
+    "entity-spawn-failed",
+];
+
 fn remote_ask_error(error: RemoteEntityAskError) -> RakkaA2AHandlerError {
     match error {
         RemoteEntityAskError::NoRoute { error } => RakkaA2AHandlerError::Unavailable {
@@ -178,9 +190,71 @@ fn remote_ask_error(error: RemoteEntityAskError) -> RakkaA2AHandlerError {
             RemoteRequestError::ReplyDropped => RakkaA2AHandlerError::OwnerAsk {
                 message: "remote reply dropped".to_string(),
             },
+            RemoteRequestError::Rejected { code, message } => {
+                let message = format!("owner rejected ask ({code}): {message}");
+                if RETRYABLE_REMOTE_REJECTION_CODES.contains(&code.as_str()) {
+                    RakkaA2AHandlerError::Unavailable { message }
+                } else {
+                    RakkaA2AHandlerError::OwnerAsk { message }
+                }
+            }
             other => RakkaA2AHandlerError::OwnerAsk {
                 message: other.to_string(),
             },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rejected(code: &str) -> RemoteEntityAskError {
+        RemoteEntityAskError::Reply {
+            error: RemoteRequestError::Rejected {
+                code: code.to_string(),
+                message: "draining".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn rejected_remote_ask_with_delivery_code_is_unavailable() {
+        for code in RETRYABLE_REMOTE_REJECTION_CODES {
+            let error = remote_ask_error(rejected(code));
+            assert!(
+                matches!(
+                    &error,
+                    RakkaA2AHandlerError::Unavailable { message }
+                        if message.contains(code) && message.contains("draining")
+                ),
+                "{code}: {error:?}"
+            );
+        }
+        assert!(matches!(
+            remote_ask_error(rejected("entity-shard-handoff")),
+            RakkaA2AHandlerError::Unavailable { message }
+                if message == "owner rejected ask (entity-shard-handoff): draining"
+        ));
+    }
+
+    #[test]
+    fn rejected_remote_ask_with_decode_code_is_owner_ask() {
+        for code in [
+            "remote-ask-decode",
+            "remote-ask-entity-type-mismatch",
+            "entity-rejected",
+            "entity-remote-encode",
+        ] {
+            let error = remote_ask_error(rejected(code));
+            assert!(
+                matches!(
+                    &error,
+                    RakkaA2AHandlerError::OwnerAsk { message }
+                        if message.contains(code) && message.contains("draining")
+                ),
+                "{code}: {error:?}"
+            );
+        }
     }
 }

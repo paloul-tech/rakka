@@ -28,7 +28,8 @@ pub use endpoint::{
 };
 pub use envelope::{
     EncodedPayload, ProtobufEnvelopeCodec, RemoteActorRef, RemoteDestination, RemoteEnvelope,
-    RemoteEnvelopeMetadata,
+    RemoteEnvelopeMetadata, RemoteFailure, REMOTE_FAILURE_MESSAGE_MAX_BYTES,
+    REMOTE_FAILURE_MESSAGE_TYPE_ID,
 };
 pub use error::{RemoteError, RemoteResult};
 pub use network::{

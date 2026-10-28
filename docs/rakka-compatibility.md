@@ -56,6 +56,36 @@ Remote envelopes carry `codec_id`, `message_type_id`, and `schema_version`. Prot
 - Incompatible migrations must use an exact schema policy, a staged drain, a bridge, or a separate cluster.
 - Unsupported schema versions fail closed with typed `RemoteError::UnknownCodec`.
 
+The envelope itself follows the same rule: an optional field with a new tag may
+be added to the remote envelope within an envelope version, and the version
+(`DEFAULT_REMOTE_ENVELOPE_VERSION`) moves only for a change the additive rules
+forbid. Within envelope version 1:
+
+- `ProtoRemoteEnvelope` field 9, `failure`, is a message with `code` at 1 and
+  `message` at 2 (the message is bounded to 512 bytes). Fields 1 to 8 are
+  unchanged.
+- An owner sets it on a reply it could not answer, with the message type id
+  `rakka.remote.RemoteFailure`, schema version 1, and an empty payload. The
+  asker sees `RemoteRequestError::Rejected { code, message }`.
+- An asker on an older binary ignores the field and reports
+  `RemoteRequestError::Decode` for that reply instead of a timeout. Its reply
+  handler also returns that decode failure to the endpoint, which closes the
+  owner-to-asker TCP connection and counts an inbound failure on the asker; the
+  owner's peer task reconnects on its next send. So during a mixed-version
+  window each rejected ask from an older asker to a newer owner costs one
+  connection reset on the asker's side. An owner on an older binary never sends
+  the field.
+- The carried codes are the entity delivery codes the HTTP and gRPC adapters
+  emit (`entity-no-route`, `entity-mailbox-full`, `entity-mailbox-closed`,
+  `entity-not-local`, `entity-spawn-failed`, `entity-remote-encode`,
+  `entity-remote-send`, `entity-shard-handoff`, `entity-shard-buffer-full`,
+  `entity-rejected`) plus `remote-ask-decode`,
+  `remote-ask-entity-type-mismatch`, and `remote-ask-unexpected-destination`.
+  (`RemoteEntityAskInboundError::code()` also names
+  `remote-ask-missing-request-id`, `remote-ask-missing-source`, and
+  `remote-ask-invalid-source`, but those failures happen before the owner knows
+  whom to answer, so they are never carried.)
+
 The helper APIs are:
 
 - `SchemaCompatibilityPolicy::n_plus_one(current_schema_version)` for standard old/current schema coexistence.

@@ -807,7 +807,7 @@ impl RemoteTransport for TcpRemoteTransport {
             state.queued = state.queued.saturating_add(1);
         }
 
-        match peer.sender.try_send(PeerCommand::Send(envelope)) {
+        match peer.sender.try_send(PeerCommand::Send(Box::new(envelope))) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_command)) => {
                 peer.state
@@ -1010,7 +1010,7 @@ struct PeerHandle {
 }
 
 enum PeerCommand {
-    Send(RemoteEnvelope),
+    Send(Box<RemoteEnvelope>),
     Drain {
         reply_to: oneshot::Sender<RemoteTransportResult<()>>,
     },
@@ -1166,7 +1166,7 @@ async fn peer_worker(
                     .lock()
                     .expect("tcp remote peer state mutex poisoned")
                     .decrement_queue();
-                match send_with_reconnect(&inner, &node, &state, &mut stream, envelope).await {
+                match send_with_reconnect(&inner, &node, &state, &mut stream, *envelope).await {
                     Ok(()) => {
                         {
                             state

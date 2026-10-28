@@ -2077,12 +2077,10 @@ where
     }
 
     fn passivate_entity(&self, entity_id: &EntityId) -> bool {
-        if let Some(actor_ref) = self.route.entity_actor(entity_id) {
-            if let Some(stop_message_factory) = &self.stop_message_factory {
-                let _ = actor_ref.tell(stop_message_factory());
-            }
-        }
-        self.route.passivate_entity(entity_id)
+        self.route.passivate_entity_with(
+            entity_id,
+            self.stop_message_factory.as_ref().map(|factory| factory()),
+        )
     }
 }
 

@@ -6,6 +6,18 @@
 //! small command envelopes and domain records. Large prompts, model responses,
 //! files, and tool outputs should continue to move through `ArtifactRef` values
 //! stored in those records.
+//!
+//! A compare-and-set that loses to another writer (a second activation of the
+//! same run during a cluster join, or any other writer sharing the store) marks
+//! the losing component stale: the refused command still fails with its typed
+//! error (`AgentRunEngineError::Persistence` carrying a revision conflict for the
+//! run state, `AgentInboxError`/`AgentOutboxError` wrapping
+//! `WorkflowError::RevisionConflict` for the inbox and outbox, including through
+//! the graph effect bridge). The actor then recovers every component before it
+//! handles its next command, so that command is computed from durable state
+//! rather than from the cached revision. There is no internal retry: the caller
+//! retries the refused command. A recovery that fails leaves the components
+//! stale and the next command tries again.
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -697,6 +709,58 @@ where
         self.graph_runtime
     }
 
+    /// Recovers every component before a command when one of them lost a
+    /// compare-and-set, so the command runs against durable state.
+    async fn refresh_if_stale(&mut self) -> AgentRunRuntimeResult<()> {
+        if self.runner.is_stale() || self.inbox.is_stale() {
+            self.recover_components().await.map(|_snapshot| ())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Answers a command that could not run because the stale recovery before it
+    /// failed.
+    fn reply_refresh_failure(message: AgentRunActorCommand, error: AgentRunRuntimeError) {
+        match message {
+            AgentRunActorCommand::Recover { reply_to }
+            | AgentRunActorCommand::Snapshot { reply_to } => {
+                let _reply_dropped = reply_to.reply(Err(error));
+            }
+            AgentRunActorCommand::AcceptCommand { reply_to, .. } => {
+                let _reply_dropped = reply_to.reply(Err(error));
+            }
+            AgentRunActorCommand::Start { reply_to, .. }
+            | AgentRunActorCommand::StartGraph { reply_to, .. }
+            | AgentRunActorCommand::BeginStep { reply_to, .. }
+            | AgentRunActorCommand::SucceedStep { reply_to, .. }
+            | AgentRunActorCommand::FailStep { reply_to, .. }
+            | AgentRunActorCommand::Wait { reply_to, .. }
+            | AgentRunActorCommand::Resume { reply_to, .. }
+            | AgentRunActorCommand::Complete { reply_to, .. }
+            | AgentRunActorCommand::FailRun { reply_to, .. }
+            | AgentRunActorCommand::RequestCancellation { reply_to, .. }
+            | AgentRunActorCommand::Cancel { reply_to, .. }
+            | AgentRunActorCommand::BeginCompensation { reply_to, .. } => {
+                let _reply_dropped = reply_to.reply(Err(error));
+            }
+            AgentRunActorCommand::MarkGraphReady { reply_to, .. }
+            | AgentRunActorCommand::StartGraphNode { reply_to, .. }
+            | AgentRunActorCommand::CompleteGraphNode { reply_to, .. } => {
+                let _reply_dropped = reply_to.reply(Err(error));
+            }
+            AgentRunActorCommand::ScheduleGraphNodeEffect { reply_to, .. } => {
+                let _reply_dropped = reply_to.reply(Err(error));
+            }
+            AgentRunActorCommand::ScheduleEffect { reply_to, .. } => {
+                let _reply_dropped = reply_to.reply(Err(error));
+            }
+            AgentRunActorCommand::DueEffects { reply_to } => {
+                let _reply_dropped = reply_to.reply(Err(error));
+            }
+        }
+    }
+
     async fn recover_components(&mut self) -> AgentRunRuntimeResult<AgentRunActorSnapshot> {
         let result = async {
             self.runner.recover().await?;
@@ -844,6 +908,12 @@ where
         msg: Self::Msg,
     ) -> ActorFuture<'a> {
         actor_future(async move {
+            if !matches!(msg, AgentRunActorCommand::Recover { .. }) {
+                if let Err(error) = self.refresh_if_stale().await {
+                    Self::reply_refresh_failure(msg, error);
+                    return Ok(ActorAction::Continue);
+                }
+            }
             match msg {
                 AgentRunActorCommand::Recover { reply_to } => {
                     let _reply_dropped = reply_to.reply(self.recover_components().await);

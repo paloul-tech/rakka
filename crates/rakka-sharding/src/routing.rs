@@ -51,6 +51,25 @@ pub enum EntityDeliveryFailure {
     Rejected(String),
 }
 
+impl EntityDeliveryFailure {
+    /// Stable code for this failure, the same string the HTTP and gRPC adapters
+    /// emit and that a remote owner carries on a rejected ask.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::MailboxFull => "entity-mailbox-full",
+            Self::MailboxClosed => "entity-mailbox-closed",
+            Self::NotLocal { .. } => "entity-not-local",
+            Self::SpawnFailed(_) => "entity-spawn-failed",
+            Self::RemoteEncode(_) => "entity-remote-encode",
+            Self::RemoteSend(_) => "entity-remote-send",
+            Self::ShardHandoff { .. } => "entity-shard-handoff",
+            Self::ShardBufferFull { .. } => "entity-shard-buffer-full",
+            Self::Rejected(_) => "entity-rejected",
+        }
+    }
+}
+
 impl Display for EntityDeliveryFailure {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -98,6 +117,16 @@ impl<M> EntityTellError<M> {
     pub fn into_message(self) -> M {
         match self {
             Self::NoRoute { message, .. } | Self::Delivery { message, .. } => message,
+        }
+    }
+
+    /// Stable code for this error: `entity-no-route` when the owner could not be
+    /// resolved, otherwise the delivery failure's code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::NoRoute { .. } => "entity-no-route",
+            Self::Delivery { failure, .. } => failure.code(),
         }
     }
 

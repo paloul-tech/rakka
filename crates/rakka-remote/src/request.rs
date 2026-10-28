@@ -53,6 +53,13 @@ pub enum RemoteRequestError {
     ReplyDropped,
     /// Timed out waiting for the reply.
     Timeout,
+    /// The owner answered with a typed failure instead of a reply payload.
+    Rejected {
+        /// Stable failure code carried by the owner's failure reply.
+        code: String,
+        /// Human-readable message carried by the owner's failure reply.
+        message: String,
+    },
 }
 
 impl Display for RemoteRequestError {
@@ -78,6 +85,9 @@ impl Display for RemoteRequestError {
             Self::Decode { error } => write!(f, "remote reply decode failed: {error}"),
             Self::ReplyDropped => f.write_str("remote reply receiver was dropped"),
             Self::Timeout => f.write_str("remote request timed out"),
+            Self::Rejected { code, message } => {
+                write!(f, "remote request rejected by owner ({code}): {message}")
+            }
         }
     }
 }
@@ -268,6 +278,20 @@ where
         registry: &SerializationRegistry,
         envelope: &RemoteEnvelope,
     ) -> RemoteRequestResult<()> {
+        if let Some(failure) = &envelope.failure {
+            let sender = self
+                .sender
+                .lock()
+                .expect("remote pending reply mutex poisoned")
+                .take()
+                .ok_or(RemoteRequestError::ReplyDropped)?;
+            return sender
+                .send(Err(RemoteRequestError::Rejected {
+                    code: failure.code().to_string(),
+                    message: failure.message().to_string(),
+                }))
+                .map_err(|_reply| RemoteRequestError::ReplyDropped);
+        }
         let reply = registry
             .decode_envelope::<R>(envelope)
             .map_err(|error| RemoteRequestError::Decode { error });

@@ -66,14 +66,57 @@ sharding.passivate_entity(&key, "cart-42")?;
 
 `ClusterSharding::state()` and `registration_state(&key)` expose registration
 mode, shard count, local entity count, passivation settings, and owner revision
-for diagnostics and tests.
+for diagnostics and tests. The local entity count covers active incarnations
+only; an incarnation that is stopping is not counted.
+
+A local entity occupies one slot in its route that is either active or
+stopping. Delivery, the decision to stop an incarnation, and the stop itself run
+under one lock, so a message is never queued behind a stop the route initiated,
+and a delivery never fails `actor-path-in-use` because the previous incarnation
+is still terminating. A message that arrives while an entity stops is held,
+bounded by the entity's configured mailbox capacity (`ActorOptions`), and
+delivered to the next incarnation in arrival order ahead of anything sent
+later; past that bound the sender gets `EntityDeliveryFailure::MailboxFull`
+with its message back. A held message is dropped, with a warning that names the
+count, only when the actor system is terminating, the entity's shard has left
+this node, or the next incarnation stops in `started` before taking it. Those
+warnings name the entity type and shard id, never the entity id.
+
+Idle passivation arms one timer task per active entity; each delivery moves the
+deadline instead of starting another sleeper, and
+`LocalEntityRoute::armed_idle_timers()` reports how many timer tasks are
+sleeping. A stop the route cannot queue because the mailbox is full leaves the
+entity active and registered: the idle timer tries again after one more
+timeout, an explicit passivation returns `false`, and a shard transfer keeps
+retrying the stop in the background until it is queued. The stop message is
+told again on the next attempt, so stop messages must be idempotent. The route
+spawns its watcher, timer, and retry tasks only when a Tokio runtime is
+current; a passivation called from a plain thread still queues the stop, and
+the next delivery to that entity resolves it.
+
+An entity that stops itself by returning `ActorAction::Stop` from `handle`
+leaves its mailbox loop at once. Whatever was already queued behind the message
+it was handling is published as `MailboxClosed` dead letters, and a message that
+reaches the route afterwards is held for the next incarnation.
+`rakka-process`'s `ProcessBackedEntityAction::Passivate` and the
+`rakka-persistence` actor facades stop entities this way. Passivating through
+the facade's `passivate_entity`, which queues the stop message and the stop in
+one critical section, or through the idle timer carries no such residual.
+
+A remote ask whose local delivery fails at the owner (a draining shard, a full
+mailbox, a spawn failure) is answered at once with a typed rejection carrying
+the delivery's stable code, surfaced to the asker as
+`RemoteRequestError::Rejected { code, message }`. The asker no longer waits out
+its timeout, and its connection to the owner stays open.
 
 ## Handoff And Passivation Buffering
 
 Facade-created entity types enable bounded shard buffering by default. Messages
 sent during graceful shard handoff, temporary owner-cache gaps, or explicit
 facade passivation are accepted into the region buffer and flushed when the
-shard/entity becomes available again.
+shard/entity becomes available again. The region buffer is no longer needed to
+survive an entity's own stop window, which the local route now covers by
+holding those messages itself (see "Passivation And State"); the two compose.
 
 ```rust
 let entity = Entity::of(key.clone(), |context| CartEntity::new(context))
@@ -288,6 +331,34 @@ sharding API with an async-only store returns
 
 See `docs/rakka-akka-parity-phase-4-durable-coordinator-rationale.md` for the
 architectural reasoning and Akka comparison.
+
+## One Activation Per Entity Is Not Guaranteed
+
+No wiring gives one activation per entity during a join:
+
+- Each node reconciles ownership from its own membership view, and a region
+  takes a gained shard without a handshake. During a join, a rebalance, or a
+  transient membership disagreement, two nodes can briefly each own one shard
+  and activate the same entity.
+- The coordinator lease does not close that window. It gates who may register a
+  region and make coordinator decisions, so it fits a single-coordinator
+  topology; a node that does not hold it cannot host the entity type at all
+  (`ShardingError::CoordinatorLeaseRejected`). Nothing carries the holder's
+  ownership to other nodes.
+- A shared coordinator store without a lease is not a supported topology.
+  Per-node coordinators race on the store, and a node whose persist loses the
+  compare-and-set keeps its in-memory ownership unpublished until membership
+  changes again.
+- The contract is the one `docs/rakka-v1-reliability-boundaries.md` states:
+  single-writer correctness rests on the revision compare-and-set and idempotent
+  effects. Every durable write an entity makes must be conditioned on the
+  revision it read. A write that takes a fresh revision unconditionally is
+  outside the contract and can overwrite newer state during a join.
+- Entity types that keep state in an actor must cope with two activations:
+  recover from the store, and treat a refused compare-and-set as "reload and
+  retry". The `rakka-agent-workflow` run actor does this: a lost compare-and-set
+  marks the runner or the durable inbox stale (`is_stale()`), and the actor
+  recovers every component before its next command.
 
 ## Remembered Entities
 

@@ -317,6 +317,7 @@ where
     store: Store,
     recovered: bool,
     record: Option<StateRecord<AgentRunState>>,
+    stale: bool,
 }
 
 impl<Store> AgentStepRunner<Store>
@@ -334,7 +335,19 @@ where
             store,
             recovered: false,
             record: None,
+            stale: false,
         }
+    }
+
+    /// Returns true once a compare-and-set lost to another writer, until
+    /// [`AgentStepRunner::recover`] reloads the record.
+    ///
+    /// A stale runner keeps answering every transition with
+    /// [`AgentRunEngineError::Persistence`] carrying a revision conflict, because
+    /// its cached revision is behind the store; the caller reloads before retrying.
+    #[must_use]
+    pub const fn is_stale(&self) -> bool {
+        self.stale
     }
 
     /// Workflow definition used by this runner.
@@ -357,12 +370,10 @@ where
 
     /// Recovers the latest durable run state, if present.
     pub async fn recover(&mut self) -> AgentRunEngineResult<Option<&AgentRunState>> {
-        self.record = self
-            .store
-            .load(&self.persistence_id)
-            .await
-            .map_err(|error| self.persistence_error(error))?;
+        let loaded = self.store.load(&self.persistence_id).await;
+        self.record = loaded.map_err(|error| self.persistence_error(error))?;
         self.recovered = true;
+        self.stale = false;
         Ok(self.record.as_ref().map(|record| &record.state))
     }
 
@@ -1088,7 +1099,12 @@ where
         }
     }
 
-    fn persistence_error(&self, error: DurableError) -> AgentRunEngineError {
+    /// Maps a store failure, marking this runner stale when a compare-and-set lost
+    /// to another writer.
+    fn persistence_error(&mut self, error: DurableError) -> AgentRunEngineError {
+        if matches!(error, DurableError::RevisionConflict { .. }) {
+            self.stale = true;
+        }
         AgentRunEngineError::Persistence {
             run_id: self.run_id.clone(),
             error,

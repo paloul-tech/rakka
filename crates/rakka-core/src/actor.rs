@@ -506,7 +506,7 @@ where
 {
     /// Sends a message without waiting for a reply.
     pub fn tell(&self, msg: M) -> Result<(), TellError<M>> {
-        if self.is_terminated() {
+        if self.is_terminated() || self.is_stopping() {
             self.publish_dead_letter::<M>(DeadLetterReason::MailboxClosed);
             return Err(TellError::Closed(msg));
         }
@@ -559,7 +559,7 @@ where
 
     /// Requests actor termination.
     pub fn stop(&self) -> Result<(), StopError> {
-        if self.is_terminated() {
+        if self.is_terminated() || self.is_stopping() {
             return Ok(());
         }
 
@@ -610,6 +610,12 @@ where
         receiver
             .await
             .expect("actor termination watcher should always send")
+    }
+
+    /// Returns true once the actor has left its mailbox loop and will not handle another message.
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.cell.is_stopping()
     }
 
     /// Returns true after the actor has terminated.
@@ -1447,6 +1453,19 @@ async fn run_actor_task<A, F>(
         }
     }
 
+    cell.mark_stopping();
+    receiver.close();
+    while let Ok(envelope) = receiver.try_recv() {
+        cell.mark_dequeued();
+        if matches!(envelope, Envelope::User(_)) {
+            let _ = cell.dead_letters.send(DeadLetter {
+                recipient: cell.path.clone(),
+                message_type: cell.message_type.to_string(),
+                reason: DeadLetterReason::MailboxClosed,
+            });
+        }
+    }
+
     let _ = catch_actor_result(actor.stopped(&mut ctx, &termination_reason)).await;
     ctx.stop_runtime_owned_tasks();
     cell.mark_terminated(termination_reason);
@@ -1529,6 +1548,7 @@ pub(crate) struct ActorCell {
     dead_letters: tokio::sync::broadcast::Sender<DeadLetter>,
     mailbox_capacity: usize,
     mailbox_depth: AtomicUsize,
+    stopping: AtomicBool,
     terminated: AtomicBool,
     termination_reason: Mutex<Option<TerminationReason>>,
     next_watch_id: AtomicU64,
@@ -1554,6 +1574,7 @@ impl ActorCell {
             dead_letters,
             mailbox_capacity,
             mailbox_depth: AtomicUsize::new(0),
+            stopping: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
             next_watch_id: AtomicU64::new(1),
@@ -1583,6 +1604,14 @@ impl ActorCell {
 
     pub(crate) fn is_terminated(&self) -> bool {
         self.terminated.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_stopping(&self) {
+        self.stopping.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
     }
 
     pub(crate) fn to_serialized_ref(&self) -> SerializedActorRef {

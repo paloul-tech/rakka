@@ -15,14 +15,15 @@ use rakka_remote::{
     InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteActorRef, RemoteActorRefInbound,
     RemoteClusteredReceptionist, RemoteClusteredReceptionistError, RemoteDestination,
     RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata, RemoteError,
-    RemoteReceptionistListing, RemoteReceptionistListingCodec, RemoteRequestError,
+    RemoteFailure, RemoteReceptionistListing, RemoteReceptionistListingCodec, RemoteRequestError,
     RemoteRequestRegistry, RemoteServiceProxyError, RemoteServiceProxyRegistry,
     RemoteServiceRoutee, RemoteServiceRouteeKey, RemoteTransport, RemoteTransportError,
     SchemaCompatibilityPolicy, SerializationRegistry, TcpRemoteTransport, TcpRemoteTransportConfig,
     TcpRemoteTransportError, DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
     DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT, DEFAULT_TCP_REMOTE_IDLE_TIMEOUT,
     DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES, DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY,
-    DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
+    DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF, REMOTE_FAILURE_MESSAGE_MAX_BYTES,
+    REMOTE_FAILURE_MESSAGE_TYPE_ID, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
 };
 use std::any::type_name;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2233,4 +2234,168 @@ async fn assert_no_ping(received: &mut tokio::sync::mpsc::UnboundedReceiver<Stri
             .is_err(),
         "remote routee unexpectedly delivered a ping"
     );
+}
+
+/// Reads only field 9 of a wire envelope, so the test pins the tag number the
+/// compatibility document records, not just the Rust round trip.
+#[derive(Clone, PartialEq, Message)]
+struct EnvelopeTag9Probe {
+    #[prost(message, optional, tag = "9")]
+    failure: Option<FailureProbe>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FailureProbe {
+    #[prost(string, tag = "1")]
+    code: String,
+    #[prost(string, tag = "2")]
+    message: String,
+}
+
+#[test]
+fn failure_reply_round_trips_through_protobuf_at_tag_9() {
+    let envelope = RemoteEnvelope::failure_reply(
+        "req-1",
+        RemoteFailure::new("entity-shard-handoff", "draining"),
+    );
+    let bytes = ProtobufEnvelopeCodec::encode(&envelope).unwrap();
+    let decoded = ProtobufEnvelopeCodec::decode(&bytes).unwrap();
+
+    assert_eq!(
+        decoded.failure.as_ref().map(RemoteFailure::code),
+        Some("entity-shard-handoff")
+    );
+    assert_eq!(
+        decoded.failure.as_ref().map(RemoteFailure::message),
+        Some("draining")
+    );
+    assert_eq!(
+        decoded.metadata.message_type_id,
+        REMOTE_FAILURE_MESSAGE_TYPE_ID
+    );
+    assert_eq!(decoded.metadata.schema_version, 1);
+    assert_eq!(decoded.request_id.as_deref(), Some("req-1"));
+    assert!(matches!(
+        &decoded.destination,
+        RemoteDestination::Reply { request_id } if request_id == "req-1"
+    ));
+    assert!(decoded.payload.is_empty());
+    assert_eq!(decoded, envelope);
+
+    let probe = EnvelopeTag9Probe::decode(bytes.as_slice()).unwrap();
+    assert_eq!(
+        probe.failure,
+        Some(FailureProbe {
+            code: "entity-shard-handoff".to_string(),
+            message: "draining".to_string(),
+        })
+    );
+
+    let plain = RemoteEnvelope::new(
+        RemoteDestination::Reply {
+            request_id: "req-2".to_string(),
+        },
+        ping_registry()
+            .encode(&Ping {
+                value: "hello".to_string(),
+            })
+            .unwrap(),
+    )
+    .with_request_id("req-2");
+    let plain_bytes = ProtobufEnvelopeCodec::encode(&plain).unwrap();
+    assert!(ProtobufEnvelopeCodec::decode(&plain_bytes)
+        .unwrap()
+        .failure
+        .is_none());
+    assert!(EnvelopeTag9Probe::decode(plain_bytes.as_slice())
+        .unwrap()
+        .failure
+        .is_none());
+}
+
+#[tokio::test]
+async fn failure_reply_completes_pending_request_with_rejected() {
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register_protobuf::<Pong>("rakka.test.Pong", 1)
+        .unwrap();
+    let requests = RemoteRequestRegistry::new(registry);
+    let pending = requests.register::<Pong>("req-1").unwrap();
+
+    requests
+        .complete_reply(RemoteEnvelope::failure_reply(
+            "req-1",
+            RemoteFailure::new("entity-shard-handoff", "draining"),
+        ))
+        .unwrap();
+
+    let error = pending.wait(Duration::from_secs(1)).await.unwrap_err();
+    assert_eq!(
+        error,
+        RemoteRequestError::Rejected {
+            code: "entity-shard-handoff".to_string(),
+            message: "draining".to_string(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "remote request rejected by owner (entity-shard-handoff): draining"
+    );
+    assert_eq!(requests.pending_count(), 0);
+}
+
+#[test]
+fn failure_message_is_bounded() {
+    let failure = RemoteFailure::new("x", "€".repeat(300));
+    assert!(failure.message().len() <= REMOTE_FAILURE_MESSAGE_MAX_BYTES);
+    assert_eq!(failure.message().len(), 510);
+    assert!(failure.message().chars().all(|character| character == '€'));
+    assert_eq!(failure.code(), "x");
+
+    let short = RemoteFailure::new("entity-no-route", "no owner");
+    assert_eq!(short.message(), "no owner");
+}
+
+#[test]
+fn late_failure_reply_for_unknown_request_is_reported_not_panicked() {
+    let requests = RemoteRequestRegistry::new(SerializationRegistry::new());
+
+    let error = requests
+        .complete_reply(RemoteEnvelope::failure_reply(
+            "never-registered",
+            RemoteFailure::new("entity-no-route", "gone"),
+        ))
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RemoteRequestError::UnknownRequestId {
+            request_id: "never-registered".to_string(),
+        }
+    );
+    assert_eq!(requests.pending_count(), 0);
+}
+
+#[test]
+fn envelope_json_without_failure_field_still_deserializes() {
+    let before = RemoteEnvelope::new(
+        RemoteDestination::Reply {
+            request_id: "req-json".to_string(),
+        },
+        ping_registry()
+            .encode(&Ping {
+                value: "hello".to_string(),
+            })
+            .unwrap(),
+    )
+    .with_request_id("req-json");
+    let mut json: serde_json::Value = serde_json::to_value(&before).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("failure")
+        .expect("the envelope serializes its failure field");
+
+    let decoded: RemoteEnvelope = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded, before);
+    assert!(decoded.failure.is_none());
 }

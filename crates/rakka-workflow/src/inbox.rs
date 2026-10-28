@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use rakka_persistence::{DurableStateStore, PersistenceId, Revision, StateRecord};
+use rakka_persistence::{DurableError, DurableStateStore, PersistenceId, Revision, StateRecord};
 
 use crate::clock::{SystemWorkflowClock, WorkflowClock};
 use crate::error::{map_durable_error, WorkflowError, WorkflowResult};
@@ -307,6 +307,7 @@ where
     store: Store,
     clock: Clock,
     record: Option<StateRecord<WorkflowState>>,
+    stale: bool,
 }
 
 impl<Store> DurableInbox<Store, SystemWorkflowClock>
@@ -335,7 +336,19 @@ where
             store,
             clock,
             record: None,
+            stale: false,
         }
+    }
+
+    /// Returns true once a compare-and-set lost to another writer, until
+    /// [`DurableInbox::recover`] reloads the record.
+    ///
+    /// A stale inbox still answers every mutating call, and every such call keeps
+    /// failing with [`WorkflowError::RevisionConflict`] until it recovers, because
+    /// its cached revision is behind the store.
+    #[must_use]
+    pub const fn is_stale(&self) -> bool {
+        self.stale
     }
 
     /// Workflow id.
@@ -382,7 +395,16 @@ where
             ))
         });
         self.record = Some(record);
+        self.stale = false;
         Ok(&self.record.as_ref().expect("record just recovered").state)
+    }
+
+    /// Maps a compare-and-set failure, marking this inbox stale on a lost revision.
+    fn persistence_failure(&mut self, error: DurableError) -> WorkflowError {
+        if matches!(error, DurableError::RevisionConflict { .. }) {
+            self.stale = true;
+        }
+        map_durable_error(&self.workflow_id, error)
     }
 
     /// Accepts a command into the durable inbox after persistence succeeds.
@@ -417,7 +439,7 @@ where
             .store
             .compare_and_set(&self.persistence_id, record.revision, next_state)
             .await
-            .map_err(|error| map_durable_error(&self.workflow_id, error))?;
+            .map_err(|error| self.persistence_failure(error))?;
         self.record = Some(next_record.clone());
         Ok(InboxAcceptance::Accepted {
             entry,
@@ -443,7 +465,7 @@ where
             .store
             .compare_and_set(&self.persistence_id, record.revision, next_state)
             .await
-            .map_err(|error| map_durable_error(&self.workflow_id, error))?;
+            .map_err(|error| self.persistence_failure(error))?;
         self.record = Some(next_record);
         Ok(entry)
     }
@@ -486,7 +508,7 @@ where
             .store
             .compare_and_set(&self.persistence_id, record.revision, next_state)
             .await
-            .map_err(|error| map_durable_error(&self.workflow_id, error))?;
+            .map_err(|error| self.persistence_failure(error))?;
         self.record = Some(next_record.clone());
         Ok(OutboxAcceptance::Scheduled {
             entry,
@@ -718,7 +740,7 @@ where
             .store
             .compare_and_set(&self.persistence_id, expected_revision, next_state)
             .await
-            .map_err(|error| map_durable_error(&self.workflow_id, error))?;
+            .map_err(|error| self.persistence_failure(error))?;
         self.record = Some(next_record);
         Ok(())
     }
