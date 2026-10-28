@@ -284,6 +284,159 @@ async fn sending_to_stopped_actor_publishes_dead_letter() {
 }
 
 #[derive(Debug)]
+enum GatedMessage {
+    Record(String),
+    Stop,
+}
+
+struct GatedStopActor {
+    handled: Arc<std::sync::Mutex<Vec<String>>>,
+    entered: mpsc::UnboundedSender<()>,
+    release: Arc<Notify>,
+}
+
+impl Actor for GatedStopActor {
+    type Msg = GatedMessage;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        actor_future(async move {
+            match msg {
+                GatedMessage::Record(value) => {
+                    self.handled.lock().unwrap().push(value);
+                    Ok(ActorAction::Continue)
+                }
+                GatedMessage::Stop => Ok(ActorAction::Stop),
+            }
+        })
+    }
+
+    fn stopped<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        _reason: &'a rakka_core::TerminationReason,
+    ) -> ActorFuture<'a> {
+        actor_future(async move {
+            let _ = self.entered.send(());
+            self.release.notified().await;
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+struct GatedFixture {
+    system: ActorSystem,
+    actor: rakka_core::ActorRef<GatedMessage>,
+    handled: Arc<std::sync::Mutex<Vec<String>>>,
+    entered: mpsc::UnboundedReceiver<()>,
+    release: Arc<Notify>,
+    dead_letters: tokio::sync::broadcast::Receiver<rakka_core::DeadLetter>,
+}
+
+fn gated_fixture(name: &str) -> GatedFixture {
+    let system = ActorSystem::new(name);
+    let dead_letters = system.subscribe_dead_letters();
+    let handled = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (entered_tx, entered) = mpsc::unbounded_channel();
+    let release = Arc::new(Notify::new());
+    let actor = system
+        .spawn_actor_with_options(
+            "gated",
+            {
+                let handled = handled.clone();
+                let release = release.clone();
+                move || GatedStopActor {
+                    handled: handled.clone(),
+                    entered: entered_tx.clone(),
+                    release: release.clone(),
+                }
+            },
+            ActorOptions::default().with_mailbox_capacity(8),
+        )
+        .unwrap();
+    GatedFixture {
+        system,
+        actor,
+        handled,
+        entered,
+        release,
+        dead_letters,
+    }
+}
+
+async fn await_entered(entered: &mut mpsc::UnboundedReceiver<()>) {
+    tokio::time::timeout(Duration::from_secs(1), entered.recv())
+        .await
+        .expect("actor should enter its stopped hook")
+        .expect("entered channel open");
+}
+
+async fn collect_dead_letters(
+    dead_letters: &mut tokio::sync::broadcast::Receiver<rakka_core::DeadLetter>,
+) -> Vec<rakka_core::DeadLetter> {
+    let mut seen = Vec::new();
+    while let Ok(Ok(dead_letter)) =
+        tokio::time::timeout(Duration::from_millis(200), dead_letters.recv()).await
+    {
+        seen.push(dead_letter);
+    }
+    seen
+}
+
+#[tokio::test]
+async fn tell_during_stopped_hook_fails_closed_and_publishes_dead_letter() {
+    let mut fixture = gated_fixture("stopping-tell");
+    fixture.actor.tell(GatedMessage::Stop).unwrap();
+    await_entered(&mut fixture.entered).await;
+
+    assert!(fixture.actor.is_stopping());
+    assert!(!fixture.actor.is_terminated());
+    assert!(matches!(
+        fixture.actor.tell(GatedMessage::Record("late".into())),
+        Err(TellError::Closed(GatedMessage::Record(value))) if value == "late"
+    ));
+    assert!(matches!(fixture.actor.stop(), Ok(())));
+
+    let seen = collect_dead_letters(&mut fixture.dead_letters).await;
+    assert_eq!(seen.len(), 1, "dead letters: {seen:?}");
+    assert_eq!(seen[0].reason, DeadLetterReason::MailboxClosed);
+    assert_eq!(seen[0].recipient, fixture.actor.path().clone());
+
+    fixture.release.notify_one();
+    wait_until_terminated(&fixture.actor).await;
+    assert!(fixture.handled.lock().unwrap().is_empty());
+    fixture.system.shutdown();
+}
+
+#[tokio::test]
+async fn messages_queued_behind_a_self_stop_become_dead_letters() {
+    let mut fixture = gated_fixture("stopping-queued");
+    fixture.actor.tell(GatedMessage::Stop).unwrap();
+    fixture
+        .actor
+        .tell(GatedMessage::Record("behind-1".into()))
+        .unwrap();
+    fixture
+        .actor
+        .tell(GatedMessage::Record("behind-2".into()))
+        .unwrap();
+    await_entered(&mut fixture.entered).await;
+    fixture.release.notify_one();
+    wait_until_terminated(&fixture.actor).await;
+
+    let seen = collect_dead_letters(&mut fixture.dead_letters).await;
+    assert_eq!(seen.len(), 2, "dead letters: {seen:?}");
+    assert!(seen
+        .iter()
+        .all(|dead_letter| dead_letter.reason == DeadLetterReason::MailboxClosed));
+    assert!(fixture.handled.lock().unwrap().is_empty());
+    fixture.system.shutdown();
+}
+
+#[derive(Debug)]
 enum SupervisedMessage {
     Fail,
     Get(ReplyTo<usize>),
