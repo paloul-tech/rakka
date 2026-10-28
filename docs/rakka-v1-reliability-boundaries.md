@@ -82,10 +82,16 @@ Guarantees:
 - Remembered entities can record successfully activated ids and restart them
   after local ownership refresh or shard acquisition when the entity type opts
   in.
+- A message delivered through a region to a local entity while that entity
+  passivates is handled by its next incarnation or refused with a typed error;
+  it is not dropped.
 
 Non-guarantees:
 
 - Remote actor/entity delivery is still at-most-once by default.
+- No wiring gives one activation per entity during a join; see "One Activation
+  Per Entity Is Not Guaranteed" in
+  `docs/rakka-akka-parity-phase-4-cluster-sharding.md`.
 - Remembered entities are liveness metadata, not durable entity state or
   exactly-once delivery.
 - Rakka internal remoting is not a public client protocol.
