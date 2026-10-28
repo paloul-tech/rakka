@@ -2638,6 +2638,7 @@ dependencies = [
  "rakka-remote",
  "serde",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -1,14 +1,15 @@
 //! Local actor delivery route for sharded entities owned by this node.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rakka_cluster::NodeId;
-use rakka_core::{Actor, ActorOptions, ActorRef, ActorSystem, Message, TellError};
+use rakka_core::{
+    Actor, ActorOptions, ActorRef, ActorSystem, ActorUid, Message, StopError, TellError,
+};
 
 use crate::handoff::ShardHandoffState;
 use crate::identity::{EntityId, EntityType, ShardId};
@@ -77,6 +78,12 @@ impl LocalEntityContext {
 }
 
 /// Local route that starts sharded entity actors on demand.
+///
+/// Each entity occupies one slot that is either active or stopping. Delivery, the
+/// decision to stop an incarnation, and the stop itself all run under the slot
+/// registry lock, so a message can never be queued behind a stop the route
+/// initiated: a message that arrives while an incarnation stops is held, bounded by
+/// the configured mailbox capacity, and delivered in order to the next incarnation.
 pub struct LocalEntityRoute<M, A, F>
 where
     M: Message,
@@ -87,34 +94,58 @@ where
     system: ActorSystem,
     actor_options: ActorOptions,
     factory: Arc<F>,
-    actors: Arc<Mutex<BTreeMap<EntityId, LocalEntityHandle<M>>>>,
+    actors: Arc<Mutex<SlotRegistry<M>>>,
     shard_states: Arc<Mutex<BTreeMap<ShardId, ShardHandoffState>>>,
-    next_idle_token: Arc<AtomicU64>,
     idle_passivation_timeout: Option<Duration>,
     activation_observer: Option<ActivationObserver>,
     _actor: PhantomData<fn() -> A>,
 }
 
-struct LocalEntityHandle<M>
+type SlotRegistry<M> = BTreeMap<EntityId, LocalEntitySlot<M>>;
+
+enum LocalEntitySlot<M>
 where
     M: Message,
 {
-    shard_id: ShardId,
-    actor_ref: ActorRef<M>,
-    idle_token: u64,
+    Active {
+        context: LocalEntityContext,
+        actor_ref: ActorRef<M>,
+        idle_deadline: Option<Instant>,
+    },
+    Stopping {
+        context: LocalEntityContext,
+        actor_ref: ActorRef<M>,
+        held: VecDeque<M>,
+        reactivate: bool,
+    },
 }
 
-impl<M> Clone for LocalEntityHandle<M>
+impl<M> LocalEntitySlot<M>
 where
     M: Message,
 {
-    fn clone(&self) -> Self {
-        Self {
-            shard_id: self.shard_id,
-            actor_ref: self.actor_ref.clone(),
-            idle_token: self.idle_token,
+    fn context(&self) -> &LocalEntityContext {
+        match self {
+            Self::Active { context, .. } | Self::Stopping { context, .. } => context,
         }
     }
+
+    fn is_terminated_active(&self) -> bool {
+        matches!(self, Self::Active { actor_ref, .. } if actor_ref.is_terminated())
+    }
+}
+
+/// Outcome of asking the route to stop one incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassivationOutcome {
+    /// The incarnation was told to stop and its slot now holds messages for the next one.
+    Stopping,
+    /// The incarnation was already stopping.
+    AlreadyStopping,
+    /// No live incarnation was registered.
+    Absent,
+    /// The stop could not be queued (mailbox full); the incarnation stays active.
+    Abandoned,
 }
 
 impl<M, A, F> LocalEntityRoute<M, A, F>
@@ -133,7 +164,6 @@ where
             factory: Arc::new(factory),
             actors: Arc::new(Mutex::new(BTreeMap::new())),
             shard_states: Arc::new(Mutex::new(BTreeMap::new())),
-            next_idle_token: Arc::new(AtomicU64::new(1)),
             idle_passivation_timeout: None,
             activation_observer: None,
             _actor: PhantomData,
@@ -176,50 +206,105 @@ where
         self.idle_passivation_timeout
     }
 
-    /// Number of currently cached local entity actors.
+    /// Number of active local entity incarnations.
+    ///
+    /// An incarnation that is stopping is not counted: it takes no further
+    /// messages itself, and its slot only holds messages for the next incarnation.
     #[must_use]
     pub fn entity_count(&self) -> usize {
         let _removed = self.reap_terminated_entities();
-        let actors = self
-            .actors
-            .lock()
-            .expect("local entity registry mutex poisoned");
-        actors.len()
+        self.lock_actors()
+            .values()
+            .filter(|slot| matches!(slot, LocalEntitySlot::Active { .. }))
+            .count()
     }
 
-    /// Returns a cached local entity actor ref.
+    /// Returns the actor ref of an active local entity.
     #[must_use]
     pub fn entity_actor(&self, entity_id: &EntityId) -> Option<ActorRef<M>> {
-        self.remove_terminated_entity(entity_id);
-        let actors = self
-            .actors
-            .lock()
-            .expect("local entity registry mutex poisoned");
-        actors.get(entity_id).map(|handle| handle.actor_ref.clone())
+        let mut actors = self.lock_actors();
+        remove_if_terminated_active(&mut actors, entity_id);
+        match actors.get(entity_id) {
+            Some(LocalEntitySlot::Active { actor_ref, .. }) => Some(actor_ref.clone()),
+            _ => None,
+        }
     }
 
-    /// Removes terminated entity actors from the local registry.
+    /// Removes active entity slots whose actor has terminated on its own.
+    ///
+    /// A stopping slot belongs to its stop watcher and is left alone.
     #[must_use]
     pub fn reap_terminated_entities(&self) -> usize {
-        let mut actors = self
-            .actors
-            .lock()
-            .expect("local entity registry mutex poisoned");
+        let mut actors = self.lock_actors();
         let before = actors.len();
-        actors.retain(|_entity_id, handle| !handle.actor_ref.is_terminated());
+        actors.retain(|_entity_id, slot| !slot.is_terminated_active());
         before - actors.len()
     }
 
     /// Explicitly passivates one local entity actor.
+    ///
+    /// Returns true when the entity is now stopping or was already stopping.
     #[must_use]
     pub fn passivate_entity(&self, entity_id: &EntityId) -> bool {
-        passivate_entity_in(&self.actors, entity_id)
+        self.passivate_entity_with(entity_id, None)
     }
 
-    /// Explicitly passivates every local entity actor in a shard.
+    /// Explicitly passivates one local entity actor, queueing `stop_message` ahead of
+    /// the stop in the same critical section.
+    ///
+    /// Returns true when the entity is now stopping or was already stopping. Returns
+    /// false when no live incarnation exists or when the stop could not be queued
+    /// because the mailbox is full; in that case the entity stays active and a later
+    /// passivation delivers the stop message again, so stop messages must be
+    /// idempotent.
+    #[must_use]
+    pub fn passivate_entity_with(&self, entity_id: &EntityId, stop_message: Option<M>) -> bool {
+        let mut actors = self.lock_actors();
+        matches!(
+            self.passivate_slot(&mut actors, entity_id, stop_message),
+            PassivationOutcome::Stopping | PassivationOutcome::AlreadyStopping
+        )
+    }
+
+    /// Explicitly passivates every active local entity actor in a shard.
+    ///
+    /// Messages held for a stopping entity of that shard are dropped with a warning:
+    /// the shard has left this node, so its next incarnation must not start here.
     #[must_use]
     pub fn passivate_shard(&self, shard_id: ShardId) -> usize {
-        passivate_shard_in(&self.actors, shard_id)
+        let mut actors = self.lock_actors();
+        let entity_ids = actors
+            .iter()
+            .filter(|(_entity_id, slot)| slot.context().shard_id() == shard_id)
+            .map(|(entity_id, _slot)| entity_id.clone())
+            .collect::<Vec<_>>();
+        let mut passivated = 0;
+
+        for entity_id in entity_ids {
+            match actors.get_mut(&entity_id) {
+                Some(LocalEntitySlot::Stopping {
+                    context,
+                    held,
+                    reactivate,
+                    ..
+                }) => {
+                    if !held.is_empty() {
+                        warn_dropped(context, held.len(), "shard left this node");
+                    }
+                    held.clear();
+                    *reactivate = false;
+                }
+                _ => {
+                    if self.passivate_slot(&mut actors, &entity_id, None)
+                        == PassivationOutcome::Stopping
+                    {
+                        passivated += 1;
+                    }
+                }
+            }
+        }
+
+        passivated
     }
 
     /// Current handoff state for a shard.
@@ -257,64 +342,291 @@ where
         0
     }
 
-    fn actor_for(
-        &self,
-        entity_type: &EntityType,
-        entity_id: &EntityId,
-        shard_id: ShardId,
-    ) -> Result<ActorRef<M>, EntityDeliveryFailure> {
-        self.ensure_shard_accepts_delivery(shard_id)?;
-        self.remove_terminated_entity(entity_id);
-
-        let mut actors = self
-            .actors
+    fn lock_actors(&self) -> std::sync::MutexGuard<'_, SlotRegistry<M>> {
+        self.actors
             .lock()
-            .expect("local entity registry mutex poisoned");
+            .expect("local entity registry mutex poisoned")
+    }
 
-        if let Some(actor_ref) = actors
-            .get(entity_id)
-            .filter(|handle| !handle.actor_ref.is_terminated())
-            .map(|handle| handle.actor_ref.clone())
-        {
-            drop(actors);
-            self.observe_activation(LocalEntityContext::new(
-                self.local_node_id.clone(),
-                entity_type.clone(),
-                entity_id.clone(),
-                shard_id,
-            ));
-            return Ok(actor_ref);
-        }
-
+    /// Delivers one routed message under the registry lock. Returns the context to
+    /// report to the activation observer once the lock is released.
+    fn deliver_locked(
+        &self,
+        actors: &mut SlotRegistry<M>,
+        message: RoutedEntityMessage<M>,
+    ) -> Result<Option<LocalEntityContext>, EntityTellError<M>> {
+        let entity_id = message.entity_id().clone();
         let context = LocalEntityContext::new(
             self.local_node_id.clone(),
-            entity_type.clone(),
+            message.entity_type().clone(),
             entity_id.clone(),
-            shard_id,
+            message.shard_id(),
         );
-        let actor_name = context.actor_name().to_string();
+
+        match actors.get_mut(&entity_id) {
+            Some(LocalEntitySlot::Active { actor_ref, .. }) if !actor_ref.is_terminated() => {
+                let actor_ref = actor_ref.clone();
+                if actor_ref.is_stopping() {
+                    self.hold_behind_self_stop(actors, &entity_id, message.into_message());
+                    return Ok(None);
+                }
+                match actor_ref.tell(message.into_message()) {
+                    Ok(()) => {
+                        self.note_delivery(actors, &entity_id);
+                        Ok(Some(context))
+                    }
+                    Err(TellError::Full(message)) => Err(EntityTellError::Delivery {
+                        message,
+                        failure: EntityDeliveryFailure::MailboxFull,
+                    }),
+                    Err(TellError::Closed(message)) if actor_ref.is_terminated() => {
+                        actors.remove(&entity_id);
+                        self.activate_and_deliver(actors, context, VecDeque::new(), message)
+                    }
+                    Err(TellError::Closed(message)) => {
+                        self.hold_behind_self_stop(actors, &entity_id, message);
+                        Ok(None)
+                    }
+                }
+            }
+            Some(LocalEntitySlot::Stopping {
+                actor_ref, held, ..
+            }) if !actor_ref.is_terminated() => {
+                if held.len() < self.actor_options.mailbox_capacity {
+                    held.push_back(message.into_message());
+                    Ok(None)
+                } else {
+                    Err(EntityTellError::Delivery {
+                        message: message.into_message(),
+                        failure: EntityDeliveryFailure::MailboxFull,
+                    })
+                }
+            }
+            Some(LocalEntitySlot::Stopping { .. }) => {
+                // The watcher has not run yet; resolve the stop inline.
+                let Some(LocalEntitySlot::Stopping { held, .. }) = actors.remove(&entity_id) else {
+                    unreachable!("slot checked above")
+                };
+                self.activate_and_deliver(actors, context, held, message.into_message())
+            }
+            _ => {
+                actors.remove(&entity_id);
+                self.activate_and_deliver(actors, context, VecDeque::new(), message.into_message())
+            }
+        }
+    }
+
+    /// Converts an active slot whose actor is stopping on its own into a stopping slot
+    /// holding `message`, and starts the stop watcher.
+    fn hold_behind_self_stop(
+        &self,
+        actors: &mut SlotRegistry<M>,
+        entity_id: &EntityId,
+        message: M,
+    ) {
+        let Some(LocalEntitySlot::Active {
+            context, actor_ref, ..
+        }) = actors.remove(entity_id)
+        else {
+            unreachable!("caller holds an active slot")
+        };
+        let mut held = VecDeque::new();
+        held.push_back(message);
+        actors.insert(
+            entity_id.clone(),
+            LocalEntitySlot::Stopping {
+                context,
+                actor_ref: actor_ref.clone(),
+                held,
+                reactivate: false,
+            },
+        );
+        self.spawn_stop_watcher(entity_id.clone(), actor_ref);
+    }
+
+    /// Spawns the next incarnation, drains `held` into it in order, then delivers
+    /// `message`. The slot is registered active on success.
+    fn activate_and_deliver(
+        &self,
+        actors: &mut SlotRegistry<M>,
+        context: LocalEntityContext,
+        held: VecDeque<M>,
+        message: M,
+    ) -> Result<Option<LocalEntityContext>, EntityTellError<M>> {
+        let actor_ref = match self.activate_slot(actors, context.clone(), held) {
+            Ok(actor_ref) => actor_ref,
+            Err(failure) => {
+                return Err(EntityTellError::Delivery { message, failure });
+            }
+        };
+        match actor_ref.tell(message) {
+            Ok(()) => {
+                self.note_delivery(actors, context.entity_id());
+                Ok(Some(context))
+            }
+            Err(TellError::Full(message)) => Err(EntityTellError::Delivery {
+                message,
+                failure: EntityDeliveryFailure::MailboxFull,
+            }),
+            Err(TellError::Closed(message)) => Err(EntityTellError::Delivery {
+                message,
+                failure: EntityDeliveryFailure::MailboxClosed,
+            }),
+        }
+    }
+
+    /// Spawns the next incarnation for `context`, drains `held` into it in order, and
+    /// registers the slot as active. On a spawn failure the held messages are dropped
+    /// with a warning and no slot is registered.
+    fn activate_slot(
+        &self,
+        actors: &mut SlotRegistry<M>,
+        context: LocalEntityContext,
+        held: VecDeque<M>,
+    ) -> Result<ActorRef<M>, EntityDeliveryFailure> {
+        let actor_ref = match self.spawn_incarnation(&context) {
+            Ok(actor_ref) => actor_ref,
+            Err(failure) => {
+                if !held.is_empty() {
+                    warn_dropped(
+                        &context,
+                        held.len(),
+                        "next incarnation could not be spawned",
+                    );
+                }
+                return Err(failure);
+            }
+        };
+        let total = held.len();
+        for (index, message) in held.into_iter().enumerate() {
+            if actor_ref.tell(message).is_err() {
+                warn_dropped(
+                    &context,
+                    total - index,
+                    "next incarnation stopped before taking held messages",
+                );
+                break;
+            }
+        }
+        let entity_id = context.entity_id().clone();
+        actors.insert(
+            entity_id.clone(),
+            LocalEntitySlot::Active {
+                context,
+                actor_ref: actor_ref.clone(),
+                idle_deadline: None,
+            },
+        );
+        if total > 0 {
+            self.note_delivery(actors, &entity_id);
+        }
+        Ok(actor_ref)
+    }
+
+    fn spawn_incarnation(
+        &self,
+        context: &LocalEntityContext,
+    ) -> Result<ActorRef<M>, EntityDeliveryFailure> {
         let context_for_factory = context.clone();
         let factory = self.factory.clone();
-        let actor_ref = self
-            .system
+        self.system
             .spawn_actor_with_options(
-                actor_name,
+                context.actor_name(),
                 move || factory(context_for_factory.clone()),
                 self.actor_options.clone(),
             )
-            .map_err(|error| EntityDeliveryFailure::SpawnFailed(error.to_string()))?;
+            .map_err(|error| EntityDeliveryFailure::SpawnFailed(error.to_string()))
+    }
 
+    /// Stops the incarnation in `entity_id`'s slot: queues `stop_message` (if any) and
+    /// then the stop, in one critical section, and starts the stop watcher.
+    fn passivate_slot(
+        &self,
+        actors: &mut SlotRegistry<M>,
+        entity_id: &EntityId,
+        stop_message: Option<M>,
+    ) -> PassivationOutcome {
+        let actor_ref = match actors.get(entity_id) {
+            None => return PassivationOutcome::Absent,
+            Some(LocalEntitySlot::Stopping { .. }) => return PassivationOutcome::AlreadyStopping,
+            Some(LocalEntitySlot::Active { actor_ref, .. }) => {
+                if actor_ref.is_terminated() {
+                    actors.remove(entity_id);
+                    return PassivationOutcome::Absent;
+                }
+                actor_ref.clone()
+            }
+        };
+
+        if let Some(stop_message) = stop_message {
+            match actor_ref.tell(stop_message) {
+                Ok(()) | Err(TellError::Closed(_)) => {}
+                Err(TellError::Full(_)) => return PassivationOutcome::Abandoned,
+            }
+        }
+        match actor_ref.stop() {
+            Ok(()) | Err(StopError::MailboxClosed) => {}
+            Err(StopError::MailboxFull) => return PassivationOutcome::Abandoned,
+        }
+
+        let Some(LocalEntitySlot::Active { context, .. }) = actors.remove(entity_id) else {
+            unreachable!("slot checked above")
+        };
         actors.insert(
             entity_id.clone(),
-            LocalEntityHandle {
-                shard_id,
+            LocalEntitySlot::Stopping {
+                context,
                 actor_ref: actor_ref.clone(),
-                idle_token: self.next_idle_token(),
+                held: VecDeque::new(),
+                reactivate: false,
             },
         );
-        drop(actors);
-        self.observe_activation(context);
-        Ok(actor_ref)
+        self.spawn_stop_watcher(entity_id.clone(), actor_ref);
+        PassivationOutcome::Stopping
+    }
+
+    fn spawn_stop_watcher(&self, entity_id: EntityId, actor_ref: ActorRef<M>) {
+        let route = self.clone();
+        tokio::spawn(async move {
+            let uid = actor_ref.uid();
+            let _terminated = actor_ref.when_terminated().await;
+            route.on_incarnation_stopped(&entity_id, uid);
+        });
+    }
+
+    /// Runs once the stopping incarnation `uid` has terminated: spawns the next
+    /// incarnation when messages were held or a replay asked for it, otherwise
+    /// removes the slot.
+    fn on_incarnation_stopped(&self, entity_id: &EntityId, uid: ActorUid) {
+        let activated = {
+            let mut actors = self.lock_actors();
+            let ours = matches!(
+                actors.get(entity_id),
+                Some(LocalEntitySlot::Stopping { actor_ref, .. }) if actor_ref.uid() == uid
+            );
+            if !ours {
+                return;
+            }
+            let Some(LocalEntitySlot::Stopping {
+                context,
+                held,
+                reactivate,
+                ..
+            }) = actors.remove(entity_id)
+            else {
+                unreachable!("slot checked above")
+            };
+            if held.is_empty() && !reactivate {
+                None
+            } else {
+                self.activate_slot(&mut actors, context.clone(), held)
+                    .ok()
+                    .map(|_actor_ref| context)
+            }
+        };
+        if let Some(context) = activated {
+            self.observe_activation(context);
+        }
     }
 
     fn activate_existing_or_spawn(
@@ -323,14 +635,56 @@ where
         entity_id: &EntityId,
         shard_id: ShardId,
     ) -> crate::ShardingResult<bool> {
-        self.actor_for(entity_type, entity_id, shard_id)
-            .map(|_actor_ref| true)
-            .map_err(|failure| crate::ShardingError::RememberedEntityReplay {
+        let replay_error =
+            |failure: EntityDeliveryFailure| crate::ShardingError::RememberedEntityReplay {
                 entity_type: entity_type.clone(),
                 entity_id: entity_id.clone(),
                 shard_id,
                 message: failure.to_string(),
-            })
+            };
+        let context = LocalEntityContext::new(
+            self.local_node_id.clone(),
+            entity_type.clone(),
+            entity_id.clone(),
+            shard_id,
+        );
+        let observed = {
+            let mut actors = self.lock_actors();
+            self.ensure_shard_accepts_delivery(shard_id)
+                .map_err(replay_error)?;
+            match actors.get_mut(entity_id) {
+                Some(LocalEntitySlot::Active { actor_ref, .. }) if !actor_ref.is_terminated() => {
+                    Some(context)
+                }
+                Some(LocalEntitySlot::Stopping {
+                    actor_ref,
+                    reactivate,
+                    ..
+                }) if !actor_ref.is_terminated() => {
+                    *reactivate = true;
+                    None
+                }
+                Some(LocalEntitySlot::Stopping { .. }) => {
+                    let Some(LocalEntitySlot::Stopping { held, .. }) = actors.remove(entity_id)
+                    else {
+                        unreachable!("slot checked above")
+                    };
+                    self.activate_slot(&mut actors, context.clone(), held)
+                        .map_err(replay_error)?;
+                    Some(context)
+                }
+                _ => {
+                    actors.remove(entity_id);
+                    self.activate_slot(&mut actors, context.clone(), VecDeque::new())
+                        .map_err(replay_error)?;
+                    Some(context)
+                }
+            }
+        };
+        if let Some(context) = observed {
+            self.observe_activation(context);
+        }
+        Ok(true)
     }
 
     fn set_shard_state(&self, shard_id: ShardId, state: ShardHandoffState) {
@@ -352,51 +706,52 @@ where
         }
     }
 
-    fn schedule_idle_passivation(&self, entity_id: EntityId) {
+    /// Records a delivery to an active slot: moves its idle deadline and arms a sleeper.
+    fn note_delivery(&self, actors: &mut SlotRegistry<M>, entity_id: &EntityId) {
         let Some(timeout) = self.idle_passivation_timeout else {
             return;
         };
-        let idle_token = {
-            let mut actors = self
-                .actors
-                .lock()
-                .expect("local entity registry mutex poisoned");
-            let Some(handle) = actors
-                .get_mut(&entity_id)
-                .filter(|handle| !handle.actor_ref.is_terminated())
-            else {
-                return;
-            };
-            let idle_token = self.next_idle_token();
-            handle.idle_token = idle_token;
-            idle_token
+        let Some(LocalEntitySlot::Active {
+            actor_ref,
+            idle_deadline,
+            ..
+        }) = actors.get_mut(entity_id)
+        else {
+            return;
         };
-        let actors = self.actors.clone();
+        let deadline = Instant::now() + timeout;
+        *idle_deadline = Some(deadline);
+        self.spawn_idle_sleeper(entity_id.clone(), actor_ref.uid(), deadline);
+    }
 
+    fn spawn_idle_sleeper(&self, entity_id: EntityId, uid: ActorUid, deadline: Instant) {
+        let route = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(timeout).await;
-            passivate_entity_if_idle(&actors, &entity_id, idle_token);
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            route.passivate_if_idle(&entity_id, uid, deadline);
         });
     }
 
-    fn remove_terminated_entity(&self, entity_id: &EntityId) -> bool {
-        let mut actors = self
-            .actors
-            .lock()
-            .expect("local entity registry mutex poisoned");
-        if actors
-            .get(entity_id)
-            .is_some_and(|handle| handle.actor_ref.is_terminated())
-        {
-            actors.remove(entity_id);
-            true
-        } else {
-            false
+    fn passivate_if_idle(&self, entity_id: &EntityId, uid: ActorUid, deadline: Instant) {
+        let Some(timeout) = self.idle_passivation_timeout else {
+            return;
+        };
+        let mut actors = self.lock_actors();
+        let due = matches!(
+            actors.get(entity_id),
+            Some(LocalEntitySlot::Active { actor_ref, idle_deadline, .. })
+                if actor_ref.uid() == uid && *idle_deadline == Some(deadline)
+        );
+        if !due {
+            return;
         }
-    }
-
-    fn next_idle_token(&self) -> u64 {
-        self.next_idle_token.fetch_add(1, Ordering::Relaxed)
+        if self.passivate_slot(&mut actors, entity_id, None) == PassivationOutcome::Abandoned {
+            let next = Instant::now() + timeout;
+            if let Some(LocalEntitySlot::Active { idle_deadline, .. }) = actors.get_mut(entity_id) {
+                *idle_deadline = Some(next);
+            }
+            self.spawn_idle_sleeper(entity_id.clone(), uid, next);
+        }
     }
 
     fn observe_activation(&self, context: LocalEntityContext) {
@@ -404,6 +759,29 @@ where
             observer(context);
         }
     }
+}
+
+fn remove_if_terminated_active<M>(actors: &mut SlotRegistry<M>, entity_id: &EntityId)
+where
+    M: Message,
+{
+    if actors
+        .get(entity_id)
+        .is_some_and(LocalEntitySlot::is_terminated_active)
+    {
+        actors.remove(entity_id);
+    }
+}
+
+fn warn_dropped(context: &LocalEntityContext, dropped: usize, reason: &str) {
+    tracing::warn!(
+        entity_type = %context.entity_type(),
+        entity_id = %context.entity_id(),
+        shard_id = context.shard_id().as_u32(),
+        dropped,
+        reason,
+        "held entity messages dropped"
+    );
 }
 
 impl<M, A, F> Clone for LocalEntityRoute<M, A, F>
@@ -420,7 +798,6 @@ where
             factory: self.factory.clone(),
             actors: self.actors.clone(),
             shard_states: self.shard_states.clone(),
-            next_idle_token: self.next_idle_token.clone(),
             idle_passivation_timeout: self.idle_passivation_timeout,
             activation_observer: self.activation_observer.clone(),
             _actor: PhantomData,
@@ -458,34 +835,21 @@ where
             });
         }
 
-        let actor_ref = match self.actor_for(
-            message.entity_type(),
-            message.entity_id(),
-            message.shard_id(),
-        ) {
-            Ok(actor_ref) => actor_ref,
-            Err(failure) => {
+        let observed = {
+            let mut actors = self.lock_actors();
+            // Checked under the registry lock so a delivery cannot slip past a shard
+            // transfer that already stopped this shard's entities.
+            if let Err(failure) = self.ensure_shard_accepts_delivery(message.shard_id()) {
                 return Err(EntityTellError::Delivery {
                     message: message.into_message(),
                     failure,
                 });
             }
+            self.deliver_locked(&mut actors, message)?
         };
-
-        let entity_id = message.entity_id().clone();
-        actor_ref
-            .tell(message.into_message())
-            .map_err(|error| match error {
-                TellError::Full(message) => EntityTellError::Delivery {
-                    message,
-                    failure: EntityDeliveryFailure::MailboxFull,
-                },
-                TellError::Closed(message) => EntityTellError::Delivery {
-                    message,
-                    failure: EntityDeliveryFailure::MailboxClosed,
-                },
-            })?;
-        self.schedule_idle_passivation(entity_id);
+        if let Some(context) = observed {
+            self.observe_activation(context);
+        }
         Ok(())
     }
 
@@ -516,78 +880,6 @@ where
 
     fn shard_handoff_state(&self, shard_id: ShardId) -> Option<ShardHandoffState> {
         Some(LocalEntityRoute::shard_handoff_state(self, shard_id))
-    }
-}
-
-fn passivate_entity_in<M>(
-    actors: &Arc<Mutex<BTreeMap<EntityId, LocalEntityHandle<M>>>>,
-    entity_id: &EntityId,
-) -> bool
-where
-    M: Message,
-{
-    let handle = actors
-        .lock()
-        .expect("local entity registry mutex poisoned")
-        .remove(entity_id);
-
-    if let Some(handle) = handle {
-        let _ = handle.actor_ref.stop();
-        true
-    } else {
-        false
-    }
-}
-
-fn passivate_shard_in<M>(
-    actors: &Arc<Mutex<BTreeMap<EntityId, LocalEntityHandle<M>>>>,
-    shard_id: ShardId,
-) -> usize
-where
-    M: Message,
-{
-    let mut actors = actors.lock().expect("local entity registry mutex poisoned");
-    let entity_ids = actors
-        .iter()
-        .filter(|(_entity_id, handle)| handle.shard_id == shard_id)
-        .map(|(entity_id, _handle)| entity_id.clone())
-        .collect::<Vec<_>>();
-    let mut passivated = 0;
-
-    for entity_id in entity_ids {
-        if let Some(handle) = actors.remove(&entity_id) {
-            let _ = handle.actor_ref.stop();
-            passivated += 1;
-        }
-    }
-
-    passivated
-}
-
-fn passivate_entity_if_idle<M>(
-    actors: &Arc<Mutex<BTreeMap<EntityId, LocalEntityHandle<M>>>>,
-    entity_id: &EntityId,
-    idle_token: u64,
-) -> bool
-where
-    M: Message,
-{
-    let handle = {
-        let mut actors = actors.lock().expect("local entity registry mutex poisoned");
-        if actors.get(entity_id).is_some_and(|handle| {
-            handle.idle_token == idle_token && !handle.actor_ref.is_terminated()
-        }) {
-            actors.remove(entity_id)
-        } else {
-            None
-        }
-    };
-
-    if let Some(handle) = handle {
-        let _ = handle.actor_ref.stop();
-        true
-    } else {
-        false
     }
 }
 
