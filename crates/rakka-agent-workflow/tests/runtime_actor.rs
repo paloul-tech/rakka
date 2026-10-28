@@ -1,6 +1,7 @@
 //! Actor-backed agent run runtime tests.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,17 +12,21 @@ use rakka_agent_workflow::{
     AgentCompiledPlanId, AgentCompiledPlanNode, AgentCompiledPlanPort, AgentCompiledPortDirection,
     AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
     AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget,
-    AgentGraphEffectScheduleRequest, AgentGraphNodeStatus, AgentGraphRunProjection,
-    AgentGraphRuntimeEffectOutcome, AgentGraphRuntimeTransition, AgentGraphWaitReason,
-    AgentIdempotencyKey, AgentInboxDuplicateReason, AgentPayloadDescriptor, AgentRunActor,
-    AgentRunActorCommand, AgentRunActorSnapshot, AgentRunId, AgentRunState, AgentRunStatus,
-    AgentRunTransition, AgentRunTransitionKind, AgentStatePayload, AgentStep, AgentStepId,
-    AgentStepKind, AgentStepSuccess, AgentTenantId, AgentTimestampMillis, AgentWorkflow,
-    AgentWorkflowId, InlineState, StateSchemaVersion, WorkflowDefinitionVersion,
+    AgentGraphEffectBridgeError, AgentGraphEffectScheduleRequest, AgentGraphNodeStatus,
+    AgentGraphRunProjection, AgentGraphRuntimeEffectOutcome, AgentGraphRuntimeTransition,
+    AgentGraphWaitReason, AgentIdempotencyKey, AgentInboxDuplicateReason, AgentPayloadDescriptor,
+    AgentRunActor, AgentRunActorCommand, AgentRunActorSnapshot, AgentRunEngineError, AgentRunId,
+    AgentRunRuntimeError, AgentRunState, AgentRunStatus, AgentRunTransition,
+    AgentRunTransitionKind, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
+    AgentStepSuccess, AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
+    InlineState, StateSchemaVersion, WorkflowDefinitionVersion,
     CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 use rakka_core::{ActorRef, ActorSystem, InMemoryMetricsRecorder, Message};
-use rakka_persistence::InMemoryDurableStateStore;
+use rakka_persistence::{
+    DurableError, DurableStateStore, InMemoryDurableStateStore, PersistenceId, Revision,
+    StateRecord, StoreFuture,
+};
 use rakka_workflow::{ManualWorkflowClock, WorkflowState, WorkflowTimestamp};
 
 type RunStore = InMemoryDurableStateStore<AgentRunState>;
@@ -416,6 +421,389 @@ async fn actor_restart_after_graph_effect_scheduled_recovers_graph_and_due_effec
     assert_eq!(node_status(graph, "effect"), AgentGraphNodeStatus::Waiting);
 
     system.terminate().await.expect("system should terminate");
+}
+
+/// Run store whose loads fail while `fail_loads` is set, so a test can hold a stale
+/// actor's recovery down and then let it through.
+#[derive(Clone)]
+struct FailingRunStore {
+    inner: RunStore,
+    fail_loads: Arc<AtomicBool>,
+}
+
+impl DurableStateStore<AgentRunState> for FailingRunStore {
+    fn backend_name(&self) -> &'static str {
+        "failing-memory"
+    }
+
+    fn load<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+    ) -> StoreFuture<'a, Option<StateRecord<AgentRunState>>> {
+        if self.fail_loads.load(Ordering::SeqCst) {
+            return Box::pin(async {
+                Err(DurableError::store(
+                    "failing-memory",
+                    "load failure injected",
+                ))
+            });
+        }
+        self.inner.load(persistence_id)
+    }
+
+    fn compare_and_set<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        expected_revision: Revision,
+        state: AgentRunState,
+    ) -> StoreFuture<'a, StateRecord<AgentRunState>> {
+        self.inner
+            .compare_and_set(persistence_id, expected_revision, state)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        expected_revision: Revision,
+    ) -> StoreFuture<'a, Revision> {
+        self.inner.delete(persistence_id, expected_revision)
+    }
+}
+
+fn is_revision_conflict(error: &AgentRunRuntimeError) -> bool {
+    matches!(
+        error,
+        AgentRunRuntimeError::RunEngine {
+            error: AgentRunEngineError::Persistence {
+                error: DurableError::RevisionConflict { .. },
+                ..
+            },
+        }
+    )
+}
+
+fn is_store_failure(error: &AgentRunRuntimeError) -> bool {
+    matches!(
+        error,
+        AgentRunRuntimeError::RunEngine {
+            error: AgentRunEngineError::Persistence {
+                error: DurableError::Store { .. },
+                ..
+            },
+        }
+    )
+}
+
+async fn ask_begin_step(
+    actor: &TestActorRef,
+    now: AgentTimestampMillis,
+) -> Result<AgentRunTransition, AgentRunRuntimeError> {
+    actor
+        .ask(
+            |reply_to| AgentRunActorCommand::BeginStep { now, reply_to },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("begin step ask should reply")
+}
+
+async fn ask_succeed_step(
+    actor: &TestActorRef,
+    success: AgentStepSuccess,
+    now: AgentTimestampMillis,
+) -> Result<AgentRunTransition, AgentRunRuntimeError> {
+    actor
+        .ask(
+            |reply_to| AgentRunActorCommand::SucceedStep {
+                success,
+                now,
+                reply_to,
+            },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("succeed step ask should reply")
+}
+
+async fn ask_fail_run(
+    actor: &TestActorRef,
+    error_code: &str,
+    now: AgentTimestampMillis,
+) -> Result<AgentRunTransition, AgentRunRuntimeError> {
+    actor
+        .ask(
+            |reply_to| AgentRunActorCommand::FailRun {
+                error_code: error_code.to_string(),
+                now,
+                reply_to,
+            },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("fail run ask should reply")
+}
+
+async fn ask_schedule_graph_effect(
+    actor: &TestActorRef,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    request: AgentGraphEffectScheduleRequest,
+) -> Result<AgentGraphRuntimeEffectOutcome, AgentRunRuntimeError> {
+    actor
+        .ask(
+            |reply_to| AgentRunActorCommand::ScheduleGraphNodeEffect {
+                plan,
+                request,
+                reply_to,
+            },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("schedule graph effect ask should reply")
+}
+
+async fn ask_due_effects(
+    actor: &TestActorRef,
+) -> Result<Vec<rakka_agent_workflow::AgentDueEffect>, AgentRunRuntimeError> {
+    actor
+        .ask(
+            |reply_to| AgentRunActorCommand::DueEffects { reply_to },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("due effects ask should reply")
+}
+
+fn advance_to_review() -> AgentStepSuccess {
+    AgentStepSuccess::advance(AgentStepId::new("review"), inline_payload("ready"))
+}
+
+/// Two actors over one store. `a` starts and begins the run; `b` recovered the
+/// run at revision 1 and then loses its own `BeginStep` to `a`'s, which leaves
+/// `b` with a stale cached record.
+async fn two_actors_with_lost_begin(
+    system: &ActorSystem,
+    fixture: &RuntimeFixture,
+    run_id: &AgentRunId,
+) -> (TestActorRef, TestActorRef) {
+    let a = spawn_actor(system, "stale-a", fixture, run_id.clone());
+    start(
+        &a,
+        accepted_run_state(&fixture.workflow, run_id, AgentStepId::new("plan")),
+    )
+    .await;
+
+    let b = spawn_actor(system, "stale-b", fixture, run_id.clone());
+    let synced = snapshot(&b).await.run_state.expect("b recovered the run");
+    assert_eq!(synced.status, AgentRunStatus::Accepted);
+
+    let began = begin_step(&a, AgentTimestampMillis::new(200)).await;
+    assert_eq!(began.revision, Revision::new(2));
+
+    let refused = ask_begin_step(&b, AgentTimestampMillis::new(210))
+        .await
+        .expect_err("b's begin step should lose the compare-and-set");
+    assert!(is_revision_conflict(&refused), "{refused:?}");
+    (a, b)
+}
+
+#[tokio::test]
+async fn actor_recovers_from_lost_compare_and_set_before_next_command() {
+    let system = ActorSystem::new("agent-runtime-stale-recover");
+    let fixture = RuntimeFixture::new(two_step_workflow());
+    let run_id = AgentRunId::new("run-stale-recover");
+    let (a, b) = two_actors_with_lost_begin(&system, &fixture, &run_id).await;
+
+    let fresh = snapshot(&b).await.run_state.expect("run state");
+    assert_eq!(fresh.status, AgentRunStatus::Running);
+    assert_eq!(fresh.current_attempt, 1);
+
+    let advanced = succeed_step(&b, advance_to_review(), AgentTimestampMillis::new(300)).await;
+    assert_eq!(advanced.revision, Revision::new(3));
+    assert_eq!(
+        advanced.state.current_step_id,
+        Some(AgentStepId::new("review"))
+    );
+
+    let refused = ask_begin_step(&a, AgentTimestampMillis::new(400))
+        .await
+        .expect_err("a's cached revision is now behind");
+    assert!(is_revision_conflict(&refused), "{refused:?}");
+    let retried = begin_step(&a, AgentTimestampMillis::new(410)).await;
+    assert_eq!(retried.revision, Revision::new(4));
+    assert_eq!(
+        retried.state.current_step_id,
+        Some(AgentStepId::new("review"))
+    );
+    assert_eq!(retried.state.current_attempt, 1);
+
+    system.terminate().await.expect("system should terminate");
+}
+
+#[tokio::test]
+async fn inbox_conflict_through_the_effect_bridge_recovers_before_next_command() {
+    let system = ActorSystem::new("agent-runtime-stale-bridge");
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-stale-bridge");
+    let plan = Arc::new(effect_graph_plan(&fixture.workflow));
+    let a = spawn_actor(&system, "bridge-a", &fixture, run_id.clone());
+    start_graph(
+        &a,
+        graph_accepted_run_state(&fixture.workflow, &run_id),
+        plan.clone(),
+        AgentTimestampMillis::new(100),
+    )
+    .await;
+    mark_graph_ready(&a, plan.clone(), AgentTimestampMillis::new(110)).await;
+    start_graph_node(&a, plan.clone(), "input", AgentTimestampMillis::new(120)).await;
+    complete_graph_node(&a, plan.clone(), "input", AgentTimestampMillis::new(130)).await;
+    mark_graph_ready(&a, plan.clone(), AgentTimestampMillis::new(140)).await;
+    start_graph_node(&a, plan.clone(), "effect", AgentTimestampMillis::new(150)).await;
+
+    let b = spawn_actor(&system, "bridge-b", &fixture, run_id.clone());
+    assert_eq!(snapshot(&b).await.due_effect_count, 0);
+
+    let scheduled = schedule_graph_effect(
+        &a,
+        plan.clone(),
+        effect_request(run_id.clone(), "effect", 160),
+    )
+    .await;
+    assert!(scheduled.effect_outcome.acceptance.is_scheduled());
+
+    let refused = ask_schedule_graph_effect(
+        &b,
+        plan.clone(),
+        effect_request(run_id.clone(), "effect", 161),
+    )
+    .await
+    .expect_err("b's outbox write should lose the compare-and-set");
+    assert!(
+        matches!(
+            &refused,
+            AgentRunRuntimeError::GraphEffectBridge {
+                error: AgentGraphEffectBridgeError::Outbox { .. }
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        refused.to_string().to_lowercase().contains("revision"),
+        "{refused}"
+    );
+
+    let due = ask_due_effects(&b)
+        .await
+        .expect("due effects should be read from the fresh record");
+    assert_eq!(due.len(), 1);
+    assert_eq!(
+        due[0].effect.effect_id,
+        AgentEffectId::new(
+            "graph-effect:run=run-stale-bridge;plan=sha256:runtime-effect-graph;node=effect;loop=root;kind=tool-call;target_class=tool"
+        )
+    );
+    assert_eq!(snapshot(&b).await.due_effect_count, 1);
+
+    system.terminate().await.expect("system should terminate");
+}
+
+#[tokio::test]
+async fn deadline_fail_run_succeeds_after_a_lost_compare_and_set() {
+    let system = ActorSystem::new("agent-runtime-stale-deadline");
+    let fixture = RuntimeFixture::new(two_step_workflow());
+    let run_id = AgentRunId::new("run-stale-deadline");
+    let (_a, b) = two_actors_with_lost_begin(&system, &fixture, &run_id).await;
+
+    let failed = ask_fail_run(&b, "deadline", AgentTimestampMillis::new(300))
+        .await
+        .expect("the deadline's fail run should succeed after the refresh");
+    assert_eq!(failed.next_status, AgentRunStatus::Failed);
+    assert_eq!(failed.revision, Revision::new(3));
+
+    system.terminate().await.expect("system should terminate");
+}
+
+#[tokio::test]
+async fn failed_stale_recovery_keeps_refusing_until_the_store_recovers() {
+    let system = ActorSystem::new("agent-runtime-stale-store-failure");
+    let fixture = RuntimeFixture::new(two_step_workflow());
+    let run_id = AgentRunId::new("run-stale-store-failure");
+    let fail_loads = Arc::new(AtomicBool::new(false));
+    let failing_store = FailingRunStore {
+        inner: fixture.run_store.clone(),
+        fail_loads: fail_loads.clone(),
+    };
+
+    let a = spawn_actor(&system, "store-a", &fixture, run_id.clone());
+    start(
+        &a,
+        accepted_run_state(&fixture.workflow, &run_id, AgentStepId::new("plan")),
+    )
+    .await;
+    let b: TestActorRef = system
+        .spawn(
+            "store-b",
+            AgentRunActor::with_clock_and_metrics(
+                fixture.workflow.clone(),
+                run_id.clone(),
+                failing_store,
+                fixture.workflow_store.clone(),
+                fixture.clock.clone(),
+                fixture.metrics.clone(),
+            ),
+        )
+        .expect("agent run actor over the failing store should spawn");
+    assert_eq!(
+        snapshot(&b).await.run_state.expect("b recovered").status,
+        AgentRunStatus::Accepted
+    );
+    begin_step(&a, AgentTimestampMillis::new(200)).await;
+    let refused = ask_begin_step(&b, AgentTimestampMillis::new(210))
+        .await
+        .expect_err("b's begin step should lose the compare-and-set");
+    assert!(is_revision_conflict(&refused), "{refused:?}");
+
+    fail_loads.store(true, Ordering::SeqCst);
+    for attempt in 0..2 {
+        let failed = ask_succeed_step(&b, advance_to_review(), AgentTimestampMillis::new(300))
+            .await
+            .expect_err("recovery fails while the store is down");
+        assert!(is_store_failure(&failed), "attempt {attempt}: {failed:?}");
+    }
+
+    fail_loads.store(false, Ordering::SeqCst);
+    let advanced = succeed_step(&b, advance_to_review(), AgentTimestampMillis::new(320)).await;
+    assert_eq!(advanced.revision, Revision::new(3));
+    assert_eq!(
+        advanced.state.current_step_id,
+        Some(AgentStepId::new("review"))
+    );
+
+    system.terminate().await.expect("system should terminate");
+}
+
+fn two_step_workflow() -> AgentWorkflow {
+    let mut workflow = workflow();
+    workflow.steps = vec![
+        AgentStep {
+            step_id: AgentStepId::new("plan"),
+            kind: AgentStepKind::Planner,
+            display_name: Some("Plan".to_string()),
+            next_step_ids: vec![AgentStepId::new("review")],
+            timeout_ms: Some(1_000),
+            config_ref: None,
+            observability_labels: BTreeMap::new(),
+        },
+        AgentStep {
+            step_id: AgentStepId::new("review"),
+            kind: AgentStepKind::Planner,
+            display_name: Some("Review".to_string()),
+            next_step_ids: Vec::new(),
+            timeout_ms: Some(1_000),
+            config_ref: None,
+            observability_labels: BTreeMap::new(),
+        },
+    ];
+    workflow
 }
 
 fn spawn_actor(

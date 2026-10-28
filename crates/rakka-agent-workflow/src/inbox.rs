@@ -287,6 +287,13 @@ where
         self.inbox.recover().await.map_err(AgentInboxError::from)
     }
 
+    /// Returns true once the wrapped inbox lost a compare-and-set, until
+    /// [`AgentRunInbox::recover`] reloads its record.
+    #[must_use]
+    pub const fn is_stale(&self) -> bool {
+        self.inbox.is_stale()
+    }
+
     /// Accepts a first-class agent command into the durable inbox.
     ///
     /// The returned [`AgentInboxAcceptance::Accepted`] value is produced only

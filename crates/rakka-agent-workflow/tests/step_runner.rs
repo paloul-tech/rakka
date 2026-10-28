@@ -9,7 +9,7 @@ use rakka_agent_workflow::{
     AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, HumanCheckpointId, InlineState,
     StateSchemaVersion, WorkflowDefinitionVersion,
 };
-use rakka_persistence::{DurableStateStore, InMemoryDurableStateStore, Revision};
+use rakka_persistence::{DurableError, DurableStateStore, InMemoryDurableStateStore, Revision};
 
 type TestStore = InMemoryDurableStateStore<AgentRunState>;
 
@@ -344,6 +344,108 @@ async fn invalid_transitions_fail_with_stable_error_codes() {
             .expect_err("unknown step should fail validation"),
         "unknown-step",
     );
+}
+
+#[tokio::test]
+async fn lost_compare_and_set_marks_runner_stale_and_recover_clears_it() {
+    let store = TestStore::new();
+    let workflow = two_step_workflow();
+    let run_id = AgentRunId::new("run-stale");
+    let mut runner_a = start_and_begin(workflow.clone(), run_id.clone(), store.clone()).await;
+    let mut runner_b = AgentStepRunner::new(workflow, run_id, store);
+    runner_b
+        .recover()
+        .await
+        .expect("second runner should recover the started run");
+    assert!(!runner_b.is_stale());
+
+    runner_a
+        .succeed_step(
+            AgentStepSuccess::advance(AgentStepId::new("review"), inline_payload("ready")),
+            ts(300),
+        )
+        .await
+        .expect("first writer should advance");
+
+    let error = runner_b
+        .succeed_step(
+            AgentStepSuccess::advance(AgentStepId::new("review"), inline_payload("ready")),
+            ts(300),
+        )
+        .await
+        .expect_err("stale writer should lose the compare-and-set");
+    assert!(
+        matches!(
+            &error,
+            AgentRunEngineError::Persistence {
+                error: DurableError::RevisionConflict { expected, actual, .. },
+                ..
+            } if *expected == Revision::new(2) && *actual == Revision::new(3)
+        ),
+        "{error:?}"
+    );
+    assert!(runner_b.is_stale());
+    assert!(!runner_a.is_stale());
+
+    runner_b
+        .recover()
+        .await
+        .expect("recovery after a lost compare-and-set should succeed");
+    assert!(!runner_b.is_stale());
+    let state = runner_b
+        .state()
+        .expect("recovered")
+        .expect("run state should be present");
+    assert_eq!(state.status, AgentRunStatus::Running);
+    assert_eq!(state.current_step_id, Some(AgentStepId::new("review")));
+
+    let began = runner_b
+        .begin_step(ts(400))
+        .await
+        .expect("recovered runner should continue from the fresh revision");
+    assert_eq!(began.revision, Revision::new(4));
+    assert_eq!(began.state.current_attempt, 1);
+}
+
+#[tokio::test]
+async fn lost_start_marks_runner_stale() {
+    let store = TestStore::new();
+    let workflow = two_step_workflow();
+    let run_id = AgentRunId::new("run-lost-start");
+    let mut runner_a = AgentStepRunner::new(workflow.clone(), run_id.clone(), store.clone());
+    let mut runner_b = AgentStepRunner::new(workflow.clone(), run_id.clone(), store);
+    runner_a.recover().await.expect("first runner recovers");
+    runner_b.recover().await.expect("second runner recovers");
+
+    runner_a
+        .start(accepted_run_state(
+            &workflow,
+            &run_id,
+            AgentStepId::new("plan"),
+        ))
+        .await
+        .expect("first start should persist");
+    let error = runner_b
+        .start(accepted_run_state(
+            &workflow,
+            &run_id,
+            AgentStepId::new("plan"),
+        ))
+        .await
+        .expect_err("second start should lose the compare-and-set");
+
+    assert!(
+        matches!(
+            &error,
+            AgentRunEngineError::Persistence {
+                error: DurableError::RevisionConflict { expected, actual, .. },
+                ..
+            } if *expected == Revision::INITIAL && *actual == Revision::new(1)
+        ),
+        "{error:?}"
+    );
+    assert!(runner_b.is_stale());
+    assert!(!runner_a.is_stale());
 }
 
 async fn start_and_begin(
