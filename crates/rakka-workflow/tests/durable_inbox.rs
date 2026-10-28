@@ -217,6 +217,49 @@ async fn revision_conflict_surfaces_as_workflow_failure() {
 }
 
 #[tokio::test]
+async fn revision_conflict_marks_inbox_stale_until_recover() {
+    let store = InMemoryDurableStateStore::<WorkflowState>::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(400));
+    let workflow_id = WorkflowId::new("workflow-stale");
+    let mut first = DurableInbox::with_clock(workflow_id.clone(), store.clone(), clock.clone());
+    let mut stale = DurableInbox::with_clock(workflow_id.clone(), store, clock);
+    first.recover().await.unwrap();
+    stale.recover().await.unwrap();
+    assert!(!stale.is_stale());
+
+    first
+        .accept(InboxCommand::new("message-1", "Command", b"first".to_vec()))
+        .await
+        .expect("first writer should persist");
+    let error = stale
+        .accept(InboxCommand::new(
+            "message-2",
+            "Command",
+            b"second".to_vec(),
+        ))
+        .await
+        .expect_err("stale writer should hit revision conflict");
+    assert!(matches!(error, WorkflowError::RevisionConflict { .. }));
+    assert!(stale.is_stale());
+    assert!(!first.is_stale());
+
+    stale.recover().await.unwrap();
+    assert!(!stale.is_stale());
+    let accepted = stale
+        .accept(InboxCommand::new(
+            "message-2",
+            "Command",
+            b"second".to_vec(),
+        ))
+        .await
+        .expect("recovered writer should persist");
+    assert!(matches!(
+        accepted,
+        InboxAcceptance::Accepted { revision, .. } if revision == Revision::new(2)
+    ));
+}
+
+#[tokio::test]
 async fn durable_outbox_recovers_due_entry_and_dispatches_success() {
     let store = InMemoryDurableStateStore::<WorkflowState>::new();
     let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(500));
