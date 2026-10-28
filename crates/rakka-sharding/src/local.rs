@@ -211,7 +211,11 @@ where
     }
 
     /// Diagnostic: number of idle timer tasks currently sleeping for this route's
-    /// entities. With idle passivation enabled this is at most one per active entity.
+    /// entities. With idle passivation enabled this is at most one per incarnation:
+    /// a timer whose incarnation was stopped before its deadline sleeps to that
+    /// deadline, finds the slot stopping or re-occupied by another uid, and exits
+    /// without touching it, so the count can briefly exceed the number of active
+    /// entities that stop and restart within one timeout.
     #[must_use]
     pub fn armed_idle_timers(&self) -> usize {
         self.armed_idle_timers.load(Ordering::Acquire)
@@ -563,14 +567,15 @@ where
         };
         let total = held.len();
         for (index, message) in held.into_iter().enumerate() {
-            if actor_ref.tell(message).is_err() {
-                warn_dropped(
-                    &context,
-                    total - index,
-                    "next incarnation stopped before taking held messages",
-                );
-                break;
-            }
+            let reason = match actor_ref.tell(message) {
+                Ok(()) => continue,
+                Err(TellError::Closed(_)) => "next incarnation stopped before taking held messages",
+                Err(TellError::Full(_)) => {
+                    "next incarnation filled its mailbox before taking held messages"
+                }
+            };
+            warn_dropped(&context, total - index, reason);
+            break;
         }
         let entity_id = context.entity_id().clone();
         actors.insert(
@@ -887,10 +892,13 @@ where
     }
 }
 
+/// Warns about held messages the route had to drop. The entity id is deliberately
+/// not logged: entity ids carry application identity (tenants, agents, runs) that
+/// operators keep out of logs; the entity type and shard id locate the entity
+/// without naming it.
 fn warn_dropped(context: &LocalEntityContext, dropped: usize, reason: &str) {
     tracing::warn!(
         entity_type = %context.entity_type(),
-        entity_id = %context.entity_id(),
         shard_id = context.shard_id().as_u32(),
         dropped,
         reason,

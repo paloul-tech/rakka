@@ -78,8 +78,9 @@ bounded by the entity's configured mailbox capacity (`ActorOptions`), and
 delivered to the next incarnation in arrival order ahead of anything sent
 later; past that bound the sender gets `EntityDeliveryFailure::MailboxFull`
 with its message back. A held message is dropped, with a warning that names the
-count, only when the actor system is terminating or the entity's shard has left
-this node.
+count, only when the actor system is terminating, the entity's shard has left
+this node, or the next incarnation stops in `started` before taking it. Those
+warnings name the entity type and shard id, never the entity id.
 
 Idle passivation arms one timer task per active entity; each delivery moves the
 deadline instead of starting another sleeper, and

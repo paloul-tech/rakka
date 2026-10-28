@@ -19,6 +19,8 @@ use rakka_sharding::{
 };
 use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 
+mod log_capture;
+
 #[derive(Debug)]
 enum LifecycleCommand {
     Record(String),
@@ -859,4 +861,43 @@ fn passivate_entity_outside_a_runtime_does_not_panic() {
         assert_eq!(fixture.get(&entity).await, strings(&["after"]));
         assert_eq!(fixture.incarnations(), 2);
     });
+}
+
+#[tokio::test]
+async fn dropped_held_messages_warn_without_the_entity_id() {
+    let captured = log_capture::install();
+    let mut fixture = fixture(
+        "warn-without-entity-id",
+        FixtureConfig {
+            stop_gate: true,
+            ..FixtureConfig::default()
+        },
+    );
+    let entity = fixture.entity("entity-1");
+    let shard = entity.shard_id(&fixture.sharding_config);
+
+    fixture.record(&entity, "a").unwrap();
+    assert!(fixture.route.passivate_entity(entity.entity_id()));
+    fixture.await_entered().await;
+    fixture.record(&entity, "held").unwrap();
+    assert_eq!(fixture.route.mark_shard_transferring(shard), 0);
+    fixture.release.notify_one();
+    wait_for_entity_count(&fixture.route, 0, Duration::from_secs(1)).await;
+
+    let lines = captured.lines_containing("held entity messages dropped");
+    let line = lines
+        .iter()
+        .find(|line| line.contains("warn-without-entity-id") || line.contains("dropped=1"))
+        .unwrap_or_else(|| panic!("no drop warning captured; log = {}", captured.text()));
+    assert!(line.contains("entity_type=Lifecycle"), "{line}");
+    assert!(
+        line.contains(&format!("shard_id={}", shard.as_u32())),
+        "{line}"
+    );
+    assert!(line.contains("dropped=1"), "{line}");
+    assert!(!line.contains("entity-1"), "raw entity id logged: {line}");
+    assert!(
+        !line.contains("entity_id="),
+        "entity id field logged: {line}"
+    );
 }

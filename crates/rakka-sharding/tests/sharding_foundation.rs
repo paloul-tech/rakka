@@ -16,6 +16,8 @@ use rakka_remote::{
     InMemoryRemoteTransport, RemoteDestination, RemoteEndpoint, RemoteEnvelope, RemoteRequestError,
     RemoteRequestRegistry, SerializationRegistry,
 };
+mod log_capture;
+
 use rakka_sharding::{
     register_cluster_sharding_leave_task, AsyncShardCoordinatorStore, ClusterSharding,
     ClusterShardingError, ClusterShardingRuntime, ClusterShardingShutdownHandle,
@@ -3017,8 +3019,16 @@ async fn remote_entity_ask_routes_reply_back_to_requesting_node() {
     assert_eq!(request_registry.pending_count(), 0);
 }
 
-#[tokio::test]
-async fn remote_entity_ask_rejected_at_owner_answers_with_delivery_code() {
+struct RejectedAskOutcome {
+    error: RemoteEntityAskError,
+    pending_count: usize,
+    owner_entity_count: usize,
+    entity_id: EntityId,
+    shard_id: ShardId,
+}
+
+/// Asks an owner whose shard is draining, through the in-memory transport.
+async fn rejected_ask_at_draining_owner(system_suffix: &str) -> RejectedAskOutcome {
     let membership =
         membership_with_up_nodes(vec![node("rakka-0", "uid-a"), node("rakka-1", "uid-b")]);
     let node_a = NodeId::new("rakka-0", "uid-a");
@@ -3034,7 +3044,7 @@ async fn remote_entity_ask_rejected_at_owner_answers_with_delivery_code() {
 
     let local_route_a = LocalEntityRoute::new(
         node_a.clone(),
-        ActorSystem::new("remote-ask-rejected-node-a-test"),
+        ActorSystem::new(format!("remote-ask-rejected-node-a-{system_suffix}")),
         |context: LocalEntityContext| RemoteAskCartEntity { context },
     );
     let region_a = ShardRegion::from_snapshot(
@@ -3053,7 +3063,7 @@ async fn remote_entity_ask_rejected_at_owner_answers_with_delivery_code() {
 
     let local_route_b = LocalEntityRoute::new(
         node_b.clone(),
-        ActorSystem::new("remote-ask-rejected-node-b-test"),
+        ActorSystem::new(format!("remote-ask-rejected-node-b-{system_suffix}")),
         |context: LocalEntityContext| RemoteAskCartEntity { context },
     );
     let region_b = ShardRegion::from_snapshot(
@@ -3082,7 +3092,8 @@ async fn remote_entity_ask_rejected_at_owner_answers_with_delivery_code() {
     transport.register_endpoint(endpoint_b).unwrap();
     let remote_entity =
         EntityRef::<RemoteAskCartCommand>::new(entity_type, remote_entity_id.clone());
-    let _draining = local_route_b.mark_shard_draining(remote_entity.shard_id(&config));
+    let shard_id = remote_entity.shard_id(&config);
+    let _draining = local_route_b.mark_shard_draining(shard_id);
 
     let outcome: Result<Result<RemoteCartReply, RemoteEntityAskError>, _> = tokio::time::timeout(
         Duration::from_secs(1),
@@ -3096,21 +3107,72 @@ async fn remote_entity_ask_rejected_at_owner_answers_with_delivery_code() {
         ),
     )
     .await;
-
     let error = outcome
         .expect("owner should answer the rejected ask well within its timeout")
         .unwrap_err();
+    RejectedAskOutcome {
+        error,
+        pending_count: request_registry.pending_count(),
+        owner_entity_count: local_route_b.entity_count(),
+        entity_id: remote_entity_id,
+        shard_id,
+    }
+}
+
+#[tokio::test]
+async fn remote_entity_ask_rejected_at_owner_answers_with_delivery_code() {
+    let outcome = rejected_ask_at_draining_owner("code").await;
+
     assert!(
         matches!(
-            &error,
+            &outcome.error,
             RemoteEntityAskError::Reply {
                 error: RemoteRequestError::Rejected { code, message },
             } if code == "entity-shard-handoff" && message.contains("draining")
         ),
-        "unexpected error: {error:?}"
+        "unexpected error: {:?}",
+        outcome.error
     );
-    assert_eq!(request_registry.pending_count(), 0);
-    assert_eq!(local_route_b.entity_count(), 0);
+    assert_eq!(outcome.pending_count, 0);
+    assert_eq!(outcome.owner_entity_count, 0);
+}
+
+#[tokio::test]
+async fn remote_ask_rejection_warns_without_entity_or_request_ids() {
+    let captured = log_capture::install();
+    let outcome = rejected_ask_at_draining_owner("log").await;
+    assert!(matches!(
+        &outcome.error,
+        RemoteEntityAskError::Reply {
+            error: RemoteRequestError::Rejected { .. },
+        }
+    ));
+
+    let lines = captured.lines_containing("remote ask rejected");
+    assert!(
+        !lines.is_empty(),
+        "no rejection warning captured; log = {}",
+        captured.text()
+    );
+    for line in &lines {
+        assert!(line.contains("code=entity-shard-handoff"), "{line}");
+        assert!(line.contains("entity_type=Cart"), "{line}");
+        assert!(line.contains("requester=rakka-0#uid-a"), "{line}");
+        assert!(!line.contains("request_id"), "request id logged: {line}");
+        assert!(
+            !line.contains("entity_id="),
+            "entity id field logged: {line}"
+        );
+        assert!(
+            !line.contains(outcome.entity_id.as_str()),
+            "raw entity id logged: {line}"
+        );
+    }
+    let own_line = lines
+        .iter()
+        .find(|line| line.contains(&format!("shard_id={}", outcome.shard_id.as_u32())))
+        .unwrap_or_else(|| panic!("no line names shard {}: {lines:?}", outcome.shard_id));
+    assert!(own_line.contains("entity_type=Cart"));
 }
 
 #[tokio::test]

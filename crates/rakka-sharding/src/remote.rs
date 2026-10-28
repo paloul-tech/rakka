@@ -622,19 +622,29 @@ where
         if self.transport.send(&requester, failure_reply).is_err() {
             return Err(error);
         }
-        let (entity_type, entity_id) = match &destination {
+        // The entity id and the request id are deliberately not logged: entity ids
+        // carry application identity that operators keep out of logs, and the
+        // request id is the requester's correlation key, not the owner's. The entity
+        // type, shard id, code and requester node locate the rejection.
+        let (entity_type, shard_id) = match &destination {
             RemoteDestination::Entity {
                 entity_type,
                 entity_id,
-            } => (entity_type.as_str(), entity_id.as_str()),
-            _ => ("", ""),
+            } => {
+                let entity_type = EntityType::new(entity_type.clone());
+                let shard_id =
+                    EntityRef::<M>::new(entity_type.clone(), EntityId::new(entity_id.clone()))
+                        .shard_id(self.region.config())
+                        .as_u32();
+                (entity_type.to_string(), Some(shard_id))
+            }
+            _ => (String::new(), None),
         };
         tracing::warn!(
-            code,
-            entity_type,
-            entity_id,
+            code = %code,
+            entity_type = %entity_type,
+            shard_id,
             %requester,
-            request_id,
             "remote ask rejected"
         );
         Ok(())

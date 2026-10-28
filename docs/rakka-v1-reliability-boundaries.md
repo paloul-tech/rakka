@@ -83,8 +83,14 @@ Guarantees:
   after local ownership refresh or shard acquisition when the entity type opts
   in.
 - A message delivered through a region to a local entity while that entity
-  passivates is handled by its next incarnation or refused with a typed error;
-  it is not dropped.
+  passivates is either refused with a typed error at the call, or accepted and
+  then handled by the entity's next incarnation in arrival order, except in
+  three cases where an accepted message is dropped with a warning: the entity's
+  shard leaves this node before the next incarnation starts, the actor system
+  is terminating, or the next incarnation stops in `started` before taking it.
+  An entity that stops itself by returning `ActorAction::Stop` also publishes
+  whatever was already queued in its mailbox as `MailboxClosed` dead letters.
+  Callers that must not lose a message in those cases keep their own retry.
 
 Non-guarantees:
 
