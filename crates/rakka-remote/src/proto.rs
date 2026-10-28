@@ -18,6 +18,16 @@ pub(crate) struct ProtoRemoteEnvelope {
     pub(crate) request_id: Option<String>,
     #[prost(bytes, tag = "8")]
     pub(crate) payload: Vec<u8>,
+    #[prost(message, optional, tag = "9")]
+    pub(crate) failure: Option<ProtoRemoteFailure>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct ProtoRemoteFailure {
+    #[prost(string, tag = "1")]
+    pub(crate) code: String,
+    #[prost(string, tag = "2")]
+    pub(crate) message: String,
 }
 
 #[derive(Clone, PartialEq, Message)]

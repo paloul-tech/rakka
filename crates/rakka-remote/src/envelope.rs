@@ -7,7 +7,9 @@ use rakka_core::{ActorPath, ActorUid, SerializedActorRef};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{RemoteError, RemoteResult};
-use crate::proto::{ProtoDestinationKind, ProtoRemoteDestination, ProtoRemoteEnvelope};
+use crate::proto::{
+    ProtoDestinationKind, ProtoRemoteDestination, ProtoRemoteEnvelope, ProtoRemoteFailure,
+};
 use crate::registry::CodecKey;
 use crate::DEFAULT_CODEC_ID;
 
@@ -196,6 +198,54 @@ impl RemoteActorRef {
     }
 }
 
+/// Upper bound, in bytes, on the message a [`RemoteFailure`] carries.
+pub const REMOTE_FAILURE_MESSAGE_MAX_BYTES: usize = 512;
+
+/// Message type id carried by a failure reply envelope. The payload is empty; the
+/// failure travels in the envelope's own `failure` field.
+pub const REMOTE_FAILURE_MESSAGE_TYPE_ID: &str = "rakka.remote.RemoteFailure";
+
+/// Typed failure an owner sends back on a reply envelope when it could not handle
+/// the request, in place of a payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteFailure {
+    code: String,
+    message: String,
+}
+
+impl RemoteFailure {
+    /// Creates a failure with a stable code and a human-readable message. The
+    /// message is truncated on a character boundary to
+    /// [`REMOTE_FAILURE_MESSAGE_MAX_BYTES`].
+    #[must_use]
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        if message.len() > REMOTE_FAILURE_MESSAGE_MAX_BYTES {
+            let mut end = REMOTE_FAILURE_MESSAGE_MAX_BYTES;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+        }
+        Self {
+            code: code.into(),
+            message,
+        }
+    }
+
+    /// Stable failure code.
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    /// Human-readable failure message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 /// Wire envelope for remote messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEnvelope {
@@ -211,6 +261,8 @@ pub struct RemoteEnvelope {
     pub request_id: Option<String>,
     /// Serialized payload bytes.
     pub payload: Vec<u8>,
+    /// Failure carried instead of a payload on a reply the owner could not answer.
+    pub failure: Option<RemoteFailure>,
 }
 
 impl RemoteEnvelope {
@@ -224,7 +276,32 @@ impl RemoteEnvelope {
             trace_context: None,
             request_id: None,
             payload: encoded_payload.payload,
+            failure: None,
         }
+    }
+
+    /// Creates a reply envelope that carries `failure` for `request_id` and no payload.
+    #[must_use]
+    pub fn failure_reply(request_id: impl Into<String>, failure: RemoteFailure) -> Self {
+        let request_id = request_id.into();
+        Self {
+            source: None,
+            destination: RemoteDestination::Reply {
+                request_id: request_id.clone(),
+            },
+            metadata: RemoteEnvelopeMetadata::protobuf(REMOTE_FAILURE_MESSAGE_TYPE_ID, 1),
+            trace_context: None,
+            request_id: Some(request_id),
+            payload: Vec::new(),
+            failure: Some(failure),
+        }
+    }
+
+    /// Sets the failure carried by this envelope.
+    #[must_use]
+    pub fn with_failure(mut self, failure: RemoteFailure) -> Self {
+        self.failure = Some(failure);
+        self
     }
 
     /// Sets the source endpoint or actor path.
@@ -294,6 +371,10 @@ impl From<RemoteEnvelope> for ProtoRemoteEnvelope {
             trace_context: envelope.trace_context,
             request_id: envelope.request_id,
             payload: envelope.payload,
+            failure: envelope.failure.map(|failure| ProtoRemoteFailure {
+                code: failure.code,
+                message: failure.message,
+            }),
         }
     }
 }
@@ -332,6 +413,9 @@ impl TryFrom<ProtoRemoteEnvelope> for RemoteEnvelope {
             trace_context: proto.trace_context,
             request_id: proto.request_id,
             payload: proto.payload,
+            failure: proto
+                .failure
+                .map(|failure| RemoteFailure::new(failure.code, failure.message)),
         })
     }
 }
