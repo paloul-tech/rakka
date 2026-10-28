@@ -666,3 +666,78 @@ async fn held_messages_are_dropped_when_the_system_is_terminating() {
         })
     ));
 }
+
+#[tokio::test]
+async fn idle_timer_is_one_task_per_entity() {
+    let fixture = fixture(
+        "one-idle-timer",
+        FixtureConfig {
+            idle: Some(Duration::from_millis(200)),
+            ..FixtureConfig::default()
+        },
+    );
+    let entity = fixture.entity("entity-1");
+
+    for index in 0..1_000 {
+        fixture.record(&entity, &format!("m{index}")).unwrap();
+    }
+    assert_eq!(fixture.route.armed_idle_timers(), 1);
+
+    wait_for_entity_count(&fixture.route, 0, Duration::from_secs(2)).await;
+    assert_eq!(fixture.route.armed_idle_timers(), 0);
+}
+
+#[tokio::test]
+async fn idle_deadline_extends_on_each_delivery() {
+    let fixture = fixture(
+        "idle-deadline-extends",
+        FixtureConfig {
+            idle: Some(Duration::from_millis(50)),
+            ..FixtureConfig::default()
+        },
+    );
+    let entity = fixture.entity("entity-1");
+    let started = tokio::time::Instant::now();
+
+    fixture.record(&entity, "t0").unwrap();
+    tokio::time::sleep_until(started + Duration::from_millis(30)).await;
+    fixture.record(&entity, "t30").unwrap();
+    tokio::time::sleep_until(started + Duration::from_millis(60)).await;
+    fixture.record(&entity, "t60").unwrap();
+    tokio::time::sleep_until(started + Duration::from_millis(90)).await;
+    assert_eq!(fixture.route.entity_count(), 1);
+
+    wait_for_entity_count(&fixture.route, 0, Duration::from_millis(110)).await;
+    assert!(started.elapsed() < Duration::from_millis(200));
+}
+
+#[tokio::test]
+async fn idle_timer_from_a_previous_incarnation_does_not_stop_the_next() {
+    let mut fixture = fixture(
+        "idle-timer-old-incarnation",
+        FixtureConfig {
+            idle: Some(Duration::from_millis(100)),
+            stop_gate: true,
+            ..FixtureConfig::default()
+        },
+    );
+    let entity = fixture.entity("entity-1");
+    let started = tokio::time::Instant::now();
+
+    fixture.record(&entity, "a").unwrap();
+    tokio::time::sleep_until(started + Duration::from_millis(20)).await;
+    assert!(fixture
+        .route
+        .passivate_entity_with(entity.entity_id(), None));
+    fixture.await_entered().await;
+    fixture.record(&entity, "b").unwrap();
+    fixture.release.notify_one();
+    fixture.wait_for_handled(2, "b").await;
+
+    tokio::time::sleep_until(started + Duration::from_millis(110)).await;
+    assert_eq!(fixture.route.entity_count(), 1);
+    assert!(fixture.route.entity_actor(entity.entity_id()).is_some());
+
+    wait_for_entity_count(&fixture.route, 0, Duration::from_millis(190)).await;
+    assert!(started.elapsed() < Duration::from_millis(300));
+}

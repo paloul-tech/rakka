@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,6 +97,7 @@ where
     factory: Arc<F>,
     actors: Arc<Mutex<SlotRegistry<M>>>,
     shard_states: Arc<Mutex<BTreeMap<ShardId, ShardHandoffState>>>,
+    armed_idle_timers: Arc<AtomicUsize>,
     idle_passivation_timeout: Option<Duration>,
     activation_observer: Option<ActivationObserver>,
     _actor: PhantomData<fn() -> A>,
@@ -111,6 +113,7 @@ where
         context: LocalEntityContext,
         actor_ref: ActorRef<M>,
         idle_deadline: Option<Instant>,
+        timer_armed: bool,
     },
     Stopping {
         context: LocalEntityContext,
@@ -164,6 +167,7 @@ where
             factory: Arc::new(factory),
             actors: Arc::new(Mutex::new(BTreeMap::new())),
             shard_states: Arc::new(Mutex::new(BTreeMap::new())),
+            armed_idle_timers: Arc::new(AtomicUsize::new(0)),
             idle_passivation_timeout: None,
             activation_observer: None,
             _actor: PhantomData,
@@ -204,6 +208,13 @@ where
     #[must_use]
     pub const fn idle_passivation_timeout(&self) -> Option<Duration> {
         self.idle_passivation_timeout
+    }
+
+    /// Diagnostic: number of idle timer tasks currently sleeping for this route's
+    /// entities. With idle passivation enabled this is at most one per active entity.
+    #[must_use]
+    pub fn armed_idle_timers(&self) -> usize {
+        self.armed_idle_timers.load(Ordering::Acquire)
     }
 
     /// Number of active local entity incarnations.
@@ -515,6 +526,7 @@ where
                 context,
                 actor_ref: actor_ref.clone(),
                 idle_deadline: None,
+                timer_armed: false,
             },
         );
         if total > 0 {
@@ -706,7 +718,8 @@ where
         }
     }
 
-    /// Records a delivery to an active slot: moves its idle deadline and arms a sleeper.
+    /// Records a delivery to an active slot: moves its idle deadline and, when no
+    /// timer task is running for this incarnation, starts one.
     fn note_delivery(&self, actors: &mut SlotRegistry<M>, entity_id: &EntityId) {
         let Some(timeout) = self.idle_passivation_timeout else {
             return;
@@ -714,6 +727,7 @@ where
         let Some(LocalEntitySlot::Active {
             actor_ref,
             idle_deadline,
+            timer_armed,
             ..
         }) = actors.get_mut(entity_id)
         else {
@@ -721,36 +735,77 @@ where
         };
         let deadline = Instant::now() + timeout;
         *idle_deadline = Some(deadline);
-        self.spawn_idle_sleeper(entity_id.clone(), actor_ref.uid(), deadline);
+        if !*timer_armed {
+            *timer_armed = true;
+            self.armed_idle_timers.fetch_add(1, Ordering::AcqRel);
+            let route = self.clone();
+            let entity_id = entity_id.clone();
+            let uid = actor_ref.uid();
+            tokio::spawn(async move {
+                route.run_idle_timer(entity_id, uid, deadline).await;
+            });
+        }
     }
 
-    fn spawn_idle_sleeper(&self, entity_id: EntityId, uid: ActorUid, deadline: Instant) {
-        let route = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-            route.passivate_if_idle(&entity_id, uid, deadline);
-        });
-    }
-
-    fn passivate_if_idle(&self, entity_id: &EntityId, uid: ActorUid, deadline: Instant) {
+    /// One timer task per active incarnation: sleeps to the deadline, re-reads it under
+    /// the lock, and passivates the incarnation once the deadline has passed. Exits when
+    /// the incarnation is gone, stopping, or replaced by another uid.
+    async fn run_idle_timer(self, entity_id: EntityId, uid: ActorUid, mut deadline: Instant) {
         let Some(timeout) = self.idle_passivation_timeout else {
+            self.armed_idle_timers.fetch_sub(1, Ordering::AcqRel);
             return;
         };
-        let mut actors = self.lock_actors();
-        let due = matches!(
-            actors.get(entity_id),
-            Some(LocalEntitySlot::Active { actor_ref, idle_deadline, .. })
-                if actor_ref.uid() == uid && *idle_deadline == Some(deadline)
-        );
-        if !due {
-            return;
-        }
-        if self.passivate_slot(&mut actors, entity_id, None) == PassivationOutcome::Abandoned {
-            let next = Instant::now() + timeout;
-            if let Some(LocalEntitySlot::Active { idle_deadline, .. }) = actors.get_mut(entity_id) {
-                *idle_deadline = Some(next);
+        loop {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            let next = {
+                let mut actors = self.lock_actors();
+                let now = Instant::now();
+                let mine = match actors.get(&entity_id) {
+                    Some(LocalEntitySlot::Active {
+                        actor_ref,
+                        idle_deadline,
+                        ..
+                    }) if actor_ref.uid() == uid => Some(*idle_deadline),
+                    _ => None,
+                };
+                match mine {
+                    None => None,
+                    Some(None) => {
+                        if let Some(LocalEntitySlot::Active { timer_armed, .. }) =
+                            actors.get_mut(&entity_id)
+                        {
+                            *timer_armed = false;
+                        }
+                        None
+                    }
+                    Some(Some(due)) if due > now => Some(due),
+                    Some(Some(_due)) => {
+                        if self.passivate_slot(&mut actors, &entity_id, None)
+                            == PassivationOutcome::Abandoned
+                        {
+                            let pushed = now + timeout;
+                            if let Some(LocalEntitySlot::Active { idle_deadline, .. }) =
+                                actors.get_mut(&entity_id)
+                            {
+                                *idle_deadline = Some(pushed);
+                            }
+                            Some(pushed)
+                        } else {
+                            None
+                        }
+                    }
+                }
+                .or_else(|| {
+                    // Exit is decided under the lock so a reader that sees the slot
+                    // stopping or gone also sees the timer as disarmed.
+                    self.armed_idle_timers.fetch_sub(1, Ordering::AcqRel);
+                    None
+                })
+            };
+            match next {
+                Some(due) => deadline = due,
+                None => break,
             }
-            self.spawn_idle_sleeper(entity_id.clone(), uid, next);
         }
     }
 
@@ -798,6 +853,7 @@ where
             factory: self.factory.clone(),
             actors: self.actors.clone(),
             shard_states: self.shard_states.clone(),
+            armed_idle_timers: self.armed_idle_timers.clone(),
             idle_passivation_timeout: self.idle_passivation_timeout,
             activation_observer: self.activation_observer.clone(),
             _actor: PhantomData,
