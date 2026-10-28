@@ -254,7 +254,8 @@ where
 
     /// Explicitly passivates one local entity actor.
     ///
-    /// Returns true when the entity is now stopping or was already stopping.
+    /// Returns true when the entity is now stopping or was already stopping. See
+    /// [`LocalEntityRoute::passivate_entity_with`] for the stop's bookkeeping.
     #[must_use]
     pub fn passivate_entity(&self, entity_id: &EntityId) -> bool {
         self.passivate_entity_with(entity_id, None)
@@ -268,6 +269,12 @@ where
     /// because the mailbox is full; in that case the entity stays active and a later
     /// passivation delivers the stop message again, so stop messages must be
     /// idempotent.
+    ///
+    /// A task watches the stopping incarnation and spawns the next one when
+    /// messages were held for it. When this is called from a thread with no Tokio
+    /// runtime, the stop is still queued but no watcher follows it: the next
+    /// delivery to the entity, once the old incarnation has terminated, spawns the
+    /// next incarnation and hands it whatever was held.
     #[must_use]
     pub fn passivate_entity_with(&self, entity_id: &EntityId, stop_message: Option<M>) -> bool {
         let mut actors = self.lock_actors();
@@ -279,8 +286,12 @@ where
 
     /// Explicitly passivates every active local entity actor in a shard.
     ///
-    /// Messages held for a stopping entity of that shard are dropped with a warning:
-    /// the shard has left this node, so its next incarnation must not start here.
+    /// Returns the number of entities that entered the stopping state. Messages held
+    /// for a stopping entity of that shard are dropped with a warning: the shard has
+    /// left this node, so its next incarnation must not start here. An entity whose
+    /// stop could not be queued because its mailbox was full is not counted; the
+    /// route keeps retrying that stop in the background (with a Tokio runtime
+    /// current) until it is queued, so the entity does not outlive the shard.
     #[must_use]
     pub fn passivate_shard(&self, shard_id: ShardId) -> usize {
         let mut actors = self.lock_actors();
@@ -305,13 +316,17 @@ where
                     held.clear();
                     *reactivate = false;
                 }
-                _ => {
-                    if self.passivate_slot(&mut actors, &entity_id, None)
-                        == PassivationOutcome::Stopping
-                    {
-                        passivated += 1;
+                _ => match self.passivate_slot(&mut actors, &entity_id, None) {
+                    PassivationOutcome::Stopping => passivated += 1,
+                    PassivationOutcome::Abandoned => {
+                        if let Some(LocalEntitySlot::Active { actor_ref, .. }) =
+                            actors.get(&entity_id)
+                        {
+                            self.spawn_owed_stop(entity_id.clone(), actor_ref.uid());
+                        }
                     }
-                }
+                    PassivationOutcome::AlreadyStopping | PassivationOutcome::Absent => {}
+                },
             }
         }
 
@@ -357,6 +372,44 @@ where
         self.actors
             .lock()
             .expect("local entity registry mutex poisoned")
+    }
+
+    /// The current Tokio runtime, when this call runs inside one. Route tasks (the
+    /// stop watcher, the idle timer, an owed stop) are spawned only then; on a plain
+    /// thread the route degrades to resolving a stop on the next delivery instead
+    /// of panicking.
+    fn runtime_handle() -> Option<tokio::runtime::Handle> {
+        tokio::runtime::Handle::try_current().ok()
+    }
+
+    /// Retries a stop that `passivate_shard` could not queue because the entity's
+    /// mailbox was full, until it is queued or the incarnation is gone.
+    fn spawn_owed_stop(&self, entity_id: EntityId, uid: ActorUid) {
+        let Some(handle) = Self::runtime_handle() else {
+            return;
+        };
+        let route = self.clone();
+        handle.spawn(async move {
+            let mut delay = Duration::from_millis(10);
+            loop {
+                tokio::time::sleep(delay).await;
+                let outcome = {
+                    let mut actors = route.lock_actors();
+                    let mine = matches!(
+                        actors.get(&entity_id),
+                        Some(LocalEntitySlot::Active { actor_ref, .. }) if actor_ref.uid() == uid
+                    );
+                    if !mine {
+                        return;
+                    }
+                    route.passivate_slot(&mut actors, &entity_id, None)
+                };
+                if outcome != PassivationOutcome::Abandoned {
+                    return;
+                }
+                delay = (delay * 2).min(Duration::from_secs(1));
+            }
+        });
     }
 
     /// Delivers one routed message under the registry lock. Returns the context to
@@ -598,8 +651,11 @@ where
     }
 
     fn spawn_stop_watcher(&self, entity_id: EntityId, actor_ref: ActorRef<M>) {
+        let Some(handle) = Self::runtime_handle() else {
+            return;
+        };
         let route = self.clone();
-        tokio::spawn(async move {
+        handle.spawn(async move {
             let uid = actor_ref.uid();
             let _terminated = actor_ref.when_terminated().await;
             route.on_incarnation_stopped(&entity_id, uid);
@@ -736,12 +792,15 @@ where
         let deadline = Instant::now() + timeout;
         *idle_deadline = Some(deadline);
         if !*timer_armed {
+            let Some(handle) = Self::runtime_handle() else {
+                return;
+            };
             *timer_armed = true;
             self.armed_idle_timers.fetch_add(1, Ordering::AcqRel);
             let route = self.clone();
             let entity_id = entity_id.clone();
             let uid = actor_ref.uid();
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 route.run_idle_timer(entity_id, uid, deadline).await;
             });
         }

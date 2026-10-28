@@ -86,8 +86,12 @@ deadline instead of starting another sleeper, and
 `LocalEntityRoute::armed_idle_timers()` reports how many timer tasks are
 sleeping. A stop the route cannot queue because the mailbox is full leaves the
 entity active and registered: the idle timer tries again after one more
-timeout, and an explicit passivation returns `false`. The stop message is told
-again on the next attempt, so stop messages must be idempotent.
+timeout, an explicit passivation returns `false`, and a shard transfer keeps
+retrying the stop in the background until it is queued. The stop message is
+told again on the next attempt, so stop messages must be idempotent. The route
+spawns its watcher, timer, and retry tasks only when a Tokio runtime is
+current; a passivation called from a plain thread still queues the stop, and
+the next delivery to that entity resolves it.
 
 An entity that stops itself by returning `ActorAction::Stop` from `handle`
 leaves its mailbox loop at once. Whatever was already queued behind the message

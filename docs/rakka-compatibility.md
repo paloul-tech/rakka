@@ -68,14 +68,23 @@ forbid. Within envelope version 1:
   `rakka.remote.RemoteFailure`, schema version 1, and an empty payload. The
   asker sees `RemoteRequestError::Rejected { code, message }`.
 - An asker on an older binary ignores the field and reports
-  `RemoteRequestError::Decode` for that reply instead of a timeout; an owner on
-  an older binary never sends it.
+  `RemoteRequestError::Decode` for that reply instead of a timeout. Its reply
+  handler also returns that decode failure to the endpoint, which closes the
+  owner-to-asker TCP connection and counts an inbound failure on the asker; the
+  owner's peer task reconnects on its next send. So during a mixed-version
+  window each rejected ask from an older asker to a newer owner costs one
+  connection reset on the asker's side. An owner on an older binary never sends
+  the field.
 - The carried codes are the entity delivery codes the HTTP and gRPC adapters
   emit (`entity-no-route`, `entity-mailbox-full`, `entity-mailbox-closed`,
   `entity-not-local`, `entity-spawn-failed`, `entity-remote-encode`,
   `entity-remote-send`, `entity-shard-handoff`, `entity-shard-buffer-full`,
-  `entity-rejected`) plus `remote-ask-decode` and
-  `remote-ask-entity-type-mismatch`.
+  `entity-rejected`) plus `remote-ask-decode`,
+  `remote-ask-entity-type-mismatch`, and `remote-ask-unexpected-destination`.
+  (`RemoteEntityAskInboundError::code()` also names
+  `remote-ask-missing-request-id`, `remote-ask-missing-source`, and
+  `remote-ask-invalid-source`, but those failures happen before the owner knows
+  whom to answer, so they are never carried.)
 
 The helper APIs are:
 

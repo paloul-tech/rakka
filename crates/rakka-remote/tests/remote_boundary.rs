@@ -2375,3 +2375,27 @@ fn late_failure_reply_for_unknown_request_is_reported_not_panicked() {
     );
     assert_eq!(requests.pending_count(), 0);
 }
+
+#[test]
+fn envelope_json_without_failure_field_still_deserializes() {
+    let before = RemoteEnvelope::new(
+        RemoteDestination::Reply {
+            request_id: "req-json".to_string(),
+        },
+        ping_registry()
+            .encode(&Ping {
+                value: "hello".to_string(),
+            })
+            .unwrap(),
+    )
+    .with_request_id("req-json");
+    let mut json: serde_json::Value = serde_json::to_value(&before).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("failure")
+        .expect("the envelope serializes its failure field");
+
+    let decoded: RemoteEnvelope = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded, before);
+    assert!(decoded.failure.is_none());
+}

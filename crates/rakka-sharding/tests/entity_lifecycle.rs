@@ -803,3 +803,60 @@ async fn no_message_is_lost_across_repeated_idle_stops() {
     );
     wait_for_entity_count(&fixture.route, 0, Duration::from_secs(2)).await;
 }
+
+#[tokio::test]
+async fn shard_transfer_stops_an_entity_whose_mailbox_was_full() {
+    let fixture = fixture(
+        "shard-transfer-full-mailbox",
+        FixtureConfig {
+            mailbox_capacity: Some(1),
+            handle_gate: true,
+            ..FixtureConfig::default()
+        },
+    );
+    let entity = fixture.entity("entity-1");
+    let shard = entity.shard_id(&fixture.sharding_config);
+
+    fixture.record(&entity, "blocked").unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    fixture.record(&entity, "queued").unwrap();
+
+    // The stop cannot be queued behind "queued": the entity stays active and
+    // registered, and the route owes it a stop.
+    assert_eq!(fixture.route.mark_shard_transferring(shard), 0);
+    assert_eq!(fixture.route.entity_count(), 1);
+
+    fixture.handle_gate.as_ref().unwrap().add_permits(2);
+    wait_for_entity_count(&fixture.route, 0, Duration::from_secs(2)).await;
+    assert!(fixture.route.entity_actor(entity.entity_id()).is_none());
+    assert_eq!(fixture.log(), log_entries(&[(1, "blocked"), (1, "queued")]));
+}
+
+#[test]
+fn passivate_entity_outside_a_runtime_does_not_panic() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let fixture = fixture("passivate-outside-runtime", FixtureConfig::default());
+    let entity = fixture.entity("entity-1");
+
+    runtime.block_on(async {
+        fixture.record(&entity, "a").unwrap();
+        assert_eq!(fixture.get(&entity).await, strings(&["a"]));
+    });
+    let actor = fixture.route.entity_actor(entity.entity_id()).unwrap();
+
+    // Called from a plain thread with no Tokio runtime context.
+    assert!(fixture.route.passivate_entity(entity.entity_id()));
+
+    runtime.block_on(async {
+        for _attempt in 0..200 {
+            if actor.is_terminated() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(actor.is_terminated());
+        fixture.record(&entity, "after").unwrap();
+        assert_eq!(fixture.get(&entity).await, strings(&["after"]));
+        assert_eq!(fixture.incarnations(), 2);
+    });
+}
