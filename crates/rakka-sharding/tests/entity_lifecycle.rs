@@ -741,3 +741,65 @@ async fn idle_timer_from_a_previous_incarnation_does_not_stop_the_next() {
     wait_for_entity_count(&fixture.route, 0, Duration::from_millis(190)).await;
     assert!(started.elapsed() < Duration::from_millis(300));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_message_is_lost_across_repeated_idle_stops() {
+    const ENTITIES: usize = 50;
+    const SENDERS: usize = 4;
+    const PER_SENDER: usize = 2_500;
+    const TOTAL: usize = SENDERS * PER_SENDER;
+
+    let fixture = fixture(
+        "stress-idle-stops",
+        FixtureConfig {
+            idle: Some(Duration::from_millis(1)),
+            ..FixtureConfig::default()
+        },
+    );
+    let entities = (0..ENTITIES)
+        .map(|index| fixture.entity(&format!("entity-{index}")))
+        .collect::<Vec<_>>();
+
+    let mut senders = Vec::new();
+    for sender in 0..SENDERS {
+        let region = fixture.region.clone();
+        let entities = entities.clone();
+        senders.push(tokio::spawn(async move {
+            let mut refused = 0usize;
+            for index in 0..PER_SENDER {
+                let sequence = sender * PER_SENDER + index;
+                let entity = &entities[sequence % ENTITIES];
+                match entity.tell(&region, LifecycleCommand::Record(format!("m{sequence}"))) {
+                    Ok(()) => {}
+                    Err(EntityTellError::Delivery {
+                        failure: EntityDeliveryFailure::MailboxFull,
+                        ..
+                    }) => refused += 1,
+                    Err(other) => panic!("unexpected delivery failure: {other:?}"),
+                }
+                if index % 97 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            refused
+        }));
+    }
+    let mut refused = 0usize;
+    for sender in senders {
+        refused += sender.await.unwrap();
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline
+        && fixture.log.lock().unwrap().len() + refused < TOTAL
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let handled = fixture.log.lock().unwrap().len();
+    assert_eq!(
+        handled + refused,
+        TOTAL,
+        "handled {handled} + refused {refused} != sent {TOTAL}"
+    );
+    wait_for_entity_count(&fixture.route, 0, Duration::from_secs(2)).await;
+}
