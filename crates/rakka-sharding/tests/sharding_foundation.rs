@@ -13,7 +13,7 @@ use rakka_core::{
     ShutdownTaskStatus, METRIC_SHARD_OWNERSHIP_COUNT,
 };
 use rakka_remote::{
-    InMemoryRemoteTransport, RemoteDestination, RemoteEndpoint, RemoteEnvelope,
+    InMemoryRemoteTransport, RemoteDestination, RemoteEndpoint, RemoteEnvelope, RemoteRequestError,
     RemoteRequestRegistry, SerializationRegistry,
 };
 use rakka_sharding::{
@@ -3015,6 +3015,102 @@ async fn remote_entity_ask_routes_reply_back_to_requesting_node() {
     assert_eq!(local_route_a.entity_count(), 0);
     assert_eq!(local_route_b.entity_count(), 1);
     assert_eq!(request_registry.pending_count(), 0);
+}
+
+#[tokio::test]
+async fn remote_entity_ask_rejected_at_owner_answers_with_delivery_code() {
+    let membership =
+        membership_with_up_nodes(vec![node("rakka-0", "uid-a"), node("rakka-1", "uid-b")]);
+    let node_a = NodeId::new("rakka-0", "uid-a");
+    let node_b = NodeId::new("rakka-1", "uid-b");
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(8).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let snapshot = coordinator.snapshot();
+    let remote_entity_id = entity_owned_by(&coordinator, "rakka-1");
+    let registry = remote_registry();
+    let transport = InMemoryRemoteTransport::new();
+
+    let local_route_a = LocalEntityRoute::new(
+        node_a.clone(),
+        ActorSystem::new("remote-ask-rejected-node-a-test"),
+        |context: LocalEntityContext| RemoteAskCartEntity { context },
+    );
+    let region_a = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config.clone(),
+        &snapshot,
+        local_route_a.clone(),
+    )
+    .unwrap();
+    let request_registry = RemoteRequestRegistry::new(registry.clone());
+    let ask_client =
+        RemoteEntityAskClient::new(node_a.clone(), request_registry.clone(), transport.clone());
+    let endpoint_a = RemoteEndpoint::new(node_a);
+    endpoint_a.register_reply_handler(request_registry.clone());
+    transport.register_endpoint(endpoint_a).unwrap();
+
+    let local_route_b = LocalEntityRoute::new(
+        node_b.clone(),
+        ActorSystem::new("remote-ask-rejected-node-b-test"),
+        |context: LocalEntityContext| RemoteAskCartEntity { context },
+    );
+    let region_b = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config.clone(),
+        &snapshot,
+        local_route_b.clone(),
+    )
+    .unwrap();
+    let endpoint_b = RemoteEndpoint::new(node_b);
+    endpoint_b
+        .register_entity_handler(
+            "Cart",
+            RemoteEntityAskInbound::new(
+                NodeId::new("rakka-1", "uid-b"),
+                region_b,
+                registry.clone(),
+                transport.clone(),
+                |request: RemoteCartGet, reply_to| RemoteAskCartCommand::Get {
+                    prefix: request.prefix,
+                    reply_to,
+                },
+            ),
+        )
+        .unwrap();
+    transport.register_endpoint(endpoint_b).unwrap();
+    let remote_entity =
+        EntityRef::<RemoteAskCartCommand>::new(entity_type, remote_entity_id.clone());
+    let _draining = local_route_b.mark_shard_draining(remote_entity.shard_id(&config));
+
+    let outcome: Result<Result<RemoteCartReply, RemoteEntityAskError>, _> = tokio::time::timeout(
+        Duration::from_secs(1),
+        ask_client.ask(
+            &region_a,
+            &remote_entity,
+            RemoteCartGet {
+                prefix: "items".to_string(),
+            },
+            Duration::from_secs(5),
+        ),
+    )
+    .await;
+
+    let error = outcome
+        .expect("owner should answer the rejected ask well within its timeout")
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            RemoteEntityAskError::Reply {
+                error: RemoteRequestError::Rejected { code, message },
+            } if code == "entity-shard-handoff" && message.contains("draining")
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(request_registry.pending_count(), 0);
+    assert_eq!(local_route_b.entity_count(), 0);
 }
 
 #[tokio::test]

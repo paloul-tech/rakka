@@ -11,14 +11,14 @@ use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, ReplyTo,
 };
 use rakka_remote::{
-    SerializationRegistry, TcpRemoteConnectionLifecycle, TcpRemoteTransportConfig,
-    TcpRemoteTransportError,
+    RemoteRequestError, SerializationRegistry, TcpRemoteConnectionLifecycle,
+    TcpRemoteTransportConfig, TcpRemoteTransportError,
 };
 use rakka_sharding::{
     ClusterNodeRuntime, ClusterNodeRuntimeBuilder, ClusterNodeRuntimeError, ClusterSharding,
     Entity, EntityContext, EntityDeliveryFailure, EntityId, EntityRef, EntityTellError, EntityType,
-    EntityTypeKey, LocalEntityContext, LocalEntityRoute, RoutedEntityMessage, ShardHandoffState,
-    ShardMoveReason, ShardRegion, ShardingConfig,
+    EntityTypeKey, LocalEntityContext, LocalEntityRoute, RemoteEntityAskError, RoutedEntityMessage,
+    ShardHandoffState, ShardMoveReason, ShardRegion, ShardingConfig,
 };
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -265,6 +265,100 @@ async fn networked_runtime_routes_remote_ask_reply_over_tcp() {
     assert_eq!(reply.summary, format!("{}:total", entity_id.as_str()));
     assert_eq!(node_a.requests().pending_count(), 0);
     wait_for(|| node_a.transport_snapshot().inbound_envelopes() >= 1).await;
+
+    system_b.shutdown();
+}
+
+#[tokio::test]
+async fn networked_runtime_answers_rejected_remote_ask_and_keeps_connection() {
+    let registry = cart_registry();
+    let Some((mut node_a, mut node_b)) = build_runtime_pair(registry).await else {
+        return;
+    };
+    let entity_type = EntityType::new("CartAskRejected");
+    let config = ShardingConfig::new(8).expect("valid sharding config");
+    let region_a = ShardRegion::new(
+        entity_type.clone(),
+        config.clone(),
+        |_message: RoutedEntityMessage<CartAskCommand>| Ok(()),
+    );
+    let system_b = ActorSystem::new("networked-ask-rejected-node-b");
+    let route_b = LocalEntityRoute::new(
+        node_b.local_node().id().clone(),
+        system_b.clone(),
+        |context: LocalEntityContext| AskCartEntity { context },
+    );
+    let region_b = ShardRegion::new(entity_type.clone(), config.clone(), route_b.clone());
+
+    node_a
+        .register_region(region_a.clone())
+        .expect("node a owner cache region should register");
+    node_b
+        .register_entity_ask_region::<CartGet, CartAskCommand, CartReply, _>(
+            region_b,
+            |request, reply_to| CartAskCommand::Get {
+                prefix: request.prefix,
+                reply_to,
+            },
+        )
+        .expect("node b ask region should register");
+    apply_pair_discovery(&mut node_a, &mut node_b);
+
+    let entity_id = entity_owned_by(&node_a, &entity_type, node_b.local_node().id().logical_id());
+    let entity = EntityRef::<CartAskCommand>::new(entity_type, entity_id.clone());
+    let shard = entity.shard_id(&config);
+    let _draining = route_b.mark_shard_draining(shard);
+
+    let outcome: Result<Result<CartReply, RemoteEntityAskError>, _> = tokio::time::timeout(
+        Duration::from_secs(1),
+        node_a.ask_client().ask(
+            &region_a,
+            &entity,
+            CartGet {
+                prefix: "total".to_string(),
+            },
+            Duration::from_secs(5),
+        ),
+    )
+    .await;
+    let error = outcome
+        .expect("owner should answer the rejected ask well within its timeout")
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            RemoteEntityAskError::Reply {
+                error: RemoteRequestError::Rejected { code, .. },
+            } if code == "entity-shard-handoff"
+        ),
+        "unexpected error: {error:?}"
+    );
+    wait_for(|| node_b.transport_snapshot().inbound_envelopes() >= 1).await;
+    let connections_after_rejection = node_b.transport_snapshot().inbound_connections();
+
+    let _owning = route_b.mark_shard_owning(shard);
+    let reply: CartReply = node_a
+        .ask_client()
+        .ask(
+            &region_a,
+            &entity,
+            CartGet {
+                prefix: "total".to_string(),
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("remote ask should receive reply once the shard is owning again");
+    assert_eq!(reply.summary, format!("{}:total", entity_id.as_str()));
+    wait_for(|| node_b.transport_snapshot().inbound_envelopes() >= 2).await;
+
+    assert_eq!(
+        node_b.transport_snapshot().inbound_connections(),
+        connections_after_rejection,
+        "the requester had to reconnect after the rejection"
+    );
+    assert_eq!(node_b.transport_snapshot().inbound_failures(), 0);
+    assert_eq!(node_a.requests().pending_count(), 0);
 
     system_b.shutdown();
 }
