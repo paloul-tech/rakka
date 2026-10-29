@@ -677,6 +677,41 @@ impl AgentGraphScheduler {
         Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
     }
 
+    /// Resumes a parked node as running: the person decided the call never
+    /// ran, so the node opens its next effect generation.
+    ///
+    /// The node must wait on [`AgentGraphWaitReason::Reconciliation`]. Its
+    /// wait reason and cause are cleared, `effect_generation` moves by one,
+    /// and `attempt` and `started_at` stay what they were. The caller's next
+    /// effect schedule mints the new generation.
+    pub fn resume_parked_node(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        mut state: AgentGraphRunState,
+        node_id: impl Into<AgentCompiledNodeId>,
+        now: AgentTimestampMillis,
+    ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition> {
+        ensure_not_terminal(&state)?;
+        let node_id = node_id.into();
+        validate_plan_state(plan, &state)?;
+        ensure_known_node(plan, &node_id)?;
+        ensure_node_wait_reason(&state, &node_id, AgentGraphWaitReason::Reconciliation)?;
+        transition_node(
+            &mut state,
+            &node_id,
+            AgentGraphNodeStatus::Waiting,
+            AgentGraphNodeStatus::Running,
+            now,
+            |node_state| {
+                node_state.wait_reason = None;
+                node_state.error_code = None;
+                node_state.effect_generation = node_state.effect_generation.saturating_add(1);
+            },
+        )?;
+        state.graph_schema_version = CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION;
+        Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
+    }
+
     /// Transitions a waiting node to completed and records output artifact refs.
     pub fn complete_waiting_node(
         &self,

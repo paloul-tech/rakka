@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentAttributes, AgentCausationId, AgentCommandId, AgentCorrelationId, AgentDeduplicationKey,
     AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus, AgentEffectTarget,
-    AgentIdempotencyKey, AgentRunId, AgentTelemetryContext, AgentTenantId, AgentTimestampMillis,
-    AgentWorkflowId, ArtifactRef, HumanCheckpointId, PrincipalRef,
+    AgentGraphReconciliationDecision, AgentIdempotencyKey, AgentRunId, AgentTelemetryContext,
+    AgentTenantId, AgentTimestampMillis, AgentWorkflowId, ArtifactRef, HumanCheckpointId,
+    PrincipalRef,
 };
 
 /// Shared result type for agent facade validation.
@@ -213,6 +214,13 @@ pub enum AgentCommandKind {
         /// Stable bounded error code.
         error_code: String,
     },
+    /// Resolve a graph node parked for reconciliation with a person's decision.
+    GraphReconciliationDecided {
+        /// Effect whose outcome was in doubt.
+        effect_id: AgentEffectId,
+        /// The decision.
+        decision: AgentGraphReconciliationDecision,
+    },
     /// Submit a human decision for an open checkpoint.
     HumanDecisionSubmitted {
         /// Checkpoint being resolved.
@@ -243,6 +251,7 @@ impl AgentCommandKind {
             Self::ContinueRun => "ContinueRun",
             Self::EffectCompleted { .. } => "EffectCompleted",
             Self::EffectFailed { .. } => "EffectFailed",
+            Self::GraphReconciliationDecided { .. } => "GraphReconciliationDecided",
             Self::HumanDecisionSubmitted { .. } => "HumanDecisionSubmitted",
             Self::TimerFired { .. } => "TimerFired",
             Self::CancelRun => "CancelRun",
@@ -260,6 +269,7 @@ impl AgentCommandKind {
             Self::ContinueRun => "agent.continue-run",
             Self::EffectCompleted { .. } => "agent.effect-completed",
             Self::EffectFailed { .. } => "agent.effect-failed",
+            Self::GraphReconciliationDecided { .. } => "agent.graph-reconciliation-decided",
             Self::HumanDecisionSubmitted { .. } => "agent.human-decision-submitted",
             Self::TimerFired { .. } => "agent.timer-fired",
             Self::CancelRun => "agent.cancel-run",
@@ -608,6 +618,9 @@ pub fn validate_command(command: &AgentCommand) -> AgentFacadeResult<()> {
         } => {
             require_command(command.kind.type_name(), effect_id.as_str(), "effect_id")?;
             require_command(command.kind.type_name(), error_code, "error_code")?;
+        }
+        AgentCommandKind::GraphReconciliationDecided { effect_id, .. } => {
+            require_command(command.kind.type_name(), effect_id.as_str(), "effect_id")?;
         }
         AgentCommandKind::HumanDecisionSubmitted {
             checkpoint_id,

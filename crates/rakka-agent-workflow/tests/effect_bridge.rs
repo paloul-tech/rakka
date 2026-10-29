@@ -11,13 +11,14 @@ use rakka_agent_workflow::{
     AgentDurabilityMetadata, AgentEffectId, AgentEffectKind, AgentEffectTarget,
     AgentGraphEffectBridge, AgentGraphEffectBridgeError, AgentGraphEffectFailureDisposition,
     AgentGraphEffectScheduleRequest, AgentGraphHumanCheckpointScheduleRequest, AgentGraphNodeState,
-    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
-    AgentGraphStateSchemaVersion, AgentGraphTerminalStatus, AgentGraphTimerScheduleRequest,
-    AgentGraphWaitReason, AgentRunId, AgentRunInbox, AgentTenantId, AgentTimerStore,
-    AgentTimerStoreState, AgentTimestampMillis, AgentWorkflowId, ArtifactEncryptionRef,
-    ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-    HumanDecisionOption, PrincipalRef, RedactionStatus, WorkflowDefinitionVersion,
-    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
+    AgentGraphNodeStatus, AgentGraphReconciliationDecision, AgentGraphRunState,
+    AgentGraphScheduler, AgentGraphSchedulerError, AgentGraphStateSchemaVersion,
+    AgentGraphTerminalStatus, AgentGraphTimerScheduleRequest, AgentGraphWaitReason, AgentRunId,
+    AgentRunInbox, AgentTenantId, AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis,
+    AgentWorkflowId, ArtifactEncryptionRef, ArtifactKind, ArtifactRef, HumanCheckpoint,
+    HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, PrincipalRef, RedactionStatus,
+    WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 use rakka_persistence::InMemoryDurableStateStore;
 use rakka_workflow::{
@@ -1676,4 +1677,276 @@ async fn a_version_one_state_parks_and_is_written_at_version_two() {
     let decoded: AgentGraphRunState =
         serde_json::from_str(&json).expect("parked state should deserialize");
     assert_eq!(decoded, outcome.transition.state);
+}
+
+// ---- the reconciliation decisions (issue #110) ----
+
+fn decision_command(
+    bridge: &AgentGraphEffectBridge,
+    plan: &AgentCompiledExecutionPlan,
+    run_id: &AgentRunId,
+    command_id: &str,
+    effect_id: &AgentEffectId,
+    decision: AgentGraphReconciliationDecision,
+) -> AgentCommand {
+    bridge
+        .reconciliation_decision_command(
+            command_metadata(plan, run_id.clone(), command_id, 400),
+            effect_id.clone(),
+            decision,
+        )
+        .expect("decision command should build")
+}
+
+#[tokio::test]
+async fn not_executed_decision_resumes_the_node_running_with_the_next_generation() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-not-executed");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let parked = node_state(&state, "effect").clone();
+    let parked_revision = state.scheduler_revision;
+    let command = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-1",
+        &effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+
+    let outcome = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, command, &mut inbox)
+        .await
+        .expect("not-executed should resume the node");
+
+    assert!(outcome.acceptance.is_accepted());
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Running);
+    assert_eq!(node.wait_reason, None);
+    assert_eq!(node.error_code, None);
+    assert_eq!(node.effect_generation, 1);
+    assert_eq!(
+        (node.attempt, node.started_at),
+        (parked.attempt, parked.started_at)
+    );
+    assert_eq!(node.scheduled_effect_ids, vec![effect_id]);
+    assert_eq!(
+        outcome.transition.changed_node_ids,
+        vec![AgentCompiledNodeId::new("effect")]
+    );
+    assert_eq!(
+        outcome.transition.state.scheduler_revision,
+        parked_revision + 1
+    );
+    assert_eq!(
+        outcome.transition.state.graph_schema_version,
+        CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION
+    );
+    assert_eq!(outcome.transition.state.terminal_status, None);
+}
+
+#[tokio::test]
+async fn abandon_decision_fails_the_node_and_the_run() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-abandon");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let command = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-abandon",
+        &effect_id,
+        AgentGraphReconciliationDecision::Abandon {
+            error_code: "reconciliation-abandoned".to_string(),
+        },
+    );
+
+    let outcome = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, command, &mut inbox)
+        .await
+        .expect("abandon should fail the node");
+
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Failed);
+    assert_eq!(node.wait_reason, None);
+    assert_eq!(node.error_code.as_deref(), Some("reconciliation-abandoned"));
+    assert_eq!(node.effect_generation, 0);
+    assert_eq!(
+        outcome.transition.state.terminal_status,
+        Some(AgentGraphTerminalStatus::Failed)
+    );
+    assert_eq!(
+        node_state(&outcome.transition.state, "terminal").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn an_abandon_without_a_code_is_refused_before_acceptance() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-blank-code");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let blank = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-blank",
+        &effect_id,
+        AgentGraphReconciliationDecision::Abandon {
+            error_code: "  ".to_string(),
+        },
+    );
+
+    let error = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state.clone(), blank, &mut inbox)
+        .await
+        .expect_err("a blank abandon code should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::Scheduler {
+                error: AgentGraphSchedulerError::EmptyCauseCode { node_id }
+            } if node_id == &AgentCompiledNodeId::new("effect")
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "empty-reconciliation-cause");
+
+    // The refusal recorded nothing: the same command id carries a valid code
+    // and is accepted, not a duplicate.
+    let valid = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-blank",
+        &effect_id,
+        AgentGraphReconciliationDecision::Abandon {
+            error_code: "reconciliation-abandoned".to_string(),
+        },
+    );
+    let outcome = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, valid, &mut inbox)
+        .await
+        .expect("a valid abandon should apply");
+    assert!(outcome.acceptance.is_accepted());
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect").status,
+        AgentGraphNodeStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn a_decision_on_an_unparked_node_is_refused() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-unparked");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = schedule_effect(&bridge, &plan, &run_id, &mut inbox).await;
+    let command = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-unparked",
+        &effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+
+    let error = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, command, &mut inbox)
+        .await
+        .expect_err("a decision on an unparked node should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::InvalidNodeStatus { node_id, status }
+                if node_id == &AgentCompiledNodeId::new("effect")
+                    && status == &AgentGraphNodeStatus::Waiting
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_decision_after_the_node_resolved_is_a_no_op() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-replayed");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let abandon = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-abandon",
+        &effect_id,
+        AgentGraphReconciliationDecision::Abandon {
+            error_code: "reconciliation-abandoned".to_string(),
+        },
+    );
+    let failed = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, abandon, &mut inbox)
+        .await
+        .expect("abandon should apply");
+    let failed_revision = failed.transition.state.scheduler_revision;
+
+    let replay = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-late",
+        &effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+    let outcome = bridge
+        .accept_and_apply_reconciliation_decision(
+            &plan,
+            failed.transition.state,
+            replay,
+            &mut inbox,
+        )
+        .await
+        .expect("a late decision on a resolved node should be a no-op");
+
+    assert!(outcome.acceptance.is_accepted());
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state.scheduler_revision, failed_revision);
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Failed);
+    assert_eq!(node.effect_generation, 0);
+}
+
+#[tokio::test]
+async fn a_decision_for_an_unknown_effect_is_refused() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-unknown");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (_effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let unknown = AgentEffectId::new("graph-effect:nope");
+    let command = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-unknown",
+        &unknown,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+
+    let error = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, command, &mut inbox)
+        .await
+        .expect_err("a decision for an unknown effect should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::UnknownEffect { effect_id } if effect_id == &unknown
+        ),
+        "{error:?}"
+    );
 }

@@ -175,9 +175,9 @@ pub use graph_scheduler::{
 };
 pub use graph_state::{
     AgentGraphBlockedReason, AgentGraphLoopInstanceState, AgentGraphNodeProjection,
-    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunProjection, AgentGraphRunState,
-    AgentGraphStateSchemaVersion, AgentGraphTerminalStatus, AgentGraphWaitReason,
-    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
+    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphReconciliationDecision,
+    AgentGraphRunProjection, AgentGraphRunState, AgentGraphStateSchemaVersion,
+    AgentGraphTerminalStatus, AgentGraphWaitReason, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 pub use inbox::{
     agent_run_workflow_id, AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError,

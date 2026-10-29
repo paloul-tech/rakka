@@ -18,15 +18,15 @@ use crate::{
     AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanNode, AgentCompiledPortId,
     AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
     AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget, AgentFacadeError,
-    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler,
-    AgentGraphSchedulerError, AgentGraphSchedulerTransition, AgentGraphTerminalStatus,
-    AgentGraphWaitReason, AgentHumanApprovalRequest, AgentHumanCheckpointError,
-    AgentIdempotencyKey, AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance,
-    AgentOutboxError, AgentRunId, AgentRunInbox, AgentTelemetryContext, AgentTenantId,
-    AgentTimerEntry, AgentTimerError, AgentTimerId, AgentTimerPolicy, AgentTimerStore,
-    AgentTimerStoreState, AgentTimestampMillis, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
-    HumanCheckpointStatus, AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
-    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
+    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphReconciliationDecision,
+    AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
+    AgentGraphSchedulerTransition, AgentGraphTerminalStatus, AgentGraphWaitReason,
+    AgentHumanApprovalRequest, AgentHumanCheckpointError, AgentIdempotencyKey,
+    AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance, AgentOutboxError, AgentRunId,
+    AgentRunInbox, AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerError,
+    AgentTimerId, AgentTimerPolicy, AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis,
+    ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 
 const ATTR_COMPILED_NODE_ID: &str = "compiled_node_id";
@@ -966,6 +966,24 @@ impl AgentGraphEffectBridge {
         .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })
     }
 
+    /// Builds a `GraphReconciliationDecided` command for a parked node's
+    /// effect.
+    pub fn reconciliation_decision_command(
+        &self,
+        metadata: AgentCommandMetadata,
+        effect_id: AgentEffectId,
+        decision: AgentGraphReconciliationDecision,
+    ) -> AgentGraphEffectBridgeResult<AgentCommand> {
+        AgentCommand::new(
+            AgentCommandKind::GraphReconciliationDecided {
+                effect_id,
+                decision,
+            },
+            metadata,
+        )
+        .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })
+    }
+
     /// Builds a `TimerFired` command for a durable graph timer.
     pub fn timer_fired_command(
         &self,
@@ -1064,6 +1082,36 @@ impl AgentGraphEffectBridge {
         }
         let acceptance = inbox.accept_command(command.clone()).await?;
         let transition = apply_effect_failed_command(plan, state, &command)?;
+        Ok(AgentGraphEffectCommandOutcome {
+            acceptance,
+            transition,
+        })
+    }
+
+    /// Accepts a reconciliation decision and applies it to graph state.
+    ///
+    /// `NotExecuted` resumes the parked node as running on its next effect
+    /// generation; `Abandon` fails the node and the graph under its code. A
+    /// decision on a node that has resolved is a no-op; one on a node that
+    /// was never parked is refused with
+    /// [`AgentGraphEffectBridgeError::InvalidNodeStatus`]. An `Abandon`
+    /// whose code is blank is refused before acceptance.
+    pub async fn accept_and_apply_reconciliation_decision<Store, Clock>(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        state: AgentGraphRunState,
+        command: AgentCommand,
+        inbox: &mut AgentRunInbox<Store, Clock>,
+    ) -> AgentGraphEffectBridgeResult<AgentGraphEffectCommandOutcome>
+    where
+        Store: DurableStateStore<WorkflowState>,
+        Clock: WorkflowClock,
+    {
+        ensure_command_kind(&command, "GraphReconciliationDecided")?;
+        validate_command_inbox_matches_run(&command, inbox)?;
+        ensure_decision_has_a_cause(&state, &command)?;
+        let acceptance = inbox.accept_command(command.clone()).await?;
+        let transition = apply_reconciliation_decision_command(plan, state, &command)?;
         Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
@@ -1412,6 +1460,77 @@ where
             effect_id: effect_id.clone(),
             status,
         }),
+    }
+}
+
+fn ensure_decision_has_a_cause(
+    state: &AgentGraphRunState,
+    command: &AgentCommand,
+) -> AgentGraphEffectBridgeResult<()> {
+    if let AgentCommandKind::GraphReconciliationDecided {
+        effect_id,
+        decision: AgentGraphReconciliationDecision::Abandon { error_code },
+    } = &command.kind
+    {
+        if error_code.trim().is_empty() {
+            let node_id = node_id_for_effect(state, effect_id)?;
+            return Err(AgentGraphEffectBridgeError::Scheduler {
+                error: AgentGraphSchedulerError::EmptyCauseCode { node_id },
+            });
+        }
+    }
+    Ok(())
+}
+
+fn apply_reconciliation_decision_command(
+    plan: &AgentCompiledExecutionPlan,
+    state: AgentGraphRunState,
+    command: &AgentCommand,
+) -> AgentGraphEffectBridgeResult<AgentGraphSchedulerTransition> {
+    validate_plan_state_for_command(plan, &state)?;
+    let (effect_id, decision) = match &command.kind {
+        AgentCommandKind::GraphReconciliationDecided {
+            effect_id,
+            decision,
+        } => (effect_id, decision),
+        _ => {
+            return Err(AgentGraphEffectBridgeError::UnexpectedCommandKind {
+                expected: "GraphReconciliationDecided",
+                actual: command.kind.type_name(),
+            });
+        }
+    };
+    let node_id = node_id_for_effect(&state, effect_id)?;
+    let node_state = state.node_states.get(&node_id).ok_or_else(|| {
+        AgentGraphEffectBridgeError::MissingNodeState {
+            node_id: node_id.clone(),
+        }
+    })?;
+    match node_state.status {
+        AgentGraphNodeStatus::Completed
+        | AgentGraphNodeStatus::Failed
+        | AgentGraphNodeStatus::Cancelled => return Ok(noop_transition(state)),
+        AgentGraphNodeStatus::Waiting
+            if node_state.wait_reason == Some(AgentGraphWaitReason::Reconciliation) => {}
+        status => {
+            return Err(AgentGraphEffectBridgeError::InvalidNodeStatus { node_id, status });
+        }
+    }
+
+    let received_at = command.metadata.received_at;
+    match decision {
+        AgentGraphReconciliationDecision::NotExecuted => {
+            Ok(AgentGraphScheduler::new().resume_parked_node(plan, state, node_id, received_at)?)
+        }
+        AgentGraphReconciliationDecision::Abandon { error_code } => Ok(AgentGraphScheduler::new()
+            .fail_waiting_node(
+                plan,
+                state,
+                node_id,
+                AgentGraphWaitReason::Reconciliation,
+                error_code.clone(),
+                received_at,
+            )?),
     }
 }
 

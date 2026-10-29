@@ -263,6 +263,11 @@ pub struct AgentGraphNodeState {
     /// Attempt count for this node.
     #[serde(default)]
     pub attempt: u32,
+    /// Effect generation this node is on: zero until a reconciliation
+    /// decision of `not-executed` re-offers it, then one more per re-offer.
+    /// Generations one and up suffix the node's effect id and dedupe key.
+    #[serde(default)]
+    pub effect_generation: u32,
     /// Whether required dependencies are satisfied.
     #[serde(default)]
     pub dependencies_ready: bool,
@@ -312,6 +317,7 @@ impl AgentGraphNodeState {
             kind,
             status: AgentGraphNodeStatus::Pending,
             attempt: 0,
+            effect_generation: 0,
             dependencies_ready: false,
             input_refs: BTreeMap::new(),
             output_refs: BTreeMap::new(),
@@ -490,6 +496,35 @@ impl AgentGraphWaitReason {
             Self::ChildWorkflow => "child-workflow",
             Self::Signal => "signal",
             Self::Reconciliation => "reconciliation",
+        }
+    }
+}
+
+/// A person's decision on a node parked for reconciliation.
+///
+/// Exhaustive on purpose: a consumer's match breaks at compile time when a
+/// decision is added. `Completed` is not a decision here, because what a
+/// completed node puts on its output port is undefined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum AgentGraphReconciliationDecision {
+    /// The call never ran: re-offer the node under a new effect generation.
+    NotExecuted,
+    /// Give the node up under a bounded code; the run fails as any failed
+    /// node fails it.
+    Abandon {
+        /// Stable bounded error code recorded on the node.
+        error_code: String,
+    },
+}
+
+impl AgentGraphReconciliationDecision {
+    /// Stable lowercase label for telemetry and query projections.
+    #[must_use]
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::NotExecuted => "not-executed",
+            Self::Abandon { .. } => "abandon",
         }
     }
 }
