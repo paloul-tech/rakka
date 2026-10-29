@@ -873,3 +873,87 @@ async fn a_definitive_failure_for_an_unknown_message_is_refused() {
         "{error:?}"
     );
 }
+
+#[tokio::test]
+async fn a_definitive_failure_exhausts_a_dispatching_or_dispatched_entry() {
+    // A dispatcher that learns only after a call began (`Dispatching`) or
+    // after it recorded the call sent (`Dispatched`) that the outcome is
+    // unknown records the entry exhausted before it reports the doubt, and a
+    // host relies on both prior statuses being admitted. Pinned so that a
+    // later status guard on this mutator keeps admitting them.
+    for (label, record_sent_first) in [("dispatching", false), ("dispatched", true)] {
+        let store = InMemoryDurableStateStore::<WorkflowState>::new();
+        let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(900));
+        let workflow_id = WorkflowId::new(format!("workflow-outbox-definitive-{label}"));
+        let mut workflow =
+            DurableInbox::with_clock(workflow_id.clone(), store.clone(), clock.clone());
+        workflow.recover().await.unwrap();
+        let message_id = OutboxMessageId::new("out-definitive");
+        workflow
+            .schedule_outbox(
+                OutboxCommand::new(
+                    "out-definitive",
+                    OutboxTarget::application("payments"),
+                    "Charge",
+                    b"payload".to_vec(),
+                )
+                .retry_policy(RetryPolicy::new(3, 10, 10)),
+            )
+            .await
+            .unwrap();
+        workflow.mark_outbox_dispatching(&message_id).await.unwrap();
+        if record_sent_first {
+            workflow.record_outbox_success(&message_id).await.unwrap();
+        }
+        let prior = store
+            .load(&workflow_id.persistence_id())
+            .await
+            .unwrap()
+            .expect("workflow state should be persisted")
+            .state
+            .outbox_entry(&message_id)
+            .unwrap()
+            .status();
+        assert_eq!(
+            prior,
+            if record_sent_first {
+                OutboxStatus::Dispatched
+            } else {
+                OutboxStatus::Dispatching
+            },
+            "{label}: the prior status the test means to exhaust over"
+        );
+
+        let event = workflow
+            .record_outbox_exhausted(&message_id, "outcome unknown")
+            .await
+            .unwrap_or_else(|error| panic!("{label}: the definitive failure is recorded: {error}"));
+
+        assert!(
+            matches!(
+                event,
+                WorkflowTelemetryEvent::OutboxDispatchExhausted { ref message, .. }
+                    if message == "outcome unknown"
+            ),
+            "{label}: {event:?}"
+        );
+        let persisted = store
+            .load(&workflow_id.persistence_id())
+            .await
+            .unwrap()
+            .expect("workflow state should be persisted");
+        let entry = persisted.state.outbox_entry(&message_id).unwrap();
+        assert_eq!(entry.status(), OutboxStatus::Exhausted, "{label}");
+        assert_eq!(entry.attempts().next_retry_at(), None, "{label}");
+        assert_eq!(
+            entry.attempts().last_error(),
+            Some("outcome unknown"),
+            "{label}"
+        );
+        clock.advance_millis(1_000);
+        assert!(
+            workflow.due_outbox().unwrap().is_empty(),
+            "{label}: an exhausted entry is never due again"
+        );
+    }
+}

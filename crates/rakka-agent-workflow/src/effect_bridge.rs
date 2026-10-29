@@ -13,7 +13,11 @@
 //! [`AgentGraphEffectBridgeError::EffectNotTerminal`] before acceptance. The
 //! dispatcher's contract: report an outcome-unknown exhaustion with
 //! `reconcile`, never with `exhausted` first (that fails the run for good),
-//! and record the entry exhausted before sending the command. A parked node
+//! and record the entry exhausted before sending the command. The exhaust
+//! mutator (`rakka-workflow`'s `record_outbox_exhausted`) admits an entry
+//! that is `Dispatching` or `Dispatched`, since the doubt can arise after the
+//! call began or after it was recorded sent; a `rakka-workflow` test pins
+//! that. A parked node
 //! still answers a real result: a late `EffectCompleted` completes it and a
 //! definitive `EffectFailed` fails it. The person's decision arrives as
 //! [`AgentCommandKind::GraphReconciliationDecided`] through
