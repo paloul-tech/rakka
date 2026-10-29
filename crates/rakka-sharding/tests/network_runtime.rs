@@ -1054,3 +1054,99 @@ async fn wait_for(mut condition: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+#[tokio::test]
+async fn networked_runtime_answers_an_ask_for_a_shard_it_handed_off_with_entity_not_local() {
+    // Node A's owner cache still names node B after B handed the shard off, so
+    // the ask reaches a node whose region no longer owns it. B's region would
+    // forward the ask, and its local reply handle cannot be encoded, which
+    // surfaced as `entity-remote-encode`, a code the asker treats as final.
+    // The node answers `entity-not-local` instead: the ask never entered a
+    // mailbox, and a retry on a refreshed owner can succeed.
+    let registry = cart_registry();
+    let Some((mut node_a, mut node_b)) = build_runtime_pair(registry).await else {
+        return;
+    };
+    let node_b_id = node_b.local_node().id().clone();
+    let entity_type = EntityType::new("CartAskHandedOff");
+    let config = ShardingConfig::new(8).expect("valid sharding config");
+    let region_a = ShardRegion::new(
+        entity_type.clone(),
+        config.clone(),
+        |_message: RoutedEntityMessage<CartAskCommand>| Ok(()),
+    );
+    let system_b = ActorSystem::new("networked-ask-handed-off-node-b");
+    let route_b = LocalEntityRoute::new(
+        node_b_id.clone(),
+        system_b.clone(),
+        |context: LocalEntityContext| AskCartEntity { context },
+    );
+    let region_b = ShardRegion::new(
+        entity_type.clone(),
+        config.clone(),
+        node_b.remote_route(route_b.clone()),
+    );
+
+    node_a
+        .register_region(region_a.clone())
+        .expect("node a owner cache region should register");
+    node_b
+        .register_entity_ask_region::<CartGet, CartAskCommand, CartReply, _>(
+            region_b,
+            |request, reply_to| CartAskCommand::Get {
+                prefix: request.prefix,
+                reply_to,
+            },
+        )
+        .expect("node b ask region should register");
+    apply_pair_discovery(&mut node_a, &mut node_b);
+
+    let entity_id = entity_owned_by(&node_a, &entity_type, node_b_id.logical_id());
+    let entity = EntityRef::<CartAskCommand>::new(entity_type, entity_id.clone());
+    let reply: CartReply = node_a
+        .ask_client()
+        .ask(
+            &region_a,
+            &entity,
+            CartGet {
+                prefix: "total".to_string(),
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the owner should answer while it owns the shard");
+    assert_eq!(reply.summary, format!("{}:total", entity_id.as_str()));
+
+    // Only node B learns of its own leave; node A keeps routing the entity to B.
+    node_b
+        .mark_leaving(&node_b_id, 3)
+        .expect("node b should begin graceful leave");
+
+    let outcome: Result<Result<CartReply, RemoteEntityAskError>, _> = tokio::time::timeout(
+        Duration::from_secs(1),
+        node_a.ask_client().ask(
+            &region_a,
+            &entity,
+            CartGet {
+                prefix: "total".to_string(),
+            },
+            Duration::from_secs(5),
+        ),
+    )
+    .await;
+    let error = outcome
+        .expect("the node should answer the misrouted ask well within its timeout")
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            RemoteEntityAskError::Reply {
+                error: RemoteRequestError::Rejected { code, .. },
+            } if code == "entity-not-local"
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(node_a.requests().pending_count(), 0);
+
+    system_b.shutdown();
+}
