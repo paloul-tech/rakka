@@ -3,6 +3,13 @@
 //! The scheduler is intentionally side-effect free in this slice. It evaluates
 //! a compiled plan against durable graph state and returns updated state for
 //! the caller to persist before any node work is executed.
+//!
+//! Two transitions serve the reconciliation park:
+//! [`AgentGraphScheduler::park_waiting_node`] moves a waiting node onto a
+//! person (`Waiting` on `Reconciliation`, cause recorded, schema version
+//! raised to the current one) and [`AgentGraphScheduler::resume_parked_node`]
+//! moves it back to `Running` on its next effect generation. Abandoning a
+//! parked node is the ordinary `fail_waiting_node` on `Reconciliation`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;

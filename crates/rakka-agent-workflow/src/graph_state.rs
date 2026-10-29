@@ -3,6 +3,14 @@
 //! These types are persisted with graph-backed agent runs so a scheduler can
 //! recover deterministic execution state after passivation, restart, or
 //! dispatcher redelivery. Large values are represented by `ArtifactRef`.
+//!
+//! A node whose effect may have run and whose outcome nobody can state is
+//! parked on a person: still [`AgentGraphNodeStatus::Waiting`], with
+//! [`AgentGraphWaitReason::Reconciliation`] and the cause in `error_code`.
+//! An [`AgentGraphReconciliationDecision`] resolves it: `not-executed`
+//! re-offers the node under the next `effect_generation`, `abandon` fails
+//! it. Schema version 2 is the version that carries these values; see the
+//! compatibility doc for the rollout.
 
 use std::collections::BTreeMap;
 

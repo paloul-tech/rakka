@@ -3,6 +3,38 @@
 //! This module maps effect-producing compiled graph nodes to first-class
 //! [`AgentEffect`] values and schedules them through the existing durable
 //! outbox boundary. It does not dispatch external work directly.
+//!
+//! # The reconciliation park
+//!
+//! An effect whose call may have run and whose answer was lost is reported
+//! with [`AgentGraphEffectFailureDisposition::Reconcile`]; the bridge parks
+//! the node on a person, but only once the effect's outbox entry is terminal
+//! and never due (`Exhausted` or `Cancelled`), refusing otherwise with
+//! [`AgentGraphEffectBridgeError::EffectNotTerminal`] before acceptance. The
+//! dispatcher's contract: report an outcome-unknown exhaustion with
+//! `reconcile`, never with `exhausted` first (that fails the run for good),
+//! and record the entry exhausted before sending the command. A parked node
+//! still answers a real result: a late `EffectCompleted` completes it and a
+//! definitive `EffectFailed` fails it. The person's decision arrives as
+//! [`AgentCommandKind::GraphReconciliationDecided`] through
+//! [`AgentGraphEffectBridge::accept_and_apply_reconciliation_decision`]:
+//! `not-executed` resumes the node on its next effect generation and
+//! `abandon` fails the node and the run (`reconciliation-abandoned` is the
+//! recommended code).
+//!
+//! # Effect generations
+//!
+//! [`AgentGraphEffectBridge::effect_from_node_in_state`] mints the effect
+//! under the node's `effect_generation`. Generation zero is exactly what
+//! [`AgentGraphEffectBridge::effect_from_node`] yields, so no stored id
+//! moves; from generation one the effect id and dedupe key carry `;gen={g}`,
+//! a new outbox entry with a fresh retry budget, while the idempotency key
+//! follows the target's declared safety class
+//! ([`ATTR_AGENT_EFFECT_SAFETY_CLASS`]). Every effect-keyed command is fenced
+//! by the generation read back from its effect id: a superseded generation's
+//! command is a no-op. A node's attempt bound travels as the target attribute
+//! [`crate::ATTR_AGENT_EFFECT_MAX_ATTEMPTS`], validated here and applied by
+//! the shared outbox conversion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
