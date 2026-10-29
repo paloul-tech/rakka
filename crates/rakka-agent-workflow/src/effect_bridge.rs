@@ -2002,6 +2002,11 @@ fn effect_from_node_for_generation(
     let target = effect_target_for_node(plan, node, request)?;
     let target_class = target_class_from_attributes(&target.attributes, node.kind);
     let generation_zero_identity = effect_identity(plan, node, request, kind, &target_class);
+    ensure_identity_reads_as_generation_zero(
+        &node.node_id,
+        &target_class,
+        &generation_zero_identity,
+    )?;
     let identity = effect_identity_for_generation(&generation_zero_identity, generation);
     let safety_class = node
         .target
@@ -2371,11 +2376,35 @@ fn effect_identity_for_generation(generation_zero_identity: &str, generation: u3
 /// The generation an effect id was minted under, read back from its
 /// trailing `;gen={g}`; zero when the suffix is absent or unparsable.
 fn effect_generation_of(effect_id: &AgentEffectId) -> u32 {
-    effect_id
-        .as_str()
+    generation_read_from(effect_id.as_str())
+}
+
+fn generation_read_from(identity: &str) -> u32 {
+    identity
         .rsplit_once(EFFECT_GENERATION_SUFFIX)
         .and_then(|(_, generation)| generation.parse::<u32>().ok())
         .unwrap_or(0)
+}
+
+/// The bridge never mints an id its own fence would misread: the identity
+/// ends with the plan's free-form `target_class`, so a class ending in
+/// `;gen=<n>` would make a generation-0 id read as generation `n` and the
+/// node's own outcome would be fenced as superseded. Such a plan is refused
+/// at every generation.
+fn ensure_identity_reads_as_generation_zero(
+    node_id: &AgentCompiledNodeId,
+    target_class: &str,
+    generation_zero_identity: &str,
+) -> AgentGraphEffectBridgeResult<()> {
+    if generation_read_from(generation_zero_identity) == 0 {
+        return Ok(());
+    }
+    Err(AgentGraphEffectBridgeError::InvalidCompiledPlan {
+        validation_code: "invalid-effect-target-class",
+        reason: format!(
+            "node `{node_id}` has target class `{target_class}`, which ends in `{EFFECT_GENERATION_SUFFIX}<n>` and would make its effect id read as another generation"
+        ),
+    })
 }
 
 /// The idempotency key for one generation by the target's declared safety

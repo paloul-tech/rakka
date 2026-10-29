@@ -1619,6 +1619,45 @@ async fn reconcile_parks_a_child_workflow_node_too() {
     assert_eq!(node.wait_reason, Some(AgentGraphWaitReason::Reconciliation));
     assert_eq!(node.error_code.as_deref(), Some("child-outcome-unknown"));
     assert_eq!(outcome.transition.state.terminal_status, None);
+
+    // ... and is resumed by the same path: not-executed opens generation 1,
+    // whose schedule waits on the child workflow again.
+    let decision = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-child",
+        &effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+    let resumed = bridge
+        .accept_and_apply_reconciliation_decision(
+            &plan,
+            outcome.transition.state,
+            decision,
+            &mut inbox,
+        )
+        .await
+        .expect("not-executed should resume the child workflow node");
+    let node = node_state(&resumed.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Running);
+    assert_eq!(node.effect_generation, 1);
+    let second = bridge
+        .schedule_node_effect(
+            &plan,
+            resumed.transition.state,
+            effect_request(run_id, "effect", 500),
+            &mut inbox,
+        )
+        .await
+        .expect("generation 1 of the child workflow should schedule");
+    assert!(second.acceptance.is_scheduled());
+    assert!(second.effect.effect_id.as_str().ends_with(";gen=1"));
+    assert_eq!(second.effect.kind, AgentEffectKind::ChildWorkflowCommand);
+    assert_eq!(
+        node_state(&second.transition.state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::ChildWorkflow)
+    );
 }
 
 #[tokio::test]
@@ -2565,4 +2604,67 @@ async fn an_invalid_bound_is_refused_at_schedule() {
             .expect("due effects should read")
             .is_empty());
     }
+}
+
+#[tokio::test]
+async fn a_target_class_that_reads_as_a_generation_is_refused_at_schedule() {
+    // The fence reads the generation back from the id's trailing `;gen=<n>`,
+    // and the identity ends with the free-form `target_class`. A class ending
+    // in `;gen=3` would mint a generation-0 id that reads as generation 3, so
+    // the node's own completion would be fenced as superseded and silently
+    // dropped. The bridge must never mint an id its own fence misreads.
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "payments.charge",
+        "payments;gen=3",
+    );
+    let run_id = AgentRunId::new("run-graph-target-class-reads-as-generation");
+    let request = effect_request(run_id.clone(), "effect", 200);
+
+    let error = bridge
+        .effect_from_node(&plan, &request)
+        .expect_err("a generation-0 id that reads as generation 3 must not be minted");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::InvalidCompiledPlan {
+                validation_code: "invalid-effect-target-class",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+
+    let mut state = running_effect_state(&plan);
+    state
+        .node_states
+        .get_mut(&AgentCompiledNodeId::new("effect"))
+        .expect("effect node should exist")
+        .effect_generation = 1;
+    let error = bridge
+        .effect_from_node_in_state(&plan, &state, &request)
+        .expect_err("the same target class is refused at generation 1 too");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::InvalidCompiledPlan {
+                validation_code: "invalid-effect-target-class",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+
+    let mut inbox = recovered_inbox(&run_id).await;
+    let error = bridge
+        .schedule_node_effect(&plan, running_effect_state(&plan), request, &mut inbox)
+        .await
+        .expect_err("the schedule is refused before anything reaches the outbox");
+    assert_eq!(error.code(), "invalid-compiled-plan");
+    assert!(inbox
+        .due_effects()
+        .expect("due effects should read")
+        .is_empty());
 }
