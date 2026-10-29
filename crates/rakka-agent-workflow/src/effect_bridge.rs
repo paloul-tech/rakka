@@ -37,6 +37,18 @@ const ATTR_TARGET_CLASS: &str = "target_class";
 const ROOT_LOOP_INSTANCE_ID: &str = "root";
 const ATTR_FAILURE_DISPOSITION: &str = "failure_disposition";
 const ATTR_DECISION_STATUS: &str = "decision_status";
+const EFFECT_GENERATION_SUFFIX: &str = ";gen=";
+
+/// Node-target attribute naming the effect's safety class, in `rakka-agent`'s
+/// dispatch-ticket vocabulary: `read-only`, `idempotent`, `non-idempotent` or
+/// `reconcileable`.
+///
+/// The bridge reads it when it mints an effect generation above zero: only
+/// `idempotent` gets a generation-suffixed idempotency key; every other class,
+/// and an absent attribute, keeps the generation-zero key so a target that
+/// deduplicates by key refuses to run the call a second time. Any other value
+/// refuses the schedule with `invalid-effect-safety-class`.
+pub const ATTR_AGENT_EFFECT_SAFETY_CLASS: &str = "agent_effect_safety_class";
 
 /// Result type for compiled graph effect bridge operations.
 pub type AgentGraphEffectBridgeResult<T> = Result<T, AgentGraphEffectBridgeError>;
@@ -726,7 +738,34 @@ impl AgentGraphEffectBridge {
     ) -> AgentGraphEffectBridgeResult<AgentEffect> {
         validate_plan(plan)?;
         let node = ensure_known_node(plan, &request.node_id)?;
-        effect_from_node(plan, node, request)
+        effect_from_node_for_generation(plan, node, request, 0)
+    }
+
+    /// Maps a compiled graph node to a scheduled effect under the effect
+    /// generation the durable state has opened for it.
+    ///
+    /// At generation zero this is exactly [`Self::effect_from_node`]. From
+    /// generation one (opened by a `not-executed` reconciliation decision)
+    /// the effect id and dedupe key carry a `;gen={g}` suffix, so the
+    /// re-offer is a new outbox entry with a fresh retry budget, and the
+    /// idempotency key follows the target's declared safety class
+    /// ([`ATTR_AGENT_EFFECT_SAFETY_CLASS`]).
+    pub fn effect_from_node_in_state(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        state: &AgentGraphRunState,
+        request: &AgentGraphEffectScheduleRequest,
+    ) -> AgentGraphEffectBridgeResult<AgentEffect> {
+        validate_plan(plan)?;
+        let node = ensure_known_node(plan, &request.node_id)?;
+        let generation = state
+            .node_states
+            .get(&request.node_id)
+            .map(|node_state| node_state.effect_generation)
+            .ok_or_else(|| AgentGraphEffectBridgeError::MissingNodeState {
+                node_id: request.node_id.clone(),
+            })?;
+        effect_from_node_for_generation(plan, node, request, generation)
     }
 
     /// Schedules one running graph node as a durable outbox effect.
@@ -747,7 +786,7 @@ impl AgentGraphEffectBridge {
     {
         validate_plan_state(plan, &state)?;
         validate_inbox_matches_run(&request, inbox)?;
-        let effect = self.effect_from_node(plan, &request)?;
+        let effect = self.effect_from_node_in_state(plan, &state, &request)?;
         let wait_reason = wait_reason_for_effect_node(plan, &request.node_id)?;
         ensure_node_can_schedule_effect(&state, &request.node_id, &effect.effect_id, wait_reason)?;
 
@@ -1506,6 +1545,9 @@ fn apply_reconciliation_decision_command(
             node_id: node_id.clone(),
         }
     })?;
+    if effect_generation_of(effect_id) != node_state.effect_generation {
+        return Ok(noop_transition(state));
+    }
     match node_state.status {
         AgentGraphNodeStatus::Completed
         | AgentGraphNodeStatus::Failed
@@ -1568,6 +1610,9 @@ fn apply_effect_completed_command(
             node_id: node_id.clone(),
         }
     })?;
+    if effect_generation_of(effect_id) != node_state.effect_generation {
+        return Ok(noop_transition(state));
+    }
     if node_state.status == AgentGraphNodeStatus::Completed {
         return Ok(noop_transition(state));
     }
@@ -1615,6 +1660,9 @@ fn apply_effect_failed_command(
             node_id: node_id.clone(),
         }
     })?;
+    if effect_generation_of(effect_id) != node_state.effect_generation {
+        return Ok(noop_transition(state));
+    }
     if matches!(
         node_state.status,
         AgentGraphNodeStatus::Failed | AgentGraphNodeStatus::Cancelled
@@ -1898,15 +1946,28 @@ fn ensure_node_can_open_checkpoint(
     })
 }
 
-fn effect_from_node(
+fn effect_from_node_for_generation(
     plan: &AgentCompiledExecutionPlan,
     node: &AgentCompiledPlanNode,
     request: &AgentGraphEffectScheduleRequest,
+    generation: u32,
 ) -> AgentGraphEffectBridgeResult<AgentEffect> {
     let kind = effect_kind_for_node(node)?;
     let target = effect_target_for_node(plan, node, request)?;
     let target_class = target_class_from_attributes(&target.attributes, node.kind);
-    let identity = effect_identity(plan, node, request, kind, &target_class);
+    let generation_zero_identity = effect_identity(plan, node, request, kind, &target_class);
+    let identity = effect_identity_for_generation(&generation_zero_identity, generation);
+    let safety_class = node
+        .target
+        .as_ref()
+        .and_then(|target| target.attributes.get(ATTR_AGENT_EFFECT_SAFETY_CLASS))
+        .map(String::as_str);
+    let idempotency_key = idempotency_key_for(
+        &node.node_id,
+        &generation_zero_identity,
+        &identity,
+        safety_class,
+    )?;
     let durability = AgentDurabilityMetadata::new(
         AgentDeduplicationKey::new(format!("graph-effect-dedupe:{identity}")),
         request.causation_id.clone(),
@@ -1916,7 +1977,7 @@ fn effect_from_node(
     let mut metadata = AgentEffectMetadata::new(
         AgentEffectId::new(format!("graph-effect:{identity}")),
         durability,
-        AgentIdempotencyKey::new(format!("graph-effect-idempotency:{identity}")),
+        AgentIdempotencyKey::new(idempotency_key),
         request.created_at,
     )?;
     if let Some(due_at) = request.due_at {
@@ -2222,6 +2283,49 @@ fn effect_identity(
         kind.as_label(),
         target_class
     )
+}
+
+/// The identity for one effect generation: the generation-zero identity
+/// itself at zero, so no stored id moves, and `{identity};gen={g}` from one.
+fn effect_identity_for_generation(generation_zero_identity: &str, generation: u32) -> String {
+    if generation == 0 {
+        generation_zero_identity.to_string()
+    } else {
+        format!("{generation_zero_identity}{EFFECT_GENERATION_SUFFIX}{generation}")
+    }
+}
+
+/// The generation an effect id was minted under, read back from its
+/// trailing `;gen={g}`; zero when the suffix is absent or unparsable.
+fn effect_generation_of(effect_id: &AgentEffectId) -> u32 {
+    effect_id
+        .as_str()
+        .rsplit_once(EFFECT_GENERATION_SUFFIX)
+        .and_then(|(_, generation)| generation.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// The idempotency key for one generation by the target's declared safety
+/// class: suffixed for `idempotent`, the bare generation-zero key for
+/// `non-idempotent`, `reconcileable`, `read-only` and an absent class.
+fn idempotency_key_for(
+    node_id: &AgentCompiledNodeId,
+    generation_zero_identity: &str,
+    identity: &str,
+    safety_class: Option<&str>,
+) -> AgentGraphEffectBridgeResult<String> {
+    match safety_class {
+        Some("idempotent") => Ok(format!("graph-effect-idempotency:{identity}")),
+        None | Some("non-idempotent" | "reconcileable" | "read-only") => Ok(format!(
+            "graph-effect-idempotency:{generation_zero_identity}"
+        )),
+        Some(other) => Err(AgentGraphEffectBridgeError::InvalidCompiledPlan {
+            validation_code: "invalid-effect-safety-class",
+            reason: format!(
+                "node `{node_id}` declares `{ATTR_AGENT_EFFECT_SAFETY_CLASS}` = `{other}`; expected read-only, idempotent, non-idempotent or reconcileable"
+            ),
+        }),
+    }
 }
 
 fn timer_identity(

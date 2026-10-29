@@ -161,7 +161,7 @@ pub use effect_bridge::{
     AgentGraphEffectCommandOutcome, AgentGraphEffectFailureDisposition,
     AgentGraphEffectScheduleOutcome, AgentGraphEffectScheduleRequest,
     AgentGraphHumanCheckpointScheduleOutcome, AgentGraphHumanCheckpointScheduleRequest,
-    AgentGraphTimerScheduleOutcome, AgentGraphTimerScheduleRequest,
+    AgentGraphTimerScheduleOutcome, AgentGraphTimerScheduleRequest, ATTR_AGENT_EFFECT_SAFETY_CLASS,
 };
 pub use facade::{
     validate_command, validate_command_metadata, validate_effect_metadata,
