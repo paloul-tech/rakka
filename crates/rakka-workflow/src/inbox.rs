@@ -661,6 +661,12 @@ where
     /// For a failure its reporter declared definitive. In every other respect
     /// it is [`Self::record_outbox_failure`]: the same recovered-record
     /// compare-and-set, the same refusal of an unknown message id.
+    ///
+    /// The entry may be in any status, `Dispatching` and `Dispatched`
+    /// included: a dispatcher that learns only after a call began, or after
+    /// it recorded the call sent, that the outcome is unknown records the
+    /// entry exhausted before it reports the doubt. A test pins that both
+    /// are admitted, because a host relies on it.
     pub async fn record_outbox_exhausted(
         &mut self,
         message_id: &OutboxMessageId,
