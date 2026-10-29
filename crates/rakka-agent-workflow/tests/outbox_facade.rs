@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata,
-    AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule,
-    AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey, AgentOutboxDuplicateReason,
-    AgentRunId, AgentRunInbox, AgentSpanLink, AgentTelemetryContext, AgentTimestampMillis,
-    METRIC_AGENT_OUTBOX_EFFECTS,
+    agent_effect_to_outbox_command, AgentCausationId, AgentCorrelationId, AgentDeduplicationKey,
+    AgentDurabilityMetadata, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
+    AgentEffectSchedule, AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey,
+    AgentOutboxDuplicateReason, AgentRunId, AgentRunInbox, AgentSpanLink, AgentTelemetryContext,
+    AgentTimestampMillis, METRIC_AGENT_OUTBOX_EFFECTS,
 };
 use rakka_core::InMemoryMetricsRecorder;
 use rakka_persistence::InMemoryDurableStateStore;
@@ -281,4 +281,33 @@ fn target() -> AgentEffectTarget {
         address: Some("tool://research".to_string()),
         attributes: BTreeMap::from([("tool_kind".to_string(), "research".to_string())]),
     }
+}
+
+#[test]
+fn outbox_command_reads_the_attempt_bound_leniently() {
+    let bound = |value: Option<&str>| {
+        let mut effect = effect("effect-bounded-1", "dedupe-bounded-1", None);
+        if let Some(value) = value {
+            effect
+                .target
+                .attributes
+                .insert("agent_effect_max_attempts".to_string(), value.to_string());
+        }
+        agent_effect_to_outbox_command(&effect)
+            .expect("effect should convert")
+            .retry_policy_value()
+    };
+
+    let default = rakka_workflow::RetryPolicy::default();
+    assert_eq!(bound(None).max_attempts(), default.max_attempts());
+    assert_eq!(bound(None).max_attempts(), 3);
+    assert_eq!(bound(Some("many")).max_attempts(), 3);
+    assert_eq!(bound(Some("0")).max_attempts(), 3);
+    let four = bound(Some("4"));
+    assert_eq!(four.max_attempts(), 4);
+    assert_eq!(
+        four.initial_backoff_millis(),
+        default.initial_backoff_millis()
+    );
+    assert_eq!(four.max_backoff_millis(), default.max_backoff_millis());
 }

@@ -2433,3 +2433,136 @@ async fn a_second_re_offer_opens_generation_two() {
         vec![first_effect_id, second_effect_id, third.effect.effect_id]
     );
 }
+
+// ---- the declared attempt bound (issue #110 optional ask) ----
+
+fn attempt_bound(inbox: &TestInbox, effect_id: &AgentEffectId) -> u32 {
+    inbox
+        .inner()
+        .state()
+        .expect("inbox should be recovered")
+        .outbox_entry(&message_id(effect_id))
+        .expect("outbox entry should exist")
+        .retry_policy()
+        .max_attempts()
+}
+
+fn bounded_payments_plan(max_attempts: &str) -> AgentCompiledExecutionPlan {
+    effect_plan_with(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "payments.charge",
+        "payments",
+        &[("agent_effect_max_attempts", max_attempts)],
+    )
+}
+
+#[tokio::test]
+async fn declared_max_attempts_reach_the_outbox_entry() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = bounded_payments_plan("5");
+    let run_id = AgentRunId::new("run-graph-declared-attempts");
+    let mut inbox = recovered_inbox(&run_id).await;
+
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            running_effect_state(&plan),
+            effect_request(run_id, "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should schedule");
+
+    assert_eq!(attempt_bound(&inbox, &scheduled.effect.effect_id), 5);
+    assert_eq!(
+        scheduled
+            .effect
+            .target
+            .attributes
+            .get("agent_effect_max_attempts")
+            .map(String::as_str),
+        Some("5")
+    );
+}
+
+#[tokio::test]
+async fn request_max_attempts_override_the_declared_bound() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = bounded_payments_plan("5");
+    let run_id = AgentRunId::new("run-graph-request-attempts");
+    let mut inbox = recovered_inbox(&run_id).await;
+
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            running_effect_state(&plan),
+            effect_request(run_id, "effect", 200).max_attempts(2),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should schedule");
+
+    assert_eq!(attempt_bound(&inbox, &scheduled.effect.effect_id), 2);
+    assert_eq!(
+        scheduled
+            .effect
+            .target
+            .attributes
+            .get("agent_effect_max_attempts")
+            .map(String::as_str),
+        Some("2")
+    );
+}
+
+#[tokio::test]
+async fn absent_bound_keeps_the_default_of_three() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-default-attempts");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, _state) = schedule_effect(&bridge, &plan, &run_id, &mut inbox).await;
+    assert_eq!(attempt_bound(&inbox, &effect_id), 3);
+}
+
+#[tokio::test]
+async fn an_invalid_bound_is_refused_at_schedule() {
+    let bridge = AgentGraphEffectBridge::new();
+    for (plan_value, request_value) in [
+        ("0", None),
+        ("many", None),
+        ("-1", None),
+        (" ", None),
+        ("5", Some(0)),
+    ] {
+        let plan = bounded_payments_plan(plan_value);
+        let run_id = AgentRunId::new(format!(
+            "run-graph-invalid-attempts-{}",
+            plan_value.trim().replace('-', "neg")
+        ));
+        let mut inbox = recovered_inbox(&run_id).await;
+        let mut request = effect_request(run_id, "effect", 200);
+        if let Some(value) = request_value {
+            request = request.max_attempts(value);
+        }
+
+        let error = bridge
+            .schedule_node_effect(&plan, running_effect_state(&plan), request, &mut inbox)
+            .await
+            .expect_err("an invalid attempt bound should be refused");
+        assert!(
+            matches!(
+                &error,
+                AgentGraphEffectBridgeError::InvalidCompiledPlan {
+                    validation_code: "invalid-effect-max-attempts",
+                    ..
+                }
+            ),
+            "{plan_value:?}/{request_value:?}: {error:?}"
+        );
+        assert!(inbox
+            .due_effects()
+            .expect("due effects should read")
+            .is_empty());
+    }
+}

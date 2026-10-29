@@ -2984,6 +2984,10 @@ mod tests {
             super::ATTR_AGENT_EFFECT_SAFETY_CLASS,
             rakka_agent_workflow::ATTR_AGENT_EFFECT_SAFETY_CLASS
         );
+        assert_eq!(
+            super::ATTR_AGENT_EFFECT_MAX_ATTEMPTS,
+            rakka_agent_workflow::ATTR_AGENT_EFFECT_MAX_ATTEMPTS
+        );
     }
 
     /// A tool result persisted before the tool and effect provenance fields

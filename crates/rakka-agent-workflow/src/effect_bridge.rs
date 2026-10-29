@@ -26,7 +26,8 @@ use crate::{
     AgentRunInbox, AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerError,
     AgentTimerId, AgentTimerPolicy, AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis,
     ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
+    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE, ATTR_AGENT_EFFECT_MAX_ATTEMPTS,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 
 const ATTR_COMPILED_NODE_ID: &str = "compiled_node_id";
@@ -385,6 +386,10 @@ pub struct AgentGraphEffectScheduleRequest {
     pub timeout_ms: Option<u64>,
     /// Expected result type name.
     pub expected_result_type: Option<String>,
+    /// Attempt bound for this schedule; written onto the effect target as
+    /// [`ATTR_AGENT_EFFECT_MAX_ATTEMPTS`] and winning over the plan's value.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
     /// Effect creation timestamp.
     pub created_at: AgentTimestampMillis,
     /// Command or event that caused this effect.
@@ -413,11 +418,20 @@ impl AgentGraphEffectScheduleRequest {
             due_at: None,
             timeout_ms: None,
             expected_result_type: None,
+            max_attempts: None,
             created_at,
             causation_id,
             correlation_id,
             telemetry_context: AgentTelemetryContext::default(),
         }
+    }
+
+    /// Sets the attempt bound for this schedule, overriding the bound the
+    /// plan declares on the node target. Zero is refused at schedule time.
+    #[must_use]
+    pub const fn max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = Some(max_attempts);
+        self
     }
 
     /// Sets a deterministic loop instance id.
@@ -2238,6 +2252,13 @@ fn effect_target_for_node(
             binding_ref.as_str().to_string(),
         );
     }
+    if let Some(max_attempts) = request.max_attempts {
+        attributes.insert(
+            ATTR_AGENT_EFFECT_MAX_ATTEMPTS.to_string(),
+            max_attempts.to_string(),
+        );
+    }
+    validate_max_attempts(&node.node_id, &attributes)?;
 
     Ok(AgentEffectTarget {
         target_type: target.target_type.clone(),
@@ -2245,6 +2266,26 @@ fn effect_target_for_node(
         address: target.address.clone(),
         attributes,
     })
+}
+
+/// Refuses an attempt bound that is not a positive decimal integer, so a
+/// graph effect never reaches the lenient outbox conversion with a bad bound.
+fn validate_max_attempts(
+    node_id: &AgentCompiledNodeId,
+    attributes: &BTreeMap<String, String>,
+) -> AgentGraphEffectBridgeResult<()> {
+    let Some(value) = attributes.get(ATTR_AGENT_EFFECT_MAX_ATTEMPTS) else {
+        return Ok(());
+    };
+    match value.parse::<u32>() {
+        Ok(max_attempts) if max_attempts > 0 => Ok(()),
+        _ => Err(AgentGraphEffectBridgeError::InvalidCompiledPlan {
+            validation_code: "invalid-effect-max-attempts",
+            reason: format!(
+                "node `{node_id}` declares `{ATTR_AGENT_EFFECT_MAX_ATTEMPTS}` = `{value}`; expected a positive decimal integer"
+            ),
+        }),
+    }
 }
 
 fn target_class(target: &AgentCompiledNodeTarget, kind: AgentCompiledNodeKind) -> String {
