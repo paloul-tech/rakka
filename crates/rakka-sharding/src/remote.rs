@@ -690,7 +690,8 @@ where
         // owner cache is stale across a handoff), the region would try to
         // forward it and fail to encode it, which the asker would read as a
         // final failure. Answer that the ask never entered a mailbox instead,
-        // naming the owner this node knows, so the asker retries there.
+        // naming the owner this node knows, so the asker retries once its own
+        // owner cache moves.
         if let Ok((owner, _shard_id)) = self.region.resolve(&entity) {
             if owner != self.local_node_id {
                 return Err(RemoteEntityAskInboundError::Delivery {
@@ -701,9 +702,11 @@ where
                 });
             }
         }
-        self.region
-            .tell(&entity, message)
-            .map_err(|error| RemoteEntityAskInboundError::Delivery { error })?;
+        self.region.tell(&entity, message).map_err(|error| {
+            RemoteEntityAskInboundError::Delivery {
+                error: refuse_forwarded_ask(&self.region, &self.local_node_id, &entity, error),
+            }
+        })?;
 
         let local_node_id = self.local_node_id.clone();
         let registry = self.registry.clone();
@@ -726,6 +729,43 @@ where
             }
         });
         Ok(())
+    }
+}
+
+/// Answers a forward the region attempted for an inbound ask as `NotLocal`.
+///
+/// The owner pre-check in `handle_request` and the region's own owner read in
+/// `tell` take the owner cache separately, so ownership can move between them.
+/// The region then tries to forward the ask over its remote route and fails to
+/// encode its local reply handle. An inbound ask is never forwarded, so that
+/// failure means this node does not own the shard: it is answered with the
+/// owner the region knows now, a code the asker treats as never entered. The
+/// encode failure stands only when the owner has moved back to this node or
+/// is unknown by then. Any other failure passes through unchanged.
+fn refuse_forwarded_ask<M>(
+    region: &ShardRegion<M>,
+    local_node_id: &NodeId,
+    entity: &EntityRef<M>,
+    error: EntityTellError<M>,
+) -> EntityTellError<M>
+where
+    M: Message,
+{
+    match error {
+        EntityTellError::Delivery {
+            failure: EntityDeliveryFailure::RemoteEncode(detail),
+            message,
+        } => match region.resolve(entity) {
+            Ok((owner, _shard_id)) if &owner != local_node_id => EntityTellError::Delivery {
+                failure: EntityDeliveryFailure::NotLocal { owner },
+                message,
+            },
+            _ => EntityTellError::Delivery {
+                failure: EntityDeliveryFailure::RemoteEncode(detail),
+                message,
+            },
+        },
+        other => other,
     }
 }
 
@@ -990,5 +1030,146 @@ impl<M> From<&RoutedEntityMessage<M>> for RemoteRoutedEntityMessage<M> {
             entity_id: message.entity_id().clone(),
             message: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rakka_cluster::{
+        ClusterMembership, ClusterNode, DiscoverySnapshot, MembershipConfig, NodeAddress,
+    };
+
+    use super::*;
+    use crate::{EntityId, ShardCoordinator, ShardingConfig};
+
+    #[derive(Debug)]
+    struct Ask(#[allow(dead_code)] ReplyTo<String>);
+
+    fn node(logical_id: &str, incarnation: &str) -> ClusterNode {
+        ClusterNode::new(
+            NodeId::new(logical_id, incarnation),
+            NodeAddress::new(format!("{logical_id}.rakka.default.svc"), 2552),
+        )
+    }
+
+    fn membership_with_up_nodes(nodes: Vec<ClusterNode>) -> ClusterMembership {
+        let local = nodes[0].clone();
+        let mut membership = ClusterMembership::new(
+            local,
+            MembershipConfig::new(1, Duration::from_millis(50), Duration::from_millis(100)),
+        );
+        membership
+            .record_discovery(DiscoverySnapshot::new("test", 1, nodes))
+            .expect("discovery should record");
+        for member in membership
+            .snapshot()
+            .members()
+            .iter()
+            .map(|member| member.node().id().clone())
+            .collect::<Vec<_>>()
+        {
+            membership.mark_up(&member, 2).expect("member should go up");
+        }
+        membership
+    }
+
+    /// A region whose owner cache names `rakka-0` and `rakka-1`, and an entity
+    /// owned by `rakka-0`.
+    fn region_and_entity_owned_by_rakka_0() -> (ShardRegion<Ask>, EntityRef<Ask>) {
+        let entity_type = EntityType::new("Cart");
+        let config = ShardingConfig::new(8).expect("valid sharding config");
+        let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+        coordinator.reconcile(&membership_with_up_nodes(vec![
+            node("rakka-0", "uid-a"),
+            node("rakka-1", "uid-b"),
+        ]));
+        let entity_id = (0..1024)
+            .map(|index| EntityId::new(format!("cart-{index}")))
+            .find(|entity_id| {
+                coordinator
+                    .owner_for_entity(entity_id)
+                    .expect("entity should have an owner")
+                    .logical_id()
+                    == "rakka-0"
+            })
+            .expect("some entity is owned by rakka-0");
+        let region = ShardRegion::from_snapshot(
+            entity_type.clone(),
+            config,
+            &coordinator.snapshot(),
+            |_message: RoutedEntityMessage<Ask>| Ok(()),
+        )
+        .expect("region should build from the snapshot");
+        (region, EntityRef::new(entity_type, entity_id))
+    }
+
+    fn encode_failure() -> EntityTellError<Ask> {
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        EntityTellError::Delivery {
+            failure: EntityDeliveryFailure::RemoteEncode("no codec".to_string()),
+            message: Ask(ReplyTo::new(sender)),
+        }
+    }
+
+    #[test]
+    fn a_forward_the_region_attempted_is_answered_not_local_naming_the_owner_it_knows() {
+        let (region, entity) = region_and_entity_owned_by_rakka_0();
+        let this_node = NodeId::new("rakka-1", "uid-b");
+
+        let refused = refuse_forwarded_ask(&region, &this_node, &entity, encode_failure());
+
+        assert!(
+            matches!(
+                &refused,
+                EntityTellError::Delivery {
+                    failure: EntityDeliveryFailure::NotLocal { owner },
+                    ..
+                } if owner == &NodeId::new("rakka-0", "uid-a")
+            ),
+            "unexpected error: {refused:?}"
+        );
+        assert_eq!(refused.code(), "entity-not-local");
+    }
+
+    #[test]
+    fn the_encode_failure_stands_when_the_owner_moved_back_to_this_node() {
+        let (region, entity) = region_and_entity_owned_by_rakka_0();
+        let this_node = NodeId::new("rakka-0", "uid-a");
+
+        let refused = refuse_forwarded_ask(&region, &this_node, &entity, encode_failure());
+
+        assert_eq!(refused.code(), "entity-remote-encode");
+    }
+
+    #[test]
+    fn the_encode_failure_stands_when_no_owner_is_known() {
+        let (_, entity) = region_and_entity_owned_by_rakka_0();
+        let empty = ShardRegion::new(
+            entity.entity_type().clone(),
+            ShardingConfig::new(8).expect("valid sharding config"),
+            |_message: RoutedEntityMessage<Ask>| Ok(()),
+        );
+        let this_node = NodeId::new("rakka-1", "uid-b");
+
+        let refused = refuse_forwarded_ask(&empty, &this_node, &entity, encode_failure());
+
+        assert_eq!(refused.code(), "entity-remote-encode");
+    }
+
+    #[test]
+    fn any_other_delivery_failure_passes_through_unchanged() {
+        let (region, entity) = region_and_entity_owned_by_rakka_0();
+        let this_node = NodeId::new("rakka-1", "uid-b");
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        let full = EntityTellError::Delivery {
+            failure: EntityDeliveryFailure::MailboxFull,
+            message: Ask(ReplyTo::new(sender)),
+        };
+
+        let refused = refuse_forwarded_ask(&region, &this_node, &entity, full);
+
+        assert_eq!(refused.code(), "entity-mailbox-full");
     }
 }
