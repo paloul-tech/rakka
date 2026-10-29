@@ -478,3 +478,43 @@ fn effect(effect_id: &str, due_at: AgentTimestampMillis) -> AgentEffect {
     .into_effect()
     .expect("effect should validate")
 }
+
+#[test]
+fn runtime_snapshot_counts_parked_nodes() {
+    let snapshots = AgentWorkflowSnapshotRegistry::new();
+    let run_id = AgentRunId::new("run-graph-parked-snapshot");
+    let mut run = accepted_run_state(&workflow(), &run_id, AgentStepId::new("graph"));
+    run.graph_state = Some(parked_graph_state());
+    snapshots.record_run_actor_snapshot(&AgentRunActorSnapshot {
+        run_id: run_id.clone(),
+        run_state: Some(run),
+        graph: None,
+        recoverable_command_count: 0,
+        due_effect_count: 0,
+    });
+
+    let runtime = snapshots.runtime_snapshot();
+
+    assert_eq!(runtime.graph_run_count(), 1);
+    assert_eq!(runtime.graph_waiting_node_count(), 1);
+    assert_eq!(runtime.graph_reconciliation_waiting_node_count(), 1);
+    assert_eq!(runtime.graph_effect_waiting_node_count(), 0);
+    assert_eq!(runtime.graph_drain_blocker_count(), 1);
+}
+
+fn parked_graph_state() -> AgentGraphRunState {
+    let parked = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new("charge"),
+        AgentCompiledNodeKind::ToolCall,
+        AgentTimestampMillis::new(120),
+    )
+    .status(AgentGraphNodeStatus::Waiting)
+    .dependencies_ready(true)
+    .wait_reason(AgentGraphWaitReason::Reconciliation)
+    .error_code("effect-outcome-unknown");
+    AgentGraphRunState::new(
+        AgentCompiledPlanId::new("plan-graph-parked"),
+        AgentCompiledPlanFingerprint::new("sha256:graph-parked"),
+    )
+    .node_state(parked)
+}

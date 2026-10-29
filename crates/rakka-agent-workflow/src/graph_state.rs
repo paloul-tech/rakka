@@ -473,6 +473,9 @@ pub enum AgentGraphWaitReason {
     ChildWorkflow,
     /// Waiting for an external signal.
     Signal,
+    /// Waiting on a person: the node's effect may have run and nobody can
+    /// say, so a reconciliation decision resolves it.
+    Reconciliation,
 }
 
 impl AgentGraphWaitReason {
@@ -486,6 +489,7 @@ impl AgentGraphWaitReason {
             Self::Human => "human",
             Self::ChildWorkflow => "child-workflow",
             Self::Signal => "signal",
+            Self::Reconciliation => "reconciliation",
         }
     }
 }

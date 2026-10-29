@@ -46,6 +46,15 @@ fn graph_node_statuses_have_stable_wire_names_and_labels() {
         AgentGraphWaitReason::ChildWorkflow.as_label(),
         "child-workflow"
     );
+    assert_eq!(
+        serde_json::to_value(AgentGraphWaitReason::Reconciliation)
+            .expect("wait reason should serialize"),
+        json!("reconciliation")
+    );
+    assert_eq!(
+        AgentGraphWaitReason::Reconciliation.as_label(),
+        "reconciliation"
+    );
 }
 
 #[test]

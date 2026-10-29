@@ -75,6 +75,11 @@ pub enum AgentGraphSchedulerError {
         /// Terminal graph status.
         status: AgentGraphTerminalStatus,
     },
+    /// A node was parked for reconciliation without a cause code.
+    EmptyCauseCode {
+        /// Node id.
+        node_id: AgentCompiledNodeId,
+    },
     /// Durable graph state was written by a newer schema than this binary supports.
     UnsupportedSchemaVersion {
         /// Schema version found on the durable graph state.
@@ -97,6 +102,7 @@ impl AgentGraphSchedulerError {
             Self::InvalidBranchSelection { .. } => "invalid-branch-selection",
             Self::InvalidIteratorTransition { .. } => "invalid-iterator-transition",
             Self::TerminalGraph { .. } => "terminal-graph",
+            Self::EmptyCauseCode { .. } => "empty-reconciliation-cause",
             Self::UnsupportedSchemaVersion { .. } => "graph-state-schema-unsupported",
         }
     }
@@ -145,6 +151,9 @@ impl Display for AgentGraphSchedulerError {
                     "graph is already terminal with status `{}`",
                     status.as_label()
                 )
+            }
+            Self::EmptyCauseCode { node_id } => {
+                write!(f, "node `{node_id}` cannot be parked without a cause code")
             }
             Self::UnsupportedSchemaVersion { found, supported } => write!(
                 f,
@@ -624,6 +633,47 @@ impl AgentGraphScheduler {
                 node_state.wait_reason = Some(reason);
             },
         )?;
+        Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
+    }
+
+    /// Parks a waiting node on a person.
+    ///
+    /// The node stays `Waiting`; its wait reason becomes
+    /// [`AgentGraphWaitReason::Reconciliation`] and `cause_code` is recorded in
+    /// `error_code`. The node must currently wait on `from_reason` (a parked
+    /// node is re-parked under a new cause with `from_reason` set to
+    /// `Reconciliation`). This is the transition that writes a version-2 wait
+    /// reason, so the state's schema version is raised to the current one.
+    pub fn park_waiting_node(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        mut state: AgentGraphRunState,
+        node_id: impl Into<AgentCompiledNodeId>,
+        from_reason: AgentGraphWaitReason,
+        cause_code: impl Into<String>,
+        now: AgentTimestampMillis,
+    ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition> {
+        ensure_not_terminal(&state)?;
+        let node_id = node_id.into();
+        validate_plan_state(plan, &state)?;
+        ensure_known_node(plan, &node_id)?;
+        let cause_code = cause_code.into();
+        if cause_code.trim().is_empty() {
+            return Err(AgentGraphSchedulerError::EmptyCauseCode { node_id });
+        }
+        ensure_node_wait_reason(&state, &node_id, from_reason)?;
+        transition_node(
+            &mut state,
+            &node_id,
+            AgentGraphNodeStatus::Waiting,
+            AgentGraphNodeStatus::Waiting,
+            now,
+            |node_state| {
+                node_state.wait_reason = Some(AgentGraphWaitReason::Reconciliation);
+                node_state.error_code = Some(cause_code);
+            },
+        )?;
+        state.graph_schema_version = CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION;
         Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
     }
 
