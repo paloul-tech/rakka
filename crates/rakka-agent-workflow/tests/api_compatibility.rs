@@ -439,12 +439,12 @@ fn graph_state_json_accepts_current_previous_and_missing_additive_defaults() {
     assert_eq!(decoded.node_states.len(), 1);
 
     let mut previous = current.clone();
-    previous["graph_schema_version"] = json!(0);
+    previous["graph_schema_version"] = json!(CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION.get() - 1);
     let previous_decoded: AgentGraphRunState =
         serde_json::from_value(previous).expect("previous graph schema value should deserialize");
     assert_eq!(
         previous_decoded.graph_schema_version,
-        AgentGraphStateSchemaVersion::new(0)
+        AgentGraphStateSchemaVersion::new(CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION.get() - 1)
     );
 
     for field in [

@@ -13,6 +13,7 @@ use crate::{
     AgentCancellation, AgentGraphRunState, AgentGraphTerminalStatus, AgentRunId, AgentRunState,
     AgentRunStatus, AgentStatePayload, AgentStep, AgentStepId, AgentTimestampMillis, AgentWorkflow,
     HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, PrincipalRef,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 
 /// Prefix used for durable agent-run state persistence ids.
@@ -894,6 +895,14 @@ where
         now: AgentTimestampMillis,
     ) -> AgentRunEngineResult<AgentRunTransition> {
         let record = self.current_record()?;
+        if graph_state.graph_schema_version > CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION {
+            return Err(AgentRunEngineError::WorkflowMismatch {
+                run_id: self.run_id.clone(),
+                field: "graph_schema_version",
+                expected: format!("<= {}", CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION.get()),
+                actual: graph_state.graph_schema_version.get().to_string(),
+            });
+        }
         let previous_status = record.state.status;
         if graph_state.terminal_status.is_none() {
             self.reject_terminal(

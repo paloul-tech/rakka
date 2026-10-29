@@ -12,8 +12,9 @@ use crate::{
     validate_compiled_execution_plan, AgentCompiledEdgeId, AgentCompiledEdgeMergeBehavior,
     AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanEdge,
     AgentCompiledPlanNode, AgentCompiledPortId, AgentGraphLoopInstanceState, AgentGraphNodeState,
-    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphTerminalStatus, AgentGraphWaitReason,
-    AgentTimestampMillis, ArtifactRef,
+    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphStateSchemaVersion,
+    AgentGraphTerminalStatus, AgentGraphWaitReason, AgentTimestampMillis, ArtifactRef,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 
 /// Result type for graph scheduler operations.
@@ -74,6 +75,13 @@ pub enum AgentGraphSchedulerError {
         /// Terminal graph status.
         status: AgentGraphTerminalStatus,
     },
+    /// Durable graph state was written by a newer schema than this binary supports.
+    UnsupportedSchemaVersion {
+        /// Schema version found on the durable graph state.
+        found: AgentGraphStateSchemaVersion,
+        /// Newest schema version this binary reads.
+        supported: AgentGraphStateSchemaVersion,
+    },
 }
 
 impl AgentGraphSchedulerError {
@@ -89,6 +97,7 @@ impl AgentGraphSchedulerError {
             Self::InvalidBranchSelection { .. } => "invalid-branch-selection",
             Self::InvalidIteratorTransition { .. } => "invalid-iterator-transition",
             Self::TerminalGraph { .. } => "terminal-graph",
+            Self::UnsupportedSchemaVersion { .. } => "graph-state-schema-unsupported",
         }
     }
 }
@@ -137,6 +146,12 @@ impl Display for AgentGraphSchedulerError {
                     status.as_label()
                 )
             }
+            Self::UnsupportedSchemaVersion { found, supported } => write!(
+                f,
+                "graph state schema version {} is newer than the supported {}",
+                found.get(),
+                supported.get()
+            ),
         }
     }
 }
@@ -747,6 +762,12 @@ fn validate_plan_state(
                 "state has {}, plan has {}",
                 state.plan_fingerprint, plan.plan_fingerprint
             ),
+        });
+    }
+    if state.graph_schema_version > CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION {
+        return Err(AgentGraphSchedulerError::UnsupportedSchemaVersion {
+            found: state.graph_schema_version,
+            supported: CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
         });
     }
     let nodes = nodes_by_id(plan);

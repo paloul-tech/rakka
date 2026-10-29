@@ -25,7 +25,7 @@ use crate::{
     AgentRunInbox, AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerError,
     AgentTimerId, AgentTimerPolicy, AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis,
     ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
+    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 
 const ATTR_COMPILED_NODE_ID: &str = "compiled_node_id";
@@ -1117,6 +1117,14 @@ fn validate_plan_state(
                 "state has {}, plan has {}",
                 state.plan_fingerprint, plan.plan_fingerprint
             ),
+        });
+    }
+    if state.graph_schema_version > CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION {
+        return Err(AgentGraphEffectBridgeError::Scheduler {
+            error: AgentGraphSchedulerError::UnsupportedSchemaVersion {
+                found: state.graph_schema_version,
+                supported: CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
+            },
         });
     }
     if let Some(status) = state.terminal_status {

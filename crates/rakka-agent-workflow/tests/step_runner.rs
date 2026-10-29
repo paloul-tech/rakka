@@ -3,11 +3,13 @@
 use std::collections::BTreeMap;
 
 use rakka_agent_workflow::{
-    agent_run_persistence_id, AgentPayloadDescriptor, AgentRunEngineError, AgentRunId,
-    AgentRunState, AgentRunStatus, AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload,
-    AgentStep, AgentStepId, AgentStepKind, AgentStepRunner, AgentStepSuccess, AgentTenantId,
-    AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, HumanCheckpointId, InlineState,
-    StateSchemaVersion, WorkflowDefinitionVersion,
+    agent_run_persistence_id, AgentCompiledPlanFingerprint, AgentCompiledPlanId,
+    AgentGraphRunState, AgentGraphStateSchemaVersion, AgentPayloadDescriptor, AgentRunEngineError,
+    AgentRunId, AgentRunState, AgentRunStatus, AgentRunTransitionKind, AgentRunWaitReason,
+    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentStepRunner, AgentStepSuccess,
+    AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, HumanCheckpointId,
+    InlineState, StateSchemaVersion, WorkflowDefinitionVersion,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 use rakka_persistence::{DurableError, DurableStateStore, InMemoryDurableStateStore, Revision};
 
@@ -591,4 +593,51 @@ const fn ts(millis: u64) -> AgentTimestampMillis {
 
 fn assert_error_code(error: AgentRunEngineError, expected: &'static str) {
     assert_eq!(error.code(), expected, "{error}");
+}
+
+#[tokio::test]
+async fn update_graph_state_refuses_a_newer_graph_schema() {
+    let mut runner = start_only(
+        single_step_workflow(),
+        AgentRunId::new("run-graph-newer-schema"),
+        AgentStepId::new("plan"),
+        TestStore::new(),
+    )
+    .await;
+    let before = runner
+        .state()
+        .expect("runner should be recovered")
+        .expect("run should exist")
+        .clone();
+    let mut graph = AgentGraphRunState::new(
+        AgentCompiledPlanId::new("plan-x"),
+        AgentCompiledPlanFingerprint::new("sha256:x"),
+    );
+    graph.graph_schema_version = AgentGraphStateSchemaVersion::new(3);
+
+    let error = runner
+        .update_graph_state(graph, ts(300))
+        .await
+        .expect_err("a newer graph schema should be refused");
+    let supported = format!("<= {}", CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION.get());
+    assert!(
+        matches!(
+            &error,
+            AgentRunEngineError::WorkflowMismatch {
+                field: "graph_schema_version",
+                expected,
+                actual,
+                ..
+            } if *expected == supported && actual == "3"
+        ),
+        "{error:?}"
+    );
+    assert_error_code(error, "workflow-mismatch");
+    let after = runner
+        .state()
+        .expect("runner should be recovered")
+        .expect("run should exist");
+    assert_eq!(after.graph_state, None);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.updated_at, before.updated_at);
 }

@@ -18,7 +18,7 @@ use crate::domain::{
 
 /// Current durable graph run state schema version.
 pub const CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION: AgentGraphStateSchemaVersion =
-    AgentGraphStateSchemaVersion::new(1);
+    AgentGraphStateSchemaVersion::new(2);
 
 /// Serialized durable graph state schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

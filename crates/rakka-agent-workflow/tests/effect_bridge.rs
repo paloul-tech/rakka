@@ -8,14 +8,16 @@ use rakka_agent_workflow::{
     AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
     AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCompiledPortId, AgentCorrelationId,
     AgentCredentialBindingRef, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffectKind,
-    AgentEffectTarget, AgentGraphEffectBridge, AgentGraphEffectFailureDisposition,
-    AgentGraphEffectScheduleRequest, AgentGraphHumanCheckpointScheduleRequest, AgentGraphNodeState,
-    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler, AgentGraphTerminalStatus,
-    AgentGraphTimerScheduleRequest, AgentGraphWaitReason, AgentRunId, AgentRunInbox, AgentTenantId,
-    AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis, AgentWorkflowId,
-    ArtifactEncryptionRef, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
-    HumanCheckpointStatus, HumanDecisionOption, PrincipalRef, RedactionStatus,
-    WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    AgentEffectTarget, AgentGraphEffectBridge, AgentGraphEffectBridgeError,
+    AgentGraphEffectFailureDisposition, AgentGraphEffectScheduleRequest,
+    AgentGraphHumanCheckpointScheduleRequest, AgentGraphNodeState, AgentGraphNodeStatus,
+    AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
+    AgentGraphStateSchemaVersion, AgentGraphTerminalStatus, AgentGraphTimerScheduleRequest,
+    AgentGraphWaitReason, AgentRunId, AgentRunInbox, AgentTenantId, AgentTimerStore,
+    AgentTimerStoreState, AgentTimestampMillis, AgentWorkflowId, ArtifactEncryptionRef,
+    ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+    HumanDecisionOption, PrincipalRef, RedactionStatus, WorkflowDefinitionVersion,
+    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 use rakka_persistence::InMemoryDurableStateStore;
 use rakka_workflow::{ManualWorkflowClock, WorkflowState, WorkflowTimestamp};
@@ -997,4 +999,47 @@ fn node_state<'a>(state: &'a AgentGraphRunState, node_id: &str) -> &'a AgentGrap
 
 const fn ts(millis: u64) -> AgentTimestampMillis {
     AgentTimestampMillis::new(millis)
+}
+
+#[tokio::test]
+async fn bridge_refuses_a_graph_state_from_a_newer_schema() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "research.search",
+        "research",
+    );
+    let mut running_state = running_effect_state(&plan);
+    running_state.graph_schema_version = AgentGraphStateSchemaVersion::new(3);
+    let run_id = AgentRunId::new("run-graph-newer-schema");
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let mut inbox = agent_inbox(run_id.clone(), store, clock);
+    inbox.recover().await.expect("inbox should recover");
+
+    let error = bridge
+        .schedule_node_effect(
+            &plan,
+            running_state,
+            effect_request(run_id, "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect_err("a newer schema version should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::Scheduler {
+                error: AgentGraphSchedulerError::UnsupportedSchemaVersion { found, supported }
+            } if *found == AgentGraphStateSchemaVersion::new(3)
+                && *supported == CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "graph-state-schema-unsupported");
+    assert!(inbox
+        .due_effects()
+        .expect("due effects should read")
+        .is_empty());
 }

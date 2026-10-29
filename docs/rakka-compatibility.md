@@ -195,7 +195,7 @@ One row per record kind the agent domain persists, keyed by the record's stable 
 | `agent-team-history-entry` | `rakka-agent` | 1 |
 | `agent-conversation-state` | `rakka-agent` | 1 |
 | `agent-conversation-history-entry` | `rakka-agent` | 1 |
-| `CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION` | `rakka-agent-workflow` | 1 |
+| `CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION` | `rakka-agent-workflow` | 2 |
 | `CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION` | `rakka-agent-workflow` | 1 |
 | `CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION` | `rakka-agent-workflow` | 1 |
 | `MCP_DESCRIPTOR_SET_SCHEMA_VERSION` | `rakka-agent-mcp` | 2 |

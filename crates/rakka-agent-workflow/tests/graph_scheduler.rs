@@ -5,9 +5,10 @@ use rakka_agent_workflow::{
     AgentCompiledIteratorPolicy, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanEdge,
     AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
     AgentCompiledPlanPort, AgentCompiledPortDirection, AgentGraphNodeState, AgentGraphNodeStatus,
-    AgentGraphRunState, AgentGraphScheduler, AgentGraphTerminalStatus, AgentGraphWaitReason,
+    AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
+    AgentGraphStateSchemaVersion, AgentGraphTerminalStatus, AgentGraphWaitReason,
     AgentTimestampMillis, AgentWorkflowId, WorkflowDefinitionVersion,
-    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 
 #[test]
@@ -1157,4 +1158,28 @@ fn node_ids(node_ids: &[AgentCompiledNodeId]) -> Vec<&str> {
 
 const fn ts(millis: u64) -> AgentTimestampMillis {
     AgentTimestampMillis::new(millis)
+}
+
+#[test]
+fn scheduler_refuses_a_graph_state_from_a_newer_schema() {
+    let plan = linear_plan();
+    let scheduler = AgentGraphScheduler::new();
+    let mut state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+    state.graph_schema_version = AgentGraphStateSchemaVersion::new(3);
+
+    let error = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(110))
+        .expect_err("a newer schema version should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphSchedulerError::UnsupportedSchemaVersion { found, supported }
+                if *found == AgentGraphStateSchemaVersion::new(3)
+                    && *supported == CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "graph-state-schema-unsupported");
 }
