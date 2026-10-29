@@ -711,6 +711,21 @@ async fn schedule_kind(
         .expect("effect should schedule")
 }
 
+/// A running state for the payments tool plan, built from its attribute-free
+/// twin. The twin shares the plan id and fingerprint (neither covers the
+/// target class or attributes), so a bridge test that hands the bridge a plan
+/// with an invalid effect attribute can still reach the bridge's own gate: the
+/// scheduler refuses such a plan at initialization now (held by
+/// `compiled_plan_contract`), so the state cannot come from the plan itself.
+fn running_payments_state() -> AgentGraphRunState {
+    running_effect_state(&effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "payments.charge",
+        "payments",
+    ))
+}
+
 fn running_effect_state(plan: &AgentCompiledExecutionPlan) -> AgentGraphRunState {
     let scheduler = AgentGraphScheduler::new();
     let state = scheduler
@@ -2177,7 +2192,7 @@ async fn idempotency_key_follows_the_target_safety_class() {
     );
     let mut inbox = recovered_inbox(&run_id).await;
     let error = bridge
-        .schedule_node_effect(&bogus, running_effect_state(&bogus), request, &mut inbox)
+        .schedule_node_effect(&bogus, running_payments_state(), request, &mut inbox)
         .await
         .expect_err("an unknown safety class should be refused");
     assert!(
@@ -2586,7 +2601,7 @@ async fn an_invalid_bound_is_refused_at_schedule() {
         }
 
         let error = bridge
-            .schedule_node_effect(&plan, running_effect_state(&plan), request, &mut inbox)
+            .schedule_node_effect(&plan, running_payments_state(), request, &mut inbox)
             .await
             .expect_err("an invalid attempt bound should be refused");
         assert!(
@@ -2637,7 +2652,7 @@ async fn a_target_class_that_reads_as_a_generation_is_refused_at_schedule() {
         "{error:?}"
     );
 
-    let mut state = running_effect_state(&plan);
+    let mut state = running_payments_state();
     state
         .node_states
         .get_mut(&AgentCompiledNodeId::new("effect"))
@@ -2659,7 +2674,7 @@ async fn a_target_class_that_reads_as_a_generation_is_refused_at_schedule() {
 
     let mut inbox = recovered_inbox(&run_id).await;
     let error = bridge
-        .schedule_node_effect(&plan, running_effect_state(&plan), request, &mut inbox)
+        .schedule_node_effect(&plan, running_payments_state(), request, &mut inbox)
         .await
         .expect_err("the schedule is refused before anything reaches the outbox");
     assert_eq!(error.code(), "invalid-compiled-plan");
