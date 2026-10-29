@@ -107,7 +107,11 @@ A remote ask whose local delivery fails at the owner (a draining shard, a full
 mailbox, a spawn failure) is answered at once with a typed rejection carrying
 the delivery's stable code, surfaced to the asker as
 `RemoteRequestError::Rejected { code, message }`. The asker no longer waits out
-its timeout, and its connection to the owner stays open.
+its timeout, and its connection to the owner stays open. An ask that reaches a
+node whose region no longer owns the entity's shard (the asker's owner cache was
+stale across a handoff) is answered the same way with `entity-not-local`, naming
+the owner that node knows, rather than with the encode failure of trying to
+forward an ask whose reply handle is local to the node it reached.
 
 ## Handoff And Passivation Buffering
 

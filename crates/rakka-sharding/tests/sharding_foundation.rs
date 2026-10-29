@@ -3154,10 +3154,10 @@ async fn remote_ask_rejection_warns_without_entity_or_request_ids() {
         "no rejection warning captured; log = {}",
         captured.text()
     );
+    // Every rejection line in the binary, whichever test emitted it and
+    // whatever its code, names nothing but the code, entity type, shard and
+    // requester.
     for line in &lines {
-        assert!(line.contains("code=entity-shard-handoff"), "{line}");
-        assert!(line.contains("entity_type=Cart"), "{line}");
-        assert!(line.contains("requester=rakka-0#uid-a"), "{line}");
         assert!(!line.contains("request_id"), "request id logged: {line}");
         assert!(
             !line.contains("entity_id="),
@@ -3170,9 +3170,18 @@ async fn remote_ask_rejection_warns_without_entity_or_request_ids() {
     }
     let own_line = lines
         .iter()
-        .find(|line| line.contains(&format!("shard_id={}", outcome.shard_id.as_u32())))
-        .unwrap_or_else(|| panic!("no line names shard {}: {lines:?}", outcome.shard_id));
-    assert!(own_line.contains("entity_type=Cart"));
+        .find(|line| {
+            line.contains("code=entity-shard-handoff")
+                && line.contains(&format!("shard_id={}", outcome.shard_id.as_u32()))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no handoff rejection names shard {}: {lines:?}",
+                outcome.shard_id
+            )
+        });
+    assert!(own_line.contains("entity_type=Cart"), "{own_line}");
+    assert!(own_line.contains("requester=rakka-0#uid-a"), "{own_line}");
 }
 
 #[tokio::test]
@@ -3433,4 +3442,138 @@ fn remote_entity_inbound_preserves_decoded_message_when_local_delivery_fails() {
         _other => panic!("unexpected inbound delivery error"),
     }
     assert_eq!(local_route.entity_count(), 0);
+}
+
+#[tokio::test]
+async fn remote_entity_ask_at_a_node_that_handed_the_shard_off_answers_entity_not_local() {
+    // Node A asks on an owner cache that still names node B, after B's own
+    // ownership moved the shard to A. B's region would forward the ask over
+    // its remote route, whose encode of the ask's local reply handle fails, so
+    // the asker saw `entity-remote-encode`, a code it treats as final. The
+    // inbound handler answers `entity-not-local` instead: the ask never
+    // entered a mailbox, and a retry on a refreshed owner can succeed.
+    let captured = log_capture::install();
+    let node_a = NodeId::new("rakka-0", "uid-a");
+    let node_b = NodeId::new("rakka-1", "uid-b");
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(8).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership_with_up_nodes(vec![
+        node("rakka-0", "uid-a"),
+        node("rakka-1", "uid-b"),
+    ]));
+    let stale_snapshot = coordinator.snapshot();
+    let remote_entity_id = entity_owned_by(&coordinator, "rakka-1");
+    coordinator.reconcile(&membership_with_up_nodes(vec![node("rakka-0", "uid-a")]));
+    let current_snapshot = coordinator.snapshot();
+    assert_eq!(
+        coordinator.owner_for_entity(&remote_entity_id).unwrap(),
+        &node_a,
+        "the shard should have moved to node a once node b left"
+    );
+    let registry = remote_registry();
+    let transport = InMemoryRemoteTransport::new();
+
+    let local_route_a = LocalEntityRoute::new(
+        node_a.clone(),
+        ActorSystem::new("remote-ask-handed-off-node-a-test"),
+        |context: LocalEntityContext| RemoteAskCartEntity { context },
+    );
+    let region_a = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config.clone(),
+        &stale_snapshot,
+        local_route_a.clone(),
+    )
+    .unwrap();
+    let request_registry = RemoteRequestRegistry::new(registry.clone());
+    let ask_client =
+        RemoteEntityAskClient::new(node_a.clone(), request_registry.clone(), transport.clone());
+    let endpoint_a = RemoteEndpoint::new(node_a.clone());
+    endpoint_a.register_reply_handler(request_registry.clone());
+    transport.register_endpoint(endpoint_a).unwrap();
+
+    let local_route_b = LocalEntityRoute::new(
+        node_b.clone(),
+        ActorSystem::new("remote-ask-handed-off-node-b-test"),
+        |context: LocalEntityContext| RemoteAskCartEntity { context },
+    );
+    let route_b = RemoteEntityRoute::new(
+        local_route_b.clone(),
+        registry.clone(),
+        RemoteTransportEntityOutbound::new(transport.clone()),
+    )
+    .with_source(node_b.to_string());
+    let region_b =
+        ShardRegion::from_snapshot(entity_type.clone(), config, &current_snapshot, route_b)
+            .unwrap();
+    let endpoint_b = RemoteEndpoint::new(node_b.clone());
+    endpoint_b
+        .register_entity_handler(
+            "Cart",
+            RemoteEntityAskInbound::new(
+                node_b,
+                region_b,
+                registry.clone(),
+                transport.clone(),
+                |request: RemoteCartGet, reply_to| RemoteAskCartCommand::Get {
+                    prefix: request.prefix,
+                    reply_to,
+                },
+            ),
+        )
+        .unwrap();
+    transport.register_endpoint(endpoint_b).unwrap();
+    let remote_entity =
+        EntityRef::<RemoteAskCartCommand>::new(entity_type, remote_entity_id.clone());
+
+    let outcome: Result<Result<RemoteCartReply, RemoteEntityAskError>, _> = tokio::time::timeout(
+        Duration::from_secs(1),
+        ask_client.ask(
+            &region_a,
+            &remote_entity,
+            RemoteCartGet {
+                prefix: "items".to_string(),
+            },
+            Duration::from_secs(5),
+        ),
+    )
+    .await;
+    let error = outcome
+        .expect("the node should answer the misrouted ask well within its timeout")
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            RemoteEntityAskError::Reply {
+                error: RemoteRequestError::Rejected { code, message },
+            } if code == "entity-not-local" && message.contains("rakka-0")
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(request_registry.pending_count(), 0);
+    assert_eq!(local_route_b.entity_count(), 0);
+
+    // The node's warning names the code, entity type, shard and requester and
+    // nothing that identifies the entity or the request.
+    let lines = captured.lines_containing("code=entity-not-local");
+    assert!(
+        !lines.is_empty(),
+        "no rejection warning captured; log = {}",
+        captured.text()
+    );
+    for line in &lines {
+        assert!(line.contains("remote ask rejected"), "{line}");
+        assert!(line.contains("entity_type=Cart"), "{line}");
+        assert!(line.contains("requester=rakka-0#uid-a"), "{line}");
+        assert!(!line.contains("request_id"), "request id logged: {line}");
+        assert!(
+            !line.contains("entity_id="),
+            "entity id field logged: {line}"
+        );
+        assert!(
+            !line.contains(remote_entity_id.as_str()),
+            "raw entity id logged: {line}"
+        );
+    }
 }

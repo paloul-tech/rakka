@@ -685,6 +685,22 @@ where
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let message = (self.build)(request, ReplyTo::new(sender));
         let entity = EntityRef::new(entity_type, entity_id);
+        // An ask carries a local reply handle, so it can only be answered by
+        // this node. When this node's region knows another owner (the asker's
+        // owner cache is stale across a handoff), the region would try to
+        // forward it and fail to encode it, which the asker would read as a
+        // final failure. Answer that the ask never entered a mailbox instead,
+        // naming the owner this node knows, so the asker retries there.
+        if let Ok((owner, _shard_id)) = self.region.resolve(&entity) {
+            if owner != self.local_node_id {
+                return Err(RemoteEntityAskInboundError::Delivery {
+                    error: EntityTellError::Delivery {
+                        message,
+                        failure: EntityDeliveryFailure::NotLocal { owner },
+                    },
+                });
+            }
+        }
         self.region
             .tell(&entity, message)
             .map_err(|error| RemoteEntityAskInboundError::Delivery { error })?;
