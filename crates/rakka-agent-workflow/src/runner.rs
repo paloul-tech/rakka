@@ -932,7 +932,13 @@ where
                 next.completed_at = Some(now);
             }
             None => {
-                next.status = AgentRunStatus::Running;
+                // A requested cancellation survives a non-terminal graph
+                // write; the graph's own terminal status ends the run.
+                next.status = if previous_status == AgentRunStatus::Cancelling {
+                    AgentRunStatus::Cancelling
+                } else {
+                    AgentRunStatus::Running
+                };
                 next.completed_at = None;
             }
         }
