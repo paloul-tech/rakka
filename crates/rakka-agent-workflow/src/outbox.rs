@@ -10,8 +10,8 @@ use std::fmt::{self, Display, Formatter};
 
 use rakka_persistence::{DurableStateStore, Revision};
 use rakka_workflow::{
-    OutboxAcceptance, OutboxCommand, OutboxEntry, OutboxTarget, WorkflowClock, WorkflowError,
-    WorkflowState, WorkflowTimestamp,
+    OutboxAcceptance, OutboxCommand, OutboxEntry, OutboxTarget, RetryPolicy, WorkflowClock,
+    WorkflowError, WorkflowState, WorkflowTimestamp,
 };
 
 use crate::{
@@ -187,6 +187,18 @@ impl AgentOutboxAcceptance {
     }
 }
 
+/// Outbox entries read back as agent effects by
+/// [`AgentRunInbox::outbox_effects`], with the count of selected entries whose
+/// payload did not decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentOutboxEffects {
+    /// The selected entries that decoded, in message-id order.
+    pub effects: Vec<AgentDueEffect>,
+    /// Selected entries skipped because their payload did not decode as an
+    /// agent effect.
+    pub undecodable: usize,
+}
+
 /// One due durable outbox effect plus its underlying outbox entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDueEffect {
@@ -282,6 +294,39 @@ where
             .collect()
     }
 
+    /// Reads the outbox entries `select` keeps, whatever their status, as
+    /// agent effects in message-id order.
+    ///
+    /// `select` runs before any payload is decoded, so a caller that already
+    /// knows an entry pays nothing for it. An entry whose payload does not
+    /// decode as an [`AgentEffect`] is counted and skipped rather than
+    /// failing the read: a concluded entry an older or foreign writer left in
+    /// the run's history must not stop the run from recovering. Recovery
+    /// reads this rather than [`Self::due_effects`] so an effect that was
+    /// dispatched and exhausted while the run actor was down can still be
+    /// re-linked to its graph node and parked.
+    pub fn outbox_effects(
+        &self,
+        mut select: impl FnMut(&OutboxEntry) -> bool,
+    ) -> AgentOutboxResult<AgentOutboxEffects> {
+        let state = self.inner().state().map_err(AgentOutboxError::from)?;
+        let mut effects = Vec::new();
+        let mut undecodable = 0;
+        for entry in state.outbox().values() {
+            if !select(entry) {
+                continue;
+            }
+            match agent_due_effect_from_entry(entry.clone()) {
+                Ok(effect) => effects.push(effect),
+                Err(_) => undecodable += 1,
+            }
+        }
+        Ok(AgentOutboxEffects {
+            effects,
+            undecodable,
+        })
+    }
+
     fn record_effect_metric(
         &self,
         effect_kind: &'static str,
@@ -304,8 +349,21 @@ where
     }
 }
 
+/// Effect-target attribute carrying the effect's attempt bound as a positive
+/// decimal integer, in `rakka-agent`'s dispatch-ticket vocabulary.
+///
+/// [`agent_effect_to_outbox_command`] reads it leniently: a positive integer
+/// replaces the outbox retry policy's attempt count and keeps the default
+/// delays; an absent or unparsable value keeps the default policy. The graph
+/// effect bridge validates it strictly before it schedules.
+pub const ATTR_AGENT_EFFECT_MAX_ATTEMPTS: &str = "agent_effect_max_attempts";
+
 /// Converts a first-class agent effect into a lower-level durable outbox
 /// command.
+///
+/// The retry policy is the default unless the effect target declares
+/// [`ATTR_AGENT_EFFECT_MAX_ATTEMPTS`] as a positive integer, in which case
+/// only the attempt count changes.
 pub fn agent_effect_to_outbox_command(effect: &AgentEffect) -> AgentOutboxResult<OutboxCommand> {
     validate_effect_for_outbox(effect)?;
 
@@ -324,8 +382,26 @@ pub fn agent_effect_to_outbox_command(effect: &AgentEffect) -> AgentOutboxResult
     if let Some(due_at) = effect.due_at {
         command = command.scheduled_at(agent_timestamp_to_workflow_timestamp(due_at));
     }
+    if let Some(max_attempts) = declared_max_attempts(effect) {
+        let default = RetryPolicy::default();
+        command = command.retry_policy(RetryPolicy::new(
+            max_attempts,
+            default.initial_backoff_millis(),
+            default.max_backoff_millis(),
+        ));
+    }
 
     Ok(command)
+}
+
+/// The attempt bound an effect target declares, when it is a positive integer.
+fn declared_max_attempts(effect: &AgentEffect) -> Option<u32> {
+    effect
+        .target
+        .attributes
+        .get(ATTR_AGENT_EFFECT_MAX_ATTEMPTS)
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|max_attempts| *max_attempts > 0)
 }
 
 /// Converts an agent effect target into the lower-level durable outbox target.

@@ -3,6 +3,14 @@
 //! These types are persisted with graph-backed agent runs so a scheduler can
 //! recover deterministic execution state after passivation, restart, or
 //! dispatcher redelivery. Large values are represented by `ArtifactRef`.
+//!
+//! A node whose effect may have run and whose outcome nobody can state is
+//! parked on a person: still [`AgentGraphNodeStatus::Waiting`], with
+//! [`AgentGraphWaitReason::Reconciliation`] and the cause in `error_code`.
+//! An [`AgentGraphReconciliationDecision`] resolves it: `not-executed`
+//! re-offers the node under the next `effect_generation`, `abandon` fails
+//! it. Schema version 2 is the version that carries these values; see the
+//! compatibility doc for the rollout.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +26,7 @@ use crate::domain::{
 
 /// Current durable graph run state schema version.
 pub const CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION: AgentGraphStateSchemaVersion =
-    AgentGraphStateSchemaVersion::new(1);
+    AgentGraphStateSchemaVersion::new(2);
 
 /// Serialized durable graph state schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -263,6 +271,11 @@ pub struct AgentGraphNodeState {
     /// Attempt count for this node.
     #[serde(default)]
     pub attempt: u32,
+    /// Effect generation this node is on: zero until a reconciliation
+    /// decision of `not-executed` re-offers it, then one more per re-offer.
+    /// Generations one and up suffix the node's effect id and dedupe key.
+    #[serde(default)]
+    pub effect_generation: u32,
     /// Whether required dependencies are satisfied.
     #[serde(default)]
     pub dependencies_ready: bool,
@@ -312,6 +325,7 @@ impl AgentGraphNodeState {
             kind,
             status: AgentGraphNodeStatus::Pending,
             attempt: 0,
+            effect_generation: 0,
             dependencies_ready: false,
             input_refs: BTreeMap::new(),
             output_refs: BTreeMap::new(),
@@ -473,6 +487,9 @@ pub enum AgentGraphWaitReason {
     ChildWorkflow,
     /// Waiting for an external signal.
     Signal,
+    /// Waiting on a person: the node's effect may have run and nobody can
+    /// say, so a reconciliation decision resolves it.
+    Reconciliation,
 }
 
 impl AgentGraphWaitReason {
@@ -486,6 +503,36 @@ impl AgentGraphWaitReason {
             Self::Human => "human",
             Self::ChildWorkflow => "child-workflow",
             Self::Signal => "signal",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+}
+
+/// A person's decision on a node parked for reconciliation.
+///
+/// Exhaustive on purpose: a consumer's match breaks at compile time when a
+/// decision is added. `Completed` is not a decision here, because what a
+/// completed node puts on its output port is undefined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum AgentGraphReconciliationDecision {
+    /// The call never ran: re-offer the node under a new effect generation.
+    NotExecuted,
+    /// Give the node up under a bounded code; the run fails as any failed
+    /// node fails it.
+    Abandon {
+        /// Stable bounded error code recorded on the node.
+        error_code: String,
+    },
+}
+
+impl AgentGraphReconciliationDecision {
+    /// Stable lowercase label for telemetry and query projections.
+    #[must_use]
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::NotExecuted => "not-executed",
+            Self::Abandon { .. } => "abandon",
         }
     }
 }

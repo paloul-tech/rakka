@@ -2974,6 +2974,22 @@ impl From<AgentTaskError> for AgentEffectError {
 
 #[cfg(test)]
 mod tests {
+    /// The attribute names the graph effect bridge reads off a node target are
+    /// the dispatch-ticket vocabulary this crate defines; the kernel cannot
+    /// import them (the dependency runs the other way), so the strings are
+    /// held equal here.
+    #[test]
+    fn attribute_vocabulary_matches_the_workflow_kernel() {
+        assert_eq!(
+            super::ATTR_AGENT_EFFECT_SAFETY_CLASS,
+            rakka_agent_workflow::ATTR_AGENT_EFFECT_SAFETY_CLASS
+        );
+        assert_eq!(
+            super::ATTR_AGENT_EFFECT_MAX_ATTEMPTS,
+            rakka_agent_workflow::ATTR_AGENT_EFFECT_MAX_ATTEMPTS
+        );
+    }
+
     /// A tool result persisted before the tool and effect provenance fields
     /// existed decodes with both absent, and one carrying them round-trips.
     #[test]

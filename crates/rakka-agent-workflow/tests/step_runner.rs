@@ -3,11 +3,13 @@
 use std::collections::BTreeMap;
 
 use rakka_agent_workflow::{
-    agent_run_persistence_id, AgentPayloadDescriptor, AgentRunEngineError, AgentRunId,
-    AgentRunState, AgentRunStatus, AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload,
-    AgentStep, AgentStepId, AgentStepKind, AgentStepRunner, AgentStepSuccess, AgentTenantId,
-    AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, HumanCheckpointId, InlineState,
-    StateSchemaVersion, WorkflowDefinitionVersion,
+    agent_run_persistence_id, AgentCompiledPlanFingerprint, AgentCompiledPlanId,
+    AgentGraphRunState, AgentGraphStateSchemaVersion, AgentGraphTerminalStatus,
+    AgentPayloadDescriptor, AgentRunEngineError, AgentRunId, AgentRunState, AgentRunStatus,
+    AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload, AgentStep, AgentStepId,
+    AgentStepKind, AgentStepRunner, AgentStepSuccess, AgentTenantId, AgentTimestampMillis,
+    AgentWorkflow, AgentWorkflowId, HumanCheckpointId, InlineState, StateSchemaVersion,
+    WorkflowDefinitionVersion, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 use rakka_persistence::{DurableError, DurableStateStore, InMemoryDurableStateStore, Revision};
 
@@ -591,4 +593,89 @@ const fn ts(millis: u64) -> AgentTimestampMillis {
 
 fn assert_error_code(error: AgentRunEngineError, expected: &'static str) {
     assert_eq!(error.code(), expected, "{error}");
+}
+
+#[tokio::test]
+async fn update_graph_state_refuses_a_newer_graph_schema() {
+    let mut runner = start_only(
+        single_step_workflow(),
+        AgentRunId::new("run-graph-newer-schema"),
+        AgentStepId::new("plan"),
+        TestStore::new(),
+    )
+    .await;
+    let before = runner
+        .state()
+        .expect("runner should be recovered")
+        .expect("run should exist")
+        .clone();
+    let mut graph = AgentGraphRunState::new(
+        AgentCompiledPlanId::new("plan-x"),
+        AgentCompiledPlanFingerprint::new("sha256:x"),
+    );
+    graph.graph_schema_version = AgentGraphStateSchemaVersion::new(3);
+
+    let error = runner
+        .update_graph_state(graph, ts(300))
+        .await
+        .expect_err("a newer graph schema should be refused");
+    let supported = format!("<= {}", CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION.get());
+    assert!(
+        matches!(
+            &error,
+            AgentRunEngineError::WorkflowMismatch {
+                field: "graph_schema_version",
+                expected,
+                actual,
+                ..
+            } if *expected == supported && actual == "3"
+        ),
+        "{error:?}"
+    );
+    assert_error_code(error, "workflow-mismatch");
+    let after = runner
+        .state()
+        .expect("runner should be recovered")
+        .expect("run should exist");
+    assert_eq!(after.graph_state, None);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.updated_at, before.updated_at);
+}
+
+#[tokio::test]
+async fn a_non_terminal_graph_update_keeps_a_requested_cancellation() {
+    let mut runner = start_only(
+        single_step_workflow(),
+        AgentRunId::new("run-cancel-graph"),
+        AgentStepId::new("plan"),
+        TestStore::new(),
+    )
+    .await;
+    let cancelling = runner
+        .request_cancellation("parent-winding-down", None, ts(250))
+        .await
+        .expect("cancellation should be requested");
+    assert_eq!(cancelling.next_status, AgentRunStatus::Cancelling);
+    let graph = AgentGraphRunState::new(
+        AgentCompiledPlanId::new("plan-x"),
+        AgentCompiledPlanFingerprint::new("sha256:x"),
+    );
+
+    let updated = runner
+        .update_graph_state(graph.clone(), ts(260))
+        .await
+        .expect("a non-terminal graph update should apply");
+    assert_eq!(updated.previous_status, Some(AgentRunStatus::Cancelling));
+    assert_eq!(updated.next_status, AgentRunStatus::Cancelling);
+    assert!(updated.state.cancellation.is_some());
+    assert_eq!(updated.state.graph_state, Some(graph.clone()));
+
+    let mut terminal = graph;
+    terminal.terminal_status = Some(AgentGraphTerminalStatus::Cancelled);
+    let ended = runner
+        .update_graph_state(terminal, ts(270))
+        .await
+        .expect("a terminal graph update should end the run");
+    assert_eq!(ended.next_status, AgentRunStatus::Cancelled);
+    assert!(ended.state.cancellation.is_some());
 }

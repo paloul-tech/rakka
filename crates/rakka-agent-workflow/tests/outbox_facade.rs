@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata,
-    AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule,
-    AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey, AgentOutboxDuplicateReason,
-    AgentRunId, AgentRunInbox, AgentSpanLink, AgentTelemetryContext, AgentTimestampMillis,
-    METRIC_AGENT_OUTBOX_EFFECTS,
+    agent_effect_to_outbox_command, AgentCausationId, AgentCorrelationId, AgentDeduplicationKey,
+    AgentDurabilityMetadata, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
+    AgentEffectSchedule, AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey,
+    AgentOutboxDuplicateReason, AgentRunId, AgentRunInbox, AgentSpanLink, AgentTelemetryContext,
+    AgentTimestampMillis, METRIC_AGENT_OUTBOX_EFFECTS,
 };
 use rakka_core::InMemoryMetricsRecorder;
 use rakka_persistence::InMemoryDurableStateStore;
@@ -281,4 +281,87 @@ fn target() -> AgentEffectTarget {
         address: Some("tool://research".to_string()),
         attributes: BTreeMap::from([("tool_kind".to_string(), "research".to_string())]),
     }
+}
+
+#[test]
+fn outbox_command_reads_the_attempt_bound_leniently() {
+    let bound = |value: Option<&str>| {
+        let mut effect = effect("effect-bounded-1", "dedupe-bounded-1", None);
+        if let Some(value) = value {
+            effect
+                .target
+                .attributes
+                .insert("agent_effect_max_attempts".to_string(), value.to_string());
+        }
+        agent_effect_to_outbox_command(&effect)
+            .expect("effect should convert")
+            .retry_policy_value()
+    };
+
+    let default = rakka_workflow::RetryPolicy::default();
+    assert_eq!(bound(None).max_attempts(), default.max_attempts());
+    assert_eq!(bound(None).max_attempts(), 3);
+    assert_eq!(bound(Some("many")).max_attempts(), 3);
+    assert_eq!(bound(Some("0")).max_attempts(), 3);
+    let four = bound(Some("4"));
+    assert_eq!(four.max_attempts(), 4);
+    assert_eq!(
+        four.initial_backoff_millis(),
+        default.initial_backoff_millis()
+    );
+    assert_eq!(four.max_backoff_millis(), default.max_backoff_millis());
+}
+
+#[tokio::test]
+async fn outbox_effects_selects_before_decoding_and_skips_an_entry_that_does_not_decode() {
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let mut inbox = agent_inbox(AgentRunId::new("run-outbox-read"), store, clock, metrics);
+    inbox.recover().await.expect("inbox should recover");
+    let effect = effect("effect-decodes-1", "dedupe-decodes-1", None);
+    inbox
+        .schedule_effect(effect.clone())
+        .await
+        .expect("effect should schedule");
+    inbox
+        .inner_mut()
+        .schedule_outbox(rakka_workflow::OutboxCommand::new(
+            "effect-undecodable-1",
+            OutboxTarget::application("tool"),
+            "agent.effect",
+            b"{not an effect".to_vec(),
+        ))
+        .await
+        .expect("raw entry should schedule");
+    inbox
+        .inner_mut()
+        .record_outbox_success(&rakka_workflow::OutboxMessageId::new(
+            "effect-undecodable-1",
+        ))
+        .await
+        .expect("raw entry should conclude");
+
+    let all = inbox
+        .outbox_effects(|_entry| true)
+        .expect("the read should not fail on an undecodable entry");
+    assert_eq!(all.effects.len(), 1);
+    assert_eq!(all.effects[0].effect, effect);
+    assert_eq!(all.effects[0].entry.status(), OutboxStatus::Pending);
+    assert_eq!(all.undecodable, 1);
+
+    let only_decodable = inbox
+        .outbox_effects(|entry| entry.message_id().as_str() == "effect-decodes-1")
+        .expect("the read should succeed");
+    assert_eq!(only_decodable.effects.len(), 1);
+    assert_eq!(
+        only_decodable.undecodable, 0,
+        "an entry the selector drops is never decoded"
+    );
+
+    let none = inbox
+        .outbox_effects(|_entry| false)
+        .expect("the read should succeed");
+    assert!(none.effects.is_empty());
+    assert_eq!(none.undecodable, 0);
 }

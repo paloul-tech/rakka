@@ -331,6 +331,7 @@ pub struct AgentWorkflowRuntimeSnapshot {
     graph_timer_waiting_node_count: usize,
     graph_human_waiting_node_count: usize,
     graph_child_workflow_waiting_node_count: usize,
+    graph_reconciliation_waiting_node_count: usize,
     graph_failed_node_count: usize,
     graph_blocked_run_count: usize,
     status_counts: Vec<AgentRunStatusCount>,
@@ -355,6 +356,7 @@ impl AgentWorkflowRuntimeSnapshot {
         let mut graph_timer_waiting_node_count = 0;
         let mut graph_human_waiting_node_count = 0;
         let mut graph_child_workflow_waiting_node_count = 0;
+        let mut graph_reconciliation_waiting_node_count = 0;
         let mut graph_failed_node_count = 0;
         let mut graph_blocked_run_count = 0;
         for run in state.runs.values() {
@@ -383,6 +385,8 @@ impl AgentWorkflowRuntimeSnapshot {
                     graph_wait_reason_count(graph, AgentGraphWaitReason::Human);
                 graph_child_workflow_waiting_node_count +=
                     graph_wait_reason_count(graph, AgentGraphWaitReason::ChildWorkflow);
+                graph_reconciliation_waiting_node_count +=
+                    graph_wait_reason_count(graph, AgentGraphWaitReason::Reconciliation);
                 graph_failed_node_count += graph.failed_node_count;
                 if graph.blocked_reason_code.is_some() {
                     graph_blocked_run_count += 1;
@@ -406,6 +410,7 @@ impl AgentWorkflowRuntimeSnapshot {
             graph_timer_waiting_node_count,
             graph_human_waiting_node_count,
             graph_child_workflow_waiting_node_count,
+            graph_reconciliation_waiting_node_count,
             graph_failed_node_count,
             graph_blocked_run_count,
             status_counts: status_counts
@@ -500,6 +505,12 @@ impl AgentWorkflowRuntimeSnapshot {
     #[must_use]
     pub const fn graph_child_workflow_waiting_node_count(&self) -> usize {
         self.graph_child_workflow_waiting_node_count
+    }
+
+    /// Total graph-node count parked on a person for a reconciliation decision.
+    #[must_use]
+    pub const fn graph_reconciliation_waiting_node_count(&self) -> usize {
+        self.graph_reconciliation_waiting_node_count
     }
 
     /// Total failed graph-node count across observed runs.

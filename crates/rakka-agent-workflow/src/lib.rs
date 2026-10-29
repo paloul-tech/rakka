@@ -161,7 +161,7 @@ pub use effect_bridge::{
     AgentGraphEffectCommandOutcome, AgentGraphEffectFailureDisposition,
     AgentGraphEffectScheduleOutcome, AgentGraphEffectScheduleRequest,
     AgentGraphHumanCheckpointScheduleOutcome, AgentGraphHumanCheckpointScheduleRequest,
-    AgentGraphTimerScheduleOutcome, AgentGraphTimerScheduleRequest,
+    AgentGraphTimerScheduleOutcome, AgentGraphTimerScheduleRequest, ATTR_AGENT_EFFECT_SAFETY_CLASS,
 };
 pub use facade::{
     validate_command, validate_command_metadata, validate_effect_metadata,
@@ -175,9 +175,9 @@ pub use graph_scheduler::{
 };
 pub use graph_state::{
     AgentGraphBlockedReason, AgentGraphLoopInstanceState, AgentGraphNodeProjection,
-    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunProjection, AgentGraphRunState,
-    AgentGraphStateSchemaVersion, AgentGraphTerminalStatus, AgentGraphWaitReason,
-    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
+    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphReconciliationDecision,
+    AgentGraphRunProjection, AgentGraphRunState, AgentGraphStateSchemaVersion,
+    AgentGraphTerminalStatus, AgentGraphWaitReason, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 pub use inbox::{
     agent_run_workflow_id, AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError,
@@ -249,7 +249,8 @@ pub use otlp::{
 pub use outbox::{
     agent_effect_outbox_target, agent_effect_to_outbox_command,
     agent_timestamp_to_workflow_timestamp, AgentDueEffect, AgentOutboxAcceptance,
-    AgentOutboxDuplicateReason, AgentOutboxError, AgentOutboxResult, METRIC_AGENT_OUTBOX_EFFECTS,
+    AgentOutboxDuplicateReason, AgentOutboxEffects, AgentOutboxError, AgentOutboxResult,
+    ATTR_AGENT_EFFECT_MAX_ATTEMPTS, METRIC_AGENT_OUTBOX_EFFECTS,
 };
 #[cfg(feature = "postgres")]
 pub use postgres_query::{

@@ -5,9 +5,10 @@ use rakka_agent_workflow::{
     AgentCompiledIteratorPolicy, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanEdge,
     AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
     AgentCompiledPlanPort, AgentCompiledPortDirection, AgentGraphNodeState, AgentGraphNodeStatus,
-    AgentGraphRunState, AgentGraphScheduler, AgentGraphTerminalStatus, AgentGraphWaitReason,
+    AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
+    AgentGraphStateSchemaVersion, AgentGraphTerminalStatus, AgentGraphWaitReason,
     AgentTimestampMillis, AgentWorkflowId, WorkflowDefinitionVersion,
-    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 
 #[test]
@@ -1157,4 +1158,151 @@ fn node_ids(node_ids: &[AgentCompiledNodeId]) -> Vec<&str> {
 
 const fn ts(millis: u64) -> AgentTimestampMillis {
     AgentTimestampMillis::new(millis)
+}
+
+#[test]
+fn scheduler_refuses_a_graph_state_from_a_newer_schema() {
+    let plan = linear_plan();
+    let scheduler = AgentGraphScheduler::new();
+    let mut state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+    state.graph_schema_version = AgentGraphStateSchemaVersion::new(3);
+
+    let error = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(110))
+        .expect_err("a newer schema version should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphSchedulerError::UnsupportedSchemaVersion { found, supported }
+                if *found == AgentGraphStateSchemaVersion::new(3)
+                    && *supported == CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "graph-state-schema-unsupported");
+}
+
+#[test]
+fn cancel_graph_run_cancels_a_parked_node() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = linear_plan();
+    let state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+    let state = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(110))
+        .expect("input should become runnable")
+        .state;
+    let state = scheduler
+        .start_node(&plan, state, "input", ts(120))
+        .expect("input should start")
+        .state;
+    let state = scheduler
+        .wait_node(&plan, state, "input", AgentGraphWaitReason::Effect, ts(130))
+        .expect("input should wait for effect")
+        .state;
+    let waiting_revision = state.scheduler_revision;
+
+    let parked = scheduler
+        .park_waiting_node(
+            &plan,
+            state,
+            "input",
+            AgentGraphWaitReason::Effect,
+            "effect-outcome-unknown",
+            ts(140),
+        )
+        .expect("input should park");
+    assert_eq!(
+        parked.changed_node_ids,
+        vec![AgentCompiledNodeId::new("input")]
+    );
+    let node = node_state(&parked.state, "input");
+    assert_eq!(node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(node.wait_reason, Some(AgentGraphWaitReason::Reconciliation));
+    assert_eq!(node.error_code.as_deref(), Some("effect-outcome-unknown"));
+    assert_eq!(node.updated_at, ts(140));
+    assert_eq!(parked.state.scheduler_revision, waiting_revision + 1);
+    assert_eq!(
+        parked.state.graph_schema_version,
+        CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION
+    );
+    assert!(parked.runnable_node_ids.is_empty());
+
+    let state = scheduler
+        .cancel_graph_run(&plan, parked.state, ts(150))
+        .expect("graph should cancel while parked")
+        .state;
+    assert_eq!(
+        node_state(&state, "input").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(node_state(&state, "input").wait_reason, None);
+    assert_eq!(
+        state.terminal_status,
+        Some(AgentGraphTerminalStatus::Cancelled)
+    );
+}
+
+#[test]
+fn park_waiting_node_requires_a_cause_code() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = linear_plan();
+    let state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+    let state = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(110))
+        .expect("input should become runnable")
+        .state;
+    let state = scheduler
+        .start_node(&plan, state, "input", ts(120))
+        .expect("input should start")
+        .state;
+    let state = scheduler
+        .wait_node(&plan, state, "input", AgentGraphWaitReason::Timer, ts(130))
+        .expect("input should wait for a timer")
+        .state;
+
+    let error = scheduler
+        .park_waiting_node(
+            &plan,
+            state.clone(),
+            "input",
+            AgentGraphWaitReason::Timer,
+            "  ",
+            ts(140),
+        )
+        .expect_err("a blank cause should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphSchedulerError::EmptyCauseCode { node_id }
+                if node_id == &AgentCompiledNodeId::new("input")
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "empty-reconciliation-cause");
+
+    let error = scheduler
+        .park_waiting_node(
+            &plan,
+            state,
+            "input",
+            AgentGraphWaitReason::Effect,
+            "effect-outcome-unknown",
+            ts(140),
+        )
+        .expect_err("a node waiting on a timer is not waiting on an effect");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphSchedulerError::InvalidNodeTransition { node_id, from, .. }
+                if node_id == &AgentCompiledNodeId::new("input")
+                    && *from == AgentGraphNodeStatus::Waiting
+        ),
+        "{error:?}"
+    );
 }

@@ -457,3 +457,49 @@ impl PlanTestExt for AgentCompiledExecutionPlan {
         self
     }
 }
+
+#[test]
+fn validation_refuses_the_effect_attribute_values_the_bridge_would() {
+    // The bridge refuses these at schedule time; plan validation refuses them
+    // before any run starts, under the same codes (PR #114 review, finding 2).
+    let targeted = sample_plan()
+        .nodes
+        .iter()
+        .position(|node| node.target.is_some())
+        .expect("sample plan has a targeted node");
+    let with_attribute = |key: &str, value: &str| {
+        let mut plan = sample_plan();
+        plan.nodes[targeted]
+            .target
+            .as_mut()
+            .expect("targeted node")
+            .attributes
+            .insert(key.to_string(), value.to_string());
+        plan
+    };
+
+    for value in ["read-only", "idempotent", "non-idempotent", "reconcileable"] {
+        validate_compiled_execution_plan(&with_attribute("agent_effect_safety_class", value))
+            .expect("a vocabulary safety class is valid");
+    }
+    assert_validation_code(
+        with_attribute("agent_effect_safety_class", "bogus"),
+        "invalid-effect-safety-class",
+    );
+
+    validate_compiled_execution_plan(&with_attribute("agent_effect_max_attempts", "5"))
+        .expect("a positive attempt bound is valid");
+    for value in ["0", "many", "-1", " "] {
+        assert_validation_code(
+            with_attribute("agent_effect_max_attempts", value),
+            "invalid-effect-max-attempts",
+        );
+    }
+
+    validate_compiled_execution_plan(&with_attribute("target_class", "payments"))
+        .expect("an ordinary target class is valid");
+    assert_validation_code(
+        with_attribute("target_class", "payments;gen=3"),
+        "invalid-effect-target-class",
+    );
+}

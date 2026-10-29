@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::metrics::label_value_contains_line_break;
 use crate::{
     AgentAttributes, AgentWorkflowId, ArtifactRef, WorkflowDefinitionVersion,
-    AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES, FORBIDDEN_HOT_METRIC_FIELDS,
+    AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES, ATTR_AGENT_EFFECT_MAX_ATTEMPTS,
+    ATTR_AGENT_EFFECT_SAFETY_CLASS, FORBIDDEN_HOT_METRIC_FIELDS,
 };
 
 const DEFAULT_COMPILED_PLAN_RUNTIME_VERSION: &str = "0.1.0";
@@ -996,6 +997,13 @@ const fn default_true() -> bool {
     true
 }
 
+/// Node-target attribute naming the effect target's class; the bridge folds it
+/// into the effect identity.
+const ATTR_TARGET_CLASS: &str = "target_class";
+/// The effect safety classes a node target may declare.
+const AGENT_EFFECT_SAFETY_CLASS_LABELS: [&str; 4] =
+    ["read-only", "idempotent", "non-idempotent", "reconcileable"];
+
 /// Result type for compiled execution plan validation.
 pub type AgentCompiledPlanValidationResult<T> = Result<T, AgentCompiledPlanValidationError>;
 
@@ -1179,6 +1187,30 @@ pub enum AgentCompiledPlanValidationError {
         /// Node with the unsafe binding ref.
         node_id: AgentCompiledNodeId,
     },
+    /// A node target declares an effect safety class outside the vocabulary
+    /// (`read-only`, `idempotent`, `non-idempotent`, `reconcileable`).
+    InvalidEffectSafetyClass {
+        /// Node whose target declares the class.
+        node_id: AgentCompiledNodeId,
+        /// The declared value.
+        value: String,
+    },
+    /// A node target declares an attempt bound that is not a positive decimal
+    /// integer.
+    InvalidEffectMaxAttempts {
+        /// Node whose target declares the bound.
+        node_id: AgentCompiledNodeId,
+        /// The declared value.
+        value: String,
+    },
+    /// A node target's class ends in `;gen=<n>`, which would make the node's
+    /// effect id read as another effect generation.
+    InvalidEffectTargetClass {
+        /// Node whose target declares the class.
+        node_id: AgentCompiledNodeId,
+        /// The declared value.
+        value: String,
+    },
 }
 
 impl AgentCompiledPlanValidationError {
@@ -1210,6 +1242,9 @@ impl AgentCompiledPlanValidationError {
             Self::CycleDetected { .. } => "cycle_detected",
             Self::UnsafeAttribute { .. } => "unsafe_attribute",
             Self::SecretLikeCredentialBindingRef { .. } => "secret_like_credential_binding_ref",
+            Self::InvalidEffectSafetyClass { .. } => "invalid-effect-safety-class",
+            Self::InvalidEffectMaxAttempts { .. } => "invalid-effect-max-attempts",
+            Self::InvalidEffectTargetClass { .. } => "invalid-effect-target-class",
         }
     }
 }
@@ -1386,6 +1421,18 @@ impl Display for AgentCompiledPlanValidationError {
                     "credential binding ref on node `{node_id}` looks like raw secret material"
                 )
             }
+            Self::InvalidEffectSafetyClass { node_id, value } => write!(
+                f,
+                "node `{node_id}` declares `{ATTR_AGENT_EFFECT_SAFETY_CLASS}` = `{value}`; expected read-only, idempotent, non-idempotent or reconcileable"
+            ),
+            Self::InvalidEffectMaxAttempts { node_id, value } => write!(
+                f,
+                "node `{node_id}` declares `{ATTR_AGENT_EFFECT_MAX_ATTEMPTS}` = `{value}`; expected a positive decimal integer"
+            ),
+            Self::InvalidEffectTargetClass { node_id, value } => write!(
+                f,
+                "node `{node_id}` has target class `{value}`, which ends in `;gen=<n>` and would make its effect id read as another generation"
+            ),
         }
     }
 }
@@ -1670,7 +1717,56 @@ fn validate_node_target(
         format!("nodes[{}].target.attributes", node.node_id),
         &target.attributes,
         false,
-    )
+    )?;
+    validate_effect_target_attributes(node, target)
+}
+
+/// The three node-target values the graph effect bridge reads when it mints
+/// an effect, refused here under the bridge's own codes so a plan the bridge
+/// would refuse at a node's schedule never starts a run.
+fn validate_effect_target_attributes(
+    node: &AgentCompiledPlanNode,
+    target: &AgentCompiledNodeTarget,
+) -> AgentCompiledPlanValidationResult<()> {
+    if let Some(value) = target.attributes.get(ATTR_AGENT_EFFECT_SAFETY_CLASS) {
+        if !AGENT_EFFECT_SAFETY_CLASS_LABELS.contains(&value.as_str()) {
+            return Err(AgentCompiledPlanValidationError::InvalidEffectSafetyClass {
+                node_id: node.node_id.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+    if let Some(value) = target.attributes.get(ATTR_AGENT_EFFECT_MAX_ATTEMPTS) {
+        if !matches!(value.parse::<u32>(), Ok(max_attempts) if max_attempts > 0) {
+            return Err(AgentCompiledPlanValidationError::InvalidEffectMaxAttempts {
+                node_id: node.node_id.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+    if let Some(value) = target
+        .attributes
+        .get(ATTR_TARGET_CLASS)
+        .filter(|value| !value.trim().is_empty())
+    {
+        if target_class_reads_as_generation(value) {
+            return Err(AgentCompiledPlanValidationError::InvalidEffectTargetClass {
+                node_id: node.node_id.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The effect identity the bridge mints ends with the node's target class and
+/// the bridge reads an effect's generation back from a trailing `;gen=<n>`, so
+/// a class ending that way would make a generation-zero id read as generation
+/// `n`.
+pub(crate) fn target_class_reads_as_generation(target_class: &str) -> bool {
+    target_class
+        .rsplit_once(";gen=")
+        .is_some_and(|(_, generation)| generation.parse::<u32>().is_ok())
 }
 
 fn validate_ports(node: &AgentCompiledPlanNode) -> AgentCompiledPlanValidationResult<()> {

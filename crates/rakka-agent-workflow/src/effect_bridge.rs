@@ -3,13 +3,45 @@
 //! This module maps effect-producing compiled graph nodes to first-class
 //! [`AgentEffect`] values and schedules them through the existing durable
 //! outbox boundary. It does not dispatch external work directly.
+//!
+//! # The reconciliation park
+//!
+//! An effect whose call may have run and whose answer was lost is reported
+//! with [`AgentGraphEffectFailureDisposition::Reconcile`]; the bridge parks
+//! the node on a person, but only once the effect's outbox entry is terminal
+//! and never due (`Exhausted` or `Cancelled`), refusing otherwise with
+//! [`AgentGraphEffectBridgeError::EffectNotTerminal`] before acceptance. The
+//! dispatcher's contract: report an outcome-unknown exhaustion with
+//! `reconcile`, never with `exhausted` first (that fails the run for good),
+//! and record the entry exhausted before sending the command. A parked node
+//! still answers a real result: a late `EffectCompleted` completes it and a
+//! definitive `EffectFailed` fails it. The person's decision arrives as
+//! [`AgentCommandKind::GraphReconciliationDecided`] through
+//! [`AgentGraphEffectBridge::accept_and_apply_reconciliation_decision`]:
+//! `not-executed` resumes the node on its next effect generation and
+//! `abandon` fails the node and the run (`reconciliation-abandoned` is the
+//! recommended code).
+//!
+//! # Effect generations
+//!
+//! [`AgentGraphEffectBridge::effect_from_node_in_state`] mints the effect
+//! under the node's `effect_generation`. Generation zero is exactly what
+//! [`AgentGraphEffectBridge::effect_from_node`] yields, so no stored id
+//! moves; from generation one the effect id and dedupe key carry `;gen={g}`,
+//! a new outbox entry with a fresh retry budget, while the idempotency key
+//! follows the target's declared safety class
+//! ([`ATTR_AGENT_EFFECT_SAFETY_CLASS`]). Every effect-keyed command is fenced
+//! by the generation read back from its effect id: a superseded generation's
+//! command is a no-op. A node's attempt bound travels as the target attribute
+//! [`crate::ATTR_AGENT_EFFECT_MAX_ATTEMPTS`], validated here and applied by
+//! the shared outbox conversion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use rakka_persistence::DurableStateStore;
-use rakka_workflow::{WorkflowClock, WorkflowState};
+use rakka_workflow::{OutboxMessageId, OutboxStatus, WorkflowClock, WorkflowState};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -18,14 +50,16 @@ use crate::{
     AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanNode, AgentCompiledPortId,
     AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
     AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget, AgentFacadeError,
-    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
+    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphReconciliationDecision,
+    AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
     AgentGraphSchedulerTransition, AgentGraphTerminalStatus, AgentGraphWaitReason,
     AgentHumanApprovalRequest, AgentHumanCheckpointError, AgentIdempotencyKey,
     AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance, AgentOutboxError, AgentRunId,
     AgentRunInbox, AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerError,
     AgentTimerId, AgentTimerPolicy, AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis,
     ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
+    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE, ATTR_AGENT_EFFECT_MAX_ATTEMPTS,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 
 const ATTR_COMPILED_NODE_ID: &str = "compiled_node_id";
@@ -36,6 +70,18 @@ const ATTR_TARGET_CLASS: &str = "target_class";
 const ROOT_LOOP_INSTANCE_ID: &str = "root";
 const ATTR_FAILURE_DISPOSITION: &str = "failure_disposition";
 const ATTR_DECISION_STATUS: &str = "decision_status";
+const EFFECT_GENERATION_SUFFIX: &str = ";gen=";
+
+/// Node-target attribute naming the effect's safety class, in `rakka-agent`'s
+/// dispatch-ticket vocabulary: `read-only`, `idempotent`, `non-idempotent` or
+/// `reconcileable`.
+///
+/// The bridge reads it when it mints an effect generation above zero: only
+/// `idempotent` gets a generation-suffixed idempotency key; every other class,
+/// and an absent attribute, keeps the generation-zero key so a target that
+/// deduplicates by key refuses to run the call a second time. Any other value
+/// refuses the schedule with `invalid-effect-safety-class`.
+pub const ATTR_AGENT_EFFECT_SAFETY_CLASS: &str = "agent_effect_safety_class";
 
 /// Result type for compiled graph effect bridge operations.
 pub type AgentGraphEffectBridgeResult<T> = Result<T, AgentGraphEffectBridgeError>;
@@ -125,6 +171,13 @@ pub enum AgentGraphEffectBridgeError {
         /// Scheduler failure.
         error: AgentGraphSchedulerError,
     },
+    /// A `Reconcile` disposition named an effect whose outbox entry is still live.
+    EffectNotTerminal {
+        /// Effect id.
+        effect_id: AgentEffectId,
+        /// Current outbox entry status.
+        status: OutboxStatus,
+    },
     /// Command kind did not match the requested graph effect operation.
     UnexpectedCommandKind {
         /// Expected command type name.
@@ -183,6 +236,7 @@ impl AgentGraphEffectBridgeError {
             Self::Inbox { error } => error.code(),
             Self::Outbox { error } => error.code(),
             Self::Scheduler { error } => error.code(),
+            Self::EffectNotTerminal { .. } => "graph-effect-not-terminal",
             Self::UnexpectedCommandKind { .. } => "unexpected-graph-effect-command-kind",
             Self::UnknownEffect { .. } => "unknown-graph-effect",
             Self::UnknownTimer { .. } => "unknown-graph-timer",
@@ -252,6 +306,10 @@ impl Display for AgentGraphEffectBridgeError {
             Self::Inbox { error } => write!(f, "graph effect command acceptance failed: {error}"),
             Self::Outbox { error } => write!(f, "graph effect outbox scheduling failed: {error}"),
             Self::Scheduler { error } => write!(f, "graph effect transition failed: {error}"),
+            Self::EffectNotTerminal { effect_id, status } => write!(
+                f,
+                "effect `{effect_id}` cannot be parked while its outbox entry is `{status:?}`"
+            ),
             Self::UnexpectedCommandKind { expected, actual } => write!(
                 f,
                 "expected graph effect command `{expected}` but received `{actual}`"
@@ -297,6 +355,7 @@ impl Error for AgentGraphEffectBridgeError {
             | Self::UnsupportedNodeKind { .. }
             | Self::MissingTarget { .. }
             | Self::InvalidNodeStatus { .. }
+            | Self::EffectNotTerminal { .. }
             | Self::UnexpectedCommandKind { .. }
             | Self::UnknownEffect { .. }
             | Self::UnknownTimer { .. }
@@ -359,6 +418,10 @@ pub struct AgentGraphEffectScheduleRequest {
     pub timeout_ms: Option<u64>,
     /// Expected result type name.
     pub expected_result_type: Option<String>,
+    /// Attempt bound for this schedule; written onto the effect target as
+    /// [`ATTR_AGENT_EFFECT_MAX_ATTEMPTS`] and winning over the plan's value.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
     /// Effect creation timestamp.
     pub created_at: AgentTimestampMillis,
     /// Command or event that caused this effect.
@@ -387,11 +450,20 @@ impl AgentGraphEffectScheduleRequest {
             due_at: None,
             timeout_ms: None,
             expected_result_type: None,
+            max_attempts: None,
             created_at,
             causation_id,
             correlation_id,
             telemetry_context: AgentTelemetryContext::default(),
         }
+    }
+
+    /// Sets the attempt bound for this schedule, overriding the bound the
+    /// plan declares on the node target. Zero is refused at schedule time.
+    #[must_use]
+    pub const fn max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = Some(max_attempts);
+        self
     }
 
     /// Sets a deterministic loop instance id.
@@ -648,6 +720,11 @@ pub enum AgentGraphEffectFailureDisposition {
     Exhausted,
     /// Failure is terminal for graph scheduling policy.
     Terminal,
+    /// The call may have run and nobody can say: park the node on a person.
+    ///
+    /// The bridge accepts it only once the effect's outbox entry is terminal
+    /// and never due (`Exhausted` or `Cancelled`).
+    Reconcile,
 }
 
 impl AgentGraphEffectFailureDisposition {
@@ -658,6 +735,7 @@ impl AgentGraphEffectFailureDisposition {
             Self::RetryScheduled => "retry-scheduled",
             Self::Exhausted => "exhausted",
             Self::Terminal => "terminal",
+            Self::Reconcile => "reconcile",
         }
     }
 }
@@ -670,6 +748,7 @@ impl std::str::FromStr for AgentGraphEffectFailureDisposition {
             "retry-scheduled" => Ok(Self::RetryScheduled),
             "exhausted" => Ok(Self::Exhausted),
             "terminal" => Ok(Self::Terminal),
+            "reconcile" => Ok(Self::Reconcile),
             _ => Err(AgentGraphEffectBridgeError::InvalidFailureDisposition {
                 disposition: Some(value.to_string()),
             }),
@@ -705,7 +784,34 @@ impl AgentGraphEffectBridge {
     ) -> AgentGraphEffectBridgeResult<AgentEffect> {
         validate_plan(plan)?;
         let node = ensure_known_node(plan, &request.node_id)?;
-        effect_from_node(plan, node, request)
+        effect_from_node_for_generation(plan, node, request, 0)
+    }
+
+    /// Maps a compiled graph node to a scheduled effect under the effect
+    /// generation the durable state has opened for it.
+    ///
+    /// At generation zero this is exactly [`Self::effect_from_node`]. From
+    /// generation one (opened by a `not-executed` reconciliation decision)
+    /// the effect id and dedupe key carry a `;gen={g}` suffix, so the
+    /// re-offer is a new outbox entry with a fresh retry budget, and the
+    /// idempotency key follows the target's declared safety class
+    /// ([`ATTR_AGENT_EFFECT_SAFETY_CLASS`]).
+    pub fn effect_from_node_in_state(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        state: &AgentGraphRunState,
+        request: &AgentGraphEffectScheduleRequest,
+    ) -> AgentGraphEffectBridgeResult<AgentEffect> {
+        validate_plan(plan)?;
+        let node = ensure_known_node(plan, &request.node_id)?;
+        let generation = state
+            .node_states
+            .get(&request.node_id)
+            .map(|node_state| node_state.effect_generation)
+            .ok_or_else(|| AgentGraphEffectBridgeError::MissingNodeState {
+                node_id: request.node_id.clone(),
+            })?;
+        effect_from_node_for_generation(plan, node, request, generation)
     }
 
     /// Schedules one running graph node as a durable outbox effect.
@@ -726,7 +832,7 @@ impl AgentGraphEffectBridge {
     {
         validate_plan_state(plan, &state)?;
         validate_inbox_matches_run(&request, inbox)?;
-        let effect = self.effect_from_node(plan, &request)?;
+        let effect = self.effect_from_node_in_state(plan, &state, &request)?;
         let wait_reason = wait_reason_for_effect_node(plan, &request.node_id)?;
         ensure_node_can_schedule_effect(&state, &request.node_id, &effect.effect_id, wait_reason)?;
 
@@ -945,6 +1051,24 @@ impl AgentGraphEffectBridge {
         .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })
     }
 
+    /// Builds a `GraphReconciliationDecided` command for a parked node's
+    /// effect.
+    pub fn reconciliation_decision_command(
+        &self,
+        metadata: AgentCommandMetadata,
+        effect_id: AgentEffectId,
+        decision: AgentGraphReconciliationDecision,
+    ) -> AgentGraphEffectBridgeResult<AgentCommand> {
+        AgentCommand::new(
+            AgentCommandKind::GraphReconciliationDecided {
+                effect_id,
+                decision,
+            },
+            metadata,
+        )
+        .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })
+    }
+
     /// Builds a `TimerFired` command for a durable graph timer.
     pub fn timer_fired_command(
         &self,
@@ -1017,7 +1141,11 @@ impl AgentGraphEffectBridge {
     /// Accepts an effect failure command and applies it to graph state.
     ///
     /// Retry-scheduled failures keep the graph node waiting. Exhausted or
-    /// terminal failures fail the node and the graph.
+    /// terminal failures fail the node and the graph. A `Reconcile`
+    /// disposition parks the node on a person; it is refused before
+    /// acceptance, with [`AgentGraphEffectBridgeError::EffectNotTerminal`],
+    /// unless the effect's outbox entry is already `Exhausted` or
+    /// `Cancelled`, so a parked node never has a live retry under it.
     pub async fn accept_and_apply_effect_failed<Store, Clock>(
         &self,
         plan: &AgentCompiledExecutionPlan,
@@ -1031,8 +1159,44 @@ impl AgentGraphEffectBridge {
     {
         ensure_command_kind(&command, "EffectFailed")?;
         validate_command_inbox_matches_run(&command, inbox)?;
+        if matches!(
+            failure_disposition(&command),
+            Ok(AgentGraphEffectFailureDisposition::Reconcile)
+        ) {
+            ensure_effect_entry_terminal(&command, inbox)?;
+        }
         let acceptance = inbox.accept_command(command.clone()).await?;
         let transition = apply_effect_failed_command(plan, state, &command)?;
+        Ok(AgentGraphEffectCommandOutcome {
+            acceptance,
+            transition,
+        })
+    }
+
+    /// Accepts a reconciliation decision and applies it to graph state.
+    ///
+    /// `NotExecuted` resumes the parked node as running on its next effect
+    /// generation; `Abandon` fails the node and the graph under its code. A
+    /// decision on a node that has resolved is a no-op; one on a node that
+    /// was never parked is refused with
+    /// [`AgentGraphEffectBridgeError::InvalidNodeStatus`]. An `Abandon`
+    /// whose code is blank is refused before acceptance.
+    pub async fn accept_and_apply_reconciliation_decision<Store, Clock>(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        state: AgentGraphRunState,
+        command: AgentCommand,
+        inbox: &mut AgentRunInbox<Store, Clock>,
+    ) -> AgentGraphEffectBridgeResult<AgentGraphEffectCommandOutcome>
+    where
+        Store: DurableStateStore<WorkflowState>,
+        Clock: WorkflowClock,
+    {
+        ensure_command_kind(&command, "GraphReconciliationDecided")?;
+        validate_command_inbox_matches_run(&command, inbox)?;
+        ensure_decision_has_a_cause(&state, &command)?;
+        let acceptance = inbox.accept_command(command.clone()).await?;
+        let transition = apply_reconciliation_decision_command(plan, state, &command)?;
         Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
@@ -1117,6 +1281,14 @@ fn validate_plan_state(
                 "state has {}, plan has {}",
                 state.plan_fingerprint, plan.plan_fingerprint
             ),
+        });
+    }
+    if state.graph_schema_version > CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION {
+        return Err(AgentGraphEffectBridgeError::Scheduler {
+            error: AgentGraphSchedulerError::UnsupportedSchemaVersion {
+                found: state.graph_schema_version,
+                supported: CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
+            },
         });
     }
     if let Some(status) = state.terminal_status {
@@ -1344,6 +1516,125 @@ fn apply_human_decision_command(
     )?)
 }
 
+fn ensure_effect_entry_terminal<Store, Clock>(
+    command: &AgentCommand,
+    inbox: &AgentRunInbox<Store, Clock>,
+) -> AgentGraphEffectBridgeResult<()>
+where
+    Store: DurableStateStore<WorkflowState>,
+    Clock: WorkflowClock,
+{
+    let effect_id = match &command.kind {
+        AgentCommandKind::EffectFailed { effect_id, .. } => effect_id,
+        _ => {
+            return Err(AgentGraphEffectBridgeError::UnexpectedCommandKind {
+                expected: "EffectFailed",
+                actual: command.kind.type_name(),
+            });
+        }
+    };
+    let state = inbox.inner().state().map_err(AgentInboxError::from)?;
+    let entry = state
+        .outbox_entry(&OutboxMessageId::new(effect_id.as_str()))
+        .ok_or_else(|| AgentGraphEffectBridgeError::UnknownEffect {
+            effect_id: effect_id.clone(),
+        })?;
+    match entry.status() {
+        OutboxStatus::Exhausted | OutboxStatus::Cancelled => Ok(()),
+        status => Err(AgentGraphEffectBridgeError::EffectNotTerminal {
+            effect_id: effect_id.clone(),
+            status,
+        }),
+    }
+}
+
+fn ensure_decision_has_a_cause(
+    state: &AgentGraphRunState,
+    command: &AgentCommand,
+) -> AgentGraphEffectBridgeResult<()> {
+    if let AgentCommandKind::GraphReconciliationDecided {
+        effect_id,
+        decision: AgentGraphReconciliationDecision::Abandon { error_code },
+    } = &command.kind
+    {
+        if error_code.trim().is_empty() {
+            let node_id = node_id_for_effect(state, effect_id)?;
+            return Err(AgentGraphEffectBridgeError::Scheduler {
+                error: AgentGraphSchedulerError::EmptyCauseCode { node_id },
+            });
+        }
+    }
+    Ok(())
+}
+
+fn apply_reconciliation_decision_command(
+    plan: &AgentCompiledExecutionPlan,
+    state: AgentGraphRunState,
+    command: &AgentCommand,
+) -> AgentGraphEffectBridgeResult<AgentGraphSchedulerTransition> {
+    validate_plan_state_for_command(plan, &state)?;
+    let (effect_id, decision) = match &command.kind {
+        AgentCommandKind::GraphReconciliationDecided {
+            effect_id,
+            decision,
+        } => (effect_id, decision),
+        _ => {
+            return Err(AgentGraphEffectBridgeError::UnexpectedCommandKind {
+                expected: "GraphReconciliationDecided",
+                actual: command.kind.type_name(),
+            });
+        }
+    };
+    let node_id = node_id_for_effect(&state, effect_id)?;
+    let node_state = state.node_states.get(&node_id).ok_or_else(|| {
+        AgentGraphEffectBridgeError::MissingNodeState {
+            node_id: node_id.clone(),
+        }
+    })?;
+    if effect_generation_of(effect_id) != node_state.effect_generation {
+        return Ok(noop_transition(state));
+    }
+    match node_state.status {
+        AgentGraphNodeStatus::Completed
+        | AgentGraphNodeStatus::Failed
+        | AgentGraphNodeStatus::Cancelled => return Ok(noop_transition(state)),
+        AgentGraphNodeStatus::Waiting
+            if node_state.wait_reason == Some(AgentGraphWaitReason::Reconciliation) => {}
+        status => {
+            return Err(AgentGraphEffectBridgeError::InvalidNodeStatus { node_id, status });
+        }
+    }
+
+    let received_at = command.metadata.received_at;
+    match decision {
+        AgentGraphReconciliationDecision::NotExecuted => {
+            Ok(AgentGraphScheduler::new().resume_parked_node(plan, state, node_id, received_at)?)
+        }
+        AgentGraphReconciliationDecision::Abandon { error_code } => Ok(AgentGraphScheduler::new()
+            .fail_waiting_node(
+                plan,
+                state,
+                node_id,
+                AgentGraphWaitReason::Reconciliation,
+                error_code.clone(),
+                received_at,
+            )?),
+    }
+}
+
+/// A node accepts an effect-keyed command while it waits on the kind's own
+/// reason or is parked for reconciliation.
+fn node_accepts_effect_command(
+    node_state: &AgentGraphNodeState,
+    kind_reason: AgentGraphWaitReason,
+) -> bool {
+    node_state.status == AgentGraphNodeStatus::Waiting
+        && matches!(
+            node_state.wait_reason,
+            Some(reason) if reason == kind_reason || reason == AgentGraphWaitReason::Reconciliation
+        )
+}
+
 fn apply_effect_completed_command(
     plan: &AgentCompiledExecutionPlan,
     state: AgentGraphRunState,
@@ -1365,18 +1656,20 @@ fn apply_effect_completed_command(
             node_id: node_id.clone(),
         }
     })?;
+    if effect_generation_of(effect_id) != node_state.effect_generation {
+        return Ok(noop_transition(state));
+    }
     if node_state.status == AgentGraphNodeStatus::Completed {
         return Ok(noop_transition(state));
     }
-    let wait_reason = wait_reason_for_effect_node(plan, &node_id)?;
-    if node_state.status != AgentGraphNodeStatus::Waiting
-        || node_state.wait_reason != Some(wait_reason)
-    {
+    let kind_reason = wait_reason_for_effect_node(plan, &node_id)?;
+    if !node_accepts_effect_command(node_state, kind_reason) {
         return Err(AgentGraphEffectBridgeError::InvalidNodeStatus {
             node_id,
             status: node_state.status,
         });
     }
+    let wait_reason = node_state.wait_reason.unwrap_or(kind_reason);
 
     let output_refs = first_output_ref(plan, &node_id, command.payload_ref.clone())?;
     Ok(AgentGraphScheduler::new().complete_waiting_node(
@@ -1413,23 +1706,44 @@ fn apply_effect_failed_command(
             node_id: node_id.clone(),
         }
     })?;
+    if effect_generation_of(effect_id) != node_state.effect_generation {
+        return Ok(noop_transition(state));
+    }
     if matches!(
         node_state.status,
         AgentGraphNodeStatus::Failed | AgentGraphNodeStatus::Cancelled
     ) {
         return Ok(noop_transition(state));
     }
-    let wait_reason = wait_reason_for_effect_node(plan, &node_id)?;
-    if node_state.status != AgentGraphNodeStatus::Waiting
-        || node_state.wait_reason != Some(wait_reason)
-    {
+    let kind_reason = wait_reason_for_effect_node(plan, &node_id)?;
+    if !node_accepts_effect_command(node_state, kind_reason) {
         return Err(AgentGraphEffectBridgeError::InvalidNodeStatus {
             node_id,
             status: node_state.status,
         });
     }
+    let wait_reason = node_state.wait_reason.unwrap_or(kind_reason);
+    let parked = wait_reason == AgentGraphWaitReason::Reconciliation;
+    let same_cause = node_state.error_code.as_deref() == Some(error_code);
 
     match failure_disposition(command)? {
+        AgentGraphEffectFailureDisposition::RetryScheduled if parked => {
+            // The entry was terminal when the park was accepted; a retry
+            // report is stale.
+            Ok(noop_transition(state))
+        }
+        AgentGraphEffectFailureDisposition::Reconcile if parked && same_cause => {
+            Ok(noop_transition(state))
+        }
+        AgentGraphEffectFailureDisposition::Reconcile => Ok(AgentGraphScheduler::new()
+            .park_waiting_node(
+                plan,
+                state,
+                node_id,
+                wait_reason,
+                error_code,
+                command.metadata.received_at,
+            )?),
         AgentGraphEffectFailureDisposition::RetryScheduled => {
             let node_state = state.node_states.get_mut(&node_id).ok_or_else(|| {
                 AgentGraphEffectBridgeError::MissingNodeState {
@@ -1678,15 +1992,33 @@ fn ensure_node_can_open_checkpoint(
     })
 }
 
-fn effect_from_node(
+fn effect_from_node_for_generation(
     plan: &AgentCompiledExecutionPlan,
     node: &AgentCompiledPlanNode,
     request: &AgentGraphEffectScheduleRequest,
+    generation: u32,
 ) -> AgentGraphEffectBridgeResult<AgentEffect> {
     let kind = effect_kind_for_node(node)?;
     let target = effect_target_for_node(plan, node, request)?;
     let target_class = target_class_from_attributes(&target.attributes, node.kind);
-    let identity = effect_identity(plan, node, request, kind, &target_class);
+    let generation_zero_identity = effect_identity(plan, node, request, kind, &target_class);
+    ensure_identity_reads_as_generation_zero(
+        &node.node_id,
+        &target_class,
+        &generation_zero_identity,
+    )?;
+    let identity = effect_identity_for_generation(&generation_zero_identity, generation);
+    let safety_class = node
+        .target
+        .as_ref()
+        .and_then(|target| target.attributes.get(ATTR_AGENT_EFFECT_SAFETY_CLASS))
+        .map(String::as_str);
+    let idempotency_key = idempotency_key_for(
+        &node.node_id,
+        &generation_zero_identity,
+        &identity,
+        safety_class,
+    )?;
     let durability = AgentDurabilityMetadata::new(
         AgentDeduplicationKey::new(format!("graph-effect-dedupe:{identity}")),
         request.causation_id.clone(),
@@ -1696,7 +2028,7 @@ fn effect_from_node(
     let mut metadata = AgentEffectMetadata::new(
         AgentEffectId::new(format!("graph-effect:{identity}")),
         durability,
-        AgentIdempotencyKey::new(format!("graph-effect-idempotency:{identity}")),
+        AgentIdempotencyKey::new(idempotency_key),
         request.created_at,
     )?;
     if let Some(due_at) = request.due_at {
@@ -1957,6 +2289,13 @@ fn effect_target_for_node(
             binding_ref.as_str().to_string(),
         );
     }
+    if let Some(max_attempts) = request.max_attempts {
+        attributes.insert(
+            ATTR_AGENT_EFFECT_MAX_ATTEMPTS.to_string(),
+            max_attempts.to_string(),
+        );
+    }
+    validate_max_attempts(&node.node_id, &attributes)?;
 
     Ok(AgentEffectTarget {
         target_type: target.target_type.clone(),
@@ -1964,6 +2303,26 @@ fn effect_target_for_node(
         address: target.address.clone(),
         attributes,
     })
+}
+
+/// Refuses an attempt bound that is not a positive decimal integer, so a
+/// graph effect never reaches the lenient outbox conversion with a bad bound.
+fn validate_max_attempts(
+    node_id: &AgentCompiledNodeId,
+    attributes: &BTreeMap<String, String>,
+) -> AgentGraphEffectBridgeResult<()> {
+    let Some(value) = attributes.get(ATTR_AGENT_EFFECT_MAX_ATTEMPTS) else {
+        return Ok(());
+    };
+    match value.parse::<u32>() {
+        Ok(max_attempts) if max_attempts > 0 => Ok(()),
+        _ => Err(AgentGraphEffectBridgeError::InvalidCompiledPlan {
+            validation_code: "invalid-effect-max-attempts",
+            reason: format!(
+                "node `{node_id}` declares `{ATTR_AGENT_EFFECT_MAX_ATTEMPTS}` = `{value}`; expected a positive decimal integer"
+            ),
+        }),
+    }
 }
 
 fn target_class(target: &AgentCompiledNodeTarget, kind: AgentCompiledNodeKind) -> String {
@@ -2002,6 +2361,73 @@ fn effect_identity(
         kind.as_label(),
         target_class
     )
+}
+
+/// The identity for one effect generation: the generation-zero identity
+/// itself at zero, so no stored id moves, and `{identity};gen={g}` from one.
+fn effect_identity_for_generation(generation_zero_identity: &str, generation: u32) -> String {
+    if generation == 0 {
+        generation_zero_identity.to_string()
+    } else {
+        format!("{generation_zero_identity}{EFFECT_GENERATION_SUFFIX}{generation}")
+    }
+}
+
+/// The generation an effect id was minted under, read back from its
+/// trailing `;gen={g}`; zero when the suffix is absent or unparsable.
+fn effect_generation_of(effect_id: &AgentEffectId) -> u32 {
+    generation_read_from(effect_id.as_str())
+}
+
+fn generation_read_from(identity: &str) -> u32 {
+    identity
+        .rsplit_once(EFFECT_GENERATION_SUFFIX)
+        .and_then(|(_, generation)| generation.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// The bridge never mints an id its own fence would misread: the identity
+/// ends with the plan's free-form `target_class`, so a class ending in
+/// `;gen=<n>` would make a generation-0 id read as generation `n` and the
+/// node's own outcome would be fenced as superseded. Such a plan is refused
+/// at every generation.
+fn ensure_identity_reads_as_generation_zero(
+    node_id: &AgentCompiledNodeId,
+    target_class: &str,
+    generation_zero_identity: &str,
+) -> AgentGraphEffectBridgeResult<()> {
+    if generation_read_from(generation_zero_identity) == 0 {
+        return Ok(());
+    }
+    Err(AgentGraphEffectBridgeError::InvalidCompiledPlan {
+        validation_code: "invalid-effect-target-class",
+        reason: format!(
+            "node `{node_id}` has target class `{target_class}`, which ends in `{EFFECT_GENERATION_SUFFIX}<n>` and would make its effect id read as another generation"
+        ),
+    })
+}
+
+/// The idempotency key for one generation by the target's declared safety
+/// class: suffixed for `idempotent`, the bare generation-zero key for
+/// `non-idempotent`, `reconcileable`, `read-only` and an absent class.
+fn idempotency_key_for(
+    node_id: &AgentCompiledNodeId,
+    generation_zero_identity: &str,
+    identity: &str,
+    safety_class: Option<&str>,
+) -> AgentGraphEffectBridgeResult<String> {
+    match safety_class {
+        Some("idempotent") => Ok(format!("graph-effect-idempotency:{identity}")),
+        None | Some("non-idempotent" | "reconcileable" | "read-only") => Ok(format!(
+            "graph-effect-idempotency:{generation_zero_identity}"
+        )),
+        Some(other) => Err(AgentGraphEffectBridgeError::InvalidCompiledPlan {
+            validation_code: "invalid-effect-safety-class",
+            reason: format!(
+                "node `{node_id}` declares `{ATTR_AGENT_EFFECT_SAFETY_CLASS}` = `{other}`; expected read-only, idempotent, non-idempotent or reconcileable"
+            ),
+        }),
+    }
 }
 
 fn timer_identity(

@@ -3,22 +3,28 @@
 use std::collections::BTreeMap;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCommandId, AgentCommandMetadata, AgentCompiledExecutionPlan,
-    AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanEdge,
-    AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
-    AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCompiledPortId, AgentCorrelationId,
-    AgentCredentialBindingRef, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffectKind,
-    AgentEffectTarget, AgentGraphEffectBridge, AgentGraphEffectFailureDisposition,
+    AgentCausationId, AgentCommand, AgentCommandId, AgentCommandMetadata,
+    AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentCompiledNodeKind,
+    AgentCompiledNodeTarget, AgentCompiledPlanEdge, AgentCompiledPlanFingerprint,
+    AgentCompiledPlanId, AgentCompiledPlanNode, AgentCompiledPlanPort, AgentCompiledPortDirection,
+    AgentCompiledPortId, AgentCorrelationId, AgentCredentialBindingRef, AgentDeduplicationKey,
+    AgentDurabilityMetadata, AgentEffectId, AgentEffectKind, AgentEffectTarget,
+    AgentGraphEffectBridge, AgentGraphEffectBridgeError, AgentGraphEffectFailureDisposition,
     AgentGraphEffectScheduleRequest, AgentGraphHumanCheckpointScheduleRequest, AgentGraphNodeState,
-    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler, AgentGraphTerminalStatus,
-    AgentGraphTimerScheduleRequest, AgentGraphWaitReason, AgentRunId, AgentRunInbox, AgentTenantId,
-    AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis, AgentWorkflowId,
-    ArtifactEncryptionRef, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
-    HumanCheckpointStatus, HumanDecisionOption, PrincipalRef, RedactionStatus,
+    AgentGraphNodeStatus, AgentGraphReconciliationDecision, AgentGraphRunState,
+    AgentGraphScheduler, AgentGraphSchedulerError, AgentGraphStateSchemaVersion,
+    AgentGraphTerminalStatus, AgentGraphTimerScheduleRequest, AgentGraphWaitReason, AgentRunId,
+    AgentRunInbox, AgentTenantId, AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis,
+    AgentWorkflowId, ArtifactEncryptionRef, ArtifactKind, ArtifactRef, HumanCheckpoint,
+    HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, PrincipalRef, RedactionStatus,
     WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 use rakka_persistence::InMemoryDurableStateStore;
-use rakka_workflow::{ManualWorkflowClock, WorkflowState, WorkflowTimestamp};
+use rakka_workflow::{
+    ManualWorkflowClock, OutboxMessageId, OutboxStatus, WorkflowState, WorkflowTimestamp,
+};
+use serde_json::json;
 
 type TestStore = InMemoryDurableStateStore<WorkflowState>;
 type TestInbox = AgentRunInbox<TestStore, ManualWorkflowClock>;
@@ -705,6 +711,21 @@ async fn schedule_kind(
         .expect("effect should schedule")
 }
 
+/// A running state for the payments tool plan, built from its attribute-free
+/// twin. The twin shares the plan id and fingerprint (neither covers the
+/// target class or attributes), so a bridge test that hands the bridge a plan
+/// with an invalid effect attribute can still reach the bridge's own gate: the
+/// scheduler refuses such a plan at initialization now (held by
+/// `compiled_plan_contract`), so the state cannot come from the plan itself.
+fn running_payments_state() -> AgentGraphRunState {
+    running_effect_state(&effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "payments.charge",
+        "payments",
+    ))
+}
+
 fn running_effect_state(plan: &AgentCompiledExecutionPlan) -> AgentGraphRunState {
     let scheduler = AgentGraphScheduler::new();
     let state = scheduler
@@ -788,9 +809,26 @@ fn effect_plan(
     target_name: &str,
     target_class: &str,
 ) -> AgentCompiledExecutionPlan {
+    effect_plan_with(kind, target_type, target_name, target_class, &[])
+}
+
+/// `effect_plan` with extra attributes declared on the effect node's target.
+fn effect_plan_with(
+    kind: AgentCompiledNodeKind,
+    target_type: &str,
+    target_name: &str,
+    target_class: &str,
+    attributes: &[(&str, &str)],
+) -> AgentCompiledExecutionPlan {
     let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
         AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),
     );
+    let mut target = AgentCompiledNodeTarget::new(target_type, target_name)
+        .address(format!("{target_type}://{target_name}"))
+        .attribute("target_class", target_class);
+    for (key, value) in attributes {
+        target = target.attribute(*key, *value);
+    }
     let effect = AgentCompiledPlanNode::new("effect", kind)
         .input_port(AgentCompiledPlanPort::new(
             "payload",
@@ -802,11 +840,7 @@ fn effect_plan(
             AgentCompiledPortDirection::Output,
             "effect-result",
         ))
-        .target(
-            AgentCompiledNodeTarget::new(target_type, target_name)
-                .address(format!("{target_type}://{target_name}"))
-                .attribute("target_class", target_class),
-        )
+        .target(target)
         .credential_binding_ref(AgentCredentialBindingRef::new("credential:effect-node"));
     let terminal = AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal)
         .input_port(AgentCompiledPlanPort::new(
@@ -997,4 +1031,1655 @@ fn node_state<'a>(state: &'a AgentGraphRunState, node_id: &str) -> &'a AgentGrap
 
 const fn ts(millis: u64) -> AgentTimestampMillis {
     AgentTimestampMillis::new(millis)
+}
+
+#[tokio::test]
+async fn bridge_refuses_a_graph_state_from_a_newer_schema() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "research.search",
+        "research",
+    );
+    let mut running_state = running_effect_state(&plan);
+    running_state.graph_schema_version = AgentGraphStateSchemaVersion::new(3);
+    let run_id = AgentRunId::new("run-graph-newer-schema");
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let mut inbox = agent_inbox(run_id.clone(), store, clock);
+    inbox.recover().await.expect("inbox should recover");
+
+    let error = bridge
+        .schedule_node_effect(
+            &plan,
+            running_state,
+            effect_request(run_id, "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect_err("a newer schema version should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::Scheduler {
+                error: AgentGraphSchedulerError::UnsupportedSchemaVersion { found, supported }
+            } if *found == AgentGraphStateSchemaVersion::new(3)
+                && *supported == CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "graph-state-schema-unsupported");
+    assert!(inbox
+        .due_effects()
+        .expect("due effects should read")
+        .is_empty());
+}
+
+// ---- the reconciliation park (issue #110) ----
+
+async fn recovered_inbox(run_id: &AgentRunId) -> TestInbox {
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let mut inbox = agent_inbox(run_id.clone(), TestStore::new(), clock);
+    inbox.recover().await.expect("inbox should recover");
+    inbox
+}
+
+async fn schedule_effect(
+    bridge: &AgentGraphEffectBridge,
+    plan: &AgentCompiledExecutionPlan,
+    run_id: &AgentRunId,
+    inbox: &mut TestInbox,
+) -> (AgentEffectId, AgentGraphRunState) {
+    let scheduled = bridge
+        .schedule_node_effect(
+            plan,
+            running_effect_state(plan),
+            effect_request(run_id.clone(), "effect", 200),
+            inbox,
+        )
+        .await
+        .expect("effect should schedule");
+    assert!(scheduled.acceptance.is_scheduled());
+    (scheduled.effect.effect_id, scheduled.transition.state)
+}
+
+fn message_id(effect_id: &AgentEffectId) -> OutboxMessageId {
+    OutboxMessageId::new(effect_id.as_str())
+}
+
+fn entry_status(inbox: &TestInbox, effect_id: &AgentEffectId) -> OutboxStatus {
+    inbox
+        .inner()
+        .state()
+        .expect("inbox should be recovered")
+        .outbox_entry(&message_id(effect_id))
+        .expect("outbox entry should exist")
+        .status()
+}
+
+async fn exhaust(inbox: &mut TestInbox, effect_id: &AgentEffectId) {
+    inbox
+        .inner_mut()
+        .record_outbox_exhausted(&message_id(effect_id), "effect-outcome-unknown")
+        .await
+        .expect("entry should exhaust");
+    assert_eq!(entry_status(inbox, effect_id), OutboxStatus::Exhausted);
+}
+
+fn reconcile_command(
+    bridge: &AgentGraphEffectBridge,
+    plan: &AgentCompiledExecutionPlan,
+    run_id: &AgentRunId,
+    command_id: &str,
+    effect_id: &AgentEffectId,
+    cause: &str,
+) -> AgentCommand {
+    bridge
+        .effect_failed_command(
+            command_metadata(plan, run_id.clone(), command_id, 300),
+            effect_id.clone(),
+            cause,
+            AgentGraphEffectFailureDisposition::Reconcile,
+        )
+        .expect("reconcile command should build")
+}
+
+/// Schedules the `effect` node, exhausts its entry, and parks it with the
+/// cause `effect-outcome-unknown`.
+async fn park(
+    bridge: &AgentGraphEffectBridge,
+    plan: &AgentCompiledExecutionPlan,
+    run_id: &AgentRunId,
+    inbox: &mut TestInbox,
+) -> (AgentEffectId, AgentGraphRunState) {
+    let (effect_id, state) = schedule_effect(bridge, plan, run_id, inbox).await;
+    exhaust(inbox, &effect_id).await;
+    let command = reconcile_command(
+        bridge,
+        plan,
+        run_id,
+        "cmd-reconcile-1",
+        &effect_id,
+        "effect-outcome-unknown",
+    );
+    let outcome = bridge
+        .accept_and_apply_effect_failed(plan, state, command, inbox)
+        .await
+        .expect("reconcile should park the node");
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::Reconciliation)
+    );
+    (effect_id, outcome.transition.state)
+}
+
+fn assert_not_terminal(
+    error: &AgentGraphEffectBridgeError,
+    effect_id: &AgentEffectId,
+    expected: OutboxStatus,
+) {
+    assert!(
+        matches!(
+            error,
+            AgentGraphEffectBridgeError::EffectNotTerminal { effect_id: id, status }
+                if id == effect_id && *status == expected
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "graph-effect-not-terminal");
+}
+
+fn payments_plan() -> AgentCompiledExecutionPlan {
+    effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "payments.charge",
+        "payments",
+    )
+}
+
+#[tokio::test]
+async fn reconcile_disposition_parks_the_node_and_leaves_the_run_running() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-reconcile-park");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = schedule_effect(&bridge, &plan, &run_id, &mut inbox).await;
+    let scheduled_revision = state.scheduler_revision;
+    exhaust(&mut inbox, &effect_id).await;
+    let command = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-reconcile-1",
+        &effect_id,
+        "effect-outcome-unknown",
+    );
+
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, state, command, &mut inbox)
+        .await
+        .expect("reconcile should park the node");
+
+    assert!(outcome.acceptance.is_accepted());
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(node.wait_reason, Some(AgentGraphWaitReason::Reconciliation));
+    assert_eq!(node.error_code.as_deref(), Some("effect-outcome-unknown"));
+    assert!(node.scheduled_effect_ids.contains(&effect_id));
+    assert_eq!(
+        outcome.transition.changed_node_ids,
+        vec![AgentCompiledNodeId::new("effect")]
+    );
+    assert_eq!(
+        outcome.transition.state.scheduler_revision,
+        scheduled_revision + 1
+    );
+    assert_eq!(outcome.transition.state.blocked_reason, None);
+    assert_eq!(outcome.transition.state.terminal_status, None);
+    assert_eq!(
+        node_state(&outcome.transition.state, "terminal").status,
+        AgentGraphNodeStatus::Pending
+    );
+    assert!(outcome.transition.runnable_node_ids.is_empty());
+    assert_eq!(entry_status(&inbox, &effect_id), OutboxStatus::Exhausted);
+    assert!(inbox
+        .due_effects()
+        .expect("due effects should read")
+        .is_empty());
+
+    assert_eq!(
+        AgentGraphEffectFailureDisposition::Reconcile.as_label(),
+        "reconcile"
+    );
+    assert_eq!(
+        "reconcile"
+            .parse::<AgentGraphEffectFailureDisposition>()
+            .expect("label should parse"),
+        AgentGraphEffectFailureDisposition::Reconcile
+    );
+}
+
+#[tokio::test]
+async fn reconcile_is_refused_while_the_entry_is_live() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-reconcile-live");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = schedule_effect(&bridge, &plan, &run_id, &mut inbox).await;
+    let command = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-reconcile-live",
+        &effect_id,
+        "effect-outcome-unknown",
+    );
+
+    assert_eq!(entry_status(&inbox, &effect_id), OutboxStatus::Pending);
+    let error = bridge
+        .accept_and_apply_effect_failed(&plan, state.clone(), command.clone(), &mut inbox)
+        .await
+        .expect_err("a pending entry should refuse the park");
+    assert_not_terminal(&error, &effect_id, OutboxStatus::Pending);
+
+    inbox
+        .inner_mut()
+        .mark_outbox_dispatching(&message_id(&effect_id))
+        .await
+        .expect("entry should mark dispatching");
+    assert_eq!(entry_status(&inbox, &effect_id), OutboxStatus::Dispatching);
+    let error = bridge
+        .accept_and_apply_effect_failed(&plan, state.clone(), command.clone(), &mut inbox)
+        .await
+        .expect_err("a dispatching entry should refuse the park");
+    assert_not_terminal(&error, &effect_id, OutboxStatus::Dispatching);
+
+    inbox
+        .inner_mut()
+        .record_outbox_failure(&message_id(&effect_id), "rate-limited", false)
+        .await
+        .expect("entry should record a retryable failure");
+    assert_eq!(entry_status(&inbox, &effect_id), OutboxStatus::Failed);
+    let error = bridge
+        .accept_and_apply_effect_failed(&plan, state.clone(), command.clone(), &mut inbox)
+        .await
+        .expect_err("a failed entry with budget left should refuse the park");
+    assert_not_terminal(&error, &effect_id, OutboxStatus::Failed);
+
+    // The refusals recorded nothing: the same command id is accepted, not a
+    // duplicate, once the entry is exhausted.
+    exhaust(&mut inbox, &effect_id).await;
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, state, command, &mut inbox)
+        .await
+        .expect("reconcile should park once the entry is exhausted");
+    assert!(outcome.acceptance.is_accepted());
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::Reconciliation)
+    );
+
+    // Dispatched, on a fresh run.
+    let run_id = AgentRunId::new("run-graph-reconcile-dispatched");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = schedule_effect(&bridge, &plan, &run_id, &mut inbox).await;
+    inbox
+        .inner_mut()
+        .mark_outbox_dispatching(&message_id(&effect_id))
+        .await
+        .expect("entry should mark dispatching");
+    inbox
+        .inner_mut()
+        .record_outbox_success(&message_id(&effect_id))
+        .await
+        .expect("entry should record success");
+    assert_eq!(entry_status(&inbox, &effect_id), OutboxStatus::Dispatched);
+    let command = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-reconcile-dispatched",
+        &effect_id,
+        "effect-outcome-unknown",
+    );
+    let error = bridge
+        .accept_and_apply_effect_failed(&plan, state.clone(), command, &mut inbox)
+        .await
+        .expect_err("a dispatched entry should refuse the park");
+    assert_not_terminal(&error, &effect_id, OutboxStatus::Dispatched);
+    assert_eq!(
+        node_state(&state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::Effect)
+    );
+}
+
+#[tokio::test]
+async fn reconcile_parks_over_a_cancelled_entry() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-reconcile-cancelled");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = schedule_effect(&bridge, &plan, &run_id, &mut inbox).await;
+    let cancelled = inbox
+        .inner_mut()
+        .record_outbox_cancelled(&message_id(&effect_id), "operator-cancelled")
+        .await
+        .expect("entry should cancel");
+    assert!(cancelled.is_some());
+    assert_eq!(entry_status(&inbox, &effect_id), OutboxStatus::Cancelled);
+    let command = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-reconcile-cancelled",
+        &effect_id,
+        "effect-outcome-unknown",
+    );
+
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, state, command, &mut inbox)
+        .await
+        .expect("reconcile should park over a cancelled entry");
+
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(node.wait_reason, Some(AgentGraphWaitReason::Reconciliation));
+    assert_eq!(entry_status(&inbox, &effect_id), OutboxStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn reconcile_twice_is_a_no_op_and_a_new_cause_replaces() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-reconcile-twice");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let parked_revision = state.scheduler_revision;
+
+    let same_cause = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-reconcile-2",
+        &effect_id,
+        "effect-outcome-unknown",
+    );
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, state, same_cause, &mut inbox)
+        .await
+        .expect("a second reconcile with the same cause should apply");
+    assert!(outcome.acceptance.is_accepted());
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state.scheduler_revision, parked_revision);
+
+    let new_cause = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-reconcile-3",
+        &effect_id,
+        "effect-reply-lost",
+    );
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, outcome.transition.state, new_cause, &mut inbox)
+        .await
+        .expect("a reconcile with a new cause should apply");
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(node.wait_reason, Some(AgentGraphWaitReason::Reconciliation));
+    assert_eq!(node.error_code.as_deref(), Some("effect-reply-lost"));
+    assert_eq!(
+        outcome.transition.changed_node_ids,
+        vec![AgentCompiledNodeId::new("effect")]
+    );
+    assert_eq!(
+        outcome.transition.state.scheduler_revision,
+        parked_revision + 1
+    );
+}
+
+#[tokio::test]
+async fn parked_node_completes_on_a_late_effect_completed() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-parked-completes");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let command = bridge
+        .effect_completed_command(
+            command_metadata(&plan, run_id, "cmd-late-completed", 400),
+            effect_id,
+            Some(artifact("artifact:late-result", ArtifactKind::ToolOutput)),
+        )
+        .expect("completion command should build");
+
+    let outcome = bridge
+        .accept_and_apply_effect_completed(&plan, state, command, &mut inbox)
+        .await
+        .expect("a late completion should resolve the park");
+
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Completed);
+    assert_eq!(node.wait_reason, None);
+    assert_eq!(node.error_code, None);
+    assert_eq!(
+        node.output_refs.get(&AgentCompiledPortId::new("result")),
+        Some(&artifact("artifact:late-result", ArtifactKind::ToolOutput))
+    );
+    assert_eq!(outcome.transition.state.terminal_status, None);
+    let ready = AgentGraphScheduler::new()
+        .mark_ready_nodes_runnable(&plan, outcome.transition.state, ts(500))
+        .expect("terminal should become runnable");
+    assert_eq!(
+        ready.runnable_node_ids,
+        vec![AgentCompiledNodeId::new("terminal")]
+    );
+}
+
+#[tokio::test]
+async fn parked_node_fails_on_a_definitive_effect_failed() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    for (disposition, suffix) in [
+        (AgentGraphEffectFailureDisposition::Exhausted, "exhausted"),
+        (AgentGraphEffectFailureDisposition::Terminal, "terminal"),
+    ] {
+        let run_id = AgentRunId::new(format!("run-graph-parked-fails-{suffix}"));
+        let mut inbox = recovered_inbox(&run_id).await;
+        let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+        let command = bridge
+            .effect_failed_command(
+                command_metadata(&plan, run_id, "cmd-definitive-failure", 400),
+                effect_id,
+                "retry-budget-exhausted",
+                disposition,
+            )
+            .expect("failure command should build");
+
+        let outcome = bridge
+            .accept_and_apply_effect_failed(&plan, state, command, &mut inbox)
+            .await
+            .expect("a definitive failure should resolve the park");
+
+        let node = node_state(&outcome.transition.state, "effect");
+        assert_eq!(node.status, AgentGraphNodeStatus::Failed, "{suffix}");
+        assert_eq!(node.wait_reason, None);
+        assert_eq!(node.error_code.as_deref(), Some("retry-budget-exhausted"));
+        assert_eq!(
+            outcome.transition.state.terminal_status,
+            Some(AgentGraphTerminalStatus::Failed)
+        );
+        assert_eq!(
+            node_state(&outcome.transition.state, "terminal").status,
+            AgentGraphNodeStatus::Cancelled
+        );
+    }
+}
+
+#[tokio::test]
+async fn parked_node_ignores_a_retry_scheduled_report() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-parked-retry-report");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let parked_revision = state.scheduler_revision;
+    let command = bridge
+        .effect_failed_command(
+            command_metadata(&plan, run_id, "cmd-stale-retry", 400),
+            effect_id,
+            "rate-limited",
+            AgentGraphEffectFailureDisposition::RetryScheduled,
+        )
+        .expect("failure command should build");
+
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, state, command, &mut inbox)
+        .await
+        .expect("a stale retry report should be a no-op");
+
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state.scheduler_revision, parked_revision);
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(node.wait_reason, Some(AgentGraphWaitReason::Reconciliation));
+    assert_eq!(node.error_code.as_deref(), Some("effect-outcome-unknown"));
+}
+
+#[tokio::test]
+async fn reconcile_after_an_exhausted_report_is_a_no_op_on_the_failed_node() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-reconcile-after-exhausted");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = schedule_effect(&bridge, &plan, &run_id, &mut inbox).await;
+    exhaust(&mut inbox, &effect_id).await;
+    let exhausted = bridge
+        .effect_failed_command(
+            command_metadata(&plan, run_id.clone(), "cmd-exhausted-first", 300),
+            effect_id.clone(),
+            "retry-budget-exhausted",
+            AgentGraphEffectFailureDisposition::Exhausted,
+        )
+        .expect("failure command should build");
+    let failed = bridge
+        .accept_and_apply_effect_failed(&plan, state, exhausted, &mut inbox)
+        .await
+        .expect("exhausted should fail the run");
+    assert_eq!(
+        failed.transition.state.terminal_status,
+        Some(AgentGraphTerminalStatus::Failed)
+    );
+    let failed_revision = failed.transition.state.scheduler_revision;
+
+    let command = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-reconcile-late",
+        &effect_id,
+        "effect-outcome-unknown",
+    );
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, failed.transition.state, command, &mut inbox)
+        .await
+        .expect("a reconcile after a definitive failure should be a no-op");
+
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state.scheduler_revision, failed_revision);
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Failed);
+    assert_eq!(node.error_code.as_deref(), Some("retry-budget-exhausted"));
+    assert_eq!(
+        outcome.transition.state.terminal_status,
+        Some(AgentGraphTerminalStatus::Failed)
+    );
+}
+
+#[tokio::test]
+async fn reconcile_parks_a_child_workflow_node_too() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ChildWorkflowCommand,
+        "workflow",
+        "child",
+        "child-workflow",
+    );
+    let run_id = AgentRunId::new("run-graph-reconcile-child");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = schedule_effect(&bridge, &plan, &run_id, &mut inbox).await;
+    assert_eq!(
+        node_state(&state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::ChildWorkflow)
+    );
+    exhaust(&mut inbox, &effect_id).await;
+    let command = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-reconcile-child",
+        &effect_id,
+        "child-outcome-unknown",
+    );
+
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, state, command, &mut inbox)
+        .await
+        .expect("reconcile should park a child workflow node");
+
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(node.wait_reason, Some(AgentGraphWaitReason::Reconciliation));
+    assert_eq!(node.error_code.as_deref(), Some("child-outcome-unknown"));
+    assert_eq!(outcome.transition.state.terminal_status, None);
+
+    // ... and is resumed by the same path: not-executed opens generation 1,
+    // whose schedule waits on the child workflow again.
+    let decision = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-child",
+        &effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+    let resumed = bridge
+        .accept_and_apply_reconciliation_decision(
+            &plan,
+            outcome.transition.state,
+            decision,
+            &mut inbox,
+        )
+        .await
+        .expect("not-executed should resume the child workflow node");
+    let node = node_state(&resumed.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Running);
+    assert_eq!(node.effect_generation, 1);
+    let second = bridge
+        .schedule_node_effect(
+            &plan,
+            resumed.transition.state,
+            effect_request(run_id, "effect", 500),
+            &mut inbox,
+        )
+        .await
+        .expect("generation 1 of the child workflow should schedule");
+    assert!(second.acceptance.is_scheduled());
+    assert!(second.effect.effect_id.as_str().ends_with(";gen=1"));
+    assert_eq!(second.effect.kind, AgentEffectKind::ChildWorkflowCommand);
+    assert_eq!(
+        node_state(&second.transition.state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::ChildWorkflow)
+    );
+}
+
+#[tokio::test]
+async fn a_version_one_state_parks_and_is_written_at_version_two() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-reconcile-version-one");
+    let mut inbox = recovered_inbox(&run_id).await;
+
+    let mut value =
+        serde_json::to_value(running_effect_state(&plan)).expect("graph state should serialize");
+    value["graph_schema_version"] = json!(1);
+    for node in value["node_states"]
+        .as_object_mut()
+        .expect("node states should be an object")
+        .values_mut()
+    {
+        node.as_object_mut()
+            .expect("node state should be an object")
+            .remove("effect_generation");
+    }
+    let state: AgentGraphRunState =
+        serde_json::from_value(value).expect("a version-one state should decode");
+    assert_eq!(
+        state.graph_schema_version,
+        AgentGraphStateSchemaVersion::new(1)
+    );
+
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            state,
+            effect_request(run_id.clone(), "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should schedule");
+    assert_eq!(
+        scheduled.transition.state.graph_schema_version,
+        AgentGraphStateSchemaVersion::new(1),
+        "scheduling writes no version-two value"
+    );
+    let effect_id = scheduled.effect.effect_id;
+    exhaust(&mut inbox, &effect_id).await;
+    let command = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-reconcile-v1",
+        &effect_id,
+        "effect-outcome-unknown",
+    );
+
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, scheduled.transition.state, command, &mut inbox)
+        .await
+        .expect("reconcile should park a version-one state");
+
+    assert_eq!(
+        outcome.transition.state.graph_schema_version,
+        CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION
+    );
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::Reconciliation)
+    );
+    let json =
+        serde_json::to_string(&outcome.transition.state).expect("parked state should serialize");
+    let decoded: AgentGraphRunState =
+        serde_json::from_str(&json).expect("parked state should deserialize");
+    assert_eq!(decoded, outcome.transition.state);
+}
+
+// ---- the reconciliation decisions (issue #110) ----
+
+fn decision_command(
+    bridge: &AgentGraphEffectBridge,
+    plan: &AgentCompiledExecutionPlan,
+    run_id: &AgentRunId,
+    command_id: &str,
+    effect_id: &AgentEffectId,
+    decision: AgentGraphReconciliationDecision,
+) -> AgentCommand {
+    bridge
+        .reconciliation_decision_command(
+            command_metadata(plan, run_id.clone(), command_id, 400),
+            effect_id.clone(),
+            decision,
+        )
+        .expect("decision command should build")
+}
+
+#[tokio::test]
+async fn not_executed_decision_resumes_the_node_running_with_the_next_generation() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-not-executed");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let parked = node_state(&state, "effect").clone();
+    let parked_revision = state.scheduler_revision;
+    let command = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-1",
+        &effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+
+    let outcome = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, command, &mut inbox)
+        .await
+        .expect("not-executed should resume the node");
+
+    assert!(outcome.acceptance.is_accepted());
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Running);
+    assert_eq!(node.wait_reason, None);
+    assert_eq!(node.error_code, None);
+    assert_eq!(node.effect_generation, 1);
+    assert_eq!(
+        (node.attempt, node.started_at),
+        (parked.attempt, parked.started_at)
+    );
+    assert_eq!(node.scheduled_effect_ids, vec![effect_id]);
+    assert_eq!(
+        outcome.transition.changed_node_ids,
+        vec![AgentCompiledNodeId::new("effect")]
+    );
+    assert_eq!(
+        outcome.transition.state.scheduler_revision,
+        parked_revision + 1
+    );
+    assert_eq!(
+        outcome.transition.state.graph_schema_version,
+        CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION
+    );
+    assert_eq!(outcome.transition.state.terminal_status, None);
+}
+
+#[tokio::test]
+async fn abandon_decision_fails_the_node_and_the_run() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-abandon");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let command = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-abandon",
+        &effect_id,
+        AgentGraphReconciliationDecision::Abandon {
+            error_code: "reconciliation-abandoned".to_string(),
+        },
+    );
+
+    let outcome = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, command, &mut inbox)
+        .await
+        .expect("abandon should fail the node");
+
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Failed);
+    assert_eq!(node.wait_reason, None);
+    assert_eq!(node.error_code.as_deref(), Some("reconciliation-abandoned"));
+    assert_eq!(node.effect_generation, 0);
+    assert_eq!(
+        outcome.transition.state.terminal_status,
+        Some(AgentGraphTerminalStatus::Failed)
+    );
+    assert_eq!(
+        node_state(&outcome.transition.state, "terminal").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn an_abandon_without_a_code_is_refused_before_acceptance() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-blank-code");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let blank = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-blank",
+        &effect_id,
+        AgentGraphReconciliationDecision::Abandon {
+            error_code: "  ".to_string(),
+        },
+    );
+
+    let error = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state.clone(), blank, &mut inbox)
+        .await
+        .expect_err("a blank abandon code should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::Scheduler {
+                error: AgentGraphSchedulerError::EmptyCauseCode { node_id }
+            } if node_id == &AgentCompiledNodeId::new("effect")
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "empty-reconciliation-cause");
+
+    // The refusal recorded nothing: the same command id carries a valid code
+    // and is accepted, not a duplicate.
+    let valid = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-blank",
+        &effect_id,
+        AgentGraphReconciliationDecision::Abandon {
+            error_code: "reconciliation-abandoned".to_string(),
+        },
+    );
+    let outcome = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, valid, &mut inbox)
+        .await
+        .expect("a valid abandon should apply");
+    assert!(outcome.acceptance.is_accepted());
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect").status,
+        AgentGraphNodeStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn a_decision_on_an_unparked_node_is_refused() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-unparked");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = schedule_effect(&bridge, &plan, &run_id, &mut inbox).await;
+    let command = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-unparked",
+        &effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+
+    let error = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, command, &mut inbox)
+        .await
+        .expect_err("a decision on an unparked node should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::InvalidNodeStatus { node_id, status }
+                if node_id == &AgentCompiledNodeId::new("effect")
+                    && status == &AgentGraphNodeStatus::Waiting
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_decision_after_the_node_resolved_is_a_no_op() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-replayed");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let abandon = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-abandon",
+        &effect_id,
+        AgentGraphReconciliationDecision::Abandon {
+            error_code: "reconciliation-abandoned".to_string(),
+        },
+    );
+    let failed = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, abandon, &mut inbox)
+        .await
+        .expect("abandon should apply");
+    let failed_revision = failed.transition.state.scheduler_revision;
+
+    let replay = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-late",
+        &effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+    let outcome = bridge
+        .accept_and_apply_reconciliation_decision(
+            &plan,
+            failed.transition.state,
+            replay,
+            &mut inbox,
+        )
+        .await
+        .expect("a late decision on a resolved node should be a no-op");
+
+    assert!(outcome.acceptance.is_accepted());
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state.scheduler_revision, failed_revision);
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Failed);
+    assert_eq!(node.effect_generation, 0);
+}
+
+#[tokio::test]
+async fn a_decision_for_an_unknown_effect_is_refused() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-decision-unknown");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (_effect_id, state) = park(&bridge, &plan, &run_id, &mut inbox).await;
+    let unknown = AgentEffectId::new("graph-effect:nope");
+    let command = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-unknown",
+        &unknown,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+
+    let error = bridge
+        .accept_and_apply_reconciliation_decision(&plan, state, command, &mut inbox)
+        .await
+        .expect_err("a decision for an unknown effect should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::UnknownEffect { effect_id } if effect_id == &unknown
+        ),
+        "{error:?}"
+    );
+}
+
+// ---- effect generations (issue #110) ----
+
+/// Parks the `effect` node, resumes it with `NotExecuted`, and returns the
+/// generation-0 effect id with the resumed (Running, generation 1) state.
+async fn park_and_resume(
+    bridge: &AgentGraphEffectBridge,
+    plan: &AgentCompiledExecutionPlan,
+    run_id: &AgentRunId,
+    inbox: &mut TestInbox,
+) -> (AgentEffectId, AgentGraphRunState) {
+    let (effect_id, state) = park(bridge, plan, run_id, inbox).await;
+    let command = decision_command(
+        bridge,
+        plan,
+        run_id,
+        "cmd-decide-not-executed",
+        &effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+    let outcome = bridge
+        .accept_and_apply_reconciliation_decision(plan, state, command, inbox)
+        .await
+        .expect("not-executed should resume the node");
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect").effect_generation,
+        1
+    );
+    (effect_id, outcome.transition.state)
+}
+
+/// `park_and_resume`, then schedules generation 1; returns both ids and the
+/// state waiting on generation 1.
+async fn re_offer(
+    bridge: &AgentGraphEffectBridge,
+    plan: &AgentCompiledExecutionPlan,
+    run_id: &AgentRunId,
+    inbox: &mut TestInbox,
+) -> (AgentEffectId, AgentEffectId, AgentGraphRunState) {
+    let (first_effect_id, resumed) = park_and_resume(bridge, plan, run_id, inbox).await;
+    let second = bridge
+        .schedule_node_effect(
+            plan,
+            resumed,
+            effect_request(run_id.clone(), "effect", 500),
+            inbox,
+        )
+        .await
+        .expect("generation 1 should schedule");
+    assert!(second.acceptance.is_scheduled());
+    (
+        first_effect_id,
+        second.effect.effect_id,
+        second.transition.state,
+    )
+}
+
+#[tokio::test]
+async fn a_re_offered_node_schedules_a_new_generation_with_a_fresh_budget() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-re-offer");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (first_effect_id, resumed) = park_and_resume(&bridge, &plan, &run_id, &mut inbox).await;
+
+    let second = bridge
+        .schedule_node_effect(
+            &plan,
+            resumed,
+            effect_request(run_id.clone(), "effect", 500),
+            &mut inbox,
+        )
+        .await
+        .expect("generation 1 should schedule");
+
+    assert!(second.acceptance.is_scheduled());
+    assert!(second.effect.effect_id.as_str().ends_with(";gen=1"));
+    assert!(second.effect.deduplication_key.as_str().ends_with(";gen=1"));
+    assert_eq!(
+        second.effect.effect_id.as_str(),
+        format!("{};gen=1", first_effect_id.as_str())
+    );
+    let workflow_state = inbox.inner().state().expect("inbox should be recovered");
+    let second_entry = workflow_state
+        .outbox_entry(&message_id(&second.effect.effect_id))
+        .expect("generation-1 entry should exist");
+    assert_eq!(second_entry.status(), OutboxStatus::Pending);
+    assert_eq!(second_entry.retry_policy().max_attempts(), 3);
+    assert_eq!(
+        workflow_state
+            .outbox_entry(&message_id(&first_effect_id))
+            .expect("generation-0 entry should exist")
+            .status(),
+        OutboxStatus::Exhausted
+    );
+    assert_eq!(
+        inbox.due_effects().expect("due effects should read").len(),
+        1
+    );
+    let node = node_state(&second.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(node.wait_reason, Some(AgentGraphWaitReason::Effect));
+    assert_eq!(node.effect_generation, 1);
+    assert_eq!(
+        node.scheduled_effect_ids,
+        vec![first_effect_id, second.effect.effect_id.clone()]
+    );
+
+    // A re-schedule of the current generation is still the dedupe hit it is today.
+    let again = bridge
+        .schedule_node_effect(
+            &plan,
+            second.transition.state,
+            effect_request(run_id, "effect", 500),
+            &mut inbox,
+        )
+        .await
+        .expect("a re-schedule of generation 1 should be a duplicate");
+    assert!(again.acceptance.is_duplicate());
+    assert_eq!(again.effect.effect_id, second.effect.effect_id);
+}
+
+#[tokio::test]
+async fn idempotency_key_follows_the_target_safety_class() {
+    let bridge = AgentGraphEffectBridge::new();
+    let run_id = AgentRunId::new("run-graph-safety-class");
+    let request = effect_request(run_id.clone(), "effect", 200);
+
+    let keys = |attributes: &[(&str, &str)]| {
+        let plan = effect_plan_with(
+            AgentCompiledNodeKind::ToolCall,
+            "tool",
+            "payments.charge",
+            "payments",
+            attributes,
+        );
+        let generation_zero = bridge
+            .effect_from_node(&plan, &request)
+            .expect("generation 0 should map");
+        let mut state = running_effect_state(&plan);
+        state
+            .node_states
+            .get_mut(&AgentCompiledNodeId::new("effect"))
+            .expect("effect node should exist")
+            .effect_generation = 1;
+        let generation_one = bridge
+            .effect_from_node_in_state(&plan, &state, &request)
+            .expect("generation 1 should map");
+        assert!(generation_one.effect_id.as_str().ends_with(";gen=1"));
+        (
+            generation_zero.idempotency_key.as_str().to_string(),
+            generation_one.idempotency_key.as_str().to_string(),
+        )
+    };
+
+    let (zero, one) = keys(&[("agent_effect_safety_class", "idempotent")]);
+    assert_eq!(one, format!("{zero};gen=1"));
+
+    for class in ["non-idempotent", "reconcileable", "read-only"] {
+        let (zero, one) = keys(&[("agent_effect_safety_class", class)]);
+        assert_eq!(one, zero, "{class}");
+        assert!(!one.ends_with(";gen=1"), "{class}");
+    }
+    let (zero, one) = keys(&[]);
+    assert_eq!(one, zero, "an absent class is non-idempotent");
+
+    let bogus = effect_plan_with(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "payments.charge",
+        "payments",
+        &[("agent_effect_safety_class", "bogus")],
+    );
+    let mut inbox = recovered_inbox(&run_id).await;
+    let error = bridge
+        .schedule_node_effect(&bogus, running_payments_state(), request, &mut inbox)
+        .await
+        .expect_err("an unknown safety class should be refused");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::InvalidCompiledPlan {
+                validation_code: "invalid-effect-safety-class",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(inbox
+        .due_effects()
+        .expect("due effects should read")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn generation_zero_identity_is_unchanged() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "github.issues.create",
+        "issue-tracker",
+    );
+    let run_id = AgentRunId::new("run-graph-generation-zero");
+    let effect = bridge
+        .effect_from_node(&plan, &effect_request(run_id.clone(), "effect", 200))
+        .expect("generation 0 should map");
+    let identity = format!(
+        "run={};plan={};node=effect;loop=root;kind=tool-call;target_class=issue-tracker",
+        run_id.as_str(),
+        plan.plan_fingerprint.as_str()
+    );
+    assert_eq!(
+        effect.effect_id.as_str(),
+        format!("graph-effect:{identity}")
+    );
+    assert_eq!(
+        effect.deduplication_key.as_str(),
+        format!("graph-effect-dedupe:{identity}")
+    );
+    assert_eq!(
+        effect.idempotency_key.as_str(),
+        format!("graph-effect-idempotency:{identity}")
+    );
+    assert_eq!(
+        bridge
+            .effect_from_node_in_state(
+                &plan,
+                &running_effect_state(&plan),
+                &effect_request(run_id, "effect", 200)
+            )
+            .expect("generation 0 should map from state"),
+        effect
+    );
+}
+
+#[tokio::test]
+async fn superseded_generation_commands_are_no_ops() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-superseded");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (first_effect_id, _second_effect_id, waiting) =
+        re_offer(&bridge, &plan, &run_id, &mut inbox).await;
+
+    let reconcile = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-stale-reconcile",
+        &first_effect_id,
+        "effect-outcome-unknown",
+    );
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, waiting.clone(), reconcile, &mut inbox)
+        .await
+        .expect("a superseded reconcile should be a no-op");
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state, waiting);
+
+    let exhausted = bridge
+        .effect_failed_command(
+            command_metadata(&plan, run_id.clone(), "cmd-stale-exhausted", 600),
+            first_effect_id.clone(),
+            "retry-budget-exhausted",
+            AgentGraphEffectFailureDisposition::Exhausted,
+        )
+        .expect("failure command should build");
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, waiting.clone(), exhausted, &mut inbox)
+        .await
+        .expect("a superseded exhaustion should be a no-op");
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state, waiting);
+
+    let completed = bridge
+        .effect_completed_command(
+            command_metadata(&plan, run_id.clone(), "cmd-stale-completed", 600),
+            first_effect_id.clone(),
+            Some(artifact("artifact:stale-result", ArtifactKind::ToolOutput)),
+        )
+        .expect("completion command should build");
+    let outcome = bridge
+        .accept_and_apply_effect_completed(&plan, waiting.clone(), completed, &mut inbox)
+        .await
+        .expect("a superseded completion should be a no-op");
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state, waiting);
+
+    let decision = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-stale-decision",
+        &first_effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+    let outcome = bridge
+        .accept_and_apply_reconciliation_decision(&plan, waiting.clone(), decision, &mut inbox)
+        .await
+        .expect("a superseded decision should be a no-op");
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state, waiting);
+}
+
+#[tokio::test]
+async fn a_generation_zero_command_in_the_resume_window_is_a_no_op() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-resume-window");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (first_effect_id, resumed) = park_and_resume(&bridge, &plan, &run_id, &mut inbox).await;
+    assert_eq!(
+        node_state(&resumed, "effect").status,
+        AgentGraphNodeStatus::Running
+    );
+
+    let completed = bridge
+        .effect_completed_command(
+            command_metadata(&plan, run_id.clone(), "cmd-window-completed", 450),
+            first_effect_id.clone(),
+            Some(artifact("artifact:window-result", ArtifactKind::ToolOutput)),
+        )
+        .expect("completion command should build");
+    let outcome = bridge
+        .accept_and_apply_effect_completed(&plan, resumed.clone(), completed, &mut inbox)
+        .await
+        .expect("a generation-0 completion in the resume window should be a no-op");
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state, resumed);
+
+    let exhausted = bridge
+        .effect_failed_command(
+            command_metadata(&plan, run_id, "cmd-window-exhausted", 450),
+            first_effect_id,
+            "retry-budget-exhausted",
+            AgentGraphEffectFailureDisposition::Exhausted,
+        )
+        .expect("failure command should build");
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, resumed.clone(), exhausted, &mut inbox)
+        .await
+        .expect("a generation-0 exhaustion in the resume window should be a no-op");
+    assert!(outcome.transition.changed_node_ids.is_empty());
+    assert_eq!(outcome.transition.state, resumed);
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Running);
+    assert_eq!(node.effect_generation, 1);
+}
+
+#[tokio::test]
+async fn generation_one_outcomes_apply() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+
+    let run_id = AgentRunId::new("run-graph-generation-one-completes");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (_first, second_effect_id, waiting) = re_offer(&bridge, &plan, &run_id, &mut inbox).await;
+    let completed = bridge
+        .effect_completed_command(
+            command_metadata(&plan, run_id, "cmd-gen1-completed", 600),
+            second_effect_id,
+            Some(artifact("artifact:gen1-result", ArtifactKind::ToolOutput)),
+        )
+        .expect("completion command should build");
+    let outcome = bridge
+        .accept_and_apply_effect_completed(&plan, waiting, completed, &mut inbox)
+        .await
+        .expect("generation 1's completion should apply");
+    let node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(node.status, AgentGraphNodeStatus::Completed);
+    assert_eq!(
+        node.output_refs.get(&AgentCompiledPortId::new("result")),
+        Some(&artifact("artifact:gen1-result", ArtifactKind::ToolOutput))
+    );
+    assert_eq!(node.effect_generation, 1);
+
+    let run_id = AgentRunId::new("run-graph-generation-one-fails");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (_first, second_effect_id, waiting) = re_offer(&bridge, &plan, &run_id, &mut inbox).await;
+    exhaust(&mut inbox, &second_effect_id).await;
+    let exhausted = bridge
+        .effect_failed_command(
+            command_metadata(&plan, run_id, "cmd-gen1-exhausted", 600),
+            second_effect_id,
+            "retry-budget-exhausted",
+            AgentGraphEffectFailureDisposition::Exhausted,
+        )
+        .expect("failure command should build");
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, waiting, exhausted, &mut inbox)
+        .await
+        .expect("generation 1's exhaustion should apply");
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect").status,
+        AgentGraphNodeStatus::Failed
+    );
+    assert_eq!(
+        outcome.transition.state.terminal_status,
+        Some(AgentGraphTerminalStatus::Failed)
+    );
+}
+
+#[tokio::test]
+async fn a_second_re_offer_opens_generation_two() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-generation-two");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (first_effect_id, second_effect_id, waiting) =
+        re_offer(&bridge, &plan, &run_id, &mut inbox).await;
+    exhaust(&mut inbox, &second_effect_id).await;
+
+    let reconcile = reconcile_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-reconcile-gen1",
+        &second_effect_id,
+        "effect-outcome-unknown",
+    );
+    let parked = bridge
+        .accept_and_apply_effect_failed(&plan, waiting, reconcile, &mut inbox)
+        .await
+        .expect("generation 1 should park");
+    assert_eq!(
+        node_state(&parked.transition.state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::Reconciliation)
+    );
+    let decision = decision_command(
+        &bridge,
+        &plan,
+        &run_id,
+        "cmd-decide-gen1",
+        &second_effect_id,
+        AgentGraphReconciliationDecision::NotExecuted,
+    );
+    let resumed = bridge
+        .accept_and_apply_reconciliation_decision(
+            &plan,
+            parked.transition.state,
+            decision,
+            &mut inbox,
+        )
+        .await
+        .expect("generation 1 should resume");
+    assert_eq!(
+        node_state(&resumed.transition.state, "effect").effect_generation,
+        2
+    );
+
+    let third = bridge
+        .schedule_node_effect(
+            &plan,
+            resumed.transition.state,
+            effect_request(run_id, "effect", 700),
+            &mut inbox,
+        )
+        .await
+        .expect("generation 2 should schedule");
+    assert!(third.acceptance.is_scheduled());
+    assert_eq!(
+        third.effect.effect_id.as_str(),
+        format!("{};gen=2", first_effect_id.as_str())
+    );
+    assert_eq!(
+        node_state(&third.transition.state, "effect").scheduled_effect_ids,
+        vec![first_effect_id, second_effect_id, third.effect.effect_id]
+    );
+}
+
+// ---- the declared attempt bound (issue #110 optional ask) ----
+
+fn attempt_bound(inbox: &TestInbox, effect_id: &AgentEffectId) -> u32 {
+    inbox
+        .inner()
+        .state()
+        .expect("inbox should be recovered")
+        .outbox_entry(&message_id(effect_id))
+        .expect("outbox entry should exist")
+        .retry_policy()
+        .max_attempts()
+}
+
+fn bounded_payments_plan(max_attempts: &str) -> AgentCompiledExecutionPlan {
+    effect_plan_with(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "payments.charge",
+        "payments",
+        &[("agent_effect_max_attempts", max_attempts)],
+    )
+}
+
+#[tokio::test]
+async fn declared_max_attempts_reach_the_outbox_entry() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = bounded_payments_plan("5");
+    let run_id = AgentRunId::new("run-graph-declared-attempts");
+    let mut inbox = recovered_inbox(&run_id).await;
+
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            running_effect_state(&plan),
+            effect_request(run_id, "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should schedule");
+
+    assert_eq!(attempt_bound(&inbox, &scheduled.effect.effect_id), 5);
+    assert_eq!(
+        scheduled
+            .effect
+            .target
+            .attributes
+            .get("agent_effect_max_attempts")
+            .map(String::as_str),
+        Some("5")
+    );
+}
+
+#[tokio::test]
+async fn request_max_attempts_override_the_declared_bound() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = bounded_payments_plan("5");
+    let run_id = AgentRunId::new("run-graph-request-attempts");
+    let mut inbox = recovered_inbox(&run_id).await;
+
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            running_effect_state(&plan),
+            effect_request(run_id, "effect", 200).max_attempts(2),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should schedule");
+
+    assert_eq!(attempt_bound(&inbox, &scheduled.effect.effect_id), 2);
+    assert_eq!(
+        scheduled
+            .effect
+            .target
+            .attributes
+            .get("agent_effect_max_attempts")
+            .map(String::as_str),
+        Some("2")
+    );
+}
+
+#[tokio::test]
+async fn absent_bound_keeps_the_default_of_three() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = payments_plan();
+    let run_id = AgentRunId::new("run-graph-default-attempts");
+    let mut inbox = recovered_inbox(&run_id).await;
+    let (effect_id, _state) = schedule_effect(&bridge, &plan, &run_id, &mut inbox).await;
+    assert_eq!(attempt_bound(&inbox, &effect_id), 3);
+}
+
+#[tokio::test]
+async fn an_invalid_bound_is_refused_at_schedule() {
+    let bridge = AgentGraphEffectBridge::new();
+    for (plan_value, request_value) in [
+        ("0", None),
+        ("many", None),
+        ("-1", None),
+        (" ", None),
+        ("5", Some(0)),
+    ] {
+        let plan = bounded_payments_plan(plan_value);
+        let run_id = AgentRunId::new(format!(
+            "run-graph-invalid-attempts-{}",
+            plan_value.trim().replace('-', "neg")
+        ));
+        let mut inbox = recovered_inbox(&run_id).await;
+        let mut request = effect_request(run_id, "effect", 200);
+        if let Some(value) = request_value {
+            request = request.max_attempts(value);
+        }
+
+        let error = bridge
+            .schedule_node_effect(&plan, running_payments_state(), request, &mut inbox)
+            .await
+            .expect_err("an invalid attempt bound should be refused");
+        assert!(
+            matches!(
+                &error,
+                AgentGraphEffectBridgeError::InvalidCompiledPlan {
+                    validation_code: "invalid-effect-max-attempts",
+                    ..
+                }
+            ),
+            "{plan_value:?}/{request_value:?}: {error:?}"
+        );
+        assert!(inbox
+            .due_effects()
+            .expect("due effects should read")
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_target_class_that_reads_as_a_generation_is_refused_at_schedule() {
+    // The fence reads the generation back from the id's trailing `;gen=<n>`,
+    // and the identity ends with the free-form `target_class`. A class ending
+    // in `;gen=3` would mint a generation-0 id that reads as generation 3, so
+    // the node's own completion would be fenced as superseded and silently
+    // dropped. The bridge must never mint an id its own fence misreads.
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "payments.charge",
+        "payments;gen=3",
+    );
+    let run_id = AgentRunId::new("run-graph-target-class-reads-as-generation");
+    let request = effect_request(run_id.clone(), "effect", 200);
+
+    let error = bridge
+        .effect_from_node(&plan, &request)
+        .expect_err("a generation-0 id that reads as generation 3 must not be minted");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::InvalidCompiledPlan {
+                validation_code: "invalid-effect-target-class",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+
+    let mut state = running_payments_state();
+    state
+        .node_states
+        .get_mut(&AgentCompiledNodeId::new("effect"))
+        .expect("effect node should exist")
+        .effect_generation = 1;
+    let error = bridge
+        .effect_from_node_in_state(&plan, &state, &request)
+        .expect_err("the same target class is refused at generation 1 too");
+    assert!(
+        matches!(
+            &error,
+            AgentGraphEffectBridgeError::InvalidCompiledPlan {
+                validation_code: "invalid-effect-target-class",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+
+    let mut inbox = recovered_inbox(&run_id).await;
+    let error = bridge
+        .schedule_node_effect(&plan, running_payments_state(), request, &mut inbox)
+        .await
+        .expect_err("the schedule is refused before anything reaches the outbox");
+    assert_eq!(error.code(), "invalid-compiled-plan");
+    assert!(inbox
+        .due_effects()
+        .expect("due effects should read")
+        .is_empty());
 }

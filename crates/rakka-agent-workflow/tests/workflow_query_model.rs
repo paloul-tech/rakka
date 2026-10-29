@@ -531,3 +531,53 @@ fn workflow_id() -> AgentWorkflowId {
 const fn ts(value: u64) -> AgentTimestampMillis {
     AgentTimestampMillis::new(value)
 }
+
+#[tokio::test]
+async fn query_index_filters_parked_nodes_by_wait_reason() {
+    let mut index = InMemoryAgentWorkflowQueryIndex::new();
+    let mut parked = run_state(
+        "run-graph-parked",
+        AgentRunStatus::Running,
+        "graph",
+        170,
+        None,
+    );
+    parked.graph_state = Some(graph_state(
+        "plan-graph-v3",
+        "sha256:graph-v3",
+        "charge",
+        AgentCompiledNodeKind::ToolCall,
+        AgentGraphNodeStatus::Waiting,
+        Some(AgentGraphWaitReason::Reconciliation),
+        Some("effect-outcome-unknown"),
+    ));
+    upsert_run(&mut index, parked).await;
+
+    let projection = index
+        .runs()
+        .get(&AgentRunId::new("run-graph-parked"))
+        .expect("parked graph run should be indexed");
+    let graph = projection
+        .graph
+        .as_ref()
+        .expect("graph projection should exist");
+    assert_eq!(graph.waiting_node_count, 1);
+    assert_eq!(
+        graph.nodes[0].wait_reason,
+        Some(AgentGraphWaitReason::Reconciliation)
+    );
+
+    let by_reconciliation = index
+        .query_runs(
+            AgentWorkflowRunQuery::new().graph_wait_reason(AgentGraphWaitReason::Reconciliation),
+        )
+        .await
+        .expect("reconciliation wait-reason query should succeed");
+    assert_eq!(run_ids(&by_reconciliation), vec!["run-graph-parked"]);
+
+    let by_effect = index
+        .query_runs(AgentWorkflowRunQuery::new().graph_wait_reason(AgentGraphWaitReason::Effect))
+        .await
+        .expect("effect wait-reason query should succeed");
+    assert!(run_ids(&by_effect).is_empty());
+}

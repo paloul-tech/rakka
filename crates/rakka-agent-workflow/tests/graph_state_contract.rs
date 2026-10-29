@@ -2,9 +2,10 @@
 
 use rakka_agent_workflow::{
     is_bounded_agent_metric_attribute, is_forbidden_agent_metric_attribute, validate_inline_state,
-    AgentCompiledEdgeId, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint,
-    AgentCompiledPlanId, AgentCompiledPortId, AgentEffectId, AgentGraphBlockedReason,
-    AgentGraphLoopInstanceState, AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState,
+    AgentCommandKind, AgentCompiledEdgeId, AgentCompiledNodeId, AgentCompiledNodeKind,
+    AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPortId, AgentEffectId,
+    AgentGraphBlockedReason, AgentGraphLoopInstanceState, AgentGraphNodeState,
+    AgentGraphNodeStatus, AgentGraphReconciliationDecision, AgentGraphRunState,
     AgentGraphTerminalStatus, AgentGraphWaitReason, AgentTimestampMillis, ArtifactEncryptionRef,
     ArtifactKind, ArtifactRef, HumanCheckpointId, InlineState, RedactionStatus,
     CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION, DEFAULT_AGENT_INLINE_STATE_LIMIT_BYTES,
@@ -45,6 +46,15 @@ fn graph_node_statuses_have_stable_wire_names_and_labels() {
     assert_eq!(
         AgentGraphWaitReason::ChildWorkflow.as_label(),
         "child-workflow"
+    );
+    assert_eq!(
+        serde_json::to_value(AgentGraphWaitReason::Reconciliation)
+            .expect("wait reason should serialize"),
+        json!("reconciliation")
+    );
+    assert_eq!(
+        AgentGraphWaitReason::Reconciliation.as_label(),
+        "reconciliation"
     );
 }
 
@@ -201,4 +211,64 @@ impl GraphStateTestExt for AgentGraphRunState {
             .push(checkpoint_id);
         self
     }
+}
+
+#[test]
+fn reconciliation_decisions_have_stable_wire_names() {
+    let not_executed = AgentGraphReconciliationDecision::NotExecuted;
+    let abandon = AgentGraphReconciliationDecision::Abandon {
+        error_code: "x".to_string(),
+    };
+    assert_eq!(
+        serde_json::to_value(&not_executed).expect("decision should serialize"),
+        json!({"kind": "not-executed"})
+    );
+    assert_eq!(
+        serde_json::to_value(&abandon).expect("decision should serialize"),
+        json!({"kind": "abandon", "error_code": "x"})
+    );
+    assert_eq!(not_executed.as_label(), "not-executed");
+    assert_eq!(abandon.as_label(), "abandon");
+
+    let effect_id = AgentEffectId::new("graph-effect:x");
+    let kind = AgentCommandKind::GraphReconciliationDecided {
+        effect_id: effect_id.clone(),
+        decision: abandon,
+    };
+    let value = serde_json::to_value(&kind).expect("command kind should serialize");
+    assert_eq!(value["type"], json!("graph-reconciliation-decided"));
+    assert_eq!(
+        value["effect_id"],
+        serde_json::to_value(&effect_id).expect("effect id should serialize")
+    );
+    assert_eq!(
+        value["decision"],
+        json!({"kind": "abandon", "error_code": "x"})
+    );
+    let decoded: AgentCommandKind =
+        serde_json::from_value(value).expect("command kind should deserialize");
+    assert_eq!(decoded, kind);
+    assert_eq!(kind.type_name(), "GraphReconciliationDecided");
+    assert_eq!(kind.message_type(), "agent.graph-reconciliation-decided");
+}
+
+#[test]
+fn node_state_without_an_effect_generation_decodes_with_zero() {
+    let node = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new("charge"),
+        AgentCompiledNodeKind::ToolCall,
+        AgentTimestampMillis::new(120),
+    );
+    assert_eq!(node.effect_generation, 0);
+    let mut value = serde_json::to_value(&node).expect("node state should serialize");
+    assert_eq!(value["effect_generation"], json!(0));
+    value
+        .as_object_mut()
+        .expect("node state should be an object")
+        .remove("effect_generation");
+
+    let decoded: AgentGraphNodeState =
+        serde_json::from_value(value).expect("a version-one node state should decode");
+    assert_eq!(decoded.effect_generation, 0);
+    assert_eq!(decoded, node);
 }
