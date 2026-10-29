@@ -1,4 +1,12 @@
 //! Standard-IO process request/reply protocols.
+//!
+//! The stdio actor attributes what a child wrote before it exited ahead of
+//! the exit itself. A supervision pass that observes the child's exit records
+//! it and lets the stdout reader drain; a line that then arrives is handled
+//! as a line (a reply resolves its request, a malformed line closes the
+//! protocol with `MalformedStdout`), and the protocol closes with
+//! `UnexpectedExit` at stdout EOF or, if stdout never drains, on the next
+//! supervision pass.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
@@ -578,7 +586,11 @@ where
     }
 
     async fn stdout_closed(&mut self) {
-        self.close_with_error(ProcessError::StdoutClosed).await;
+        let error = match &self.last_exit {
+            Some(exit) => unexpected_exit(exit),
+            None => ProcessError::StdoutClosed,
+        };
+        self.close_with_error(error).await;
     }
 
     async fn request_timeout(&mut self, request_id: String) {
@@ -599,20 +611,38 @@ where
         if token != self.tick_token || self.closed {
             return;
         }
+        if self.supervise_child().await == SupervisionOutcome::Reschedule {
+            self.schedule_supervision_tick(ctx);
+        }
+    }
 
-        if let Some(process) = &mut self.process {
-            match process.try_wait() {
-                Ok(Some(exit)) => {
-                    self.last_exit = Some(exit.clone());
-                    self.process = None;
-                    self.close_with_error(ProcessError::UnexpectedExit {
-                        code: exit.code(),
-                        signal: exit.signal(),
-                    })
-                    .await;
-                }
-                Ok(None) => self.schedule_supervision_tick(ctx),
-                Err(error) => self.close_with_error(error).await,
+    /// One supervision pass over the child.
+    ///
+    /// An exit is not acted on the moment it is observed. The stdout reader
+    /// task may still hold lines the child wrote just before it exited, and
+    /// those must be attributed first: a malformed line as `MalformedStdout`,
+    /// a reply as the reply. So the exit is recorded and the handle dropped,
+    /// and the protocol closes with `UnexpectedExit` when stdout reaches EOF
+    /// or, if stdout never drains (a grandchild holding the pipe open), on
+    /// the next pass.
+    async fn supervise_child(&mut self) -> SupervisionOutcome {
+        if let Some(exit) = self.last_exit.clone() {
+            self.close_with_error(unexpected_exit(&exit)).await;
+            return SupervisionOutcome::Closed;
+        }
+        let Some(process) = &mut self.process else {
+            return SupervisionOutcome::Closed;
+        };
+        match process.try_wait() {
+            Ok(Some(exit)) => {
+                self.last_exit = Some(exit);
+                self.process = None;
+                SupervisionOutcome::Reschedule
+            }
+            Ok(None) => SupervisionOutcome::Reschedule,
+            Err(error) => {
+                self.close_with_error(error).await;
+                SupervisionOutcome::Closed
             }
         }
     }
@@ -829,6 +859,23 @@ where
     system.spawn_actor(name, StdioActor::new(spec, allowlist, codec, config))
 }
 
+/// What one supervision pass decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisionOutcome {
+    /// The child is live, or its exit was just observed and stdout may still
+    /// drain: supervise again after the interval.
+    Reschedule,
+    /// The protocol is closed, or nothing is left to supervise.
+    Closed,
+}
+
+fn unexpected_exit(exit: &ProcessExit) -> ProcessError {
+    ProcessError::UnexpectedExit {
+        code: exit.code(),
+        signal: exit.signal(),
+    }
+}
+
 fn validate_raw_request_id(request_id: &str) -> ProcessResult<()> {
     if request_id.is_empty() || request_id.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Err(ProcessError::ProtocolEncode {
@@ -855,4 +902,136 @@ fn trim_line_ending(mut line: &[u8]) -> &[u8] {
         line = &line[..line.len() - 1];
     }
     line
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+
+    use super::{
+        LineJsonCodec, Pending, ProcessError, ProcessResult, StdioActor, StdioProtocolConfig,
+        SupervisionOutcome,
+    };
+    use crate::{ExecutableAllowlist, ManagedProcess, ProcessSpec};
+    use rakka_core::ReplyTo;
+
+    type Payload = serde_json::Value;
+
+    fn shell_spec(script: &str) -> (ProcessSpec, ExecutableAllowlist) {
+        (
+            ProcessSpec::new("/bin/sh").arg("-c").arg(script),
+            ExecutableAllowlist::from_exact_paths(["/bin/sh"]),
+        )
+    }
+
+    /// An actor whose child has already exited (reaped through `wait`, so the
+    /// next `try_wait` answers at once) and which holds one pending request:
+    /// the state a supervision pass meets when it observes an exit before the
+    /// stdout reader has delivered the child's last line.
+    async fn actor_with_exited_child_and_pending() -> (
+        StdioActor<LineJsonCodec<Payload, Payload>>,
+        oneshot::Receiver<ProcessResult<Payload>>,
+    ) {
+        let (spec, allowlist) = shell_spec("exit 0");
+        let mut actor = StdioActor::new(
+            spec.clone(),
+            allowlist.clone(),
+            LineJsonCodec::<Payload, Payload>::new(),
+            StdioProtocolConfig::new(),
+        );
+        let mut process = ManagedProcess::spawn(spec, &allowlist).expect("shell should spawn");
+        process.wait().await.expect("shell should exit");
+        actor.process = Some(process);
+        let (sender, receiver) = oneshot::channel();
+        actor.pending.insert(
+            "stdio-1".to_string(),
+            Pending {
+                timeout: Duration::from_secs(1),
+                reply_to: ReplyTo::new(sender),
+            },
+        );
+        (actor, receiver)
+    }
+
+    #[tokio::test]
+    async fn an_observed_exit_lets_unread_stdout_drain_before_the_protocol_closes() {
+        let (mut actor, receiver) = actor_with_exited_child_and_pending().await;
+
+        // The supervision pass observes the exit while the reader still holds
+        // the child's last line: nothing closes yet.
+        assert_eq!(
+            actor.supervise_child().await,
+            SupervisionOutcome::Reschedule
+        );
+        assert!(!actor.closed);
+        assert_eq!(actor.pending.len(), 1);
+        assert!(actor.last_exit.is_some());
+
+        // The line arrives and is attributed first.
+        actor.stdout_line(b"not-json\n".to_vec()).await;
+        assert!(actor.closed);
+        let reply = receiver
+            .await
+            .expect("the pending request should be answered");
+        assert!(
+            matches!(reply, Err(ProcessError::MalformedStdout { .. })),
+            "{reply:?}"
+        );
+
+        // EOF after the close changes nothing for the request.
+        actor.stdout_closed().await;
+        assert!(actor.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_observed_exit_closes_with_the_exit_at_stdout_eof() {
+        let (mut actor, receiver) = actor_with_exited_child_and_pending().await;
+        assert_eq!(
+            actor.supervise_child().await,
+            SupervisionOutcome::Reschedule
+        );
+
+        actor.stdout_closed().await;
+
+        assert!(actor.closed);
+        let reply = receiver
+            .await
+            .expect("the pending request should be answered");
+        assert!(
+            matches!(
+                reply,
+                Err(ProcessError::UnexpectedExit { code: Some(0), .. })
+            ),
+            "{reply:?}"
+        );
+        assert!(matches!(
+            actor.last_error,
+            Some(ProcessError::UnexpectedExit { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_observed_exit_closes_on_the_next_pass_when_stdout_never_drains() {
+        let (mut actor, receiver) = actor_with_exited_child_and_pending().await;
+        assert_eq!(
+            actor.supervise_child().await,
+            SupervisionOutcome::Reschedule
+        );
+
+        assert_eq!(actor.supervise_child().await, SupervisionOutcome::Closed);
+
+        assert!(actor.closed);
+        let reply = receiver
+            .await
+            .expect("the pending request should be answered");
+        assert!(
+            matches!(
+                reply,
+                Err(ProcessError::UnexpectedExit { code: Some(0), .. })
+            ),
+            "{reply:?}"
+        );
+    }
 }

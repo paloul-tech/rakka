@@ -515,11 +515,11 @@ async fn malformed_stdout_fails_pending_request_and_closes_protocol() {
     .await;
     let status = ask_stdio_status(&actor).await;
 
-    assert!(matches!(
-        response,
-        Err(ProcessError::MalformedStdout { .. })
-    ));
-    assert!(status.closed());
+    assert!(
+        matches!(response, Err(ProcessError::MalformedStdout { .. })),
+        "{response:?} / {status:?}"
+    );
+    assert!(status.closed(), "{status:?}");
     assert_eq!(status.pending_count(), 0);
 
     system.shutdown();
