@@ -12,14 +12,14 @@ use rakka_agent_workflow::{
     AgentCompiledPlanId, AgentCompiledPlanNode, AgentCompiledPlanPort, AgentCompiledPortDirection,
     AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
     AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget,
-    AgentGraphEffectBridgeError, AgentGraphEffectScheduleRequest, AgentGraphNodeStatus,
-    AgentGraphRunProjection, AgentGraphRuntimeEffectOutcome, AgentGraphRuntimeTransition,
-    AgentGraphWaitReason, AgentIdempotencyKey, AgentInboxDuplicateReason, AgentPayloadDescriptor,
-    AgentRunActor, AgentRunActorCommand, AgentRunActorSnapshot, AgentRunEngineError, AgentRunId,
-    AgentRunRuntimeError, AgentRunState, AgentRunStatus, AgentRunTransition,
-    AgentRunTransitionKind, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
-    AgentStepSuccess, AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
-    InlineState, StateSchemaVersion, WorkflowDefinitionVersion,
+    AgentGraphEffectBridge, AgentGraphEffectBridgeError, AgentGraphEffectScheduleRequest,
+    AgentGraphNodeStatus, AgentGraphRunProjection, AgentGraphRuntimeEffectOutcome,
+    AgentGraphRuntimeTransition, AgentGraphWaitReason, AgentIdempotencyKey,
+    AgentInboxDuplicateReason, AgentPayloadDescriptor, AgentRunActor, AgentRunActorCommand,
+    AgentRunActorSnapshot, AgentRunEngineError, AgentRunId, AgentRunInbox, AgentRunRuntimeError,
+    AgentRunState, AgentRunStatus, AgentRunTransition, AgentRunTransitionKind, AgentStatePayload,
+    AgentStep, AgentStepId, AgentStepKind, AgentStepSuccess, AgentTenantId, AgentTimestampMillis,
+    AgentWorkflow, AgentWorkflowId, InlineState, StateSchemaVersion, WorkflowDefinitionVersion,
     CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 use rakka_core::{ActorRef, ActorSystem, InMemoryMetricsRecorder, Message};
@@ -27,7 +27,7 @@ use rakka_persistence::{
     DurableError, DurableStateStore, InMemoryDurableStateStore, PersistenceId, Revision,
     StateRecord, StoreFuture,
 };
-use rakka_workflow::{ManualWorkflowClock, WorkflowState, WorkflowTimestamp};
+use rakka_workflow::{ManualWorkflowClock, OutboxMessageId, WorkflowState, WorkflowTimestamp};
 
 type RunStore = InMemoryDurableStateStore<AgentRunState>;
 type WorkflowStore = InMemoryDurableStateStore<WorkflowState>;
@@ -1248,4 +1248,109 @@ fn inline_payload(value: &str) -> AgentStatePayload {
         size_bytes: bytes.len() as u64,
         bytes,
     })
+}
+
+#[tokio::test]
+async fn actor_recovery_relinks_an_effect_that_exhausted_while_it_was_down() {
+    let system = ActorSystem::new("agent-runtime-graph-effect-exhausted-down");
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-runtime-graph-effect-exhausted");
+    let plan = Arc::new(effect_graph_plan(&fixture.workflow));
+    let first = spawn_actor(
+        &system,
+        "runtime-graph-effect-exhausted-a",
+        &fixture,
+        run_id.clone(),
+    );
+
+    start_graph(
+        &first,
+        graph_accepted_run_state(&fixture.workflow, &run_id),
+        plan.clone(),
+        AgentTimestampMillis::new(100),
+    )
+    .await;
+    mark_graph_ready(&first, plan.clone(), AgentTimestampMillis::new(110)).await;
+    start_graph_node(
+        &first,
+        plan.clone(),
+        "input",
+        AgentTimestampMillis::new(120),
+    )
+    .await;
+    complete_graph_node(
+        &first,
+        plan.clone(),
+        "input",
+        AgentTimestampMillis::new(130),
+    )
+    .await;
+    mark_graph_ready(&first, plan.clone(), AgentTimestampMillis::new(140)).await;
+    let running = start_graph_node(
+        &first,
+        plan.clone(),
+        "effect",
+        AgentTimestampMillis::new(150),
+    )
+    .await;
+    first.stop().expect("first actor should stop");
+    wait_until_terminated(&first).await;
+
+    // The crash window: the effect reached the durable outbox but the graph
+    // transition was never persisted, and the dispatcher exhausted the entry
+    // before the actor came back.
+    let bridge = AgentGraphEffectBridge::new();
+    let mut inbox = AgentRunInbox::with_clock(
+        run_id.clone(),
+        fixture.workflow_store.clone(),
+        fixture.clock.clone(),
+    );
+    inbox
+        .recover()
+        .await
+        .expect("standalone inbox should recover");
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            running.graph_transition.state,
+            effect_request(run_id.clone(), "effect", 160),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should commit to the durable outbox");
+    let effect_id = scheduled.effect.effect_id.clone();
+    drop(scheduled);
+    inbox
+        .inner_mut()
+        .record_outbox_exhausted(
+            &OutboxMessageId::new(effect_id.as_str()),
+            "effect-outcome-unknown",
+        )
+        .await
+        .expect("entry should exhaust");
+    drop(inbox);
+
+    let restarted = spawn_actor(
+        &system,
+        "runtime-graph-effect-exhausted-b",
+        &fixture,
+        run_id.clone(),
+    );
+    let recovered = snapshot(&restarted).await;
+    assert_eq!(recovered.due_effect_count, 0);
+    let graph = recovered
+        .graph
+        .as_ref()
+        .expect("graph summary should recover");
+    assert_eq!(node_status(graph, "effect"), AgentGraphNodeStatus::Waiting);
+    let effect_node = recovered
+        .run_state
+        .as_ref()
+        .and_then(|state| state.graph_state.as_ref())
+        .and_then(|graph| graph.node_states.get(&node_id("effect")))
+        .expect("effect node state should recover");
+    assert_eq!(effect_node.wait_reason, Some(AgentGraphWaitReason::Effect));
+    assert!(effect_node.scheduled_effect_ids.contains(&effect_id));
+
+    system.terminate().await.expect("system should terminate");
 }

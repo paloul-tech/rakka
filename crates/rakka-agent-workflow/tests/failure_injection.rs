@@ -11,7 +11,8 @@ use rakka_agent_workflow::{
     AgentDispatcherWorkerId, AgentDurabilityMetadata, AgentEffect, AgentEffectDispatchFuture,
     AgentEffectDispatcher, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
     AgentEffectSchedule, AgentEffectTarget, AgentGraphEffectBridge,
-    AgentGraphEffectScheduleRequest, AgentGraphNodeStatus, AgentGraphRuntime, AgentGraphScheduler,
+    AgentGraphEffectFailureDisposition, AgentGraphEffectScheduleRequest, AgentGraphNodeStatus,
+    AgentGraphReconciliationDecision, AgentGraphRuntime, AgentGraphScheduler, AgentGraphWaitReason,
     AgentHumanApprovalRequest, AgentHumanCheckpointRuntime, AgentHumanDecisionSubmission,
     AgentIdempotencyKey, AgentInboxDuplicateReason, AgentRunId, AgentRunInbox, AgentRunState,
     AgentRunStatus, AgentRunTransitionKind, AgentRunWaitReason, AgentRuntimeEventDraft,
@@ -1234,4 +1235,237 @@ impl AgentEffectDispatcher for ExpiringRecordingDispatcher {
 
 const fn ts(millis: u64) -> AgentTimestampMillis {
     AgentTimestampMillis::new(millis)
+}
+
+#[tokio::test]
+async fn crash_window_effect_exhausted_before_recovery_still_links_and_parks() {
+    // The neighbour's crash window, plus the dispatcher: the effect reached the
+    // durable outbox, the graph transition was never persisted, and before the
+    // run actor recovered the dispatcher ran the call, lost its answer, and
+    // exhausted the entry as outcome-unknown. The entry is no longer due, so a
+    // recovery that reads only due effects never links it and the later
+    // Reconcile answers UnknownEffect (issue #110).
+    let workflow = workflow();
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = graph_effect_plan(&workflow);
+    let run_id = AgentRunId::new("run-graph-effect-exhausted-in-crash-window");
+    let workflow_store = WorkflowStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(200));
+    let persisted_state = graph_running_effect_state(&plan);
+
+    let mut inbox =
+        AgentRunInbox::with_clock(run_id.clone(), workflow_store.clone(), clock.clone());
+    inbox.recover().await.expect("inbox should recover");
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            persisted_state.clone(),
+            graph_effect_request(run_id.clone(), "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should commit to the durable outbox");
+    let effect_id = scheduled.effect.effect_id.clone();
+    drop(scheduled);
+    drop(inbox);
+
+    let mut dispatcher =
+        AgentRunInbox::with_clock(run_id.clone(), workflow_store.clone(), clock.clone());
+    dispatcher
+        .recover()
+        .await
+        .expect("dispatcher inbox should recover");
+    dispatcher
+        .inner_mut()
+        .record_outbox_exhausted(
+            &OutboxMessageId::new(effect_id.as_str()),
+            "effect-outcome-unknown",
+        )
+        .await
+        .expect("entry should exhaust");
+    drop(dispatcher);
+
+    let mut recovered = AgentRunInbox::with_clock(run_id.clone(), workflow_store, clock);
+    recovered
+        .recover()
+        .await
+        .expect("recovered inbox should reload the durable outbox");
+    assert!(recovered
+        .due_effects()
+        .expect("due effects should decode")
+        .is_empty());
+    let effects: Vec<AgentEffect> = recovered
+        .outbox_effects()
+        .expect("outbox effects should decode")
+        .into_iter()
+        .map(|due| due.effect)
+        .collect();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].effect_id, effect_id);
+
+    let reconciled = bridge.reconcile_recovered_effects(persisted_state, &effects);
+    assert_eq!(
+        reconciled.changed_node_ids,
+        vec![AgentCompiledNodeId::new("effect")]
+    );
+    let effect_node = reconciled
+        .state
+        .node_states
+        .get(&AgentCompiledNodeId::new("effect"))
+        .expect("effect node should exist");
+    assert_eq!(effect_node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(effect_node.wait_reason, Some(AgentGraphWaitReason::Effect));
+    assert!(effect_node.scheduled_effect_ids.contains(&effect_id));
+
+    let command = bridge
+        .effect_failed_command(
+            graph_command_metadata(&plan, run_id, "cmd-reconcile-after-crash", 300),
+            effect_id,
+            "effect-outcome-unknown",
+            AgentGraphEffectFailureDisposition::Reconcile,
+        )
+        .expect("reconcile command should build");
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, reconciled.state, command, &mut recovered)
+        .await
+        .expect("the re-linked effect should park instead of answering UnknownEffect");
+    let node = outcome
+        .transition
+        .state
+        .node_states
+        .get(&AgentCompiledNodeId::new("effect"))
+        .expect("effect node should exist");
+    assert_eq!(node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(node.wait_reason, Some(AgentGraphWaitReason::Reconciliation));
+    assert_eq!(node.error_code.as_deref(), Some("effect-outcome-unknown"));
+}
+
+#[tokio::test]
+async fn crash_between_generation_one_outbox_write_and_graph_persist_relinks_on_recovery() {
+    let workflow = workflow();
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = graph_effect_plan(&workflow);
+    let run_id = AgentRunId::new("run-graph-effect-gen1-relink-on-recovery");
+    let workflow_store = WorkflowStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(200));
+
+    // Park generation 0 and resume the node: every step here is persisted.
+    let mut inbox =
+        AgentRunInbox::with_clock(run_id.clone(), workflow_store.clone(), clock.clone());
+    inbox.recover().await.expect("inbox should recover");
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            graph_running_effect_state(&plan),
+            graph_effect_request(run_id.clone(), "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("generation 0 should schedule");
+    let generation_zero_id = scheduled.effect.effect_id.clone();
+    inbox
+        .inner_mut()
+        .record_outbox_exhausted(
+            &OutboxMessageId::new(generation_zero_id.as_str()),
+            "effect-outcome-unknown",
+        )
+        .await
+        .expect("entry should exhaust");
+    let reconcile = bridge
+        .effect_failed_command(
+            graph_command_metadata(&plan, run_id.clone(), "cmd-reconcile-gen0", 300),
+            generation_zero_id.clone(),
+            "effect-outcome-unknown",
+            AgentGraphEffectFailureDisposition::Reconcile,
+        )
+        .expect("reconcile command should build");
+    let parked = bridge
+        .accept_and_apply_effect_failed(&plan, scheduled.transition.state, reconcile, &mut inbox)
+        .await
+        .expect("generation 0 should park");
+    let decision = bridge
+        .reconciliation_decision_command(
+            graph_command_metadata(&plan, run_id.clone(), "cmd-decide-gen0", 400),
+            generation_zero_id.clone(),
+            AgentGraphReconciliationDecision::NotExecuted,
+        )
+        .expect("decision command should build");
+    let resumed = bridge
+        .accept_and_apply_reconciliation_decision(
+            &plan,
+            parked.transition.state,
+            decision,
+            &mut inbox,
+        )
+        .await
+        .expect("not-executed should resume the node");
+    let persisted_state = resumed.transition.state;
+    assert_eq!(
+        graph_node_status(&persisted_state, "effect"),
+        AgentGraphNodeStatus::Running
+    );
+
+    // Generation 1 reaches the durable outbox; the graph transition is lost.
+    let second = bridge
+        .schedule_node_effect(
+            &plan,
+            persisted_state.clone(),
+            graph_effect_request(run_id.clone(), "effect", 500),
+            &mut inbox,
+        )
+        .await
+        .expect("generation 1 should commit to the durable outbox");
+    let generation_one_id = second.effect.effect_id.clone();
+    assert!(generation_one_id.as_str().ends_with(";gen=1"));
+    drop(second);
+    drop(inbox);
+
+    let mut recovered = AgentRunInbox::with_clock(run_id.clone(), workflow_store, clock);
+    recovered
+        .recover()
+        .await
+        .expect("recovered inbox should reload the durable outbox");
+    let effects: Vec<AgentEffect> = recovered
+        .outbox_effects()
+        .expect("outbox effects should decode")
+        .into_iter()
+        .map(|due| due.effect)
+        .collect();
+    assert_eq!(effects.len(), 2);
+
+    let reconciled = bridge.reconcile_recovered_effects(persisted_state, &effects);
+    assert_eq!(
+        reconciled.changed_node_ids,
+        vec![AgentCompiledNodeId::new("effect")]
+    );
+    let effect_node = reconciled
+        .state
+        .node_states
+        .get(&AgentCompiledNodeId::new("effect"))
+        .expect("effect node should exist");
+    assert_eq!(effect_node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(effect_node.wait_reason, Some(AgentGraphWaitReason::Effect));
+    assert_eq!(effect_node.effect_generation, 1);
+    assert_eq!(
+        effect_node.scheduled_effect_ids,
+        vec![generation_zero_id, generation_one_id.clone()]
+    );
+    let again = bridge.reconcile_recovered_effects(reconciled.state.clone(), &effects);
+    assert!(again.changed_node_ids.is_empty());
+
+    let command = bridge
+        .effect_completed_command(
+            graph_command_metadata(&plan, run_id, "cmd-gen1-relinked-completed", 600),
+            generation_one_id,
+            None,
+        )
+        .expect("completion command should build");
+    let outcome = bridge
+        .accept_and_apply_effect_completed(&plan, reconciled.state, command, &mut recovered)
+        .await
+        .expect("generation 1's completion should apply after the re-link");
+    assert_eq!(
+        graph_node_status(&outcome.transition.state, "effect"),
+        AgentGraphNodeStatus::Completed
+    );
 }

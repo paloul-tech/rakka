@@ -794,7 +794,7 @@ where
         };
         let effects: Vec<AgentEffect> = self
             .inbox
-            .due_effects()?
+            .outbox_effects()?
             .into_iter()
             .map(|due| due.effect)
             .collect();

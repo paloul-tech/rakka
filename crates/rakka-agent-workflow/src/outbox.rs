@@ -282,6 +282,22 @@ where
             .collect()
     }
 
+    /// Returns every agent effect in the current durable outbox snapshot,
+    /// whatever its entry's status, in message-id order.
+    ///
+    /// Recovery reads this rather than [`Self::due_effects`] so an effect
+    /// that was dispatched and exhausted while the run actor was down can
+    /// still be re-linked to its graph node and parked.
+    pub fn outbox_effects(&self) -> AgentOutboxResult<Vec<AgentDueEffect>> {
+        let state = self.inner().state().map_err(AgentOutboxError::from)?;
+        state
+            .outbox()
+            .values()
+            .cloned()
+            .map(agent_due_effect_from_entry)
+            .collect()
+    }
+
     fn record_effect_metric(
         &self,
         effect_kind: &'static str,
