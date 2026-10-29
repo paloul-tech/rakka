@@ -311,3 +311,57 @@ fn outbox_command_reads_the_attempt_bound_leniently() {
     );
     assert_eq!(four.max_backoff_millis(), default.max_backoff_millis());
 }
+
+#[tokio::test]
+async fn outbox_effects_selects_before_decoding_and_skips_an_entry_that_does_not_decode() {
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let mut inbox = agent_inbox(AgentRunId::new("run-outbox-read"), store, clock, metrics);
+    inbox.recover().await.expect("inbox should recover");
+    let effect = effect("effect-decodes-1", "dedupe-decodes-1", None);
+    inbox
+        .schedule_effect(effect.clone())
+        .await
+        .expect("effect should schedule");
+    inbox
+        .inner_mut()
+        .schedule_outbox(rakka_workflow::OutboxCommand::new(
+            "effect-undecodable-1",
+            OutboxTarget::application("tool"),
+            "agent.effect",
+            b"{not an effect".to_vec(),
+        ))
+        .await
+        .expect("raw entry should schedule");
+    inbox
+        .inner_mut()
+        .record_outbox_success(&rakka_workflow::OutboxMessageId::new(
+            "effect-undecodable-1",
+        ))
+        .await
+        .expect("raw entry should conclude");
+
+    let all = inbox
+        .outbox_effects(|_entry| true)
+        .expect("the read should not fail on an undecodable entry");
+    assert_eq!(all.effects.len(), 1);
+    assert_eq!(all.effects[0].effect, effect);
+    assert_eq!(all.effects[0].entry.status(), OutboxStatus::Pending);
+    assert_eq!(all.undecodable, 1);
+
+    let only_decodable = inbox
+        .outbox_effects(|entry| entry.message_id().as_str() == "effect-decodes-1")
+        .expect("the read should succeed");
+    assert_eq!(only_decodable.effects.len(), 1);
+    assert_eq!(
+        only_decodable.undecodable, 0,
+        "an entry the selector drops is never decoded"
+    );
+
+    let none = inbox
+        .outbox_effects(|_entry| false)
+        .expect("the read should succeed");
+    assert!(none.effects.is_empty());
+    assert_eq!(none.undecodable, 0);
+}

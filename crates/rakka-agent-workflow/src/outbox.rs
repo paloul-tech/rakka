@@ -187,6 +187,18 @@ impl AgentOutboxAcceptance {
     }
 }
 
+/// Outbox entries read back as agent effects by
+/// [`AgentRunInbox::outbox_effects`], with the count of selected entries whose
+/// payload did not decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentOutboxEffects {
+    /// The selected entries that decoded, in message-id order.
+    pub effects: Vec<AgentDueEffect>,
+    /// Selected entries skipped because their payload did not decode as an
+    /// agent effect.
+    pub undecodable: usize,
+}
+
 /// One due durable outbox effect plus its underlying outbox entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDueEffect {
@@ -282,20 +294,37 @@ where
             .collect()
     }
 
-    /// Returns every agent effect in the current durable outbox snapshot,
-    /// whatever its entry's status, in message-id order.
+    /// Reads the outbox entries `select` keeps, whatever their status, as
+    /// agent effects in message-id order.
     ///
-    /// Recovery reads this rather than [`Self::due_effects`] so an effect
-    /// that was dispatched and exhausted while the run actor was down can
-    /// still be re-linked to its graph node and parked.
-    pub fn outbox_effects(&self) -> AgentOutboxResult<Vec<AgentDueEffect>> {
+    /// `select` runs before any payload is decoded, so a caller that already
+    /// knows an entry pays nothing for it. An entry whose payload does not
+    /// decode as an [`AgentEffect`] is counted and skipped rather than
+    /// failing the read: a concluded entry an older or foreign writer left in
+    /// the run's history must not stop the run from recovering. Recovery
+    /// reads this rather than [`Self::due_effects`] so an effect that was
+    /// dispatched and exhausted while the run actor was down can still be
+    /// re-linked to its graph node and parked.
+    pub fn outbox_effects(
+        &self,
+        mut select: impl FnMut(&OutboxEntry) -> bool,
+    ) -> AgentOutboxResult<AgentOutboxEffects> {
         let state = self.inner().state().map_err(AgentOutboxError::from)?;
-        state
-            .outbox()
-            .values()
-            .cloned()
-            .map(agent_due_effect_from_entry)
-            .collect()
+        let mut effects = Vec::new();
+        let mut undecodable = 0;
+        for entry in state.outbox().values() {
+            if !select(entry) {
+                continue;
+            }
+            match agent_due_effect_from_entry(entry.clone()) {
+                Ok(effect) => effects.push(effect),
+                Err(_) => undecodable += 1,
+            }
+        }
+        Ok(AgentOutboxEffects {
+            effects,
+            undecodable,
+        })
     }
 
     fn record_effect_metric(

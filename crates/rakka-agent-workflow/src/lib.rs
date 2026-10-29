@@ -249,7 +249,7 @@ pub use otlp::{
 pub use outbox::{
     agent_effect_outbox_target, agent_effect_to_outbox_command,
     agent_timestamp_to_workflow_timestamp, AgentDueEffect, AgentOutboxAcceptance,
-    AgentOutboxDuplicateReason, AgentOutboxError, AgentOutboxResult,
+    AgentOutboxDuplicateReason, AgentOutboxEffects, AgentOutboxError, AgentOutboxResult,
     ATTR_AGENT_EFFECT_MAX_ATTEMPTS, METRIC_AGENT_OUTBOX_EFFECTS,
 };
 #[cfg(feature = "postgres")]

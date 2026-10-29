@@ -19,6 +19,7 @@
 //! retries the refused command. A recovery that fails leaves the components
 //! stale and the next command tries again.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
@@ -32,12 +33,12 @@ use rakka_workflow::{SystemWorkflowClock, WorkflowClock, WorkflowState};
 
 use crate::{
     AgentCommand, AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentDueEffect, AgentEffect,
-    AgentGraphEffectBridge, AgentGraphEffectBridgeError, AgentGraphEffectScheduleOutcome,
-    AgentGraphEffectScheduleRequest, AgentGraphRunProjection, AgentGraphRunState,
-    AgentGraphScheduler, AgentGraphSchedulerError, AgentGraphSchedulerTransition,
-    AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance, AgentOutboxError,
-    AgentOutboxResult, AgentRunEngineError, AgentRunId, AgentRunInbox, AgentRunState,
-    AgentRunTransition, AgentRunWaitReason, AgentStepRunner, AgentStepSuccess,
+    AgentEffectId, AgentGraphEffectBridge, AgentGraphEffectBridgeError,
+    AgentGraphEffectScheduleOutcome, AgentGraphEffectScheduleRequest, AgentGraphRunProjection,
+    AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
+    AgentGraphSchedulerTransition, AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance,
+    AgentOutboxError, AgentOutboxResult, AgentRunEngineError, AgentRunId, AgentRunInbox,
+    AgentRunState, AgentRunTransition, AgentRunWaitReason, AgentStepRunner, AgentStepSuccess,
     AgentTimestampMillis, AgentWorkflow, AgentWorkflowSnapshotRegistry,
 };
 
@@ -784,6 +785,13 @@ where
     /// here from the self-describing recovered effects. The pass is idempotent:
     /// a run with no graph state, no in-flight effects, or nothing to relink
     /// persists nothing.
+    ///
+    /// Only the outbox entries no node lists yet are decoded (an entry's
+    /// message id is its effect id), whatever their status, so an effect that
+    /// exhausted while the actor was down is still reached and a healthy run
+    /// decodes nothing. An entry whose payload does not decode as an agent
+    /// effect is skipped with a warning that carries no ids: it cannot be
+    /// re-linked, and it must not stop the run from recovering.
     async fn reconcile_recovered_graph_effects(&mut self) -> AgentRunRuntimeResult<()> {
         let Some(graph) = self
             .runner
@@ -792,12 +800,21 @@ where
         else {
             return Ok(());
         };
-        let effects: Vec<AgentEffect> = self
-            .inbox
-            .outbox_effects()?
-            .into_iter()
-            .map(|due| due.effect)
+        let listed: BTreeSet<&str> = graph
+            .node_states
+            .values()
+            .flat_map(|node| node.scheduled_effect_ids.iter().map(AgentEffectId::as_str))
             .collect();
+        let read = self
+            .inbox
+            .outbox_effects(|entry| !listed.contains(entry.message_id().as_str()))?;
+        if read.undecodable > 0 {
+            tracing::warn!(
+                skipped = read.undecodable,
+                "graph recovery skipped outbox entries that do not decode as agent effects"
+            );
+        }
+        let effects: Vec<AgentEffect> = read.effects.into_iter().map(|due| due.effect).collect();
         if effects.is_empty() {
             return Ok(());
         }

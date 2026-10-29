@@ -1295,8 +1295,9 @@ async fn crash_window_effect_exhausted_before_recovery_still_links_and_parks() {
         .expect("due effects should decode")
         .is_empty());
     let effects: Vec<AgentEffect> = recovered
-        .outbox_effects()
-        .expect("outbox effects should decode")
+        .outbox_effects(|_entry| true)
+        .expect("outbox effects should read")
+        .effects
         .into_iter()
         .map(|due| due.effect)
         .collect();
@@ -1426,8 +1427,9 @@ async fn crash_between_generation_one_outbox_write_and_graph_persist_relinks_on_
         .await
         .expect("recovered inbox should reload the durable outbox");
     let effects: Vec<AgentEffect> = recovered
-        .outbox_effects()
-        .expect("outbox effects should decode")
+        .outbox_effects(|_entry| true)
+        .expect("outbox effects should read")
+        .effects
         .into_iter()
         .map(|due| due.effect)
         .collect();

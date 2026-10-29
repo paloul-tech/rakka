@@ -1354,3 +1354,59 @@ async fn actor_recovery_relinks_an_effect_that_exhausted_while_it_was_down() {
 
     system.terminate().await.expect("system should terminate");
 }
+
+// A run whose outbox holds one concluded entry with a payload that will not
+// decode as an AgentEffect must still recover (PR #114 review, finding 1).
+#[tokio::test]
+async fn recovery_survives_a_concluded_entry_that_will_not_decode() {
+    let system = ActorSystem::new("undecodable-concluded-entry");
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-undecodable-concluded-entry");
+    let plan = Arc::new(effect_graph_plan(&fixture.workflow));
+    let first = spawn_actor(&system, "undecodable-a", &fixture, run_id.clone());
+    start_graph(
+        &first,
+        graph_accepted_run_state(&fixture.workflow, &run_id),
+        plan,
+        AgentTimestampMillis::new(100),
+    )
+    .await;
+    first.stop().expect("first actor should stop");
+    wait_until_terminated(&first).await;
+
+    let mut inbox = AgentRunInbox::with_clock(
+        run_id.clone(),
+        fixture.workflow_store.clone(),
+        fixture.clock.clone(),
+    );
+    inbox.recover().await.expect("inbox should recover");
+    inbox
+        .inner_mut()
+        .schedule_outbox(rakka_workflow::OutboxCommand::new(
+            "graph-effect:undecodable",
+            rakka_workflow::OutboxTarget::application("tool"),
+            "agent.effect",
+            b"{not an effect".to_vec(),
+        ))
+        .await
+        .expect("raw entry should schedule");
+    inbox
+        .inner_mut()
+        .record_outbox_success(&OutboxMessageId::new("graph-effect:undecodable"))
+        .await
+        .expect("entry should conclude");
+    drop(inbox);
+
+    let restarted = spawn_actor(&system, "undecodable-b", &fixture, run_id);
+    let recovered = restarted
+        .ask(
+            |reply_to| AgentRunActorCommand::Recover { reply_to },
+            ASK_TIMEOUT,
+        )
+        .await;
+    assert!(
+        matches!(recovered, Ok(Ok(_))),
+        "a concluded entry that will not decode should not stop the run's recovery: {recovered:?}"
+    );
+    system.terminate().await.expect("system should terminate");
+}
