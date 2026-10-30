@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -73,9 +73,44 @@ pub fn unique_short_temp_dir(name: impl AsRef<str>) -> PathBuf {
     PathBuf::from("/tmp").join(unique_name(name.as_ref()))
 }
 
-/// Returns an available local TCP port, or `None` when local bind is denied.
+/// Number of ephemeral ports `available_tcp_port` probes before giving up.
+const TCP_PORT_PROBE_ATTEMPTS: usize = 16;
+
+/// How long a probe waits for a released port to answer before calling it quiet.
+const TCP_PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Returns an available loopback TCP port, or `None` when local bind is denied.
+///
+/// The port is one the kernel just handed out for an ephemeral bind and that
+/// nothing answers on once the probe listener is released. The second check
+/// matters on macOS, where the standard library marks a socket close-on-exec
+/// only after creating it: a child another thread spawns in that window
+/// inherits the probe listener and keeps the port answering after this process
+/// has closed it, so a server bound to the port fails with address-in-use while
+/// a readiness connect succeeds against the leaked listener.
 #[must_use]
 pub fn available_tcp_port() -> Option<u16> {
+    quiet_tcp_port(bind_ephemeral_tcp_port, tcp_port_answers)
+}
+
+/// Returns the first candidate port nothing answers on, or `None` once a
+/// candidate cannot be produced.
+fn quiet_tcp_port(
+    mut candidate: impl FnMut() -> Option<u16>,
+    mut answers: impl FnMut(u16) -> bool,
+) -> Option<u16> {
+    for _attempt in 0..TCP_PORT_PROBE_ATTEMPTS {
+        let port = candidate()?;
+        if !answers(port) {
+            return Some(port);
+        }
+    }
+
+    panic!("no quiet loopback tcp port after {TCP_PORT_PROBE_ATTEMPTS} probes");
+}
+
+/// Binds an ephemeral loopback port, releases it, and returns its number.
+fn bind_ephemeral_tcp_port() -> Option<u16> {
     let listener = match TcpListener::bind(("127.0.0.1", 0)) {
         Ok(listener) => listener,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return None,
@@ -87,6 +122,12 @@ pub fn available_tcp_port() -> Option<u16> {
             .expect("listener address should be available")
             .port(),
     )
+}
+
+/// Returns true when something accepts a connection on the loopback port.
+fn tcp_port_answers(port: u16) -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&address, TCP_PORT_PROBE_TIMEOUT).is_ok()
 }
 
 /// Returns a bindable Unix socket path, or `None` when local bind is denied.
@@ -417,4 +458,39 @@ fn sanitize_name(name: &str) -> String {
             _ => '-',
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_candidate_port_that_still_answers_is_skipped() {
+        let mut candidates = vec![Some(50_001), Some(50_002), Some(50_003)].into_iter();
+        let mut probed = Vec::new();
+
+        let chosen = quiet_tcp_port(
+            || candidates.next().flatten(),
+            |port| {
+                probed.push(port);
+                port != 50_003
+            },
+        );
+
+        assert_eq!(chosen, Some(50_003));
+        assert_eq!(probed, vec![50_001, 50_002, 50_003]);
+    }
+
+    #[test]
+    fn a_held_listener_answers_on_its_port() {
+        let held = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let port = held.local_addr().expect("listener address").port();
+
+        assert!(tcp_port_answers(port));
+    }
+
+    #[test]
+    fn no_candidate_means_no_port() {
+        assert_eq!(quiet_tcp_port(|| None, |_| false), None);
+    }
 }

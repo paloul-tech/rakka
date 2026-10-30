@@ -31,6 +31,7 @@ Per-actor Kubernetes sidecars are future work. They are not part of v1 because t
 - Stdin, stdout, and stderr default to `Null`; protocols opt into `Piped`.
 - Graceful shutdown defaults to closing stdin, then killing the child after the configured shutdown timeout.
 - Resource hints are declarative in v1. Hard enforcement belongs to deployment policy and later platform integrations.
+- On macOS a descriptor another thread is creating can reach a child spawned at that moment: the standard library marks sockets and pipes close-on-exec only after creating them, and its `posix_spawn` path sets no close-on-exec default. Rakka cannot close that window. A listener or pipe that must stay private is best created before the first child spawns; otherwise a child spawned concurrently may hold a copy until it exits, and a listener it holds keeps answering on its port.
 
 For process-backed entities, use stable working directories derived from entity type, shard id, and entity id. Do not share mutable working directories across two logical entities unless the child protocol has its own fencing.
 
@@ -74,7 +75,7 @@ This is not exactly-once delivery to arbitrary external systems. External effect
 `rakka_process::testkit` provides reusable helpers for process integration tests:
 
 - `ProcessFixture` creates allowlisted fixture specs and stdio fixture specs.
-- Temporary directory, TCP port, and Unix socket path helpers avoid host-specific fixtures.
+- Temporary directory, TCP port, and Unix socket path helpers avoid host-specific fixtures. The TCP port helper also verifies that nothing answers on the port it hands out, which catches a probe listener that a concurrently spawned child inherited on macOS.
 - File log helpers wait for expected lifecycle lines.
 - Process actor helpers start, stop, read status, wait for states, and assert restart-budget exhaustion.
 - Stdio helpers send requests, read status/stderr, wait for pending counts, and assert stderr/output contents.

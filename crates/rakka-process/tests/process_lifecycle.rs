@@ -789,12 +789,14 @@ async fn socket_process_waits_for_tcp_readiness() {
     .expect("socket process should become ready");
 
     assert!(socket_process.ready().attempts() >= 1);
-    assert!(socket_process
+    let shutdown = socket_process
         .shutdown()
         .await
-        .expect("socket process should stop")
-        .exit()
-        .success());
+        .expect("socket process should stop");
+    assert!(
+        shutdown.exit().success(),
+        "tcp fixture should exit cleanly once stdin closes: {shutdown:?}"
+    );
 }
 
 #[tokio::test]
