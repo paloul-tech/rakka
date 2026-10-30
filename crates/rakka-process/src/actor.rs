@@ -719,11 +719,18 @@ impl ProcessActor {
         Ok(self.status())
     }
 
+    /// Runs one supervision pass: an exit the child has made since the last
+    /// pass is supervised like any other failure, otherwise the health check
+    /// decides. The exit check runs exactly once per pass; a second check that
+    /// handed the exit back as a plain error left the actor `Running` with no
+    /// process and no next tick whenever the child exited between the two.
     async fn check_health(
         &mut self,
         ctx: &mut ActorContext<ProcessActorCommand>,
     ) -> ProcessResult<ProcessActorStatus> {
-        self.check_process_exit()?;
+        if let Err(error) = self.check_process_exit() {
+            return self.supervise_failure(ctx, error, true).await;
+        }
         let status = self.status();
         match self.config.health_check.check(&status) {
             ProcessHealth::Healthy => {
@@ -753,11 +760,7 @@ impl ProcessActor {
             return;
         }
 
-        let result = match self.check_process_exit() {
-            Ok(()) => self.check_health(ctx).await,
-            Err(error) => self.supervise_failure(ctx, error, true).await,
-        };
-
+        let result = self.check_health(ctx).await;
         if result.is_ok() && self.state == ProcessActorState::Running {
             self.schedule_supervision_tick(ctx);
         }

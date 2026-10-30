@@ -262,7 +262,11 @@ pub async fn wait_for_process_state(
         }
 
         if tokio::time::Instant::now() >= deadline {
-            assert_eq!(status.state(), expected);
+            assert_eq!(
+                status.state(),
+                expected,
+                "process actor did not reach {expected:?} within {timeout:?}: {status:?}"
+            );
             return status;
         }
 
