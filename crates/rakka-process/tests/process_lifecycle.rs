@@ -327,6 +327,57 @@ async fn process_actor_restarts_unexpected_exit_until_budget_is_exhausted() {
 }
 
 #[tokio::test]
+async fn an_exit_observed_by_the_health_check_is_supervised() {
+    // Without a supervision timer the health-check command is the only observer of
+    // the child's exit, so the exit it finds must be supervised exactly as the
+    // timer's would be: one restart, then the exhausted budget fails the actor.
+    let system = ActorSystem::new("process-actor-health-check-observes-exit");
+    let actor = spawn_process_actor(
+        &system,
+        "managed",
+        ProcessActorConfig::new(
+            fixture_spec("fixture_exits_after_delay").startup_timeout(Duration::from_secs(1)),
+            fixture_allowlist(),
+        )
+        .restart_policy(ProcessRestartPolicy::exponential(
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            1,
+        ))
+        .without_supervision_interval(),
+    )
+    .expect("process actor should spawn");
+
+    let started = ask_start(&actor).await.expect("process should start");
+    assert_eq!(started.state(), ProcessActorState::Running);
+
+    let restarted = ask_check_health_until(&actor, |status| status.restart_count() == 1)
+        .await
+        .expect("the exit the health check observed should be answered by a restart");
+    assert_eq!(
+        restarted.state(),
+        ProcessActorState::Running,
+        "{restarted:?}"
+    );
+    assert!(restarted.pid().is_some(), "{restarted:?}");
+
+    let exhausted = ask_check_health_until(&actor, |_status| false).await;
+    assert!(
+        matches!(
+            exhausted,
+            Err(ProcessError::RestartBudgetExhausted { max_restarts: 1 })
+        ),
+        "{exhausted:?}"
+    );
+    let failed = ask_status(&actor).await;
+    assert_eq!(failed.state(), ProcessActorState::Failed, "{failed:?}");
+    assert_eq!(failed.restart_count(), 1);
+    process_testkit::assert_restart_budget_exhausted(&failed, 1);
+
+    system.shutdown();
+}
+
+#[tokio::test]
 async fn process_actor_health_check_failure_triggers_supervision() {
     let system = ActorSystem::new("process-actor-health-fails");
     let actor = spawn_process_actor(
@@ -738,12 +789,14 @@ async fn socket_process_waits_for_tcp_readiness() {
     .expect("socket process should become ready");
 
     assert!(socket_process.ready().attempts() >= 1);
-    assert!(socket_process
+    let shutdown = socket_process
         .shutdown()
         .await
-        .expect("socket process should stop")
-        .exit()
-        .success());
+        .expect("socket process should stop");
+    assert!(
+        shutdown.exit().success(),
+        "tcp fixture should exit cleanly once stdin closes: {shutdown:?}"
+    );
 }
 
 #[tokio::test]
@@ -1065,6 +1118,30 @@ async fn ask_stop(
     actor: &rakka_core::ActorRef<ProcessActorCommand>,
 ) -> Result<rakka_process::ProcessActorStatus, ProcessError> {
     process_testkit::stop_process(actor).await
+}
+
+/// Sends health checks every 10 ms until one replies with an error, `done` accepts
+/// the status, or the test timeout elapses (the last reply is returned then).
+async fn ask_check_health_until(
+    actor: &rakka_core::ActorRef<ProcessActorCommand>,
+    done: impl Fn(&rakka_process::ProcessActorStatus) -> bool,
+) -> Result<rakka_process::ProcessActorStatus, ProcessError> {
+    let deadline = tokio::time::Instant::now() + process_testkit::DEFAULT_TEST_TIMEOUT;
+    loop {
+        let reply = actor
+            .ask(
+                |reply_to| ProcessActorCommand::CheckHealth { reply_to },
+                process_testkit::DEFAULT_TEST_TIMEOUT,
+            )
+            .await
+            .expect("health check ask should receive a reply");
+        match &reply {
+            Ok(status) if !done(status) && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            _ => return reply,
+        }
+    }
 }
 
 async fn ask_status(
