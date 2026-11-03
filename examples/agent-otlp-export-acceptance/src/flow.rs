@@ -486,16 +486,19 @@ pub async fn run_acceptance() -> AcceptanceReport {
         "the external system was called exactly once"
     );
     // The durable decision record of specification 17.7, and the reason this
-    // count is here rather than a `!is_empty()`. Every one of this run's four
-    // deciding transitions is committed by the *delivery* — that is what
-    // delivering a model result is — so an unwired delivery leaves exactly the
+    // count is here rather than a `!is_empty()`. This run records six
+    // decisions: the opening one, the model's tool selection, the approval it
+    // opened, the iteration, the proposal, and the run's `complete` end. Every
+    // one after the first is committed by the *delivery* — that is what
+    // delivering a model or tool result is, down to the settle of the
+    // proposal that ends the run — so an unwired delivery leaves exactly the
     // one decision the sharded registration commits on its own and silently
-    // drops the other three. `rakka.agent.decisions` still appears in the
+    // drops the other five. `rakka.agent.decisions` still appears in the
     // exported surface either way, which is why the metric-name assertion
     // above cannot see this: the sink's contents are the only witness.
     let decisions = world.decisions.events(&run_scope).len();
     assert_eq!(
-        decisions, 4,
+        decisions, 6,
         "every deciding transition of the run is durably recorded; a delivery \
          wired for segments and metrics but not decisions records only the first"
     );

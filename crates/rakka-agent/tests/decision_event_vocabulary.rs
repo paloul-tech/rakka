@@ -175,12 +175,29 @@ async fn an_event_without_the_new_fields_serializes_without_their_keys() {
 
     let events = sink.events(&run_scope());
     assert!(!events.is_empty());
+    // The run's `complete` end carries `run_status`; every other event of the
+    // flow sets none of the four fields, and an unset field has no key.
+    let mut without_any = 0;
     for event in events {
         let value = serde_json::to_value(&event).expect("event serializes");
-        for key in ["checkpoint", "effect", "outcome", "run_status"] {
-            assert!(value.get(key).is_none(), "{key} must be absent");
+        let fields = [
+            ("checkpoint", event.checkpoint.is_some()),
+            ("effect", event.effect.is_some()),
+            ("outcome", event.outcome.is_some()),
+            ("run_status", event.run_status.is_some()),
+        ];
+        for (key, set) in fields {
+            assert_eq!(
+                value.get(key).is_some(),
+                set,
+                "{key} is serialized exactly when it is set"
+            );
+        }
+        if fields.iter().all(|(_, set)| !set) {
+            without_any += 1;
         }
     }
+    assert_eq!(without_any, 4, "start, call-tools, iterate, proposal");
 }
 
 /// A vocabulary without a sink records nothing: every transition still queues
@@ -221,7 +238,11 @@ async fn iterate_keeps_the_turn_and_context_it_was_decided_in() {
     fx.pump().await.expect("the loop should run to completion");
 
     let events = sink.events(&run_scope());
-    assert_eq!(events.len(), 4, "start, call-tools, iterate, proposal");
+    assert_eq!(
+        events.len(),
+        5,
+        "start, call-tools, iterate, proposal, complete"
+    );
     assert_eq!(events[2].kind, AgentDecisionKind::Continue);
     assert_eq!(events[2].turn, 1);
     assert!(events[2].context_snapshot.is_some());

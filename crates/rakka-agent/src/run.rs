@@ -1340,12 +1340,35 @@ fn bounded_detail(detail: impl Into<String>) -> String {
     detail
 }
 
+/// The decision kind that records a run's end in `status`.
+///
+/// `Completed` is `complete`, `Failed` is `fail`, `Cancelled` is `cancel`,
+/// `HandedOff` is `handoff` and `Superseded` is `supersede`.
+/// [`AgentRunTerminalReason::status`] yields only those five; any other
+/// status falls back to `fail`, so an end is never recorded as anything but
+/// an end.
+fn end_kind(status: AgentRunStatus) -> AgentDecisionKind {
+    match status {
+        AgentRunStatus::Completed => AgentDecisionKind::Complete,
+        AgentRunStatus::Cancelled => AgentDecisionKind::Cancel,
+        AgentRunStatus::HandedOff => AgentDecisionKind::Handoff,
+        AgentRunStatus::Superseded => AgentDecisionKind::Supersede,
+        _ => AgentDecisionKind::Fail,
+    }
+}
+
 /// Moves the run to a terminal status and records why.
+///
+/// The end is also queued as a decision (`complete`, `fail`, `cancel`,
+/// `handoff` or `supersede`) carrying the status and the reason's code. Its
+/// slot is `end`, and the already-terminal guard below makes it once per run,
+/// however the wind-down that reaches here is re-driven.
 fn terminate(
     state: &mut AgentRunState,
     reason: AgentRunTerminalReason,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
     let run = state.run_mut()?;
     if run.status.is_terminal() {
         return Ok(());
@@ -1360,7 +1383,9 @@ fn terminate(
     if descendants > 0 {
         run.loop_state.budget_mut().charge_descendants(descendants);
     }
-    run.status = reason.status();
+    let status = reason.status();
+    let code = reason.code();
+    run.status = status;
     run.loop_state.set_phase(AgentLoopPhase::Complete);
     // A terminal run owes its escrow back, not a top-up: clearing the park here
     // means a run cancelled while waiting on a grant stops asking and settles.
@@ -1370,6 +1395,22 @@ fn terminate(
     // clock must not move when a re-driven wind-down re-enters this transition
     // ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
     run.terminal_at = Some(now);
+    // The end is the run's deterministic policy recording the terminal
+    // outcome, even when a person's denial caused it: that person's decision
+    // is its own `resolve-checkpoint`. Queued after every draft the
+    // transition queued before reaching here, such as the closes a cancel
+    // records, so the end is the transition's last event.
+    run.loop_state.queue_decision(
+        &scope,
+        AgentDecisionDraft::new(
+            end_kind(status),
+            AgentDecisionSource::DeterministicPolicy,
+            "end",
+        )
+        .with_run_status(status)
+        .with_reason_code(code),
+        now,
+    );
     // The record now carries a field only a binary that knows schema version 2
     // can round-trip, so a version-1 record earns its upgrade at exactly the
     // transition that gives it one. Without this a run *created* before the
@@ -11036,6 +11077,23 @@ mod tests {
             0,
             "a prefix-length diff reports an empty transition here"
         );
+    }
+
+    /// Each terminal status records its own end kind, and a status no
+    /// terminal reason yields falls back to `fail`.
+    #[test]
+    fn each_terminal_status_maps_to_its_end_kind() {
+        for (status, kind) in [
+            (AgentRunStatus::Completed, AgentDecisionKind::Complete),
+            (AgentRunStatus::Failed, AgentDecisionKind::Fail),
+            (AgentRunStatus::Cancelled, AgentDecisionKind::Cancel),
+            (AgentRunStatus::HandedOff, AgentDecisionKind::Handoff),
+            (AgentRunStatus::Superseded, AgentDecisionKind::Supersede),
+            (AgentRunStatus::Running, AgentDecisionKind::Fail),
+            (AgentRunStatus::Cancelling, AgentDecisionKind::Fail),
+        ] {
+            assert_eq!(end_kind(status), kind, "{status:?}");
+        }
     }
 
     /// Queues one draft of `kind` under `slot` on the fixture's loop state.

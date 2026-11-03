@@ -830,11 +830,12 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
             AgentDecisionKind::CallTools,
             AgentDecisionKind::Continue,
             AgentDecisionKind::SubmitResult,
+            AgentDecisionKind::Complete,
         ],
         "the session's decisions are reconstructable in order (scenario 21)"
     );
     assert_eq!(
-        view.snapshot.decision_cursor, 4,
+        view.snapshot.decision_cursor, 5,
         "the durable cursor backs the lag computation"
     );
 
@@ -853,8 +854,8 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
     assert!(!degraded.decisions_available);
     assert!(degraded.decisions.is_empty());
     assert_eq!(
-        degraded.decision_lag, 4,
-        "all four decisions are unprojected"
+        degraded.decision_lag, 5,
+        "all five decisions are unprojected"
     );
     assert_eq!(degraded.snapshot, view.snapshot);
 
@@ -894,7 +895,7 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
             .iter()
             .map(|event| event.sequence)
             .collect::<Vec<_>>(),
-        vec![1, 2, 4],
+        vec![1, 2, 4, 5],
         "every retained decision is shown; only the hole is absent"
     );
     assert_eq!(gapped.snapshot, view.snapshot);
