@@ -156,12 +156,19 @@ pub const AGENT_RUN_OPERATION_LOG_CAPACITY: usize = 64;
 
 /// Largest materialized run record, in bytes, once serialized.
 ///
-/// It is [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] of growth on top of the
-/// admission budget acceptance enforces, 80 KiB, so raising the reserve must
-/// raise this bound with it rather than silently shrinking what a run may be
-/// admitted with. Both rose by 32 KiB together on 2026-11-03, when the reserve
-/// took on the owed decision outbox ([`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`]),
-/// and the admission budget stayed where it was.
+/// It is the admission budget acceptance enforces, 80 KiB, plus
+/// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] of post-acceptance growth: the
+/// maximal one-turn working set's growth *and* a full owed decision outbox at
+/// its byte bound, [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`]. Raising the
+/// reserve must raise this bound with it rather than silently shrinking what
+/// a run may be admitted with.
+///
+/// Both rose by 32 KiB together on 2026-11-03, by the owner's ruling, when the
+/// reserve took on the outbox, and the admission budget stayed where it was.
+/// Measured then: the maximal working set grows the record by 89538 bytes;
+/// the outbox holds at most 40960 bytes of events, in a container (its field,
+/// separators and counters) of at most 131 bytes; and
+/// 89538 + 40960 + 131 = 130629 fits the reserve's 131072.
 pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 208 * 1024;
 
 /// Bytes of growth headroom an accepted run record keeps below
@@ -195,9 +202,9 @@ pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 208 * 1024;
 /// events land on top of the record that check measured; the outbox's place
 /// in the reserve is what keeps a run whose sink is down from being refused a
 /// transition over telemetry. Measured on 2026-11-03: the maximal working set
-/// grows the record by 89538 bytes, so 89538 + 40960 of outbox, plus the
-/// outbox's own field names, separators and counters, must fit these 131072
-/// bytes.
+/// grows the record by 89538 bytes, and the outbox adds at most 40960 bytes of
+/// events and 131 bytes of container (its field, separators and counters), so
+/// 89538 + 40960 + 131 = 130629 must fit these 131072 bytes.
 ///
 /// Acceptance therefore enforces the materialized bound *minus* this reserve,
 /// so a run the entity admits can never later be unable to record the very turn
@@ -205,13 +212,18 @@ pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 208 * 1024;
 /// retry forever, exactly the committed-record-bricks-its-own-recovery class
 /// the schema gate exists to prevent. It is the same reservation the task
 /// entity makes for its own lifecycle
-/// ([`crate::task::AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`]). The test
-/// `the_growth_reserve_covers_the_maximal_working_set` holds this constant to
-/// that claim: it materializes a superset of every reachable working set, under
-/// maximal identifiers, and measures it.
+/// ([`crate::task::AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`]).
+///
+/// The test
 /// `the_growth_reserve_covers_the_working_set_and_a_full_decision_outbox`
-/// measures the same working set again with the outbox full of maximal
-/// events.
+/// holds this constant to the whole claim. Under maximal identifiers it
+/// materializes a superset of every reachable working set, measures its
+/// growth, and asserts that growth plus the outbox's byte bound plus the
+/// outbox's largest container, measured from a serialized full ring, fits
+/// the reserve; it then fills the outbox with maximal events and measures the
+/// record. `the_growth_reserve_covers_the_maximal_working_set` measures the
+/// same working set alone and holds the delegation lifecycle to its door
+/// price; on its own it does not hold the outbox's share.
 pub const AGENT_RUN_STATE_GROWTH_RESERVE_BYTES: usize = 128 * 1024;
 
 /// Most bounded loop transitions one settle pass may perform.
@@ -11206,11 +11218,14 @@ mod tests {
     /// The reserve exists so a run the entity admits can never later be refused
     /// its own turn: `record_effect_result` checks the full materialized bound,
     /// a rejected transition never enters the operation log, and the
-    /// dispatcher's retry would be refused identically forever. This test holds
-    /// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] to that claim empirically: it
-    /// materializes more than any reachable state carries at once
-    /// ([`maximal_working_set`]) and measures the growth over the record
-    /// acceptance admitted.
+    /// dispatcher's retry would be refused identically forever. This test
+    /// measures the working set alone against
+    /// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`]: it materializes more than any
+    /// reachable state carries at once ([`maximal_working_set`]) and measures
+    /// the growth over the record acceptance admitted. The reserve also holds
+    /// the owed decision outbox, so the claim the reserve makes in full — the
+    /// working set and a full outbox together — is held by
+    /// `the_growth_reserve_covers_the_working_set_and_a_full_decision_outbox`.
     #[test]
     fn the_growth_reserve_covers_the_maximal_working_set() {
         let (mut run, baseline, scope) = maximal_working_set();
@@ -11374,7 +11389,15 @@ mod tests {
     /// the maximal working set ([`maximal_working_set`]) *plus* an outbox
     /// holding all it may at [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`] — stays
     /// within [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`], so the admission
-    /// budget is unchanged. The fill offers twice the ring's count of maximal
+    /// budget is unchanged.
+    ///
+    /// The worst case is asserted directly, not only reached: the working
+    /// set's measured growth, plus the outbox's whole byte bound, plus the
+    /// largest container the outbox can serialize in (a full ring with both
+    /// counters at their widest, measured from a serialized loop state), must
+    /// fit the reserve. Maximal events settle a few owed events short of the
+    /// byte bound, so the measured record alone would leave the reserve's
+    /// margin unchecked. The fill then offers twice the ring's count of maximal
     /// events, as a sink that stays down would leave them, and the byte bound
     /// must have evicted past what the count alone would, or the test proves
     /// nothing about it.
@@ -11383,6 +11406,7 @@ mod tests {
         use crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY;
 
         let (mut run, baseline, scope) = maximal_working_set();
+        let working_set_growth = run.materialized_size_bytes().saturating_sub(baseline);
         let now = AgentTimestampMillis::new(1);
         let longest = crate::identity::AGENT_IDENTITY_MAX_LENGTH;
 
@@ -11482,6 +11506,20 @@ mod tests {
             "the maximal working set and a full decision outbox grow the record by {growth} \
              bytes, which exceeds the {AGENT_RUN_STATE_GROWTH_RESERVE_BYTES} byte reserve: a \
              run admitted at the bound could be refused a transition over telemetry"
+        );
+
+        // The worst case the bound admits, which the fill above stops short of.
+        let container_max = run
+            .loop_state
+            .decision_outbox_container_max_bytes(outbox.last().expect("a maximal event is owed"));
+        let worst_case = working_set_growth + AGENT_RUN_DECISION_OUTBOX_MAX_BYTES + container_max;
+        assert!(
+            worst_case <= AGENT_RUN_STATE_GROWTH_RESERVE_BYTES,
+            "the maximal working set ({working_set_growth} bytes), a full outbox \
+             ({AGENT_RUN_DECISION_OUTBOX_MAX_BYTES} bytes) and its largest container \
+             ({container_max} bytes) need {worst_case} bytes, more than the \
+             {AGENT_RUN_STATE_GROWTH_RESERVE_BYTES} byte reserve: a run admitted at the bound \
+             could be refused a transition over telemetry"
         );
     }
 

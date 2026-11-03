@@ -174,8 +174,9 @@ pub const AGENT_RUN_DECISION_OUTBOX_CAPACITY: usize = 32;
 /// keeping the admission budget at 80 KiB. The outbox takes 40 KiB of the
 /// 128 KiB reserve, room for four maximal events: 89538 + 40960, plus the
 /// outbox's own field names, separators and counters (at most 131 bytes),
-/// fits 131072. The proof ends its fill owing four maximal events, 34904
-/// bytes, with the record grown by 124509.
+/// fits 131072 with 443 to spare; the proof asserts that worst case directly.
+/// Its fill of maximal events ends owing four, 34904 bytes, with the record
+/// grown by 124509.
 pub const AGENT_RUN_DECISION_OUTBOX_MAX_BYTES: usize = 40 * 1024;
 
 /// Most settled memory-promotion receipts a run's loop state retains.
@@ -2040,6 +2041,39 @@ impl VersionedAgentRecord for AgentLoopState {
 
     fn schema_version(&self) -> StateSchemaVersion {
         self.schema_version
+    }
+}
+
+#[cfg(test)]
+impl AgentLoopState {
+    /// The most bytes the owed outbox adds to the serialized record beyond
+    /// its events' own: the `decision_outbox` field with its brackets and the
+    /// separators of a full ring, and the `decision_sequence` and
+    /// `decision_drops` counters at their widest.
+    ///
+    /// Measured, not counted by hand: this state is serialized once with an
+    /// empty outbox and zeroed counters, and once with a ring of
+    /// [`AGENT_RUN_DECISION_OUTBOX_CAPACITY`] copies of `event` and both
+    /// counters at `u64::MAX`, and the events' own bytes are subtracted from
+    /// the difference. The ring is full because every owed event past the
+    /// first adds a separator; the outbox can be full by count and by bytes
+    /// at once, since a small event is well under its share of
+    /// [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`].
+    pub(crate) fn decision_outbox_container_max_bytes(&self, event: &AgentDecisionEvent) -> usize {
+        let encoded = |state: &Self| {
+            serde_json::to_vec(state)
+                .expect("the loop state encodes")
+                .len()
+        };
+        let mut empty = self.clone();
+        empty.decision_outbox.clear();
+        empty.decision_sequence = 0;
+        empty.decision_drops = 0;
+        let mut full = empty.clone();
+        full.decision_outbox = vec![event.clone(); AGENT_RUN_DECISION_OUTBOX_CAPACITY];
+        full.decision_sequence = u64::MAX;
+        full.decision_drops = u64::MAX;
+        encoded(&full) - encoded(&empty) - AGENT_RUN_DECISION_OUTBOX_CAPACITY * encoded_len(event)
     }
 }
 
