@@ -14,9 +14,12 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    load_agent_run_state, AgentDecisionKind, AgentDecisionSource, AgentModelTurn, AgentModelUsage,
-    AgentSchemaPolicy, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    InMemoryAgentDecisionEventSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    load_agent_run_state, AgentDecisionEvent, AgentDecisionEventPage, AgentDecisionEventSink,
+    AgentDecisionKind, AgentDecisionSource, AgentDecisionWriteStatus, AgentModelTurn,
+    AgentModelUsage, AgentObservabilityError, AgentObservabilityFuture, AgentRunScope,
+    AgentRunStatus, AgentSchemaPolicy, AgentTaskContent, AgentToolCallId, AgentToolCallRequest,
+    AgentToolId, InMemoryAgentDecisionEventSink, AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 
 mod common;
@@ -126,6 +129,92 @@ async fn a_run_emits_its_decision_sequence_exactly_once() {
         .map(|loop_state| loop_state.decision_outbox().len())
         .unwrap_or_default();
     assert_eq!(owed, 0, "every owed decision was flushed");
+}
+
+/// A sink whose backend is down for good: every append and every read fails.
+#[derive(Debug)]
+struct AlwaysDownSink;
+
+impl AgentDecisionEventSink for AlwaysDownSink {
+    fn backend_name(&self) -> &'static str {
+        "always-down"
+    }
+
+    fn append<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _event: &'a AgentDecisionEvent,
+    ) -> AgentObservabilityFuture<'a, AgentDecisionWriteStatus> {
+        Box::pin(async { Err(sink_down()) })
+    }
+
+    fn read<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _after: u64,
+        _limit: usize,
+    ) -> AgentObservabilityFuture<'a, AgentDecisionEventPage> {
+        Box::pin(async { Err(sink_down()) })
+    }
+}
+
+fn sink_down() -> AgentObservabilityError {
+    AgentObservabilityError::Sink {
+        code: "unavailable".to_string(),
+        message: "the decision-event backend is down".to_string(),
+    }
+}
+
+/// A run whose decision sink is down still completes: telemetry is never a
+/// correctness input ([specification 17.1](../../../docs/plans/rakka-agent/spec.md)).
+/// The events it could not flush stay owed in its durable record, within the
+/// outbox's byte bound, and every sequence the run assigned is accounted for:
+/// either still owed or counted as dropped, so a replay reader can see any
+/// hole.
+#[tokio::test]
+async fn a_run_with_its_sink_down_completes_and_accounts_for_every_sequence() {
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, proposing_turn("resolved")),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    );
+    let fx = Fixture::new(dispatcher).with_decision_events(Arc::new(AlwaysDownSink));
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump()
+        .await
+        .expect("a sink that is down never fails the run");
+
+    let state = load_agent_run_state(&fx.runs, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+    assert_eq!(state.status(), Some(AgentRunStatus::Completed));
+    let loop_state = state.loop_state().expect("the run has a loop state");
+    let outbox = loop_state.decision_outbox();
+    assert!(
+        !outbox.is_empty(),
+        "nothing was flushed, so the run still owes its decisions"
+    );
+    assert_eq!(
+        outbox.len() as u64 + loop_state.decision_drops(),
+        loop_state.decision_sequence(),
+        "every sequence is either owed or counted as dropped"
+    );
+    let owed: usize = outbox
+        .iter()
+        .map(|event| serde_json::to_vec(event).expect("the event encodes").len())
+        .sum();
+    assert!(
+        owed <= AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+        "the run owes {owed} bytes of decision events, more than the \
+         {AGENT_RUN_DECISION_OUTBOX_MAX_BYTES} byte bound"
+    );
 }
 
 /// Scenario 21's decision half under the owner-kill sweep: kill the run's

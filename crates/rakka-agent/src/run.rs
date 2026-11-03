@@ -104,7 +104,10 @@ use crate::identity::{
     AgentRunBinding, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope,
     AgentWorkflowInvocationId, TenantId,
 };
-use crate::loop_runtime::{AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal};
+use crate::loop_runtime::{
+    AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal,
+    AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+};
 use crate::memory::{
     AgentContextSnapshotRef, AgentRunMemory, MemoryError, MemorySequence, SessionMemoryEntry,
 };
@@ -153,11 +156,13 @@ pub const AGENT_RUN_OPERATION_LOG_CAPACITY: usize = 64;
 
 /// Largest materialized run record, in bytes, once serialized.
 ///
-/// It is [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] of working-set growth on top
-/// of the admission budget acceptance enforces, so raising the reserve must
+/// It is [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] of growth on top of the
+/// admission budget acceptance enforces, 80 KiB, so raising the reserve must
 /// raise this bound with it rather than silently shrinking what a run may be
-/// admitted with.
-pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 176 * 1024;
+/// admitted with. Both rose by 32 KiB together on 2026-11-03, when the reserve
+/// took on the owed decision outbox ([`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`]),
+/// and the admission budget stayed where it was.
+pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 208 * 1024;
 
 /// Bytes of growth headroom an accepted run record keeps below
 /// [`AGENT_RUN_MATERIALIZED_MAX_BYTES`].
@@ -184,6 +189,16 @@ pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 176 * 1024;
 /// reserve covers it again so a result arriving after acceptance can always
 /// be recorded.
 ///
+/// The reserve also holds a full owed decision outbox, at
+/// [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`]. A transition checks the run's
+/// bounds before the seal commits the decision events it queued, so the
+/// events land on top of the record that check measured; the outbox's place
+/// in the reserve is what keeps a run whose sink is down from being refused a
+/// transition over telemetry. Measured on 2026-11-03: the maximal working set
+/// grows the record by 89538 bytes, so 89538 + 40960 of outbox, plus the
+/// outbox's own field names, separators and counters, must fit these 131072
+/// bytes.
+///
 /// Acceptance therefore enforces the materialized bound *minus* this reserve,
 /// so a run the entity admits can never later be unable to record the very turn
 /// it was created to take — a record refused mid-turn would refuse the same
@@ -194,7 +209,10 @@ pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 176 * 1024;
 /// `the_growth_reserve_covers_the_maximal_working_set` holds this constant to
 /// that claim: it materializes a superset of every reachable working set, under
 /// maximal identifiers, and measures it.
-pub const AGENT_RUN_STATE_GROWTH_RESERVE_BYTES: usize = 96 * 1024;
+/// `the_growth_reserve_covers_the_working_set_and_a_full_decision_outbox`
+/// measures the same working set again with the outbox full of maximal
+/// events.
+pub const AGENT_RUN_STATE_GROWTH_RESERVE_BYTES: usize = 128 * 1024;
 
 /// Most bounded loop transitions one settle pass may perform.
 ///
@@ -780,6 +798,25 @@ impl AgentRun {
             return Err(AgentRunError::MaterializedStateTooLarge { bytes, maximum });
         }
         Ok(())
+    }
+
+    /// The bytes the interception door may commit to this turn's delegations
+    /// and workflow invocations: what the record has left below
+    /// [`AGENT_RUN_MATERIALIZED_MAX_BYTES`], less the owed decision outbox's
+    /// bound.
+    ///
+    /// The door prices its commits against the materialized bound, not
+    /// against the growth reserve, so the outbox's share of the reserve does
+    /// not protect it here. The seal commits a transition's decision events
+    /// after the bounds check, so a turn that spent the record up to the
+    /// materialized bound would leave the record over it once its events
+    /// landed, and the next transition would be refused over telemetry. Holding
+    /// [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`] back keeps a full outbox
+    /// affordable whatever the door commits.
+    fn coordination_door_headroom(&self) -> usize {
+        AGENT_RUN_MATERIALIZED_MAX_BYTES
+            .saturating_sub(AGENT_RUN_DECISION_OUTBOX_MAX_BYTES)
+            .saturating_sub(self.materialized_size_bytes())
     }
 }
 
@@ -3384,10 +3421,12 @@ fn evaluate_model_output(
     // unaffordable delegation a failed tool result the model corrects course
     // from; letting it commit would wedge the run afterwards, when the bound
     // check fails a transition whose model turn is already durably pending
-    // and every re-drive fails the same way.
+    // and every re-drive fails the same way. The headroom holds the owed
+    // decision outbox's bound back: the turn's decision events are sealed in
+    // after the bounds check, and must still fit
+    // (`AgentRun::coordination_door_headroom`).
     let mut delegation_headroom = if delegation.is_some() || workflow.is_some() {
-        let run = state.run_mut()?;
-        AGENT_RUN_MATERIALIZED_MAX_BYTES.saturating_sub(run.materialized_size_bytes())
+        state.run_mut()?.coordination_door_headroom()
     } else {
         // No coordination or workflow tool is wired, so no call below prices
         // against it. Delegations and workflow invocations share this one
@@ -10749,6 +10788,56 @@ mod tests {
         assert_eq!(loop_state.decision_drops(), 0);
     }
 
+    /// An event larger than the outbox's byte bound on its own is dropped on
+    /// arrival, since evicting every owed event would still not make room.
+    /// The loss consumes its sequence and counts a drop, and the events
+    /// already owed stay owed.
+    #[test]
+    fn an_event_over_the_byte_bound_on_its_own_is_dropped_and_leaves_the_owed_events() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        queue(
+            &mut loop_state,
+            &scope,
+            AgentDecisionKind::Continue,
+            "small",
+        );
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+
+        // Every event copies the loop's telemetry, and a span link may carry
+        // dozens of kilobyte-long attributes, so the next event outgrows the
+        // bound by itself.
+        loop_state.record_telemetry(rakka_agent_workflow::AgentTelemetryContext {
+            span_links: vec![rakka_agent_workflow::AgentSpanLink {
+                trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                span_id: "b7ad6b7169203331".to_string(),
+                trace_state: None,
+                attributes: (0..64)
+                    .map(|index| (format!("key-{index}"), "v".repeat(1000)))
+                    .collect(),
+            }],
+            ..Default::default()
+        });
+        queue(
+            &mut loop_state,
+            &scope,
+            AgentDecisionKind::Continue,
+            "oversize",
+        );
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+
+        assert_eq!(
+            loop_state
+                .decision_outbox()
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the owed event is not evicted for an event that could never fit"
+        );
+        assert_eq!(loop_state.decision_sequence(), 2);
+        assert_eq!(loop_state.decision_drops(), 1);
+    }
+
     /// A draft is positioned when it is queued: a transition that advances
     /// the turn after deciding (the `iterate` decision does) still records
     /// the decision under the turn, phase and context it was made in.
@@ -10894,19 +10983,16 @@ mod tests {
     }
 
     /// A superset of every working set one turn can hold, under maximal
-    /// identifiers, must fit the growth reserve.
+    /// identifiers: the run holding it, the bytes of the record acceptance
+    /// admitted before any of it was recorded, and the maximal scope.
     ///
-    /// The reserve exists so a run the entity admits can never later be refused
-    /// its own turn: `record_effect_result` checks the full materialized bound,
-    /// a rejected transition never enters the operation log, and the
-    /// dispatcher's retry would be refused identically forever. This test holds
-    /// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] to that claim empirically: it
-    /// materializes more than any reachable state carries at once — the maximal
-    /// pending turn, its full effect fan-out, every tool result, the proposal,
-    /// the accepted result, the feedback, and the terminal reason together —
-    /// and measures the growth over the record acceptance admitted.
-    #[test]
-    fn the_growth_reserve_covers_the_maximal_working_set() {
+    /// It materializes more than any reachable state carries at once — the
+    /// maximal pending turn, its full effect fan-out, every tool result, the
+    /// proposal, the accepted result, the feedback, and the terminal reason
+    /// together — so the growth it measures over the baseline bounds what any
+    /// admitted run can grow by within one turn. The decision outbox is left
+    /// empty: the proofs that need it fill it themselves.
+    fn maximal_working_set() -> (AgentRun, usize, AgentRunScope) {
         let now = AgentTimestampMillis::new(1);
         let maximal_reason = crate::failure::AgentFailureReason::guardrail(
             crate::definition::AgentGuardrailStageId::new(
@@ -10941,9 +11027,11 @@ mod tests {
             crate::budget::AgentBudgetGrant::from_ceilings(&definition.budgets),
             now,
         );
+        // A run serving a goal carries its id from acceptance on, and every
+        // decision event copies it.
         let loop_state = AgentLoopState::started(
             task.clone(),
-            None,
+            Some(AgentGoalId::new(&long).expect("the goal id is valid")),
             AgentRevisionNumber::INITIAL,
             AgentRevisionNumber::INITIAL,
             definition.version,
@@ -11109,6 +11197,27 @@ mod tests {
             max_attempts: Some(u32::MAX),
         });
 
+        (run, baseline, scope)
+    }
+
+    /// A superset of every working set one turn can hold, under maximal
+    /// identifiers, must fit the growth reserve.
+    ///
+    /// The reserve exists so a run the entity admits can never later be refused
+    /// its own turn: `record_effect_result` checks the full materialized bound,
+    /// a rejected transition never enters the operation log, and the
+    /// dispatcher's retry would be refused identically forever. This test holds
+    /// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] to that claim empirically: it
+    /// materializes more than any reachable state carries at once
+    /// ([`maximal_working_set`]) and measures the growth over the record
+    /// acceptance admitted.
+    #[test]
+    fn the_growth_reserve_covers_the_maximal_working_set() {
+        let (mut run, baseline, scope) = maximal_working_set();
+        let now = AgentTimestampMillis::new(1);
+        let turn = run.loop_state.turn();
+        let long = "a".repeat(crate::identity::AGENT_IDENTITY_MAX_LENGTH);
+
         let growth = run.materialized_size_bytes().saturating_sub(baseline);
         assert!(
             growth <= AGENT_RUN_STATE_GROWTH_RESERVE_BYTES,
@@ -11248,6 +11357,153 @@ mod tests {
             "the full delegation lifecycle grows the record by {delegation_growth} bytes, which \
              exceeds the {door_price} bytes the interception door priced for it: a delegation \
              the door admits could wedge the run it was committed on"
+        );
+    }
+
+    /// The maximal working set and a full decision outbox of maximal events
+    /// must fit the growth reserve together.
+    ///
+    /// A transition checks the run's bounds *before* the participant's seal
+    /// commits the decision events it queued, so a persisted record can exceed
+    /// what the check measured by the events sealed after it, and an outbox
+    /// that grew past what the reserve covers would push the record over
+    /// [`AGENT_RUN_MATERIALIZED_MAX_BYTES`]: every later transition would then
+    /// be refused over telemetry, the anti-goal of specification 17.1. What
+    /// makes the late seal safe is the property this test measures: under
+    /// maximal identifiers, the growth over the record acceptance admitted —
+    /// the maximal working set ([`maximal_working_set`]) *plus* an outbox
+    /// holding all it may at [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`] — stays
+    /// within [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`], so the admission
+    /// budget is unchanged. The fill offers twice the ring's count of maximal
+    /// events, as a sink that stays down would leave them, and the byte bound
+    /// must have evicted past what the count alone would, or the test proves
+    /// nothing about it.
+    #[test]
+    fn the_growth_reserve_covers_the_working_set_and_a_full_decision_outbox() {
+        use crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY;
+
+        let (mut run, baseline, scope) = maximal_working_set();
+        let now = AgentTimestampMillis::new(1);
+        let longest = crate::identity::AGENT_IDENTITY_MAX_LENGTH;
+
+        // A maximal event sets every field it can, each at its longest: the
+        // checkpoint and effect of the last slot the maximal fan-out could
+        // derive, under the largest generation, with both deadlines set; the
+        // longest kind, source, outcome, run status and safety-class labels; a
+        // reason code at its bound; and a full fan-out of selected tools at the
+        // longest tool id. The loop supplies the rest — the maximal scope,
+        // task and goal, the context snapshot, and the telemetry — from the
+        // working set.
+        let effect_id = effect_id_for(&scope, u64::MAX, usize::MAX).expect("the effect id derives");
+        let generation = AgentEffectGeneration::new(u32::MAX);
+        let kind = AgentCheckpointKind::IndeterminateEffectReconciliation;
+        let checkpoint = crate::observability::AgentDecisionCheckpoint {
+            checkpoint_id: AgentCheckpoint::id_for_effect(&effect_id, generation, kind),
+            kind,
+            due_at: Some(AgentTimestampMillis::new(u64::MAX)),
+            expires_at: Some(AgentTimestampMillis::new(u64::MAX)),
+        };
+        let effect = crate::query::AgentCheckpointBoundEffectView {
+            effect_id,
+            generation,
+            target: format!("tool:{}", "t".repeat(longest)),
+            safety_class: crate::definition::AgentEffectSafetyClass::NonIdempotent,
+        };
+        let tools: Vec<AgentToolId> = (0..crate::model::AGENT_MODEL_MAX_TOOL_CALLS)
+            .map(|_| AgentToolId::new("t".repeat(longest)).expect("the tool id is valid"))
+            .collect();
+        // Every event needs its own identity, or the outbox would skip it as
+        // a re-driven duplicate; the generation digits vary and keep their
+        // length.
+        let maximal_draft = |ordinal: u64| {
+            AgentDecisionDraft::new(
+                AgentDecisionKind::RequestReconciliation,
+                AgentDecisionSource::AuthorizationService,
+                format!(
+                    "ck-escalate-reconcile-t{}-s{}-g{}",
+                    u64::MAX,
+                    usize::MAX,
+                    u64::MAX - ordinal
+                ),
+            )
+            .with_checkpoint(checkpoint.clone())
+            .with_effect(effect.clone())
+            .with_outcome(crate::observability::AgentDecisionOutcome::ConfirmedNotExecuted)
+            .with_run_status(AgentRunStatus::WaitingForReconciliation)
+            .with_safety_class(crate::definition::AgentEffectSafetyClass::NonIdempotent)
+            .with_reason_code("r".repeat(crate::observability::AGENT_DECISION_REASON_MAX_LENGTH))
+            .with_selected_tools(tools.clone())
+        };
+
+        // The sink is down: nothing is flushed, so every commit adds to the
+        // outbox and the bound alone decides what it keeps.
+        let offered = 2 * AGENT_RUN_DECISION_OUTBOX_CAPACITY;
+        for ordinal in 0..offered {
+            run.loop_state
+                .queue_decision(&scope, maximal_draft(ordinal as u64), now);
+            run.loop_state
+                .commit_decisions(AgentDecisionEventVocabulary::Version2);
+        }
+
+        let outbox = run.loop_state.decision_outbox();
+        let one_event = serde_json::to_vec(outbox.last().expect("a maximal event is owed"))
+            .expect("the event encodes")
+            .len();
+        assert!(
+            one_event <= AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+            "one maximal event is {one_event} bytes, more than the \
+             {AGENT_RUN_DECISION_OUTBOX_MAX_BYTES} byte bound: every such event would be dropped"
+        );
+        let owed: usize = outbox
+            .iter()
+            .map(|event| serde_json::to_vec(event).expect("the event encodes").len())
+            .sum();
+        assert!(
+            owed <= AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+            "the outbox owes {owed} bytes, more than its {AGENT_RUN_DECISION_OUTBOX_MAX_BYTES} \
+             byte bound"
+        );
+        let count_drops = (offered - AGENT_RUN_DECISION_OUTBOX_CAPACITY) as u64;
+        assert!(
+            run.loop_state.decision_drops() > count_drops,
+            "the count bound alone drops {count_drops}; the byte bound must have evicted \
+             beyond that, or this proves nothing about it"
+        );
+        assert_eq!(
+            outbox.len() as u64 + run.loop_state.decision_drops(),
+            run.loop_state.decision_sequence(),
+            "every sequence is either owed or counted as dropped"
+        );
+        assert_eq!(run.loop_state.decision_sequence(), offered as u64);
+
+        let growth = run.materialized_size_bytes().saturating_sub(baseline);
+        assert!(
+            growth <= AGENT_RUN_STATE_GROWTH_RESERVE_BYTES,
+            "the maximal working set and a full decision outbox grow the record by {growth} \
+             bytes, which exceeds the {AGENT_RUN_STATE_GROWTH_RESERVE_BYTES} byte reserve: a \
+             run admitted at the bound could be refused a transition over telemetry"
+        );
+    }
+
+    /// The interception door leaves the owed decision outbox's bound free.
+    ///
+    /// The door prices delegations and workflow invocations against the
+    /// materialized bound, and the seal adds the turn's decision events after
+    /// the bounds check. A door that could spend the record up to the bound
+    /// would leave a full outbox nowhere to land.
+    #[test]
+    fn the_coordination_door_holds_the_decision_outbox_bound_back() {
+        let (run, _baseline, _scope) = maximal_working_set();
+        let size = run.materialized_size_bytes();
+        assert!(
+            size + AGENT_RUN_DECISION_OUTBOX_MAX_BYTES < AGENT_RUN_MATERIALIZED_MAX_BYTES,
+            "the fixture must sit below the door's ceiling, or the headroom saturates"
+        );
+
+        assert_eq!(
+            run.coordination_door_headroom() + size + AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+            AGENT_RUN_MATERIALIZED_MAX_BYTES,
+            "the door may spend everything below the bound except the outbox's room"
         );
     }
 

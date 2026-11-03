@@ -135,8 +135,48 @@ pub const AGENT_RUN_SESSION_OUTBOX_CAPACITY: usize = 32;
 /// drops its *oldest unflushed* event and counts the drop, because a
 /// transition that failed over telemetry would make observability a
 /// correctness input. Drops are visible through
-/// [`AgentLoopState::decision_drops`].
+/// [`AgentLoopState::decision_drops`]. The ring is bounded by bytes as well,
+/// at [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`], and whichever bound an event
+/// would cross first is the one that drops.
 pub const AGENT_RUN_DECISION_OUTBOX_CAPACITY: usize = 32;
+
+/// Most bytes the decision events a run owes its sink may hold, summed over
+/// each owed event's serialized `serde_json` length.
+///
+/// The count bound alone does not bound the record. Under maximal
+/// identifiers one event is about 8.5 KiB, so a full ring of
+/// [`AGENT_RUN_DECISION_OUTBOX_CAPACITY`] events, which is what a sink that
+/// stays down leaves, would be over 270 KiB, past the run's materialized
+/// bound. A decision whose event would cross either bound drops the oldest
+/// owed events until it fits, counting each drop. An event larger than this
+/// bound on its own is dropped and counted instead, its sequence consumed,
+/// so a replay reader sees the hole.
+///
+/// The bound lives in the run's growth reserve, not in its admission budget.
+/// A transition checks the run's bounds *before* the participant's seal
+/// commits the decision events it queued, so a persisted record can exceed
+/// what that check measured by the events sealed after it. That is safe
+/// because
+/// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`](crate::AGENT_RUN_STATE_GROWTH_RESERVE_BYTES)
+/// holds the maximal one-turn working set *and* a full outbox at this bound:
+/// a run admitted at its budget still fits
+/// [`AGENT_RUN_MATERIALIZED_MAX_BYTES`](crate::AGENT_RUN_MATERIALIZED_MAX_BYTES)
+/// with its outbox full, and is never refused a transition over telemetry
+/// ([specification 17.1](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Sized by measurement on 2026-11-03, at `f3e7653`, by
+/// `the_growth_reserve_covers_the_working_set_and_a_full_decision_outbox`.
+/// The maximal working set grows the record by 89538 bytes. One maximal
+/// event, with maximal identifiers and goal, is 8726 bytes. The former 96 KiB
+/// reserve left 8766 bytes of slack: 40 bytes over one event, and short of
+/// one once the outbox's own field names are counted. So, by the owner's
+/// ruling, the reserve and the materialized bound both rose by 32 KiB,
+/// keeping the admission budget at 80 KiB. The outbox takes 40 KiB of the
+/// 128 KiB reserve, room for four maximal events: 89538 + 40960, plus the
+/// outbox's own field names, separators and counters (at most 131 bytes),
+/// fits 131072. The proof ends its fill owing four maximal events, 34904
+/// bytes, with the record grown by 124509.
+pub const AGENT_RUN_DECISION_OUTBOX_MAX_BYTES: usize = 40 * 1024;
 
 /// Most settled memory-promotion receipts a run's loop state retains.
 ///
@@ -383,9 +423,9 @@ pub struct AgentLoopState {
     /// settle pass after each transition commits
     /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md),
     /// [17.13](../../../docs/plans/rakka-agent/spec.md)). Populated only when
-    /// the run entity is wired with a decision-event sink; a bounded ring, so
-    /// overflow drops the oldest owed event rather than failing the
-    /// transition.
+    /// the run entity is wired with a decision-event sink; a ring bounded by
+    /// count and by bytes, so overflow drops the oldest owed event rather
+    /// than failing the transition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     decision_outbox: Vec<AgentDecisionEvent>,
     /// How many decision events this run has assigned a sequence, so an
@@ -528,6 +568,14 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+/// The bytes one owed decision event adds to the run's serialized record,
+/// as [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`] counts them. An event that
+/// cannot be encoded could not be persisted either, so it measures as too
+/// large to keep.
+fn encoded_len(event: &AgentDecisionEvent) -> usize {
+    serde_json::to_vec(event).map_or(usize::MAX, |bytes| bytes.len())
+}
+
 impl AgentLoopState {
     /// The loop state of a run that has just accepted its assignment.
     #[must_use]
@@ -644,17 +692,31 @@ impl AgentLoopState {
     /// whose derived identity is already owed is the same decision recorded
     /// again by a re-driven transition, and is skipped without a sequence.
     ///
-    /// The outbox is a bounded ring: a decision that would cross the bound
-    /// drops the oldest owed event and counts the drop, never failing the
-    /// transition — telemetry is not a correctness input. A draft whose
-    /// derived identity could not be formed is dropped and counted the same
-    /// way. Either way the sequence is *consumed*, so the loss leaves a hole a
-    /// replay can see. A drop that silently reused its sequence would hand the
-    /// sink a contiguous stream missing an event, which is precisely the
-    /// silent gap [specification 17.13](../../../docs/plans/rakka-agent/spec.md)
+    /// The outbox is a bounded ring, bounded by count
+    /// ([`AGENT_RUN_DECISION_OUTBOX_CAPACITY`]) and by serialized bytes
+    /// ([`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`]): a decision that would cross
+    /// either bound drops the oldest owed events until it fits and counts each
+    /// drop, never failing the transition — telemetry is not a correctness
+    /// input. An event larger than the byte bound on its own, and a draft
+    /// whose derived identity could not be formed, are dropped and counted the
+    /// same way. Either way the sequence is *consumed*, so the loss leaves a
+    /// hole a replay can see. A drop that silently reused its sequence would
+    /// hand the sink a contiguous stream missing an event, which is precisely
+    /// the silent gap [specification 17.13](../../../docs/plans/rakka-agent/spec.md)
     /// forbids a replay cursor to cross.
     pub(crate) fn commit_decisions(&mut self, vocabulary: AgentDecisionEventVocabulary) {
-        for pending in std::mem::take(&mut self.pending_decisions.0) {
+        let pending = std::mem::take(&mut self.pending_decisions.0);
+        if pending.is_empty() {
+            return;
+        }
+        // Summed once per commit, then kept current as events leave and
+        // join, rather than re-summed for every event the commit adds.
+        let mut owed_bytes = self
+            .decision_outbox
+            .iter()
+            .map(encoded_len)
+            .fold(0_usize, usize::saturating_add);
+        for pending in pending {
             if !vocabulary.writes(pending.kind()) {
                 continue;
             }
@@ -673,13 +735,26 @@ impl AgentLoopState {
             {
                 continue;
             }
-            while self.decision_outbox.len() >= AGENT_RUN_DECISION_OUTBOX_CAPACITY {
-                self.decision_outbox.remove(0);
-                self.decision_drops = self.decision_drops.saturating_add(1);
-            }
+            // Stamped before it is measured: the sequence is part of the bytes
+            // the record will hold.
             let sequence = self.decision_sequence.saturating_add(1);
             event.stamp(sequence, vocabulary.schema_version());
             self.decision_sequence = sequence;
+            let size = encoded_len(&event);
+            if size > AGENT_RUN_DECISION_OUTBOX_MAX_BYTES {
+                // Evicting every owed event would still not make room.
+                self.decision_drops = self.decision_drops.saturating_add(1);
+                continue;
+            }
+            while !self.decision_outbox.is_empty()
+                && (self.decision_outbox.len() >= AGENT_RUN_DECISION_OUTBOX_CAPACITY
+                    || owed_bytes.saturating_add(size) > AGENT_RUN_DECISION_OUTBOX_MAX_BYTES)
+            {
+                let evicted = self.decision_outbox.remove(0);
+                owed_bytes = owed_bytes.saturating_sub(encoded_len(&evicted));
+                self.decision_drops = self.decision_drops.saturating_add(1);
+            }
+            owed_bytes = owed_bytes.saturating_add(size);
             self.decision_outbox.push(*event);
         }
     }
