@@ -702,6 +702,18 @@ impl AgentRun {
         self.binding.task()
     }
 
+    /// Whether the run is winding down: a terminal reason is recorded, or a
+    /// cancellation is in progress.
+    ///
+    /// This is the one statement of the predicate `settle_run_disposition`
+    /// applies, and the decision stream's `winding-down` wait reads it too, so
+    /// the two cannot drift apart. A terminal reason is never cleared, so once
+    /// true it stays true for the rest of the run — through a rest in
+    /// `WaitingForReconciliation` and back.
+    pub(crate) fn winding_down(&self) -> bool {
+        self.terminal_reason.is_some() || self.status == AgentRunStatus::Cancelling
+    }
+
     /// Whether the run may perform another bounded loop transition right now.
     ///
     /// This is the authoritative crank condition, and it is deliberately a
@@ -5215,8 +5227,7 @@ fn settle_run_disposition(
         return Ok(());
     }
 
-    let winding_down = run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling;
-    if winding_down {
+    if run.winding_down() {
         // The quiesce condition spans the subtree ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
         // a created child whose terminal outcome has not returned is a
         // started consequential effect, so the parent stays `Cancelling`
@@ -7167,17 +7178,105 @@ impl AgentExchangeParticipant for AgentRunParticipant {
     /// participant's vocabulary — or discards them when no sink is wired, so
     /// an unwired run records nothing. Every write path seals, so a decision
     /// queued by a transition the entity's own commands drive, by an accepted
-    /// exchange, or by a settled reply is recorded alike. The drafts were
-    /// assembled when they were queued, so the commit needs no scope.
-    fn seal(&self, _before: &Self::State, after: &mut Self::State, _now: AgentTimestampMillis) {
+    /// exchange, or by a settled reply is recorded alike.
+    ///
+    /// Before the commit it derives the waits the write leaves the run in
+    /// that `before` did not show (`entered_waits`), and queues them after
+    /// the transition's own drafts, assembled from `after`'s loop state. A
+    /// wait is a fact about the record, not about the site that rested it,
+    /// so no turn-rest site records one.
+    fn seal(&self, before: &Self::State, after: &mut Self::State, now: AgentTimestampMillis) {
+        let Some(vocabulary) = self.decisions else {
+            if let Some(run) = after.run.as_mut() {
+                run.loop_state.discard_pending_decisions();
+            }
+            return;
+        };
+        let waits = entered_waits(before, after);
         let Some(run) = after.run.as_mut() else {
             return;
         };
-        match self.decisions {
-            Some(vocabulary) => run.loop_state.commit_decisions(vocabulary),
-            None => run.loop_state.discard_pending_decisions(),
+        for wait in waits {
+            run.loop_state.queue_decision(&after.scope, wait, now);
+        }
+        run.loop_state.commit_decisions(vocabulary);
+    }
+}
+
+/// The waits `after` shows that `before` did not, as `wait` drafts in the
+/// order the run records them: a budget top-up, a fan-in or a handoff
+/// awaiting its target, then the wind-down (issue #119, ask 4).
+///
+/// Each is recorded only by the transition that leaves the run in it having
+/// started outside it, so a settle pass that re-rests the same wait records
+/// nothing, and none is recorded when `after` is terminal: a transition that
+/// ends the run records the end alone. Every draft carries `after`'s status.
+///
+/// No slot comes from a new durable field (a `bc0c224` writer would drop
+/// one):
+/// - a top-up is named by its own request sequence, which counts the run's
+///   top-ups;
+/// - the wind-down happens once per run, because a terminal reason is never
+///   cleared;
+/// - a fan-in or handoff entry is named by the run's decision sequence as it
+///   stood before this write committed. That separates two entries in one
+///   turn: each entry's own wait advances the sequence, so a later entry
+///   reads a larger one.
+fn entered_waits(before: &AgentRunState, after: &AgentRunState) -> Vec<AgentDecisionDraft> {
+    let Some(run) = after.run.as_ref() else {
+        return Vec::new();
+    };
+    if run.status.is_terminal() {
+        return Vec::new();
+    }
+    let prior = before.run.as_ref();
+    let loop_state = &run.loop_state;
+    // Read before the seal commits: unique per entry.
+    let entry = loop_state.decision_sequence();
+    let wait = |reason: &str, slot: String| {
+        AgentDecisionDraft::new(
+            AgentDecisionKind::Wait,
+            AgentDecisionSource::DeterministicPolicy,
+            slot,
+        )
+        .with_run_status(run.status)
+        .with_reason_code(reason)
+    };
+    let mut waits = Vec::new();
+
+    if let Some(pending) = loop_state.pending_top_up() {
+        let held = prior
+            .and_then(|prior| prior.loop_state.pending_top_up())
+            .map(|prior| prior.sequence);
+        if held != Some(pending.sequence) {
+            waits.push(wait(
+                "budget-top-up",
+                format!("wait-top-up-{}", pending.sequence),
+            ));
         }
     }
+
+    if loop_state.phase() == AgentLoopPhase::AwaitingChildren {
+        let rested = prior.is_some_and(|prior| {
+            prior.loop_state.phase() == AgentLoopPhase::AwaitingChildren
+                && prior.loop_state.turn() == loop_state.turn()
+        });
+        if !rested {
+            if loop_state
+                .handoff()
+                .is_some_and(|cell| cell.status.awaits_target())
+            {
+                waits.push(wait("awaiting-handoff", format!("wait-handoff-q{entry}")));
+            } else {
+                waits.push(wait("awaiting-children", format!("wait-children-q{entry}")));
+            }
+        }
+    }
+
+    if run.winding_down() && !prior.is_some_and(AgentRun::winding_down) {
+        waits.push(wait("winding-down", "wait-winding-down".to_string()));
+    }
+    waits
 }
 
 fn unroutable_agent_id() -> AgentId {
@@ -11094,6 +11193,94 @@ mod tests {
         ] {
             assert_eq!(end_kind(status), kind, "{status:?}");
         }
+    }
+
+    /// A turn that enters its fan-in wait, leaves it, and enters it again
+    /// records each entry under its own identity: the slot's ordinal is the
+    /// run's decision sequence before the entering write, which the first
+    /// entry's own wait advanced. A seal that re-rests the wait, or leaves
+    /// it, records nothing.
+    #[test]
+    fn each_fan_in_entry_in_one_turn_records_its_own_wait() {
+        let now = AgentTimestampMillis::new(10);
+        let (scope, loop_state) = segment_mark_fixture();
+        let turn = loop_state.turn();
+        let schema = AgentSchemaRef::new(
+            AgentSchemaId::new("result").expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        );
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("definition").expect("the definition id is valid"),
+            "The wait fixture.",
+            schema.clone(),
+            schema,
+        )
+        .expect("the definition is valid");
+        let mut resting = AgentRunState::unassigned(scope.clone(), now);
+        resting.run = Some(AgentRun {
+            binding: AgentRunBinding::new(scope.clone(), loop_state.task().clone()),
+            generation: AgentAssignmentGeneration::new(1),
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            status: AgentRunStatus::Running,
+            loop_state,
+            terminal_reason: None,
+            settlement: AgentRunSettlementStatus::Owed,
+            accepted_at: now,
+            terminal_at: None,
+        });
+        let participant = AgentRunParticipant {
+            decisions: Some(AgentDecisionEventVocabulary::Version1),
+        };
+        let phase = |state: &AgentRunState, phase: AgentLoopPhase| {
+            let mut next = state.clone();
+            next.run_mut()
+                .expect("the run exists")
+                .loop_state
+                .set_phase(phase);
+            next
+        };
+        let seal = |before: &AgentRunState, mut after: AgentRunState| {
+            participant.seal(before, &mut after, now);
+            after
+        };
+        let owed = |state: &AgentRunState| -> Vec<String> {
+            state
+                .loop_state()
+                .expect("the loop exists")
+                .decision_outbox()
+                .iter()
+                .map(|event| event.operation_id.as_str().to_string())
+                .collect()
+        };
+
+        let resting = phase(&resting, AgentLoopPhase::AwaitingTools);
+        let entered = seal(&resting, phase(&resting, AgentLoopPhase::AwaitingChildren));
+        let first = owed(&entered);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].ends_with("/wait-children-q0"), "{first:?}");
+
+        let re_rested = seal(&entered, entered.clone());
+        assert_eq!(owed(&re_rested), first, "a re-rest records nothing");
+        let left = seal(&re_rested, phase(&re_rested, AgentLoopPhase::AwaitingTools));
+        assert_eq!(owed(&left), first, "leaving the wait records nothing");
+
+        let again = seal(&left, phase(&left, AgentLoopPhase::AwaitingChildren));
+        let both = owed(&again);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both[1].ends_with("/wait-children-q1"), "{both:?}");
+        assert_eq!(
+            again
+                .loop_state()
+                .expect("the loop exists")
+                .decision_outbox()
+                .iter()
+                .map(|event| event.turn)
+                .collect::<Vec<_>>(),
+            [turn, turn],
+            "both entries are in one turn"
+        );
     }
 
     /// Queues one draft of `kind` under `slot` on the fixture's loop state.

@@ -1976,15 +1976,29 @@ pub trait AgentExchangeParticipant: Send + Sync + 'static {
 
     /// Seals one write after its transition and before it persists.
     ///
-    /// The host calls it on every path that writes a transition's state —
-    /// [`AgentExchangeHost::initiate`], [`AgentExchangeHost::accept`] and
-    /// [`AgentExchangeHost::settle`] — with `before`, the record state the
-    /// transition started from, and `after`, the state about to be written.
-    /// A rejected transition persists nothing and is never sealed. It exists
-    /// so a participant can finish, once per write and on every path alike,
-    /// work its transitions only queue: the run participant commits the
-    /// decision events its transitions queued. Like every method here it may
-    /// neither perform I/O nor fail. The default does nothing.
+    /// The host calls it on every path that writes a transition's state, with
+    /// `before`, the record state the transition started from, and `after`,
+    /// the transition's state. Where it falls differs by path:
+    ///
+    /// - [`AgentExchangeHost::initiate`]: after the transition and after the
+    ///   exchanges it owes are recorded, immediately before the write.
+    /// - [`AgentExchangeHost::accept`]: immediately after
+    ///   [`Self::apply`], before the journal records the result and before
+    ///   the exchanges the transition owes are recorded. So a sealed accept
+    ///   can still be discarded, when recording an owed exchange is refused,
+    ///   or go unwritten, when the delivery was an unsettleable refusal that
+    ///   owed nothing and left the record, seal included, exactly as it
+    ///   found it.
+    /// - [`AgentExchangeHost::settle`]: after [`Self::settle`] and after the
+    ///   exchanges it owes are recorded, immediately before the write.
+    ///
+    /// A transition rejected before the seal persists nothing and is never
+    /// sealed, and on any path the write that follows can still fail, so a
+    /// seal is never proof that its state persisted. It exists so a
+    /// participant can finish, once per write and on every path alike, work
+    /// its transitions only queue: the run participant commits the decision
+    /// events its transitions queued. Like every method here it may neither
+    /// perform I/O nor fail. The default does nothing.
     fn seal(&self, _before: &Self::State, _after: &mut Self::State, _now: AgentTimestampMillis) {}
 }
 
