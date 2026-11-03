@@ -458,9 +458,10 @@ impl Display for AgentDecisionSource {
 
 /// What a transition asks the loop to record about one decision.
 ///
-/// The loop supplies everything positional — turn, phase, sequence, revisions,
-/// context snapshot, telemetry — when it records the draft, so a call site
-/// states only what it decided and why.
+/// The loop supplies everything positional — turn, phase, revisions, context
+/// snapshot, telemetry — when the draft is queued, and the sequence when the
+/// write that carries it is sealed, so a call site states only what it decided
+/// and why.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentDecisionDraft {
     kind: AgentDecisionKind,
@@ -631,17 +632,18 @@ pub struct AgentDecisionEvent {
 }
 
 impl AgentDecisionEvent {
-    /// Assembles the event the loop owes for one recorded draft.
+    /// Assembles the event the loop owes for one queued draft.
     ///
     /// Everything positional comes from the loop's own durable state; the
     /// operation id is *derived* from the run, the turn, and the draft's slot,
-    /// so a re-driven transition resolves to the same event.
+    /// so a re-driven transition resolves to the same event. The sequence is
+    /// not known yet: the event is unsequenced until [`Self::stamp`] gives it
+    /// one at commit.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn assemble(
         scope: &AgentRunScope,
         task: Option<AgentTaskId>,
         goal: Option<AgentGoalId>,
-        sequence: u64,
         turn: u64,
         phase: AgentLoopPhase,
         definition_revision: AgentRevisionNumber,
@@ -670,7 +672,7 @@ impl AgentDecisionEvent {
             causation_id: AgentCausationId::new(operation_id.as_str()),
             correlation_id: AgentCorrelationId::new(scope.key()),
             operation_id,
-            sequence,
+            sequence: 0,
             turn,
             phase,
             kind: draft.kind,
@@ -688,6 +690,13 @@ impl AgentDecisionEvent {
             telemetry,
             occurred_at,
         })
+    }
+
+    /// Gives a committed event its per-run sequence and the schema version
+    /// it is written under.
+    pub(crate) fn stamp(&mut self, sequence: u64, schema_version: StateSchemaVersion) {
+        self.sequence = sequence;
+        self.schema_version = schema_version;
     }
 }
 

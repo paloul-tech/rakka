@@ -113,17 +113,17 @@ use crate::observability::{
     agent_linked_telemetry_context, agent_span_link, record_agent_domain_counter,
     record_agent_domain_duration, record_agent_domain_gauge, record_agent_domain_histogram,
     record_unsettleable_exchanges, AgentDecisionDraft, AgentDecisionEvent, AgentDecisionEventSink,
-    AgentDecisionKind, AgentDecisionSource, AgentSegmentIdentity, AgentSegmentOperation,
-    AgentSegmentSink, AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT,
-    LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST, METRIC_AGENT_DECISIONS,
-    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_FAN_IN_RESOLUTIONS,
-    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
-    METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION, METRIC_AGENT_RECOVERY_EVENTS,
-    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
-    METRIC_AGENT_TURN_DURATION, METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND,
-    SEGMENT_ATTR_EFFECT_ATTEMPT, SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS,
-    SEGMENT_ATTR_SETTINGS_REVISION,
+    AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionSource, AgentSegmentIdentity,
+    AgentSegmentOperation, AgentSegmentSink, AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT,
+    LINK_KIND_PARKED_CHECKPOINT, LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
+    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
+    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION,
+    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_TURN_DURATION,
+    METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND, SEGMENT_ATTR_EFFECT_ATTEMPT,
+    SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS, SEGMENT_ATTR_SETTINGS_REVISION,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -2618,7 +2618,6 @@ fn advance_once(
     state: &mut AgentRunState,
     policies: &AgentEffectPolicies,
     session_memory: bool,
-    decision_events: bool,
     delegation: Option<&crate::delegation::AgentRunDelegationConfig>,
     workflow: Option<&crate::workflow_tool::AgentRunWorkflowConfig>,
     now: AgentTimestampMillis,
@@ -2648,31 +2647,17 @@ fn advance_once(
     }
 
     let mut owed = match run.loop_state.phase() {
-        AgentLoopPhase::PreparingContext => prepare_context(
-            state,
-            &scope,
-            policies,
-            session_memory,
-            decision_events,
-            now,
-        )
-        .map(|()| Vec::new()),
-        AgentLoopPhase::EvaluatingModelOutput => evaluate_model_output(
-            state,
-            &scope,
-            policies,
-            decision_events,
-            delegation,
-            workflow,
-            now,
-        )
-        .map(|()| Vec::new()),
+        AgentLoopPhase::PreparingContext => {
+            prepare_context(state, &scope, policies, session_memory, now).map(|()| Vec::new())
+        }
+        AgentLoopPhase::EvaluatingModelOutput => {
+            evaluate_model_output(state, &scope, policies, delegation, workflow, now)
+                .map(|()| Vec::new())
+        }
         AgentLoopPhase::RecordingTurn => {
             record_turn(state, &scope, session_memory, now).map(|()| Vec::new())
         }
-        AgentLoopPhase::DecidingContinuation => {
-            decide_continuation(state, &scope, decision_events, now)
-        }
+        AgentLoopPhase::DecidingContinuation => decide_continuation(state, &scope, now),
         // `can_advance` already excluded these.
         AgentLoopPhase::AwaitingModel
         | AgentLoopPhase::AwaitingTools
@@ -2705,7 +2690,6 @@ fn prepare_context(
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
     session_memory: bool,
-    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let turn = {
@@ -2765,8 +2749,8 @@ fn prepare_context(
     // The opening decision: the run's deterministic policy decided to start
     // consulting the model. Later iterations are the *model's* continuation
     // decision and are recorded where it is made, in `decide_continuation`.
-    if decision_events && turn == 1 {
-        run.loop_state.record_decision(
+    if turn == 1 {
+        run.loop_state.queue_decision(
             scope,
             AgentDecisionDraft::new(
                 AgentDecisionKind::Continue,
@@ -3288,7 +3272,6 @@ fn evaluate_model_output(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
-    decision_events: bool,
     delegation: Option<&crate::delegation::AgentRunDelegationConfig>,
     workflow: Option<&crate::workflow_tool::AgentRunWorkflowConfig>,
     now: AgentTimestampMillis,
@@ -3970,19 +3953,16 @@ fn evaluate_model_output(
 
     // The model's decision, recorded in the same compare-and-set that commits
     // the fan-out it selected ([specification 17.7]).
-    if decision_events {
-        let run = state.run_mut()?;
-        run.loop_state.record_decision(
-            scope,
-            AgentDecisionDraft::new(
-                AgentDecisionKind::CallTools,
-                AgentDecisionSource::Model,
-                "tools",
-            )
-            .with_selected_tools(selected),
-            now,
-        );
-    }
+    state.run_mut()?.loop_state.queue_decision(
+        scope,
+        AgentDecisionDraft::new(
+            AgentDecisionKind::CallTools,
+            AgentDecisionSource::Model,
+            "tools",
+        )
+        .with_selected_tools(selected),
+        now,
+    );
 
     // A tool the deployment marked checkpoint- or authorization-required is not
     // dispatched: the run opens a checkpoint of the matching kind bound to the
@@ -4188,7 +4168,6 @@ fn record_turn(
 fn decide_continuation(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
-    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let proposed = state
@@ -4203,17 +4182,15 @@ fn decide_continuation(
         // iteration and stops the run with a structured reason if the ceiling is
         // reached.
         let run = state.run_mut()?;
-        if decision_events {
-            run.loop_state.record_decision(
-                scope,
-                AgentDecisionDraft::new(
-                    AgentDecisionKind::Continue,
-                    AgentDecisionSource::Model,
-                    "iterate",
-                ),
-                now,
-            );
-        }
+        run.loop_state.queue_decision(
+            scope,
+            AgentDecisionDraft::new(
+                AgentDecisionKind::Continue,
+                AgentDecisionSource::Model,
+                "iterate",
+            ),
+            now,
+        );
         run.loop_state.clear_turn();
         run.loop_state.begin_turn(None);
         run.status = AgentRunStatus::Running;
@@ -4224,17 +4201,15 @@ fn decide_continuation(
     let (proposal, envelope) = build_proposal(state, scope, content, now)?;
 
     let run = state.run_mut()?;
-    if decision_events {
-        run.loop_state.record_decision(
-            scope,
-            AgentDecisionDraft::new(
-                AgentDecisionKind::SubmitResult,
-                AgentDecisionSource::Model,
-                "proposal",
-            ),
-            now,
-        );
-    }
+    run.loop_state.queue_decision(
+        scope,
+        AgentDecisionDraft::new(
+            AgentDecisionKind::SubmitResult,
+            AgentDecisionSource::Model,
+            "proposal",
+        ),
+        now,
+    );
     run.loop_state.clear_turn();
     run.loop_state.set_proposal(proposal);
     // The run is not *waiting on an effect*, a timer, or a human: it is waiting
@@ -6044,7 +6019,6 @@ fn evaluate_goal(
     state: &mut AgentRunState,
     evaluation: crate::evaluation::AgentGoalEvaluationRequest,
     policies: &AgentEffectPolicies,
-    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     use crate::evaluation::AgentGoalEvaluationMethod;
@@ -6109,17 +6083,15 @@ fn evaluate_goal(
         let effect_id = effect.effect_id.clone();
         let checkpoint_owed = effect.checkpoint_required;
         run.loop_state.record_effect(effect)?;
-        if decision_events {
-            run.loop_state.record_decision(
-                &scope,
-                AgentDecisionDraft::new(
-                    AgentDecisionKind::Evaluate,
-                    AgentDecisionSource::DeterministicPolicy,
-                    "goal-evaluation",
-                ),
-                now,
-            );
-        }
+        run.loop_state.queue_decision(
+            &scope,
+            AgentDecisionDraft::new(
+                AgentDecisionKind::Evaluate,
+                AgentDecisionSource::DeterministicPolicy,
+                "goal-evaluation",
+            ),
+            now,
+        );
         checkpoint_owed.then_some(effect_id)
     };
     if let Some(effect_id) = checkpoint_owed {
@@ -6467,9 +6439,24 @@ fn settle_proposal(
 /// The domain half of the run entity.
 ///
 /// It supplies bounded, pure transitions and nothing else; the choreography
-/// substrate owns durability, deduplication, re-drive, and routing.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AgentRunParticipant;
+/// substrate owns durability, deduplication, re-drive, and routing. The one
+/// thing it holds is how its seal treats the decision events the run's
+/// transitions queue: the default records none, as a run with no
+/// decision-event sink does, and the run entity's builders set it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentRunParticipant {
+    /// The vocabulary the seal commits queued decisions under, or `None`
+    /// when no sink is wired and the seal discards them.
+    decisions: Option<AgentDecisionEventVocabulary>,
+}
+
+impl AgentRunParticipant {
+    /// Sets how the seal treats queued decisions: commit them under the
+    /// vocabulary, or discard them when there is none.
+    pub(crate) fn set_decisions(&mut self, vocabulary: Option<AgentDecisionEventVocabulary>) {
+        self.decisions = vocabulary;
+    }
+}
 
 impl AgentExchangeParticipant for AgentRunParticipant {
     type State = AgentRunState;
@@ -6756,6 +6743,22 @@ impl AgentExchangeParticipant for AgentRunParticipant {
         }
         owed_run_exchanges(state, now).unwrap_or_default()
     }
+
+    /// Commits the decision events the write's transitions queued, under the
+    /// participant's vocabulary — or discards them when no sink is wired, so
+    /// an unwired run records nothing. Every write path seals, so a decision
+    /// queued by a transition the entity's own commands drive, by an accepted
+    /// exchange, or by a settled reply is recorded alike. The drafts were
+    /// assembled when they were queued, so the commit needs no scope.
+    fn seal(&self, _before: &Self::State, after: &mut Self::State, _now: AgentTimestampMillis) {
+        let Some(run) = after.run.as_mut() else {
+            return;
+        };
+        match self.decisions {
+            Some(vocabulary) => run.loop_state.commit_decisions(vocabulary),
+            None => run.loop_state.discard_pending_decisions(),
+        }
+    }
 }
 
 fn unroutable_agent_id() -> AgentId {
@@ -6783,6 +6786,8 @@ where
     policies: AgentEffectPolicies,
     memory: Option<AgentRunMemory>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    /// Which decision kinds the run writes once a sink is wired.
+    decision_vocabulary: AgentDecisionEventVocabulary,
     segments: Option<Arc<dyn AgentSegmentSink>>,
     /// The checkpoint the command in flight would resolve, when it is a
     /// resolution command. Set by `apply`, read by `apply_command`.
@@ -6827,7 +6832,7 @@ where
     pub fn new(scope: AgentRunScope, store: Store, effects: Effects) -> Self {
         let host = AgentExchangeHost::new(
             AgentEntityAddress::Run(scope.clone()),
-            AgentRunParticipant,
+            AgentRunParticipant::default(),
             store,
         );
         Self {
@@ -6837,6 +6842,7 @@ where
             policies: AgentEffectPolicies::default(),
             memory: None,
             decisions: None,
+            decision_vocabulary: AgentDecisionEventVocabulary::default(),
             segments: None,
             resolving: None,
             committed: None,
@@ -6886,7 +6892,36 @@ where
     #[must_use]
     pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
         self.decisions = Some(sink);
+        self.sync_decision_participant();
         self
+    }
+
+    /// Selects which decision kinds a wired run writes
+    /// ([`AgentDecisionEventVocabulary`]); the default is
+    /// [`AgentDecisionEventVocabulary::Version1`], the kinds an older reader
+    /// decodes.
+    ///
+    /// A decision of a kind the vocabulary does not write is discarded before
+    /// it is given a sequence, so the stream it leaves has no hole. The
+    /// vocabulary alone records nothing: a run with no sink
+    /// ([`Self::with_decision_events`]) records no decision, whatever the
+    /// vocabulary. The two builders may be called in either order.
+    #[must_use]
+    pub fn with_decision_event_vocabulary(
+        mut self,
+        vocabulary: AgentDecisionEventVocabulary,
+    ) -> Self {
+        self.decision_vocabulary = vocabulary;
+        self.sync_decision_participant();
+        self
+    }
+
+    /// Tells the participant the host drives how its seal treats queued
+    /// decisions: commit them under the vocabulary when a sink is wired,
+    /// discard them otherwise.
+    fn sync_decision_participant(&mut self) {
+        let decisions = self.decisions.as_ref().map(|_| self.decision_vocabulary);
+        self.host.participant_mut().set_decisions(decisions);
     }
 
     /// Closes bounded operation segments into `sink`
@@ -7448,9 +7483,8 @@ where
                 evaluation,
             } => {
                 let policies = self.policies.clone();
-                let decision_events = self.decisions.is_some();
                 self.transition(now, records_decision, move |state| {
-                    evaluate_goal(state, *evaluation, &policies, decision_events, now)?;
+                    evaluate_goal(state, *evaluation, &policies, now)?;
                     Ok(operation_id)
                 })
                 .await?
@@ -7956,7 +7990,6 @@ where
             let mut rejection = None;
             let policies = self.policies.clone();
             let session_memory = self.memory.is_some();
-            let decision_events = self.decisions.is_some();
             let delegation = self.delegation.clone();
             let workflow = self.workflow_tools.clone();
             let phase = self
@@ -8010,7 +8043,6 @@ where
                         state,
                         &policies,
                         session_memory,
-                        decision_events,
                         delegation.as_ref(),
                         workflow.as_ref(),
                         now,
@@ -9156,6 +9188,20 @@ where
         self
     }
 
+    /// Selects which decision kinds the hosted run writes, delegating to the
+    /// wrapped store
+    /// ([`AgentRunEntityStore::with_decision_event_vocabulary`]).
+    #[must_use]
+    pub fn with_decision_event_vocabulary(
+        mut self,
+        vocabulary: AgentDecisionEventVocabulary,
+    ) -> Self {
+        self.entity = self
+            .entity
+            .map(|entity| entity.with_decision_event_vocabulary(vocabulary));
+        self
+    }
+
     /// Closes bounded operation segments into `sink`, delegating to the
     /// wrapped store so a sharded entity closes the same segments a
     /// directly-driven one does.
@@ -9284,6 +9330,7 @@ pub struct AgentRunEntityShardingSettings {
     clock: AgentRunClock,
     metrics: Arc<dyn MetricsRecorder>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    decision_vocabulary: AgentDecisionEventVocabulary,
     segments: Option<Arc<dyn AgentSegmentSink>>,
     memory: Option<AgentRunMemory>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
@@ -9316,6 +9363,7 @@ impl AgentRunEntityShardingSettings {
             clock: system_run_clock(),
             metrics: Arc::new(NoopMetricsRecorder),
             decisions: None,
+            decision_vocabulary: AgentDecisionEventVocabulary::default(),
             segments: None,
             memory: None,
             delegation: None,
@@ -9418,6 +9466,18 @@ impl AgentRunEntityShardingSettings {
     #[must_use]
     pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
         self.decisions = Some(sink);
+        self
+    }
+
+    /// Selects which decision kinds every hosted run writes once a sink is
+    /// wired ([`AgentRunEntityStore::with_decision_event_vocabulary`]); the
+    /// default is [`AgentDecisionEventVocabulary::Version1`].
+    #[must_use]
+    pub fn with_decision_event_vocabulary(
+        mut self,
+        vocabulary: AgentDecisionEventVocabulary,
+    ) -> Self {
+        self.decision_vocabulary = vocabulary;
         self
     }
 
@@ -9576,7 +9636,8 @@ where
         settings.schema_policy,
         settings.effect_policies.clone(),
     )
-    .with_metrics(settings.metrics.clone());
+    .with_metrics(settings.metrics.clone())
+    .with_decision_event_vocabulary(settings.decision_vocabulary);
     if let Some(decisions) = settings.decisions.clone() {
         entity = entity.with_decision_events(decisions);
     }
@@ -10532,7 +10593,7 @@ mod tests {
         let (scope, mut loop_state) = segment_mark_fixture();
 
         for slot in 0..crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY {
-            assert!(loop_state.record_decision(
+            loop_state.queue_decision(
                 &scope,
                 AgentDecisionDraft::new(
                     AgentDecisionKind::Continue,
@@ -10540,8 +10601,14 @@ mod tests {
                     format!("fill-{slot}"),
                 ),
                 now,
-            ));
+            );
         }
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+        assert_eq!(
+            loop_state.decision_sequence(),
+            crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY as u64,
+            "every fill decision was newly owed"
+        );
         let saturated = loop_state.decision_outbox().len();
         assert_eq!(
             saturated,
@@ -10552,7 +10619,7 @@ mod tests {
         // The transition under measurement: it commits two decisions.
         let marks = segment_marks(&loop_state);
         for slot in ["committed-a", "committed-b"] {
-            assert!(loop_state.record_decision(
+            loop_state.queue_decision(
                 &scope,
                 AgentDecisionDraft::new(
                     AgentDecisionKind::CallTools,
@@ -10560,8 +10627,14 @@ mod tests {
                     slot,
                 ),
                 now,
-            ));
+            );
         }
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+        assert_eq!(
+            loop_state.decision_sequence(),
+            marks.decision_sequence + 2,
+            "both of the transition's decisions were newly owed"
+        );
 
         assert_eq!(
             loop_state.decision_outbox().len(),
@@ -10585,6 +10658,153 @@ mod tests {
             0,
             "a prefix-length diff reports an empty transition here"
         );
+    }
+
+    /// Queues one draft of `kind` under `slot` on the fixture's loop state.
+    fn queue(
+        loop_state: &mut AgentLoopState,
+        scope: &AgentRunScope,
+        kind: AgentDecisionKind,
+        slot: &str,
+    ) {
+        loop_state.queue_decision(
+            scope,
+            AgentDecisionDraft::new(kind, AgentDecisionSource::DeterministicPolicy, slot),
+            AgentTimestampMillis::new(1),
+        );
+    }
+
+    /// The first vocabulary discards a kind an older reader cannot decode
+    /// *before* it is given a sequence, so the stream it writes has no hole
+    /// and no drop is counted.
+    #[test]
+    fn version_one_discards_a_new_kind_without_consuming_a_sequence() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        queue(&mut loop_state, &scope, AgentDecisionKind::Continue, "a");
+        queue(
+            &mut loop_state,
+            &scope,
+            AgentDecisionKind::ResolveCheckpoint,
+            "b",
+        );
+        queue(&mut loop_state, &scope, AgentDecisionKind::Continue, "c");
+
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+
+        let outbox = loop_state.decision_outbox();
+        assert_eq!(
+            outbox.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![AgentDecisionKind::Continue, AgentDecisionKind::Continue]
+        );
+        assert_eq!(
+            outbox
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(loop_state.decision_sequence(), 2);
+        assert_eq!(loop_state.decision_drops(), 0);
+
+        // The commit drained the list: a later commit under the wider
+        // vocabulary finds nothing left to write.
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version2);
+        assert_eq!(loop_state.decision_outbox().len(), 2);
+        assert_eq!(loop_state.decision_sequence(), 2);
+    }
+
+    /// A written kind whose identity cannot be formed is lost, and the loss
+    /// consumes its sequence so a replay sees the hole.
+    #[test]
+    fn an_unformable_draft_of_a_written_kind_consumes_a_sequence_and_counts_a_drop() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        queue(&mut loop_state, &scope, AgentDecisionKind::Continue, "");
+        queue(&mut loop_state, &scope, AgentDecisionKind::Continue, "ok");
+
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+
+        assert_eq!(
+            loop_state
+                .decision_outbox()
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(loop_state.decision_sequence(), 2);
+        assert_eq!(loop_state.decision_drops(), 1);
+    }
+
+    /// An unformable draft of a kind the vocabulary does not write was never
+    /// going to be written, so it costs neither a sequence nor a drop.
+    #[test]
+    fn an_unformable_draft_of_an_unwritten_kind_consumes_nothing() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        queue(&mut loop_state, &scope, AgentDecisionKind::Cancel, "");
+
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+
+        assert!(loop_state.decision_outbox().is_empty());
+        assert_eq!(loop_state.decision_sequence(), 0);
+        assert_eq!(loop_state.decision_drops(), 0);
+    }
+
+    /// A draft is positioned when it is queued: a transition that advances
+    /// the turn after deciding (the `iterate` decision does) still records
+    /// the decision under the turn, phase and context it was made in.
+    #[test]
+    fn a_queued_draft_keeps_the_turn_and_phase_it_was_queued_under() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        loop_state.set_phase(AgentLoopPhase::DecidingContinuation);
+        let context =
+            AgentContextSnapshotRef::for_turn(&scope, 1).expect("the context reference derives");
+        loop_state.set_context_snapshot(context.clone());
+        let turn = loop_state.turn();
+        queue(
+            &mut loop_state,
+            &scope,
+            AgentDecisionKind::Continue,
+            "iterate",
+        );
+
+        loop_state.begin_turn(None);
+        loop_state.set_phase(AgentLoopPhase::AwaitingModel);
+        assert_ne!(
+            loop_state.turn(),
+            turn,
+            "the turn moved, or this proves nothing"
+        );
+        assert_eq!(loop_state.context_snapshot(), None);
+
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version2);
+
+        let event = loop_state
+            .decision_outbox()
+            .first()
+            .expect("the draft was committed");
+        assert_eq!(event.turn, turn);
+        assert_eq!(event.phase, AgentLoopPhase::DecidingContinuation);
+        assert_eq!(event.context_snapshot, Some(context));
+    }
+
+    /// The draft list is transient: it never counts in equality — so the
+    /// host's unchanged-state comparison and `unchanged_by` behave as before
+    /// — and it is never serialized.
+    #[test]
+    fn pending_drafts_never_count_in_equality() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        let before = loop_state.clone();
+        queue(&mut loop_state, &scope, AgentDecisionKind::Continue, "a");
+
+        assert_eq!(before, loop_state);
+        assert_eq!(
+            serde_json::to_value(&before).expect("the state serializes"),
+            serde_json::to_value(&loop_state).expect("the state serializes"),
+            "a queued draft is never serialized"
+        );
+
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+        assert_ne!(before, loop_state, "a committed draft does count");
     }
 
     /// A transition that retires one checkpoint and opens another must still
@@ -11052,7 +11272,8 @@ mod tests {
         let sink: Arc<dyn AgentDecisionEventSink> = Arc::new(InMemoryAgentDecisionEventSink::new());
         let settings = AgentRunEntityShardingSettings::new(agent_run_entity_type_key())
             .with_metrics(metrics.clone())
-            .with_decision_events(sink);
+            .with_decision_events(sink)
+            .with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2);
 
         let scope = AgentRunScope::new(
             TenantId::new("acme"),
@@ -11071,6 +11292,13 @@ mod tests {
         assert!(
             inner.decisions.is_some(),
             "the settings' decision sink is wired onto the hosted run"
+        );
+        assert_eq!(
+            *inner.host.participant_mut(),
+            AgentRunParticipant {
+                decisions: Some(AgentDecisionEventVocabulary::Version2)
+            },
+            "the settings' vocabulary reaches the participant the host seals with"
         );
         assert!(
             Arc::ptr_eq(&inner.metrics, &metrics),
@@ -11092,9 +11320,66 @@ mod tests {
             unwired.decisions.is_none(),
             "an unwired deployment records no decision events"
         );
+        assert_eq!(
+            *unwired.host.participant_mut(),
+            AgentRunParticipant::default(),
+            "an unwired participant discards what its transitions queue"
+        );
         assert!(
             !Arc::ptr_eq(&unwired.metrics, &metrics),
             "an unwired deployment measures through the no-op default"
+        );
+    }
+
+    /// The participant commits queued decisions only once a sink is wired,
+    /// under the store's vocabulary, whichever builder ran first.
+    #[test]
+    fn the_run_participant_follows_the_sink_and_the_vocabulary_in_either_order() {
+        use std::sync::Arc;
+
+        use rakka_persistence::InMemoryDurableStateStore;
+
+        use crate::effect::InMemoryAgentRunEffectSink;
+        use crate::observability::InMemoryAgentDecisionEventSink;
+
+        let (scope, _) = segment_mark_fixture();
+        let store = || {
+            AgentRunEntityStore::new(
+                scope.clone(),
+                InMemoryDurableStateStore::<AgentRunState>::new(),
+                InMemoryAgentRunEffectSink::new(),
+            )
+        };
+        let sink = || -> Arc<dyn AgentDecisionEventSink> {
+            Arc::new(InMemoryAgentDecisionEventSink::new())
+        };
+        let wired = AgentRunParticipant {
+            decisions: Some(AgentDecisionEventVocabulary::Version2),
+        };
+
+        let mut sink_first = store()
+            .with_decision_events(sink())
+            .with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2);
+        assert_eq!(*sink_first.host.participant_mut(), wired);
+        let mut vocabulary_first = store()
+            .with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2)
+            .with_decision_events(sink());
+        assert_eq!(*vocabulary_first.host.participant_mut(), wired);
+
+        let mut vocabulary_only =
+            store().with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2);
+        assert_eq!(
+            *vocabulary_only.host.participant_mut(),
+            AgentRunParticipant::default(),
+            "a vocabulary without a sink records nothing"
+        );
+        let mut sink_only = store().with_decision_events(sink());
+        assert_eq!(
+            *sink_only.host.participant_mut(),
+            AgentRunParticipant {
+                decisions: Some(AgentDecisionEventVocabulary::Version1)
+            },
+            "a sink alone writes the default vocabulary"
         );
     }
 
@@ -12101,7 +12386,6 @@ mod tests {
             &mut fx.state,
             &AgentEffectPolicies::default(),
             false,
-            false,
             None,
             None,
             now,
@@ -12136,7 +12420,6 @@ mod tests {
             &mut fx.state,
             &AgentEffectPolicies::default(),
             false,
-            false,
             None,
             None,
             now,
@@ -12166,7 +12449,6 @@ mod tests {
         advance_once(
             &mut fx.state,
             &AgentEffectPolicies::default(),
-            false,
             false,
             None,
             None,

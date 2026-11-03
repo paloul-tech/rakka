@@ -660,7 +660,7 @@ fn a_refusal_that_is_not_the_ledgers_answer_keeps_the_exchange_outstanding() {
     };
     use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
 
-    let participant = AgentRunParticipant;
+    let participant = AgentRunParticipant::default();
     let now = AgentTimestampMillis::new(1_752_451_200_000);
 
     for kind in [

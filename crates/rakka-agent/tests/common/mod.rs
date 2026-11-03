@@ -861,6 +861,9 @@ pub struct Fixture<
     /// enables it. Absent by default, so the run records no decision events —
     /// the pre-slice-1.13 behavior.
     pub decisions: Option<Arc<dyn rakka_agent::AgentDecisionEventSink>>,
+    /// Which decision kinds the run entity writes once a sink is wired.
+    /// `Version1` by default, the store's own default.
+    pub decision_vocabulary: rakka_agent::AgentDecisionEventVocabulary,
     /// The bounded-segment sink the run entity is wired with, when a test
     /// enables it. Absent by default, so the run closes no segments.
     pub segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
@@ -980,6 +983,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             clock,
             memory: None,
             decisions: None,
+            decision_vocabulary: rakka_agent::AgentDecisionEventVocabulary::Version1,
             segments: None,
             metrics: None,
             delegation: None,
@@ -1028,6 +1032,18 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     ) -> Self {
         self.run_transport.install_decisions(sink.clone());
         self.decisions = Some(sink);
+        self
+    }
+
+    /// Selects which decision kinds the run entity writes, under the same
+    /// every-driver rule as [`Self::with_memory`].
+    #[must_use]
+    pub fn with_decision_event_vocabulary(
+        mut self,
+        vocabulary: rakka_agent::AgentDecisionEventVocabulary,
+    ) -> Self {
+        self.run_transport.install_decision_vocabulary(vocabulary);
+        self.decision_vocabulary = vocabulary;
         self
     }
 
@@ -1344,6 +1360,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         if let Some(decisions) = &self.decisions {
             entity = entity.with_decision_events(decisions.clone());
         }
+        entity = entity.with_decision_event_vocabulary(self.decision_vocabulary);
         if let Some(segments) = &self.segments {
             entity = entity.with_segments(segments.clone());
         }
@@ -1622,6 +1639,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         if let Some(decisions) = &self.decisions {
             entity = entity.with_decision_events(decisions.clone());
         }
+        entity = entity.with_decision_event_vocabulary(self.decision_vocabulary);
         if let Some(segments) = &self.segments {
             entity = entity.with_segments(segments.clone());
         }
@@ -3043,6 +3061,7 @@ impl AuthorityFixture {
         if let Some(decisions) = &self.fx.decisions {
             delivery = delivery.with_decision_events(decisions.clone());
         }
+        delivery = delivery.with_decision_event_vocabulary(self.fx.decision_vocabulary);
         let mut pipeline = AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new(worker_id),
             self.workflow_store.clone(),

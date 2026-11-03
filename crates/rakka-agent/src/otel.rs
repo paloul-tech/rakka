@@ -1438,7 +1438,6 @@ mod tests {
             None,
             None,
             1,
-            1,
             crate::loop_runtime::AgentLoopPhase::DecidingContinuation,
             crate::definition::AgentRevisionNumber::INITIAL,
             crate::definition::AgentRevisionNumber::INITIAL,

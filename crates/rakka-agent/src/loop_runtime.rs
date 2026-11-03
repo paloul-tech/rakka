@@ -95,10 +95,12 @@ use crate::memory::{
     MemoryEntryRole, MemoryError, MemoryOperationId, MemorySequence, SessionMemoryEntry,
 };
 use crate::model::AgentModelTurn;
-use crate::observability::{AgentDecisionDraft, AgentDecisionEvent};
+use crate::observability::{
+    AgentDecisionDraft, AgentDecisionEvent, AgentDecisionEventVocabulary, AgentDecisionKind,
+};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
-    CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION, CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
 };
 use crate::task::{AgentAcceptedResult, AgentContentDigest, AgentSchemaRef, AgentTaskContent};
 
@@ -395,6 +397,13 @@ pub struct AgentLoopState {
     /// requires of telemetry loss.
     #[serde(default, skip_serializing_if = "is_zero")]
     decision_drops: u64,
+    /// The decisions the transition in flight has queued and the seal has not
+    /// yet committed ([`AgentLoopState::queue_decision`],
+    /// [`AgentLoopState::commit_decisions`]). Transient: never serialized, so
+    /// every loaded record starts with an empty list, and never counted in
+    /// equality, so a state comparison sees only what the record persists.
+    #[serde(skip)]
+    pending_decisions: AgentPendingDecisions,
     /// Bounded receipts of settled memory promotions
     /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)):
     /// identities and revisions only, never content. A ring capped at
@@ -478,6 +487,41 @@ pub struct AgentGoalEvaluationCell {
     pub refusal: Option<String>,
 }
 
+/// One decision a transition queued, waiting for the seal to commit it.
+#[derive(Debug, Clone)]
+enum AgentPendingDecision {
+    /// The event, assembled when it was queued and owed only its sequence.
+    Assembled(Box<AgentDecisionEvent>),
+    /// A draft of this kind whose derived identity could not be formed.
+    Unformable(AgentDecisionKind),
+}
+
+impl AgentPendingDecision {
+    /// What the queued decision decides.
+    fn kind(&self) -> AgentDecisionKind {
+        match self {
+            Self::Assembled(event) => event.kind,
+            Self::Unformable(kind) => *kind,
+        }
+    }
+}
+
+/// The decisions the transition in flight has queued, in the order it queued
+/// them.
+///
+/// The list is transient by construction: it is never serialized, and two
+/// lists always compare equal, so the host's unchanged-state comparison and
+/// every other comparison of a loop state behave exactly as they did before
+/// decisions were queued rather than recorded in place.
+#[derive(Debug, Clone, Default)]
+struct AgentPendingDecisions(Vec<AgentPendingDecision>);
+
+impl PartialEq for AgentPendingDecisions {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 /// Whether a defaulted count is zero, so it is omitted from a run's serialized
 /// state until the run actually uses session memory.
 fn is_zero(value: &u64) -> bool {
@@ -525,6 +569,7 @@ impl AgentLoopState {
             decision_outbox: Vec::new(),
             decision_sequence: 0,
             decision_drops: 0,
+            pending_decisions: AgentPendingDecisions::default(),
             memory_promotions: Vec::new(),
             goal_evaluation: None,
             delegations: BTreeMap::new(),
@@ -553,35 +598,29 @@ impl AgentLoopState {
         &self.telemetry
     }
 
-    /// Records one decision the committing transition made
-    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)),
-    /// returning whether it was newly owed.
+    /// Queues one decision the committing transition made
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)).
     ///
-    /// The event's identity is *derived* from the run, the turn, and the
-    /// draft's slot, so a re-driven transition records the same decision at
-    /// the same sequence rather than duplicating it. The outbox is a bounded
-    /// ring: a decision that would cross the bound drops the oldest owed
-    /// event and counts the drop, never failing the transition — telemetry is
-    /// not a correctness input. A draft whose derived identity cannot be
-    /// formed is dropped and counted the same way.
-    ///
-    /// Either way the sequence is *consumed*, so the loss leaves a hole a
-    /// replay can see. A drop that silently reused its sequence would hand the
-    /// sink a contiguous stream missing an event, which is precisely the
-    /// silent gap [specification 17.13](../../../docs/plans/rakka-agent/spec.md)
-    /// forbids a replay cursor to cross.
-    pub(crate) fn record_decision(
+    /// The event is assembled *now*, from the loop's turn, phase, task and
+    /// goal, revisions, context snapshot and telemetry as they stand at the
+    /// moment of the decision — so a decision a transition makes before it
+    /// advances the turn keeps the turn it was made in. Its identity is
+    /// derived from the run, that turn, and the draft's slot. Only the
+    /// sequence is left for [`Self::commit_decisions`], which the run
+    /// participant's seal calls once per write; a site never needs to know
+    /// whether decision events are on. A draft whose identity cannot be
+    /// formed is queued as such, for the commit to count.
+    pub(crate) fn queue_decision(
         &mut self,
         scope: &AgentRunScope,
         draft: AgentDecisionDraft,
         now: AgentTimestampMillis,
-    ) -> bool {
-        let sequence = self.decision_sequence.saturating_add(1);
-        let Ok(event) = AgentDecisionEvent::assemble(
+    ) {
+        let kind = draft.kind();
+        let pending = match AgentDecisionEvent::assemble(
             scope,
             Some(self.task.clone()),
             self.goal.clone(),
-            sequence,
             self.turn,
             self.phase,
             self.agent_definition_revision,
@@ -590,25 +629,65 @@ impl AgentLoopState {
             self.telemetry.clone(),
             draft,
             now,
-        ) else {
-            self.decision_sequence = sequence;
-            self.decision_drops = self.decision_drops.saturating_add(1);
-            return false;
+        ) {
+            Ok(event) => AgentPendingDecision::Assembled(Box::new(event)),
+            Err(_) => AgentPendingDecision::Unformable(kind),
         };
-        if self
-            .decision_outbox
-            .iter()
-            .any(|owed| owed.operation_id == event.operation_id)
-        {
-            return false;
+        self.pending_decisions.0.push(pending);
+    }
+
+    /// Commits the queued decisions into the owed outbox, in the order they
+    /// were queued, and leaves the list empty.
+    ///
+    /// A decision of a kind `vocabulary` does not write is discarded before it
+    /// is given a sequence, so it leaves neither a hole nor a drop. An event
+    /// whose derived identity is already owed is the same decision recorded
+    /// again by a re-driven transition, and is skipped without a sequence.
+    ///
+    /// The outbox is a bounded ring: a decision that would cross the bound
+    /// drops the oldest owed event and counts the drop, never failing the
+    /// transition — telemetry is not a correctness input. A draft whose
+    /// derived identity could not be formed is dropped and counted the same
+    /// way. Either way the sequence is *consumed*, so the loss leaves a hole a
+    /// replay can see. A drop that silently reused its sequence would hand the
+    /// sink a contiguous stream missing an event, which is precisely the
+    /// silent gap [specification 17.13](../../../docs/plans/rakka-agent/spec.md)
+    /// forbids a replay cursor to cross.
+    pub(crate) fn commit_decisions(&mut self, vocabulary: AgentDecisionEventVocabulary) {
+        for pending in std::mem::take(&mut self.pending_decisions.0) {
+            if !vocabulary.writes(pending.kind()) {
+                continue;
+            }
+            let mut event = match pending {
+                AgentPendingDecision::Assembled(event) => event,
+                AgentPendingDecision::Unformable(_) => {
+                    self.decision_sequence = self.decision_sequence.saturating_add(1);
+                    self.decision_drops = self.decision_drops.saturating_add(1);
+                    continue;
+                }
+            };
+            if self
+                .decision_outbox
+                .iter()
+                .any(|owed| owed.operation_id == event.operation_id)
+            {
+                continue;
+            }
+            while self.decision_outbox.len() >= AGENT_RUN_DECISION_OUTBOX_CAPACITY {
+                self.decision_outbox.remove(0);
+                self.decision_drops = self.decision_drops.saturating_add(1);
+            }
+            let sequence = self.decision_sequence.saturating_add(1);
+            event.stamp(sequence, CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION);
+            self.decision_sequence = sequence;
+            self.decision_outbox.push(*event);
         }
-        if self.decision_outbox.len() >= AGENT_RUN_DECISION_OUTBOX_CAPACITY {
-            self.decision_outbox.remove(0);
-            self.decision_drops = self.decision_drops.saturating_add(1);
-        }
-        self.decision_sequence = sequence;
-        self.decision_outbox.push(event);
-        true
+    }
+
+    /// Discards the queued decisions: what the seal does for a run with no
+    /// decision-event sink, which records nothing.
+    pub(crate) fn discard_pending_decisions(&mut self) {
+        self.pending_decisions.0.clear();
     }
 
     /// The decision events recorded transitions still owe the sink.

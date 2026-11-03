@@ -1973,6 +1973,19 @@ pub trait AgentExchangeParticipant: Send + Sync + 'static {
         result: &AgentExchangeResult,
         now: AgentTimestampMillis,
     ) -> Vec<AgentExchangeEnvelope>;
+
+    /// Seals one write after its transition and before it persists.
+    ///
+    /// The host calls it on every path that writes a transition's state —
+    /// [`AgentExchangeHost::initiate`], [`AgentExchangeHost::accept`] and
+    /// [`AgentExchangeHost::settle`] — with `before`, the record state the
+    /// transition started from, and `after`, the state about to be written.
+    /// A rejected transition persists nothing and is never sealed. It exists
+    /// so a participant can finish, once per write and on every path alike,
+    /// work its transitions only queue: the run participant commits the
+    /// decision events its transitions queued. Like every method here it may
+    /// neither perform I/O nor fail. The default does nothing.
+    fn seal(&self, _before: &Self::State, _after: &mut Self::State, _now: AgentTimestampMillis) {}
 }
 
 /// The durable host of one choreography participant.
@@ -2052,6 +2065,11 @@ where
         &self.persistence_id
     }
 
+    /// The participant this host drives, for a builder that reconfigures it.
+    pub(crate) fn participant_mut(&mut self) -> &mut P {
+        &mut self.participant
+    }
+
     /// Loads durable state, failing closed on an unsupported schema version.
     ///
     /// An address that has never been written recovers to the participant's
@@ -2127,6 +2145,7 @@ where
         let mut state = record.state.clone();
         let envelopes = transition(&mut state)?;
         let initiations = self.record_owed(&mut state, envelopes, now)?;
+        self.participant.seal(&record.state, &mut state, now);
         self.persist(state, record.revision).await?;
         Ok(initiations)
     }
@@ -2173,6 +2192,10 @@ where
             .participant
             .apply(&mut state, envelope, now)
             .into_parts();
+        // Sealed before anything below reads the state: the unchanged-state
+        // comparison must see what the seal commits, or a transition whose
+        // only change was a sealed write would be taken for a no-op.
+        self.participant.seal(&record.state, &mut state, now);
         let owed = propagate_exchange_telemetry(envelope.telemetry(), owed);
         // The unsettleable class is an inability to answer — an uncreated
         // receiver, a payload this binary cannot decode, a kind it predates —
@@ -2266,6 +2289,7 @@ where
         let owed = self.participant.settle(&mut state, envelope, result, now);
         let owed = propagate_exchange_telemetry(envelope.telemetry(), owed);
         self.record_owed(&mut state, owed, now)?;
+        self.participant.seal(&record.state, &mut state, now);
         self.persist(state, record.revision).await?;
         Ok(settlement)
     }

@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionOutcome, AgentModelTurn,
-    AgentModelUsage, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    InMemoryAgentDecisionEventSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    load_agent_run_state, AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionOutcome,
+    AgentModelTurn, AgentModelUsage, AgentSchemaPolicy, AgentTaskContent, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, InMemoryAgentDecisionEventSink,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 
 mod common;
@@ -71,6 +72,20 @@ fn proposing_turn(answer: &str) -> AgentModelTurn {
             cost_micros: 3,
             ..Default::default()
         })
+}
+
+/// The two-turn flow: a tool call on turn one, a proposal on turn two.
+fn two_turn_dispatcher() -> ScriptedDispatcher<DeterministicModelAdapter> {
+    ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, proposing_turn("resolved")),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    )
 }
 
 #[test]
@@ -166,4 +181,49 @@ async fn an_event_without_the_new_fields_serializes_without_their_keys() {
             assert!(value.get(key).is_none(), "{key} must be absent");
         }
     }
+}
+
+/// A vocabulary without a sink records nothing: every transition still queues
+/// its drafts, and the seal discards them, so the persisted record owes no
+/// event and has assigned no sequence.
+#[tokio::test]
+async fn an_unwired_run_keeps_no_decisions_in_its_record() {
+    let fx = Fixture::new(two_turn_dispatcher())
+        .with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2);
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the loop should run to completion");
+
+    let state = load_agent_run_state(&fx.runs, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+    assert!(
+        state
+            .status()
+            .is_some_and(rakka_agent::AgentRunStatus::is_terminal),
+        "the flow ran to its end, so it made every decision it would record"
+    );
+    let loop_state = state.loop_state().expect("the run has a loop state");
+    assert!(loop_state.decision_outbox().is_empty());
+    assert_eq!(loop_state.decision_sequence(), 0);
+}
+
+/// The `iterate` decision is queued before `begin_turn` advances the turn
+/// and clears the context, and sealed after: it keeps the turn and the
+/// context snapshot it was decided in.
+#[tokio::test]
+async fn iterate_keeps_the_turn_and_context_it_was_decided_in() {
+    let sink = Arc::new(InMemoryAgentDecisionEventSink::new());
+    let fx = Fixture::new(two_turn_dispatcher()).with_decision_events(sink.clone());
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the loop should run to completion");
+
+    let events = sink.events(&run_scope());
+    assert_eq!(events.len(), 4, "start, call-tools, iterate, proposal");
+    assert_eq!(events[2].kind, AgentDecisionKind::Continue);
+    assert_eq!(events[2].turn, 1);
+    assert!(events[2].context_snapshot.is_some());
+    assert_eq!(events[2].context_snapshot, events[1].context_snapshot);
 }
