@@ -339,7 +339,7 @@ its own is dropped and counted (`decision_drops`, `rakka.agent.decision.drops`).
 Besides the proposal and budget decisions, the stream records a run's
 lifecycle: checkpoint opens (`request-approval`, `request-authorization`),
 reconciliations (`reconcile`, including the one a handoff notice settles, and
-`request-reconciliation`), checkpoint resolutions and escalations
+`request-reconciliation`, `Version2` only), checkpoint resolutions and escalations
 (`resolve-checkpoint`, `escalate-checkpoint`), the waits a run enters (`wait`,
 slots `wait-top-up-{sequence}`, `wait-children-q{n}`, `wait-handoff-q{n}`,
 `wait-winding-down`), and the run's end (`complete`, `fail`, `cancel`,
@@ -347,9 +347,14 @@ slots `wait-top-up-{sequence}`, `wait-children-q{n}`, `wait-handoff-q{n}`,
 apply, the optional `checkpoint`, `effect`, `outcome` (`AgentDecisionOutcome`)
 and `run_status` fields; readers should key on `reason_code`, since an
 `awaiting-children` wait entered during a wind-down reads `run_status`
-`cancelling`. `AgentDecisionEventVocabulary` selects what is written:
+`cancelling`, and a wind-down begun while an effect's outcome is unknown reads
+`waiting-for-reconciliation`. The A2A coordination replay shows only a run
+event's kind and `reason_code`. When a failure ends a run, any other gated
+effect's approval or authorization checkpoint stays open on the ended run and
+gets no close event; the run's end event closes it for readers. `AgentDecisionEventVocabulary` selects what is written:
 `Version1`, the default, writes only the kinds an earlier reader decodes
-(`request-*`, `reconcile`, `complete`, `fail`, `wait`), and `Version2` adds the
+(`request-approval`, `request-authorization`, `reconcile`, `complete`,
+`fail`, `wait`), and `Version2` adds the
 six newer kinds and stamps events with schema version 2. Select it with
 `with_decision_event_vocabulary` once every process that loads the run store or
 reads the sink reads version 2 (see `docs/rakka-compatibility.md`). An ended
