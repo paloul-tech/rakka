@@ -3722,3 +3722,70 @@ pub fn assert_bc0c224_decodes(events: &[rakka_agent::AgentDecisionEvent]) {
         assert_eq!(decoded.sequence, event.sequence);
     }
 }
+
+/// A decision-event sink that delegates to an in-memory sink and counts the
+/// `Duplicate` answers it gave: a duplicate is how a re-derived event identity
+/// shows itself, and the hole it leaves in the run's sequence is what a replay
+/// reader is refused at.
+pub struct CountingDecisionSink {
+    inner: rakka_agent::InMemoryAgentDecisionEventSink,
+    duplicates: AtomicU64,
+}
+
+impl CountingDecisionSink {
+    /// A fresh sink that has answered no duplicates.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: rakka_agent::InMemoryAgentDecisionEventSink::new(),
+            duplicates: AtomicU64::new(0),
+        })
+    }
+
+    /// Every retained event for `scope`, in sequence order.
+    pub fn events(&self, scope: &AgentRunScope) -> Vec<rakka_agent::AgentDecisionEvent> {
+        self.inner.events(scope)
+    }
+
+    /// How many appends the sink answered `Duplicate`.
+    pub fn duplicates(&self) -> usize {
+        usize::try_from(self.duplicates.load(Ordering::SeqCst)).expect("the count fits")
+    }
+}
+
+impl rakka_agent::AgentDecisionEventSink for CountingDecisionSink {
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    fn append<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        event: &'a rakka_agent::AgentDecisionEvent,
+    ) -> rakka_agent::AgentObservabilityFuture<'a, rakka_agent::AgentDecisionWriteStatus> {
+        Box::pin(async move {
+            let status = self.inner.append(scope, event).await?;
+            if status == rakka_agent::AgentDecisionWriteStatus::Duplicate {
+                self.duplicates.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(status)
+        })
+    }
+
+    fn read<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        after: u64,
+        limit: usize,
+    ) -> rakka_agent::AgentObservabilityFuture<'a, rakka_agent::AgentDecisionEventPage> {
+        self.inner.read(scope, after, limit)
+    }
+}
+
+/// Asserts the run's decision stream has no hole: the sequences are exactly
+/// `1..=n` and the sink never answered `Duplicate`.
+pub fn assert_decision_stream_whole(sink: &CountingDecisionSink, scope: &AgentRunScope) {
+    let sequences: Vec<u64> = sink.events(scope).iter().map(|e| e.sequence).collect();
+    let expected: Vec<u64> = (1..=sequences.len() as u64).collect();
+    assert_eq!(sequences, expected, "the decision sequences must be 1..=n");
+    assert_eq!(sink.duplicates(), 0, "no append may answer Duplicate");
+}

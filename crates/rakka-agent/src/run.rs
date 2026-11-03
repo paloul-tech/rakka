@@ -6139,7 +6139,7 @@ fn evaluate_goal(
             AgentDecisionDraft::new(
                 AgentDecisionKind::Evaluate,
                 AgentDecisionSource::DeterministicPolicy,
-                "goal-evaluation",
+                format!("goal-evaluation-s{slot}"),
             ),
             now,
         );

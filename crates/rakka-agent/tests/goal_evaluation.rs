@@ -25,9 +25,9 @@ use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis, Princ
 mod common;
 
 use common::{
-    agent_scope, goal_evaluation, goal_evaluation_request, goal_spec, goal_spec_draft,
-    goal_spec_with_evaluator, goal_task_creation_command, provenance, run_scope, task_definition,
-    Fixture, TASK, TENANT,
+    agent_scope, assert_decision_stream_whole, goal_evaluation, goal_evaluation_request, goal_spec,
+    goal_spec_draft, goal_spec_with_evaluator, goal_task_creation_command, provenance, run_scope,
+    task_definition, CountingDecisionSink, Fixture, TASK, TENANT,
 };
 
 fn text_turn(text: &str) -> AgentModelTurn {
@@ -707,6 +707,34 @@ async fn a_second_evaluation_is_refused_while_one_is_open() {
             .code(),
         "run-goal-evaluation-outstanding"
     );
+}
+
+#[tokio::test]
+async fn two_goal_evaluations_in_one_turn_record_two_contiguous_events() {
+    let sink = CountingDecisionSink::new();
+    let fx = satisfying_fixture().with_decision_events(sink.clone());
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+
+    for step in ["1", "2"] {
+        apply_run(
+            &fx,
+            evaluate_command(step, goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+        )
+        .await
+        .expect("the evaluation commits");
+        // The reported result closes the first evaluation, so the second
+        // commits in the same turn.
+        answer_evaluation(&fx).await;
+    }
+
+    let events = sink.events(&run_scope());
+    let evaluations: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == rakka_agent::AgentDecisionKind::Evaluate)
+        .collect();
+    assert_eq!(evaluations.len(), 2);
+    assert_ne!(evaluations[0].operation_id, evaluations[1].operation_id);
+    assert_decision_stream_whole(&sink, &run_scope());
 }
 
 #[tokio::test]
