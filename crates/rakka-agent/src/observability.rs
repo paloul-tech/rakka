@@ -369,8 +369,6 @@ pub struct AgentDecisionCheckpoint {
 }
 
 impl AgentDecisionCheckpoint {
-    // A later task's recording sites use this.
-    #[allow(dead_code)]
     pub(crate) fn of(checkpoint: &AgentCheckpoint) -> Self {
         Self {
             checkpoint_id: checkpoint.checkpoint_id.clone(),

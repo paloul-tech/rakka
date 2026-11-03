@@ -115,19 +115,21 @@ use crate::model::AgentModelError;
 use crate::observability::{
     agent_linked_telemetry_context, agent_span_link, record_agent_domain_counter,
     record_agent_domain_duration, record_agent_domain_gauge, record_agent_domain_histogram,
-    record_unsettleable_exchanges, AgentDecisionDraft, AgentDecisionEvent, AgentDecisionEventSink,
-    AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionSource, AgentSegmentIdentity,
-    AgentSegmentOperation, AgentSegmentSink, AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT,
-    LINK_KIND_PARKED_CHECKPOINT, LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST,
-    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
-    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
-    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
-    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION,
-    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_TURN_DURATION,
-    METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND, SEGMENT_ATTR_EFFECT_ATTEMPT,
-    SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS, SEGMENT_ATTR_SETTINGS_REVISION,
+    record_unsettleable_exchanges, AgentDecisionCheckpoint, AgentDecisionDraft, AgentDecisionEvent,
+    AgentDecisionEventSink, AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionSource,
+    AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink, AgentSegmentTimer,
+    LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT, LINK_KIND_RECONCILIATION_DECISION,
+    LINK_KIND_RESUME_REQUEST, METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS,
+    METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
+    METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_FAN_IN_RESOLUTIONS,
+    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
+    METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION, METRIC_AGENT_RECOVERY_EVENTS,
+    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+    METRIC_AGENT_TURN_DURATION, METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND,
+    SEGMENT_ATTR_EFFECT_ATTEMPT, SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS,
+    SEGMENT_ATTR_SETTINGS_REVISION,
 };
+use crate::query::AgentCheckpointBoundEffectView;
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION,
@@ -5547,8 +5549,70 @@ fn open_effect_checkpoint(
         };
         checkpoint = checkpoint.with_deadlines(due_at, expires_at, sla.escalation_target.clone());
     }
-    run.loop_state.record_checkpoint(checkpoint)?;
+    // Only a checkpoint this call newly holds is a decision: re-entering with
+    // the id already held changes nothing and so records nothing.
+    let newly_recorded = run.loop_state.record_checkpoint(checkpoint.clone())?;
+    if newly_recorded {
+        let decision = match kind {
+            AgentCheckpointKind::Approval => AgentDecisionKind::RequestApproval,
+            AgentCheckpointKind::SecurityAuthorization => AgentDecisionKind::RequestAuthorization,
+            AgentCheckpointKind::IndeterminateEffectReconciliation => {
+                AgentDecisionKind::RequestReconciliation
+            }
+        };
+        let mut draft = checkpoint_draft(
+            &run.loop_state,
+            &checkpoint,
+            decision,
+            AgentDecisionSource::DeterministicPolicy,
+            "ck-open",
+        );
+        if kind == AgentCheckpointKind::IndeterminateEffectReconciliation {
+            draft = draft
+                .with_reason_code(effect.last_error_code.as_deref().unwrap_or("indeterminate"));
+        }
+        run.loop_state.queue_decision(&scope, draft, now);
+    }
     Ok(())
+}
+
+/// Builds the draft every checkpoint decision shares: the checkpoint's own
+/// references, the bound effect and its safety class, and a slot naming the
+/// role, checkpoint tag, and the bound effect's turn, slot and generation.
+///
+/// The turn and slot come from the effect the loop still holds; when it is not
+/// held the slot is empty, which the commit counts as a drop rather than
+/// recording a guessed identity.
+fn checkpoint_draft(
+    loop_state: &AgentLoopState,
+    checkpoint: &AgentCheckpoint,
+    kind: AgentDecisionKind,
+    source: AgentDecisionSource,
+    role: &str,
+) -> AgentDecisionDraft {
+    let binding = &checkpoint.bound_effect;
+    let tag = match checkpoint.kind {
+        AgentCheckpointKind::Approval => "approval",
+        AgentCheckpointKind::SecurityAuthorization => "authz",
+        AgentCheckpointKind::IndeterminateEffectReconciliation => "reconcile",
+    };
+    let slot = loop_state
+        .effects()
+        .iter()
+        .find(|effect| effect.effect_id == binding.effect_id)
+        .map(|effect| {
+            format!(
+                "{role}-{tag}-t{}-s{}-g{}",
+                effect.turn,
+                effect.slot,
+                binding.generation.get()
+            )
+        })
+        .unwrap_or_default();
+    AgentDecisionDraft::new(kind, source, slot)
+        .with_checkpoint(AgentDecisionCheckpoint::of(checkpoint))
+        .with_effect(AgentCheckpointBoundEffectView::of_binding(binding))
+        .with_safety_class(binding.safety_class)
 }
 
 /// Applies a decision to a checkpoint the run is waiting on
@@ -10906,6 +10970,51 @@ mod tests {
 
         loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
         assert_ne!(before, loop_state, "a committed draft does count");
+    }
+
+    /// Recording a checkpoint the loop already holds changes nothing and says so,
+    /// which is what keeps a re-entered open from recording a second decision.
+    #[test]
+    fn recording_a_held_checkpoint_reports_it_was_not_new() {
+        let now = AgentTimestampMillis::new(1);
+        let (scope, mut loop_state) = segment_mark_fixture();
+        let context =
+            AgentContextSnapshotRef::for_turn(&scope, loop_state.turn()).expect("the ref derives");
+        let effect = AgentRunEffect::new(
+            &scope,
+            loop_state.turn(),
+            0,
+            AgentRunEffectRequest::Model {
+                context,
+                profile: None,
+            },
+            &AgentEffectSpec::read_only(),
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the effect derives");
+        let held = crate::checkpoints::AgentCheckpoint::open(
+            HumanCheckpointId::new("held"),
+            crate::checkpoints::AgentCheckpointKind::Approval,
+            scope.clone(),
+            &effect,
+            "summary",
+            PrincipalRef {
+                principal_type: "service".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            now,
+        )
+        .expect("the checkpoint opens");
+
+        assert!(loop_state
+            .record_checkpoint(held.clone())
+            .expect("the first record succeeds"));
+        assert!(!loop_state
+            .record_checkpoint(held)
+            .expect("the repeat succeeds"));
+        assert_eq!(loop_state.open_checkpoints().len(), 1);
     }
 
     /// A transition that retires one checkpoint and opens another must still

@@ -1228,6 +1228,15 @@ impl Ending {
 /// A promoting world driven to its terminal status. However the run ended,
 /// the session durably holds the task input at sequence one.
 async fn ended_world(ending: Ending) -> (Fixture, Stores) {
+    ended_world_recording(ending, None).await
+}
+
+/// [`ended_world`], optionally wiring a decision-event sink under the
+/// vocabulary that writes every kind.
+async fn ended_world_recording(
+    ending: Ending,
+    sink: Option<Arc<CountingDecisionSink>>,
+) -> (Fixture, Stores) {
     let stores = stores();
     let adapter = match ending {
         Ending::Failed => {
@@ -1249,6 +1258,12 @@ async fn ended_world(ending: Ending) -> (Fixture, Stores) {
         AgentRunMemory::new(stores.session.clone(), stores.snapshots.clone())
             .with_private_store(stores.private.clone()),
     );
+    let fx = match sink {
+        Some(sink) => fx
+            .with_decision_events(sink)
+            .with_decision_event_vocabulary(rakka_agent::AgentDecisionEventVocabulary::Version2),
+        None => fx,
+    };
     fx.instantiate_agent().await;
     fx.create_task().await;
     if ending == Ending::Cancelled {
@@ -1598,6 +1613,47 @@ async fn an_indeterminate_post_terminal_outcome_opens_no_checkpoint() {
     );
     assert_eq!(after.status, before.status);
     assert_eq!(after.terminal_at, before.terminal_at);
+}
+
+/// Pins the owner's ruling on issue #120: an ended run's ambiguous promotion
+/// opens no checkpoint, so it records no `RequestReconciliation` either — only
+/// a live run's reconciliation open does. A change to that ruling changes this
+/// test.
+#[tokio::test]
+async fn an_indeterminate_post_terminal_outcome_records_no_decision_event() {
+    let sink = CountingDecisionSink::new();
+    let (fx, _stores) = ended_world_recording(Ending::Cancelled, Some(sink.clone())).await;
+    let scope = run_scope();
+    let before = sink.events(&scope);
+    assert!(
+        !before.is_empty(),
+        "the ended run recorded its own decisions"
+    );
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "ambiguous")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let parked = resolve_promotion(
+        &fx,
+        AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the recovery retry was refused",
+        ),
+    )
+    .await;
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+
+    let after = sink.events(&scope);
+    assert!(
+        after
+            .iter()
+            .all(|event| event.kind != rakka_agent::AgentDecisionKind::RequestReconciliation),
+        "an ended run's ambiguous append records no reconciliation open"
+    );
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the park changes the sink's count by nothing"
+    );
+    assert_decision_stream_whole(&sink, &scope);
 }
 
 /// The owner-kill sweep over the post-terminal promotion flow: complete the

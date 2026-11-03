@@ -1228,13 +1228,13 @@ impl AgentLoopState {
     pub(crate) fn record_checkpoint(
         &mut self,
         checkpoint: AgentCheckpoint,
-    ) -> Result<(), AgentEffectError> {
+    ) -> Result<bool, AgentEffectError> {
         if self
             .open_checkpoints
             .iter()
             .any(|held| held.checkpoint_id == checkpoint.checkpoint_id)
         {
-            return Ok(());
+            return Ok(false);
         }
         if self.open_checkpoints.len() >= AGENT_RUN_MAX_PENDING_EFFECTS {
             return Err(AgentEffectError::PendingOverflow {
@@ -1243,7 +1243,7 @@ impl AgentLoopState {
         }
         self.pending_checkpoint = Some(checkpoint.checkpoint_id.clone());
         self.open_checkpoints.push(checkpoint);
-        Ok(())
+        Ok(true)
     }
 
     /// Records the grant a resolved checkpoint issued, replacing any prior grant
