@@ -1890,6 +1890,20 @@ fn settle_parked_handoff_send(
     let Some((effect_id, generation)) = parked else {
         return Ok(false);
     };
+    // This applies exactly the resolution a `ConfirmedExecuted` decision
+    // would, so it is recorded as that reconciliation (issue #119): decided by
+    // deterministic policy, since the evidence is the task's durable answer,
+    // not a person; naming the checkpoint it retires; and queued before the
+    // outcome is applied, as every reconciliation is. A generation settles
+    // once, so its slot cannot meet a person's `reconcile` for it.
+    queue_reconcile(
+        state,
+        &effect_id,
+        generation,
+        AgentDecisionSource::DeterministicPolicy,
+        AgentDecisionOutcome::ConfirmedExecuted,
+        now,
+    )?;
     apply_effect_outcome(
         state,
         &effect_id,
@@ -5210,17 +5224,14 @@ fn resolve_indeterminate_effect(
     policies: &AgentEffectPolicies,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
-    let scope = state.scope.clone();
-    let run = state.run_mut()?;
-    let bound = bound_reconciliation_checkpoint(&run.loop_state, effect_id, generation).cloned();
-    let draft = reconcile_draft(
-        &run.loop_state,
+    queue_reconcile(
+        state,
         effect_id,
         generation,
-        bound.as_ref(),
+        AgentDecisionSource::Human,
         resolution_outcome(&resolution),
-    );
-    run.loop_state.queue_decision(&scope, draft, now);
+        now,
+    )?;
     apply_indeterminate_resolution(
         state, effect_id, generation, resolution, policy, policies, now,
     )?;
@@ -5252,6 +5263,32 @@ fn bound_reconciliation_checkpoint<'a>(
         .open_checkpoints()
         .iter()
         .find(|checkpoint| binds_reconciliation(checkpoint, effect_id, generation))
+}
+
+/// Queues the `reconcile` decision applied to one parked effect generation,
+/// naming the reconciliation checkpoint the run holds for it, when it holds
+/// one: the record [`drop_reconciliation_checkpoint`] then retires.
+fn queue_reconcile(
+    state: &mut AgentRunState,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+    source: AgentDecisionSource,
+    outcome: AgentDecisionOutcome,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
+    let run = state.run_mut()?;
+    let bound = bound_reconciliation_checkpoint(&run.loop_state, effect_id, generation);
+    let draft = reconcile_draft(
+        &run.loop_state,
+        effect_id,
+        generation,
+        bound,
+        source,
+        outcome,
+    );
+    run.loop_state.queue_decision(&scope, draft, now);
+    Ok(())
 }
 
 /// Whether the loop holds the reconciliation checkpoint bound to one parked
@@ -5693,8 +5730,9 @@ fn checkpoint_close_draft(
 }
 
 /// Builds the `reconcile` draft for a reconciliation decision applied to one
-/// effect generation, through a checkpoint decision or the effect-layer
-/// command.
+/// effect generation: by a person, through a checkpoint decision or the
+/// effect-layer command, or by deterministic policy, when the task's durable
+/// answer settles a parked handoff send.
 ///
 /// The slot names the effect's turn and slot and the reconciled generation,
 /// which a reconciliation settles at most once. The effect view comes from the
@@ -5706,6 +5744,7 @@ fn reconcile_draft(
     effect_id: &AgentEffectId,
     generation: AgentEffectGeneration,
     checkpoint: Option<&AgentCheckpoint>,
+    source: AgentDecisionSource,
     outcome: AgentDecisionOutcome,
 ) -> AgentDecisionDraft {
     let held = loop_state
@@ -5722,13 +5761,9 @@ fn reconcile_draft(
             )
         })
         .unwrap_or_default();
-    let mut draft = AgentDecisionDraft::new(
-        AgentDecisionKind::Reconcile,
-        AgentDecisionSource::Human,
-        slot,
-    )
-    .with_outcome(outcome)
-    .with_reason_code(outcome.as_label());
+    let mut draft = AgentDecisionDraft::new(AgentDecisionKind::Reconcile, source, slot)
+        .with_outcome(outcome)
+        .with_reason_code(outcome.as_label());
     let view = match checkpoint {
         Some(checkpoint) => {
             draft = draft.with_checkpoint(AgentDecisionCheckpoint::of(checkpoint));
@@ -5771,6 +5806,7 @@ fn checkpoint_decision_draft(
             &binding.effect_id,
             binding.generation,
             Some(checkpoint),
+            AgentDecisionSource::Human,
             outcome,
         )
     };
