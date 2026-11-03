@@ -83,7 +83,8 @@ use serde::{Deserialize, Serialize};
 use crate::budget::{AgentBudgetAllocation, AgentBudgetExhaustion, AgentRunBudget};
 use crate::checkpoints::{
     AgentCheckpoint, AgentCheckpointDecision, AgentCheckpointError, AgentCheckpointKind,
-    AgentCheckpointOutcome, AgentCheckpointTimerOutcome, AgentCompensationRef,
+    AgentCheckpointOutcome, AgentCheckpointStatus, AgentCheckpointTimerOutcome,
+    AgentCompensationRef,
 };
 use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
@@ -116,11 +117,11 @@ use crate::observability::{
     agent_linked_telemetry_context, agent_span_link, record_agent_domain_counter,
     record_agent_domain_duration, record_agent_domain_gauge, record_agent_domain_histogram,
     record_unsettleable_exchanges, AgentDecisionCheckpoint, AgentDecisionDraft, AgentDecisionEvent,
-    AgentDecisionEventSink, AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionSource,
-    AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink, AgentSegmentTimer,
-    LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT, LINK_KIND_RECONCILIATION_DECISION,
-    LINK_KIND_RESUME_REQUEST, METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS,
-    METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
+    AgentDecisionEventSink, AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionOutcome,
+    AgentDecisionSource, AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink,
+    AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT,
+    LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST, METRIC_AGENT_DECISIONS,
+    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
     METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_FAN_IN_RESOLUTIONS,
     METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
     METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION, METRIC_AGENT_RECOVERY_EVENTS,
@@ -5194,6 +5195,12 @@ fn settle_run_disposition(
 /// [`AgentCheckpointOutcome::EffectResolution`] checkpoint decision: both end
 /// in [`apply_indeterminate_resolution`], and whichever path resolves the
 /// generation retires the wait the other would have answered.
+///
+/// The decision is recorded as `reconcile` before the core applies it, naming
+/// the reconciliation checkpoint this call retires when the run holds one: so
+/// it carries the phase it was made in and precedes whatever the core opens or
+/// ends. A resolution the core refuses rejects the transition, and the draft
+/// is discarded with it.
 fn resolve_indeterminate_effect(
     state: &mut AgentRunState,
     effect_id: &AgentEffectId,
@@ -5203,6 +5210,17 @@ fn resolve_indeterminate_effect(
     policies: &AgentEffectPolicies,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
+    let run = state.run_mut()?;
+    let bound = bound_reconciliation_checkpoint(&run.loop_state, effect_id, generation).cloned();
+    let draft = reconcile_draft(
+        &run.loop_state,
+        effect_id,
+        generation,
+        bound.as_ref(),
+        resolution_outcome(&resolution),
+    );
+    run.loop_state.queue_decision(&scope, draft, now);
     apply_indeterminate_resolution(
         state, effect_id, generation, resolution, policy, policies, now,
     )?;
@@ -5210,14 +5228,36 @@ fn resolve_indeterminate_effect(
     settle_run_disposition(state, now)
 }
 
+/// Whether `checkpoint` is the reconciliation checkpoint parked on one effect
+/// generation.
+fn binds_reconciliation(
+    checkpoint: &AgentCheckpoint,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+) -> bool {
+    checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
+        && checkpoint.bound_effect.effect_id == *effect_id
+        && checkpoint.bound_effect.generation == generation
+}
+
+/// The reconciliation checkpoint the loop holds for one parked effect
+/// generation, when it holds one: the record
+/// [`drop_reconciliation_checkpoint`] retires.
+fn bound_reconciliation_checkpoint<'a>(
+    loop_state: &'a AgentLoopState,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+) -> Option<&'a AgentCheckpoint> {
+    loop_state
+        .open_checkpoints()
+        .iter()
+        .find(|checkpoint| binds_reconciliation(checkpoint, effect_id, generation))
+}
+
 /// Whether the loop holds the reconciliation checkpoint bound to one parked
 /// effect generation.
 fn has_reconciliation_checkpoint(loop_state: &AgentLoopState, effect: &AgentRunEffect) -> bool {
-    loop_state.open_checkpoints().iter().any(|checkpoint| {
-        checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
-            && checkpoint.bound_effect.effect_id == effect.effect_id
-            && checkpoint.bound_effect.generation == effect.generation
-    })
+    bound_reconciliation_checkpoint(loop_state, &effect.effect_id, effect.generation).is_some()
 }
 
 /// Drops the reconciliation checkpoint parked on one resolved effect
@@ -5233,11 +5273,7 @@ fn drop_reconciliation_checkpoint(
         .loop_state
         .open_checkpoints()
         .iter()
-        .filter(|checkpoint| {
-            checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
-                && checkpoint.bound_effect.effect_id == *effect_id
-                && checkpoint.bound_effect.generation == generation
-        })
+        .filter(|checkpoint| binds_reconciliation(checkpoint, effect_id, generation))
         .map(|checkpoint| checkpoint.checkpoint_id.clone())
         .collect();
     for checkpoint_id in &retired {
@@ -5446,13 +5482,35 @@ fn cancel(
     reason: String,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
     let run = state.run_mut()?;
     if run.status.is_terminal() {
         return Err(AgentRunError::Terminal { status: run.status });
     }
 
     run.loop_state.fence_unsent_effects(now);
-    run.loop_state.cancel_open_checkpoints(now);
+    // Each checkpoint the wind-down closes is recorded as closed, before the
+    // settle below may end the run; one a repeated cancellation finds already
+    // closed is not among them, so it is recorded once.
+    for checkpoint_id in run.loop_state.cancel_open_checkpoints(now) {
+        let Some(draft) = run
+            .loop_state
+            .open_checkpoints()
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+            .map(|checkpoint| {
+                checkpoint_close_draft(
+                    &run.loop_state,
+                    checkpoint,
+                    AgentDecisionSource::DeterministicPolicy,
+                    AgentDecisionOutcome::Cancelled,
+                )
+            })
+        else {
+            continue;
+        };
+        run.loop_state.queue_decision(&scope, draft, now);
+    }
     if run.terminal_reason.is_none() {
         run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
             reason: bounded_detail(reason),
@@ -5615,6 +5673,136 @@ fn checkpoint_draft(
         .with_safety_class(binding.safety_class)
 }
 
+/// The `resolve-checkpoint` draft for an approval-family checkpoint closed
+/// with `outcome`, whose label is also its reason code.
+fn checkpoint_close_draft(
+    loop_state: &AgentLoopState,
+    checkpoint: &AgentCheckpoint,
+    source: AgentDecisionSource,
+    outcome: AgentDecisionOutcome,
+) -> AgentDecisionDraft {
+    checkpoint_draft(
+        loop_state,
+        checkpoint,
+        AgentDecisionKind::ResolveCheckpoint,
+        source,
+        "ck-close",
+    )
+    .with_outcome(outcome)
+    .with_reason_code(outcome.as_label())
+}
+
+/// Builds the `reconcile` draft for a reconciliation decision applied to one
+/// effect generation, through a checkpoint decision or the effect-layer
+/// command.
+///
+/// The slot names the effect's turn and slot and the reconciled generation,
+/// which a reconciliation settles at most once. The effect view comes from the
+/// checkpoint's binding when one was bound, else from the effect the loop
+/// holds; an effect the loop does not hold leaves the slot empty, which the
+/// commit counts as a drop rather than recording a guessed identity.
+fn reconcile_draft(
+    loop_state: &AgentLoopState,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+    checkpoint: Option<&AgentCheckpoint>,
+    outcome: AgentDecisionOutcome,
+) -> AgentDecisionDraft {
+    let held = loop_state
+        .effects()
+        .iter()
+        .find(|effect| effect.effect_id == *effect_id);
+    let slot = held
+        .map(|effect| {
+            format!(
+                "reconcile-t{}-s{}-g{}",
+                effect.turn,
+                effect.slot,
+                generation.get()
+            )
+        })
+        .unwrap_or_default();
+    let mut draft = AgentDecisionDraft::new(
+        AgentDecisionKind::Reconcile,
+        AgentDecisionSource::Human,
+        slot,
+    )
+    .with_outcome(outcome)
+    .with_reason_code(outcome.as_label());
+    let view = match checkpoint {
+        Some(checkpoint) => {
+            draft = draft.with_checkpoint(AgentDecisionCheckpoint::of(checkpoint));
+            Some(AgentCheckpointBoundEffectView::of_binding(
+                &checkpoint.bound_effect,
+            ))
+        }
+        None => held.map(AgentCheckpointBoundEffectView::of_effect),
+    };
+    if let Some(view) = view {
+        draft = draft.with_safety_class(view.safety_class).with_effect(view);
+    }
+    draft
+}
+
+/// The decision outcome an effect resolution records.
+const fn resolution_outcome(resolution: &AgentEffectResolution) -> AgentDecisionOutcome {
+    match resolution {
+        AgentEffectResolution::ConfirmedExecuted { .. } => AgentDecisionOutcome::ConfirmedExecuted,
+        AgentEffectResolution::ConfirmedNotExecuted => AgentDecisionOutcome::ConfirmedNotExecuted,
+    }
+}
+
+/// The decision a submitted checkpoint decision records, by what resolving the
+/// checkpoint yielded; `checkpoint` is the record as the decision found it.
+///
+/// A grant or denial closes the checkpoint; a confirming, compensating or
+/// abandoning decision is a reconciliation applied to the bound generation;
+/// an escalation is recorded only when it moved the checkpoint from `Open`,
+/// because a second Escalate changes nothing visible.
+fn checkpoint_decision_draft(
+    loop_state: &AgentLoopState,
+    checkpoint: &AgentCheckpoint,
+    outcome: &AgentCheckpointOutcome,
+) -> Option<AgentDecisionDraft> {
+    let binding = &checkpoint.bound_effect;
+    let reconciled = |outcome| {
+        reconcile_draft(
+            loop_state,
+            &binding.effect_id,
+            binding.generation,
+            Some(checkpoint),
+            outcome,
+        )
+    };
+    let closed = |outcome| {
+        checkpoint_close_draft(loop_state, checkpoint, AgentDecisionSource::Human, outcome)
+    };
+    match outcome {
+        AgentCheckpointOutcome::Granted(_) => Some(closed(AgentDecisionOutcome::Granted)),
+        AgentCheckpointOutcome::Denied { .. } => Some(closed(AgentDecisionOutcome::Denied)),
+        AgentCheckpointOutcome::EffectResolution(resolution) => {
+            Some(reconciled(resolution_outcome(resolution)))
+        }
+        AgentCheckpointOutcome::Compensate { .. } => {
+            Some(reconciled(AgentDecisionOutcome::Compensate))
+        }
+        AgentCheckpointOutcome::Abandoned => Some(reconciled(AgentDecisionOutcome::Abandon)),
+        AgentCheckpointOutcome::Escalated => (checkpoint.status == AgentCheckpointStatus::Open)
+            .then(|| {
+                checkpoint_draft(
+                    loop_state,
+                    checkpoint,
+                    AgentDecisionKind::EscalateCheckpoint,
+                    AgentDecisionSource::Human,
+                    "ck-escalate",
+                )
+                .with_reason_code("escalated")
+            }),
+        // `Expired` and `Cancelled` are never yielded by a submitted decision.
+        _ => None,
+    }
+}
+
 /// Applies a decision to a checkpoint the run is waiting on
 /// ([specification 12](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -5646,25 +5834,39 @@ fn resolve_checkpoint(
         }
     }
 
-    let (report, bound_effect_id, bound_generation) = {
+    let (report, found) = {
         let run = state.run_mut()?;
         let Some(checkpoint) = run.loop_state.open_checkpoint_mut(checkpoint_id) else {
             return Err(AgentRunError::UnknownCheckpoint {
                 checkpoint_id: checkpoint_id.clone(),
             });
         };
-        let bound_effect_id = checkpoint.bound_effect.effect_id.clone();
-        let bound_generation = checkpoint.bound_effect.generation;
+        // The record as the decision found it, taken before `resolve` moves
+        // its status and before an arm below drops it: the decision event
+        // names this checkpoint, and an escalation is recorded only when it
+        // moved the checkpoint from `Open`.
+        let found = checkpoint.clone();
         let report = checkpoint.resolve(decision_key, resolver, decision, now)?;
-        (report, bound_effect_id, bound_generation)
+        (report, found)
     };
+    let bound_effect_id = found.bound_effect.effect_id.clone();
+    let bound_generation = found.bound_effect.generation;
 
     if report.deduplicated {
         // The decision was already applied and its consequences committed in
         // the transition that first carried it; a replay makes no second
-        // transition (scenario 11).
+        // transition (scenario 11), and records no second decision.
         state.updated_at = now;
         return settle_run_disposition(state, now);
+    }
+
+    // Recorded before the consequence below, so the event carries the phase
+    // the decision was made in and precedes anything the consequence records,
+    // the run's end included.
+    let scope = state.scope.clone();
+    let run = state.run_mut()?;
+    if let Some(draft) = checkpoint_decision_draft(&run.loop_state, &found, &report.outcome) {
+        run.loop_state.queue_decision(&scope, draft, now);
     }
 
     match report.outcome {
@@ -6254,26 +6456,51 @@ fn fire_checkpoint_timers(
         })
         .unwrap_or_default();
 
+    let scope = state.scope.clone();
     for checkpoint_id in &checkpoint_ids {
-        let (fired, bound_effect_id, kind) = {
+        let (fired, checkpoint) = {
             let run = state.run_mut()?;
             let Some(checkpoint) = run.loop_state.open_checkpoint_mut(checkpoint_id) else {
                 continue;
             };
-            let bound_effect_id = checkpoint.bound_effect.effect_id.clone();
-            let kind = checkpoint.kind;
-            (checkpoint.on_timer(now), bound_effect_id, kind)
+            (checkpoint.on_timer(now), checkpoint.clone())
         };
+        let bound_effect_id = &checkpoint.bound_effect.effect_id;
+        let kind = checkpoint.kind;
+        // What a timer did is recorded before its consequence, so an expiry
+        // precedes the run's end it may cause. Each is recorded once: the
+        // timer escalates only an `Open` checkpoint, and an expired one is
+        // dropped here, so no later pass finds it again.
         match fired {
             AgentCheckpointTimerOutcome::Expired => {
-                state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
+                let run = state.run_mut()?;
+                let draft = checkpoint_close_draft(
+                    &run.loop_state,
+                    &checkpoint,
+                    AgentDecisionSource::DeterministicPolicy,
+                    AgentDecisionOutcome::Expired,
+                );
+                run.loop_state.queue_decision(&scope, draft, now);
+                run.loop_state.drop_checkpoint(checkpoint_id);
                 let expiry = AgentRunEffectOutcome::failed(
                     "checkpoint-expired".to_string(),
                     format!("the {kind} checkpoint expired without a decision"),
                 );
-                apply_effect_outcome(state, &bound_effect_id, &expiry, now)?;
+                apply_effect_outcome(state, bound_effect_id, &expiry, now)?;
             }
-            AgentCheckpointTimerOutcome::Escalated | AgentCheckpointTimerOutcome::Pending => {}
+            AgentCheckpointTimerOutcome::Escalated => {
+                let run = state.run_mut()?;
+                let draft = checkpoint_draft(
+                    &run.loop_state,
+                    &checkpoint,
+                    AgentDecisionKind::EscalateCheckpoint,
+                    AgentDecisionSource::DeterministicPolicy,
+                    "ck-escalate",
+                )
+                .with_reason_code("sla-due");
+                run.loop_state.queue_decision(&scope, draft, now);
+            }
+            AgentCheckpointTimerOutcome::Pending => {}
         }
     }
 
@@ -12660,6 +12887,54 @@ mod tests {
             fx.cell().status
         );
         assert!(fx.run().loop_state.open_checkpoints().is_empty());
+    }
+
+    /// Issue #119: a decision the checkpoint has already applied under its
+    /// key is answered by the checkpoint's own deduplication, which records
+    /// no decision, even for an outcome whose first application records one.
+    #[test]
+    fn a_decision_the_checkpoint_already_applied_records_nothing() {
+        let mut fx = parked();
+        let checkpoint_id = fx.checkpoint_id();
+        let decision =
+            || reconcile(crate::checkpoints::AgentReconciliationDecision::AbandonAndFail);
+        // The record shows the key applied while the checkpoint is still held.
+        // No transition leaves a resolved checkpoint held, so this is built by
+        // hand: it leaves the deduplicated branch as the only thing between
+        // the replay and a recorded `reconcile`.
+        fx.state
+            .run_mut()
+            .expect("the run exists")
+            .loop_state
+            .open_checkpoint_mut(&checkpoint_id)
+            .expect("the checkpoint is held")
+            .resolve(decision_key("abandon"), operator(), decision(), fx.now)
+            .expect("the checkpoint records the decision");
+        let run = fx.state.run_mut().expect("the run exists");
+        run.loop_state
+            .commit_decisions(AgentDecisionEventVocabulary::Version2);
+        let sequence = run.loop_state.decision_sequence();
+
+        resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            decision(),
+            decision_key("abandon"),
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            fx.now,
+        )
+        .expect("the replay is answered");
+
+        let run = fx.state.run_mut().expect("the run exists");
+        run.loop_state
+            .commit_decisions(AgentDecisionEventVocabulary::Version2);
+        assert_eq!(run.loop_state.decision_sequence(), sequence);
+        assert!(
+            !run.status.is_terminal(),
+            "the replay applied no consequence either"
+        );
     }
 
     /// Ruling 3: compensating the send settles the transfer in the same

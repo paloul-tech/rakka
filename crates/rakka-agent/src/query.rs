@@ -301,8 +301,6 @@ impl AgentCheckpointBoundEffectView {
         }
     }
 
-    // A later task's recording sites use this.
-    #[allow(dead_code)]
     pub(crate) fn of_effect(effect: &AgentRunEffect) -> Self {
         Self {
             effect_id: effect.effect_id.clone(),

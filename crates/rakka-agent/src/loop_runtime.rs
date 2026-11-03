@@ -1278,15 +1278,26 @@ impl AgentLoopState {
     /// unknown outcome known, and the parked ambiguity must stay resolvable
     /// through its checkpoint until an explicit decision settles it
     /// ([specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 57).
-    pub(crate) fn cancel_open_checkpoints(&mut self, now: AgentTimestampMillis) {
+    ///
+    /// Answers the checkpoints this call moved from waiting to cancelled, in
+    /// the order the run holds them: one already terminal is left as it was
+    /// and is not among them, so a repeated cancellation answers nothing.
+    pub(crate) fn cancel_open_checkpoints(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> Vec<HumanCheckpointId> {
+        let mut cancelled = Vec::new();
         for checkpoint in &mut self.open_checkpoints {
             if checkpoint.kind
                 != crate::checkpoints::AgentCheckpointKind::IndeterminateEffectReconciliation
+                && checkpoint.status.is_waiting()
             {
                 checkpoint.cancel(now);
+                cancelled.push(checkpoint.checkpoint_id.clone());
             }
         }
         self.resync_pending_checkpoint();
+        cancelled
     }
 
     /// Fails closed on a loop state, or a record inside it, that this binary
