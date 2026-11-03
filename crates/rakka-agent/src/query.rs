@@ -776,9 +776,10 @@ pub struct AgentOperationalSnapshot {
     /// The bounded label of the wait the run is in, when it is waiting.
     pub wait_reason: Option<String>,
     /// The earliest durable checkpoint deadline that will wake the run, when
-    /// one is set. M1 waits park on checkpoints and effects; timer occurrences
-    /// live in the substrate's timer store and join here when the wake
-    /// controller lands (Phase 3).
+    /// one is set. No agent run enters `WaitingForTimer`: a run waits on
+    /// checkpoints, effects, children and handoffs, and timer wakes belong to
+    /// the wake controller's epochs on the task, not to the run, so no timer
+    /// occurrence ever appears here.
     pub next_wake: Option<AgentTimestampMillis>,
     /// Every effect the run holds that is not yet resolved.
     pub pending_effects: Vec<AgentPendingEffectView>,

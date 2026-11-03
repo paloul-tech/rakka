@@ -447,3 +447,14 @@ Posted on #119 when the PR merges. For each ask it gives:
 - the differences in section 2, including that an ended run's unknown outcome stays off the stream until #120, so Studio still learns of it only from the snapshot.
 
 It also names the one new knob the host turns, `with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2)`, and when to turn it.
+
+## As built (2026-11-03)
+
+Where the build differs from the text above:
+
+- Wait slots (sections 5.5 and 9): the children and handoff slots carry a `-q{n}` ordinal, the run's decision sequence before the entering transition (`wait-children-q{n}`, `wait-handoff-q{n}`), so a re-entered wait needs no uniqueness proof. The other two are `wait-top-up-{sequence}` and `wait-winding-down`.
+- Run-record bounds (section 5.7): by owner ruling in Task 4, `AGENT_RUN_STATE_GROWTH_RESERVE_BYTES` is 128 KiB (was 96) and `AGENT_RUN_MATERIALIZED_MAX_BYTES` is 208 KiB (was 176), the admission budget staying 80 KiB; `AGENT_RUN_DECISION_OUTBOX_MAX_BYTES` is 40 KiB; the coordination door's ceiling is 168 KiB. The compatibility doc carries the resulting rollout note.
+- Handoff notice (sections 5.1 and 5.5): a third path records `reconcile`, when a task's handoff answer settles a parked handoff send, with outcome `confirmed-executed` and source `deterministic-policy`.
+- Tests (section 7): existing decision-event tests whose flow ends `Completed` gain the end event; their earlier events keep their positions.
+- Vocabulary knob (section 5.3): beyond the three public types, the test kit's `InProcessRunEntityTransport` and `InProcessRunResultDelivery` and the test `Fixture` carry `with_decision_event_vocabulary`.
+- `drop_reconciliation_checkpoint` kept its signature.
