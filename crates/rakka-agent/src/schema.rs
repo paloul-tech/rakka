@@ -160,8 +160,15 @@ pub const CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION: StateSchemaVersi
 /// A decision event is a projection record, never the correctness source, but
 /// it is persisted with bounded retention and read back by the session view,
 /// so it evolves under the same fail-closed rule as every other record.
+///
+/// The stamp follows the writer's decision-event vocabulary
+/// ([`crate::observability::AgentDecisionEventVocabulary::schema_version`]):
+/// the first vocabulary writes version 1, so a binary at the earlier pin still
+/// decodes it, and the second writes version 2. This constant is the highest
+/// version this binary reads and writes; the next bump belongs to the next
+/// vocabulary that adds a kind, a field or an outcome.
 pub const CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION: StateSchemaVersion =
-    StateSchemaVersion::new(1);
+    StateSchemaVersion::new(2);
 
 /// Current schema version of a persisted
 /// [`crate::memory::AgentPrivateMemory`].

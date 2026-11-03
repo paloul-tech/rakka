@@ -903,6 +903,9 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
     // interpreted with guessed semantics: the view treats the sink as
     // unavailable and the authoritative half is untouched, while the replay
     // entry point — the same load path — refuses it outright.
+    let written = rakka_agent::AgentDecisionEventVocabulary::default()
+        .schema_version()
+        .get();
     let current = rakka_agent::AgentRecordKind::DecisionEvent
         .current_schema_version()
         .get();
@@ -912,7 +915,7 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
             let mut value = serde_json::to_value(event).expect("the event serializes");
             assert_eq!(
                 value["schema_version"],
-                serde_json::json!(current),
+                serde_json::json!(written),
                 "the doctored path must reach the event's schema version"
             );
             value["schema_version"] = serde_json::json!(current + 1);

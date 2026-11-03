@@ -100,7 +100,7 @@ use crate::observability::{
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
-    CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION, CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
 };
 use crate::task::{AgentAcceptedResult, AgentContentDigest, AgentSchemaRef, AgentTaskContent};
 
@@ -678,7 +678,7 @@ impl AgentLoopState {
                 self.decision_drops = self.decision_drops.saturating_add(1);
             }
             let sequence = self.decision_sequence.saturating_add(1);
-            event.stamp(sequence, CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION);
+            event.stamp(sequence, vocabulary.schema_version());
             self.decision_sequence = sequence;
             self.decision_outbox.push(*event);
         }

@@ -227,3 +227,43 @@ async fn iterate_keeps_the_turn_and_context_it_was_decided_in() {
     assert!(events[2].context_snapshot.is_some());
     assert_eq!(events[2].context_snapshot, events[1].context_snapshot);
 }
+
+async fn two_turn_events(
+    vocabulary: AgentDecisionEventVocabulary,
+) -> Vec<rakka_agent::AgentDecisionEvent> {
+    let sink = Arc::new(InMemoryAgentDecisionEventSink::new());
+    let fx = Fixture::new(two_turn_dispatcher())
+        .with_decision_events(sink.clone())
+        .with_decision_event_vocabulary(vocabulary);
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the loop should run to completion");
+    let events = sink.events(&run_scope());
+    assert!(!events.is_empty());
+    events
+}
+
+#[tokio::test]
+async fn version_one_stamps_one_and_version_two_stamps_two() {
+    for (vocabulary, expected) in [
+        (AgentDecisionEventVocabulary::Version1, 1),
+        (AgentDecisionEventVocabulary::Version2, 2),
+    ] {
+        for event in two_turn_events(vocabulary).await {
+            assert_eq!(
+                rakka_agent::VersionedAgentRecord::schema_version(&event).get(),
+                expected
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_bc0c224_reader_decodes_every_version_one_event_and_no_new_kind() {
+    let events = two_turn_events(AgentDecisionEventVocabulary::Version1).await;
+    assert_bc0c224_decodes(&events);
+    for (kind, _) in NEW_KINDS {
+        let value = serde_json::to_value(kind).expect("kind serializes");
+        assert!(serde_json::from_value::<Bc0c224DecisionKind>(value).is_err());
+    }
+}

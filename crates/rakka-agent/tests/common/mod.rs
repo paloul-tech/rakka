@@ -3668,3 +3668,57 @@ pub async fn forget_operations<S, Store>(
         .await
         .expect("the rewrite lands");
 }
+
+/// The ten decision kinds the pinned `bc0c224` binary decodes — a test-local
+/// enum, so a kind added since is a decode failure here exactly as it is there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Bc0c224DecisionKind {
+    Continue,
+    CallTools,
+    SubmitResult,
+    Wait,
+    Complete,
+    Fail,
+    RequestApproval,
+    RequestAuthorization,
+    Reconcile,
+    Evaluate,
+}
+
+/// The decision event as `bc0c224` (commit `47f31ec`) declares it: no
+/// `deny_unknown_fields`, so the fields added since are dropped on decode.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Bc0c224DecisionEvent {
+    pub schema_version: u32,
+    pub scope: AgentRunScope,
+    pub task: Option<AgentTaskId>,
+    pub goal: Option<AgentGoalId>,
+    pub operation_id: AgentOperationId,
+    pub sequence: u64,
+    pub turn: u64,
+    pub phase: rakka_agent::AgentLoopPhase,
+    pub kind: Bc0c224DecisionKind,
+    pub source: rakka_agent::AgentDecisionSource,
+    pub selected_tools: Vec<rakka_agent::AgentToolId>,
+    pub definition_revision: AgentRevisionNumber,
+    pub settings_revision: AgentRevisionNumber,
+    pub context_snapshot: Option<rakka_agent::AgentContextSnapshotRef>,
+    pub safety_class: Option<rakka_agent::AgentEffectSafetyClass>,
+    pub reason_code: Option<String>,
+    pub causation_id: AgentCausationId,
+    pub correlation_id: AgentCorrelationId,
+    pub telemetry: rakka_agent_workflow::AgentTelemetryContext,
+    pub occurred_at: AgentTimestampMillis,
+}
+
+/// Asserts a `bc0c224` reader decodes every event, at schema version 1.
+pub fn assert_bc0c224_decodes(events: &[rakka_agent::AgentDecisionEvent]) {
+    for event in events {
+        let value = serde_json::to_value(event).expect("the event encodes");
+        let decoded: Bc0c224DecisionEvent = serde_json::from_value(value)
+            .unwrap_or_else(|error| panic!("a bc0c224 reader must decode {event:?}: {error}"));
+        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.sequence, event.sequence);
+    }
+}
