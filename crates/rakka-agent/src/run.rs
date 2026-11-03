@@ -705,9 +705,8 @@ impl AgentRun {
     /// Whether the run is winding down: a terminal reason is recorded, or a
     /// cancellation is in progress.
     ///
-    /// This is the one statement of the predicate `settle_run_disposition`
-    /// applies, and the decision stream's `winding-down` wait reads it too, so
-    /// the two cannot drift apart. A terminal reason is never cleared, so once
+    /// This is the predicate `settle_run_disposition` and the decision
+    /// stream's `winding-down` wait share, so those two cannot drift apart. A terminal reason is never cleared, so once
     /// true it stays true for the rest of the run — through a rest in
     /// `WaitingForReconciliation` and back.
     pub(crate) fn winding_down(&self) -> bool {
@@ -1949,6 +1948,16 @@ fn settle_parked_handoff_send(
     // not a person; naming the checkpoint it retires; and queued before the
     // outcome is applied, as every reconciliation is. A generation settles
     // once, so its slot cannot meet a person's `reconcile` for it.
+    //
+    // That invariant depends on nothing after this queue failing:
+    // `accept_handoff_result` turns an error here into `handoff-result-failed`,
+    // an UNSETTLEABLE refusal (not memoized; the half-applied clone, queued
+    // `reconcile` included, is sealed and persisted), so a redelivery would
+    // re-run the transition and queue the same identity again, leaving a hole.
+    // Every step below is infallible today: the effect comes from the `parked`
+    // lookup, `receipt.handoff == cell.record.handoff` is enforced by
+    // `handoff-forged`, and `run_mut` cannot fail on a run that parked it.
+    debug_assert!(state.run.is_some(), "a parked handoff send has a run");
     queue_reconcile(
         state,
         &effect_id,
@@ -5329,7 +5338,11 @@ fn queue_reconcile(
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let scope = state.scope.clone();
-    let run = state.run_mut()?;
+    // No run, nothing to record: the core's own ordering then decides the
+    // refusal (a resolution's validation error precedes `NotAccepted`).
+    let Some(run) = state.run.as_mut() else {
+        return Ok(());
+    };
     let bound = bound_reconciliation_checkpoint(&run.loop_state, effect_id, generation);
     let draft = reconcile_draft(
         &run.loop_state,
@@ -13636,5 +13649,42 @@ mod tests {
         .expect("the exhaustion records");
 
         assert_parked(&fx);
+    }
+
+    /// An invalid resolution sent to a run that never accepted an assignment
+    /// answers the resolution's own validation error, not `NotAccepted`: the
+    /// reconcile record is queued only where a run exists, so the core's
+    /// ordering decides the refusal (issue #119).
+    #[test]
+    fn an_invalid_resolution_for_an_unassigned_run_answers_the_validation_error() {
+        let now = AgentTimestampMillis::new(10);
+        let scope = AgentRunScope::new(
+            TenantId::new("tenant"),
+            AgentId::new("agent").expect("the agent id is valid"),
+            AgentRunId::new("run").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let mut state = AgentRunState::unassigned(scope, now);
+        let resolution = AgentEffectResolution::ConfirmedExecuted {
+            outcome: Box::new(AgentRunEffectOutcome::Cancelled {
+                reason: "resolves nothing".to_string(),
+            }),
+        };
+
+        let refusal = resolve_indeterminate_effect(
+            &mut state,
+            &AgentEffectId::new("effect-1"),
+            AgentEffectGeneration::FIRST,
+            resolution,
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            now,
+        )
+        .expect_err("the resolution resolves nothing");
+
+        assert!(
+            matches!(refusal, AgentRunError::Effect(_)),
+            "the validation error answers, not NotAccepted: {refusal:?}"
+        );
     }
 }

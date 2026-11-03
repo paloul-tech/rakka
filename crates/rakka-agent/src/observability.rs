@@ -265,7 +265,8 @@ pub enum AgentDecisionKind {
     /// A checkpoint was resolved (granted, denied, expired or cancelled) and
     /// the run resumed or ended accordingly.
     ResolveCheckpoint,
-    /// An open checkpoint was escalated past its due time.
+    /// An open checkpoint was escalated: past its due time, or by a person's
+    /// Escalate (on any checkpoint kind, reconciliation included).
     EscalateCheckpoint,
     /// The run ended by cancellation.
     Cancel,

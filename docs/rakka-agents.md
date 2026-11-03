@@ -336,7 +336,7 @@ durable records with a bounded outbox and a sink that may lag but never blocks.
 The outbox is bounded by count (32) and by bytes
 (`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`, 40 KiB); an event over the byte bound on
 its own is dropped and counted (`decision_drops`, `rakka.agent.decision.drops`).
-Besides the proposal and budget decisions, the stream records a run's
+Besides the proposal decisions (`continue`, `call-tools`, `submit-result`, `evaluate`), the stream records a run's
 lifecycle: checkpoint opens (`request-approval`, `request-authorization`),
 reconciliations (`reconcile`, including the one a handoff notice settles, and
 `request-reconciliation`, `Version2` only), checkpoint resolutions and escalations
@@ -347,7 +347,8 @@ slots `wait-top-up-{sequence}`, `wait-children-q{n}`, `wait-handoff-q{n}`,
 apply, the optional `checkpoint`, `effect`, `outcome` (`AgentDecisionOutcome`)
 and `run_status` fields; readers should key on `reason_code`, since an
 `awaiting-children` wait entered during a wind-down reads `run_status`
-`cancelling`, and a wind-down begun while an effect's outcome is unknown reads
+`cancelling`, a `budget-top-up` wait reads `running` (the run parks for a
+top-up under `Running`), and a wind-down begun while an effect's outcome is unknown reads
 `waiting-for-reconciliation`. The A2A coordination replay shows only a run
 event's kind and `reason_code`. When a failure ends a run, any other gated
 effect's approval or authorization checkpoint stays open on the ended run and

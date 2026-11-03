@@ -1104,7 +1104,7 @@ impl rakka_agent::AgentExchangeParticipant for SealCountingProbe {
 }
 
 #[tokio::test]
-async fn the_host_seals_each_write_path_once_and_nothing_it_does_not_write() {
+async fn the_host_seals_each_write_path_once_and_not_a_rejected_replayed_or_duplicate_transition() {
     // A participant that finishes queued work in its seal — the run entity
     // commits its decision events there — must be sealed on every path that
     // writes a transition, and never on one that writes nothing.
