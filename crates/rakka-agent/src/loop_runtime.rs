@@ -95,7 +95,9 @@ use crate::memory::{
     MemoryEntryRole, MemoryError, MemoryOperationId, MemorySequence, SessionMemoryEntry,
 };
 use crate::model::AgentModelTurn;
-use crate::observability::{AgentDecisionDraft, AgentDecisionEvent};
+use crate::observability::{
+    AgentDecisionDraft, AgentDecisionEvent, AgentDecisionEventVocabulary, AgentDecisionKind,
+};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
@@ -133,8 +135,49 @@ pub const AGENT_RUN_SESSION_OUTBOX_CAPACITY: usize = 32;
 /// drops its *oldest unflushed* event and counts the drop, because a
 /// transition that failed over telemetry would make observability a
 /// correctness input. Drops are visible through
-/// [`AgentLoopState::decision_drops`].
+/// [`AgentLoopState::decision_drops`]. The ring is bounded by bytes as well,
+/// at [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`], and whichever bound an event
+/// would cross first is the one that drops.
 pub const AGENT_RUN_DECISION_OUTBOX_CAPACITY: usize = 32;
+
+/// Most bytes the decision events a run owes its sink may hold, summed over
+/// each owed event's serialized `serde_json` length.
+///
+/// The count bound alone does not bound the record. Under maximal
+/// identifiers one event is about 8.5 KiB, so a full ring of
+/// [`AGENT_RUN_DECISION_OUTBOX_CAPACITY`] events, which is what a sink that
+/// stays down leaves, would be over 270 KiB, past the run's materialized
+/// bound. A decision whose event would cross either bound drops the oldest
+/// owed events until it fits, counting each drop. An event larger than this
+/// bound on its own is dropped and counted instead, its sequence consumed,
+/// so a replay reader sees the hole.
+///
+/// The bound lives in the run's growth reserve, not in its admission budget.
+/// A transition checks the run's bounds *before* the participant's seal
+/// commits the decision events it queued, so a persisted record can exceed
+/// what that check measured by the events sealed after it. That is safe
+/// because
+/// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`](crate::AGENT_RUN_STATE_GROWTH_RESERVE_BYTES)
+/// holds the maximal one-turn working set *and* a full outbox at this bound:
+/// a run admitted at its budget still fits
+/// [`AGENT_RUN_MATERIALIZED_MAX_BYTES`](crate::AGENT_RUN_MATERIALIZED_MAX_BYTES)
+/// with its outbox full, and is never refused a transition over telemetry
+/// ([specification 17.1](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Sized by measurement on 2026-11-03, at `f3e7653`, by
+/// `the_growth_reserve_covers_the_working_set_and_a_full_decision_outbox`.
+/// The maximal working set grows the record by 89538 bytes. One maximal
+/// event, with maximal identifiers and goal, is 8726 bytes. The former 96 KiB
+/// reserve left 8766 bytes of slack: 40 bytes over one event, and short of
+/// one once the outbox's own field names are counted. So, by the owner's
+/// ruling, the reserve and the materialized bound both rose by 32 KiB,
+/// keeping the admission budget at 80 KiB. The outbox takes 40 KiB of the
+/// 128 KiB reserve, room for four maximal events: 89538 + 40960, plus the
+/// outbox's own field names, separators and counters (at most 131 bytes),
+/// fits 131072 with 443 to spare; the proof asserts that worst case directly.
+/// Its fill of maximal events ends owing four, 34904 bytes, with the record
+/// grown by 124509.
+pub const AGENT_RUN_DECISION_OUTBOX_MAX_BYTES: usize = 40 * 1024;
 
 /// Most settled memory-promotion receipts a run's loop state retains.
 ///
@@ -381,9 +424,9 @@ pub struct AgentLoopState {
     /// settle pass after each transition commits
     /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md),
     /// [17.13](../../../docs/plans/rakka-agent/spec.md)). Populated only when
-    /// the run entity is wired with a decision-event sink; a bounded ring, so
-    /// overflow drops the oldest owed event rather than failing the
-    /// transition.
+    /// the run entity is wired with a decision-event sink; a ring bounded by
+    /// count and by bytes, so overflow drops the oldest owed event rather
+    /// than failing the transition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     decision_outbox: Vec<AgentDecisionEvent>,
     /// How many decision events this run has assigned a sequence, so an
@@ -395,6 +438,13 @@ pub struct AgentLoopState {
     /// requires of telemetry loss.
     #[serde(default, skip_serializing_if = "is_zero")]
     decision_drops: u64,
+    /// The decisions the transition in flight has queued and the seal has not
+    /// yet committed ([`AgentLoopState::queue_decision`],
+    /// [`AgentLoopState::commit_decisions`]). Transient: never serialized, so
+    /// every loaded record starts with an empty list, and never counted in
+    /// equality, so a state comparison sees only what the record persists.
+    #[serde(skip)]
+    pending_decisions: AgentPendingDecisions,
     /// Bounded receipts of settled memory promotions
     /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)):
     /// identities and revisions only, never content. A ring capped at
@@ -478,10 +528,53 @@ pub struct AgentGoalEvaluationCell {
     pub refusal: Option<String>,
 }
 
+/// One decision a transition queued, waiting for the seal to commit it.
+#[derive(Debug, Clone)]
+enum AgentPendingDecision {
+    /// The event, assembled when it was queued and owed only its sequence.
+    Assembled(Box<AgentDecisionEvent>),
+    /// A draft of this kind whose derived identity could not be formed.
+    Unformable(AgentDecisionKind),
+}
+
+impl AgentPendingDecision {
+    /// What the queued decision decides.
+    fn kind(&self) -> AgentDecisionKind {
+        match self {
+            Self::Assembled(event) => event.kind,
+            Self::Unformable(kind) => *kind,
+        }
+    }
+}
+
+/// The decisions the transition in flight has queued, in the order it queued
+/// them.
+///
+/// The list is transient by construction: it is never serialized, and two
+/// lists always compare equal, so the host's unchanged-state comparison and
+/// every other comparison of a loop state behave exactly as they did before
+/// decisions were queued rather than recorded in place.
+#[derive(Debug, Clone, Default)]
+struct AgentPendingDecisions(Vec<AgentPendingDecision>);
+
+impl PartialEq for AgentPendingDecisions {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 /// Whether a defaulted count is zero, so it is omitted from a run's serialized
 /// state until the run actually uses session memory.
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+/// The bytes one owed decision event adds to the run's serialized record,
+/// as [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`] counts them. An event that
+/// cannot be encoded could not be persisted either, so it measures as too
+/// large to keep.
+fn encoded_len(event: &AgentDecisionEvent) -> usize {
+    serde_json::to_vec(event).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 impl AgentLoopState {
@@ -525,6 +618,7 @@ impl AgentLoopState {
             decision_outbox: Vec::new(),
             decision_sequence: 0,
             decision_drops: 0,
+            pending_decisions: AgentPendingDecisions::default(),
             memory_promotions: Vec::new(),
             goal_evaluation: None,
             delegations: BTreeMap::new(),
@@ -553,35 +647,29 @@ impl AgentLoopState {
         &self.telemetry
     }
 
-    /// Records one decision the committing transition made
-    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)),
-    /// returning whether it was newly owed.
+    /// Queues one decision the committing transition made
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)).
     ///
-    /// The event's identity is *derived* from the run, the turn, and the
-    /// draft's slot, so a re-driven transition records the same decision at
-    /// the same sequence rather than duplicating it. The outbox is a bounded
-    /// ring: a decision that would cross the bound drops the oldest owed
-    /// event and counts the drop, never failing the transition — telemetry is
-    /// not a correctness input. A draft whose derived identity cannot be
-    /// formed is dropped and counted the same way.
-    ///
-    /// Either way the sequence is *consumed*, so the loss leaves a hole a
-    /// replay can see. A drop that silently reused its sequence would hand the
-    /// sink a contiguous stream missing an event, which is precisely the
-    /// silent gap [specification 17.13](../../../docs/plans/rakka-agent/spec.md)
-    /// forbids a replay cursor to cross.
-    pub(crate) fn record_decision(
+    /// The event is assembled *now*, from the loop's turn, phase, task and
+    /// goal, revisions, context snapshot and telemetry as they stand at the
+    /// moment of the decision — so a decision a transition makes before it
+    /// advances the turn keeps the turn it was made in. Its identity is
+    /// derived from the run, that turn, and the draft's slot. Only the
+    /// sequence is left for [`Self::commit_decisions`], which the run
+    /// participant's seal calls once per write; a site never needs to know
+    /// whether decision events are on. A draft whose identity cannot be
+    /// formed is queued as such, for the commit to count.
+    pub(crate) fn queue_decision(
         &mut self,
         scope: &AgentRunScope,
         draft: AgentDecisionDraft,
         now: AgentTimestampMillis,
-    ) -> bool {
-        let sequence = self.decision_sequence.saturating_add(1);
-        let Ok(event) = AgentDecisionEvent::assemble(
+    ) {
+        let kind = draft.kind();
+        let pending = match AgentDecisionEvent::assemble(
             scope,
             Some(self.task.clone()),
             self.goal.clone(),
-            sequence,
             self.turn,
             self.phase,
             self.agent_definition_revision,
@@ -590,25 +678,92 @@ impl AgentLoopState {
             self.telemetry.clone(),
             draft,
             now,
-        ) else {
-            self.decision_sequence = sequence;
-            self.decision_drops = self.decision_drops.saturating_add(1);
-            return false;
+        ) {
+            Ok(event) => AgentPendingDecision::Assembled(Box::new(event)),
+            Err(_) => AgentPendingDecision::Unformable(kind),
         };
-        if self
+        self.pending_decisions.0.push(pending);
+    }
+
+    /// Commits the queued decisions into the owed outbox, in the order they
+    /// were queued, and leaves the list empty.
+    ///
+    /// A decision of a kind `vocabulary` does not write is discarded before it
+    /// is given a sequence, so it leaves neither a hole nor a drop. An event
+    /// whose derived identity is already owed is the same decision recorded
+    /// again by a re-driven transition, and is skipped without a sequence.
+    ///
+    /// The outbox is a bounded ring, bounded by count
+    /// ([`AGENT_RUN_DECISION_OUTBOX_CAPACITY`]) and by serialized bytes
+    /// ([`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`]): a decision that would cross
+    /// either bound drops the oldest owed events until it fits and counts each
+    /// drop, never failing the transition — telemetry is not a correctness
+    /// input. An event larger than the byte bound on its own, and a draft
+    /// whose derived identity could not be formed, are dropped and counted the
+    /// same way. Either way the sequence is *consumed*, so the loss leaves a
+    /// hole a replay can see. A drop that silently reused its sequence would
+    /// hand the sink a contiguous stream missing an event, which is precisely
+    /// the silent gap [specification 17.13](../../../docs/plans/rakka-agent/spec.md)
+    /// forbids a replay cursor to cross.
+    pub(crate) fn commit_decisions(&mut self, vocabulary: AgentDecisionEventVocabulary) {
+        let pending = std::mem::take(&mut self.pending_decisions.0);
+        if pending.is_empty() {
+            return;
+        }
+        // Summed once per commit, then kept current as events leave and
+        // join, rather than re-summed for every event the commit adds.
+        let mut owed_bytes = self
             .decision_outbox
             .iter()
-            .any(|owed| owed.operation_id == event.operation_id)
-        {
-            return false;
+            .map(encoded_len)
+            .fold(0_usize, usize::saturating_add);
+        for pending in pending {
+            if !vocabulary.writes(pending.kind()) {
+                continue;
+            }
+            let mut event = match pending {
+                AgentPendingDecision::Assembled(event) => event,
+                AgentPendingDecision::Unformable(_) => {
+                    self.decision_sequence = self.decision_sequence.saturating_add(1);
+                    self.decision_drops = self.decision_drops.saturating_add(1);
+                    continue;
+                }
+            };
+            if self
+                .decision_outbox
+                .iter()
+                .any(|owed| owed.operation_id == event.operation_id)
+            {
+                continue;
+            }
+            // Stamped, and cut to the fields its vocabulary writes, before it
+            // is measured: the bound counts the bytes the record will hold.
+            let sequence = self.decision_sequence.saturating_add(1);
+            event.stamp(sequence, vocabulary);
+            self.decision_sequence = sequence;
+            let size = encoded_len(&event);
+            if size > AGENT_RUN_DECISION_OUTBOX_MAX_BYTES {
+                // Evicting every owed event would still not make room.
+                self.decision_drops = self.decision_drops.saturating_add(1);
+                continue;
+            }
+            while !self.decision_outbox.is_empty()
+                && (self.decision_outbox.len() >= AGENT_RUN_DECISION_OUTBOX_CAPACITY
+                    || owed_bytes.saturating_add(size) > AGENT_RUN_DECISION_OUTBOX_MAX_BYTES)
+            {
+                let evicted = self.decision_outbox.remove(0);
+                owed_bytes = owed_bytes.saturating_sub(encoded_len(&evicted));
+                self.decision_drops = self.decision_drops.saturating_add(1);
+            }
+            owed_bytes = owed_bytes.saturating_add(size);
+            self.decision_outbox.push(*event);
         }
-        if self.decision_outbox.len() >= AGENT_RUN_DECISION_OUTBOX_CAPACITY {
-            self.decision_outbox.remove(0);
-            self.decision_drops = self.decision_drops.saturating_add(1);
-        }
-        self.decision_sequence = sequence;
-        self.decision_outbox.push(event);
-        true
+    }
+
+    /// Discards the queued decisions: what the seal does for a run with no
+    /// decision-event sink, which records nothing.
+    pub(crate) fn discard_pending_decisions(&mut self) {
+        self.pending_decisions.0.clear();
     }
 
     /// The decision events recorded transitions still owe the sink.
@@ -1073,13 +1228,13 @@ impl AgentLoopState {
     pub(crate) fn record_checkpoint(
         &mut self,
         checkpoint: AgentCheckpoint,
-    ) -> Result<(), AgentEffectError> {
+    ) -> Result<bool, AgentEffectError> {
         if self
             .open_checkpoints
             .iter()
             .any(|held| held.checkpoint_id == checkpoint.checkpoint_id)
         {
-            return Ok(());
+            return Ok(false);
         }
         if self.open_checkpoints.len() >= AGENT_RUN_MAX_PENDING_EFFECTS {
             return Err(AgentEffectError::PendingOverflow {
@@ -1088,7 +1243,7 @@ impl AgentLoopState {
         }
         self.pending_checkpoint = Some(checkpoint.checkpoint_id.clone());
         self.open_checkpoints.push(checkpoint);
-        Ok(())
+        Ok(true)
     }
 
     /// Records the grant a resolved checkpoint issued, replacing any prior grant
@@ -1123,15 +1278,26 @@ impl AgentLoopState {
     /// unknown outcome known, and the parked ambiguity must stay resolvable
     /// through its checkpoint until an explicit decision settles it
     /// ([specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 57).
-    pub(crate) fn cancel_open_checkpoints(&mut self, now: AgentTimestampMillis) {
+    ///
+    /// Answers the checkpoints this call moved from waiting to cancelled, in
+    /// the order the run holds them: one already terminal is left as it was
+    /// and is not among them, so a repeated cancellation answers nothing.
+    pub(crate) fn cancel_open_checkpoints(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> Vec<HumanCheckpointId> {
+        let mut cancelled = Vec::new();
         for checkpoint in &mut self.open_checkpoints {
             if checkpoint.kind
                 != crate::checkpoints::AgentCheckpointKind::IndeterminateEffectReconciliation
+                && checkpoint.status.is_waiting()
             {
                 checkpoint.cancel(now);
+                cancelled.push(checkpoint.checkpoint_id.clone());
             }
         }
         self.resync_pending_checkpoint();
+        cancelled
     }
 
     /// Fails closed on a loop state, or a record inside it, that this binary
@@ -1886,6 +2052,39 @@ impl VersionedAgentRecord for AgentLoopState {
 
     fn schema_version(&self) -> StateSchemaVersion {
         self.schema_version
+    }
+}
+
+#[cfg(test)]
+impl AgentLoopState {
+    /// The most bytes the owed outbox adds to the serialized record beyond
+    /// its events' own: the `decision_outbox` field with its brackets and the
+    /// separators of a full ring, and the `decision_sequence` and
+    /// `decision_drops` counters at their widest.
+    ///
+    /// Measured, not counted by hand: this state is serialized once with an
+    /// empty outbox and zeroed counters, and once with a ring of
+    /// [`AGENT_RUN_DECISION_OUTBOX_CAPACITY`] copies of `event` and both
+    /// counters at `u64::MAX`, and the events' own bytes are subtracted from
+    /// the difference. The ring is full because every owed event past the
+    /// first adds a separator; the outbox can be full by count and by bytes
+    /// at once, since a small event is well under its share of
+    /// [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`].
+    pub(crate) fn decision_outbox_container_max_bytes(&self, event: &AgentDecisionEvent) -> usize {
+        let encoded = |state: &Self| {
+            serde_json::to_vec(state)
+                .expect("the loop state encodes")
+                .len()
+        };
+        let mut empty = self.clone();
+        empty.decision_outbox.clear();
+        empty.decision_sequence = 0;
+        empty.decision_drops = 0;
+        let mut full = empty.clone();
+        full.decision_outbox = vec![event.clone(); AGENT_RUN_DECISION_OUTBOX_CAPACITY];
+        full.decision_sequence = u64::MAX;
+        full.decision_drops = u64::MAX;
+        encoded(&full) - encoded(&empty) - AGENT_RUN_DECISION_OUTBOX_CAPACITY * encoded_len(event)
     }
 }
 

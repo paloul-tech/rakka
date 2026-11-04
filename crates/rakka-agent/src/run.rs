@@ -83,7 +83,8 @@ use serde::{Deserialize, Serialize};
 use crate::budget::{AgentBudgetAllocation, AgentBudgetExhaustion, AgentRunBudget};
 use crate::checkpoints::{
     AgentCheckpoint, AgentCheckpointDecision, AgentCheckpointError, AgentCheckpointKind,
-    AgentCheckpointOutcome, AgentCheckpointTimerOutcome, AgentCompensationRef,
+    AgentCheckpointOutcome, AgentCheckpointStatus, AgentCheckpointTimerOutcome,
+    AgentCompensationRef,
 };
 use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
@@ -104,7 +105,10 @@ use crate::identity::{
     AgentRunBinding, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope,
     AgentWorkflowInvocationId, TenantId,
 };
-use crate::loop_runtime::{AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal};
+use crate::loop_runtime::{
+    AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal,
+    AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+};
 use crate::memory::{
     AgentContextSnapshotRef, AgentRunMemory, MemoryError, MemorySequence, SessionMemoryEntry,
 };
@@ -112,9 +116,10 @@ use crate::model::AgentModelError;
 use crate::observability::{
     agent_linked_telemetry_context, agent_span_link, record_agent_domain_counter,
     record_agent_domain_duration, record_agent_domain_gauge, record_agent_domain_histogram,
-    record_unsettleable_exchanges, AgentDecisionDraft, AgentDecisionEvent, AgentDecisionEventSink,
-    AgentDecisionKind, AgentDecisionSource, AgentSegmentIdentity, AgentSegmentOperation,
-    AgentSegmentSink, AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT,
+    record_unsettleable_exchanges, AgentDecisionCheckpoint, AgentDecisionDraft, AgentDecisionEvent,
+    AgentDecisionEventSink, AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionOutcome,
+    AgentDecisionSource, AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink,
+    AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT,
     LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST, METRIC_AGENT_DECISIONS,
     METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
     METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_FAN_IN_RESOLUTIONS,
@@ -125,6 +130,7 @@ use crate::observability::{
     SEGMENT_ATTR_EFFECT_ATTEMPT, SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS,
     SEGMENT_ATTR_SETTINGS_REVISION,
 };
+use crate::query::AgentCheckpointBoundEffectView;
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION,
@@ -153,11 +159,20 @@ pub const AGENT_RUN_OPERATION_LOG_CAPACITY: usize = 64;
 
 /// Largest materialized run record, in bytes, once serialized.
 ///
-/// It is [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] of working-set growth on top
-/// of the admission budget acceptance enforces, so raising the reserve must
-/// raise this bound with it rather than silently shrinking what a run may be
-/// admitted with.
-pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 176 * 1024;
+/// It is the admission budget acceptance enforces, 80 KiB, plus
+/// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] of post-acceptance growth: the
+/// maximal one-turn working set's growth *and* a full owed decision outbox at
+/// its byte bound, [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`]. Raising the
+/// reserve must raise this bound with it rather than silently shrinking what
+/// a run may be admitted with.
+///
+/// Both rose by 32 KiB together on 2026-11-03, by the owner's ruling, when the
+/// reserve took on the outbox, and the admission budget stayed where it was.
+/// Measured then: the maximal working set grows the record by 89538 bytes;
+/// the outbox holds at most 40960 bytes of events, in a container (its field,
+/// separators and counters) of at most 131 bytes; and
+/// 89538 + 40960 + 131 = 130629 fits the reserve's 131072.
+pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 208 * 1024;
 
 /// Bytes of growth headroom an accepted run record keeps below
 /// [`AGENT_RUN_MATERIALIZED_MAX_BYTES`].
@@ -184,17 +199,35 @@ pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 176 * 1024;
 /// reserve covers it again so a result arriving after acceptance can always
 /// be recorded.
 ///
+/// The reserve also holds a full owed decision outbox, at
+/// [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`]. A transition checks the run's
+/// bounds before the seal commits the decision events it queued, so the
+/// events land on top of the record that check measured; the outbox's place
+/// in the reserve is what keeps a run whose sink is down from being refused a
+/// transition over telemetry. Measured on 2026-11-03: the maximal working set
+/// grows the record by 89538 bytes, and the outbox adds at most 40960 bytes of
+/// events and 131 bytes of container (its field, separators and counters), so
+/// 89538 + 40960 + 131 = 130629 must fit these 131072 bytes.
+///
 /// Acceptance therefore enforces the materialized bound *minus* this reserve,
 /// so a run the entity admits can never later be unable to record the very turn
 /// it was created to take — a record refused mid-turn would refuse the same
 /// retry forever, exactly the committed-record-bricks-its-own-recovery class
 /// the schema gate exists to prevent. It is the same reservation the task
 /// entity makes for its own lifecycle
-/// ([`crate::task::AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`]). The test
-/// `the_growth_reserve_covers_the_maximal_working_set` holds this constant to
-/// that claim: it materializes a superset of every reachable working set, under
-/// maximal identifiers, and measures it.
-pub const AGENT_RUN_STATE_GROWTH_RESERVE_BYTES: usize = 96 * 1024;
+/// ([`crate::task::AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`]).
+///
+/// The test
+/// `the_growth_reserve_covers_the_working_set_and_a_full_decision_outbox`
+/// holds this constant to the whole claim. Under maximal identifiers it
+/// materializes a superset of every reachable working set, measures its
+/// growth, and asserts that growth plus the outbox's byte bound plus the
+/// outbox's largest container, measured from a serialized full ring, fits
+/// the reserve; it then fills the outbox with maximal events and measures the
+/// record. `the_growth_reserve_covers_the_maximal_working_set` measures the
+/// same working set alone and holds the delegation lifecycle to its door
+/// price; on its own it does not hold the outbox's share.
+pub const AGENT_RUN_STATE_GROWTH_RESERVE_BYTES: usize = 128 * 1024;
 
 /// Most bounded loop transitions one settle pass may perform.
 ///
@@ -669,6 +702,17 @@ impl AgentRun {
         self.binding.task()
     }
 
+    /// Whether the run is winding down: a terminal reason is recorded, or a
+    /// cancellation is in progress.
+    ///
+    /// This is the predicate `settle_run_disposition` and the decision
+    /// stream's `winding-down` wait share, so those two cannot drift apart. A terminal reason is never cleared, so once
+    /// true it stays true for the rest of the run — through a rest in
+    /// `WaitingForReconciliation` and back.
+    pub(crate) fn winding_down(&self) -> bool {
+        self.terminal_reason.is_some() || self.status == AgentRunStatus::Cancelling
+    }
+
     /// Whether the run may perform another bounded loop transition right now.
     ///
     /// This is the authoritative crank condition, and it is deliberately a
@@ -780,6 +824,25 @@ impl AgentRun {
             return Err(AgentRunError::MaterializedStateTooLarge { bytes, maximum });
         }
         Ok(())
+    }
+
+    /// The bytes the interception door may commit to this turn's delegations
+    /// and workflow invocations: what the record has left below
+    /// [`AGENT_RUN_MATERIALIZED_MAX_BYTES`], less the owed decision outbox's
+    /// bound.
+    ///
+    /// The door prices its commits against the materialized bound, not
+    /// against the growth reserve, so the outbox's share of the reserve does
+    /// not protect it here. The seal commits a transition's decision events
+    /// after the bounds check, so a turn that spent the record up to the
+    /// materialized bound would leave the record over it once its events
+    /// landed, and the next transition would be refused over telemetry. Holding
+    /// [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`] back keeps a full outbox
+    /// affordable whatever the door commits.
+    fn coordination_door_headroom(&self) -> usize {
+        AGENT_RUN_MATERIALIZED_MAX_BYTES
+            .saturating_sub(AGENT_RUN_DECISION_OUTBOX_MAX_BYTES)
+            .saturating_sub(self.materialized_size_bytes())
     }
 }
 
@@ -1288,12 +1351,35 @@ fn bounded_detail(detail: impl Into<String>) -> String {
     detail
 }
 
+/// The decision kind that records a run's end in `status`.
+///
+/// `Completed` is `complete`, `Failed` is `fail`, `Cancelled` is `cancel`,
+/// `HandedOff` is `handoff` and `Superseded` is `supersede`.
+/// [`AgentRunTerminalReason::status`] yields only those five; any other
+/// status falls back to `fail`, so an end is never recorded as anything but
+/// an end.
+fn end_kind(status: AgentRunStatus) -> AgentDecisionKind {
+    match status {
+        AgentRunStatus::Completed => AgentDecisionKind::Complete,
+        AgentRunStatus::Cancelled => AgentDecisionKind::Cancel,
+        AgentRunStatus::HandedOff => AgentDecisionKind::Handoff,
+        AgentRunStatus::Superseded => AgentDecisionKind::Supersede,
+        _ => AgentDecisionKind::Fail,
+    }
+}
+
 /// Moves the run to a terminal status and records why.
+///
+/// The end is also queued as a decision (`complete`, `fail`, `cancel`,
+/// `handoff` or `supersede`) carrying the status and the reason's code. Its
+/// slot is `end`, and the already-terminal guard below makes it once per run,
+/// however the wind-down that reaches here is re-driven.
 fn terminate(
     state: &mut AgentRunState,
     reason: AgentRunTerminalReason,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
     let run = state.run_mut()?;
     if run.status.is_terminal() {
         return Ok(());
@@ -1308,7 +1394,9 @@ fn terminate(
     if descendants > 0 {
         run.loop_state.budget_mut().charge_descendants(descendants);
     }
-    run.status = reason.status();
+    let status = reason.status();
+    let code = reason.code();
+    run.status = status;
     run.loop_state.set_phase(AgentLoopPhase::Complete);
     // A terminal run owes its escrow back, not a top-up: clearing the park here
     // means a run cancelled while waiting on a grant stops asking and settles.
@@ -1318,6 +1406,22 @@ fn terminate(
     // clock must not move when a re-driven wind-down re-enters this transition
     // ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
     run.terminal_at = Some(now);
+    // The end is the run's deterministic policy recording the terminal
+    // outcome, even when a person's denial caused it: that person's decision
+    // is its own `resolve-checkpoint`. Queued after every draft the
+    // transition queued before reaching here, such as the closes a cancel
+    // records, so the end is the transition's last event.
+    run.loop_state.queue_decision(
+        &scope,
+        AgentDecisionDraft::new(
+            end_kind(status),
+            AgentDecisionSource::DeterministicPolicy,
+            "end",
+        )
+        .with_run_status(status)
+        .with_reason_code(code),
+        now,
+    );
     // The record now carries a field only a binary that knows schema version 2
     // can round-trip, so a version-1 record earns its upgrade at exactly the
     // transition that gives it one. Without this a run *created* before the
@@ -1838,6 +1942,30 @@ fn settle_parked_handoff_send(
     let Some((effect_id, generation)) = parked else {
         return Ok(false);
     };
+    // This applies exactly the resolution a `ConfirmedExecuted` decision
+    // would, so it is recorded as that reconciliation (issue #119): decided by
+    // deterministic policy, since the evidence is the task's durable answer,
+    // not a person; naming the checkpoint it retires; and queued before the
+    // outcome is applied, as every reconciliation is. A generation settles
+    // once, so its slot cannot meet a person's `reconcile` for it.
+    //
+    // That invariant depends on nothing after this queue failing:
+    // `accept_handoff_result` turns an error here into `handoff-result-failed`,
+    // an UNSETTLEABLE refusal (not memoized; the half-applied clone, queued
+    // `reconcile` included, is sealed and persisted), so a redelivery would
+    // re-run the transition and queue the same identity again, leaving a hole.
+    // Every step below is infallible today: the effect comes from the `parked`
+    // lookup, `receipt.handoff == cell.record.handoff` is enforced by
+    // `handoff-forged`, and `run_mut` cannot fail on a run that parked it.
+    debug_assert!(state.run.is_some(), "a parked handoff send has a run");
+    queue_reconcile(
+        state,
+        &effect_id,
+        generation,
+        AgentDecisionSource::DeterministicPolicy,
+        AgentDecisionOutcome::ConfirmedExecuted,
+        now,
+    )?;
     apply_effect_outcome(
         state,
         &effect_id,
@@ -2618,7 +2746,6 @@ fn advance_once(
     state: &mut AgentRunState,
     policies: &AgentEffectPolicies,
     session_memory: bool,
-    decision_events: bool,
     delegation: Option<&crate::delegation::AgentRunDelegationConfig>,
     workflow: Option<&crate::workflow_tool::AgentRunWorkflowConfig>,
     now: AgentTimestampMillis,
@@ -2648,31 +2775,17 @@ fn advance_once(
     }
 
     let mut owed = match run.loop_state.phase() {
-        AgentLoopPhase::PreparingContext => prepare_context(
-            state,
-            &scope,
-            policies,
-            session_memory,
-            decision_events,
-            now,
-        )
-        .map(|()| Vec::new()),
-        AgentLoopPhase::EvaluatingModelOutput => evaluate_model_output(
-            state,
-            &scope,
-            policies,
-            decision_events,
-            delegation,
-            workflow,
-            now,
-        )
-        .map(|()| Vec::new()),
+        AgentLoopPhase::PreparingContext => {
+            prepare_context(state, &scope, policies, session_memory, now).map(|()| Vec::new())
+        }
+        AgentLoopPhase::EvaluatingModelOutput => {
+            evaluate_model_output(state, &scope, policies, delegation, workflow, now)
+                .map(|()| Vec::new())
+        }
         AgentLoopPhase::RecordingTurn => {
             record_turn(state, &scope, session_memory, now).map(|()| Vec::new())
         }
-        AgentLoopPhase::DecidingContinuation => {
-            decide_continuation(state, &scope, decision_events, now)
-        }
+        AgentLoopPhase::DecidingContinuation => decide_continuation(state, &scope, now),
         // `can_advance` already excluded these.
         AgentLoopPhase::AwaitingModel
         | AgentLoopPhase::AwaitingTools
@@ -2705,7 +2818,6 @@ fn prepare_context(
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
     session_memory: bool,
-    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let turn = {
@@ -2765,8 +2877,8 @@ fn prepare_context(
     // The opening decision: the run's deterministic policy decided to start
     // consulting the model. Later iterations are the *model's* continuation
     // decision and are recorded where it is made, in `decide_continuation`.
-    if decision_events && turn == 1 {
-        run.loop_state.record_decision(
+    if turn == 1 {
+        run.loop_state.queue_decision(
             scope,
             AgentDecisionDraft::new(
                 AgentDecisionKind::Continue,
@@ -3288,7 +3400,6 @@ fn evaluate_model_output(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
-    decision_events: bool,
     delegation: Option<&crate::delegation::AgentRunDelegationConfig>,
     workflow: Option<&crate::workflow_tool::AgentRunWorkflowConfig>,
     now: AgentTimestampMillis,
@@ -3401,10 +3512,12 @@ fn evaluate_model_output(
     // unaffordable delegation a failed tool result the model corrects course
     // from; letting it commit would wedge the run afterwards, when the bound
     // check fails a transition whose model turn is already durably pending
-    // and every re-drive fails the same way.
+    // and every re-drive fails the same way. The headroom holds the owed
+    // decision outbox's bound back: the turn's decision events are sealed in
+    // after the bounds check, and must still fit
+    // (`AgentRun::coordination_door_headroom`).
     let mut delegation_headroom = if delegation.is_some() || workflow.is_some() {
-        let run = state.run_mut()?;
-        AGENT_RUN_MATERIALIZED_MAX_BYTES.saturating_sub(run.materialized_size_bytes())
+        state.run_mut()?.coordination_door_headroom()
     } else {
         // No coordination or workflow tool is wired, so no call below prices
         // against it. Delegations and workflow invocations share this one
@@ -3970,19 +4083,16 @@ fn evaluate_model_output(
 
     // The model's decision, recorded in the same compare-and-set that commits
     // the fan-out it selected ([specification 17.7]).
-    if decision_events {
-        let run = state.run_mut()?;
-        run.loop_state.record_decision(
-            scope,
-            AgentDecisionDraft::new(
-                AgentDecisionKind::CallTools,
-                AgentDecisionSource::Model,
-                "tools",
-            )
-            .with_selected_tools(selected),
-            now,
-        );
-    }
+    state.run_mut()?.loop_state.queue_decision(
+        scope,
+        AgentDecisionDraft::new(
+            AgentDecisionKind::CallTools,
+            AgentDecisionSource::Model,
+            "tools",
+        )
+        .with_selected_tools(selected),
+        now,
+    );
 
     // A tool the deployment marked checkpoint- or authorization-required is not
     // dispatched: the run opens a checkpoint of the matching kind bound to the
@@ -4188,7 +4298,6 @@ fn record_turn(
 fn decide_continuation(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
-    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let proposed = state
@@ -4203,17 +4312,15 @@ fn decide_continuation(
         // iteration and stops the run with a structured reason if the ceiling is
         // reached.
         let run = state.run_mut()?;
-        if decision_events {
-            run.loop_state.record_decision(
-                scope,
-                AgentDecisionDraft::new(
-                    AgentDecisionKind::Continue,
-                    AgentDecisionSource::Model,
-                    "iterate",
-                ),
-                now,
-            );
-        }
+        run.loop_state.queue_decision(
+            scope,
+            AgentDecisionDraft::new(
+                AgentDecisionKind::Continue,
+                AgentDecisionSource::Model,
+                "iterate",
+            ),
+            now,
+        );
         run.loop_state.clear_turn();
         run.loop_state.begin_turn(None);
         run.status = AgentRunStatus::Running;
@@ -4224,17 +4331,15 @@ fn decide_continuation(
     let (proposal, envelope) = build_proposal(state, scope, content, now)?;
 
     let run = state.run_mut()?;
-    if decision_events {
-        run.loop_state.record_decision(
-            scope,
-            AgentDecisionDraft::new(
-                AgentDecisionKind::SubmitResult,
-                AgentDecisionSource::Model,
-                "proposal",
-            ),
-            now,
-        );
-    }
+    run.loop_state.queue_decision(
+        scope,
+        AgentDecisionDraft::new(
+            AgentDecisionKind::SubmitResult,
+            AgentDecisionSource::Model,
+            "proposal",
+        ),
+        now,
+    );
     run.loop_state.clear_turn();
     run.loop_state.set_proposal(proposal);
     // The run is not *waiting on an effect*, a timer, or a human: it is waiting
@@ -5131,8 +5236,7 @@ fn settle_run_disposition(
         return Ok(());
     }
 
-    let winding_down = run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling;
-    if winding_down {
+    if run.winding_down() {
         // The quiesce condition spans the subtree ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
         // a created child whose terminal outcome has not returned is a
         // started consequential effect, so the parent stays `Cancelling`
@@ -5166,6 +5270,12 @@ fn settle_run_disposition(
 /// [`AgentCheckpointOutcome::EffectResolution`] checkpoint decision: both end
 /// in [`apply_indeterminate_resolution`], and whichever path resolves the
 /// generation retires the wait the other would have answered.
+///
+/// The decision is recorded as `reconcile` before the core applies it, naming
+/// the reconciliation checkpoint this call retires when the run holds one: so
+/// it carries the phase it was made in and precedes whatever the core opens or
+/// ends. A resolution the core refuses rejects the transition, and the draft
+/// is discarded with it.
 fn resolve_indeterminate_effect(
     state: &mut AgentRunState,
     effect_id: &AgentEffectId,
@@ -5175,6 +5285,14 @@ fn resolve_indeterminate_effect(
     policies: &AgentEffectPolicies,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
+    queue_reconcile(
+        state,
+        effect_id,
+        generation,
+        AgentDecisionSource::Human,
+        resolution_outcome(&resolution),
+        now,
+    )?;
     apply_indeterminate_resolution(
         state, effect_id, generation, resolution, policy, policies, now,
     )?;
@@ -5182,14 +5300,66 @@ fn resolve_indeterminate_effect(
     settle_run_disposition(state, now)
 }
 
+/// Whether `checkpoint` is the reconciliation checkpoint parked on one effect
+/// generation.
+fn binds_reconciliation(
+    checkpoint: &AgentCheckpoint,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+) -> bool {
+    checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
+        && checkpoint.bound_effect.effect_id == *effect_id
+        && checkpoint.bound_effect.generation == generation
+}
+
+/// The reconciliation checkpoint the loop holds for one parked effect
+/// generation, when it holds one: the record
+/// [`drop_reconciliation_checkpoint`] retires.
+fn bound_reconciliation_checkpoint<'a>(
+    loop_state: &'a AgentLoopState,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+) -> Option<&'a AgentCheckpoint> {
+    loop_state
+        .open_checkpoints()
+        .iter()
+        .find(|checkpoint| binds_reconciliation(checkpoint, effect_id, generation))
+}
+
+/// Queues the `reconcile` decision applied to one parked effect generation,
+/// naming the reconciliation checkpoint the run holds for it, when it holds
+/// one: the record [`drop_reconciliation_checkpoint`] then retires.
+fn queue_reconcile(
+    state: &mut AgentRunState,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+    source: AgentDecisionSource,
+    outcome: AgentDecisionOutcome,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
+    // No run, nothing to record: the core's own ordering then decides the
+    // refusal (a resolution's validation error precedes `NotAccepted`).
+    let Some(run) = state.run.as_mut() else {
+        return Ok(());
+    };
+    let bound = bound_reconciliation_checkpoint(&run.loop_state, effect_id, generation);
+    let draft = reconcile_draft(
+        &run.loop_state,
+        effect_id,
+        generation,
+        bound,
+        source,
+        outcome,
+    );
+    run.loop_state.queue_decision(&scope, draft, now);
+    Ok(())
+}
+
 /// Whether the loop holds the reconciliation checkpoint bound to one parked
 /// effect generation.
 fn has_reconciliation_checkpoint(loop_state: &AgentLoopState, effect: &AgentRunEffect) -> bool {
-    loop_state.open_checkpoints().iter().any(|checkpoint| {
-        checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
-            && checkpoint.bound_effect.effect_id == effect.effect_id
-            && checkpoint.bound_effect.generation == effect.generation
-    })
+    bound_reconciliation_checkpoint(loop_state, &effect.effect_id, effect.generation).is_some()
 }
 
 /// Drops the reconciliation checkpoint parked on one resolved effect
@@ -5205,11 +5375,7 @@ fn drop_reconciliation_checkpoint(
         .loop_state
         .open_checkpoints()
         .iter()
-        .filter(|checkpoint| {
-            checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
-                && checkpoint.bound_effect.effect_id == *effect_id
-                && checkpoint.bound_effect.generation == generation
-        })
+        .filter(|checkpoint| binds_reconciliation(checkpoint, effect_id, generation))
         .map(|checkpoint| checkpoint.checkpoint_id.clone())
         .collect();
     for checkpoint_id in &retired {
@@ -5418,13 +5584,35 @@ fn cancel(
     reason: String,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
     let run = state.run_mut()?;
     if run.status.is_terminal() {
         return Err(AgentRunError::Terminal { status: run.status });
     }
 
     run.loop_state.fence_unsent_effects(now);
-    run.loop_state.cancel_open_checkpoints(now);
+    // Each checkpoint the wind-down closes is recorded as closed, before the
+    // settle below may end the run; one a repeated cancellation finds already
+    // closed is not among them, so it is recorded once.
+    for checkpoint_id in run.loop_state.cancel_open_checkpoints(now) {
+        let Some(draft) = run
+            .loop_state
+            .open_checkpoints()
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+            .map(|checkpoint| {
+                checkpoint_close_draft(
+                    &run.loop_state,
+                    checkpoint,
+                    AgentDecisionSource::DeterministicPolicy,
+                    AgentDecisionOutcome::Cancelled,
+                )
+            })
+        else {
+            continue;
+        };
+        run.loop_state.queue_decision(&scope, draft, now);
+    }
     if run.terminal_reason.is_none() {
         run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
             reason: bounded_detail(reason),
@@ -5521,8 +5709,199 @@ fn open_effect_checkpoint(
         };
         checkpoint = checkpoint.with_deadlines(due_at, expires_at, sla.escalation_target.clone());
     }
-    run.loop_state.record_checkpoint(checkpoint)?;
+    // Only a checkpoint this call newly holds is a decision: re-entering with
+    // the id already held changes nothing and so records nothing.
+    let newly_recorded = run.loop_state.record_checkpoint(checkpoint.clone())?;
+    if newly_recorded {
+        let decision = match kind {
+            AgentCheckpointKind::Approval => AgentDecisionKind::RequestApproval,
+            AgentCheckpointKind::SecurityAuthorization => AgentDecisionKind::RequestAuthorization,
+            AgentCheckpointKind::IndeterminateEffectReconciliation => {
+                AgentDecisionKind::RequestReconciliation
+            }
+        };
+        let mut draft = checkpoint_draft(
+            &run.loop_state,
+            &checkpoint,
+            decision,
+            AgentDecisionSource::DeterministicPolicy,
+            "ck-open",
+        );
+        if kind == AgentCheckpointKind::IndeterminateEffectReconciliation {
+            draft = draft
+                .with_reason_code(effect.last_error_code.as_deref().unwrap_or("indeterminate"));
+        }
+        run.loop_state.queue_decision(&scope, draft, now);
+    }
     Ok(())
+}
+
+/// Builds the draft every checkpoint decision shares: the checkpoint's own
+/// references, the bound effect and its safety class, and a slot naming the
+/// role, checkpoint tag, and the bound effect's turn, slot and generation.
+///
+/// The turn and slot come from the effect the loop still holds; when it is not
+/// held the slot is empty, which the commit counts as a drop rather than
+/// recording a guessed identity.
+fn checkpoint_draft(
+    loop_state: &AgentLoopState,
+    checkpoint: &AgentCheckpoint,
+    kind: AgentDecisionKind,
+    source: AgentDecisionSource,
+    role: &str,
+) -> AgentDecisionDraft {
+    let binding = &checkpoint.bound_effect;
+    let tag = match checkpoint.kind {
+        AgentCheckpointKind::Approval => "approval",
+        AgentCheckpointKind::SecurityAuthorization => "authz",
+        AgentCheckpointKind::IndeterminateEffectReconciliation => "reconcile",
+    };
+    let slot = loop_state
+        .effects()
+        .iter()
+        .find(|effect| effect.effect_id == binding.effect_id)
+        .map(|effect| {
+            format!(
+                "{role}-{tag}-t{}-s{}-g{}",
+                effect.turn,
+                effect.slot,
+                binding.generation.get()
+            )
+        })
+        .unwrap_or_default();
+    AgentDecisionDraft::new(kind, source, slot)
+        .with_checkpoint(AgentDecisionCheckpoint::of(checkpoint))
+        .with_effect(AgentCheckpointBoundEffectView::of_binding(binding))
+        .with_safety_class(binding.safety_class)
+}
+
+/// The `resolve-checkpoint` draft for an approval-family checkpoint closed
+/// with `outcome`, whose label is also its reason code.
+fn checkpoint_close_draft(
+    loop_state: &AgentLoopState,
+    checkpoint: &AgentCheckpoint,
+    source: AgentDecisionSource,
+    outcome: AgentDecisionOutcome,
+) -> AgentDecisionDraft {
+    checkpoint_draft(
+        loop_state,
+        checkpoint,
+        AgentDecisionKind::ResolveCheckpoint,
+        source,
+        "ck-close",
+    )
+    .with_outcome(outcome)
+    .with_reason_code(outcome.as_label())
+}
+
+/// Builds the `reconcile` draft for a reconciliation decision applied to one
+/// effect generation: by a person, through a checkpoint decision or the
+/// effect-layer command, or by deterministic policy, when the task's durable
+/// answer settles a parked handoff send.
+///
+/// The slot names the effect's turn and slot and the reconciled generation,
+/// which a reconciliation settles at most once. The effect view comes from the
+/// checkpoint's binding when one was bound, else from the effect the loop
+/// holds; an effect the loop does not hold leaves the slot empty, which the
+/// commit counts as a drop rather than recording a guessed identity.
+fn reconcile_draft(
+    loop_state: &AgentLoopState,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+    checkpoint: Option<&AgentCheckpoint>,
+    source: AgentDecisionSource,
+    outcome: AgentDecisionOutcome,
+) -> AgentDecisionDraft {
+    let held = loop_state
+        .effects()
+        .iter()
+        .find(|effect| effect.effect_id == *effect_id);
+    let slot = held
+        .map(|effect| {
+            format!(
+                "reconcile-t{}-s{}-g{}",
+                effect.turn,
+                effect.slot,
+                generation.get()
+            )
+        })
+        .unwrap_or_default();
+    let mut draft = AgentDecisionDraft::new(AgentDecisionKind::Reconcile, source, slot)
+        .with_outcome(outcome)
+        .with_reason_code(outcome.as_label());
+    let view = match checkpoint {
+        Some(checkpoint) => {
+            draft = draft.with_checkpoint(AgentDecisionCheckpoint::of(checkpoint));
+            Some(AgentCheckpointBoundEffectView::of_binding(
+                &checkpoint.bound_effect,
+            ))
+        }
+        None => held.map(AgentCheckpointBoundEffectView::of_effect),
+    };
+    if let Some(view) = view {
+        draft = draft.with_safety_class(view.safety_class).with_effect(view);
+    }
+    draft
+}
+
+/// The decision outcome an effect resolution records.
+const fn resolution_outcome(resolution: &AgentEffectResolution) -> AgentDecisionOutcome {
+    match resolution {
+        AgentEffectResolution::ConfirmedExecuted { .. } => AgentDecisionOutcome::ConfirmedExecuted,
+        AgentEffectResolution::ConfirmedNotExecuted => AgentDecisionOutcome::ConfirmedNotExecuted,
+    }
+}
+
+/// The decision a submitted checkpoint decision records, by what resolving the
+/// checkpoint yielded; `checkpoint` is the record as the decision found it.
+///
+/// A grant or denial closes the checkpoint; a confirming, compensating or
+/// abandoning decision is a reconciliation applied to the bound generation;
+/// an escalation is recorded only when it moved the checkpoint from `Open`,
+/// because a second Escalate changes nothing visible.
+fn checkpoint_decision_draft(
+    loop_state: &AgentLoopState,
+    checkpoint: &AgentCheckpoint,
+    outcome: &AgentCheckpointOutcome,
+) -> Option<AgentDecisionDraft> {
+    let binding = &checkpoint.bound_effect;
+    let reconciled = |outcome| {
+        reconcile_draft(
+            loop_state,
+            &binding.effect_id,
+            binding.generation,
+            Some(checkpoint),
+            AgentDecisionSource::Human,
+            outcome,
+        )
+    };
+    let closed = |outcome| {
+        checkpoint_close_draft(loop_state, checkpoint, AgentDecisionSource::Human, outcome)
+    };
+    match outcome {
+        AgentCheckpointOutcome::Granted(_) => Some(closed(AgentDecisionOutcome::Granted)),
+        AgentCheckpointOutcome::Denied { .. } => Some(closed(AgentDecisionOutcome::Denied)),
+        AgentCheckpointOutcome::EffectResolution(resolution) => {
+            Some(reconciled(resolution_outcome(resolution)))
+        }
+        AgentCheckpointOutcome::Compensate { .. } => {
+            Some(reconciled(AgentDecisionOutcome::Compensate))
+        }
+        AgentCheckpointOutcome::Abandoned => Some(reconciled(AgentDecisionOutcome::Abandon)),
+        AgentCheckpointOutcome::Escalated => (checkpoint.status == AgentCheckpointStatus::Open)
+            .then(|| {
+                checkpoint_draft(
+                    loop_state,
+                    checkpoint,
+                    AgentDecisionKind::EscalateCheckpoint,
+                    AgentDecisionSource::Human,
+                    "ck-escalate",
+                )
+                .with_reason_code("escalated")
+            }),
+        // `Expired` and `Cancelled` are never yielded by a submitted decision.
+        _ => None,
+    }
 }
 
 /// Applies a decision to a checkpoint the run is waiting on
@@ -5556,25 +5935,39 @@ fn resolve_checkpoint(
         }
     }
 
-    let (report, bound_effect_id, bound_generation) = {
+    let (report, found) = {
         let run = state.run_mut()?;
         let Some(checkpoint) = run.loop_state.open_checkpoint_mut(checkpoint_id) else {
             return Err(AgentRunError::UnknownCheckpoint {
                 checkpoint_id: checkpoint_id.clone(),
             });
         };
-        let bound_effect_id = checkpoint.bound_effect.effect_id.clone();
-        let bound_generation = checkpoint.bound_effect.generation;
+        // The record as the decision found it, taken before `resolve` moves
+        // its status and before an arm below drops it: the decision event
+        // names this checkpoint, and an escalation is recorded only when it
+        // moved the checkpoint from `Open`.
+        let found = checkpoint.clone();
         let report = checkpoint.resolve(decision_key, resolver, decision, now)?;
-        (report, bound_effect_id, bound_generation)
+        (report, found)
     };
+    let bound_effect_id = found.bound_effect.effect_id.clone();
+    let bound_generation = found.bound_effect.generation;
 
     if report.deduplicated {
         // The decision was already applied and its consequences committed in
         // the transition that first carried it; a replay makes no second
-        // transition (scenario 11).
+        // transition (scenario 11), and records no second decision.
         state.updated_at = now;
         return settle_run_disposition(state, now);
+    }
+
+    // Recorded before the consequence below, so the event carries the phase
+    // the decision was made in and precedes anything the consequence records,
+    // the run's end included.
+    let scope = state.scope.clone();
+    let run = state.run_mut()?;
+    if let Some(draft) = checkpoint_decision_draft(&run.loop_state, &found, &report.outcome) {
+        run.loop_state.queue_decision(&scope, draft, now);
     }
 
     match report.outcome {
@@ -6044,7 +6437,6 @@ fn evaluate_goal(
     state: &mut AgentRunState,
     evaluation: crate::evaluation::AgentGoalEvaluationRequest,
     policies: &AgentEffectPolicies,
-    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     use crate::evaluation::AgentGoalEvaluationMethod;
@@ -6109,17 +6501,15 @@ fn evaluate_goal(
         let effect_id = effect.effect_id.clone();
         let checkpoint_owed = effect.checkpoint_required;
         run.loop_state.record_effect(effect)?;
-        if decision_events {
-            run.loop_state.record_decision(
-                &scope,
-                AgentDecisionDraft::new(
-                    AgentDecisionKind::Evaluate,
-                    AgentDecisionSource::DeterministicPolicy,
-                    "goal-evaluation",
-                ),
-                now,
-            );
-        }
+        run.loop_state.queue_decision(
+            &scope,
+            AgentDecisionDraft::new(
+                AgentDecisionKind::Evaluate,
+                AgentDecisionSource::DeterministicPolicy,
+                format!("goal-evaluation-s{slot}"),
+            ),
+            now,
+        );
         checkpoint_owed.then_some(effect_id)
     };
     if let Some(effect_id) = checkpoint_owed {
@@ -6167,26 +6557,51 @@ fn fire_checkpoint_timers(
         })
         .unwrap_or_default();
 
+    let scope = state.scope.clone();
     for checkpoint_id in &checkpoint_ids {
-        let (fired, bound_effect_id, kind) = {
+        let (fired, checkpoint) = {
             let run = state.run_mut()?;
             let Some(checkpoint) = run.loop_state.open_checkpoint_mut(checkpoint_id) else {
                 continue;
             };
-            let bound_effect_id = checkpoint.bound_effect.effect_id.clone();
-            let kind = checkpoint.kind;
-            (checkpoint.on_timer(now), bound_effect_id, kind)
+            (checkpoint.on_timer(now), checkpoint.clone())
         };
+        let bound_effect_id = &checkpoint.bound_effect.effect_id;
+        let kind = checkpoint.kind;
+        // What a timer did is recorded before its consequence, so an expiry
+        // precedes the run's end it may cause. Each is recorded once: the
+        // timer escalates only an `Open` checkpoint, and an expired one is
+        // dropped here, so no later pass finds it again.
         match fired {
             AgentCheckpointTimerOutcome::Expired => {
-                state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
+                let run = state.run_mut()?;
+                let draft = checkpoint_close_draft(
+                    &run.loop_state,
+                    &checkpoint,
+                    AgentDecisionSource::DeterministicPolicy,
+                    AgentDecisionOutcome::Expired,
+                );
+                run.loop_state.queue_decision(&scope, draft, now);
+                run.loop_state.drop_checkpoint(checkpoint_id);
                 let expiry = AgentRunEffectOutcome::failed(
                     "checkpoint-expired".to_string(),
                     format!("the {kind} checkpoint expired without a decision"),
                 );
-                apply_effect_outcome(state, &bound_effect_id, &expiry, now)?;
+                apply_effect_outcome(state, bound_effect_id, &expiry, now)?;
             }
-            AgentCheckpointTimerOutcome::Escalated | AgentCheckpointTimerOutcome::Pending => {}
+            AgentCheckpointTimerOutcome::Escalated => {
+                let run = state.run_mut()?;
+                let draft = checkpoint_draft(
+                    &run.loop_state,
+                    &checkpoint,
+                    AgentDecisionKind::EscalateCheckpoint,
+                    AgentDecisionSource::DeterministicPolicy,
+                    "ck-escalate",
+                )
+                .with_reason_code("sla-due");
+                run.loop_state.queue_decision(&scope, draft, now);
+            }
+            AgentCheckpointTimerOutcome::Pending => {}
         }
     }
 
@@ -6467,9 +6882,24 @@ fn settle_proposal(
 /// The domain half of the run entity.
 ///
 /// It supplies bounded, pure transitions and nothing else; the choreography
-/// substrate owns durability, deduplication, re-drive, and routing.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AgentRunParticipant;
+/// substrate owns durability, deduplication, re-drive, and routing. The one
+/// thing it holds is how its seal treats the decision events the run's
+/// transitions queue: the default records none, as a run with no
+/// decision-event sink does, and the run entity's builders set it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentRunParticipant {
+    /// The vocabulary the seal commits queued decisions under, or `None`
+    /// when no sink is wired and the seal discards them.
+    decisions: Option<AgentDecisionEventVocabulary>,
+}
+
+impl AgentRunParticipant {
+    /// Sets how the seal treats queued decisions: commit them under the
+    /// vocabulary, or discard them when there is none.
+    pub(crate) fn set_decisions(&mut self, vocabulary: Option<AgentDecisionEventVocabulary>) {
+        self.decisions = vocabulary;
+    }
+}
 
 impl AgentExchangeParticipant for AgentRunParticipant {
     type State = AgentRunState;
@@ -6756,6 +7186,110 @@ impl AgentExchangeParticipant for AgentRunParticipant {
         }
         owed_run_exchanges(state, now).unwrap_or_default()
     }
+
+    /// Commits the decision events the write's transitions queued, under the
+    /// participant's vocabulary — or discards them when no sink is wired, so
+    /// an unwired run records nothing. Every write path seals, so a decision
+    /// queued by a transition the entity's own commands drive, by an accepted
+    /// exchange, or by a settled reply is recorded alike.
+    ///
+    /// Before the commit it derives the waits the write leaves the run in
+    /// that `before` did not show (`entered_waits`), and queues them after
+    /// the transition's own drafts, assembled from `after`'s loop state. A
+    /// wait is a fact about the record, not about the site that rested it,
+    /// so no turn-rest site records one.
+    fn seal(&self, before: &Self::State, after: &mut Self::State, now: AgentTimestampMillis) {
+        let Some(vocabulary) = self.decisions else {
+            if let Some(run) = after.run.as_mut() {
+                run.loop_state.discard_pending_decisions();
+            }
+            return;
+        };
+        let waits = entered_waits(before, after);
+        let Some(run) = after.run.as_mut() else {
+            return;
+        };
+        for wait in waits {
+            run.loop_state.queue_decision(&after.scope, wait, now);
+        }
+        run.loop_state.commit_decisions(vocabulary);
+    }
+}
+
+/// The waits `after` shows that `before` did not, as `wait` drafts in the
+/// order the run records them: a budget top-up, a fan-in or a handoff
+/// awaiting its target, then the wind-down (issue #119, ask 4).
+///
+/// Each is recorded only by the transition that leaves the run in it having
+/// started outside it, so a settle pass that re-rests the same wait records
+/// nothing, and none is recorded when `after` is terminal: a transition that
+/// ends the run records the end alone. Every draft carries `after`'s status.
+///
+/// No slot comes from a new durable field (a `bc0c224` writer would drop
+/// one):
+/// - a top-up is named by its own request sequence, which counts the run's
+///   top-ups;
+/// - the wind-down happens once per run, because a terminal reason is never
+///   cleared;
+/// - a fan-in or handoff entry is named by the run's decision sequence as it
+///   stood before this write committed. That separates two entries in one
+///   turn: each entry's own wait advances the sequence, so a later entry
+///   reads a larger one.
+fn entered_waits(before: &AgentRunState, after: &AgentRunState) -> Vec<AgentDecisionDraft> {
+    let Some(run) = after.run.as_ref() else {
+        return Vec::new();
+    };
+    if run.status.is_terminal() {
+        return Vec::new();
+    }
+    let prior = before.run.as_ref();
+    let loop_state = &run.loop_state;
+    // Read before the seal commits: unique per entry.
+    let entry = loop_state.decision_sequence();
+    let wait = |reason: &str, slot: String| {
+        AgentDecisionDraft::new(
+            AgentDecisionKind::Wait,
+            AgentDecisionSource::DeterministicPolicy,
+            slot,
+        )
+        .with_run_status(run.status)
+        .with_reason_code(reason)
+    };
+    let mut waits = Vec::new();
+
+    if let Some(pending) = loop_state.pending_top_up() {
+        let held = prior
+            .and_then(|prior| prior.loop_state.pending_top_up())
+            .map(|prior| prior.sequence);
+        if held != Some(pending.sequence) {
+            waits.push(wait(
+                "budget-top-up",
+                format!("wait-top-up-{}", pending.sequence),
+            ));
+        }
+    }
+
+    if loop_state.phase() == AgentLoopPhase::AwaitingChildren {
+        let rested = prior.is_some_and(|prior| {
+            prior.loop_state.phase() == AgentLoopPhase::AwaitingChildren
+                && prior.loop_state.turn() == loop_state.turn()
+        });
+        if !rested {
+            if loop_state
+                .handoff()
+                .is_some_and(|cell| cell.status.awaits_target())
+            {
+                waits.push(wait("awaiting-handoff", format!("wait-handoff-q{entry}")));
+            } else {
+                waits.push(wait("awaiting-children", format!("wait-children-q{entry}")));
+            }
+        }
+    }
+
+    if run.winding_down() && !prior.is_some_and(AgentRun::winding_down) {
+        waits.push(wait("winding-down", "wait-winding-down".to_string()));
+    }
+    waits
 }
 
 fn unroutable_agent_id() -> AgentId {
@@ -6783,6 +7317,8 @@ where
     policies: AgentEffectPolicies,
     memory: Option<AgentRunMemory>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    /// Which decision kinds the run writes once a sink is wired.
+    decision_vocabulary: AgentDecisionEventVocabulary,
     segments: Option<Arc<dyn AgentSegmentSink>>,
     /// The checkpoint the command in flight would resolve, when it is a
     /// resolution command. Set by `apply`, read by `apply_command`.
@@ -6827,7 +7363,7 @@ where
     pub fn new(scope: AgentRunScope, store: Store, effects: Effects) -> Self {
         let host = AgentExchangeHost::new(
             AgentEntityAddress::Run(scope.clone()),
-            AgentRunParticipant,
+            AgentRunParticipant::default(),
             store,
         );
         Self {
@@ -6837,6 +7373,7 @@ where
             policies: AgentEffectPolicies::default(),
             memory: None,
             decisions: None,
+            decision_vocabulary: AgentDecisionEventVocabulary::default(),
             segments: None,
             resolving: None,
             committed: None,
@@ -6886,7 +7423,36 @@ where
     #[must_use]
     pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
         self.decisions = Some(sink);
+        self.sync_decision_participant();
         self
+    }
+
+    /// Selects which decision kinds a wired run writes
+    /// ([`AgentDecisionEventVocabulary`]); the default is
+    /// [`AgentDecisionEventVocabulary::Version1`], the kinds an older reader
+    /// decodes.
+    ///
+    /// A decision of a kind the vocabulary does not write is discarded before
+    /// it is given a sequence, so the stream it leaves has no hole. The
+    /// vocabulary alone records nothing: a run with no sink
+    /// ([`Self::with_decision_events`]) records no decision, whatever the
+    /// vocabulary. The two builders may be called in either order.
+    #[must_use]
+    pub fn with_decision_event_vocabulary(
+        mut self,
+        vocabulary: AgentDecisionEventVocabulary,
+    ) -> Self {
+        self.decision_vocabulary = vocabulary;
+        self.sync_decision_participant();
+        self
+    }
+
+    /// Tells the participant the host drives how its seal treats queued
+    /// decisions: commit them under the vocabulary when a sink is wired,
+    /// discard them otherwise.
+    fn sync_decision_participant(&mut self) {
+        let decisions = self.decisions.as_ref().map(|_| self.decision_vocabulary);
+        self.host.participant_mut().set_decisions(decisions);
     }
 
     /// Closes bounded operation segments into `sink`
@@ -7448,9 +8014,8 @@ where
                 evaluation,
             } => {
                 let policies = self.policies.clone();
-                let decision_events = self.decisions.is_some();
                 self.transition(now, records_decision, move |state| {
-                    evaluate_goal(state, *evaluation, &policies, decision_events, now)?;
+                    evaluate_goal(state, *evaluation, &policies, now)?;
                     Ok(operation_id)
                 })
                 .await?
@@ -7956,7 +8521,6 @@ where
             let mut rejection = None;
             let policies = self.policies.clone();
             let session_memory = self.memory.is_some();
-            let decision_events = self.decisions.is_some();
             let delegation = self.delegation.clone();
             let workflow = self.workflow_tools.clone();
             let phase = self
@@ -8010,7 +8574,6 @@ where
                         state,
                         &policies,
                         session_memory,
-                        decision_events,
                         delegation.as_ref(),
                         workflow.as_ref(),
                         now,
@@ -9156,6 +9719,20 @@ where
         self
     }
 
+    /// Selects which decision kinds the hosted run writes, delegating to the
+    /// wrapped store
+    /// ([`AgentRunEntityStore::with_decision_event_vocabulary`]).
+    #[must_use]
+    pub fn with_decision_event_vocabulary(
+        mut self,
+        vocabulary: AgentDecisionEventVocabulary,
+    ) -> Self {
+        self.entity = self
+            .entity
+            .map(|entity| entity.with_decision_event_vocabulary(vocabulary));
+        self
+    }
+
     /// Closes bounded operation segments into `sink`, delegating to the
     /// wrapped store so a sharded entity closes the same segments a
     /// directly-driven one does.
@@ -9284,6 +9861,7 @@ pub struct AgentRunEntityShardingSettings {
     clock: AgentRunClock,
     metrics: Arc<dyn MetricsRecorder>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    decision_vocabulary: AgentDecisionEventVocabulary,
     segments: Option<Arc<dyn AgentSegmentSink>>,
     memory: Option<AgentRunMemory>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
@@ -9316,6 +9894,7 @@ impl AgentRunEntityShardingSettings {
             clock: system_run_clock(),
             metrics: Arc::new(NoopMetricsRecorder),
             decisions: None,
+            decision_vocabulary: AgentDecisionEventVocabulary::default(),
             segments: None,
             memory: None,
             delegation: None,
@@ -9418,6 +9997,18 @@ impl AgentRunEntityShardingSettings {
     #[must_use]
     pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
         self.decisions = Some(sink);
+        self
+    }
+
+    /// Selects which decision kinds every hosted run writes once a sink is
+    /// wired ([`AgentRunEntityStore::with_decision_event_vocabulary`]); the
+    /// default is [`AgentDecisionEventVocabulary::Version1`].
+    #[must_use]
+    pub fn with_decision_event_vocabulary(
+        mut self,
+        vocabulary: AgentDecisionEventVocabulary,
+    ) -> Self {
+        self.decision_vocabulary = vocabulary;
         self
     }
 
@@ -9576,7 +10167,8 @@ where
         settings.schema_policy,
         settings.effect_policies.clone(),
     )
-    .with_metrics(settings.metrics.clone());
+    .with_metrics(settings.metrics.clone())
+    .with_decision_event_vocabulary(settings.decision_vocabulary);
     if let Some(decisions) = settings.decisions.clone() {
         entity = entity.with_decision_events(decisions);
     }
@@ -10532,7 +11124,7 @@ mod tests {
         let (scope, mut loop_state) = segment_mark_fixture();
 
         for slot in 0..crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY {
-            assert!(loop_state.record_decision(
+            loop_state.queue_decision(
                 &scope,
                 AgentDecisionDraft::new(
                     AgentDecisionKind::Continue,
@@ -10540,8 +11132,14 @@ mod tests {
                     format!("fill-{slot}"),
                 ),
                 now,
-            ));
+            );
         }
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+        assert_eq!(
+            loop_state.decision_sequence(),
+            crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY as u64,
+            "every fill decision was newly owed"
+        );
         let saturated = loop_state.decision_outbox().len();
         assert_eq!(
             saturated,
@@ -10552,7 +11150,7 @@ mod tests {
         // The transition under measurement: it commits two decisions.
         let marks = segment_marks(&loop_state);
         for slot in ["committed-a", "committed-b"] {
-            assert!(loop_state.record_decision(
+            loop_state.queue_decision(
                 &scope,
                 AgentDecisionDraft::new(
                     AgentDecisionKind::CallTools,
@@ -10560,8 +11158,14 @@ mod tests {
                     slot,
                 ),
                 now,
-            ));
+            );
         }
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+        assert_eq!(
+            loop_state.decision_sequence(),
+            marks.decision_sequence + 2,
+            "both of the transition's decisions were newly owed"
+        );
 
         assert_eq!(
             loop_state.decision_outbox().len(),
@@ -10585,6 +11189,353 @@ mod tests {
             0,
             "a prefix-length diff reports an empty transition here"
         );
+    }
+
+    /// Each terminal status records its own end kind, and a status no
+    /// terminal reason yields falls back to `fail`.
+    #[test]
+    fn each_terminal_status_maps_to_its_end_kind() {
+        for (status, kind) in [
+            (AgentRunStatus::Completed, AgentDecisionKind::Complete),
+            (AgentRunStatus::Failed, AgentDecisionKind::Fail),
+            (AgentRunStatus::Cancelled, AgentDecisionKind::Cancel),
+            (AgentRunStatus::HandedOff, AgentDecisionKind::Handoff),
+            (AgentRunStatus::Superseded, AgentDecisionKind::Supersede),
+            (AgentRunStatus::Running, AgentDecisionKind::Fail),
+            (AgentRunStatus::Cancelling, AgentDecisionKind::Fail),
+        ] {
+            assert_eq!(end_kind(status), kind, "{status:?}");
+        }
+    }
+
+    /// A turn that enters its fan-in wait, leaves it, and enters it again
+    /// records each entry under its own identity: the slot's ordinal is the
+    /// run's decision sequence before the entering write, which the first
+    /// entry's own wait advanced. A seal that re-rests the wait, or leaves
+    /// it, records nothing.
+    #[test]
+    fn each_fan_in_entry_in_one_turn_records_its_own_wait() {
+        let now = AgentTimestampMillis::new(10);
+        let (scope, loop_state) = segment_mark_fixture();
+        let turn = loop_state.turn();
+        let schema = AgentSchemaRef::new(
+            AgentSchemaId::new("result").expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        );
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("definition").expect("the definition id is valid"),
+            "The wait fixture.",
+            schema.clone(),
+            schema,
+        )
+        .expect("the definition is valid");
+        let mut resting = AgentRunState::unassigned(scope.clone(), now);
+        resting.run = Some(AgentRun {
+            binding: AgentRunBinding::new(scope.clone(), loop_state.task().clone()),
+            generation: AgentAssignmentGeneration::new(1),
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            status: AgentRunStatus::Running,
+            loop_state,
+            terminal_reason: None,
+            settlement: AgentRunSettlementStatus::Owed,
+            accepted_at: now,
+            terminal_at: None,
+        });
+        let participant = AgentRunParticipant {
+            decisions: Some(AgentDecisionEventVocabulary::Version1),
+        };
+        let phase = |state: &AgentRunState, phase: AgentLoopPhase| {
+            let mut next = state.clone();
+            next.run_mut()
+                .expect("the run exists")
+                .loop_state
+                .set_phase(phase);
+            next
+        };
+        let seal = |before: &AgentRunState, mut after: AgentRunState| {
+            participant.seal(before, &mut after, now);
+            after
+        };
+        let owed = |state: &AgentRunState| -> Vec<String> {
+            state
+                .loop_state()
+                .expect("the loop exists")
+                .decision_outbox()
+                .iter()
+                .map(|event| event.operation_id.as_str().to_string())
+                .collect()
+        };
+
+        let resting = phase(&resting, AgentLoopPhase::AwaitingTools);
+        let entered = seal(&resting, phase(&resting, AgentLoopPhase::AwaitingChildren));
+        let first = owed(&entered);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].ends_with("/wait-children-q0"), "{first:?}");
+
+        let re_rested = seal(&entered, entered.clone());
+        assert_eq!(owed(&re_rested), first, "a re-rest records nothing");
+        let left = seal(&re_rested, phase(&re_rested, AgentLoopPhase::AwaitingTools));
+        assert_eq!(owed(&left), first, "leaving the wait records nothing");
+
+        let again = seal(&left, phase(&left, AgentLoopPhase::AwaitingChildren));
+        let both = owed(&again);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both[1].ends_with("/wait-children-q1"), "{both:?}");
+        assert_eq!(
+            again
+                .loop_state()
+                .expect("the loop exists")
+                .decision_outbox()
+                .iter()
+                .map(|event| event.turn)
+                .collect::<Vec<_>>(),
+            [turn, turn],
+            "both entries are in one turn"
+        );
+    }
+
+    /// Queues one draft of `kind` under `slot` on the fixture's loop state.
+    fn queue(
+        loop_state: &mut AgentLoopState,
+        scope: &AgentRunScope,
+        kind: AgentDecisionKind,
+        slot: &str,
+    ) {
+        loop_state.queue_decision(
+            scope,
+            AgentDecisionDraft::new(kind, AgentDecisionSource::DeterministicPolicy, slot),
+            AgentTimestampMillis::new(1),
+        );
+    }
+
+    /// The first vocabulary discards a kind an older reader cannot decode
+    /// *before* it is given a sequence, so the stream it writes has no hole
+    /// and no drop is counted.
+    #[test]
+    fn version_one_discards_a_new_kind_without_consuming_a_sequence() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        queue(&mut loop_state, &scope, AgentDecisionKind::Continue, "a");
+        queue(
+            &mut loop_state,
+            &scope,
+            AgentDecisionKind::ResolveCheckpoint,
+            "b",
+        );
+        queue(&mut loop_state, &scope, AgentDecisionKind::Continue, "c");
+
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+
+        let outbox = loop_state.decision_outbox();
+        assert_eq!(
+            outbox.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![AgentDecisionKind::Continue, AgentDecisionKind::Continue]
+        );
+        assert_eq!(
+            outbox
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(loop_state.decision_sequence(), 2);
+        assert_eq!(loop_state.decision_drops(), 0);
+
+        // The commit drained the list: a later commit under the wider
+        // vocabulary finds nothing left to write.
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version2);
+        assert_eq!(loop_state.decision_outbox().len(), 2);
+        assert_eq!(loop_state.decision_sequence(), 2);
+    }
+
+    /// A written kind whose identity cannot be formed is lost, and the loss
+    /// consumes its sequence so a replay sees the hole.
+    #[test]
+    fn an_unformable_draft_of_a_written_kind_consumes_a_sequence_and_counts_a_drop() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        queue(&mut loop_state, &scope, AgentDecisionKind::Continue, "");
+        queue(&mut loop_state, &scope, AgentDecisionKind::Continue, "ok");
+
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+
+        assert_eq!(
+            loop_state
+                .decision_outbox()
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(loop_state.decision_sequence(), 2);
+        assert_eq!(loop_state.decision_drops(), 1);
+    }
+
+    /// An unformable draft of a kind the vocabulary does not write was never
+    /// going to be written, so it costs neither a sequence nor a drop.
+    #[test]
+    fn an_unformable_draft_of_an_unwritten_kind_consumes_nothing() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        queue(&mut loop_state, &scope, AgentDecisionKind::Cancel, "");
+
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+
+        assert!(loop_state.decision_outbox().is_empty());
+        assert_eq!(loop_state.decision_sequence(), 0);
+        assert_eq!(loop_state.decision_drops(), 0);
+    }
+
+    /// An event larger than the outbox's byte bound on its own is dropped on
+    /// arrival, since evicting every owed event would still not make room.
+    /// The loss consumes its sequence and counts a drop, and the events
+    /// already owed stay owed.
+    #[test]
+    fn an_event_over_the_byte_bound_on_its_own_is_dropped_and_leaves_the_owed_events() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        queue(
+            &mut loop_state,
+            &scope,
+            AgentDecisionKind::Continue,
+            "small",
+        );
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+
+        // Every event copies the loop's telemetry, and a span link may carry
+        // dozens of kilobyte-long attributes, so the next event outgrows the
+        // bound by itself.
+        loop_state.record_telemetry(rakka_agent_workflow::AgentTelemetryContext {
+            span_links: vec![rakka_agent_workflow::AgentSpanLink {
+                trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                span_id: "b7ad6b7169203331".to_string(),
+                trace_state: None,
+                attributes: (0..64)
+                    .map(|index| (format!("key-{index}"), "v".repeat(1000)))
+                    .collect(),
+            }],
+            ..Default::default()
+        });
+        queue(
+            &mut loop_state,
+            &scope,
+            AgentDecisionKind::Continue,
+            "oversize",
+        );
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+
+        assert_eq!(
+            loop_state
+                .decision_outbox()
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the owed event is not evicted for an event that could never fit"
+        );
+        assert_eq!(loop_state.decision_sequence(), 2);
+        assert_eq!(loop_state.decision_drops(), 1);
+    }
+
+    /// A draft is positioned when it is queued: a transition that advances
+    /// the turn after deciding (the `iterate` decision does) still records
+    /// the decision under the turn, phase and context it was made in.
+    #[test]
+    fn a_queued_draft_keeps_the_turn_and_phase_it_was_queued_under() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        loop_state.set_phase(AgentLoopPhase::DecidingContinuation);
+        let context =
+            AgentContextSnapshotRef::for_turn(&scope, 1).expect("the context reference derives");
+        loop_state.set_context_snapshot(context.clone());
+        let turn = loop_state.turn();
+        queue(
+            &mut loop_state,
+            &scope,
+            AgentDecisionKind::Continue,
+            "iterate",
+        );
+
+        loop_state.begin_turn(None);
+        loop_state.set_phase(AgentLoopPhase::AwaitingModel);
+        assert_ne!(
+            loop_state.turn(),
+            turn,
+            "the turn moved, or this proves nothing"
+        );
+        assert_eq!(loop_state.context_snapshot(), None);
+
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version2);
+
+        let event = loop_state
+            .decision_outbox()
+            .first()
+            .expect("the draft was committed");
+        assert_eq!(event.turn, turn);
+        assert_eq!(event.phase, AgentLoopPhase::DecidingContinuation);
+        assert_eq!(event.context_snapshot, Some(context));
+    }
+
+    /// The draft list is transient: it never counts in equality — so the
+    /// host's unchanged-state comparison and `unchanged_by` behave as before
+    /// — and it is never serialized.
+    #[test]
+    fn pending_drafts_never_count_in_equality() {
+        let (scope, mut loop_state) = segment_mark_fixture();
+        let before = loop_state.clone();
+        queue(&mut loop_state, &scope, AgentDecisionKind::Continue, "a");
+
+        assert_eq!(before, loop_state);
+        assert_eq!(
+            serde_json::to_value(&before).expect("the state serializes"),
+            serde_json::to_value(&loop_state).expect("the state serializes"),
+            "a queued draft is never serialized"
+        );
+
+        loop_state.commit_decisions(AgentDecisionEventVocabulary::Version1);
+        assert_ne!(before, loop_state, "a committed draft does count");
+    }
+
+    /// Recording a checkpoint the loop already holds changes nothing and says so,
+    /// which is what keeps a re-entered open from recording a second decision.
+    #[test]
+    fn recording_a_held_checkpoint_reports_it_was_not_new() {
+        let now = AgentTimestampMillis::new(1);
+        let (scope, mut loop_state) = segment_mark_fixture();
+        let context =
+            AgentContextSnapshotRef::for_turn(&scope, loop_state.turn()).expect("the ref derives");
+        let effect = AgentRunEffect::new(
+            &scope,
+            loop_state.turn(),
+            0,
+            AgentRunEffectRequest::Model {
+                context,
+                profile: None,
+            },
+            &AgentEffectSpec::read_only(),
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the effect derives");
+        let held = crate::checkpoints::AgentCheckpoint::open(
+            HumanCheckpointId::new("held"),
+            crate::checkpoints::AgentCheckpointKind::Approval,
+            scope.clone(),
+            &effect,
+            "summary",
+            PrincipalRef {
+                principal_type: "service".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            now,
+        )
+        .expect("the checkpoint opens");
+
+        assert!(loop_state
+            .record_checkpoint(held.clone())
+            .expect("the first record succeeds"));
+        assert!(!loop_state
+            .record_checkpoint(held)
+            .expect("the repeat succeeds"));
+        assert_eq!(loop_state.open_checkpoints().len(), 1);
     }
 
     /// A transition that retires one checkpoint and opens another must still
@@ -10674,19 +11625,16 @@ mod tests {
     }
 
     /// A superset of every working set one turn can hold, under maximal
-    /// identifiers, must fit the growth reserve.
+    /// identifiers: the run holding it, the bytes of the record acceptance
+    /// admitted before any of it was recorded, and the maximal scope.
     ///
-    /// The reserve exists so a run the entity admits can never later be refused
-    /// its own turn: `record_effect_result` checks the full materialized bound,
-    /// a rejected transition never enters the operation log, and the
-    /// dispatcher's retry would be refused identically forever. This test holds
-    /// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] to that claim empirically: it
-    /// materializes more than any reachable state carries at once — the maximal
-    /// pending turn, its full effect fan-out, every tool result, the proposal,
-    /// the accepted result, the feedback, and the terminal reason together —
-    /// and measures the growth over the record acceptance admitted.
-    #[test]
-    fn the_growth_reserve_covers_the_maximal_working_set() {
+    /// It materializes more than any reachable state carries at once — the
+    /// maximal pending turn, its full effect fan-out, every tool result, the
+    /// proposal, the accepted result, the feedback, and the terminal reason
+    /// together — so the growth it measures over the baseline bounds what any
+    /// admitted run can grow by within one turn. The decision outbox is left
+    /// empty: the proofs that need it fill it themselves.
+    fn maximal_working_set() -> (AgentRun, usize, AgentRunScope) {
         let now = AgentTimestampMillis::new(1);
         let maximal_reason = crate::failure::AgentFailureReason::guardrail(
             crate::definition::AgentGuardrailStageId::new(
@@ -10721,9 +11669,11 @@ mod tests {
             crate::budget::AgentBudgetGrant::from_ceilings(&definition.budgets),
             now,
         );
+        // A run serving a goal carries its id from acceptance on, and every
+        // decision event copies it.
         let loop_state = AgentLoopState::started(
             task.clone(),
-            None,
+            Some(AgentGoalId::new(&long).expect("the goal id is valid")),
             AgentRevisionNumber::INITIAL,
             AgentRevisionNumber::INITIAL,
             definition.version,
@@ -10889,6 +11839,30 @@ mod tests {
             max_attempts: Some(u32::MAX),
         });
 
+        (run, baseline, scope)
+    }
+
+    /// A superset of every working set one turn can hold, under maximal
+    /// identifiers, must fit the growth reserve.
+    ///
+    /// The reserve exists so a run the entity admits can never later be refused
+    /// its own turn: `record_effect_result` checks the full materialized bound,
+    /// a rejected transition never enters the operation log, and the
+    /// dispatcher's retry would be refused identically forever. This test
+    /// measures the working set alone against
+    /// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`]: it materializes more than any
+    /// reachable state carries at once ([`maximal_working_set`]) and measures
+    /// the growth over the record acceptance admitted. The reserve also holds
+    /// the owed decision outbox, so the claim the reserve makes in full — the
+    /// working set and a full outbox together — is held by
+    /// `the_growth_reserve_covers_the_working_set_and_a_full_decision_outbox`.
+    #[test]
+    fn the_growth_reserve_covers_the_maximal_working_set() {
+        let (mut run, baseline, scope) = maximal_working_set();
+        let now = AgentTimestampMillis::new(1);
+        let turn = run.loop_state.turn();
+        let long = "a".repeat(crate::identity::AGENT_IDENTITY_MAX_LENGTH);
+
         let growth = run.materialized_size_bytes().saturating_sub(baseline);
         assert!(
             growth <= AGENT_RUN_STATE_GROWTH_RESERVE_BYTES,
@@ -11031,6 +12005,176 @@ mod tests {
         );
     }
 
+    /// The maximal working set and a full decision outbox of maximal events
+    /// must fit the growth reserve together.
+    ///
+    /// A transition checks the run's bounds *before* the participant's seal
+    /// commits the decision events it queued, so a persisted record can exceed
+    /// what the check measured by the events sealed after it, and an outbox
+    /// that grew past what the reserve covers would push the record over
+    /// [`AGENT_RUN_MATERIALIZED_MAX_BYTES`]: every later transition would then
+    /// be refused over telemetry, the anti-goal of specification 17.1. What
+    /// makes the late seal safe is the property this test measures: under
+    /// maximal identifiers, the growth over the record acceptance admitted —
+    /// the maximal working set ([`maximal_working_set`]) *plus* an outbox
+    /// holding all it may at [`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`] — stays
+    /// within [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`], so the admission
+    /// budget is unchanged.
+    ///
+    /// The worst case is asserted directly, not only reached: the working
+    /// set's measured growth, plus the outbox's whole byte bound, plus the
+    /// largest container the outbox can serialize in (a full ring with both
+    /// counters at their widest, measured from a serialized loop state), must
+    /// fit the reserve. Maximal events settle a few owed events short of the
+    /// byte bound, so the measured record alone would leave the reserve's
+    /// margin unchecked. The fill then offers twice the ring's count of maximal
+    /// events, as a sink that stays down would leave them, and the byte bound
+    /// must have evicted past what the count alone would, or the test proves
+    /// nothing about it.
+    #[test]
+    fn the_growth_reserve_covers_the_working_set_and_a_full_decision_outbox() {
+        use crate::loop_runtime::AGENT_RUN_DECISION_OUTBOX_CAPACITY;
+
+        let (mut run, baseline, scope) = maximal_working_set();
+        let working_set_growth = run.materialized_size_bytes().saturating_sub(baseline);
+        let now = AgentTimestampMillis::new(1);
+        let longest = crate::identity::AGENT_IDENTITY_MAX_LENGTH;
+
+        // A maximal event sets every field it can, each at its longest: the
+        // checkpoint and effect of the last slot the maximal fan-out could
+        // derive, under the largest generation, with both deadlines set; the
+        // longest kind, source, outcome, run status and safety-class labels; a
+        // reason code at its bound; and a full fan-out of selected tools at the
+        // longest tool id. The loop supplies the rest — the maximal scope,
+        // task and goal, the context snapshot, and the telemetry — from the
+        // working set.
+        let effect_id = effect_id_for(&scope, u64::MAX, usize::MAX).expect("the effect id derives");
+        let generation = AgentEffectGeneration::new(u32::MAX);
+        let kind = AgentCheckpointKind::IndeterminateEffectReconciliation;
+        let checkpoint = crate::observability::AgentDecisionCheckpoint {
+            checkpoint_id: AgentCheckpoint::id_for_effect(&effect_id, generation, kind),
+            kind,
+            due_at: Some(AgentTimestampMillis::new(u64::MAX)),
+            expires_at: Some(AgentTimestampMillis::new(u64::MAX)),
+        };
+        let effect = crate::query::AgentCheckpointBoundEffectView {
+            effect_id,
+            generation,
+            target: format!("tool:{}", "t".repeat(longest)),
+            safety_class: crate::definition::AgentEffectSafetyClass::NonIdempotent,
+        };
+        let tools: Vec<AgentToolId> = (0..crate::model::AGENT_MODEL_MAX_TOOL_CALLS)
+            .map(|_| AgentToolId::new("t".repeat(longest)).expect("the tool id is valid"))
+            .collect();
+        // Every event needs its own identity, or the outbox would skip it as
+        // a re-driven duplicate; the generation digits vary and keep their
+        // length.
+        let maximal_draft = |ordinal: u64| {
+            AgentDecisionDraft::new(
+                AgentDecisionKind::RequestReconciliation,
+                AgentDecisionSource::AuthorizationService,
+                format!(
+                    "ck-escalate-reconcile-t{}-s{}-g{}",
+                    u64::MAX,
+                    usize::MAX,
+                    u64::MAX - ordinal
+                ),
+            )
+            .with_checkpoint(checkpoint.clone())
+            .with_effect(effect.clone())
+            .with_outcome(crate::observability::AgentDecisionOutcome::ConfirmedNotExecuted)
+            .with_run_status(AgentRunStatus::WaitingForReconciliation)
+            .with_safety_class(crate::definition::AgentEffectSafetyClass::NonIdempotent)
+            .with_reason_code("r".repeat(crate::observability::AGENT_DECISION_REASON_MAX_LENGTH))
+            .with_selected_tools(tools.clone())
+        };
+
+        // The sink is down: nothing is flushed, so every commit adds to the
+        // outbox and the bound alone decides what it keeps.
+        let offered = 2 * AGENT_RUN_DECISION_OUTBOX_CAPACITY;
+        for ordinal in 0..offered {
+            run.loop_state
+                .queue_decision(&scope, maximal_draft(ordinal as u64), now);
+            run.loop_state
+                .commit_decisions(AgentDecisionEventVocabulary::Version2);
+        }
+
+        let outbox = run.loop_state.decision_outbox();
+        let one_event = serde_json::to_vec(outbox.last().expect("a maximal event is owed"))
+            .expect("the event encodes")
+            .len();
+        assert!(
+            one_event <= AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+            "one maximal event is {one_event} bytes, more than the \
+             {AGENT_RUN_DECISION_OUTBOX_MAX_BYTES} byte bound: every such event would be dropped"
+        );
+        let owed: usize = outbox
+            .iter()
+            .map(|event| serde_json::to_vec(event).expect("the event encodes").len())
+            .sum();
+        assert!(
+            owed <= AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+            "the outbox owes {owed} bytes, more than its {AGENT_RUN_DECISION_OUTBOX_MAX_BYTES} \
+             byte bound"
+        );
+        let count_drops = (offered - AGENT_RUN_DECISION_OUTBOX_CAPACITY) as u64;
+        assert!(
+            run.loop_state.decision_drops() > count_drops,
+            "the count bound alone drops {count_drops}; the byte bound must have evicted \
+             beyond that, or this proves nothing about it"
+        );
+        assert_eq!(
+            outbox.len() as u64 + run.loop_state.decision_drops(),
+            run.loop_state.decision_sequence(),
+            "every sequence is either owed or counted as dropped"
+        );
+        assert_eq!(run.loop_state.decision_sequence(), offered as u64);
+
+        let growth = run.materialized_size_bytes().saturating_sub(baseline);
+        assert!(
+            growth <= AGENT_RUN_STATE_GROWTH_RESERVE_BYTES,
+            "the maximal working set and a full decision outbox grow the record by {growth} \
+             bytes, which exceeds the {AGENT_RUN_STATE_GROWTH_RESERVE_BYTES} byte reserve: a \
+             run admitted at the bound could be refused a transition over telemetry"
+        );
+
+        // The worst case the bound admits, which the fill above stops short of.
+        let container_max = run
+            .loop_state
+            .decision_outbox_container_max_bytes(outbox.last().expect("a maximal event is owed"));
+        let worst_case = working_set_growth + AGENT_RUN_DECISION_OUTBOX_MAX_BYTES + container_max;
+        assert!(
+            worst_case <= AGENT_RUN_STATE_GROWTH_RESERVE_BYTES,
+            "the maximal working set ({working_set_growth} bytes), a full outbox \
+             ({AGENT_RUN_DECISION_OUTBOX_MAX_BYTES} bytes) and its largest container \
+             ({container_max} bytes) need {worst_case} bytes, more than the \
+             {AGENT_RUN_STATE_GROWTH_RESERVE_BYTES} byte reserve: a run admitted at the bound \
+             could be refused a transition over telemetry"
+        );
+    }
+
+    /// The interception door leaves the owed decision outbox's bound free.
+    ///
+    /// The door prices delegations and workflow invocations against the
+    /// materialized bound, and the seal adds the turn's decision events after
+    /// the bounds check. A door that could spend the record up to the bound
+    /// would leave a full outbox nowhere to land.
+    #[test]
+    fn the_coordination_door_holds_the_decision_outbox_bound_back() {
+        let (run, _baseline, _scope) = maximal_working_set();
+        let size = run.materialized_size_bytes();
+        assert!(
+            size + AGENT_RUN_DECISION_OUTBOX_MAX_BYTES < AGENT_RUN_MATERIALIZED_MAX_BYTES,
+            "the fixture must sit below the door's ceiling, or the headroom saturates"
+        );
+
+        assert_eq!(
+            run.coordination_door_headroom() + size + AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+            AGENT_RUN_MATERIALIZED_MAX_BYTES,
+            "the door may spend everything below the bound except the outbox's room"
+        );
+    }
+
     /// The sharded factory's per-entity builder installs the settings'
     /// observability wiring onto the hosted run's inner store — both the
     /// metrics recorder and the decision sink — so a clustered run measures its
@@ -11052,7 +12196,8 @@ mod tests {
         let sink: Arc<dyn AgentDecisionEventSink> = Arc::new(InMemoryAgentDecisionEventSink::new());
         let settings = AgentRunEntityShardingSettings::new(agent_run_entity_type_key())
             .with_metrics(metrics.clone())
-            .with_decision_events(sink);
+            .with_decision_events(sink)
+            .with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2);
 
         let scope = AgentRunScope::new(
             TenantId::new("acme"),
@@ -11071,6 +12216,13 @@ mod tests {
         assert!(
             inner.decisions.is_some(),
             "the settings' decision sink is wired onto the hosted run"
+        );
+        assert_eq!(
+            *inner.host.participant_mut(),
+            AgentRunParticipant {
+                decisions: Some(AgentDecisionEventVocabulary::Version2)
+            },
+            "the settings' vocabulary reaches the participant the host seals with"
         );
         assert!(
             Arc::ptr_eq(&inner.metrics, &metrics),
@@ -11092,9 +12244,66 @@ mod tests {
             unwired.decisions.is_none(),
             "an unwired deployment records no decision events"
         );
+        assert_eq!(
+            *unwired.host.participant_mut(),
+            AgentRunParticipant::default(),
+            "an unwired participant discards what its transitions queue"
+        );
         assert!(
             !Arc::ptr_eq(&unwired.metrics, &metrics),
             "an unwired deployment measures through the no-op default"
+        );
+    }
+
+    /// The participant commits queued decisions only once a sink is wired,
+    /// under the store's vocabulary, whichever builder ran first.
+    #[test]
+    fn the_run_participant_follows_the_sink_and_the_vocabulary_in_either_order() {
+        use std::sync::Arc;
+
+        use rakka_persistence::InMemoryDurableStateStore;
+
+        use crate::effect::InMemoryAgentRunEffectSink;
+        use crate::observability::InMemoryAgentDecisionEventSink;
+
+        let (scope, _) = segment_mark_fixture();
+        let store = || {
+            AgentRunEntityStore::new(
+                scope.clone(),
+                InMemoryDurableStateStore::<AgentRunState>::new(),
+                InMemoryAgentRunEffectSink::new(),
+            )
+        };
+        let sink = || -> Arc<dyn AgentDecisionEventSink> {
+            Arc::new(InMemoryAgentDecisionEventSink::new())
+        };
+        let wired = AgentRunParticipant {
+            decisions: Some(AgentDecisionEventVocabulary::Version2),
+        };
+
+        let mut sink_first = store()
+            .with_decision_events(sink())
+            .with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2);
+        assert_eq!(*sink_first.host.participant_mut(), wired);
+        let mut vocabulary_first = store()
+            .with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2)
+            .with_decision_events(sink());
+        assert_eq!(*vocabulary_first.host.participant_mut(), wired);
+
+        let mut vocabulary_only =
+            store().with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2);
+        assert_eq!(
+            *vocabulary_only.host.participant_mut(),
+            AgentRunParticipant::default(),
+            "a vocabulary without a sink records nothing"
+        );
+        let mut sink_only = store().with_decision_events(sink());
+        assert_eq!(
+            *sink_only.host.participant_mut(),
+            AgentRunParticipant {
+                decisions: Some(AgentDecisionEventVocabulary::Version1)
+            },
+            "a sink alone writes the default vocabulary"
         );
     }
 
@@ -11974,6 +13183,54 @@ mod tests {
         assert!(fx.run().loop_state.open_checkpoints().is_empty());
     }
 
+    /// Issue #119: a decision the checkpoint has already applied under its
+    /// key is answered by the checkpoint's own deduplication, which records
+    /// no decision, even for an outcome whose first application records one.
+    #[test]
+    fn a_decision_the_checkpoint_already_applied_records_nothing() {
+        let mut fx = parked();
+        let checkpoint_id = fx.checkpoint_id();
+        let decision =
+            || reconcile(crate::checkpoints::AgentReconciliationDecision::AbandonAndFail);
+        // The record shows the key applied while the checkpoint is still held.
+        // No transition leaves a resolved checkpoint held, so this is built by
+        // hand: it leaves the deduplicated branch as the only thing between
+        // the replay and a recorded `reconcile`.
+        fx.state
+            .run_mut()
+            .expect("the run exists")
+            .loop_state
+            .open_checkpoint_mut(&checkpoint_id)
+            .expect("the checkpoint is held")
+            .resolve(decision_key("abandon"), operator(), decision(), fx.now)
+            .expect("the checkpoint records the decision");
+        let run = fx.state.run_mut().expect("the run exists");
+        run.loop_state
+            .commit_decisions(AgentDecisionEventVocabulary::Version2);
+        let sequence = run.loop_state.decision_sequence();
+
+        resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            decision(),
+            decision_key("abandon"),
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            fx.now,
+        )
+        .expect("the replay is answered");
+
+        let run = fx.state.run_mut().expect("the run exists");
+        run.loop_state
+            .commit_decisions(AgentDecisionEventVocabulary::Version2);
+        assert_eq!(run.loop_state.decision_sequence(), sequence);
+        assert!(
+            !run.status.is_terminal(),
+            "the replay applied no consequence either"
+        );
+    }
+
     /// Ruling 3: compensating the send settles the transfer in the same
     /// compare-and-set, so the wind-down never waits on a handoff result
     /// that may not come. The run ends once the compensation's outcome lands.
@@ -12101,7 +13358,6 @@ mod tests {
             &mut fx.state,
             &AgentEffectPolicies::default(),
             false,
-            false,
             None,
             None,
             now,
@@ -12136,7 +13392,6 @@ mod tests {
             &mut fx.state,
             &AgentEffectPolicies::default(),
             false,
-            false,
             None,
             None,
             now,
@@ -12166,7 +13421,6 @@ mod tests {
         advance_once(
             &mut fx.state,
             &AgentEffectPolicies::default(),
-            false,
             false,
             None,
             None,
@@ -12395,5 +13649,42 @@ mod tests {
         .expect("the exhaustion records");
 
         assert_parked(&fx);
+    }
+
+    /// An invalid resolution sent to a run that never accepted an assignment
+    /// answers the resolution's own validation error, not `NotAccepted`: the
+    /// reconcile record is queued only where a run exists, so the core's
+    /// ordering decides the refusal (issue #119).
+    #[test]
+    fn an_invalid_resolution_for_an_unassigned_run_answers_the_validation_error() {
+        let now = AgentTimestampMillis::new(10);
+        let scope = AgentRunScope::new(
+            TenantId::new("tenant"),
+            AgentId::new("agent").expect("the agent id is valid"),
+            AgentRunId::new("run").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let mut state = AgentRunState::unassigned(scope, now);
+        let resolution = AgentEffectResolution::ConfirmedExecuted {
+            outcome: Box::new(AgentRunEffectOutcome::Cancelled {
+                reason: "resolves nothing".to_string(),
+            }),
+        };
+
+        let refusal = resolve_indeterminate_effect(
+            &mut state,
+            &AgentEffectId::new("effect-1"),
+            AgentEffectGeneration::FIRST,
+            resolution,
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            now,
+        )
+        .expect_err("the resolution resolves nothing");
+
+        assert!(
+            matches!(refusal, AgentRunError::Effect(_)),
+            "the validation error answers, not NotAccepted: {refusal:?}"
+        );
     }
 }

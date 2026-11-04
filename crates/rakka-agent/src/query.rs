@@ -40,7 +40,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::{AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetDimension};
 use crate::checkpoints::{
-    AgentCheckpoint, AgentCheckpointDecisionOption, AgentCheckpointKind, AgentCheckpointStatus,
+    AgentCheckpoint, AgentCheckpointDecisionOption, AgentCheckpointEffectBinding,
+    AgentCheckpointKind, AgentCheckpointStatus,
 };
 use crate::choreography::AgentExchangeState;
 use crate::definition::{
@@ -52,8 +53,8 @@ use crate::delegation::{
     AgentDelegationStatus,
 };
 use crate::effect::{
-    AgentEffectGeneration, AgentRunEffectKind, AgentRunEffectRequest, AgentRunEffectStatus,
-    AgentUnknownOutcomeEvidence,
+    AgentEffectGeneration, AgentRunEffect, AgentRunEffectKind, AgentRunEffectRequest,
+    AgentRunEffectStatus, AgentUnknownOutcomeEvidence,
 };
 use crate::evaluation::{
     AgentGoalEvaluationMethodKind, AgentGoalEvaluationOutcome, AgentGoalEvidenceRef,
@@ -288,6 +289,26 @@ pub struct AgentCheckpointBoundEffectView {
     pub target: String,
     /// The safety class the checkpoint gates.
     pub safety_class: AgentEffectSafetyClass,
+}
+
+impl AgentCheckpointBoundEffectView {
+    pub(crate) fn of_binding(binding: &AgentCheckpointEffectBinding) -> Self {
+        Self {
+            effect_id: binding.effect_id.clone(),
+            generation: binding.generation,
+            target: binding.target.clone(),
+            safety_class: binding.safety_class,
+        }
+    }
+
+    pub(crate) fn of_effect(effect: &AgentRunEffect) -> Self {
+        Self {
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            target: effect.request.target_label(),
+            safety_class: effect.safety.class(),
+        }
+    }
 }
 
 /// One open checkpoint, as the authoritative snapshot reports it
@@ -755,9 +776,10 @@ pub struct AgentOperationalSnapshot {
     /// The bounded label of the wait the run is in, when it is waiting.
     pub wait_reason: Option<String>,
     /// The earliest durable checkpoint deadline that will wake the run, when
-    /// one is set. M1 waits park on checkpoints and effects; timer occurrences
-    /// live in the substrate's timer store and join here when the wake
-    /// controller lands (Phase 3).
+    /// one is set. No agent run enters `WaitingForTimer`: a run waits on
+    /// checkpoints, effects, children and handoffs, and timer wakes belong to
+    /// the wake controller's epochs on the task, not to the run, so no timer
+    /// occurrence ever appears here.
     pub next_wake: Option<AgentTimestampMillis>,
     /// Every effect the run holds that is not yet resolved.
     pub pending_effects: Vec<AgentPendingEffectView>,
@@ -838,12 +860,9 @@ impl AgentOperationalSnapshot {
                         required_capabilities: checkpoint.required_capabilities.len(),
                         due_at: checkpoint.due_at,
                         expires_at: checkpoint.expires_at,
-                        bound_effect: AgentCheckpointBoundEffectView {
-                            effect_id: checkpoint.bound_effect.effect_id.clone(),
-                            generation: checkpoint.bound_effect.generation,
-                            target: checkpoint.bound_effect.target.clone(),
-                            safety_class: checkpoint.bound_effect.safety_class,
-                        },
+                        bound_effect: AgentCheckpointBoundEffectView::of_binding(
+                            &checkpoint.bound_effect,
+                        ),
                         allowed_decisions: checkpoint.allowed_decisions.clone(),
                         summary: checkpoint.summary.clone(),
                     })

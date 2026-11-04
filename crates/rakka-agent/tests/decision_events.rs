@@ -14,9 +14,12 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    load_agent_run_state, AgentDecisionKind, AgentDecisionSource, AgentModelTurn, AgentModelUsage,
-    AgentSchemaPolicy, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    InMemoryAgentDecisionEventSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    load_agent_run_state, AgentDecisionEvent, AgentDecisionEventPage, AgentDecisionEventSink,
+    AgentDecisionKind, AgentDecisionSource, AgentDecisionWriteStatus, AgentModelTurn,
+    AgentModelUsage, AgentObservabilityError, AgentObservabilityFuture, AgentRunScope,
+    AgentRunStatus, AgentSchemaPolicy, AgentTaskContent, AgentToolCallId, AgentToolCallRequest,
+    AgentToolId, InMemoryAgentDecisionEventSink, AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 
 mod common;
@@ -53,8 +56,9 @@ fn proposing_turn(answer: &str) -> AgentModelTurn {
 
 /// A run that calls a tool on its first turn and proposes on its second emits
 /// the decision sequence that explains it — start, call-tools, iterate,
-/// submit-result — each event bounded, sequenced, and attributed to its source,
-/// and a re-driven pump never emits a decision twice.
+/// submit-result, and the run's complete end — each event bounded, sequenced,
+/// and attributed to its source, and a re-driven pump never emits a decision
+/// twice.
 #[tokio::test]
 async fn a_run_emits_its_decision_sequence_exactly_once() {
     let sink = Arc::new(InMemoryAgentDecisionEventSink::new());
@@ -84,14 +88,15 @@ async fn a_run_emits_its_decision_sequence_exactly_once() {
             AgentDecisionKind::CallTools,    // the model's turn-one fan-out
             AgentDecisionKind::Continue,     // the model's decision to iterate
             AgentDecisionKind::SubmitResult, // the model's turn-two proposal
+            AgentDecisionKind::Complete,     // the run's end on the task's acceptance
         ],
     );
 
     // Each event is bounded, sequenced, and attributed.
     let sequences: Vec<u64> = events.iter().map(|event| event.sequence).collect();
-    assert_eq!(sequences, vec![1, 2, 3, 4], "per-run monotonic sequence");
+    assert_eq!(sequences, vec![1, 2, 3, 4, 5], "per-run monotonic sequence");
     let turns: Vec<u64> = events.iter().map(|event| event.turn).collect();
-    assert_eq!(turns, vec![1, 1, 1, 2]);
+    assert_eq!(turns, vec![1, 1, 1, 2, 2]);
     assert_eq!(events[0].source, AgentDecisionSource::DeterministicPolicy);
     assert_eq!(events[1].source, AgentDecisionSource::Model);
     assert_eq!(
@@ -104,6 +109,11 @@ async fn a_run_emits_its_decision_sequence_exactly_once() {
         "the selected tool classes ride the call-tools decision"
     );
     assert_eq!(events[3].source, AgentDecisionSource::Model);
+    assert_eq!(events[4].source, AgentDecisionSource::DeterministicPolicy);
+    // The default vocabulary writes none of the version-2 fields, so the end
+    // is read from its kind and reason code.
+    assert_eq!(events[4].run_status, None);
+    assert_eq!(events[4].reason_code.as_deref(), Some("result-accepted"));
     for event in &events {
         assert_eq!(event.task.as_ref(), Some(task_scope().task()));
         assert_eq!(event.scope, scope);
@@ -113,7 +123,7 @@ async fn a_run_emits_its_decision_sequence_exactly_once() {
     // events were flushed and cleared, and every decision's derived identity
     // already answered.
     fx.pump().await.expect("the re-driven pump is harmless");
-    assert_eq!(sink.events(&scope).len(), 4);
+    assert_eq!(sink.events(&scope).len(), 5);
 
     // The flushed outbox is empty in durable state: the run owes nothing, so a
     // passivated run holds no unflushed telemetry.
@@ -128,10 +138,96 @@ async fn a_run_emits_its_decision_sequence_exactly_once() {
     assert_eq!(owed, 0, "every owed decision was flushed");
 }
 
+/// A sink whose backend is down for good: every append and every read fails.
+#[derive(Debug)]
+struct AlwaysDownSink;
+
+impl AgentDecisionEventSink for AlwaysDownSink {
+    fn backend_name(&self) -> &'static str {
+        "always-down"
+    }
+
+    fn append<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _event: &'a AgentDecisionEvent,
+    ) -> AgentObservabilityFuture<'a, AgentDecisionWriteStatus> {
+        Box::pin(async { Err(sink_down()) })
+    }
+
+    fn read<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _after: u64,
+        _limit: usize,
+    ) -> AgentObservabilityFuture<'a, AgentDecisionEventPage> {
+        Box::pin(async { Err(sink_down()) })
+    }
+}
+
+fn sink_down() -> AgentObservabilityError {
+    AgentObservabilityError::Sink {
+        code: "unavailable".to_string(),
+        message: "the decision-event backend is down".to_string(),
+    }
+}
+
+/// A run whose decision sink is down still completes: telemetry is never a
+/// correctness input ([specification 17.1](../../../docs/plans/rakka-agent/spec.md)).
+/// The events it could not flush stay owed in its durable record, within the
+/// outbox's byte bound, and every sequence the run assigned is accounted for:
+/// either still owed or counted as dropped, so a replay reader can see any
+/// hole.
+#[tokio::test]
+async fn a_run_with_its_sink_down_completes_and_accounts_for_every_sequence() {
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, proposing_turn("resolved")),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    );
+    let fx = Fixture::new(dispatcher).with_decision_events(Arc::new(AlwaysDownSink));
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump()
+        .await
+        .expect("a sink that is down never fails the run");
+
+    let state = load_agent_run_state(&fx.runs, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+    assert_eq!(state.status(), Some(AgentRunStatus::Completed));
+    let loop_state = state.loop_state().expect("the run has a loop state");
+    let outbox = loop_state.decision_outbox();
+    assert!(
+        !outbox.is_empty(),
+        "nothing was flushed, so the run still owes its decisions"
+    );
+    assert_eq!(
+        outbox.len() as u64 + loop_state.decision_drops(),
+        loop_state.decision_sequence(),
+        "every sequence is either owed or counted as dropped"
+    );
+    let owed: usize = outbox
+        .iter()
+        .map(|event| serde_json::to_vec(event).expect("the event encodes").len())
+        .sum();
+    assert!(
+        owed <= AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+        "the run owes {owed} bytes of decision events, more than the \
+         {AGENT_RUN_DECISION_OUTBOX_MAX_BYTES} byte bound"
+    );
+}
+
 /// Scenario 21's decision half under the owner-kill sweep: kill the run's
 /// owner at every durable write of the two-turn flow, on both sides of the
 /// compare-and-set. However the owner died, the converged sink holds exactly
-/// the four-decision sequence once — the derived event identity deduplicates
+/// the five-decision sequence once — the derived event identity deduplicates
 /// every re-driven flush — and the durable decision outbox is empty. The run
 /// store is the only store this flow's crash windows live in; the driver is
 /// the in-process dispatcher, so owner kill at every write is the complete
@@ -193,13 +289,14 @@ async fn the_decision_sequence_survives_any_owner_loss_exactly_once() {
                 AgentDecisionKind::CallTools,
                 AgentDecisionKind::Continue,
                 AgentDecisionKind::SubmitResult,
+                AgentDecisionKind::Complete,
             ],
             "crash {point:?} at write {nth} duplicated or dropped a decision"
         );
         let sequences: Vec<u64> = events.iter().map(|event| event.sequence).collect();
         assert_eq!(
             sequences,
-            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4, 5],
             "crash {point:?} at write {nth} broke the decision sequence"
         );
 

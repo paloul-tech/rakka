@@ -214,8 +214,8 @@ pub use guardrails::{
 };
 pub use loop_runtime::{
     AgentGoalEvaluationCell, AgentLoopPhase, AgentLoopState, AgentMemoryPromotionRecord,
-    AgentPendingTopUp, AgentRunProposal, AGENT_RUN_MAX_MEMORY_PROMOTIONS,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentPendingTopUp, AgentRunProposal, AGENT_RUN_DECISION_OUTBOX_MAX_BYTES,
+    AGENT_RUN_MAX_MEMORY_PROMOTIONS, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 pub use memory::{
     assemble_session_context, check_memory_schema, check_private_memory_schema,
@@ -258,8 +258,9 @@ pub use observability::{
     agent_linked_telemetry_context, agent_span_link, record_agent_domain_counter,
     record_agent_domain_duration, record_agent_domain_gauge, record_agent_domain_histogram,
     record_unsettleable_exchanges, sanitize_agent_telemetry_context,
-    validate_agent_domain_metric_attributes, AgentDecisionDraft, AgentDecisionEvent,
-    AgentDecisionEventPage, AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource,
+    validate_agent_domain_metric_attributes, AgentDecisionCheckpoint, AgentDecisionDraft,
+    AgentDecisionEvent, AgentDecisionEventPage, AgentDecisionEventSink,
+    AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionOutcome, AgentDecisionSource,
     AgentDecisionWriteStatus, AgentDomainMetricInstrument, AgentObservabilityError,
     AgentObservabilityFuture, AgentObservabilityResult, AgentSegmentIdentity,
     AgentSegmentOperation, AgentSegmentOutcome, AgentSegmentSink, AgentSegmentSinkHealth,

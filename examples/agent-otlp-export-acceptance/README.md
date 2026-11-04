@@ -48,7 +48,7 @@ ok  7/12 3 histograms exported with the catalogue's boundaries and the +Inf buck
 ok  8/12 3 of 3 exported histograms carry an exemplar linking to the run's trace
 ok  9/12 39 spans and every metric crossed a real OTLP gRPC socket
 ok 10/12 no prompt, tool argument, result, or exporter credential appears in the decoded OTLP payload, the bridge record's Debug, or its serialization
-ok 11/12 the run completed, the tool ran exactly once, and all 4 deciding transitions were durably recorded: telemetry changed no durable outcome
+ok 11/12 the run completed, the tool ran exactly once, and all 6 deciding transitions were durably recorded: telemetry changed no durable outcome
 ok 12/12 export queue depth published, nothing dropped, and 1 pre-trace segment counted unmappable rather than exported under an invented trace
 ```
 

@@ -830,11 +830,12 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
             AgentDecisionKind::CallTools,
             AgentDecisionKind::Continue,
             AgentDecisionKind::SubmitResult,
+            AgentDecisionKind::Complete,
         ],
         "the session's decisions are reconstructable in order (scenario 21)"
     );
     assert_eq!(
-        view.snapshot.decision_cursor, 4,
+        view.snapshot.decision_cursor, 5,
         "the durable cursor backs the lag computation"
     );
 
@@ -853,8 +854,8 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
     assert!(!degraded.decisions_available);
     assert!(degraded.decisions.is_empty());
     assert_eq!(
-        degraded.decision_lag, 4,
-        "all four decisions are unprojected"
+        degraded.decision_lag, 5,
+        "all five decisions are unprojected"
     );
     assert_eq!(degraded.snapshot, view.snapshot);
 
@@ -894,7 +895,7 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
             .iter()
             .map(|event| event.sequence)
             .collect::<Vec<_>>(),
-        vec![1, 2, 4],
+        vec![1, 2, 4, 5],
         "every retained decision is shown; only the hole is absent"
     );
     assert_eq!(gapped.snapshot, view.snapshot);
@@ -903,6 +904,9 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
     // interpreted with guessed semantics: the view treats the sink as
     // unavailable and the authoritative half is untouched, while the replay
     // entry point — the same load path — refuses it outright.
+    let written = rakka_agent::AgentDecisionEventVocabulary::default()
+        .schema_version()
+        .get();
     let current = rakka_agent::AgentRecordKind::DecisionEvent
         .current_schema_version()
         .get();
@@ -912,7 +916,7 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
             let mut value = serde_json::to_value(event).expect("the event serializes");
             assert_eq!(
                 value["schema_version"],
-                serde_json::json!(current),
+                serde_json::json!(written),
                 "the doctored path must reach the event's schema version"
             );
             value["schema_version"] = serde_json::json!(current + 1);

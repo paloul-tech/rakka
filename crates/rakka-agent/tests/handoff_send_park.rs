@@ -14,15 +14,17 @@ mod common;
 use std::sync::Arc;
 
 use common::{
-    agent_scope, goal_spec_draft, goal_spec_with_handoff, goal_task_creation_command,
-    handoff_config, handoff_target_scope, handoff_tool_id, run_scope, task_definition, task_scope,
-    ApplyingHandoffExecutor, Fixture, HANDOFF_SKILL,
+    agent_scope, assert_decision_stream_whole, goal_spec_draft, goal_spec_with_handoff,
+    goal_task_creation_command, handoff_config, handoff_target_scope, handoff_tool_id, run_scope,
+    task_definition, task_scope, ApplyingHandoffExecutor, CountingDecisionSink, Fixture,
+    HANDOFF_SKILL,
 };
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     AgentA2aHandoffFinding, AgentA2aHandoffSendExecutor, AgentBudgetAllocation,
     AgentBudgetCeilings, AgentBudgetDimension, AgentCheckpoint, AgentCheckpointDecision,
-    AgentCheckpointKind, AgentDispatchError, AgentDispatchFuture, AgentHandoffRecord,
+    AgentCheckpointKind, AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionOutcome,
+    AgentDecisionSource, AgentDispatchError, AgentDispatchFuture, AgentHandoffRecord,
     AgentHandoffStatus, AgentModelTurn, AgentOperationId, AgentOperationKind,
     AgentReconciliationDecision, AgentRun, AgentRunEffect, AgentRunEffectKind,
     AgentRunEffectStatus, AgentRunEntityCommand, AgentRunScope, AgentRunStatus,
@@ -109,14 +111,29 @@ async fn parking_world(
     record_transfer: bool,
     target_ready: bool,
 ) -> (Fixture, Arc<InMemoryAgentSegmentSink>) {
+    parking_world_with(record_transfer, target_ready, None).await
+}
+
+/// [`parking_world`], with the run's decision events written to `decisions`
+/// under the vocabulary that writes every kind, when given.
+async fn parking_world_with(
+    record_transfer: bool,
+    target_ready: bool,
+    decisions: Option<Arc<CountingDecisionSink>>,
+) -> (Fixture, Arc<InMemoryAgentSegmentSink>) {
     let segments = Arc::new(InMemoryAgentSegmentSink::new());
-    let fixture = Fixture::new(ScriptedDispatcher::with_adapter(
+    let mut fixture = Fixture::new(ScriptedDispatcher::with_adapter(
         DeterministicModelAdapter::new()
             .with_turn(handoff_turn())
             .with_turn(proposing_turn()),
     ))
     .with_delegation(handoff_config())
     .with_segments(segments.clone());
+    if let Some(decisions) = decisions {
+        fixture = fixture
+            .with_decision_events(decisions)
+            .with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2);
+    }
     let executor = Arc::new(LostAnswerExecutor {
         applying: record_transfer.then(|| ApplyingHandoffExecutor::over(&fixture)),
     });
@@ -407,4 +424,98 @@ async fn a_park_left_without_its_checkpoint_heals_on_the_next_settle_pass() {
         )
     );
     assert_eq!(healed.status, AgentRunStatus::WaitingForReconciliation);
+}
+
+/// Issue #119: the task's answer settling a parked send applies exactly the
+/// resolution a `ConfirmedExecuted` decision would, so the run's stream
+/// records it as one `reconcile`, by deterministic policy, naming the
+/// checkpoint it retires and following that checkpoint's open. An accepted
+/// and a refused answer both prove the send executed.
+#[tokio::test]
+async fn a_task_answer_settling_a_parked_send_records_one_reconcile() {
+    for target_ready in [true, false] {
+        let sink = CountingDecisionSink::new();
+        let (fixture, _segments) = parking_world_with(true, target_ready, Some(sink.clone())).await;
+        settle(&fixture).await;
+        let run = run_record(&fixture).await;
+        let released = if target_ready {
+            AgentRunStatus::HandedOff
+        } else {
+            AgentRunStatus::Completed
+        };
+        assert_eq!(run.status, released, "the task's answer released the park");
+        assert!(run.loop_state.open_checkpoints().is_empty());
+        // The send itself may already be gone from a source that resumed and
+        // finished, so the park is read from its open on the stream.
+        let events = sink.events(&run_scope());
+        let opens: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == AgentDecisionKind::RequestReconciliation)
+            .collect();
+        assert_eq!(opens.len(), 1, "the send parked once: {events:?}");
+        let parked = opens[0]
+            .effect
+            .clone()
+            .expect("the open names the parked send");
+        let checkpoint_id = opens[0]
+            .checkpoint
+            .as_ref()
+            .expect("the open names its checkpoint")
+            .checkpoint_id
+            .clone();
+        assert_eq!(
+            checkpoint_id,
+            AgentCheckpoint::id_for_effect(
+                &parked.effect_id,
+                parked.generation,
+                AgentCheckpointKind::IndeterminateEffectReconciliation,
+            )
+        );
+
+        // A re-driven world records nothing more.
+        let before = sink.events(&run_scope());
+        settle(&fixture).await;
+        assert_eq!(sink.events(&run_scope()), before);
+        assert_decision_stream_whole(&sink, &run_scope());
+
+        let events = sink.events(&run_scope());
+        let named: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event
+                    .checkpoint
+                    .as_ref()
+                    .is_some_and(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+            })
+            .collect();
+        assert_eq!(
+            named.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [
+                AgentDecisionKind::RequestReconciliation,
+                AgentDecisionKind::Reconcile
+            ],
+            "target ready {target_ready}: {events:?}"
+        );
+        let reconciles: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == AgentDecisionKind::Reconcile)
+            .collect();
+        assert_eq!(reconciles.len(), 1, "{events:?}");
+        let reconciled = reconciles[0];
+        assert_eq!(
+            reconciled.outcome,
+            Some(AgentDecisionOutcome::ConfirmedExecuted)
+        );
+        assert_eq!(
+            reconciled.reason_code.as_deref(),
+            Some("confirmed-executed")
+        );
+        assert_eq!(reconciled.source, AgentDecisionSource::DeterministicPolicy);
+        assert_eq!(
+            reconciled.effect.as_ref(),
+            Some(&parked),
+            "the reconcile names the parked send"
+        );
+        assert_eq!(reconciled.safety_class, Some(parked.safety_class));
+    }
 }

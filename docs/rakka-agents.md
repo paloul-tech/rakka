@@ -333,6 +333,35 @@ map to the pinned GenAI semantic-convention revision with a status, a stable
 on. Metrics are catalogued as data with units, buckets, and bounded label keys,
 and a source scan holds the catalogue to the call sites. Decision events are
 durable records with a bounded outbox and a sink that may lag but never blocks.
+The outbox is bounded by count (32) and by bytes
+(`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`, 40 KiB); an event over the byte bound on
+its own is dropped and counted (`decision_drops`, `rakka.agent.decision.drops`).
+Besides the proposal decisions (`continue`, `call-tools`, `submit-result`, `evaluate`), the stream records a run's
+lifecycle: checkpoint opens (`request-approval`, `request-authorization`),
+reconciliations (`reconcile`, including the one a handoff notice settles, and
+`request-reconciliation`, `Version2` only), checkpoint resolutions and escalations
+(`resolve-checkpoint`, `escalate-checkpoint`), the waits a run enters (`wait`,
+slots `wait-top-up-{sequence}`, `wait-children-q{n}`, `wait-handoff-q{n}`,
+`wait-winding-down`), and the run's end (`complete`, `fail`, `cancel`,
+`handoff`, `supersede`). New events carry a `reason_code` and, under
+`Version2` and where they apply, the optional `checkpoint`, `effect`, `outcome`
+(`AgentDecisionOutcome`) and `run_status` fields; readers should key on
+`reason_code`, since an
+`awaiting-children` wait entered during a wind-down reads `run_status`
+`cancelling`, a `budget-top-up` wait reads `running` (the run parks for a
+top-up under `Running`), and a wind-down begun while an effect's outcome is unknown reads
+`waiting-for-reconciliation`. The A2A coordination replay shows only a run
+event's kind and `reason_code`. When a failure ends a run, any other gated
+effect's approval or authorization checkpoint stays open on the ended run and
+gets no close event; the run's end event closes it for readers. `AgentDecisionEventVocabulary` selects what is written:
+`Version1`, the default, writes only the kinds an earlier reader decodes
+(`request-approval`, `request-authorization`, `reconcile`, `complete`,
+`fail`, `wait`) and none of the four fields, so a binary at the earlier pin
+writes back exactly the event it read; `Version2` adds the six newer kinds and
+the four fields and stamps events with schema version 2. Select it with
+`with_decision_event_vocabulary` once every process that loads the run store or
+reads the sink reads version 2 (see `docs/rakka-compatibility.md`). An ended
+run's ambiguous memory promotion or claim append records no event (issue #120).
 The SDK, exporter, and Collector live at the application binary;
 `examples/agent-otlp-export-acceptance` is that binary, and
 `docs/plans/rakka-agent/kubernetes-agent-otel-collector-topology.yaml` is the

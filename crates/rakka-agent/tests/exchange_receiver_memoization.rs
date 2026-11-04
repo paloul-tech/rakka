@@ -428,7 +428,7 @@ fn every_cross_participant_kind_classifies_alike_at_both_ends() {
 
     let fx = fixture();
     let task = AgentTaskParticipant;
-    let run = AgentRunParticipant;
+    let run = AgentRunParticipant::default();
     for case in cases {
         let Case {
             kind,

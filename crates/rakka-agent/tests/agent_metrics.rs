@@ -135,17 +135,18 @@ async fn a_run_records_bounded_agent_metrics_and_no_identifiers() {
         "a resolved tool generation is counted: {outcome_labels:?}"
     );
 
-    // Each of the four decisions was counted exactly once, on first durable
-    // acceptance by the sink — a re-driven pump adds nothing.
+    // Each of the five decisions — the four the loop made and the run's
+    // `complete` end — was counted exactly once, on first durable acceptance
+    // by the sink — a re-driven pump adds nothing.
     let decisions = snapshot.observations_named(METRIC_AGENT_DECISIONS);
-    assert_eq!(decisions.len(), 4, "one count per accepted decision");
+    assert_eq!(decisions.len(), 5, "one count per accepted decision");
     fx.pump().await.expect("the re-driven pump is harmless");
     assert_eq!(
         metrics
             .snapshot()
             .observations_named(METRIC_AGENT_DECISIONS)
             .len(),
-        4,
+        5,
         "a replayed flush counts nothing"
     );
 }

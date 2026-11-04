@@ -24,17 +24,21 @@ use std::sync::{Arc, Mutex};
 use rakka_agent_workflow::{
     agent_derived_span_id, require_agent_trace_context, validate_agent_span_link,
     validate_agent_telemetry_context, AgentAttributes, AgentCausationId, AgentCorrelationId,
-    AgentTelemetryContext, AgentTimestampMillis, AgentTraceContext, StateSchemaVersion,
+    AgentTelemetryContext, AgentTimestampMillis, AgentTraceContext, HumanCheckpointId,
+    StateSchemaVersion,
 };
 use rakka_core::{MetricAttributes, MetricKind, MetricsRecorder, OpenTelemetryInstrumentView};
 use serde::{Deserialize, Serialize};
 
+use crate::checkpoints::{AgentCheckpoint, AgentCheckpointKind};
 use crate::definition::{AgentEffectSafetyClass, AgentRevisionNumber, AgentToolId};
 use crate::identity::{
     AgentGoalId, AgentOperationId, AgentOperationKind, AgentRunScope, AgentTaskId, AgentTaskScope,
 };
 use crate::loop_runtime::AgentLoopPhase;
 use crate::memory::AgentContextSnapshotRef;
+use crate::query::AgentCheckpointBoundEffectView;
+use crate::run::AgentRunStatus;
 use crate::schema::{
     AgentRecordKind, VersionedAgentRecord, CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION,
 };
@@ -224,8 +228,13 @@ pub const AGENT_DECISION_REASON_MAX_LENGTH: usize = 64;
 /// What the loop decided
 /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// The M1 loop produces this set; the coordination kinds (`delegate`,
-/// `handoff`, `team-operation`, `moderated-turn`) arrive with their phases.
+/// The shipped vocabulary covers the loop's own choices (`continue`,
+/// `call-tools`, `submit-result`, `wait`, `evaluate`), the run's terminal
+/// states (`complete`, `fail`) and the checkpoint and run-lifecycle
+/// transitions (`request-*`, `reconcile`, `request-reconciliation`,
+/// `resolve-checkpoint`, `escalate-checkpoint`, `cancel`, `handoff`,
+/// `supersede`). `handoff` is the run's end by handoff, not the model's choice
+/// to hand off, which is `call-tools`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -250,6 +259,22 @@ pub enum AgentDecisionKind {
     Reconcile,
     /// Commit a goal-evaluation effect.
     Evaluate,
+    /// Park on an indeterminate-effect reconciliation checkpoint: an effect
+    /// whose outcome is unknown needs a human or service decision.
+    RequestReconciliation,
+    /// A checkpoint was resolved (granted, denied, expired or cancelled) and
+    /// the run resumed or ended accordingly.
+    ResolveCheckpoint,
+    /// An open checkpoint was escalated: past its due time, or by a person's
+    /// Escalate (on any checkpoint kind, reconciliation included).
+    EscalateCheckpoint,
+    /// The run ended by cancellation.
+    Cancel,
+    /// The run ended by handing its task to another agent; not the model's
+    /// choice to hand off, which is `call-tools`.
+    Handoff,
+    /// The run ended because a newer run superseded it.
+    Supersede,
 }
 
 impl AgentDecisionKind {
@@ -267,6 +292,12 @@ impl AgentDecisionKind {
             Self::RequestAuthorization => "request-authorization",
             Self::Reconcile => "reconcile",
             Self::Evaluate => "evaluate",
+            Self::RequestReconciliation => "request-reconciliation",
+            Self::ResolveCheckpoint => "resolve-checkpoint",
+            Self::EscalateCheckpoint => "escalate-checkpoint",
+            Self::Cancel => "cancel",
+            Self::Handoff => "handoff",
+            Self::Supersede => "supersede",
         }
     }
 }
@@ -274,6 +305,121 @@ impl AgentDecisionKind {
 impl Display for AgentDecisionKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_label())
+    }
+}
+
+/// How a checkpoint or reconciliation decision came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentDecisionOutcome {
+    /// The checkpoint was granted.
+    Granted,
+    /// The checkpoint was denied.
+    Denied,
+    /// The checkpoint expired unresolved.
+    Expired,
+    /// The checkpoint was cancelled with its run.
+    Cancelled,
+    /// Reconciliation confirmed the effect executed.
+    ConfirmedExecuted,
+    /// Reconciliation confirmed the effect did not execute.
+    ConfirmedNotExecuted,
+    /// Reconciliation chose to compensate the effect.
+    Compensate,
+    /// Reconciliation chose to abandon the effect.
+    Abandon,
+}
+
+impl AgentDecisionOutcome {
+    /// Stable kebab-case label for telemetry and metrics.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+            Self::ConfirmedExecuted => "confirmed-executed",
+            Self::ConfirmedNotExecuted => "confirmed-not-executed",
+            Self::Compensate => "compensate",
+            Self::Abandon => "abandon",
+        }
+    }
+}
+
+impl Display for AgentDecisionOutcome {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
+/// The checkpoint a decision event concerns: identity, kind and deadlines,
+/// never the summary or resolver requirements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentDecisionCheckpoint {
+    /// The checkpoint's identity.
+    pub checkpoint_id: HumanCheckpointId,
+    /// What kind of decision resolves it.
+    pub kind: AgentCheckpointKind,
+    /// When it escalates, when it does.
+    pub due_at: Option<AgentTimestampMillis>,
+    /// When it expires, when it does.
+    pub expires_at: Option<AgentTimestampMillis>,
+}
+
+impl AgentDecisionCheckpoint {
+    pub(crate) fn of(checkpoint: &AgentCheckpoint) -> Self {
+        Self {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            kind: checkpoint.kind,
+            due_at: checkpoint.due_at,
+            expires_at: checkpoint.expires_at,
+        }
+    }
+}
+
+/// Which decision kinds and fields a run records: the compatibility switch
+/// between a reader that knows only the original ten kinds and fields and one
+/// that knows the full vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum AgentDecisionEventVocabulary {
+    /// The original ten kinds, schema version 1, and none of the fields
+    /// `checkpoint`, `effect`, `outcome` and `run_status`: exactly what a
+    /// `bc0c224` binary reads and writes back.
+    #[default]
+    Version1,
+    /// The full sixteen-kind vocabulary and the four fields, schema version 2.
+    Version2,
+}
+
+impl AgentDecisionEventVocabulary {
+    /// Whether this vocabulary writes events of `kind`.
+    #[must_use]
+    pub const fn writes(self, kind: AgentDecisionKind) -> bool {
+        match self {
+            Self::Version2 => true,
+            Self::Version1 => !matches!(
+                kind,
+                AgentDecisionKind::RequestReconciliation
+                    | AgentDecisionKind::ResolveCheckpoint
+                    | AgentDecisionKind::EscalateCheckpoint
+                    | AgentDecisionKind::Cancel
+                    | AgentDecisionKind::Handoff
+                    | AgentDecisionKind::Supersede
+            ),
+        }
+    }
+
+    /// The event schema version this vocabulary writes.
+    #[must_use]
+    pub const fn schema_version(self) -> StateSchemaVersion {
+        match self {
+            Self::Version1 => StateSchemaVersion::new(1),
+            Self::Version2 => StateSchemaVersion::new(2),
+        }
     }
 }
 
@@ -313,9 +459,10 @@ impl Display for AgentDecisionSource {
 
 /// What a transition asks the loop to record about one decision.
 ///
-/// The loop supplies everything positional — turn, phase, sequence, revisions,
-/// context snapshot, telemetry — when it records the draft, so a call site
-/// states only what it decided and why.
+/// The loop supplies everything positional — turn, phase, revisions, context
+/// snapshot, telemetry — when the draft is queued, and the sequence when the
+/// write that carries it is sealed, so a call site states only what it decided
+/// and why.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentDecisionDraft {
     kind: AgentDecisionKind,
@@ -324,6 +471,10 @@ pub struct AgentDecisionDraft {
     selected_tools: Vec<AgentToolId>,
     safety_class: Option<AgentEffectSafetyClass>,
     reason_code: Option<String>,
+    checkpoint: Option<AgentDecisionCheckpoint>,
+    effect: Option<AgentCheckpointBoundEffectView>,
+    outcome: Option<AgentDecisionOutcome>,
+    run_status: Option<AgentRunStatus>,
 }
 
 impl AgentDecisionDraft {
@@ -341,7 +492,45 @@ impl AgentDecisionDraft {
             selected_tools: Vec::new(),
             safety_class: None,
             reason_code: None,
+            checkpoint: None,
+            effect: None,
+            outcome: None,
+            run_status: None,
         }
+    }
+
+    /// The checkpoint the decision concerns.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: AgentDecisionCheckpoint) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
+    /// The effect the decision gates or reconciles.
+    #[must_use]
+    pub fn with_effect(mut self, effect: AgentCheckpointBoundEffectView) -> Self {
+        self.effect = Some(effect);
+        self
+    }
+
+    /// How the decision came out.
+    #[must_use]
+    pub const fn with_outcome(mut self, outcome: AgentDecisionOutcome) -> Self {
+        self.outcome = Some(outcome);
+        self
+    }
+
+    /// The run status the decision left the run in.
+    #[must_use]
+    pub const fn with_run_status(mut self, status: AgentRunStatus) -> Self {
+        self.run_status = Some(status);
+        self
+    }
+
+    /// What the draft decides.
+    #[must_use]
+    pub const fn kind(&self) -> AgentDecisionKind {
+        self.kind
     }
 
     /// The tool classes the decision selected. Bounded by construction: a
@@ -421,6 +610,22 @@ pub struct AgentDecisionEvent {
     pub safety_class: Option<AgentEffectSafetyClass>,
     /// Stable bounded reason code, when the decision carries one.
     pub reason_code: Option<String>,
+    /// The checkpoint the decision concerns, when it concerns one.
+    /// Written only under [`AgentDecisionEventVocabulary::Version2`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<AgentDecisionCheckpoint>,
+    /// The effect the decision gates or reconciles, when it does.
+    /// Written only under [`AgentDecisionEventVocabulary::Version2`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<AgentCheckpointBoundEffectView>,
+    /// How the decision came out, when it has an outcome.
+    /// Written only under [`AgentDecisionEventVocabulary::Version2`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<AgentDecisionOutcome>,
+    /// The run status the decision left the run in, when recorded.
+    /// Written only under [`AgentDecisionEventVocabulary::Version2`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_status: Option<AgentRunStatus>,
     /// Causation id: the decision's own derived operation id.
     pub causation_id: AgentCausationId,
     /// Correlation id shared by every record of the run.
@@ -432,17 +637,18 @@ pub struct AgentDecisionEvent {
 }
 
 impl AgentDecisionEvent {
-    /// Assembles the event the loop owes for one recorded draft.
+    /// Assembles the event the loop owes for one queued draft.
     ///
     /// Everything positional comes from the loop's own durable state; the
     /// operation id is *derived* from the run, the turn, and the draft's slot,
-    /// so a re-driven transition resolves to the same event.
+    /// so a re-driven transition resolves to the same event. The sequence is
+    /// not known yet: the event is unsequenced until [`Self::stamp`] gives it
+    /// one at commit.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn assemble(
         scope: &AgentRunScope,
         task: Option<AgentTaskId>,
         goal: Option<AgentGoalId>,
-        sequence: u64,
         turn: u64,
         phase: AgentLoopPhase,
         definition_revision: AgentRevisionNumber,
@@ -471,7 +677,7 @@ impl AgentDecisionEvent {
             causation_id: AgentCausationId::new(operation_id.as_str()),
             correlation_id: AgentCorrelationId::new(scope.key()),
             operation_id,
-            sequence,
+            sequence: 0,
             turn,
             phase,
             kind: draft.kind,
@@ -482,9 +688,34 @@ impl AgentDecisionEvent {
             context_snapshot,
             safety_class: draft.safety_class,
             reason_code: draft.reason_code,
+            checkpoint: draft.checkpoint,
+            effect: draft.effect,
+            outcome: draft.outcome,
+            run_status: draft.run_status,
             telemetry,
             occurred_at,
         })
+    }
+
+    /// Gives a committed event its per-run sequence and the schema version
+    /// it is written under, and keeps only the fields `vocabulary` writes.
+    ///
+    /// `Version1` writes none of the four fields a `bc0c224` binary drops on
+    /// decode. A replica at that pin re-persists the events a run still owes
+    /// and flushes them again, and a sink that checks content answers a
+    /// resend that differs from what it holds as a conflict.
+    pub(crate) fn stamp(&mut self, sequence: u64, vocabulary: AgentDecisionEventVocabulary) {
+        self.sequence = sequence;
+        self.schema_version = vocabulary.schema_version();
+        match vocabulary {
+            AgentDecisionEventVocabulary::Version1 => {
+                self.checkpoint = None;
+                self.effect = None;
+                self.outcome = None;
+                self.run_status = None;
+            }
+            AgentDecisionEventVocabulary::Version2 => {}
+        }
     }
 }
 

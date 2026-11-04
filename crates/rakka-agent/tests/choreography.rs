@@ -1043,3 +1043,158 @@ async fn an_oversized_reply_payload_is_refused_before_it_enters_durable_state() 
         .pending_exchange(&operation_id)
         .is_some());
 }
+
+/// The probe, counting the writes its host seals and whether each seal saw
+/// the transition it sealed.
+#[derive(Clone, Default)]
+struct SealCountingProbe {
+    seals: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl SealCountingProbe {
+    /// How many writes were sealed.
+    fn sealed(&self) -> usize {
+        self.seals
+            .lock()
+            .expect("the seal log is not poisoned")
+            .len()
+    }
+}
+
+impl rakka_agent::AgentExchangeParticipant for SealCountingProbe {
+    type State = ChoreographyProbeState;
+
+    fn initialize(&self, address: &AgentEntityAddress, now: AgentTimestampMillis) -> Self::State {
+        ChoreographyProbe.initialize(address, now)
+    }
+
+    fn apply(
+        &self,
+        state: &mut Self::State,
+        envelope: &AgentExchangeEnvelope,
+        now: AgentTimestampMillis,
+    ) -> rakka_agent::choreography::AgentExchangeTransition {
+        ChoreographyProbe.apply(state, envelope, now)
+    }
+
+    fn check_settle(
+        &self,
+        envelope: &AgentExchangeEnvelope,
+        result: &rakka_agent::AgentExchangeResult,
+    ) -> rakka_agent::AgentChoreographyResult<()> {
+        ChoreographyProbe.check_settle(envelope, result)
+    }
+
+    fn settle(
+        &self,
+        state: &mut Self::State,
+        envelope: &AgentExchangeEnvelope,
+        result: &rakka_agent::AgentExchangeResult,
+        now: AgentTimestampMillis,
+    ) -> Vec<AgentExchangeEnvelope> {
+        ChoreographyProbe.settle(state, envelope, result, now)
+    }
+
+    fn seal(&self, before: &Self::State, after: &mut Self::State, _now: AgentTimestampMillis) {
+        self.seals
+            .lock()
+            .expect("the seal log is not poisoned")
+            .push(before != after);
+    }
+}
+
+#[tokio::test]
+async fn the_host_seals_each_write_path_once_and_not_a_rejected_replayed_or_duplicate_transition() {
+    // A participant that finishes queued work in its seal — the run entity
+    // commits its decision events there — must be sealed on every path that
+    // writes a transition, and never on one that writes nothing.
+    use rakka_agent::AgentExchangeParticipant as _;
+
+    let store = Store::new();
+    let clock = AtomicU64::new(1);
+    let now = || AgentTimestampMillis::new(clock.fetch_add(1, Ordering::SeqCst));
+    let probe = SealCountingProbe::default();
+    let mut initiator = AgentExchangeHost::new(run_address(), probe.clone(), store.clone());
+    initiator.recover(now()).await.expect("the run recovers");
+    let mut receiver = AgentExchangeHost::new(task_address(), probe.clone(), store.clone());
+    receiver.recover(now()).await.expect("the task recovers");
+
+    // A rejected entry point persists nothing, so nothing is sealed.
+    let foreign = ChoreographyProbe::envelope(
+        AgentExchangeKind::Creation,
+        operation("foreign"),
+        task_address(),
+        run_address(),
+        now(),
+    )
+    .expect("the envelope should be valid");
+    initiator
+        .initiate(now(), |_state| Ok(vec![foreign]))
+        .await
+        .expect_err("an entity may not owe another entity's exchange");
+    assert_eq!(probe.sealed(), 0, "a rejected transition is never sealed");
+
+    let envelope = ChoreographyProbe::envelope(
+        AgentExchangeKind::Creation,
+        operation("creation"),
+        run_address(),
+        task_address(),
+        now(),
+    )
+    .expect("the envelope should be valid");
+    initiator
+        .initiate(now(), |_state| Ok(vec![envelope.clone()]))
+        .await
+        .expect("the initiating transition commits");
+    assert_eq!(probe.sealed(), 1, "initiate seals its write");
+
+    let reply = receiver
+        .accept(&envelope, now())
+        .await
+        .expect("the receiver accepts");
+    assert_eq!(probe.sealed(), 2, "accept seals its write");
+    receiver
+        .accept(&envelope, now())
+        .await
+        .expect("the replay is answered from the journal");
+    assert_eq!(
+        probe.sealed(),
+        2,
+        "a replay writes nothing and is not sealed"
+    );
+
+    let settlement = initiator
+        .settle(&reply, now())
+        .await
+        .expect("the reply settles");
+    assert!(matches!(
+        settlement,
+        AgentExchangeSettlement::Settled { .. }
+    ));
+    assert_eq!(probe.sealed(), 3, "settle seals its write");
+    initiator
+        .settle(&reply, now())
+        .await
+        .expect("a duplicate reply is harmless");
+    assert_eq!(
+        probe.sealed(),
+        3,
+        "a duplicate reply writes nothing and is not sealed"
+    );
+
+    assert!(
+        probe
+            .seals
+            .lock()
+            .expect("the seal log is not poisoned")
+            .iter()
+            .all(|changed| *changed),
+        "every seal saw the record it started from and the transition it sealed"
+    );
+    // The participant the trait's default seal leaves untouched still works:
+    // the probe itself seals nothing.
+    let mut untouched = ChoreographyProbe.initialize(&run_address(), now());
+    let before = untouched.clone();
+    ChoreographyProbe.seal(&before, &mut untouched, now());
+    assert_eq!(before, untouched, "the default seal does nothing");
+}

@@ -85,7 +85,7 @@ use crate::model::{
     AgentModelAdapter, AgentModelFuture, AgentModelRequest, AgentModelResult,
     AgentModelRetryPolicy, AgentModelTurn, AgentToolCallRequest,
 };
-use crate::observability::AgentDecisionEventSink;
+use crate::observability::{AgentDecisionEventSink, AgentDecisionEventVocabulary};
 use crate::run::{
     AgentRunEntityCommand, AgentRunEntityReply, AgentRunEntityStore, AgentRunError, AgentRunState,
 };
@@ -1542,6 +1542,7 @@ where
     policies: AgentEffectPolicies,
     memory: Arc<Mutex<Option<AgentRunMemory>>>,
     decisions: Arc<Mutex<Option<Arc<dyn AgentDecisionEventSink>>>>,
+    decision_vocabulary: Arc<Mutex<AgentDecisionEventVocabulary>>,
     segments: Arc<Mutex<Option<Arc<dyn crate::observability::AgentSegmentSink>>>>,
     metrics: Arc<Mutex<Option<Arc<dyn MetricsRecorder>>>>,
     delegation: Arc<Mutex<Option<crate::delegation::AgentRunDelegationConfig>>>,
@@ -1565,6 +1566,7 @@ where
             policies: self.policies.clone(),
             memory: self.memory.clone(),
             decisions: self.decisions.clone(),
+            decision_vocabulary: self.decision_vocabulary.clone(),
             segments: self.segments.clone(),
             metrics: self.metrics.clone(),
             delegation: self.delegation.clone(),
@@ -1597,6 +1599,7 @@ where
             policies: AgentEffectPolicies::default(),
             memory: Arc::new(Mutex::new(None)),
             decisions: Arc::new(Mutex::new(None)),
+            decision_vocabulary: Arc::new(Mutex::new(AgentDecisionEventVocabulary::default())),
             segments: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(None)),
             delegation: Arc::new(Mutex::new(None)),
@@ -1643,6 +1646,17 @@ where
             .decisions
             .lock()
             .expect("the decision slot should not be poisoned") = Some(sink);
+    }
+
+    /// Selects which decision kinds every run entity this transport builds
+    /// writes, under the same shared-slot rule as [`Self::install_memory`]:
+    /// a driver that wrote a narrower vocabulary than the run's other drivers
+    /// would silently discard the kinds they record.
+    pub fn install_decision_vocabulary(&self, vocabulary: AgentDecisionEventVocabulary) {
+        *self
+            .decision_vocabulary
+            .lock()
+            .expect("the decision-vocabulary slot should not be poisoned") = vocabulary;
     }
 
     /// Wires every run entity this transport builds with a bounded-segment
@@ -1769,6 +1783,11 @@ where
             if let Some(decisions) = decisions {
                 entity = entity.with_decision_events(decisions);
             }
+            let vocabulary = *self
+                .decision_vocabulary
+                .lock()
+                .expect("the decision-vocabulary slot should not be poisoned");
+            entity = entity.with_decision_event_vocabulary(vocabulary);
             let segments = self
                 .segments
                 .lock()
@@ -3064,6 +3083,7 @@ where
     segments: Option<Arc<dyn crate::observability::AgentSegmentSink>>,
     metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
     decisions: Option<Arc<dyn crate::observability::AgentDecisionEventSink>>,
+    decision_vocabulary: AgentDecisionEventVocabulary,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -3091,6 +3111,7 @@ where
             segments: None,
             metrics: None,
             decisions: None,
+            decision_vocabulary: AgentDecisionEventVocabulary::default(),
         }
     }
 
@@ -3175,6 +3196,19 @@ where
         self
     }
 
+    /// Selects which decision kinds the entity this delivery drives writes,
+    /// under the same every-driver rule as [`Self::with_decision_events`]: a
+    /// delivery writing a narrower vocabulary than the run's other drivers
+    /// would discard the kinds they record.
+    #[must_use]
+    pub fn with_decision_event_vocabulary(
+        mut self,
+        vocabulary: AgentDecisionEventVocabulary,
+    ) -> Self {
+        self.decision_vocabulary = vocabulary;
+        self
+    }
+
     /// Wires the entities this delivery builds to serve delegation — the
     /// delivered model result is where a fan-out turn is intercepted, so an
     /// unwired delivery would refuse the coordination and await verbs the
@@ -3218,6 +3252,7 @@ where
             if let Some(decisions) = &self.decisions {
                 entity = entity.with_decision_events(decisions.clone());
             }
+            entity = entity.with_decision_event_vocabulary(self.decision_vocabulary);
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity
                 .apply(command, &self.router, now)

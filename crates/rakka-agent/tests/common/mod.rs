@@ -861,6 +861,9 @@ pub struct Fixture<
     /// enables it. Absent by default, so the run records no decision events —
     /// the pre-slice-1.13 behavior.
     pub decisions: Option<Arc<dyn rakka_agent::AgentDecisionEventSink>>,
+    /// Which decision kinds the run entity writes once a sink is wired.
+    /// `Version1` by default, the store's own default.
+    pub decision_vocabulary: rakka_agent::AgentDecisionEventVocabulary,
     /// The bounded-segment sink the run entity is wired with, when a test
     /// enables it. Absent by default, so the run closes no segments.
     pub segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
@@ -980,6 +983,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             clock,
             memory: None,
             decisions: None,
+            decision_vocabulary: rakka_agent::AgentDecisionEventVocabulary::Version1,
             segments: None,
             metrics: None,
             delegation: None,
@@ -1028,6 +1032,18 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     ) -> Self {
         self.run_transport.install_decisions(sink.clone());
         self.decisions = Some(sink);
+        self
+    }
+
+    /// Selects which decision kinds the run entity writes, under the same
+    /// every-driver rule as [`Self::with_memory`].
+    #[must_use]
+    pub fn with_decision_event_vocabulary(
+        mut self,
+        vocabulary: rakka_agent::AgentDecisionEventVocabulary,
+    ) -> Self {
+        self.run_transport.install_decision_vocabulary(vocabulary);
+        self.decision_vocabulary = vocabulary;
         self
     }
 
@@ -1344,6 +1360,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         if let Some(decisions) = &self.decisions {
             entity = entity.with_decision_events(decisions.clone());
         }
+        entity = entity.with_decision_event_vocabulary(self.decision_vocabulary);
         if let Some(segments) = &self.segments {
             entity = entity.with_segments(segments.clone());
         }
@@ -1622,6 +1639,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         if let Some(decisions) = &self.decisions {
             entity = entity.with_decision_events(decisions.clone());
         }
+        entity = entity.with_decision_event_vocabulary(self.decision_vocabulary);
         if let Some(segments) = &self.segments {
             entity = entity.with_segments(segments.clone());
         }
@@ -3043,6 +3061,7 @@ impl AuthorityFixture {
         if let Some(decisions) = &self.fx.decisions {
             delivery = delivery.with_decision_events(decisions.clone());
         }
+        delivery = delivery.with_decision_event_vocabulary(self.fx.decision_vocabulary);
         let mut pipeline = AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new(worker_id),
             self.workflow_store.clone(),
@@ -3648,4 +3667,143 @@ pub async fn forget_operations<S, Store>(
         .compare_and_set(id, record.revision, state)
         .await
         .expect("the rewrite lands");
+}
+
+/// The ten decision kinds the pinned `bc0c224` binary decodes — a test-local
+/// enum, so a kind added since is a decode failure here exactly as it is there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Bc0c224DecisionKind {
+    Continue,
+    CallTools,
+    SubmitResult,
+    Wait,
+    Complete,
+    Fail,
+    RequestApproval,
+    RequestAuthorization,
+    Reconcile,
+    Evaluate,
+}
+
+/// The decision event as `bc0c224` (commit `47f31ec`) declares it, fields in
+/// its order: no `deny_unknown_fields`, so the fields added since are dropped
+/// on decode, and a re-encode writes what a replica at that pin re-flushes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Bc0c224DecisionEvent {
+    pub schema_version: u32,
+    pub scope: AgentRunScope,
+    pub task: Option<AgentTaskId>,
+    pub goal: Option<AgentGoalId>,
+    pub operation_id: AgentOperationId,
+    pub sequence: u64,
+    pub turn: u64,
+    pub phase: rakka_agent::AgentLoopPhase,
+    pub kind: Bc0c224DecisionKind,
+    pub source: rakka_agent::AgentDecisionSource,
+    pub selected_tools: Vec<rakka_agent::AgentToolId>,
+    pub definition_revision: AgentRevisionNumber,
+    pub settings_revision: AgentRevisionNumber,
+    pub context_snapshot: Option<rakka_agent::AgentContextSnapshotRef>,
+    pub safety_class: Option<rakka_agent::AgentEffectSafetyClass>,
+    pub reason_code: Option<String>,
+    pub causation_id: AgentCausationId,
+    pub correlation_id: AgentCorrelationId,
+    pub telemetry: rakka_agent_workflow::AgentTelemetryContext,
+    pub occurred_at: AgentTimestampMillis,
+}
+
+/// Asserts a `bc0c224` binary reads every event at schema version 1 and
+/// writes it back unchanged. A replica at that pin re-persists the events a
+/// run still owes and flushes them again, and a sink that checks content
+/// answers a resend that differs from what it holds as a conflict. So an
+/// event must carry none of the fields added since, and its re-encode must
+/// be the same bytes.
+pub fn assert_bc0c224_round_trips(events: &[rakka_agent::AgentDecisionEvent]) {
+    for event in events {
+        assert!(
+            event.checkpoint.is_none()
+                && event.effect.is_none()
+                && event.outcome.is_none()
+                && event.run_status.is_none(),
+            "a version-1 event carries none of the version-2 fields: {event:?}"
+        );
+        let encoded = serde_json::to_string(event).expect("the event encodes");
+        let decoded: Bc0c224DecisionEvent = serde_json::from_str(&encoded)
+            .unwrap_or_else(|error| panic!("a bc0c224 reader must decode {event:?}: {error}"));
+        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.sequence, event.sequence);
+        let written_back = serde_json::to_string(&decoded).expect("the mirror encodes");
+        assert_eq!(
+            written_back, encoded,
+            "a bc0c224 binary writes the event back unchanged"
+        );
+    }
+}
+
+/// A decision-event sink that delegates to an in-memory sink and counts the
+/// `Duplicate` answers it gave: a duplicate is how a re-derived event identity
+/// shows itself, and the hole it leaves in the run's sequence is what a replay
+/// reader is refused at.
+pub struct CountingDecisionSink {
+    inner: rakka_agent::InMemoryAgentDecisionEventSink,
+    duplicates: AtomicU64,
+}
+
+impl CountingDecisionSink {
+    /// A fresh sink that has answered no duplicates.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: rakka_agent::InMemoryAgentDecisionEventSink::new(),
+            duplicates: AtomicU64::new(0),
+        })
+    }
+
+    /// Every retained event for `scope`, in sequence order.
+    pub fn events(&self, scope: &AgentRunScope) -> Vec<rakka_agent::AgentDecisionEvent> {
+        self.inner.events(scope)
+    }
+
+    /// How many appends the sink answered `Duplicate`.
+    pub fn duplicates(&self) -> usize {
+        usize::try_from(self.duplicates.load(Ordering::SeqCst)).expect("the count fits")
+    }
+}
+
+impl rakka_agent::AgentDecisionEventSink for CountingDecisionSink {
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    fn append<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        event: &'a rakka_agent::AgentDecisionEvent,
+    ) -> rakka_agent::AgentObservabilityFuture<'a, rakka_agent::AgentDecisionWriteStatus> {
+        Box::pin(async move {
+            let status = self.inner.append(scope, event).await?;
+            if status == rakka_agent::AgentDecisionWriteStatus::Duplicate {
+                self.duplicates.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(status)
+        })
+    }
+
+    fn read<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        after: u64,
+        limit: usize,
+    ) -> rakka_agent::AgentObservabilityFuture<'a, rakka_agent::AgentDecisionEventPage> {
+        self.inner.read(scope, after, limit)
+    }
+}
+
+/// Asserts the run's decision stream has no hole: the sequences are exactly
+/// `1..=n` and the sink never answered `Duplicate`.
+pub fn assert_decision_stream_whole(sink: &CountingDecisionSink, scope: &AgentRunScope) {
+    let sequences: Vec<u64> = sink.events(scope).iter().map(|e| e.sequence).collect();
+    let expected: Vec<u64> = (1..=sequences.len() as u64).collect();
+    assert_eq!(sequences, expected, "the decision sequences must be 1..=n");
+    assert_eq!(sink.duplicates(), 0, "no append may answer Duplicate");
 }
