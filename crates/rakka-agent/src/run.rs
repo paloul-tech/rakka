@@ -5955,6 +5955,12 @@ fn checkpoint_decision_draft(
 /// inside the checkpoint on its decision key, so a duplicate submission never
 /// resumes the run twice (scenario 11). A decision for a checkpoint the run no
 /// longer holds, or one that does not fit the checkpoint kind, is refused.
+///
+/// An ended run answers only a checkpoint bound to an effect outside the turn
+/// (a memory promotion or claim append), whatever the checkpoint's kind, and
+/// never a `Compensate`; every other decision is refused `Terminal`, before the
+/// checkpoint is resolved. An accepted decision leaves the run's terminal
+/// status, reason and stamp as they were.
 #[allow(clippy::too_many_arguments)]
 fn resolve_checkpoint(
     state: &mut AgentRunState,
@@ -5969,7 +5975,27 @@ fn resolve_checkpoint(
     {
         let run = state.run_mut()?;
         if run.status.is_terminal() {
-            return Err(AgentRunError::Terminal { status: run.status });
+            // An ended run answers only a checkpoint bound to an effect outside
+            // the turn (a memory promotion or claim append), and never a
+            // compensation, which would be new work. Both are decided before
+            // the checkpoint is resolved, so a refusal changes nothing.
+            let answerable = run
+                .loop_state
+                .open_checkpoints()
+                .iter()
+                .find(|checkpoint| &checkpoint.checkpoint_id == checkpoint_id)
+                .is_some_and(|checkpoint| {
+                    run.holds_outside_the_turn_effect(&checkpoint.bound_effect.effect_id)
+                });
+            let compensation = matches!(
+                &decision,
+                AgentCheckpointDecision::Reconciliation(
+                    crate::checkpoints::AgentReconciliationDecision::Compensate { .. }
+                )
+            );
+            if !answerable || compensation {
+                return Err(AgentRunError::Terminal { status: run.status });
+            }
         }
     }
 
@@ -6015,8 +6041,12 @@ fn resolve_checkpoint(
             run.loop_state.drop_checkpoint(checkpoint_id);
             // Resume: the gated effect is still `Pending`, and the next dispatch
             // pass now finds its grant and hands it to the sink. Another gated
-            // effect may still hold the run on its own wait.
-            run.status = checkpoint_wait_status(&run.loop_state);
+            // effect may still hold the run on its own wait. An ended run's
+            // status never moves: its gated effect rides the outbox without a
+            // wait status.
+            if !run.status.is_terminal() {
+                run.status = checkpoint_wait_status(&run.loop_state);
+            }
             state.updated_at = now;
         }
         AgentCheckpointOutcome::Denied { reason } => {
@@ -12993,6 +13023,85 @@ mod tests {
         decision: crate::checkpoints::AgentReconciliationDecision,
     ) -> AgentCheckpointDecision {
         AgentCheckpointDecision::Reconciliation(decision)
+    }
+
+    /// An ended run answers only a checkpoint bound to an effect outside the
+    /// turn. An approval checkpoint a failed run left open on a tool effect is
+    /// refused `run-terminal` before the checkpoint is read, and nothing moves.
+    #[test]
+    fn resolve_checkpoint_refuses_an_ended_runs_checkpoint_on_another_kind() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Failed,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        let now = fx.now;
+        let scope = fx.scope.clone();
+        let run = fx.state.run_mut().expect("the run exists");
+        let tool = AgentRunEffect::new(
+            &scope,
+            run.loop_state.turn(),
+            1,
+            AgentRunEffectRequest::Tool {
+                call: Box::new(
+                    AgentToolCallRequest::new(
+                        AgentToolCallId::new("call-2").expect("the call id is valid"),
+                        AgentToolId::new("charge-card").expect("the tool id is valid"),
+                        serde_json::json!({}),
+                    )
+                    .expect("the call is bounded"),
+                ),
+            },
+            &AgentEffectSpec::non_idempotent().with_checkpoint_required(),
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the tool effect derives");
+        let checkpoint = AgentCheckpoint::open(
+            AgentCheckpoint::id_for_effect(
+                &tool.effect_id,
+                tool.generation,
+                AgentCheckpointKind::Approval,
+            ),
+            AgentCheckpointKind::Approval,
+            scope,
+            &tool,
+            "charge the card",
+            operator(),
+            now,
+        )
+        .expect("the checkpoint opens");
+        let checkpoint_id = checkpoint.checkpoint_id.clone();
+        run.loop_state
+            .record_effect(tool)
+            .expect("the tool records");
+        run.loop_state
+            .record_checkpoint(checkpoint)
+            .expect("the checkpoint records");
+        let before = fx.state.clone();
+
+        let error = resolve_checkpoint(
+            &mut fx.state,
+            &checkpoint_id,
+            operator(),
+            AgentCheckpointDecision::Approval(crate::checkpoints::AgentApprovalDecision::Approve {
+                credential_binding: None,
+                expires_at: AgentTimestampMillis::new(10_000_000),
+                allowed_use_count: 1,
+            }),
+            decision_key("approve"),
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            now,
+        )
+        .expect_err("an ended run refuses a checkpoint on another kind");
+        assert!(matches!(
+            error,
+            AgentRunError::Terminal {
+                status: AgentRunStatus::Failed
+            }
+        ));
+        assert_eq!(fx.state, before, "a refused decision changes nothing");
     }
 
     /// Issue #106, Ask 2: the task's acceptance is the proof the parked

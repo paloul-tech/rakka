@@ -2190,6 +2190,372 @@ async fn a_version_one_host_records_the_ended_runs_reconcile() {
     assert_terminal_unmoved(&fx, &before, "after the decision").await;
 }
 
+// ---------------------------------------------------------------------------
+// Answering an ended run's parked promotion through `ResolveCheckpoint`
+// (issue #120).
+// ---------------------------------------------------------------------------
+
+/// A `ResolveCheckpoint` command under a checkpoint-resolution key.
+fn resolve_checkpoint_command(
+    checkpoint_id: &rakka_agent_workflow::HumanCheckpointId,
+    key: &str,
+    decision: rakka_agent::AgentCheckpointDecision,
+) -> AgentRunEntityCommand {
+    AgentRunEntityCommand::ResolveCheckpoint {
+        operation_id: AgentOperationId::for_agent(
+            AgentOperationKind::CheckpointResolution,
+            &agent_scope(),
+            key,
+        )
+        .expect("the decision key derives"),
+        checkpoint_id: checkpoint_id.clone(),
+        resolver: requested_by(),
+        decision: Box::new(decision),
+        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+    }
+}
+
+/// A reconciliation checkpoint decision.
+fn reconciliation(
+    decision: rakka_agent::AgentReconciliationDecision,
+) -> rakka_agent::AgentCheckpointDecision {
+    rakka_agent::AgentCheckpointDecision::Reconciliation(decision)
+}
+
+/// `ConfirmedCompleted` carrying an empty promotion outcome.
+fn confirmed_completed() -> rakka_agent::AgentReconciliationDecision {
+    rakka_agent::AgentReconciliationDecision::ConfirmedCompleted {
+        resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+            outcome: Box::new(AgentRunEffectOutcome::MemoryPromotion {
+                promoted: Vec::new(),
+            }),
+        }),
+    }
+}
+
+/// The one checkpoint the ended run holds open.
+async fn the_open_checkpoint(fx: &Fixture) -> AgentCheckpoint {
+    let open = open_checkpoints(fx).await;
+    assert_eq!(open.len(), 1, "one checkpoint is open");
+    open.into_iter().next().expect("one checkpoint")
+}
+
+/// `ConfirmedNotExecuted` through the checkpoint: re-sent under generation 2,
+/// which then lands `Succeeded`.
+async fn checkpoint_confirms_not_executed(ending: Ending) {
+    let (fx, stores) = ended_world(ending).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let parked = park_promotion(&fx, "ambiguous").await;
+    let checkpoint = the_open_checkpoint(&fx).await;
+    let reply = apply_ok(
+        &fx,
+        resolve_checkpoint_command(
+            &checkpoint.checkpoint_id,
+            "not-executed",
+            reconciliation(rakka_agent::AgentReconciliationDecision::ConfirmedNotExecuted),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{ending:?}: {reply:?}"
+    );
+    let resent = promotion_record(&fx, &parked).await;
+    assert_eq!(resent.generation, parked.generation.next(), "{ending:?}");
+    assert!(open_checkpoints(&fx).await.is_empty(), "{ending:?}");
+    assert_terminal_unmoved(&fx, &before, "after the re-send decision").await;
+    fx.pump_post_terminal(AgentRunEffectKind::MemoryPromotionCall)
+        .await
+        .expect("the re-sent promotion settles");
+    let done = promotion_record(&fx, &parked).await;
+    assert_eq!(done.status, AgentRunEffectStatus::Succeeded, "{ending:?}");
+    assert_eq!(stores.private.len(&agent_scope()), 1, "{ending:?}");
+    assert_terminal_unmoved(&fx, &before, "after the pump").await;
+}
+
+/// `ConfirmedCompleted` through the checkpoint: the outcome lands on the same
+/// generation.
+async fn checkpoint_confirms_completed(ending: Ending) {
+    let (fx, _stores) = ended_world(ending).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let parked = park_promotion(&fx, "ambiguous").await;
+    let checkpoint = the_open_checkpoint(&fx).await;
+    apply_ok(
+        &fx,
+        resolve_checkpoint_command(
+            &checkpoint.checkpoint_id,
+            "completed",
+            reconciliation(confirmed_completed()),
+        ),
+    )
+    .await;
+    let done = promotion_record(&fx, &parked).await;
+    assert_eq!(done.status, AgentRunEffectStatus::Succeeded, "{ending:?}");
+    assert_eq!(done.generation, parked.generation, "{ending:?}");
+    assert!(open_checkpoints(&fx).await.is_empty(), "{ending:?}");
+    assert_terminal_unmoved(&fx, &before, "after ConfirmedCompleted").await;
+}
+
+/// `AbandonAndFail` through the checkpoint: the generation fails, and the
+/// run's own reason is untouched.
+async fn checkpoint_abandons(ending: Ending) {
+    let (fx, _stores) = ended_world(ending).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let parked = park_promotion(&fx, "ambiguous").await;
+    let checkpoint = the_open_checkpoint(&fx).await;
+    apply_ok(
+        &fx,
+        resolve_checkpoint_command(
+            &checkpoint.checkpoint_id,
+            "abandon",
+            reconciliation(rakka_agent::AgentReconciliationDecision::AbandonAndFail),
+        ),
+    )
+    .await;
+    let done = promotion_record(&fx, &parked).await;
+    assert_eq!(done.status, AgentRunEffectStatus::Failed, "{ending:?}");
+    assert_eq!(
+        done.last_error_code.as_deref(),
+        Some("reconciliation-abandoned"),
+        "{ending:?}"
+    );
+    assert_eq!(done.generation, parked.generation, "{ending:?}");
+    assert!(open_checkpoints(&fx).await.is_empty(), "{ending:?}");
+    assert_terminal_unmoved(&fx, &before, "after AbandonAndFail").await;
+}
+
+/// `Escalate` through the checkpoint: it stays open, escalated, and the effect
+/// stays parked.
+async fn checkpoint_escalates(ending: Ending) {
+    let (fx, _stores) = ended_world(ending).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let parked = park_promotion(&fx, "ambiguous").await;
+    let checkpoint = the_open_checkpoint(&fx).await;
+    apply_ok(
+        &fx,
+        resolve_checkpoint_command(
+            &checkpoint.checkpoint_id,
+            "escalate",
+            reconciliation(rakka_agent::AgentReconciliationDecision::Escalate),
+        ),
+    )
+    .await;
+    let open = the_open_checkpoint(&fx).await;
+    assert_eq!(open.checkpoint_id, checkpoint.checkpoint_id, "{ending:?}");
+    assert_eq!(
+        open.status,
+        rakka_agent::AgentCheckpointStatus::Escalated,
+        "{ending:?}"
+    );
+    let held = promotion_record(&fx, &parked).await;
+    assert_eq!(
+        held.status,
+        AgentRunEffectStatus::Indeterminate,
+        "{ending:?}"
+    );
+    assert_eq!(held.generation, parked.generation, "{ending:?}");
+    assert_terminal_unmoved(&fx, &before, "after Escalate").await;
+}
+
+/// A person's checkpoint decision answers an ended run's parked promotion
+/// exactly as `ResolveIndeterminateEffect` does, and the terminal record never
+/// moves.
+#[tokio::test]
+async fn a_checkpoint_decision_answers_an_ended_runs_promotion() {
+    for ending in Ending::ALL {
+        Box::pin(checkpoint_confirms_not_executed(ending)).await;
+        Box::pin(checkpoint_confirms_completed(ending)).await;
+        Box::pin(checkpoint_abandons(ending)).await;
+        Box::pin(checkpoint_escalates(ending)).await;
+    }
+}
+
+/// A compensation is new work the host did not ask for: `Compensate` on an
+/// ended run's reconciliation checkpoint is `run-terminal`, and the checkpoint
+/// and the parked effect are untouched.
+#[tokio::test]
+async fn compensate_is_refused_on_an_ended_run() {
+    for ending in Ending::ALL {
+        let (fx, _stores) = ended_world(ending).await;
+        let before = fx.run_snapshot().await.expect("the run exists");
+        let parked = park_promotion(&fx, "ambiguous").await;
+        let checkpoint = the_open_checkpoint(&fx).await;
+        let refusal = apply(
+            &fx,
+            resolve_checkpoint_command(
+                &checkpoint.checkpoint_id,
+                "compensate",
+                reconciliation(rakka_agent::AgentReconciliationDecision::Compensate {
+                    compensation: rakka_agent::AgentCompensationRef::new("refund-charge")
+                        .expect("the compensation ref is valid"),
+                }),
+            ),
+        )
+        .await
+        .expect_err("a compensation is refused on an ended run");
+        assert_eq!(refusal.code(), "run-terminal", "{ending:?}");
+
+        let still = the_open_checkpoint(&fx).await;
+        assert_eq!(still.checkpoint_id, checkpoint.checkpoint_id, "{ending:?}");
+        assert_eq!(
+            still.status,
+            rakka_agent::AgentCheckpointStatus::Open,
+            "{ending:?}: still waiting"
+        );
+        let held = promotion_record(&fx, &parked).await;
+        assert_eq!(
+            held.status,
+            AgentRunEffectStatus::Indeterminate,
+            "{ending:?}"
+        );
+        assert_terminal_unmoved(&fx, &before, "after the refusal").await;
+    }
+}
+
+/// Two decisions for one park through different paths: the checkpoint a
+/// `ResolveIndeterminateEffect` dropped is gone, so a decision naming it is
+/// `run-terminal` and nothing is re-sent a second time.
+#[tokio::test]
+async fn a_dropped_checkpoint_on_an_ended_run_answers_run_terminal() {
+    let (fx, _stores) = ended_world(Ending::Completed).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let parked = park_promotion(&fx, "ambiguous").await;
+    let checkpoint = the_open_checkpoint(&fx).await;
+    apply_ok(
+        &fx,
+        resolve_indeterminate(
+            "not-executed",
+            &parked,
+            parked.generation,
+            rakka_agent::AgentEffectResolution::ConfirmedNotExecuted,
+        ),
+    )
+    .await;
+    assert!(open_checkpoints(&fx).await.is_empty());
+
+    let refusal = apply(
+        &fx,
+        resolve_checkpoint_command(
+            &checkpoint.checkpoint_id,
+            "late",
+            reconciliation(rakka_agent::AgentReconciliationDecision::ConfirmedNotExecuted),
+        ),
+    )
+    .await
+    .expect_err("the dropped checkpoint answers nothing");
+    assert_eq!(refusal.code(), "run-terminal");
+    let held = promotion_record(&fx, &parked).await;
+    assert_eq!(held.generation, parked.generation.next());
+    assert_terminal_unmoved(&fx, &before, "after the late decision").await;
+}
+
+/// The person's escalation and confirmation each record exactly one decision
+/// event, in the effect's own slots; a replay of either answers `Duplicate`
+/// and records nothing, and the stream has no hole.
+#[tokio::test]
+async fn an_ended_runs_checkpoint_decisions_record_their_events() {
+    use rakka_agent::AgentDecisionKind as Kind;
+    let sink = CountingDecisionSink::new();
+    let (fx, _stores) = ended_world_recording(Ending::Completed, Some(sink.clone())).await;
+    let scope = run_scope();
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let ended = sink.events(&scope).len();
+    assert!(ended > 0, "the ended run recorded its own decisions");
+    let parked = park_promotion(&fx, "ambiguous").await;
+    let checkpoint = the_open_checkpoint(&fx).await;
+
+    let escalate = resolve_checkpoint_command(
+        &checkpoint.checkpoint_id,
+        "escalate",
+        reconciliation(rakka_agent::AgentReconciliationDecision::Escalate),
+    );
+    apply_ok(&fx, escalate.clone()).await;
+    let complete = resolve_checkpoint_command(
+        &checkpoint.checkpoint_id,
+        "completed",
+        reconciliation(confirmed_completed()),
+    );
+    apply_ok(&fx, complete.clone()).await;
+
+    let events = sink.events(&scope);
+    let kinds: Vec<_> = events[ended..].iter().map(|event| event.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            Kind::RequestReconciliation,
+            Kind::EscalateCheckpoint,
+            Kind::Reconcile
+        ]
+    );
+    assert_eq!(events[ended + 1].reason_code.as_deref(), Some("escalated"));
+    let reconcile = &events[ended + 2];
+    assert_eq!(
+        reconcile.outcome,
+        Some(rakka_agent::AgentDecisionOutcome::ConfirmedExecuted)
+    );
+    assert!(
+        reconcile.operation_id.as_str().ends_with("-g1"),
+        "{}",
+        reconcile.operation_id.as_str()
+    );
+    let recorded = events.len();
+
+    for replay in [escalate, complete] {
+        let reply = apply_ok(&fx, replay).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Duplicate { .. }),
+            "{reply:?}"
+        );
+    }
+    assert_eq!(
+        sink.events(&scope).len(),
+        recorded,
+        "a replay records nothing"
+    );
+    let held = promotion_record(&fx, &parked).await;
+    assert_eq!(held.status, AgentRunEffectStatus::Succeeded);
+    assert_decision_stream_whole(&sink, &scope);
+    assert_terminal_unmoved(&fx, &before, "after the replays").await;
+}
+
+/// A promotion whose spec requires a checkpoint opens no approval on an ended
+/// run: `promote_memory` records the effect with `checkpoint_required` set and
+/// never calls `open_effect_checkpoint` (it is called only from the tool-call
+/// and evaluation paths), on a live run as on an ended one. With no grant the
+/// effect is not dispatchable (`is_dispatchable`), so it waits, and the run
+/// holds no checkpoint a person could grant. The gated `Granted` row of the
+/// design therefore holds by construction for the window's commands.
+#[tokio::test]
+async fn a_gated_promotion_on_an_ended_run_opens_no_approval() {
+    let (mut fx, stores) = ended_world(Ending::Completed).await;
+    fx.policies = rakka_agent::AgentEffectPolicies::new()
+        .with_memory_promotion_spec(
+            rakka_agent::AgentEffectSpec::idempotent(3)
+                .expect("the spec is valid")
+                .with_checkpoint_required(),
+        )
+        .expect("the policies are valid");
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "gated")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    crank(&fx).await;
+
+    let effect = promotion_effect(&fx).await;
+    assert!(effect.checkpoint_required, "the effect is gated");
+    assert!(open_checkpoints(&fx).await.is_empty(), "no approval opens");
+    assert!(
+        matches!(
+            effect.status,
+            AgentRunEffectStatus::Pending | AgentRunEffectStatus::Ready
+        ),
+        "{:?}",
+        effect.status
+    );
+    assert_eq!(effect.attempts, 0, "the ungranted effect never dispatches");
+    assert!(stores.private.is_empty(&agent_scope()));
+    assert_terminal_unmoved(&fx, &before, "after the gated promotion").await;
+}
+
 /// The owner-kill sweep over the post-terminal promotion flow: complete the
 /// run uncrashed, then kill its owner at every durable write of the
 /// promotion, recover, and retry under the same operation id. However the
