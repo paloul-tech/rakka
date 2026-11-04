@@ -280,7 +280,29 @@ incorrectly.
   and its outcome never rests one — a failure of either stays on the effect
   record rather than ending the run, and a run that has ended still accepts
   both for a deployment-configured window after its terminal stamp, its
-  effects riding the ordinary outbox the application keeps pumping. The
+  effects riding the ordinary outbox the application keeps pumping. If such
+  an effect's attempt may have run and its recovery retry is refused (the
+  agent was terminated just after the run ended), the generation parks
+  `Indeterminate` behind a reconciliation checkpoint, as a live run's does,
+  and the checkpoint lists `confirmed-completed`, `confirmed-not-executed`,
+  `escalate` and `abandon-and-fail`, never `compensate`. Either
+  `ResolveCheckpoint` or `ResolveIndeterminateEffect` answers it, at any time
+  after the run ended; the window bounds new commands, not the answer. The
+  terminal status, reason and stamp never move. `ConfirmedCompleted` records
+  the outcome and `AbandonAndFail` fails that generation only. `ConfirmedNotExecuted` is a
+  person's assertion that the attempt never ran, not a probe: it re-sends
+  under a new idempotency key, so if the first attempt did land, a re-sent
+  claim append appends a second claim and a re-sent consolidation is refused
+  on a stale revision. A person who does not know chooses `ConfirmedCompleted`
+  or `AbandonAndFail`. A re-send the authority still refuses fails
+  definitively; after memory retention has purged the run's session rows, a
+  re-sent promotion settles without parking (`Exhausted`, code
+  `memory-promotion-source-missing`, once its attempts run out). A timer
+  escalates the checkpoint but never expires it, and the settle pass opens
+  the checkpoint for a park that has none (see the decision events below).
+  A compensation or workflow cancel parked on an ended run stays as it was
+  (issue #123), and every other resolution on an ended run is still refused
+  `run-terminal`. The
   retriever supplies a ranking and nothing else: every ranked identity is
   resolved through the authoritative store before it is admitted, so a foreign
   or forged record is dropped and counted, and an unauthorized read reveals
@@ -362,8 +384,7 @@ gets no close event; the run's end event closes it for readers. `AgentDecisionEv
 writes back exactly the event it read; `Version2` adds the six newer kinds and
 the four fields and stamps events with schema version 2. Select it with
 `with_decision_event_vocabulary` once every process that loads the run store or
-reads the sink reads version 2 (see `docs/rakka-compatibility.md`). An ended
-run's ambiguous memory promotion or claim append records no event (issue #120).
+reads the sink reads version 2 (see `docs/rakka-compatibility.md`).
 The SDK, exporter, and Collector live at the application binary;
 `examples/agent-otlp-export-acceptance` is that binary, and
 `docs/plans/rakka-agent/kubernetes-agent-otel-collector-topology.yaml` is the

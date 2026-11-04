@@ -261,3 +261,23 @@ Posted on #120 when the PR merges:
 - the repair, and that it covers records a `bc0c224` replica parks during the roll;
 - the decision events and their slots;
 - the rollout table from section 6.
+
+## 11. As built
+
+Sections 1-10 are the design record and are left as written. The build differs from them in the points below.
+
+**The commits**
+- 5.1, the park opens its checkpoint: `88bb418`.
+- 5.2, `ResolveIndeterminateEffect`: `f016984`.
+- 5.2, `ResolveCheckpoint`: `99839de` and `548d337` (the gated promotion, the claim append checkpoint decision and the unaffordable re-send).
+- 5.3 and 5.4, the timers and the repair: `43b04ff`, scoped by `47365b0`.
+- 5.5, the decision events: recorded by the transitions above through `queue_decision`, with no commit of their own.
+
+**The retention outcome (corrects 5.2).** Section 5.2 says a promotion re-sent after memory retention is refused `memory-promotion-selection-empty`, also definitively. That is wrong.
+- The executor's read of a purged window returns the retryable `memory-promotion-source-missing` (`dispatch.rs:1207-1219`). `memory-promotion-selection-empty` (`:1265`) fires only when the rows exist and the role filter selects none.
+- In the real dispatch pipeline the retryable failure is retried under the effect's attempt bound and then settles `Exhausted` with code `memory-promotion-source-missing`. It does not park again.
+- The in-process test dispatcher has no attempt machinery. It surfaces the same read as `Failed` with `memory-promotion-attempt-failed`, which `a_re_sent_promotion_after_retention_fails_definitively` pins.
+
+**The gated rows of 5.2 are unreachable (answers section 9).** `promote_memory` and `append_claim` record `checkpoint_required` and `authorization_required` from the deployment's spec but never open an approval or authorization checkpoint; only the tool-call turn opens those gates. So a gated promotion or claim append stays `Pending` and is never dispatched, on an ended run and on a live one. `a_gated_promotion_on_an_ended_run_opens_no_approval` pins the ended case. That the gate never opens on a live run is a gap that predates this change, found here and not fixed here. The `Granted` arm's status-write skip stays as a guard that a window command cannot reach.
+
+**The repair is scoped (refines 5.4).** On an ended run the park repair opens a checkpoint only for an effect held outside the turn. A compensation, workflow cancel or handoff send parked checkpoint-less on the same ended run stays as it is (#123). One private helper, `AgentRun::parks_owed_a_checkpoint`, feeds both `needs_park_repair` and `repair_park`, so the gate and the action cannot drift apart.
