@@ -781,6 +781,19 @@ impl AgentRun {
                 .any(|effect| !effect.kind().outside_the_turn())
     }
 
+    /// Whether the loop state holds `effect_id` and the effect is one that
+    /// runs outside the turn (a memory promotion or a claim append).
+    ///
+    /// It reads only the effect, never the status, so it answers the same on
+    /// a live run and on one that has ended; the callers decide what a
+    /// terminal status means.
+    pub(crate) fn holds_outside_the_turn_effect(&self, effect_id: &AgentEffectId) -> bool {
+        self.loop_state
+            .effects()
+            .iter()
+            .any(|effect| &effect.effect_id == effect_id && effect.kind().outside_the_turn())
+    }
+
     /// Whether the record holds a park a binary before issue #106 left
     /// unresolvable:
     /// - a live run whose handoff cell the task already answered while the
@@ -4484,21 +4497,23 @@ fn record_effect_result(
     // does a handoff send's `Exhausted` one, whose probe could not establish
     // the transfer; a park with no checkpoint was the defect of issue #106.
     //
-    // Not on a run that has already ended: there is no run to park, and the
-    // only effect a terminal run can owe a result for is a promotion or claim
-    // append, whose ambiguous attempt the dispatcher retries under its
-    // idempotency key rather than parking. The one path that can still park
-    // one — a possibly-executed attempt whose recovery retry the authority
-    // refused — leaves the generation `Indeterminate` on the effect record,
-    // resolvable by `ResolveIndeterminateEffect`, and the terminal status
-    // untouched ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+    // A run that has ended opens it too, but only for a promotion or claim
+    // append: the one effect kind a terminal run can still owe a result for,
+    // whose possibly-executed attempt the dispatcher retries under its
+    // idempotency key and whose recovery retry the authority may refuse. That
+    // park opens its checkpoint, so either resolution path can answer it, and
+    // the terminal status, reason and stamp do not move. A compensation or
+    // workflow cancel parked on an ended run opens none (issue #123).
     let live = state.run().is_some_and(|run| !run.status.is_terminal());
     let parked = state.run().is_some_and(|run| {
         run.loop_state
             .indeterminate_effects()
             .any(|effect| effect.effect_id == *effect_id && effect.generation == generation)
     });
-    if live && parked {
+    let outside_the_turn = state
+        .run()
+        .is_some_and(|run| run.holds_outside_the_turn_effect(effect_id));
+    if parked && (live || outside_the_turn) {
         open_effect_checkpoint(
             state,
             policies,
@@ -5686,10 +5701,18 @@ fn open_effect_checkpoint(
         summary,
         agent_principal(&scope),
         now,
-    )?
-    .with_task(task)
-    .with_revisions(settings_revision, definition_revision)
-    .with_telemetry(telemetry);
+    )?;
+    // An ended run refuses `Compensate`, so a reconciliation checkpoint it
+    // opens must not offer it.
+    if run.status.is_terminal() && kind == AgentCheckpointKind::IndeterminateEffectReconciliation {
+        checkpoint
+            .allowed_decisions
+            .retain(|decision| decision.value != "compensate");
+    }
+    let mut checkpoint = checkpoint
+        .with_task(task)
+        .with_revisions(settings_revision, definition_revision)
+        .with_telemetry(telemetry);
     if let Some(goal) = goal {
         checkpoint = checkpoint.with_goal(goal);
     }

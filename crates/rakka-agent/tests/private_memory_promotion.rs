@@ -14,13 +14,14 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{sweep_crash_points, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    promotion_operation_id, AgentLoopPhase, AgentMemoryConsolidationTarget,
-    AgentMemoryPromotionRequest, AgentModelTurn, AgentModelUsage, AgentOperationId,
-    AgentOperationKind, AgentPrivateMemoryId, AgentPrivateMemoryKind, AgentPrivateMemoryStore,
-    AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectStatus,
-    AgentRunEntityCommand, AgentRunEntityReply, AgentRunMemory, AgentRunStatus, AgentScope,
-    AgentTaskContent, AgentTaskEntityStore, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest,
-    AgentToolId, AgentToolResult, InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore,
+    agent_operational_snapshot, promotion_operation_id, AgentCheckpoint, AgentCheckpointKind,
+    AgentLoopPhase, AgentMemoryConsolidationTarget, AgentMemoryPromotionRequest, AgentModelTurn,
+    AgentModelUsage, AgentOperationId, AgentOperationKind, AgentPrivateMemoryId,
+    AgentPrivateMemoryKind, AgentPrivateMemoryStore, AgentRunEffect, AgentRunEffectKind,
+    AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunEntityReply,
+    AgentRunMemory, AgentRunStatus, AgentSchemaPolicy, AgentScope, AgentTaskContent,
+    AgentTaskEntityStore, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    AgentToolResult, InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore,
     InMemorySessionMemoryStore, MemoryEntryRole, MemorySequence, PrivateMemoryCursor,
     SessionMemoryCursor, SessionMemoryPage, SessionMemoryPromotionExecutor, SessionMemoryStore,
     AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
@@ -1576,51 +1577,86 @@ async fn an_exhausted_post_terminal_promotion_leaves_the_terminal_record_untouch
     assert!(stores.private.is_empty(&agent_scope()));
 }
 
-/// An ambiguous outcome delivered to a run that has ended is recorded on the
-/// effect and opens no reconciliation checkpoint: there is no run to park,
-/// and the terminal status does not move.
+/// An ambiguous outcome delivered to a run that has ended parks the
+/// promotion `Indeterminate` and opens its reconciliation checkpoint: either
+/// resolution path can then answer it. The checkpoint omits `compensate`,
+/// which an ended run refuses, and the terminal record does not move.
 #[tokio::test]
-async fn an_indeterminate_post_terminal_outcome_opens_no_checkpoint() {
-    let (fx, _stores) = ended_world(Ending::Cancelled).await;
-    let before = fx.run_snapshot().await.expect("the run exists");
-    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "ambiguous")).await;
-    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
-    let parked = resolve_promotion(
-        &fx,
-        AgentRunEffectOutcome::indeterminate(
-            "dispatcher-lost-after-started",
-            "the recovery retry was refused",
-        ),
-    )
-    .await;
-    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
-    let mut entity = fx.run();
-    entity.recover(fx.now()).await.expect("recover");
-    let state = entity.state().expect("state");
-    assert!(
-        state
+async fn an_ended_runs_ambiguous_promotion_opens_its_reconciliation_checkpoint() {
+    for ending in Ending::ALL {
+        let (fx, _stores) = ended_world(ending).await;
+        let before = fx.run_snapshot().await.expect("the run exists");
+        let reply = apply_ok(&fx, promote_command(promotion(1, 1), "ambiguous")).await;
+        assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+        let parked = resolve_promotion(
+            &fx,
+            AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the recovery retry was refused",
+            ),
+        )
+        .await;
+        assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+
+        let mut entity = fx.run();
+        entity.recover(fx.now()).await.expect("recover");
+        let state = entity.state().expect("state");
+        let open = state
             .loop_state()
             .expect("the loop is started")
-            .open_checkpoints()
-            .is_empty(),
-        "no reconciliation checkpoint opens on a run that has ended"
-    );
-    let after = fx.run_snapshot().await.expect("the run exists");
-    assert_eq!(
-        after.status,
-        AgentRunStatus::Cancelled,
-        "the status did not move"
-    );
-    assert_eq!(after.status, before.status);
-    assert_eq!(after.terminal_at, before.terminal_at);
+            .open_checkpoints();
+        assert_eq!(open.len(), 1, "{ending:?}: one checkpoint opens");
+        assert_eq!(
+            open[0].kind,
+            AgentCheckpointKind::IndeterminateEffectReconciliation
+        );
+        assert_eq!(
+            open[0].checkpoint_id,
+            AgentCheckpoint::id_for_effect(
+                &parked.effect_id,
+                parked.generation,
+                AgentCheckpointKind::IndeterminateEffectReconciliation
+            )
+        );
+        let decisions: Vec<&str> = open[0]
+            .allowed_decisions
+            .iter()
+            .map(|decision| decision.value.as_str())
+            .collect();
+        assert_eq!(
+            decisions,
+            [
+                "confirmed-completed",
+                "confirmed-not-executed",
+                "escalate",
+                "abandon-and-fail"
+            ],
+            "{ending:?}: an ended run offers no compensate"
+        );
+
+        let snapshot = agent_operational_snapshot(
+            &fx.runs,
+            &run_scope(),
+            &AgentSchemaPolicy::default(),
+            fx.now(),
+        )
+        .await
+        .expect("the point query answers")
+        .expect("the run exists");
+        assert_eq!(snapshot.open_checkpoints.len(), 1, "{ending:?}");
+
+        let after = fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(after.status, before.status, "{ending:?}");
+        assert_eq!(after.terminal_reason, before.terminal_reason, "{ending:?}");
+        assert_eq!(after.terminal_at, before.terminal_at, "{ending:?}");
+    }
 }
 
-/// Pins the owner's ruling on issue #120: an ended run's ambiguous promotion
-/// opens no checkpoint, so it records no `RequestReconciliation` either — only
-/// a live run's reconciliation open does. A change to that ruling changes this
-/// test.
+/// The ended run's park records exactly one `request-reconciliation`, in the
+/// slot its effect's identity names, and a replay of the same result records
+/// no second one.
 #[tokio::test]
-async fn an_indeterminate_post_terminal_outcome_records_no_decision_event() {
+async fn an_ended_runs_ambiguous_promotion_records_one_reconciliation_open() {
     let sink = CountingDecisionSink::new();
     let (fx, _stores) = ended_world_recording(Ending::Cancelled, Some(sink.clone())).await;
     let scope = run_scope();
@@ -1629,6 +1665,7 @@ async fn an_indeterminate_post_terminal_outcome_records_no_decision_event() {
         !before.is_empty(),
         "the ended run recorded its own decisions"
     );
+    let before_snapshot = fx.run_snapshot().await.expect("the run exists");
     let reply = apply_ok(&fx, promote_command(promotion(1, 1), "ambiguous")).await;
     assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
     let parked = resolve_promotion(
@@ -1641,19 +1678,60 @@ async fn an_indeterminate_post_terminal_outcome_records_no_decision_event() {
     .await;
     assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
 
-    let after = sink.events(&scope);
-    assert!(
-        after
-            .iter()
-            .all(|event| event.kind != rakka_agent::AgentDecisionKind::RequestReconciliation),
-        "an ended run's ambiguous append records no reconciliation open"
-    );
+    let opens = |sink: &CountingDecisionSink| -> Vec<rakka_agent::AgentDecisionEvent> {
+        sink.events(&scope)
+            .into_iter()
+            .filter(|event| event.kind == rakka_agent::AgentDecisionKind::RequestReconciliation)
+            .collect()
+    };
+    let opened = opens(&sink);
+    assert_eq!(opened.len(), 1, "one reconciliation open");
     assert_eq!(
-        after.len(),
-        before.len(),
-        "the park changes the sink's count by nothing"
+        opened[0].reason_code.as_deref(),
+        Some("dispatcher-lost-after-started")
     );
+    let slot = format!("ck-open-reconcile-t{}-s{}-g1", parked.turn, parked.slot);
+    assert!(
+        opened[0].operation_id.as_str().contains(&slot),
+        "the open's operation id carries slot {slot}: {}",
+        opened[0].operation_id.as_str()
+    );
+    let count = sink.events(&scope).len();
+    assert_eq!(count, before.len() + 1, "the park added exactly one event");
+
+    // A settle pass, then the same result re-applied: nothing more records.
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.settle_side_effects(&fx.router, fx.now())
+        .await
+        .expect("settle");
+    let _ = run
+        .apply(
+            AgentRunEntityCommand::RecordEffectResult {
+                operation_id: parked
+                    .result_operation_id(&scope)
+                    .expect("result operation id"),
+                effect_id: parked.effect_id.clone(),
+                generation: parked.generation,
+                attempt: parked.attempts,
+                fence: 0,
+                outcome: Box::new(AgentRunEffectOutcome::indeterminate(
+                    "dispatcher-lost-after-started",
+                    "the recovery retry was refused",
+                )),
+            },
+            &fx.router,
+            fx.now(),
+        )
+        .await;
+    assert_eq!(opens(&sink).len(), 1, "a replay records no second open");
+    assert_eq!(sink.events(&scope).len(), count);
     assert_decision_stream_whole(&sink, &scope);
+
+    let after = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before_snapshot.status);
+    assert_eq!(after.terminal_reason, before_snapshot.terminal_reason);
+    assert_eq!(after.terminal_at, before_snapshot.terminal_at);
 }
 
 /// The owner-kill sweep over the post-terminal promotion flow: complete the

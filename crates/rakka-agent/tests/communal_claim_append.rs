@@ -16,14 +16,14 @@ use std::sync::{Arc, Mutex};
 use common::{goal_spec, goal_spec_draft, goal_task_creation_command, task_definition, task_scope};
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    claim_append_operation_id, AgentClaimAppendExecutor, AgentClaimAppendFinding,
-    AgentClaimAppendProvenance, AgentClaimAppendRequest, AgentClaimObjectRequest,
-    AgentCommunalClaimId, AgentDispatchFuture, AgentModelTurn, AgentModelUsage, AgentOperationId,
-    AgentOperationKind, AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome,
-    AgentRunEffectStatus, AgentRunEntityCommand, AgentRunEntityReply, AgentRunScope,
-    AgentRunStatus, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    KnowledgeSpaceId, AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    agent_operational_snapshot, claim_append_operation_id, AgentCheckpoint, AgentCheckpointKind,
+    AgentClaimAppendExecutor, AgentClaimAppendFinding, AgentClaimAppendProvenance,
+    AgentClaimAppendRequest, AgentClaimObjectRequest, AgentCommunalClaimId, AgentDispatchFuture,
+    AgentModelTurn, AgentModelUsage, AgentOperationId, AgentOperationKind, AgentRunEffect,
+    AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand,
+    AgentRunEntityReply, AgentRunScope, AgentRunStatus, AgentSchemaPolicy, AgentTaskContent,
+    AgentToolCallId, AgentToolCallRequest, AgentToolId, KnowledgeSpaceId,
+    AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 use serde_json::json;
@@ -660,6 +660,80 @@ async fn a_claim_append_is_accepted_inside_the_post_terminal_window() {
             "{ending:?}: the terminal stamp did not move"
         );
     }
+}
+
+/// An ambiguous claim-append outcome delivered to an ended run parks the
+/// append `Indeterminate` and opens its reconciliation checkpoint, without
+/// `compensate`, and the terminal record does not move.
+#[tokio::test]
+async fn an_ended_runs_ambiguous_claim_append_opens_its_reconciliation_checkpoint() {
+    let executor = RecordingClaimAppendExecutor::new();
+    let fx = ended_goal_world(Ending::Completed, executor.clone()).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let reply = apply_append(&fx, "ambiguous", append_request("space-alpha"))
+        .await
+        .expect("the post-terminal append applies");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let parked = resolve_claim_append(
+        &fx,
+        AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the recovery retry was refused",
+        ),
+    )
+    .await;
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let open = run
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .open_checkpoints();
+    assert_eq!(open.len(), 1, "one checkpoint opens");
+    assert_eq!(
+        open[0].kind,
+        AgentCheckpointKind::IndeterminateEffectReconciliation
+    );
+    assert_eq!(
+        open[0].checkpoint_id,
+        AgentCheckpoint::id_for_effect(
+            &parked.effect_id,
+            parked.generation,
+            AgentCheckpointKind::IndeterminateEffectReconciliation
+        )
+    );
+    let decisions: Vec<&str> = open[0]
+        .allowed_decisions
+        .iter()
+        .map(|decision| decision.value.as_str())
+        .collect();
+    assert_eq!(
+        decisions,
+        [
+            "confirmed-completed",
+            "confirmed-not-executed",
+            "escalate",
+            "abandon-and-fail"
+        ]
+    );
+    let snapshot = agent_operational_snapshot(
+        &fx.runs,
+        &common::run_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists");
+    assert_eq!(snapshot.open_checkpoints.len(), 1);
+
+    let after = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.terminal_reason, before.terminal_reason);
+    assert_eq!(after.terminal_at, before.terminal_at);
 }
 
 /// The window is inclusive of its last millisecond and closed one past it,
