@@ -736,6 +736,98 @@ async fn an_ended_runs_ambiguous_claim_append_opens_its_reconciliation_checkpoin
     assert_eq!(after.terminal_at, before.terminal_at);
 }
 
+/// `ConfirmedNotExecuted` on an ended run re-sends its parked claim append
+/// under a new generation, and so a new idempotency key: the append lands
+/// through the ordinary outbox and the terminal record does not move.
+#[tokio::test]
+async fn confirmed_not_executed_re_sends_an_ended_runs_claim_append_under_a_new_key() {
+    let executor = RecordingClaimAppendExecutor::new();
+    let fx = ended_goal_world(Ending::Completed, executor.clone()).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    apply_append(&fx, "ambiguous", append_request("space-alpha"))
+        .await
+        .expect("the post-terminal append applies");
+    let parked = resolve_claim_append(
+        &fx,
+        AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the recovery retry was refused",
+        ),
+    )
+    .await;
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    let first_key = parked
+        .safety
+        .external_key()
+        .expect("an append carries its external key")
+        .as_str()
+        .to_string();
+    assert!(first_key.ends_with("#g1"), "{first_key}");
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.apply(
+        AgentRunEntityCommand::ResolveIndeterminateEffect {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "not-executed",
+            )
+            .expect("the decision key derives"),
+            effect_id: parked.effect_id.clone(),
+            generation: parked.generation,
+            resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedNotExecuted),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("an ended run's parked append is re-sent");
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let resent = committed_append(run.state().expect("state"))
+        .into_iter()
+        .find(|held| held.effect_id == parked.effect_id)
+        .expect("the effect survives");
+    assert_eq!(resent.generation, parked.generation.next());
+    let key = resent
+        .safety
+        .external_key()
+        .expect("the new generation carries a key")
+        .as_str();
+    assert!(
+        key.ends_with("#g2"),
+        "the new generation derives a new key: {key}"
+    );
+    assert!(run
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .open_checkpoints()
+        .is_empty());
+    assert!(executor.invocations().is_empty(), "nothing sent yet");
+
+    fx.pump_post_terminal(AgentRunEffectKind::ClaimAppendCall)
+        .await
+        .expect("the re-sent append settles");
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let done = committed_append(run.state().expect("state"))
+        .into_iter()
+        .find(|held| held.effect_id == parked.effect_id)
+        .expect("the effect survives");
+    assert_eq!(done.status, AgentRunEffectStatus::Succeeded);
+    assert_eq!(executor.invocations().len(), 1);
+
+    let after = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.terminal_reason, before.terminal_reason);
+    assert_eq!(after.terminal_at, before.terminal_at);
+}
+
 /// The window is inclusive of its last millisecond and closed one past it,
 /// under `run-memory-window-closed`, with nothing committed and the executor
 /// never reached.

@@ -5411,6 +5411,15 @@ fn drop_reconciliation_checkpoint(
 /// the ambiguous generation binds that generation exactly, so the fresh intent
 /// needs a fresh decision
 /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// An ended run answers only an outside-the-turn effect it holds (a memory
+/// promotion or a claim append parked after the end); every other target is
+/// refused `Terminal`. A held one then meets the refusals a live run gives
+/// (stale generation, stale result). On an ended run `ConfirmedNotExecuted`
+/// is a person's assertion that the attempt never ran, so it takes the live
+/// arm and re-sends under a new generation rather than settling `Cancelled`;
+/// the run's status, terminal reason and terminal stamp never move, and the
+/// window for new memory commands is not read.
 fn apply_indeterminate_resolution(
     state: &mut AgentRunState,
     effect_id: &AgentEffectId,
@@ -5424,10 +5433,12 @@ fn apply_indeterminate_resolution(
     let scope = state.scope.clone();
 
     let run = state.run_mut()?;
-    if run.status.is_terminal() {
+    if run.status.is_terminal() && !run.holds_outside_the_turn_effect(effect_id) {
         return Err(AgentRunError::Terminal { status: run.status });
     }
-    let winding_down = run.terminal_reason.is_some();
+    // An ended run always carries a terminal reason, but it is not winding
+    // down: it re-sends a generation its person says never ran (issue #120).
+    let winding_down = run.terminal_reason.is_some() && !run.status.is_terminal();
     // Read before the effect is borrowed (issue #106).
     let handoff_standing = handoff_send(&run.loop_state, effect_id);
 
@@ -5574,7 +5585,11 @@ fn apply_indeterminate_resolution(
                     open_effect_checkpoint(state, policies, effect_id, kind, now)?;
                 }
                 let run = state.run_mut()?;
-                run.status = checkpoint_wait_status(&run.loop_state);
+                // The terminal status never moves: an ended run's re-sent
+                // generation rides the outbox without a wait status.
+                if !run.status.is_terminal() {
+                    run.status = checkpoint_wait_status(&run.loop_state);
+                }
                 state.updated_at = now;
             }
         }
