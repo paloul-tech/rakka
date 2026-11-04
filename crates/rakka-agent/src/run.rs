@@ -817,15 +817,30 @@ impl AgentRun {
     /// slice 3 repair rests an unrested turn.
     pub(crate) fn needs_park_repair(&self) -> bool {
         if self.status.is_terminal() {
-            return self.loop_state.indeterminate_effects().any(|effect| {
-                effect.kind().outside_the_turn()
-                    && !has_reconciliation_checkpoint(&self.loop_state, effect)
-            });
+            return self.parks_owed_a_checkpoint().next().is_some();
         }
         self.loop_state.indeterminate_effects().any(|effect| {
             handoff_send(&self.loop_state, &effect.effect_id) == HandoffSend::ResolvedByTask
-                || !has_reconciliation_checkpoint(&self.loop_state, effect)
-        })
+        }) || self.parks_owed_a_checkpoint().next().is_some()
+    }
+
+    /// The `Indeterminate` effects owed a reconciliation checkpoint they do
+    /// not hold: the one list both [`Self::needs_park_repair`] and
+    /// `repair_park` read, so the gate and the action cannot drift apart.
+    ///
+    /// A live run is owed one for every such effect. An ended run is owed one
+    /// only for an effect held outside the turn (a memory promotion or a
+    /// claim append); a parked compensation, workflow cancel or handoff send
+    /// on an ended run is left without one, because its checkpoint would
+    /// advertise decisions the ended run refuses.
+    fn parks_owed_a_checkpoint(&self) -> impl Iterator<Item = &AgentRunEffect> {
+        let ended = self.status.is_terminal();
+        self.loop_state
+            .indeterminate_effects()
+            .filter(move |effect| {
+                (!ended || effect.kind().outside_the_turn())
+                    && !has_reconciliation_checkpoint(&self.loop_state, effect)
+            })
     }
 
     /// Serialized size of the materialized record, in bytes.
@@ -4205,9 +4220,7 @@ fn repair_park(
     let unbound: Vec<AgentEffectId> = state
         .run()
         .map(|run| {
-            run.loop_state
-                .indeterminate_effects()
-                .filter(|effect| !has_reconciliation_checkpoint(&run.loop_state, effect))
+            run.parks_owed_a_checkpoint()
                 .map(|effect| effect.effect_id.clone())
                 .collect()
         })
@@ -13204,20 +13217,9 @@ mod tests {
         assert_eq!(fx.state, before, "a timer on another kind changes nothing");
     }
 
-    /// On an ended run the park repair reads only an `Indeterminate` effect
-    /// held outside the turn: a checkpoint-less promotion needs it, and the
-    /// same shape on a handoff send does not.
-    #[test]
-    fn needs_park_repair_reads_only_outside_the_turn_effects_on_an_ended_run() {
-        let mut fx = handoff_send_fixture(
-            AgentRunStatus::Failed,
-            AgentHandoffStatus::Pending,
-            AgentRunEffectStatus::Indeterminate,
-        );
-        assert!(
-            !fx.state.run().expect("run").needs_park_repair(),
-            "a checkpoint-less handoff send on an ended run is left as it is"
-        );
+    /// Records a checkpoint-less `Indeterminate` memory promotion on the
+    /// fixture's run, returning its effect id.
+    fn park_a_promotion(fx: &mut HandoffSendFixture) -> AgentEffectId {
         let now = fx.now;
         let scope = fx.scope.clone();
         let run = fx.state.run_mut().expect("the run exists");
@@ -13242,12 +13244,85 @@ mod tests {
         )
         .expect("the promotion derives");
         promotion.status = AgentRunEffectStatus::Indeterminate;
+        let effect_id = promotion.effect_id.clone();
         run.loop_state
             .record_effect(promotion)
             .expect("the promotion records");
+        effect_id
+    }
+
+    /// On an ended run the park repair reads only an `Indeterminate` effect
+    /// held outside the turn: a checkpoint-less promotion needs it, and the
+    /// same shape on a handoff send does not.
+    #[test]
+    fn needs_park_repair_reads_only_outside_the_turn_effects_on_an_ended_run() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Failed,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Indeterminate,
+        );
+        assert!(
+            !fx.state.run().expect("run").needs_park_repair(),
+            "a checkpoint-less handoff send on an ended run is left as it is"
+        );
+        park_a_promotion(&mut fx);
         assert!(
             fx.state.run().expect("run").needs_park_repair(),
             "a checkpoint-less promotion on an ended run needs the repair"
+        );
+    }
+
+    /// The repair opens a checkpoint for an ended run's outside-the-turn park
+    /// only. A checkpoint-less handoff send held beside the promotion (the
+    /// fixture's `A2aHandoff`; a `WorkflowCancel` needs an invocation record)
+    /// stays without one, and the pass queues exactly one
+    /// `request-reconciliation`, so the terminal record never moves.
+    #[test]
+    fn repair_park_on_an_ended_run_opens_only_the_outside_the_turn_checkpoint() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Failed,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Indeterminate,
+        );
+        let promotion = park_a_promotion(&mut fx);
+        let before = fx.state.run().expect("run").clone();
+
+        repair_park(&mut fx.state, &AgentEffectPolicies::default(), fx.now)
+            .expect("the repair applies");
+
+        let run = fx.state.run_mut().expect("run");
+        let open = run.loop_state.open_checkpoints();
+        assert_eq!(open.len(), 1, "exactly the promotion's checkpoint opens");
+        assert_eq!(open[0].bound_effect.effect_id, promotion);
+        assert_eq!(
+            open[0].kind,
+            AgentCheckpointKind::IndeterminateEffectReconciliation
+        );
+        let send = run
+            .loop_state
+            .effects()
+            .iter()
+            .find(|effect| effect.effect_id == fx.effect_id)
+            .expect("the send stays");
+        assert!(
+            !has_reconciliation_checkpoint(&run.loop_state, send),
+            "the handoff send stays checkpoint-less"
+        );
+        run.loop_state
+            .commit_decisions(AgentDecisionEventVocabulary::Version2);
+        let opens: Vec<_> = run
+            .loop_state
+            .decision_outbox()
+            .iter()
+            .filter(|event| event.kind == AgentDecisionKind::RequestReconciliation)
+            .collect();
+        assert_eq!(opens.len(), 1, "one request-reconciliation is queued");
+        assert_eq!(run.status, before.status);
+        assert_eq!(run.terminal_reason, before.terminal_reason);
+        assert_eq!(run.terminal_at, before.terminal_at);
+        assert!(
+            !fx.state.run().expect("run").needs_park_repair(),
+            "the repair leaves nothing owed"
         );
     }
 
