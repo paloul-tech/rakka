@@ -3466,3 +3466,221 @@ async fn a_timer_escalates_an_ended_runs_reconciliation_checkpoint() {
     assert_decision_stream_whole(&sink, &scope);
     assert_terminal_unmoved(&fx, &before, "after the replay").await;
 }
+
+// ---------------------------------------------------------------------------
+// A gated promotion committed in a tool-calling turn (issue #120).
+// ---------------------------------------------------------------------------
+
+/// Policies whose promotion spec requires a checkpoint, under `sla`.
+fn gated_promotion_policies(
+    sla: rakka_agent::AgentCheckpointSla,
+) -> rakka_agent::AgentEffectPolicies {
+    rakka_agent::AgentEffectPolicies::new()
+        .with_memory_promotion_spec(
+            rakka_agent::AgentEffectSpec::idempotent(3)
+                .expect("the spec is valid")
+                .with_checkpoint_required(),
+        )
+        .expect("the policies are valid")
+        .with_checkpoint_sla(sla)
+}
+
+/// A live run whose first turn's model call answers with a tool call, with a gated promotion committed while the run awaited that model
+/// call. Returned after the model answered: the tool-call transition has run.
+async fn gated_promotion_in_a_tool_turn(sla: rakka_agent::AgentCheckpointSla) -> (Fixture, Stores) {
+    let stores = stores();
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, proposing_turn("resolved")),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    )
+    .with_memory_promotion_executor(Arc::new(SessionMemoryPromotionExecutor::new(
+        stores.session.clone(),
+        stores.private.clone(),
+    )));
+    let mut fx = Fixture::new(dispatcher).with_memory(
+        AgentRunMemory::new(stores.session.clone(), stores.snapshots.clone())
+            .with_private_store(stores.private.clone()),
+    );
+    fx.policies = gated_promotion_policies(sla);
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    crank(&fx).await;
+    let (phase, _, turn, _) = resting_at(&fx).await;
+    assert_eq!(
+        (phase, turn),
+        (AgentLoopPhase::AwaitingModel, 1),
+        "the run awaits its model call"
+    );
+    let reply = apply_ok(&fx, promote_command(promotion(1, 1), "gated")).await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    // The model answers with a tool call in the same turn.
+    drive_turn(&fx).await;
+    (fx, stores)
+}
+
+/// `promote_memory` takes the current turn with no phase guard, and the
+/// tool-call transition opens an approval for every ungranted gated effect of
+/// its turn whatever its kind: so a gated promotion committed while the run
+/// awaits its model call gets an `Approval` checkpoint bound to it.
+#[tokio::test]
+async fn a_gated_promotion_in_a_tool_calling_turn_opens_its_approval() {
+    let (fx, _stores) =
+        gated_promotion_in_a_tool_turn(rakka_agent::AgentCheckpointSla::default()).await;
+    let open = open_checkpoints(&fx).await;
+    let promotion = open_promotion(&fx).await;
+    assert!(promotion.checkpoint_required, "the effect is gated");
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].kind, AgentCheckpointKind::Approval);
+    assert_eq!(open[0].bound_effect.effect_id, promotion.effect_id);
+}
+
+/// The promotion effect the run holds, whatever its status.
+async fn open_promotion(fx: &Fixture) -> AgentRunEffect {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .effects()
+        .iter()
+        .find(|effect| effect.kind() == AgentRunEffectKind::MemoryPromotionCall)
+        .cloned()
+        .expect("the promotion is held")
+}
+
+/// Pumps the run to its end and checks the gated promotion's approval
+/// survives it. The run ends `Completed`: the task accepts the second turn's
+/// proposal, and `settle_proposal`'s `Accepted` arm terminates without waiting
+/// on the promotion, which is outside the turn. (A run that fails instead
+/// winds down `Cancelling` and waits on the pending approval; it never
+/// reaches a terminal status while the approval is open.) Returns the run's
+/// snapshot and the approval.
+async fn end_the_run_leaving_the_approval(
+    fx: &Fixture,
+) -> (rakka_agent::AgentRunSnapshot, AgentCheckpoint) {
+    fx.pump().await.expect("the loop runs to its end");
+    let ended = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(ended.status, AgentRunStatus::Completed);
+    assert!(ended.terminal_at.is_some());
+    let approval = the_open_checkpoint(fx).await;
+    assert_eq!(approval.kind, AgentCheckpointKind::Approval);
+    let promotion = open_promotion(fx).await;
+    assert_eq!(approval.bound_effect.effect_id, promotion.effect_id);
+    assert_eq!(promotion.status, AgentRunEffectStatus::Pending);
+    assert_eq!(promotion.attempts, 0);
+    (ended, approval)
+}
+
+/// A grant on an ended run's gated promotion approval dispatches the
+/// promotion without moving the terminal record: the `Granted` arm must not
+/// rewrite the status from the checkpoint-wait projection.
+#[tokio::test]
+async fn a_granted_gated_promotion_on_an_ended_run_dispatches_without_moving_the_status() {
+    let (fx, stores) =
+        gated_promotion_in_a_tool_turn(rakka_agent::AgentCheckpointSla::default()).await;
+    let (before, approval) = end_the_run_leaving_the_approval(&fx).await;
+    assert_terminal_unmoved(&fx, &before, "after the run ended").await;
+
+    let reply = apply_ok(
+        &fx,
+        resolve_checkpoint_command(
+            &approval.checkpoint_id,
+            "approve",
+            rakka_agent::AgentCheckpointDecision::Approval(
+                rakka_agent::AgentApprovalDecision::Approve {
+                    credential_binding: None,
+                    expires_at: AgentTimestampMillis::new(u64::MAX / 2),
+                    allowed_use_count: 1,
+                },
+            ),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    assert!(open_checkpoints(&fx).await.is_empty());
+    assert_terminal_unmoved(&fx, &before, "after the grant").await;
+
+    fx.pump_post_terminal(AgentRunEffectKind::MemoryPromotionCall)
+        .await
+        .expect("the granted promotion settles");
+    let done = open_promotion(&fx).await;
+    assert_eq!(done.status, AgentRunEffectStatus::Succeeded);
+    assert_eq!(stores.private.len(&agent_scope()), 1);
+    assert_terminal_unmoved(&fx, &before, "after the pump").await;
+}
+
+/// A timer expires an ended run's gated promotion approval: the promotion's
+/// generation fails, nothing else does, and the terminal record is unmoved.
+#[tokio::test]
+async fn a_timer_expires_an_ended_runs_gated_promotion_approval() {
+    let (fx, _stores) = gated_promotion_in_a_tool_turn(rakka_agent::AgentCheckpointSla {
+        due_after_ms: None,
+        expire_after_ms: Some(1_000),
+        escalation_target: None,
+    })
+    .await;
+    let (before, approval) = end_the_run_leaving_the_approval(&fx).await;
+    let expires = approval.expires_at.expect("the SLA stamped an expiry");
+    let effects_before = {
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .effects()
+            .to_vec()
+    };
+
+    fx.clock
+        .store(expires.as_millis() + 1, std::sync::atomic::Ordering::SeqCst);
+    apply_ok(
+        &fx,
+        AgentRunEntityCommand::FireCheckpointTimers {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "timer",
+            )
+            .expect("the timer key derives"),
+        },
+    )
+    .await;
+
+    assert!(
+        open_checkpoints(&fx).await.is_empty(),
+        "the approval expired"
+    );
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let effects_after = run
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .effects()
+        .to_vec();
+    for after in &effects_after {
+        let was = effects_before
+            .iter()
+            .find(|held| held.effect_id == after.effect_id)
+            .expect("no effect appears");
+        if after.kind() == AgentRunEffectKind::MemoryPromotionCall {
+            assert_eq!(after.status, AgentRunEffectStatus::Failed);
+            assert_eq!(after.generation, was.generation);
+        } else {
+            assert_eq!(after, was, "only the promotion's generation changes");
+        }
+    }
+    assert_terminal_unmoved(&fx, &before, "after the timer").await;
+}
