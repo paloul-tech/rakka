@@ -343,8 +343,10 @@ reconciliations (`reconcile`, including the one a handoff notice settles, and
 (`resolve-checkpoint`, `escalate-checkpoint`), the waits a run enters (`wait`,
 slots `wait-top-up-{sequence}`, `wait-children-q{n}`, `wait-handoff-q{n}`,
 `wait-winding-down`), and the run's end (`complete`, `fail`, `cancel`,
-`handoff`, `supersede`). New events carry a `reason_code` and, under
-`Version2` and where they apply, the optional `checkpoint`, `effect`, `outcome`
+`handoff`, `supersede`). Every new event but the approval and authorization
+opens (`request-approval`, `request-authorization`, whose kind names the
+checkpoint) carries a `reason_code`. Under `Version2`, and where they apply,
+events also carry the optional `checkpoint`, `effect`, `outcome`
 (`AgentDecisionOutcome`) and `run_status` fields; readers should key on
 `reason_code`, since an
 `awaiting-children` wait entered during a wind-down reads `run_status`
