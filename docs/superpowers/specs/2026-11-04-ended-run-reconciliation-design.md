@@ -273,6 +273,7 @@ Sections 1-10 are the design record and are left as written. The build differs f
 - 5.3 and 5.4, the timers and the repair: `43b04ff`, scoped by `47365b0`.
 - The gated approval on an ended run: `bcb1a1b` pins that a tool-calling turn's approval for a gated promotion outlives a run that ends `Completed`, and that a grant or a timer expiry answers it without moving the terminal record.
 - 5.5, the decision events: recorded by the transitions above through `queue_decision`, with no commit of their own.
+- The final review's fixes: `515c315` (the confirmation refusal below, the #123 park pin, the gated approvals' decision events, and doc comments), then the product docs.
 
 **The retention outcome (corrects 5.2).** Section 5.2 says a promotion re-sent after memory retention is refused `memory-promotion-selection-empty`, also definitively. That is wrong.
 - The executor's read of a purged window returns the retryable `memory-promotion-source-missing` (`dispatch.rs:1207-1219`). `memory-promotion-selection-empty` (`:1265`) fires only when the rows exist and the role filter selects none.
@@ -285,5 +286,31 @@ Sections 1-10 are the design record and are left as written. The build differs f
 - Such an approval can outlive the run. An ended run can hold it open through `settle_proposal`'s `Accepted` arm, which terminates without waiting (the same path that leaves the kinds of #123 outstanding). A failed run does not end with it open: the pending promotion blocks settlement, so the run stays `Cancelling` until the approval is denied or expires.
 - Granting it on the ended run dispatches the effect without moving the run's status. The `Granted` arm's `checkpoint_wait_status` write is skipped on an ended run, and that skip is load-bearing (`a_granted_gated_promotion_on_an_ended_run_dispatches_without_moving_the_status`, falsified).
 - Letting it expire fails that generation only (`a_timer_expires_an_ended_runs_gated_promotion_approval`).
+- The grant and the expiry each record exactly one `resolve-checkpoint` after the run's `complete`, written only under `Version2`; a replay records nothing, and the stream has no hole. Both tests attach a `Version2` `CountingDecisionSink` to pin it.
 
-**The repair is scoped (refines 5.4).** On an ended run the park repair opens a checkpoint only for an effect held outside the turn. A compensation, workflow cancel or handoff send parked checkpoint-less on the same ended run stays as it is (#123). One private helper, `AgentRun::parks_owed_a_checkpoint`, feeds both `needs_park_repair` and `repair_park`, so the gate and the action cannot drift apart.
+**The repair is scoped (refines 5.4).** On an ended run the park repair opens a checkpoint only for an effect held outside the turn. A compensation or workflow cancel parked checkpoint-less on the same ended run stays as it is (#123), and so does any other parked kind: on an ended run the repair reads only the two kinds outside the turn. One private helper, `AgentRun::parks_owed_a_checkpoint`, feeds both `needs_park_repair` and `repair_park`, so the gate and the action cannot drift apart.
+- The park itself is scoped the same way. A compensation that parks on an ended run opens no checkpoint and queues no event (`an_ended_runs_parked_compensation_opens_no_checkpoint`, falsified by letting every ended-run park open one).
+
+**A confirmation must settle the parked effect (adds to 5.2).**
+- On an ended run, `apply_indeterminate_resolution` refuses a `ConfirmedExecuted` whose outcome is not one of: the effect's own success receipt (`MemoryPromotion` for a promotion, `ClaimAppend` for a claim append), `Failed`, or `Exhausted`.
+- The refusal is `AgentEffectError::InvalidPolicy`, code `effect-policy-invalid`, the code the exhausted handoff-send confirmation already gives. It is raised before anything changes, and both `ResolveIndeterminateEffect` and `ResolveCheckpoint`'s `ConfirmedCompleted` reach it.
+- Without it, a model turn moved an ended run's phase from `Complete` to `EvaluatingModelOutput` and left a pending turn, and a goal evaluation would fill the goal-evaluation cell and owe the task a `GoalEvaluation` exchange. Both break section 3's anti-goal of new work on an ended run.
+- A live run, and `RecordEffectResult` on any run, accept what they accepted before. That older gap is a follow-up.
+- Pinned by `an_ended_run_refuses_a_confirmation_carrying_another_kinds_outcome` and `an_ended_runs_checkpoint_refuses_a_confirmation_carrying_another_kinds_outcome`, falsified.
+
+**Proof 2's terminated re-send is argued, not tested (answers section 7).** Proof 2's second bullet says that, with the agent still terminated, the re-send fails definitively. No test drives it. It follows from two facts:
+- `begin_next_generation` resets the new generation's `attempts` to 0 (`effect.rs:2031`), so its first dispatch is attempt 1.
+- The dispatcher's `possibly_executed` rule, which this change leaves alone, holds only for an idempotent effect on an attempt after the first (`dispatch.rs:2872`). So `settle_undispatchable` (`dispatch.rs:3809-3830`) refuses that first attempt definitively instead of parking it.
+
+**A rollback costs more than section 6 says (corrects 6).** Section 6 says the only loss on a rollback to `bc0c224` is that a resolve on an ended run is refused again. After the rollback a `bc0c224` binary also:
+- no longer escalates these checkpoints on timers, or expires an approval left open on one of these effects (its `fire_checkpoint_timers` returns early on an ended run);
+- opens no checkpoint for a new park (its `record_effect_result` opens one only on a live run);
+- keeps showing a checkpoint already open in the run's snapshot, offering decisions it refuses `run-terminal`.
+
+`docs/rakka-compatibility.md` says all of it.
+
+**A checkpoint opened while the run was live keeps `compensate` (refines 5.1; an open question).**
+- A reconciliation checkpoint opened while the run was live keeps its decision list after the run ends, `compensate` included. That is reachable: `settle_proposal`'s `Accepted` arm can end a run that holds a promotion it parked while live.
+- `Compensate` against it is refused `run-terminal`, as section 5.1's last bullet says, and the final review ruled to keep the code as it is.
+- The docs say so: a checkpoint opened on an ended run never offers `compensate`, and one opened while the run was live keeps its list.
+- The open question: the snapshot still lists `compensate` on such a checkpoint, a decision the run refuses, which is section 3's last anti-goal.

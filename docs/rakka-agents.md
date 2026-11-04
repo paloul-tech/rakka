@@ -283,13 +283,19 @@ incorrectly.
   effects riding the ordinary outbox the application keeps pumping. If such
   an effect's attempt may have run and its recovery retry is refused (the
   agent was terminated just after the run ended), the generation parks
-  `Indeterminate` behind a reconciliation checkpoint, as a live run's does,
-  and the checkpoint lists `confirmed-completed`, `confirmed-not-executed`,
-  `escalate` and `abandon-and-fail`, never `compensate`. Either
-  `ResolveCheckpoint` or `ResolveIndeterminateEffect` answers it, at any time
-  after the run ended; the window bounds new commands, not the answer. The
-  terminal status, reason and stamp never move. `ConfirmedCompleted` records
-  the outcome and `AbandonAndFail` fails that generation only. `ConfirmedNotExecuted` is a
+  `Indeterminate` behind a reconciliation checkpoint, as a live run's does.
+  A checkpoint opened on the ended run lists `confirmed-completed`,
+  `confirmed-not-executed`, `escalate` and `abandon-and-fail`, never
+  `compensate`. One opened while the run was live keeps its list,
+  `compensate` included, after the run ends, and a `Compensate` decision on
+  an ended run is refused `run-terminal`. Either `ResolveCheckpoint` or
+  `ResolveIndeterminateEffect` answers it, at any time after the run ended;
+  the window bounds new commands, not the answer. The terminal status,
+  reason and stamp never move. `ConfirmedCompleted` records the outcome it
+  carries, which must be the effect's own receipt, a `Failed` or an
+  `Exhausted`; any other outcome, such as a model turn, is refused
+  `effect-policy-invalid`, because it would move the ended run's loop.
+  `AbandonAndFail` fails that generation only. `ConfirmedNotExecuted` is a
   person's assertion that the attempt never ran, not a probe: it re-sends
   under a new idempotency key, so if the first attempt did land, a re-sent
   claim append appends a second claim and a re-sent consolidation is refused
@@ -299,10 +305,12 @@ incorrectly.
   re-sent promotion settles without parking (`Exhausted`, code
   `memory-promotion-source-missing`, once its attempts run out). A timer
   escalates the checkpoint but never expires it, and the settle pass opens
-  the checkpoint for a park that has none (see the decision events below).
-  An approval left open on an ended run's promotion or claim append is
-  answered and timed as on a live run, and the run's status does not move.
-  A compensation or workflow cancel parked on an ended run stays as it was
+  the checkpoint for a park that has none. An approval left open on an
+  ended run's promotion or claim append is answered and timed as on a live
+  run: a grant dispatches the effect, and a denial or an expiry fails that
+  generation only. The run's status does not move. The decision events all
+  of this records follow the run's end event (see Observability below). A
+  compensation or workflow cancel parked on an ended run stays as it was
   (issue #123), and every other resolution on an ended run is still refused
   `run-terminal`. The
   retriever supplies a ranking and nothing else: every ranked identity is
@@ -379,7 +387,15 @@ top-up under `Running`), and a wind-down begun while an effect's outcome is unkn
 `waiting-for-reconciliation`. The A2A coordination replay shows only a run
 event's kind and `reason_code`. When a failure ends a run, any other gated
 effect's approval or authorization checkpoint stays open on the ended run and
-gets no close event; the run's end event closes it for readers. `AgentDecisionEventVocabulary` selects what is written:
+gets no close event; the run's end event closes it for readers. On an ended
+run, events can follow the run's end event: for a parked memory promotion or
+claim append, `request-reconciliation` (the checkpoint's open),
+`escalate-checkpoint` and `reconcile`; for an approval left open on one of
+them, `resolve-checkpoint` (its grant, denial or expiry); and for a re-sent
+gated generation, the `request-approval` or `request-authorization` of its new
+gate. `request-reconciliation`, `escalate-checkpoint` and `resolve-checkpoint`
+are written only under `Version2`; the other three are written under
+`Version1` too. `AgentDecisionEventVocabulary` selects what is written:
 `Version1`, the default, writes only the kinds an earlier reader decodes
 (`request-approval`, `request-authorization`, `reconcile`, `complete`,
 `fail`, `wait`) and none of the four fields, so a binary at the earlier pin
