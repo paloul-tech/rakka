@@ -2370,6 +2370,38 @@ async fn a_checkpoint_decision_answers_an_ended_runs_promotion() {
     }
 }
 
+/// The same refusal through the checkpoint: `ConfirmedNotExecuted` the run
+/// cannot afford answers `run-redispatch-unaffordable`, and the refused
+/// transition is discarded whole, so the checkpoint (which the decision's arm
+/// drops before the core refuses) stays open, the effect stays parked at its
+/// generation, and the terminal record is unmoved.
+#[tokio::test]
+async fn an_unaffordable_re_send_through_the_checkpoint_keeps_it_open() {
+    let (fx, _stores) = ended_world_configured(Ending::Completed, None, Some(5)).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let parked = park_promotion(&fx, "ambiguous").await;
+    let checkpoint = the_open_checkpoint(&fx).await;
+    let refusal = apply(
+        &fx,
+        resolve_checkpoint_command(
+            &checkpoint.checkpoint_id,
+            "not-executed",
+            reconciliation(rakka_agent::AgentReconciliationDecision::ConfirmedNotExecuted),
+        ),
+    )
+    .await
+    .expect_err("an unaffordable re-send is refused");
+    assert_eq!(refusal.code(), "run-redispatch-unaffordable");
+
+    let still = the_open_checkpoint(&fx).await;
+    assert_eq!(still.checkpoint_id, checkpoint.checkpoint_id);
+    assert_eq!(still.status, rakka_agent::AgentCheckpointStatus::Open);
+    let held = promotion_record(&fx, &parked).await;
+    assert_eq!(held.status, AgentRunEffectStatus::Indeterminate);
+    assert_eq!(held.generation, parked.generation);
+    assert_terminal_unmoved(&fx, &before, "after the refusal").await;
+}
+
 /// A compensation is new work the host did not ask for: `Compensate` on an
 /// ended run's reconciliation checkpoint is `run-terminal`, and the checkpoint
 /// and the parked effect are untouched.
@@ -2543,16 +2575,21 @@ async fn a_gated_promotion_on_an_ended_run_opens_no_approval() {
     let effect = promotion_effect(&fx).await;
     assert!(effect.checkpoint_required, "the effect is gated");
     assert!(open_checkpoints(&fx).await.is_empty(), "no approval opens");
+    assert_eq!(effect.status, AgentRunEffectStatus::Pending);
+
+    // Drive the dispatcher: an ungranted effect is not handed to it.
+    let driven = fx
+        .pump_post_terminal(AgentRunEffectKind::MemoryPromotionCall)
+        .await;
     assert!(
-        matches!(
-            effect.status,
-            AgentRunEffectStatus::Pending | AgentRunEffectStatus::Ready
-        ),
-        "{:?}",
-        effect.status
+        driven.is_err(),
+        "the gated effect never settles: {driven:?}"
     );
-    assert_eq!(effect.attempts, 0, "the ungranted effect never dispatches");
+    let held = promotion_record(&fx, &effect).await;
+    assert_eq!(held.status, AgentRunEffectStatus::Pending);
+    assert_eq!(held.attempts, 0, "the ungranted effect never dispatches");
     assert!(stores.private.is_empty(&agent_scope()));
+    assert!(open_checkpoints(&fx).await.is_empty());
     assert_terminal_unmoved(&fx, &before, "after the gated promotion").await;
 }
 

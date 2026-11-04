@@ -828,6 +828,105 @@ async fn confirmed_not_executed_re_sends_an_ended_runs_claim_append_under_a_new_
     assert_eq!(after.terminal_at, before.terminal_at);
 }
 
+/// A person's `ConfirmedCompleted` through `ResolveCheckpoint` answers an
+/// ended run's parked claim append: the outcome lands on the same generation,
+/// the checkpoint is gone, and the terminal record never moves.
+#[tokio::test]
+async fn a_checkpoint_decision_answers_an_ended_runs_claim_append() {
+    let executor = RecordingClaimAppendExecutor::new();
+    let fx = ended_goal_world(Ending::Completed, executor.clone()).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    apply_append(&fx, "ambiguous", append_request("space-alpha"))
+        .await
+        .expect("the post-terminal append applies");
+    let parked = resolve_claim_append(
+        &fx,
+        AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the recovery retry was refused",
+        ),
+    )
+    .await;
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let checkpoint_id = {
+        let open = run
+            .state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .open_checkpoints();
+        assert_eq!(open.len(), 1, "one checkpoint opens");
+        open[0].checkpoint_id.clone()
+    };
+    let unmoved = |after: rakka_agent::AgentRunSnapshot, at: &str| {
+        assert_eq!(after.status, before.status, "{at}: status");
+        assert_eq!(
+            after.terminal_reason, before.terminal_reason,
+            "{at}: reason"
+        );
+        assert_eq!(after.terminal_at, before.terminal_at, "{at}: stamp");
+    };
+    unmoved(
+        fx.run_snapshot().await.expect("the run exists"),
+        "after the park",
+    );
+
+    run.apply(
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "completed",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id,
+            resolver: PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(rakka_agent::AgentCheckpointDecision::Reconciliation(
+                rakka_agent::AgentReconciliationDecision::ConfirmedCompleted {
+                    resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                        outcome: Box::new(AgentRunEffectOutcome::ClaimAppend {
+                            claim: AgentCommunalClaimId::new("claim-established")
+                                .expect("the claim id is valid"),
+                        }),
+                    }),
+                },
+            )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("an ended run's parked append is answered through its checkpoint");
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let done = committed_append(run.state().expect("state"))
+        .into_iter()
+        .find(|held| held.effect_id == parked.effect_id)
+        .expect("the effect survives");
+    assert_eq!(done.status, AgentRunEffectStatus::Succeeded);
+    assert_eq!(done.generation, parked.generation);
+    assert!(run
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .open_checkpoints()
+        .is_empty());
+    assert!(executor.invocations().is_empty(), "nothing was re-sent");
+    unmoved(
+        fx.run_snapshot().await.expect("the run exists"),
+        "after the decision",
+    );
+}
+
 /// The window is inclusive of its last millisecond and closed one past it,
 /// under `run-memory-window-closed`, with nothing committed and the executor
 /// never reached.
