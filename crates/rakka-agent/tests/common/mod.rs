@@ -3671,7 +3671,7 @@ pub async fn forget_operations<S, Store>(
 
 /// The ten decision kinds the pinned `bc0c224` binary decodes — a test-local
 /// enum, so a kind added since is a decode failure here exactly as it is there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Bc0c224DecisionKind {
     Continue,
@@ -3686,9 +3686,10 @@ pub enum Bc0c224DecisionKind {
     Evaluate,
 }
 
-/// The decision event as `bc0c224` (commit `47f31ec`) declares it: no
-/// `deny_unknown_fields`, so the fields added since are dropped on decode.
-#[derive(Debug, Clone, serde::Deserialize)]
+/// The decision event as `bc0c224` (commit `47f31ec`) declares it, fields in
+/// its order: no `deny_unknown_fields`, so the fields added since are dropped
+/// on decode, and a re-encode writes what a replica at that pin re-flushes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Bc0c224DecisionEvent {
     pub schema_version: u32,
     pub scope: AgentRunScope,
@@ -3712,14 +3713,31 @@ pub struct Bc0c224DecisionEvent {
     pub occurred_at: AgentTimestampMillis,
 }
 
-/// Asserts a `bc0c224` reader decodes every event, at schema version 1.
-pub fn assert_bc0c224_decodes(events: &[rakka_agent::AgentDecisionEvent]) {
+/// Asserts a `bc0c224` binary reads every event at schema version 1 and
+/// writes it back unchanged. A replica at that pin re-persists the events a
+/// run still owes and flushes them again, and a sink that checks content
+/// answers a resend that differs from what it holds as a conflict. So an
+/// event must carry none of the fields added since, and its re-encode must
+/// be the same bytes.
+pub fn assert_bc0c224_round_trips(events: &[rakka_agent::AgentDecisionEvent]) {
     for event in events {
-        let value = serde_json::to_value(event).expect("the event encodes");
-        let decoded: Bc0c224DecisionEvent = serde_json::from_value(value)
+        assert!(
+            event.checkpoint.is_none()
+                && event.effect.is_none()
+                && event.outcome.is_none()
+                && event.run_status.is_none(),
+            "a version-1 event carries none of the version-2 fields: {event:?}"
+        );
+        let encoded = serde_json::to_string(event).expect("the event encodes");
+        let decoded: Bc0c224DecisionEvent = serde_json::from_str(&encoded)
             .unwrap_or_else(|error| panic!("a bc0c224 reader must decode {event:?}: {error}"));
         assert_eq!(decoded.schema_version, 1);
         assert_eq!(decoded.sequence, event.sequence);
+        let written_back = serde_json::to_string(&decoded).expect("the mirror encodes");
+        assert_eq!(
+            written_back, encoded,
+            "a bc0c224 binary writes the event back unchanged"
+        );
     }
 }
 

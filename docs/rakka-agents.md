@@ -343,9 +343,10 @@ reconciliations (`reconcile`, including the one a handoff notice settles, and
 (`resolve-checkpoint`, `escalate-checkpoint`), the waits a run enters (`wait`,
 slots `wait-top-up-{sequence}`, `wait-children-q{n}`, `wait-handoff-q{n}`,
 `wait-winding-down`), and the run's end (`complete`, `fail`, `cancel`,
-`handoff`, `supersede`). New events carry a `reason_code` and, where they
-apply, the optional `checkpoint`, `effect`, `outcome` (`AgentDecisionOutcome`)
-and `run_status` fields; readers should key on `reason_code`, since an
+`handoff`, `supersede`). New events carry a `reason_code` and, under
+`Version2` and where they apply, the optional `checkpoint`, `effect`, `outcome`
+(`AgentDecisionOutcome`) and `run_status` fields; readers should key on
+`reason_code`, since an
 `awaiting-children` wait entered during a wind-down reads `run_status`
 `cancelling`, a `budget-top-up` wait reads `running` (the run parks for a
 top-up under `Running`), and a wind-down begun while an effect's outcome is unknown reads
@@ -355,8 +356,9 @@ effect's approval or authorization checkpoint stays open on the ended run and
 gets no close event; the run's end event closes it for readers. `AgentDecisionEventVocabulary` selects what is written:
 `Version1`, the default, writes only the kinds an earlier reader decodes
 (`request-approval`, `request-authorization`, `reconcile`, `complete`,
-`fail`, `wait`), and `Version2` adds the
-six newer kinds and stamps events with schema version 2. Select it with
+`fail`, `wait`) and none of the four fields, so a binary at the earlier pin
+writes back exactly the event it read; `Version2` adds the six newer kinds and
+the four fields and stamps events with schema version 2. Select it with
 `with_decision_event_vocabulary` once every process that loads the run store or
 reads the sink reads version 2 (see `docs/rakka-compatibility.md`). An ended
 run's ambiguous memory promotion or claim append records no event (issue #120).

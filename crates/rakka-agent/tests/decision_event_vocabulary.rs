@@ -168,15 +168,18 @@ async fn an_event_without_the_new_fields_serializes_without_their_keys() {
         AgentTaskContent::inline(serde_json::json!({ "found": true }))
             .expect("the tool result is inline-bounded"),
     );
-    let fx = Fixture::new(dispatcher).with_decision_events(sink.clone());
+    let fx = Fixture::new(dispatcher)
+        .with_decision_events(sink.clone())
+        .with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2);
     fx.instantiate_agent().await;
     fx.create_task().await;
     fx.pump().await.expect("the loop should run to completion");
 
     let events = sink.events(&run_scope());
     assert!(!events.is_empty());
-    // The run's `complete` end carries `run_status`; every other event of the
-    // flow sets none of the four fields, and an unset field has no key.
+    // Under Version2 the run's `complete` end carries `run_status`; every
+    // other event of the flow sets none of the four fields, and an unset field
+    // has no key.
     let mut without_any = 0;
     for event in events {
         let value = serde_json::to_value(&event).expect("event serializes");
@@ -282,7 +285,7 @@ async fn version_one_stamps_one_and_version_two_stamps_two() {
 #[tokio::test]
 async fn a_bc0c224_reader_decodes_every_version_one_event_and_no_new_kind() {
     let events = two_turn_events(AgentDecisionEventVocabulary::Version1).await;
-    assert_bc0c224_decodes(&events);
+    assert_bc0c224_round_trips(&events);
     for (kind, _) in NEW_KINDS {
         let value = serde_json::to_value(kind).expect("kind serializes");
         assert!(serde_json::from_value::<Bc0c224DecisionKind>(value).is_err());

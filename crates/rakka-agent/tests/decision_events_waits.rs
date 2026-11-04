@@ -26,7 +26,7 @@ use rakka_agent::{
     AgentRunScope, AgentRunStatus, AgentSchemaPolicy, AgentTaskContent, AgentTaskDefinition,
     AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskStatus,
     AgentToolCallId, AgentToolCallRequest, AgentToolId, InMemoryAgentRunEffectSink, TenantId,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    VersionedAgentRecord, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentEphemeralCredential;
 
@@ -78,8 +78,9 @@ fn decision_operation_id(turn: u64, slot: &str) -> AgentOperationId {
 }
 
 /// Asserts `events` hold exactly one wait for `reason`, recorded by the
-/// run's deterministic policy with the status the run entered it in and no
-/// checkpoint, effect or outcome, and returns it.
+/// run's deterministic policy with no checkpoint, effect or outcome, and
+/// returns it. A version-2 wait carries `status`, the status the run entered
+/// it in; a version-1 wait carries none of the version-2 fields.
 fn one_wait<'a>(
     events: &'a [AgentDecisionEvent],
     reason: &str,
@@ -89,7 +90,8 @@ fn one_wait<'a>(
     assert_eq!(found.len(), 1, "one {reason} wait: {:?}", kinds(events));
     let wait = found[0];
     assert_eq!(wait.source, AgentDecisionSource::DeterministicPolicy);
-    assert_eq!(wait.run_status, Some(status), "{reason} wait's status");
+    let written = (VersionedAgentRecord::schema_version(wait).get() == 2).then_some(status);
+    assert_eq!(wait.run_status, written, "{reason} wait's status");
     assert_eq!(wait.checkpoint, None);
     assert_eq!(wait.effect, None);
     assert_eq!(wait.outcome, None);
@@ -415,7 +417,7 @@ async fn a_top_up_park_records_one_budget_wait() {
     fx.pump().await.expect("the run tops up and completes");
     let events = sink.events(&run_scope());
     one_wait(&events, BUDGET_TOP_UP, AgentRunStatus::Running);
-    assert_bc0c224_decodes(&events);
+    assert_bc0c224_round_trips(&events);
     assert_decision_stream_whole(&sink, &run_scope());
 }
 
@@ -508,7 +510,7 @@ async fn a_fan_in_records_one_children_wait() {
     let (_fx, sink) = fan_out_parked(AgentDecisionEventVocabulary::Version1).await;
     let events = sink.events(&run_scope());
     one_wait(&events, AWAITING_CHILDREN, AgentRunStatus::Running);
-    assert_bc0c224_decodes(&events);
+    assert_bc0c224_round_trips(&events);
     assert_decision_stream_whole(&sink, &run_scope());
 }
 
@@ -651,7 +653,7 @@ async fn a_handoff_awaiting_its_target_records_one_handoff_wait() {
     let (_fx, sink) = handoff_flow(AgentDecisionEventVocabulary::Version1, true).await;
     let events = sink.events(&run_scope());
     one_wait(&events, AWAITING_HANDOFF, AgentRunStatus::Running);
-    assert_bc0c224_decodes(&events);
+    assert_bc0c224_round_trips(&events);
     assert_decision_stream_whole(&sink, &run_scope());
 }
 
@@ -755,7 +757,7 @@ async fn a_wind_down_records_one_winding_down_wait() {
     end_children(&fx, &child_scopes).await;
     let events = sink.events(&run_scope());
     one_wait(&events, WINDING_DOWN, AgentRunStatus::Cancelling);
-    assert_bc0c224_decodes(&events);
+    assert_bc0c224_round_trips(&events);
     assert_decision_stream_whole(&sink, &run_scope());
 }
 
@@ -1044,7 +1046,7 @@ async fn a_wind_down_through_reconciliation_records_one_winding_down() {
         .expect("the shipment lands and the run ends");
     let events = sink.events(&run_scope());
     one_wait(&events, WINDING_DOWN, AgentRunStatus::Cancelling);
-    assert_bc0c224_decodes(&events);
+    assert_bc0c224_round_trips(&events);
     assert_decision_stream_whole(&sink, &run_scope());
 }
 
@@ -1111,7 +1113,7 @@ async fn a_cancel_that_ends_in_its_own_transition_records_the_end_and_no_wait() 
         };
         assert_eq!(kinds(&events[parked..]), expected);
         if vocabulary == AgentDecisionEventVocabulary::Version1 {
-            assert_bc0c224_decodes(&events);
+            assert_bc0c224_round_trips(&events);
         }
         assert_decision_stream_whole(&sink, &run_scope());
     }

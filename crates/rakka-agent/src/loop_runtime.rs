@@ -736,10 +736,10 @@ impl AgentLoopState {
             {
                 continue;
             }
-            // Stamped before it is measured: the sequence is part of the bytes
-            // the record will hold.
+            // Stamped, and cut to the fields its vocabulary writes, before it
+            // is measured: the bound counts the bytes the record will hold.
             let sequence = self.decision_sequence.saturating_add(1);
-            event.stamp(sequence, vocabulary.schema_version());
+            event.stamp(sequence, vocabulary);
             self.decision_sequence = sequence;
             let size = encoded_len(&event);
             if size > AGENT_RUN_DECISION_OUTBOX_MAX_BYTES {

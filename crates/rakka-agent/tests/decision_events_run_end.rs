@@ -712,7 +712,7 @@ async fn a_vocabulary_switch_mid_run_keeps_one_contiguous_sequence() {
         .map(|event| VersionedAgentRecord::schema_version(event).get())
         .collect();
     assert_eq!(versions, [1, 1, 1, 2, 2], "each instance stamps its own");
-    assert_bc0c224_decodes(&events[..3]);
+    assert_bc0c224_round_trips(&events[..3]);
     assert_decision_stream_whole(&sink, &run_scope());
 
     // Version2 parks; a Version1 instance applies the cancel and writes

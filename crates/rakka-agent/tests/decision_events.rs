@@ -110,7 +110,9 @@ async fn a_run_emits_its_decision_sequence_exactly_once() {
     );
     assert_eq!(events[3].source, AgentDecisionSource::Model);
     assert_eq!(events[4].source, AgentDecisionSource::DeterministicPolicy);
-    assert_eq!(events[4].run_status, Some(AgentRunStatus::Completed));
+    // The default vocabulary writes none of the version-2 fields, so the end
+    // is read from its kind and reason code.
+    assert_eq!(events[4].run_status, None);
     assert_eq!(events[4].reason_code.as_deref(), Some("result-accepted"));
     for event in &events {
         assert_eq!(event.task.as_ref(), Some(task_scope().task()));

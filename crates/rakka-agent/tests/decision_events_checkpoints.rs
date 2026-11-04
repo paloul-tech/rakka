@@ -188,7 +188,7 @@ async fn an_approval_checkpoint_open_records_request_approval_with_its_reference
     park(&fx1, AgentRunStatus::WaitingForApproval).await;
     let events = sink1.events(&run_scope());
     assert!(!of_kind(&events, AgentDecisionKind::RequestApproval).is_empty());
-    assert_bc0c224_decodes(&events);
+    assert_bc0c224_round_trips(&events);
     assert_decision_stream_whole(&sink1, &run_scope());
 }
 
@@ -302,7 +302,7 @@ async fn an_unknown_outcome_on_a_live_run_records_request_reconciliation_with_it
     let events = sink1.events(&run_scope());
     assert!(!events.is_empty());
     assert!(of_kind(&events, AgentDecisionKind::RequestReconciliation).is_empty());
-    assert_bc0c224_decodes(&events);
+    assert_bc0c224_round_trips(&events);
     assert_decision_stream_whole(&sink1, &run_scope());
 }
 
@@ -545,7 +545,7 @@ async fn a_granted_and_a_denied_checkpoint_each_record_resolve_checkpoint() {
         decide_approval(AgentDecisionEventVocabulary::Version1, approve()).await;
     let events = sink.events(&run_scope());
     assert!(of_kind(&events, AgentDecisionKind::ResolveCheckpoint).is_empty());
-    assert_bc0c224_decodes(&events);
+    assert_bc0c224_round_trips(&events);
     assert_decision_stream_whole(&sink, &run_scope());
 }
 
@@ -901,9 +901,18 @@ async fn reconcile_once(
         "one reconcile for {outcome}: {events:?}"
     );
     let reconciled = reconciles[0];
-    assert_eq!(reconciled.outcome, Some(outcome));
     assert_eq!(reconciled.reason_code.as_deref(), Some(outcome.as_label()));
     assert_eq!(reconciled.source, AgentDecisionSource::Human);
+    assert_eq!(
+        reconciled.safety_class,
+        Some(bound.bound_effect.safety_class)
+    );
+    if vocabulary == AgentDecisionEventVocabulary::Version1 {
+        // The default vocabulary leaves the version-2 fields off: the caller's
+        // round trip checks all four.
+        return sink;
+    }
+    assert_eq!(reconciled.outcome, Some(outcome));
     assert_eq!(
         reconciled
             .checkpoint
@@ -918,7 +927,7 @@ async fn reconcile_once(
         .expect("the reconcile names its effect");
     assert_eq!(effect.effect_id, bound.bound_effect.effect_id);
     assert_eq!(effect.generation, bound.bound_effect.generation);
-    assert_eq!(reconciled.safety_class, Some(effect.safety_class));
+    assert_eq!(effect.safety_class, bound.bound_effect.safety_class);
     sink
 }
 
@@ -988,7 +997,8 @@ async fn each_reconciliation_outcome_records_one_reconcile() {
     .await;
 
     // `reconcile` is a kind bc0c224 already decodes: under the default
-    // vocabulary it is written, and the fields it gained are ignored there.
+    // vocabulary it is written, without the fields it gained, so a bc0c224
+    // binary writes it back unchanged.
     let sink = reconcile_once(
         AgentDecisionEventVocabulary::Version1,
         |_, effect_id, generation| {
@@ -997,7 +1007,7 @@ async fn each_reconciliation_outcome_records_one_reconcile() {
         AgentDecisionOutcome::ConfirmedExecuted,
     )
     .await;
-    assert_bc0c224_decodes(&sink.events(&run_scope()));
+    assert_bc0c224_round_trips(&sink.events(&run_scope()));
 }
 
 #[tokio::test]

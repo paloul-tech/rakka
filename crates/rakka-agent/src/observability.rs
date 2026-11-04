@@ -380,16 +380,18 @@ impl AgentDecisionCheckpoint {
     }
 }
 
-/// Which decision kinds a run records: the compatibility switch between a
-/// reader that decodes only the original ten kinds and one that decodes the
-/// full vocabulary.
+/// Which decision kinds and fields a run records: the compatibility switch
+/// between a reader that knows only the original ten kinds and fields and one
+/// that knows the full vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum AgentDecisionEventVocabulary {
-    /// The original ten kinds, schema version 1.
+    /// The original ten kinds, schema version 1, and none of the fields
+    /// `checkpoint`, `effect`, `outcome` and `run_status`: exactly what a
+    /// `bc0c224` binary reads and writes back.
     #[default]
     Version1,
-    /// The full sixteen-kind vocabulary, schema version 2.
+    /// The full sixteen-kind vocabulary and the four fields, schema version 2.
     Version2,
 }
 
@@ -609,15 +611,19 @@ pub struct AgentDecisionEvent {
     /// Stable bounded reason code, when the decision carries one.
     pub reason_code: Option<String>,
     /// The checkpoint the decision concerns, when it concerns one.
+    /// Written only under [`AgentDecisionEventVocabulary::Version2`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<AgentDecisionCheckpoint>,
     /// The effect the decision gates or reconciles, when it does.
+    /// Written only under [`AgentDecisionEventVocabulary::Version2`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<AgentCheckpointBoundEffectView>,
     /// How the decision came out, when it has an outcome.
+    /// Written only under [`AgentDecisionEventVocabulary::Version2`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<AgentDecisionOutcome>,
     /// The run status the decision left the run in, when recorded.
+    /// Written only under [`AgentDecisionEventVocabulary::Version2`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_status: Option<AgentRunStatus>,
     /// Causation id: the decision's own derived operation id.
@@ -692,10 +698,24 @@ impl AgentDecisionEvent {
     }
 
     /// Gives a committed event its per-run sequence and the schema version
-    /// it is written under.
-    pub(crate) fn stamp(&mut self, sequence: u64, schema_version: StateSchemaVersion) {
+    /// it is written under, and keeps only the fields `vocabulary` writes.
+    ///
+    /// `Version1` writes none of the four fields a `bc0c224` binary drops on
+    /// decode. A replica at that pin re-persists the events a run still owes
+    /// and flushes them again, and a sink that checks content answers a
+    /// resend that differs from what it holds as a conflict.
+    pub(crate) fn stamp(&mut self, sequence: u64, vocabulary: AgentDecisionEventVocabulary) {
         self.sequence = sequence;
-        self.schema_version = schema_version;
+        self.schema_version = vocabulary.schema_version();
+        match vocabulary {
+            AgentDecisionEventVocabulary::Version1 => {
+                self.checkpoint = None;
+                self.effect = None;
+                self.outcome = None;
+                self.run_status = None;
+            }
+            AgentDecisionEventVocabulary::Version2 => {}
+        }
     }
 }
 
