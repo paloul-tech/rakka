@@ -271,6 +271,7 @@ Sections 1-10 are the design record and are left as written. The build differs f
 - 5.2, `ResolveIndeterminateEffect`: `f016984`.
 - 5.2, `ResolveCheckpoint`: `99839de` and `548d337` (the gated promotion, the claim append checkpoint decision and the unaffordable re-send).
 - 5.3 and 5.4, the timers and the repair: `43b04ff`, scoped by `47365b0`.
+- The gated approval on an ended run: `bcb1a1b` pins that a tool-calling turn's approval for a gated promotion outlives a run that ends `Completed`, and that a grant or a timer expiry answers it without moving the terminal record.
 - 5.5, the decision events: recorded by the transitions above through `queue_decision`, with no commit of their own.
 
 **The retention outcome (corrects 5.2).** Section 5.2 says a promotion re-sent after memory retention is refused `memory-promotion-selection-empty`, also definitively. That is wrong.
@@ -278,6 +279,11 @@ Sections 1-10 are the design record and are left as written. The build differs f
 - In the real dispatch pipeline the retryable failure is retried under the effect's attempt bound and then settles `Exhausted` with code `memory-promotion-source-missing`. It does not park again.
 - The in-process test dispatcher has no attempt machinery. It surfaces the same read as `Failed` with `memory-promotion-attempt-failed`, which `a_re_sent_promotion_after_retention_fails_definitively` pins.
 
-**The gated rows of 5.2 are unreachable (answers section 9).** `promote_memory` and `append_claim` record `checkpoint_required` and `authorization_required` from the deployment's spec but never open an approval or authorization checkpoint; only the tool-call turn opens those gates. So a gated promotion or claim append stays `Pending` and is never dispatched, on an ended run and on a live one. `a_gated_promotion_on_an_ended_run_opens_no_approval` pins the ended case. That the gate never opens on a live run is a gap that predates this change, found here and not fixed here. The `Granted` arm's status-write skip stays as a guard that a window command cannot reach.
+**The gated rows of 5.2 are reachable (answers section 9; corrects an earlier reading).**
+- After the end, a command never opens a gate. `promote_memory` or `append_claim` made on an ended run records the gated effect (`checkpoint_required`, `authorization_required`) but opens no approval, so the effect stays `Pending` and is never dispatched. `a_gated_promotion_on_an_ended_run_opens_no_approval` pins it.
+- On a live run, the approval opens only by accident. A gated promotion or claim append gets an approval only when a model output in the same turn calls a tool: the tool-call turn's gate block opens an approval for every ungranted gated effect of the turn, whatever its kind (`a_gated_promotion_in_a_tool_calling_turn_opens_its_approval`). Otherwise the effect waits `Pending` for good. That gap predates this change; it is found here and not fixed here.
+- Such an approval can outlive the run. An ended run can hold it open through `settle_proposal`'s `Accepted` arm, which terminates without waiting (the same path that leaves the kinds of #123 outstanding). A failed run does not end with it open: the pending promotion blocks settlement, so the run stays `Cancelling` until the approval is denied or expires.
+- Granting it on the ended run dispatches the effect without moving the run's status. The `Granted` arm's `checkpoint_wait_status` write is skipped on an ended run, and that skip is load-bearing (`a_granted_gated_promotion_on_an_ended_run_dispatches_without_moving_the_status`, falsified).
+- Letting it expire fails that generation only (`a_timer_expires_an_ended_runs_gated_promotion_approval`).
 
 **The repair is scoped (refines 5.4).** On an ended run the park repair opens a checkpoint only for an effect held outside the turn. A compensation, workflow cancel or handoff send parked checkpoint-less on the same ended run stays as it is (#123). One private helper, `AgentRun::parks_owed_a_checkpoint`, feeds both `needs_park_repair` and `repair_park`, so the gate and the action cannot drift apart.

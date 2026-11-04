@@ -300,6 +300,8 @@ incorrectly.
   `memory-promotion-source-missing`, once its attempts run out). A timer
   escalates the checkpoint but never expires it, and the settle pass opens
   the checkpoint for a park that has none (see the decision events below).
+  An approval left open on an ended run's promotion or claim append is
+  answered and timed as on a live run, and the run's status does not move.
   A compensation or workflow cancel parked on an ended run stays as it was
   (issue #123), and every other resolution on an ended run is still refused
   `run-terminal`. The
