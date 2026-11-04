@@ -2791,10 +2791,11 @@ fn advance_once(
         return Ok(Vec::new());
     };
     if run.needs_park_repair() {
-        // A park a binary before issue #106 left unresolvable: give it its
-        // checkpoint, or settle the send its task already answered. A repair
-        // that terminalizes the run owes what any terminalization owes, in
-        // this same compare-and-set ([`AgentRun::needs_park_repair`]).
+        // A park a binary before issue #106 left unresolvable, and an ended
+        // run's outside-the-turn park (#120): give it its checkpoint, or
+        // settle the send its task already answered. A repair that
+        // terminalizes the run owes what any terminalization owes, in this
+        // same compare-and-set ([`AgentRun::needs_park_repair`]).
         repair_park(state, policies, now)?;
         return owed_run_exchanges(state, now);
     }
@@ -4189,14 +4190,21 @@ fn rest_unrested_turn(state: &mut AgentRunState, now: AgentTimestampMillis) -> A
     Ok(())
 }
 
-/// Repairs a park a binary before issue #106 left unresolvable, in one
-/// compare-and-set: the repair of [`AgentRun::needs_park_repair`].
+/// Repairs a park a binary before issue #106, or before issue #120 on an ended
+/// run, left unresolvable, in one compare-and-set: the repair of
+/// [`AgentRun::needs_park_repair`].
 ///
 /// A send whose cell the task already answered settles as executed, exactly
 /// as the fixed notice path settles it. That terminalizes an accepted
-/// transfer `HandedOff` and leaves a refused one resumed. Every remaining
-/// `Indeterminate` effect without its reconciliation checkpoint gets the one
-/// `record_effect_result` opens. The disposition is then re-settled.
+/// transfer `HandedOff` and leaves a refused one resumed. Then every effect
+/// `AgentRun::parks_owed_a_checkpoint` lists gets the reconciliation
+/// checkpoint `record_effect_result` opens. On a live run that is every
+/// remaining `Indeterminate` effect without one. On an ended run it is only
+/// an `Indeterminate` effect held outside the turn (a memory promotion or a
+/// claim append) with no checkpoint, as a binary before issue #120 left it;
+/// any other parked effect there stays without one, and the terminal status,
+/// reason and stamp do not move. The disposition is then re-settled, which
+/// leaves an ended run as it is.
 fn repair_park(
     state: &mut AgentRunState,
     policies: &AgentEffectPolicies,
@@ -4518,13 +4526,15 @@ fn record_effect_result(
     // does a handoff send's `Exhausted` one, whose probe could not establish
     // the transfer; a park with no checkpoint was the defect of issue #106.
     //
-    // A run that has ended opens it too, but only for a promotion or claim
-    // append: the one effect kind a terminal run can still owe a result for,
-    // whose possibly-executed attempt the dispatcher retries under its
-    // idempotency key and whose recovery retry the authority may refuse. That
-    // park opens its checkpoint, so either resolution path can answer it, and
-    // the terminal status, reason and stamp do not move. A compensation or
-    // workflow cancel parked on an ended run opens none (issue #123).
+    // A run that has ended opens it too, but only for an effect held outside
+    // the turn (a promotion or a claim append). An ended run still takes the
+    // result of any of the four fence-exempt kinds, and any of them can park
+    // when the authority refuses the retry of a possibly-executed attempt.
+    // A promotion's or claim append's park opens its checkpoint, so either
+    // resolution path can answer it, and the terminal status, reason and
+    // stamp do not move. A compensation or workflow cancel parked on an ended
+    // run opens none, since its checkpoint would offer decisions the ended
+    // run refuses (issue #123).
     let live = state.run().is_some_and(|run| !run.status.is_terminal());
     let parked = state.run().is_some_and(|run| {
         run.loop_state
@@ -5434,13 +5444,20 @@ fn drop_reconciliation_checkpoint(
 /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
 /// An ended run answers only an outside-the-turn effect it holds (a memory
-/// promotion or a claim append parked after the end); every other target is
+/// promotion or a claim append, whenever it parked); every other target is
 /// refused `Terminal`. A held one then meets the refusals a live run gives
-/// (stale generation, stale result). On an ended run `ConfirmedNotExecuted`
-/// is a person's assertion that the attempt never ran, so it takes the live
-/// arm and re-sends under a new generation rather than settling `Cancelled`;
-/// the run's status, terminal reason and terminal stamp never move, and the
-/// window for new memory commands is not read.
+/// (stale generation, stale result). On an ended run `ConfirmedExecuted` is
+/// also refused `InvalidPolicy` (`effect-policy-invalid`) unless its outcome
+/// settles that effect: the effect's own success receipt (`MemoryPromotion`
+/// for a promotion, `ClaimAppend` for a claim append), `Failed`, or
+/// `Exhausted`. Another kind's outcome, such as a model turn or a goal
+/// evaluation, would move the ended run's phase or fill its goal-evaluation
+/// cell, so it is refused before anything changes. A live run keeps
+/// accepting whatever outcome it accepted before. On an ended run
+/// `ConfirmedNotExecuted` is a person's assertion that the attempt never ran,
+/// so it takes the live arm and re-sends under a new generation rather than
+/// settling `Cancelled`; the run's status, terminal reason and terminal stamp
+/// never move, and the window for new memory commands is not read.
 fn apply_indeterminate_resolution(
     state: &mut AgentRunState,
     effect_id: &AgentEffectId,
@@ -5454,12 +5471,13 @@ fn apply_indeterminate_resolution(
     let scope = state.scope.clone();
 
     let run = state.run_mut()?;
-    if run.status.is_terminal() && !run.holds_outside_the_turn_effect(effect_id) {
+    let ended = run.status.is_terminal();
+    if ended && !run.holds_outside_the_turn_effect(effect_id) {
         return Err(AgentRunError::Terminal { status: run.status });
     }
     // An ended run always carries a terminal reason, but it is not winding
     // down: it re-sends a generation its person says never ran (issue #120).
-    let winding_down = run.terminal_reason.is_some() && !run.status.is_terminal();
+    let winding_down = run.terminal_reason.is_some() && !ended;
     // Read before the effect is borrowed (issue #106).
     let handoff_standing = handoff_send(&run.loop_state, effect_id);
 
@@ -5501,6 +5519,38 @@ fn apply_indeterminate_resolution(
                 .to_string(),
         }
         .into());
+    }
+    // On an ended run a confirmation must settle the parked effect itself:
+    // its own success receipt (a promotion's or a claim append's), a
+    // definitive failure, or a spent retry budget. Any other outcome, such as
+    // a model turn or a goal evaluation, would be applied to the loop as if
+    // the run had produced it, moving the ended run's phase or owing its task
+    // an exchange, so it is refused before anything changes (issue #120).
+    if ended {
+        if let AgentEffectResolution::ConfirmedExecuted { outcome } = &resolution {
+            let kind = effect.kind();
+            let settles_the_effect = match outcome.as_ref() {
+                AgentRunEffectOutcome::MemoryPromotion { .. } => {
+                    kind == AgentRunEffectKind::MemoryPromotionCall
+                }
+                AgentRunEffectOutcome::ClaimAppend { .. } => {
+                    kind == AgentRunEffectKind::ClaimAppendCall
+                }
+                AgentRunEffectOutcome::Failed { .. } | AgentRunEffectOutcome::Exhausted { .. } => {
+                    true
+                }
+                _ => false,
+            };
+            if !settles_the_effect {
+                return Err(AgentEffectError::InvalidPolicy {
+                    message: format!(
+                        "an ended run's {kind} can be confirmed only with its own outcome, a \
+                         failure, or an exhaustion"
+                    ),
+                }
+                .into());
+            }
+        }
     }
 
     match resolution {
@@ -6618,16 +6668,22 @@ fn evaluate_goal(
 /// ([specification 12.6](../../../docs/plans/rakka-agent/spec.md)).
 ///
 /// A checkpoint whose SLA deadline has passed escalates and stays open; one whose
-/// expiration has passed is denied — the gated effect fails, and the run winds
-/// down. A timeout never resolves the checkpoint into a grant: sensitive work no
-/// one decided in time fails closed, it does not auto-approve.
+/// expiration has passed is denied — the gated effect fails, and on a live run
+/// that failure winds the run down as any failed effect of its kind would. An
+/// ended run stays as it ended. A timeout never resolves the checkpoint
+/// into a grant: sensitive work no one decided in time fails closed, it does
+/// not auto-approve.
 ///
 /// On an ended run the sweep acts only on a checkpoint bound to an effect held
-/// outside the turn (a memory promotion or a claim append): a reconciliation
-/// checkpoint never expires, so a timer only escalates it. Every other
-/// checkpoint an ended run still holds, such as an approval a failed run left
-/// open on a tool effect, is left waiting, because expiring it would apply a
-/// failure to an effect of a run that already ended.
+/// outside the turn (a memory promotion or a claim append). A reconciliation
+/// checkpoint never expires, so a timer only escalates it. A gated
+/// promotion's or claim append's approval or authorization checkpoint still
+/// expires on an ended run, as on a live one: the expiry fails only that
+/// generation, and the run's status, terminal reason and terminal stamp do
+/// not move. Every other checkpoint an ended run still holds, such as an
+/// approval a failed run left open on a tool effect, is left waiting, because
+/// expiring it would apply a failure to an effect of a run that already
+/// ended.
 fn fire_checkpoint_timers(
     state: &mut AgentRunState,
     now: AgentTimestampMillis,
@@ -8604,7 +8660,8 @@ where
             // A record wedged by a binary before gap slice 3 cannot advance,
             // but one step rests its turn and it can thereafter
             // ([`AgentRun::needs_turn_rest`]). A park a binary before issue
-            // #106 left unresolvable is repaired the same way
+            // #106 left unresolvable is repaired the same way, and so is an
+            // ended run's outside-the-turn park (#120)
             // ([`AgentRun::needs_park_repair`]).
             let can_advance = self.state()?.run().is_some_and(|run| {
                 run.can_advance() || run.needs_turn_rest() || run.needs_park_repair()
@@ -13324,6 +13381,95 @@ mod tests {
             !fx.state.run().expect("run").needs_park_repair(),
             "the repair leaves nothing owed"
         );
+    }
+
+    /// A compensation still outstanding when its run ended parks on an
+    /// ambiguous result, but opens no checkpoint: it is fence-exempt, so the
+    /// ended run takes its result, and it is not held outside the turn, so
+    /// its checkpoint would advertise decisions the ended run refuses. It
+    /// stays as it was before issue #120 (issue #123), with nothing queued and
+    /// the terminal record unmoved.
+    #[test]
+    fn an_ended_runs_parked_compensation_opens_no_checkpoint() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Failed,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        let now = fx.now;
+        let scope = fx.scope.clone();
+        let compensated = fx.effect_id.clone();
+        let compensated_generation = fx.generation;
+        let run = fx.state.run_mut().expect("the run exists");
+        run.terminal_reason = Some(AgentRunTerminalReason::ResultRejectionsExhausted);
+        run.terminal_at = Some(now);
+        let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+        let mut compensation = AgentRunEffect::new(
+            &scope,
+            run.loop_state.turn(),
+            1,
+            AgentRunEffectRequest::Compensation {
+                compensation: AgentCompensationRef::new("refund-charge").expect("the ref is valid"),
+                compensated,
+                compensated_generation,
+            },
+            &spec,
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the compensation derives");
+        compensation.status = AgentRunEffectStatus::Ready;
+        assert_eq!(compensation.kind(), AgentRunEffectKind::CompensationCall);
+        assert!(compensation.kind().exempt_from_wind_down_fence());
+        assert!(!compensation.kind().outside_the_turn());
+        let (effect_id, generation) = (compensation.effect_id.clone(), compensation.generation);
+        run.loop_state
+            .budget_mut()
+            .reserve_attempts(spec.max_attempts)
+            .expect("the compensation's attempts are affordable");
+        run.loop_state
+            .record_effect(compensation)
+            .expect("the compensation records");
+        let before = fx.state.run().expect("run").clone();
+
+        record_effect_result(
+            &mut fx.state,
+            &effect_id,
+            generation,
+            1,
+            0,
+            AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the recovery retry was refused",
+            ),
+            &AgentSchemaPolicy::default(),
+            &AgentEffectPolicies::default(),
+            now,
+        )
+        .expect("the ended run takes a fence-exempt result");
+
+        let run = fx.state.run_mut().expect("run");
+        let parked = run
+            .loop_state
+            .effects()
+            .iter()
+            .find(|effect| effect.effect_id == effect_id)
+            .expect("the compensation stays");
+        assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+        assert_eq!(parked.generation, generation);
+        assert!(
+            run.loop_state.open_checkpoints().is_empty(),
+            "no checkpoint opens for a parked compensation on an ended run"
+        );
+        run.loop_state
+            .commit_decisions(AgentDecisionEventVocabulary::Version2);
+        assert!(
+            run.loop_state.decision_outbox().is_empty(),
+            "nothing is queued"
+        );
+        assert_eq!(run.status, before.status);
+        assert_eq!(run.terminal_reason, before.terminal_reason);
+        assert_eq!(run.terminal_at, before.terminal_at);
     }
 
     /// Issue #106, Ask 2: the task's acceptance is the proof the parked
