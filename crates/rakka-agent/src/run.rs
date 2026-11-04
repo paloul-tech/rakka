@@ -801,18 +801,26 @@ impl AgentRun {
     ///   the effect parked;
     /// - a live run holding an `Indeterminate` effect with no reconciliation
     ///   checkpoint bound to its generation, because the old exhausted-send
-    ///   path opened none.
+    ///   path opened none;
+    /// - an ended run holding an `Indeterminate` effect held outside the turn
+    ///   (a memory promotion or a claim append) with no reconciliation
+    ///   checkpoint, because a binary before issue #120 left an ended run's
+    ///   park checkpoint-less, and a replica of that binary still does while
+    ///   a roll is in flight. On an ended run it reads nothing else: its
+    ///   handoff cell is settled by construction, and any other kind of
+    ///   parked effect is left as it is.
     ///
-    /// Under the fixed transitions neither shape is reachable: every
+    /// Under the fixed transitions neither live shape is reachable: every
     /// transition that parks a live run's effect opens its checkpoint, and
     /// every notice settles a parked send. The settle pass repairs such a
     /// record on the first pass that touches it (`repair_park`), as the gap
-    /// slice 3 repair rests an unrested turn. A terminal run is excluded: its
-    /// checkpoint-less `Indeterminate` promotion or claim append is the
-    /// deliberate shape `record_effect_result` documents.
+    /// slice 3 repair rests an unrested turn.
     pub(crate) fn needs_park_repair(&self) -> bool {
         if self.status.is_terminal() {
-            return false;
+            return self.loop_state.indeterminate_effects().any(|effect| {
+                effect.kind().outside_the_turn()
+                    && !has_reconciliation_checkpoint(&self.loop_state, effect)
+            });
         }
         self.loop_state.indeterminate_effects().any(|effect| {
             handoff_send(&self.loop_state, &effect.effect_id) == HandoffSend::ResolvedByTask
@@ -6600,26 +6608,32 @@ fn evaluate_goal(
 /// expiration has passed is denied — the gated effect fails, and the run winds
 /// down. A timeout never resolves the checkpoint into a grant: sensitive work no
 /// one decided in time fails closed, it does not auto-approve.
+///
+/// On an ended run the sweep acts only on a checkpoint bound to an effect held
+/// outside the turn (a memory promotion or a claim append): a reconciliation
+/// checkpoint never expires, so a timer only escalates it. Every other
+/// checkpoint an ended run still holds, such as an approval a failed run left
+/// open on a tool effect, is left waiting, because expiring it would apply a
+/// failure to an effect of a run that already ended.
 fn fire_checkpoint_timers(
     state: &mut AgentRunState,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
-    {
-        let run = state.run_mut()?;
-        if run.status.is_terminal() {
-            return Ok(());
-        }
-    }
-
     // Collect the ids first: applying an expiration mutates the effect list and
-    // the checkpoint set, so the sweep works from a stable snapshot of ids.
+    // the checkpoint set, so the sweep works from a stable snapshot of ids. An
+    // ended run keeps only the checkpoints bound to an effect held outside the
+    // turn.
     let checkpoint_ids: Vec<HumanCheckpointId> = state
         .run()
         .map(|run| {
+            let ended = run.status.is_terminal();
             run.loop_state
                 .open_checkpoints()
                 .iter()
                 .filter(|checkpoint| checkpoint.status.is_waiting())
+                .filter(|checkpoint| {
+                    !ended || run.holds_outside_the_turn_effect(&checkpoint.bound_effect.effect_id)
+                })
                 .map(|checkpoint| checkpoint.checkpoint_id.clone())
                 .collect()
         })
@@ -13102,6 +13116,139 @@ mod tests {
             }
         ));
         assert_eq!(fx.state, before, "a refused decision changes nothing");
+    }
+
+    /// An approval checkpoint a failed run left open on a tool effect, with a
+    /// hard expiry, is never acted on by a timer on the ended run: expiring it
+    /// would fail an effect of a run that already ended. The checkpoint stays
+    /// waiting and the effect keeps its status.
+    #[test]
+    fn timers_leave_an_ended_runs_other_checkpoints_alone() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Failed,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        let now = fx.now;
+        let scope = fx.scope.clone();
+        let run = fx.state.run_mut().expect("the run exists");
+        let tool = AgentRunEffect::new(
+            &scope,
+            run.loop_state.turn(),
+            1,
+            AgentRunEffectRequest::Tool {
+                call: Box::new(
+                    AgentToolCallRequest::new(
+                        AgentToolCallId::new("call-2").expect("the call id is valid"),
+                        AgentToolId::new("charge-card").expect("the tool id is valid"),
+                        serde_json::json!({}),
+                    )
+                    .expect("the call is bounded"),
+                ),
+            },
+            &AgentEffectSpec::non_idempotent().with_checkpoint_required(),
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the tool effect derives");
+        let mut checkpoint = AgentCheckpoint::open(
+            AgentCheckpoint::id_for_effect(
+                &tool.effect_id,
+                tool.generation,
+                AgentCheckpointKind::Approval,
+            ),
+            AgentCheckpointKind::Approval,
+            scope,
+            &tool,
+            "charge the card",
+            operator(),
+            now,
+        )
+        .expect("the checkpoint opens");
+        let expires_at = AgentTimestampMillis::new(now.as_millis() + 100);
+        checkpoint.expires_at = Some(expires_at);
+        let checkpoint_id = checkpoint.checkpoint_id.clone();
+        let effect_id = tool.effect_id.clone();
+        let effect_status = tool.status;
+        run.loop_state
+            .record_effect(tool)
+            .expect("the tool records");
+        run.loop_state
+            .record_checkpoint(checkpoint)
+            .expect("the checkpoint records");
+        let before = fx.state.clone();
+
+        let past = AgentTimestampMillis::new(expires_at.as_millis() + 1);
+        fire_checkpoint_timers(&mut fx.state, past).expect("the timer sweep applies");
+
+        let run = fx.state.run().expect("the run exists");
+        assert_eq!(run.status, AgentRunStatus::Failed);
+        assert_eq!(
+            run.terminal_reason,
+            before.run().expect("run").terminal_reason
+        );
+        let held = run
+            .loop_state
+            .open_checkpoints()
+            .iter()
+            .find(|held| held.checkpoint_id == checkpoint_id)
+            .expect("the checkpoint stays open");
+        assert!(held.status.is_waiting(), "the checkpoint stays waiting");
+        let effect = run
+            .loop_state
+            .effects()
+            .iter()
+            .find(|held| held.effect_id == effect_id)
+            .expect("the effect stays");
+        assert_eq!(effect.status, effect_status, "the effect is unchanged");
+        assert_eq!(fx.state, before, "a timer on another kind changes nothing");
+    }
+
+    /// On an ended run the park repair reads only an `Indeterminate` effect
+    /// held outside the turn: a checkpoint-less promotion needs it, and the
+    /// same shape on a handoff send does not.
+    #[test]
+    fn needs_park_repair_reads_only_outside_the_turn_effects_on_an_ended_run() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Failed,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Indeterminate,
+        );
+        assert!(
+            !fx.state.run().expect("run").needs_park_repair(),
+            "a checkpoint-less handoff send on an ended run is left as it is"
+        );
+        let now = fx.now;
+        let scope = fx.scope.clone();
+        let run = fx.state.run_mut().expect("the run exists");
+        let mut promotion = AgentRunEffect::new(
+            &scope,
+            run.loop_state.turn(),
+            1,
+            AgentRunEffectRequest::MemoryPromotion {
+                promotion: Box::new(crate::AgentMemoryPromotionRequest {
+                    from_sequence: crate::MemorySequence::new(1),
+                    to_sequence: crate::MemorySequence::new(1),
+                    kind: crate::AgentPrivateMemoryKind::Semantic,
+                    target: None,
+                    confidence_bps: 9_000,
+                    requested_by: operator(),
+                    roles: None,
+                }),
+            },
+            &AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the promotion derives");
+        promotion.status = AgentRunEffectStatus::Indeterminate;
+        run.loop_state
+            .record_effect(promotion)
+            .expect("the promotion records");
+        assert!(
+            fx.state.run().expect("run").needs_park_repair(),
+            "a checkpoint-less promotion on an ended run needs the repair"
+        );
     }
 
     /// Issue #106, Ask 2: the task's acceptance is the proof the parked

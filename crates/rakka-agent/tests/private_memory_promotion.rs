@@ -1256,6 +1256,26 @@ async fn ended_world_configured(
     )>,
     attempt_ceiling: Option<u32>,
 ) -> (Fixture, Stores) {
+    ended_world_with_policies(
+        ending,
+        sink,
+        attempt_ceiling,
+        rakka_agent::AgentEffectPolicies::default(),
+    )
+    .await
+}
+
+/// [`ended_world_configured`] under explicit effect policies, which carry the
+/// checkpoint SLA the run stamps onto the checkpoints it opens.
+async fn ended_world_with_policies(
+    ending: Ending,
+    sink: Option<(
+        Arc<CountingDecisionSink>,
+        rakka_agent::AgentDecisionEventVocabulary,
+    )>,
+    attempt_ceiling: Option<u32>,
+    policies: rakka_agent::AgentEffectPolicies,
+) -> (Fixture, Stores) {
     let stores = stores();
     let adapter = match ending {
         Ending::Failed => {
@@ -1273,7 +1293,13 @@ async fn ended_world_configured(
         dispatcher =
             dispatcher.with_tool_failure("flaky-tool", "tool-unavailable", "the tool is down");
     }
-    let fx = Fixture::new(dispatcher).with_memory(
+    let fx = Fixture::with_sink(
+        dispatcher,
+        rakka_agent::InMemoryAgentRunEffectSink::new(),
+        policies,
+        Arc::new(std::sync::atomic::AtomicU64::new(1)),
+    )
+    .with_memory(
         AgentRunMemory::new(stores.session.clone(), stores.snapshots.clone())
             .with_private_store(stores.private.clone()),
     );
@@ -3221,4 +3247,222 @@ async fn a_promotion_committed_mid_turn_still_dispatches_when_the_run_winds_down
         .memory_promotions()
         .len();
     assert_eq!(receipts, 1, "one bounded receipt on the terminal record");
+}
+
+// ---------------------------------------------------------------------------
+// The park repair and the checkpoint timers on an ended run (issue #120).
+// ---------------------------------------------------------------------------
+
+/// Rewrites the stored record checkpoint-less, as a record already stuck in a
+/// store, or one a `bc0c224` replica parked mid-roll, reads.
+async fn unbind_checkpoints(fx: &Fixture) {
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    let loop_state = value["run"]["loop_state"]
+        .as_object_mut()
+        .expect("the loop state is an object");
+    loop_state.insert("open_checkpoints".to_string(), serde_json::json!([]));
+    loop_state.insert("pending_checkpoint".to_string(), serde_json::Value::Null);
+    let unbound = serde_json::from_value(value).expect("the checkpoint-less record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, unbound)
+        .await
+        .expect("the checkpoint-less record persists");
+}
+
+/// One settle pass: recover, then settle the side effects.
+async fn settle_pass(fx: &Fixture) {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.settle_side_effects(&fx.router, fx.now())
+        .await
+        .expect("settle");
+}
+
+/// A park an ended run holds without its checkpoint heals on the next settle
+/// pass: the pass opens exactly the checkpoint the park would have, once, with
+/// no `compensate`, records one `request-reconciliation`, and never moves the
+/// terminal record. The person's `ConfirmedCompleted` then settles it.
+#[tokio::test]
+async fn a_checkpoint_less_park_on_an_ended_run_heals_on_the_next_settle_pass() {
+    use rakka_agent::AgentDecisionKind as Kind;
+    // The park predates decision events, as a record an older binary left
+    // does: the sink joins afterwards, so the repair's open is the first
+    // `request-reconciliation` the stream sees.
+    let (fx, _stores) = ended_world(Ending::Failed).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let parked = park_promotion(&fx, "ambiguous").await;
+    assert_terminal_unmoved(&fx, &before, "after the park").await;
+    let sink = CountingDecisionSink::new();
+    let fx = fx
+        .with_decision_events(sink.clone())
+        .with_decision_event_vocabulary(rakka_agent::AgentDecisionEventVocabulary::Version2);
+    let scope = run_scope();
+    unbind_checkpoints(&fx).await;
+    assert!(open_checkpoints(&fx).await.is_empty(), "none is open");
+    assert_terminal_unmoved(&fx, &before, "after the rewrite").await;
+
+    settle_pass(&fx).await;
+    let open = the_open_checkpoint(&fx).await;
+    assert_eq!(
+        open.checkpoint_id,
+        AgentCheckpoint::id_for_effect(
+            &parked.effect_id,
+            parked.generation,
+            AgentCheckpointKind::IndeterminateEffectReconciliation
+        )
+    );
+    let decisions: Vec<&str> = open
+        .allowed_decisions
+        .iter()
+        .map(|decision| decision.value.as_str())
+        .collect();
+    assert_eq!(
+        decisions,
+        [
+            "confirmed-completed",
+            "confirmed-not-executed",
+            "escalate",
+            "abandon-and-fail"
+        ],
+        "the repaired checkpoint offers no compensate"
+    );
+    assert_terminal_unmoved(&fx, &before, "after the first settle pass").await;
+
+    let recorded = sink.events(&scope);
+    let opens: Vec<_> = recorded
+        .iter()
+        .filter(|event| event.kind == Kind::RequestReconciliation)
+        .collect();
+    assert_eq!(opens.len(), 1, "exactly one reconciliation open");
+    let first: Vec<_> = recorded.iter().map(|event| event.kind).collect();
+    assert_eq!(
+        first,
+        [Kind::RequestReconciliation],
+        "the pass records only the open"
+    );
+    let slot = format!("ck-open-reconcile-t{}-s{}-g1", parked.turn, parked.slot);
+    assert!(
+        opens[0].operation_id.as_str().contains(&slot),
+        "the open carries slot {slot}: {}",
+        opens[0].operation_id.as_str()
+    );
+
+    settle_pass(&fx).await;
+    assert_eq!(
+        the_open_checkpoint(&fx).await.checkpoint_id,
+        open.checkpoint_id
+    );
+    assert_eq!(
+        sink.events(&scope).len(),
+        recorded.len(),
+        "a second pass adds nothing"
+    );
+    assert_terminal_unmoved(&fx, &before, "after the second settle pass").await;
+
+    let complete = resolve_checkpoint_command(
+        &open.checkpoint_id,
+        "completed",
+        reconciliation(confirmed_completed()),
+    );
+    apply_ok(&fx, complete.clone()).await;
+    let done = promotion_record(&fx, &parked).await;
+    assert_eq!(done.status, AgentRunEffectStatus::Succeeded);
+    assert!(open_checkpoints(&fx).await.is_empty());
+    let reply = apply_ok(&fx, complete).await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Duplicate { .. }),
+        "{reply:?}"
+    );
+    let events = sink.events(&scope);
+    let kinds: Vec<_> = events
+        .iter()
+        .skip(recorded.len())
+        .map(|event| event.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [Kind::Reconcile],
+        "the decision records one reconcile"
+    );
+    assert_decision_stream_whole(&sink, &scope);
+    assert_terminal_unmoved(&fx, &before, "after ConfirmedCompleted").await;
+}
+
+/// A timer escalates an ended run's reconciliation checkpoint once its SLA is
+/// due, records `escalate-checkpoint` with `sla-due`, and moves nothing of the
+/// terminal record.
+#[tokio::test]
+async fn a_timer_escalates_an_ended_runs_reconciliation_checkpoint() {
+    use rakka_agent::AgentDecisionKind as Kind;
+    let sink = CountingDecisionSink::new();
+    let policies = rakka_agent::AgentEffectPolicies::default().with_checkpoint_sla(
+        rakka_agent::AgentCheckpointSla {
+            due_after_ms: Some(1_000),
+            expire_after_ms: None,
+            escalation_target: Some("ops-oncall".to_string()),
+        },
+    );
+    let (fx, _stores) = ended_world_with_policies(
+        Ending::Completed,
+        Some((
+            sink.clone(),
+            rakka_agent::AgentDecisionEventVocabulary::Version2,
+        )),
+        None,
+        policies,
+    )
+    .await;
+    let scope = run_scope();
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let parked = park_promotion(&fx, "ambiguous").await;
+    let checkpoint = the_open_checkpoint(&fx).await;
+    assert_eq!(checkpoint.status, rakka_agent::AgentCheckpointStatus::Open);
+    let due = checkpoint.due_at.expect("the SLA stamped a due time");
+    assert_terminal_unmoved(&fx, &before, "after the park").await;
+    let fired = sink.events(&scope).len();
+
+    fx.clock
+        .store(due.as_millis() + 1, std::sync::atomic::Ordering::SeqCst);
+    let timer = AgentRunEntityCommand::FireCheckpointTimers {
+        operation_id: AgentOperationId::for_agent(
+            AgentOperationKind::CheckpointResolution,
+            &agent_scope(),
+            "timer",
+        )
+        .expect("the timer key derives"),
+    };
+    apply_ok(&fx, timer.clone()).await;
+    let escalated = the_open_checkpoint(&fx).await;
+    assert_eq!(escalated.checkpoint_id, checkpoint.checkpoint_id);
+    assert_eq!(
+        escalated.status,
+        rakka_agent::AgentCheckpointStatus::Escalated
+    );
+    let held = promotion_record(&fx, &parked).await;
+    assert_eq!(held.status, AgentRunEffectStatus::Indeterminate);
+    let events = sink.events(&scope);
+    let kinds: Vec<_> = events[fired..].iter().map(|event| event.kind).collect();
+    assert_eq!(kinds, [Kind::EscalateCheckpoint]);
+    assert_eq!(events[fired].reason_code.as_deref(), Some("sla-due"));
+    assert_terminal_unmoved(&fx, &before, "after the timer").await;
+
+    let reply = apply_ok(&fx, timer).await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Duplicate { .. }),
+        "{reply:?}"
+    );
+    assert_eq!(
+        sink.events(&scope).len(),
+        fired + 1,
+        "a replay records nothing"
+    );
+    assert_decision_stream_whole(&sink, &scope);
+    assert_terminal_unmoved(&fx, &before, "after the replay").await;
 }
