@@ -16,14 +16,14 @@ use std::sync::{Arc, Mutex};
 use common::{goal_spec, goal_spec_draft, goal_task_creation_command, task_definition, task_scope};
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    claim_append_operation_id, AgentClaimAppendExecutor, AgentClaimAppendFinding,
-    AgentClaimAppendProvenance, AgentClaimAppendRequest, AgentClaimObjectRequest,
-    AgentCommunalClaimId, AgentDispatchFuture, AgentModelTurn, AgentModelUsage, AgentOperationId,
-    AgentOperationKind, AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome,
-    AgentRunEffectStatus, AgentRunEntityCommand, AgentRunEntityReply, AgentRunScope,
-    AgentRunStatus, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    KnowledgeSpaceId, AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    agent_operational_snapshot, claim_append_operation_id, AgentCheckpoint, AgentCheckpointKind,
+    AgentClaimAppendExecutor, AgentClaimAppendFinding, AgentClaimAppendProvenance,
+    AgentClaimAppendRequest, AgentClaimObjectRequest, AgentCommunalClaimId, AgentDispatchFuture,
+    AgentModelTurn, AgentModelUsage, AgentOperationId, AgentOperationKind, AgentRunEffect,
+    AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand,
+    AgentRunEntityReply, AgentRunScope, AgentRunStatus, AgentSchemaPolicy, AgentTaskContent,
+    AgentToolCallId, AgentToolCallRequest, AgentToolId, KnowledgeSpaceId,
+    AGENT_POST_TERMINAL_MEMORY_WINDOW_DEFAULT_MS, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 use serde_json::json;
@@ -660,6 +660,271 @@ async fn a_claim_append_is_accepted_inside_the_post_terminal_window() {
             "{ending:?}: the terminal stamp did not move"
         );
     }
+}
+
+/// An ambiguous claim-append outcome delivered to an ended run parks the
+/// append `Indeterminate` and opens its reconciliation checkpoint, without
+/// `compensate`, and the terminal record does not move.
+#[tokio::test]
+async fn an_ended_runs_ambiguous_claim_append_opens_its_reconciliation_checkpoint() {
+    let executor = RecordingClaimAppendExecutor::new();
+    let fx = ended_goal_world(Ending::Completed, executor.clone()).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let reply = apply_append(&fx, "ambiguous", append_request("space-alpha"))
+        .await
+        .expect("the post-terminal append applies");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let parked = resolve_claim_append(
+        &fx,
+        AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the recovery retry was refused",
+        ),
+    )
+    .await;
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let open = run
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .open_checkpoints();
+    assert_eq!(open.len(), 1, "one checkpoint opens");
+    assert_eq!(
+        open[0].kind,
+        AgentCheckpointKind::IndeterminateEffectReconciliation
+    );
+    assert_eq!(
+        open[0].checkpoint_id,
+        AgentCheckpoint::id_for_effect(
+            &parked.effect_id,
+            parked.generation,
+            AgentCheckpointKind::IndeterminateEffectReconciliation
+        )
+    );
+    let decisions: Vec<&str> = open[0]
+        .allowed_decisions
+        .iter()
+        .map(|decision| decision.value.as_str())
+        .collect();
+    assert_eq!(
+        decisions,
+        [
+            "confirmed-completed",
+            "confirmed-not-executed",
+            "escalate",
+            "abandon-and-fail"
+        ]
+    );
+    let snapshot = agent_operational_snapshot(
+        &fx.runs,
+        &common::run_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists");
+    assert_eq!(snapshot.open_checkpoints.len(), 1);
+
+    let after = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.terminal_reason, before.terminal_reason);
+    assert_eq!(after.terminal_at, before.terminal_at);
+}
+
+/// `ConfirmedNotExecuted` on an ended run re-sends its parked claim append
+/// under a new generation, and so a new idempotency key: the append lands
+/// through the ordinary outbox and the terminal record does not move.
+#[tokio::test]
+async fn confirmed_not_executed_re_sends_an_ended_runs_claim_append_under_a_new_key() {
+    let executor = RecordingClaimAppendExecutor::new();
+    let fx = ended_goal_world(Ending::Completed, executor.clone()).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    apply_append(&fx, "ambiguous", append_request("space-alpha"))
+        .await
+        .expect("the post-terminal append applies");
+    let parked = resolve_claim_append(
+        &fx,
+        AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the recovery retry was refused",
+        ),
+    )
+    .await;
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    let first_key = parked
+        .safety
+        .external_key()
+        .expect("an append carries its external key")
+        .as_str()
+        .to_string();
+    assert!(first_key.ends_with("#g1"), "{first_key}");
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.apply(
+        AgentRunEntityCommand::ResolveIndeterminateEffect {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "not-executed",
+            )
+            .expect("the decision key derives"),
+            effect_id: parked.effect_id.clone(),
+            generation: parked.generation,
+            resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedNotExecuted),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("an ended run's parked append is re-sent");
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let resent = committed_append(run.state().expect("state"))
+        .into_iter()
+        .find(|held| held.effect_id == parked.effect_id)
+        .expect("the effect survives");
+    assert_eq!(resent.generation, parked.generation.next());
+    let key = resent
+        .safety
+        .external_key()
+        .expect("the new generation carries a key")
+        .as_str();
+    assert!(
+        key.ends_with("#g2"),
+        "the new generation derives a new key: {key}"
+    );
+    assert!(run
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .open_checkpoints()
+        .is_empty());
+    assert!(executor.invocations().is_empty(), "nothing sent yet");
+
+    fx.pump_post_terminal(AgentRunEffectKind::ClaimAppendCall)
+        .await
+        .expect("the re-sent append settles");
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let done = committed_append(run.state().expect("state"))
+        .into_iter()
+        .find(|held| held.effect_id == parked.effect_id)
+        .expect("the effect survives");
+    assert_eq!(done.status, AgentRunEffectStatus::Succeeded);
+    assert_eq!(executor.invocations().len(), 1);
+
+    let after = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.terminal_reason, before.terminal_reason);
+    assert_eq!(after.terminal_at, before.terminal_at);
+}
+
+/// A person's `ConfirmedCompleted` through `ResolveCheckpoint` answers an
+/// ended run's parked claim append: the outcome lands on the same generation,
+/// the checkpoint is gone, and the terminal record never moves.
+#[tokio::test]
+async fn a_checkpoint_decision_answers_an_ended_runs_claim_append() {
+    let executor = RecordingClaimAppendExecutor::new();
+    let fx = ended_goal_world(Ending::Completed, executor.clone()).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    apply_append(&fx, "ambiguous", append_request("space-alpha"))
+        .await
+        .expect("the post-terminal append applies");
+    let parked = resolve_claim_append(
+        &fx,
+        AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the recovery retry was refused",
+        ),
+    )
+    .await;
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let checkpoint_id = {
+        let open = run
+            .state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .open_checkpoints();
+        assert_eq!(open.len(), 1, "one checkpoint opens");
+        open[0].checkpoint_id.clone()
+    };
+    let unmoved = |after: rakka_agent::AgentRunSnapshot, at: &str| {
+        assert_eq!(after.status, before.status, "{at}: status");
+        assert_eq!(
+            after.terminal_reason, before.terminal_reason,
+            "{at}: reason"
+        );
+        assert_eq!(after.terminal_at, before.terminal_at, "{at}: stamp");
+    };
+    unmoved(
+        fx.run_snapshot().await.expect("the run exists"),
+        "after the park",
+    );
+
+    run.apply(
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "completed",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id,
+            resolver: PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(rakka_agent::AgentCheckpointDecision::Reconciliation(
+                rakka_agent::AgentReconciliationDecision::ConfirmedCompleted {
+                    resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                        outcome: Box::new(AgentRunEffectOutcome::ClaimAppend {
+                            claim: AgentCommunalClaimId::new("claim-established")
+                                .expect("the claim id is valid"),
+                        }),
+                    }),
+                },
+            )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("an ended run's parked append is answered through its checkpoint");
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let done = committed_append(run.state().expect("state"))
+        .into_iter()
+        .find(|held| held.effect_id == parked.effect_id)
+        .expect("the effect survives");
+    assert_eq!(done.status, AgentRunEffectStatus::Succeeded);
+    assert_eq!(done.generation, parked.generation);
+    assert!(run
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .open_checkpoints()
+        .is_empty());
+    assert!(executor.invocations().is_empty(), "nothing was re-sent");
+    unmoved(
+        fx.run_snapshot().await.expect("the run exists"),
+        "after the decision",
+    );
 }
 
 /// The window is inclusive of its last millisecond and closed one past it,

@@ -280,7 +280,45 @@ incorrectly.
   and its outcome never rests one — a failure of either stays on the effect
   record rather than ending the run, and a run that has ended still accepts
   both for a deployment-configured window after its terminal stamp, its
-  effects riding the ordinary outbox the application keeps pumping. The
+  effects riding the ordinary outbox the application keeps pumping. If such
+  an effect's attempt may have run and its recovery retry is refused (the
+  agent was terminated just after the run ended), the generation parks
+  `Indeterminate` behind a reconciliation checkpoint, as a live run's does.
+  An ended run's checkpoint lists `confirmed-completed`,
+  `confirmed-not-executed`, `escalate` and `abandon-and-fail`, never
+  `compensate`: one opened after the run ended is opened without it, and the
+  point query drops it from one opened while the run was live, whose durable
+  record keeps it. A `Compensate` decision on an ended run is refused
+  `run-terminal`. Either `ResolveCheckpoint` or
+  `ResolveIndeterminateEffect` answers it, at any time after the run ended;
+  the window bounds new commands, not the answer. The terminal status,
+  reason and stamp never move. `ConfirmedCompleted` records the outcome it
+  carries, which must be the effect's own receipt, a `Failed` or an
+  `Exhausted`; any other outcome, such as a model turn, is refused
+  `effect-policy-invalid`, because it would move the ended run's loop.
+  `AbandonAndFail` fails that generation only. `ConfirmedNotExecuted` is a
+  person's assertion that the attempt never ran, not a probe: it re-sends
+  under a new idempotency key, so if the first attempt did land, a re-sent
+  claim append appends a second claim and a re-sent consolidation is refused
+  on a stale revision. A person who does not know chooses `AbandonAndFail`:
+  `ConfirmedCompleted` must carry the effect's receipt (the promoted
+  memories' ids and revisions, or the claim's id), which only someone who
+  knows what happened has. For a plain promotion, one without a `target`,
+  `ConfirmedNotExecuted` is safe too: the memory's identity comes from its
+  session entry, not the generation, so a re-send after an attempt that
+  landed converges on the memory it wrote. A re-send the authority still
+  refuses fails definitively; after memory retention has purged the run's
+  session rows, a re-sent promotion settles without parking (`Exhausted`,
+  code `memory-promotion-source-missing`, once its attempts run out). A timer
+  escalates the checkpoint but never expires it, and the settle pass opens
+  the checkpoint for a park that has none. An approval left open on an
+  ended run's promotion or claim append is answered and timed as on a live
+  run: a grant dispatches the effect, and a denial or an expiry fails that
+  generation only. The run's status does not move. The decision events all
+  of this records follow the run's end event (see Observability below). A
+  compensation or workflow cancel parked on an ended run stays as it was
+  (issue #123), and every other resolution on an ended run is still refused
+  `run-terminal`. The
   retriever supplies a ranking and nothing else: every ranked identity is
   resolved through the authoritative store before it is admitted, so a foreign
   or forged record is dropped and counted, and an unauthorized read reveals
@@ -355,15 +393,22 @@ top-up under `Running`), and a wind-down begun while an effect's outcome is unkn
 `waiting-for-reconciliation`. The A2A coordination replay shows only a run
 event's kind and `reason_code`. When a failure ends a run, any other gated
 effect's approval or authorization checkpoint stays open on the ended run and
-gets no close event; the run's end event closes it for readers. `AgentDecisionEventVocabulary` selects what is written:
+gets no close event; the run's end event closes it for readers. On an ended
+run, events can follow the run's end event: for a parked memory promotion or
+claim append, `request-reconciliation` (the checkpoint's open),
+`escalate-checkpoint` and `reconcile`; for an approval left open on one of
+them, `resolve-checkpoint` (its grant, denial or expiry); and for a re-sent
+gated generation, the `request-approval` or `request-authorization` of its new
+gate. `request-reconciliation`, `escalate-checkpoint` and `resolve-checkpoint`
+are written only under `Version2`; the other three are written under
+`Version1` too. `AgentDecisionEventVocabulary` selects what is written:
 `Version1`, the default, writes only the kinds an earlier reader decodes
 (`request-approval`, `request-authorization`, `reconcile`, `complete`,
 `fail`, `wait`) and none of the four fields, so a binary at the earlier pin
 writes back exactly the event it read; `Version2` adds the six newer kinds and
 the four fields and stamps events with schema version 2. Select it with
 `with_decision_event_vocabulary` once every process that loads the run store or
-reads the sink reads version 2 (see `docs/rakka-compatibility.md`). An ended
-run's ambiguous memory promotion or claim append records no event (issue #120).
+reads the sink reads version 2 (see `docs/rakka-compatibility.md`).
 The SDK, exporter, and Collector live at the application binary;
 `examples/agent-otlp-export-acceptance` is that binary, and
 `docs/plans/rakka-agent/kubernetes-agent-otel-collector-topology.yaml` is the
