@@ -2470,6 +2470,111 @@ async fn compensate_is_refused_on_an_ended_run() {
     }
 }
 
+/// The decisions the point query lists on the run's one open checkpoint.
+async fn listed_decisions(fx: &Fixture) -> Vec<String> {
+    let snapshot = agent_operational_snapshot(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists");
+    assert_eq!(snapshot.open_checkpoints.len(), 1, "one checkpoint is open");
+    snapshot.open_checkpoints[0]
+        .allowed_decisions
+        .iter()
+        .map(|decision| decision.value.clone())
+        .collect()
+}
+
+/// A reconciliation checkpoint the run opened while live keeps `compensate`
+/// in its durable record after the run ends, because a checkpoint is never
+/// rewritten. The point query stops listing it once the run has ended: an
+/// ended run refuses `Compensate`, so its checkpoint never offers it. The run
+/// ends with the checkpoint open through `settle_proposal`'s `Accepted` arm,
+/// which terminates without waiting on a promotion, outside the turn.
+#[tokio::test]
+async fn an_ended_runs_snapshot_lists_no_compensate_on_a_checkpoint_opened_while_live() {
+    use rakka_agent::testkit::ExchangeFault;
+
+    let (fx, _stores) = promoting_world();
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    crank(&fx).await;
+    drive_turn(&fx).await;
+    crank(&fx).await;
+    // Turn two proposes, and the proposal's deliveries are lost until after
+    // the promotion parks, so the run rests on its proposal meanwhile.
+    for _ in 0..12 {
+        fx.task_transport.inject(ExchangeFault::LoseEnvelope);
+    }
+    drive_turn(&fx).await;
+    crank(&fx).await;
+    let resting = fx.run_snapshot().await.expect("the run exists");
+    assert!(resting.proposal.is_some(), "the run rests on its proposal");
+    let parked = park_promotion(&fx, "ambiguous").await;
+    let live = fx.run_snapshot().await.expect("the run exists");
+    assert!(
+        !live.status.is_terminal(),
+        "the promotion parks on a live run"
+    );
+    let opened = the_open_checkpoint(&fx).await;
+    assert_eq!(
+        opened.kind,
+        AgentCheckpointKind::IndeterminateEffectReconciliation
+    );
+    assert_eq!(opened.bound_effect.effect_id, parked.effect_id);
+    let all = [
+        "confirmed-completed",
+        "confirmed-not-executed",
+        "compensate",
+        "escalate",
+        "abandon-and-fail",
+    ];
+    assert_eq!(
+        listed_decisions(&fx).await,
+        all,
+        "a live run lists them all"
+    );
+
+    // The proposal is re-delivered once the lost deliveries run out, and the
+    // task's acceptance ends the run with the checkpoint still open.
+    for _ in 0..16 {
+        fx.pump().await.expect("the loop runs");
+        if fx
+            .run_snapshot()
+            .await
+            .expect("the run exists")
+            .status
+            .is_terminal()
+        {
+            break;
+        }
+    }
+    let ended = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(ended.status, AgentRunStatus::Completed);
+    let held = the_open_checkpoint(&fx).await;
+    assert_eq!(held.checkpoint_id, opened.checkpoint_id);
+    let recorded: Vec<&str> = held
+        .allowed_decisions
+        .iter()
+        .map(|decision| decision.value.as_str())
+        .collect();
+    assert_eq!(recorded, all, "the durable record keeps its list");
+    assert_eq!(
+        listed_decisions(&fx).await,
+        [
+            "confirmed-completed",
+            "confirmed-not-executed",
+            "escalate",
+            "abandon-and-fail"
+        ],
+        "the point query drops compensate on an ended run"
+    );
+}
+
 /// Two decisions for one park through different paths: the checkpoint a
 /// `ResolveIndeterminateEffect` dropped is gone, so a decision naming it is
 /// `run-terminal` and nothing is re-sent a second time.

@@ -5790,10 +5790,11 @@ fn open_effect_checkpoint(
     )?;
     // An ended run refuses `Compensate`, so a reconciliation checkpoint it
     // opens must not offer it.
-    if run.status.is_terminal() && kind == AgentCheckpointKind::IndeterminateEffectReconciliation {
-        checkpoint
-            .allowed_decisions
-            .retain(|decision| decision.value != "compensate");
+    if run.status.is_terminal() {
+        crate::checkpoints::drop_decisions_an_ended_run_refuses(
+            kind,
+            &mut checkpoint.allowed_decisions,
+        );
     }
     let mut checkpoint = checkpoint
         .with_task(task)

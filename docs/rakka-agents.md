@@ -284,11 +284,12 @@ incorrectly.
   an effect's attempt may have run and its recovery retry is refused (the
   agent was terminated just after the run ended), the generation parks
   `Indeterminate` behind a reconciliation checkpoint, as a live run's does.
-  A checkpoint opened on the ended run lists `confirmed-completed`,
+  An ended run's checkpoint lists `confirmed-completed`,
   `confirmed-not-executed`, `escalate` and `abandon-and-fail`, never
-  `compensate`. One opened while the run was live keeps its list,
-  `compensate` included, after the run ends, and a `Compensate` decision on
-  an ended run is refused `run-terminal`. Either `ResolveCheckpoint` or
+  `compensate`: one opened after the run ended is opened without it, and the
+  point query drops it from one opened while the run was live, whose durable
+  record keeps it. A `Compensate` decision on an ended run is refused
+  `run-terminal`. Either `ResolveCheckpoint` or
   `ResolveIndeterminateEffect` answers it, at any time after the run ended;
   the window bounds new commands, not the answer. The terminal status,
   reason and stamp never move. `ConfirmedCompleted` records the outcome it
@@ -299,11 +300,16 @@ incorrectly.
   person's assertion that the attempt never ran, not a probe: it re-sends
   under a new idempotency key, so if the first attempt did land, a re-sent
   claim append appends a second claim and a re-sent consolidation is refused
-  on a stale revision. A person who does not know chooses `ConfirmedCompleted`
-  or `AbandonAndFail`. A re-send the authority still refuses fails
-  definitively; after memory retention has purged the run's session rows, a
-  re-sent promotion settles without parking (`Exhausted`, code
-  `memory-promotion-source-missing`, once its attempts run out). A timer
+  on a stale revision. A person who does not know chooses `AbandonAndFail`:
+  `ConfirmedCompleted` must carry the effect's receipt (the promoted
+  memories' ids and revisions, or the claim's id), which only someone who
+  knows what happened has. For a plain promotion, one without a `target`,
+  `ConfirmedNotExecuted` is safe too: the memory's identity comes from its
+  session entry, not the generation, so a re-send after an attempt that
+  landed converges on the memory it wrote. A re-send the authority still
+  refuses fails definitively; after memory retention has purged the run's
+  session rows, a re-sent promotion settles without parking (`Exhausted`,
+  code `memory-promotion-source-missing`, once its attempts run out). A timer
   escalates the checkpoint but never expires it, and the settle pass opens
   the checkpoint for a park that has none. An approval left open on an
   ended run's promotion or claim append is answered and timed as on a live

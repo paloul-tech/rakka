@@ -333,9 +333,12 @@ pub struct AgentCheckpointView {
     /// The effect it gates. The checkpoint id's format is not a contract;
     /// this is the link from a checkpoint to its effect.
     pub bound_effect: AgentCheckpointBoundEffectView,
-    /// The decisions a resolver may choose, as the checkpoint records them.
-    /// What a deployment offers a person may be narrower. Bodies serialized
-    /// before this field decode it empty.
+    /// The decisions a resolver may choose, as the checkpoint records them,
+    /// less any its run refuses because the run has ended: a reconciliation
+    /// checkpoint on an ended run never lists `compensate`, even one opened
+    /// while the run was live, whose record keeps it (issue #120). What a
+    /// deployment offers a person may be narrower. Bodies serialized before
+    /// this field decode it empty.
     #[serde(default)]
     pub allowed_decisions: Vec<AgentCheckpointDecisionOption>,
     /// Its bounded, non-secret prompt/decision summary. Bodies serialized
@@ -816,6 +819,7 @@ impl AgentOperationalSnapshot {
     ) -> Self {
         let run = state.run();
         let loop_state = run.map(|run| &run.loop_state);
+        let ended = run.is_some_and(|run| run.status.is_terminal());
         let pending_effects = loop_state
             .map(|loop_state| {
                 loop_state
@@ -852,19 +856,31 @@ impl AgentOperationalSnapshot {
                     // its deadline must not surface as a `next_wake` — the same
                     // `is_waiting` gate `has_open_checkpoint` uses.
                     .filter(|checkpoint| checkpoint.status.is_waiting())
-                    .map(|checkpoint: &AgentCheckpoint| AgentCheckpointView {
-                        checkpoint_id: checkpoint.checkpoint_id.clone(),
-                        kind: checkpoint.kind,
-                        status: checkpoint.status,
-                        required_roles: checkpoint.required_roles.clone(),
-                        required_capabilities: checkpoint.required_capabilities.len(),
-                        due_at: checkpoint.due_at,
-                        expires_at: checkpoint.expires_at,
-                        bound_effect: AgentCheckpointBoundEffectView::of_binding(
-                            &checkpoint.bound_effect,
-                        ),
-                        allowed_decisions: checkpoint.allowed_decisions.clone(),
-                        summary: checkpoint.summary.clone(),
+                    .map(|checkpoint: &AgentCheckpoint| {
+                        // A checkpoint opened while the run was live keeps
+                        // its full list on the record; the view drops what
+                        // the ended run refuses (issue #120).
+                        let mut allowed_decisions = checkpoint.allowed_decisions.clone();
+                        if ended {
+                            crate::checkpoints::drop_decisions_an_ended_run_refuses(
+                                checkpoint.kind,
+                                &mut allowed_decisions,
+                            );
+                        }
+                        AgentCheckpointView {
+                            checkpoint_id: checkpoint.checkpoint_id.clone(),
+                            kind: checkpoint.kind,
+                            status: checkpoint.status,
+                            required_roles: checkpoint.required_roles.clone(),
+                            required_capabilities: checkpoint.required_capabilities.len(),
+                            due_at: checkpoint.due_at,
+                            expires_at: checkpoint.expires_at,
+                            bound_effect: AgentCheckpointBoundEffectView::of_binding(
+                                &checkpoint.bound_effect,
+                            ),
+                            allowed_decisions,
+                            summary: checkpoint.summary.clone(),
+                        }
                     })
                     .collect()
             })

@@ -274,6 +274,7 @@ Sections 1-10 are the design record and are left as written. The build differs f
 - The gated approval on an ended run: `bcb1a1b` pins that a tool-calling turn's approval for a gated promotion outlives a run that ends `Completed`, and that a grant or a timer expiry answers it without moving the terminal record.
 - 5.5, the decision events: recorded by the transitions above through `queue_decision`, with no commit of their own.
 - The final review's fixes: `515c315` (the confirmation refusal below, the #123 park pin, the gated approvals' decision events, and doc comments), then the product docs.
+- The host's review on PR #124: the point query's `compensate` filter, the advice to a person who does not know, and the correction to section 6, all below. They land in the commit after `5899aeb`.
 
 **The retention outcome (corrects 5.2).** Section 5.2 says a promotion re-sent after memory retention is refused `memory-promotion-selection-empty`, also definitively. That is wrong.
 - The executor's read of a purged window returns the retryable `memory-promotion-source-missing` (`dispatch.rs:1207-1219`). `memory-promotion-selection-empty` (`:1265`) fires only when the rows exist and the role filter selects none.
@@ -309,8 +310,22 @@ Sections 1-10 are the design record and are left as written. The build differs f
 
 `docs/rakka-compatibility.md` says all of it.
 
-**A checkpoint opened while the run was live keeps `compensate` (refines 5.1; an open question).**
+**A checkpoint opened while the run was live keeps `compensate` on its record, and the point query drops it (refines 5.1; the host's review).**
 - A reconciliation checkpoint opened while the run was live keeps its decision list after the run ends, `compensate` included. That is reachable: `settle_proposal`'s `Accepted` arm can end a run that holds a promotion it parked while live.
-- `Compensate` against it is refused `run-terminal`, as section 5.1's last bullet says, and the final review ruled to keep the code as it is.
-- The docs say so: a checkpoint opened on an ended run never offers `compensate`, and one opened while the run was live keeps its list.
-- The open question: the snapshot still lists `compensate` on such a checkpoint, a decision the run refuses, which is section 3's last anti-goal.
+- `Compensate` against it is refused `run-terminal`, as section 5.1's last bullet says.
+- The build first left the snapshot listing `compensate` there, a decision the run refuses (section 3's last anti-goal), and asked the owner. The host's review on PR #124 asked for the filter, because the host serves `allowed_decisions` as written.
+- `AgentOperationalSnapshot::derive` now drops `compensate` from a reconciliation checkpoint once its run has ended. It shares one private helper, `drop_decisions_an_ended_run_refuses`, with the run's own opening of a checkpoint on an ended run, so the two rules cannot drift apart.
+- The record is unchanged. A `bc0c224` binary's snapshot lists `compensate` again, during the roll and after a rollback, and `docs/rakka-compatibility.md` says so.
+- Pinned by `an_ended_runs_snapshot_lists_no_compensate_on_a_checkpoint_opened_while_live`, which failed before the change. It parks a promotion while the run rests on its proposal, then lets the task's acceptance end the run.
+
+**What a person who does not know chooses (corrects 5.2 and 10; the host's review).** Sections 5.2 and 10 say a person who doesn't know what happened chooses `ConfirmedCompleted` or `AbandonAndFail`. But on an ended run `ConfirmedCompleted` must carry the effect's own receipt: the promoted memories' ids and revisions (`effect.rs:2347-2350`), or the claim's id (`:2390-2393`). A person who doesn't know has neither.
+- So that person chooses `AbandonAndFail`.
+- For a plain promotion, one without a `target`, `ConfirmedNotExecuted` is safe too, as section 2 says. The memory id derives from the session entry, not the generation (`dispatch.rs:1367`), and `AlreadyExists` converges (`:1414`).
+- After retention has purged the run's session rows, that re-send settles `Exhausted` instead (above). It still writes no duplicate.
+- The docs and the CHANGELOG say this. The report to the host on #120 will too.
+
+**The host's run port (corrects 6).** Section 6's third row says the host's own run port refuses these resolves until its bump. The host's review corrects that, and the host's comment on #120 that it came from:
+- the run port checks only `confirmed_completed` before Rakka;
+- `confirmed_not_executed`, `escalate` and `abandon_and_fail` already reach Rakka, which answers `run-terminal` at `bc0c224`.
+
+Nothing in this change depends on that row.

@@ -1345,6 +1345,20 @@ fn default_decisions(kind: AgentCheckpointKind) -> Vec<AgentCheckpointDecisionOp
     }
 }
 
+/// Drops from a checkpoint's decisions the ones a run that has ended refuses:
+/// `compensate` on a reconciliation checkpoint, because a compensation is new
+/// work and an ended run refuses it `run-terminal` (issue #120). The run
+/// applies it to a checkpoint it opens after its end, and the point query to
+/// one it opened while live, whose durable record keeps its full list.
+pub(crate) fn drop_decisions_an_ended_run_refuses(
+    kind: AgentCheckpointKind,
+    decisions: &mut Vec<AgentCheckpointDecisionOption>,
+) {
+    if kind == AgentCheckpointKind::IndeterminateEffectReconciliation {
+        decisions.retain(|decision| decision.value != "compensate");
+    }
+}
+
 /// Truncates a string to a bounded character length, on a character boundary.
 fn bounded(value: impl Into<String>, max: usize) -> String {
     let value = value.into();
