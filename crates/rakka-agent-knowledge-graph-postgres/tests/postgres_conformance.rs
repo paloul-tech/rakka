@@ -193,6 +193,16 @@ async fn an_operation_id_reused_across_erasure_kinds_is_a_conflict_when_dsn_is_s
 }
 
 #[tokio::test]
+async fn an_erasure_operation_id_replayed_against_another_claim_is_a_conflict_when_dsn_is_set() {
+    let Some(store) = store().await else { return };
+    conformance::an_erasure_operation_id_belongs_to_one_claim(
+        &store,
+        ConformanceScopes::unique("pg-erasure-one-claim"),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn retention_ages_claims_out_by_a_window_per_trust_status_when_dsn_is_set() {
     let Some(store) = store().await else { return };
     conformance::retention_ages_claims_by_trust_status(

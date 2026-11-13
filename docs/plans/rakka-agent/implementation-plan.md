@@ -5113,7 +5113,7 @@ with design weight in
   ([#68](https://github.com/paloul-tech/rakka/issues/68)) — operational the
   moment a consumer writes claims, and **done**: `tombstone` and `delete` on
   `KnowledgeGraphStore`, and `KnowledgeSpaceRetentionSweep`, proven by the
-  thirteen erasure and retention clauses of
+  fourteen erasure and retention clauses of
   `rakka_agent_knowledge_graph::conformance` on both backends and by
   `rakka-agent-knowledge-graph-postgres/tests/postgres_erasure_proofs.rs`
   (design and as-built record:

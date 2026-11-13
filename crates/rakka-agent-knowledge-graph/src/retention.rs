@@ -78,8 +78,22 @@
 //!   Rakka keeps no reverse index from a claim to the snapshots or run records
 //!   that copied it.
 //!
+//! - **The database's own physical copies.** On a durable backend an erased
+//!   row is logically gone at once and physically gone later. PostgreSQL keeps
+//!   the old row versions, in the table, its out-of-line storage and its
+//!   indexes, until vacuum reclaims them; write-ahead-log archives, base
+//!   backups and replicas hold the content for as long as the deployment keeps
+//!   them. Rakka controls none of that: backup retention and vacuum policy are
+//!   the deployment's.
+//! - **Two fingerprints, after a tombstone.** A stub keeps the statement's
+//!   `content_digest`, and a gated promotion in its history keeps the gate's
+//!   own digest of the statement. Neither is salted. Someone who already knows
+//!   a statement, or can enumerate a small set of candidates, can confirm it
+//!   against a stub. A caller who cannot accept that uses `delete`.
+//!
 //! Erasing a subject's content therefore means deleting the claims **and**
-//! discharging the retention of the runs that produced them.
+//! discharging the retention of the runs that produced them, under a backup
+//! and vacuum policy that lets the erased bytes age out.
 //!
 //! # Cost
 //!
@@ -120,7 +134,12 @@ const RETENTION_DELETE_DISCRIMINATOR: &str = "retention";
 /// nothing out: a trust status ages only when a window is set for it, and
 /// [`ClaimTrustStatus`] is non-exhaustive, so a status added later is retained
 /// until a deployment sets a window for it too.
+///
+/// A policy read from configuration refuses a key it does not know. A
+/// misspelt `legal_hold` must not read as "no hold": the sweep would then
+/// delete the very knowledge the hold was written to keep.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KnowledgeSpaceRetentionPolicy {
     #[serde(default)]
     windows: BTreeMap<ClaimTrustStatus, u64>,
@@ -546,6 +565,30 @@ mod tests {
         let empty: KnowledgeSpaceRetentionPolicy =
             serde_json::from_str("{}").expect("an empty policy deserializes");
         assert_eq!(empty, KnowledgeSpaceRetentionPolicy::retain_all());
+    }
+
+    #[test]
+    fn a_policy_with_a_key_it_does_not_know_is_refused() {
+        // A misspelt hold must not read as "no hold": the sweep would then
+        // delete the very knowledge the hold was written to keep.
+        for misspelt in [
+            r#"{"legal-hold": true}"#,
+            r#"{"legalHold": true}"#,
+            r#"{"windows": {"proposed": 5}, "hold": true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<KnowledgeSpaceRetentionPolicy>(misspelt).is_err(),
+                "a policy carrying an unknown key is refused, not read without it: {misspelt}"
+            );
+        }
+        // The keys it does know still read.
+        let held: KnowledgeSpaceRetentionPolicy = serde_json::from_str(
+            r#"{"windows": {"proposed": 5}, "tombstone_window_millis": 7, "legal_hold": true}"#,
+        )
+        .expect("a policy in its own keys deserializes");
+        assert!(held.legal_hold());
+        assert_eq!(held.window(ClaimTrustStatus::Proposed), Some(5));
+        assert_eq!(held.tombstone_window(), Some(7));
     }
 
     #[test]

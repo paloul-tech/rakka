@@ -15,6 +15,17 @@
 //! it; the fence is what makes that safe. A transition that lands between the
 //! read and the write moves the count, the statement matches nothing, and the
 //! loop reads again.
+//!
+//! # An operation id belongs to one claim
+//!
+//! A replayed tombstone answers its own claim's stub, and a replayed delete
+//! answers success for the claim it removed. The same id sent for a
+//! *different* claim is neither: it answers `claim-operation-conflict`. A
+//! deleted claim can never exist again, so a claim still present under a
+//! delete's id is not the one that delete removed. The ledger inserts carry no
+//! `ON CONFLICT` clause for the same reason: two claims erased at once under
+//! one id must not both apply and share one ledger row. The loser's statement
+//! aborts whole, and the next read answers the conflict.
 
 use rakka_agent_knowledge_graph::claim::{Claim, ClaimId, ClaimOperationId};
 use rakka_agent_knowledge_graph::error::{ClaimError, ClaimResult};
@@ -23,9 +34,9 @@ use rakka_agent_knowledge_graph::tombstone::{ClaimDeleteRequest, ClaimTombstoneR
 use tokio_postgres::types::ToSql;
 
 use super::{
-    decode_claim, decode_transition, encode, map_error, LedgerHit, PostgresKnowledgeGraphStore,
-    WriteStart, BACKEND_NAME, CLAIM_TOMBSTONE_MARKER, KIND_DELETE, KIND_ERASED, KIND_TOMBSTONE,
-    TOMBSTONE_FENCE_TRANSITION_COUNT, TRANSITION_CAS_MAX_ATTEMPTS,
+    decode_claim, decode_transition, encode, is_unique_violation, map_error, LedgerHit,
+    PostgresKnowledgeGraphStore, WriteStart, BACKEND_NAME, CLAIM_TOMBSTONE_MARKER, KIND_DELETE,
+    KIND_ERASED, KIND_TOMBSTONE, TOMBSTONE_FENCE_TRANSITION_COUNT, TRANSITION_CAS_MAX_ATTEMPTS,
 };
 
 /// Every transition record of one claim. At most `CLAIM_MAX_TRUST_TRANSITIONS`
@@ -63,12 +74,8 @@ WITH existing_op AS (
 ), ins_op AS (
     INSERT INTO rakka_agent_knowledge_claim_op (tenant, space, operation_id, kind, result)
     SELECT $1, $2, $3, $11, $7 FROM upd
-    ON CONFLICT (tenant, space, operation_id) DO NOTHING
 )
-SELECT EXISTS (SELECT 1 FROM existing_op) AS replayed,
-       (SELECT kind   FROM existing_op)   AS replay_kind,
-       (SELECT result FROM existing_op)   AS replay_result,
-       EXISTS (SELECT 1 FROM upd)         AS applied
+SELECT EXISTS (SELECT 1 FROM upd) AS applied
 ";
 
 /// One delete: the claim row and every transition row of the claim are
@@ -105,11 +112,8 @@ WITH existing_op AS (
 ), ins_op AS (
     INSERT INTO rakka_agent_knowledge_claim_op (tenant, space, operation_id, kind, result)
     SELECT $1, $2, $3, $8, ''::BYTEA FROM del
-    ON CONFLICT (tenant, space, operation_id) DO NOTHING
 )
-SELECT EXISTS (SELECT 1 FROM existing_op) AS replayed,
-       (SELECT kind FROM existing_op)     AS replay_kind,
-       EXISTS (SELECT 1 FROM del)         AS applied
+SELECT EXISTS (SELECT 1 FROM del) AS applied
 ";
 
 impl PostgresKnowledgeGraphStore {
@@ -170,12 +174,21 @@ impl PostgresKnowledgeGraphStore {
                 .write_start(scope, &request.operation_id, &request.claim_id)
                 .await?
             {
-                WriteStart::Spent(LedgerHit::Tombstone(result)) => return decode_claim(&result),
-                WriteStart::Spent(LedgerHit::Erased) => {
+                WriteStart::Spent(LedgerHit::Tombstone(result), _) => {
+                    let stub = decode_claim(&result)?;
+                    // The id was spent tombstoning this claim, or another one.
+                    return if stub.claim_id == request.claim_id {
+                        Ok(stub)
+                    } else {
+                        Err(conflict(&request.operation_id))
+                    };
+                }
+                WriteStart::Spent(LedgerHit::Erased, _) => {
                     return Err(erased(&request.operation_id));
                 }
                 WriteStart::Spent(
                     LedgerHit::Append(_) | LedgerHit::Transition(_) | LedgerHit::Deleted,
+                    _,
                 ) => return Err(conflict(&request.operation_id)),
                 // Absent and out-of-scope are the same refusal (scenario 18).
                 WriteStart::Absent => return Err(not_found(&request.claim_id)),
@@ -201,30 +214,17 @@ impl PostgresKnowledgeGraphStore {
                 &KIND_ERASED,
                 &KIND_TOMBSTONE,
             ];
-            let row = self
-                .client
-                .query_one(TOMBSTONE_SQL, &params)
-                .await
-                .map_err(map_error)?;
-            if row.get::<_, bool>("replayed") {
-                let kind: Option<String> = row.get("replay_kind");
-                let result: Option<Vec<u8>> = row.get("replay_result");
-                return match (kind.as_deref(), result) {
-                    (Some(KIND_TOMBSTONE), Some(result)) => decode_claim(&result),
-                    (Some(KIND_ERASED), _) => Err(erased(&request.operation_id)),
-                    (Some(_), _) => Err(conflict(&request.operation_id)),
-                    _ => Err(ClaimError::Backend {
-                        backend: BACKEND_NAME.to_string(),
-                        message: "the ledger reported a replay without its stored result"
-                            .to_string(),
-                    }),
-                };
+            match self.client.query_one(TOMBSTONE_SQL, &params).await {
+                Ok(row) if row.get::<_, bool>("applied") => return Ok(stub),
+                // Nothing applied: the fence moved, or the operation id was
+                // spent after the read. Loop — the fresh read decides.
+                Ok(_) => {}
+                // The stub went in and the ledger row was already there: the
+                // id was spent on another claim while this statement waited.
+                // The statement aborted whole; the fresh read answers.
+                Err(error) if is_unique_violation(&error) => {}
+                Err(error) => return Err(map_error(error)),
             }
-            if row.get::<_, bool>("applied") {
-                return Ok(stub);
-            }
-            // The fence moved: a concurrent transition, tombstone or delete
-            // won the race. Loop — the fresh read decides against that state.
         }
         Err(lost_races("tombstone"))
     }
@@ -243,12 +243,20 @@ impl PostgresKnowledgeGraphStore {
                 .write_start(scope, &request.operation_id, &request.claim_id)
                 .await?
             {
-                WriteStart::Spent(LedgerHit::Deleted) => return Ok(()),
-                WriteStart::Spent(LedgerHit::Erased) => {
+                // A deleted claim can never exist again, so a claim still here
+                // is not the one this id removed: the id was reused for another
+                // claim, and answering success would report an erasure that did
+                // not happen.
+                WriteStart::Spent(LedgerHit::Deleted, true) => {
+                    return Err(conflict(&request.operation_id));
+                }
+                WriteStart::Spent(LedgerHit::Deleted, false) => return Ok(()),
+                WriteStart::Spent(LedgerHit::Erased, _) => {
                     return Err(erased(&request.operation_id));
                 }
                 WriteStart::Spent(
                     LedgerHit::Append(_) | LedgerHit::Transition(_) | LedgerHit::Tombstone(_),
+                    _,
                 ) => return Err(conflict(&request.operation_id)),
                 // Absent and out-of-scope are the same refusal (scenario 18).
                 WriteStart::Absent => return Err(not_found(&request.claim_id)),
@@ -281,24 +289,17 @@ impl PostgresKnowledgeGraphStore {
                 &KIND_ERASED,
                 &KIND_DELETE,
             ];
-            let row = self
-                .client
-                .query_one(DELETE_SQL, &params)
-                .await
-                .map_err(map_error)?;
-            if row.get::<_, bool>("replayed") {
-                let kind: Option<String> = row.get("replay_kind");
-                return match kind.as_deref() {
-                    Some(KIND_DELETE) => Ok(()),
-                    Some(KIND_ERASED) => Err(erased(&request.operation_id)),
-                    _ => Err(conflict(&request.operation_id)),
-                };
+            match self.client.query_one(DELETE_SQL, &params).await {
+                Ok(row) if row.get::<_, bool>("applied") => return Ok(()),
+                // Nothing applied: the fence moved, or the operation id was
+                // spent after the read. Loop — the fresh read decides.
+                Ok(_) => {}
+                // The claim row went and the ledger row was already there: the
+                // id was spent on another claim while this statement waited.
+                // The statement aborted whole; the fresh read answers.
+                Err(error) if is_unique_violation(&error) => {}
+                Err(error) => return Err(map_error(error)),
             }
-            if row.get::<_, bool>("applied") {
-                return Ok(());
-            }
-            // The fence moved: a concurrent transition, tombstone or delete
-            // won the race. Loop — the fresh read decides against that state.
         }
         Err(lost_races("delete"))
     }

@@ -104,6 +104,7 @@ use rakka_agent_knowledge_graph::transition::{
 use rakka_agent_knowledge_graph::ClaimTrustStatus;
 use rakka_agent_knowledge_graph::CLAIM_TOMBSTONE_MARKER;
 use rakka_agent_workflow::AgentTimestampMillis;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Row};
 
@@ -179,13 +180,33 @@ const QUERY_SCAN_BATCH_ROWS: i64 = 256;
 ///
 /// Fresh tables are created in the current shape. Existing ones are upgraded
 /// in place by the trailing block, which adds the `tombstoned` column and
-/// widens the ledger's `kind` check — each only when it is not already there,
-/// so a second run takes no table lock and rewrites nothing. Adding a column
-/// with a constant default does not rewrite the table, and the wider check is
-/// added `NOT VALID` and validated separately, so neither step holds an
-/// exclusive lock across a scan. Both are safe under a binary from before
-/// tombstones that is still appending: its insert does not name the new
-/// column, and both kinds it writes are in the wider check.
+/// widens the ledger's `kind` check — each only when it is not already there.
+///
+/// What the upgrade costs, stated exactly, because it runs while earlier
+/// binaries are serving:
+///
+/// - The whole of this text is one statement batch and so one transaction.
+///   The first time it runs against an earlier schema it takes an `ACCESS
+///   EXCLUSIVE` lock on the claim table (for the column) and on the ledger
+///   table (for the check), and holds both until the batch commits. Nothing in
+///   the batch scans or rewrites a table — a column with a constant default is
+///   a catalog change, and the wider check is added `NOT VALID` — so the locks
+///   are held for catalog work only.
+/// - The scan that validates the wider check is **not** here. It is
+///   [`MIGRATION_VALIDATE_SQL`], which [`PostgresKnowledgeGraphStore::migrate`]
+///   runs as a statement of its own, under a lock a writer does not conflict
+///   with.
+/// - A repeat run alters nothing and takes no `ACCESS EXCLUSIVE` lock. It
+///   still takes the brief `SHARE` lock `CREATE INDEX IF NOT EXISTS` always
+///   takes on a table whose index already exists.
+/// - The batch sets no `lock_timeout`. A session holding a conflicting lock on
+///   either table (a long `pg_dump`, say) makes the upgrade wait, and
+///   statements arriving behind it wait too. A deployment that would rather
+///   fail fast sets `lock_timeout` on the session it migrates from.
+///
+/// Both changes are safe under a binary from before tombstones that is still
+/// appending: its insert does not name the new column, and both kinds it
+/// writes are in the wider check.
 pub const MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS rakka_agent_knowledge_claim (
     tenant TEXT NOT NULL,
@@ -264,16 +285,55 @@ BEGIN
             ADD CONSTRAINT rakka_agent_knowledge_claim_op_kind_check
             CHECK (kind IN ('append', 'transition', 'tombstone', 'delete', 'erased'))
             NOT VALID;
-        ALTER TABLE rakka_agent_knowledge_claim_op
-            VALIDATE CONSTRAINT rakka_agent_knowledge_claim_op_kind_check;
     END IF;
 END
 $migrate$;
 "#;
 
+/// Validates the ledger's widened `kind` check, when [`MIGRATION_SQL`] left
+/// it unvalidated.
+///
+/// A statement of its own, and so a transaction of its own: `VALIDATE
+/// CONSTRAINT` takes a `SHARE UPDATE EXCLUSIVE` lock, which reads and writes
+/// do not conflict with, but only once the `ACCESS EXCLUSIVE` lock the check
+/// was added under has been released by a commit. Run inside the batch that
+/// added the check, the scan of the whole ledger would happen under that
+/// exclusive lock and stall every graph statement for as long as it took.
+///
+/// The check refuses new rows from the moment it is added, validated or not,
+/// and every row written before it passed the narrower check it replaced, so
+/// validation cannot fail and nothing depends on it having run. It is run so
+/// an upgraded schema ends identical to a fresh one. A repeat run does nothing.
+pub const MIGRATION_VALIDATE_SQL: &str = r#"
+DO $validate$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'rakka_agent_knowledge_claim_op'::regclass
+          AND conname = 'rakka_agent_knowledge_claim_op_kind_check'
+          AND NOT convalidated
+    ) THEN
+        ALTER TABLE rakka_agent_knowledge_claim_op
+            VALIDATE CONSTRAINT rakka_agent_knowledge_claim_op_kind_check;
+    END IF;
+END
+$validate$;
+"#;
+
 /// One append: the ledger is consulted, the claim row and its ledger row are
 /// written together, and the final row reports which door answered — all one
 /// statement, so there is no crash window between the claim and its ledger.
+///
+/// The ledger insert carries no `ON CONFLICT` clause, on purpose. It runs only
+/// when the claim row was inserted, so a ledger row already there means the
+/// operation id was spent between this statement's snapshot and its insert —
+/// and the one way that happens for an honest writer is the dangerous one: a
+/// duplicate of an append waits on the original's uncommitted claim row, the
+/// original commits, a delete of that claim commits, and the duplicate then
+/// finds no claim row and inserts it. Skipping the ledger insert there would
+/// leave a deleted claim restored beside its erased ledger row. Failing it
+/// aborts the whole statement, claim insert included; `append` then reads the
+/// ledger and answers from it.
 const APPEND_SQL: &str = "
 WITH existing_op AS (
     SELECT kind, result FROM rakka_agent_knowledge_claim_op
@@ -289,7 +349,6 @@ WITH existing_op AS (
 ), ins_op AS (
     INSERT INTO rakka_agent_knowledge_claim_op (tenant, space, operation_id, kind, result)
     SELECT $1, $2, $3, 'append', $10 FROM ins_claim
-    ON CONFLICT (tenant, space, operation_id) DO NOTHING
 )
 SELECT EXISTS (SELECT 1 FROM existing_op) AS replayed,
        (SELECT kind   FROM existing_op)   AS replay_kind,
@@ -427,8 +486,11 @@ enum LedgerHit {
 /// What one fenced write found when it read its operation and its claim
 /// together.
 enum WriteStart {
-    /// The operation id is already spent; the ledger answers.
-    Spent(LedgerHit),
+    /// The operation id is already spent; the ledger answers. The flag says
+    /// whether the claim the request names exists in the scope, which is how
+    /// an erasure tells its own replay from the same id sent for another
+    /// claim.
+    Spent(LedgerHit, bool),
     /// The operation is new and the claim does not exist in the scope.
     Absent,
     /// The operation is new; the claim, and the fence its row holds.
@@ -482,7 +544,13 @@ impl PostgresKnowledgeGraphStore {
             .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
             .await
             .map_err(map_error)?;
-        let applied = self.client.batch_execute(MIGRATION_SQL).await;
+        // Two batches, two transactions: the validating scan must not run under
+        // the exclusive locks the first batch takes (see
+        // `MIGRATION_VALIDATE_SQL`).
+        let applied = match self.client.batch_execute(MIGRATION_SQL).await {
+            Ok(()) => self.client.batch_execute(MIGRATION_VALIDATE_SQL).await,
+            Err(error) => Err(error),
+        };
         let unlocked = self
             .client
             .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
@@ -545,14 +613,15 @@ impl PostgresKnowledgeGraphStore {
             )
             .await
             .map_err(map_error)?;
+        let record: Option<Vec<u8>> = row.get("record");
         if let Some(kind) = row.get::<_, Option<String>>("kind") {
             let result: Option<Vec<u8>> = row.get("result");
-            return Ok(WriteStart::Spent(LedgerHit::from_row(
-                &kind,
-                result.unwrap_or_default(),
-            )?));
+            return Ok(WriteStart::Spent(
+                LedgerHit::from_row(&kind, result.unwrap_or_default())?,
+                record.is_some(),
+            ));
         }
-        let Some(record) = row.get::<_, Option<Vec<u8>>>("record") else {
+        let Some(record) = record else {
             return Ok(WriteStart::Absent);
         };
         let tombstoned: Option<bool> = row.get("tombstoned");
@@ -690,16 +759,22 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
                 &transition_count,
                 &record,
             ];
-            let row = self
-                .client
-                .query_one(APPEND_SQL, &params)
-                .await
-                .map_err(map_error)?;
-            if row.get::<_, bool>("replayed") {
-                return replayed_append(&row, &claim.operation_id);
-            }
-            if row.get::<_, bool>("applied") {
-                return Ok(claim.clone());
+            match self.client.query_one(APPEND_SQL, &params).await {
+                Ok(row) => {
+                    if row.get::<_, bool>("replayed") {
+                        return replayed_append(&row, &claim.operation_id);
+                    }
+                    if row.get::<_, bool>("applied") {
+                        return Ok(claim.clone());
+                    }
+                }
+                // The claim row went in and the ledger row was already there:
+                // the operation id was spent while this statement waited. The
+                // statement aborted whole, so nothing was written — the ledger
+                // decides below, and an erased row answers
+                // `claim-operation-erased` instead of a restored claim.
+                Err(error) if is_unique_violation(&error) => {}
+                Err(error) => return Err(map_error(error)),
             }
             // Neither door answered: a concurrent writer got between the
             // ledger read and the insert. Re-consult the ledger once — a
@@ -929,16 +1004,17 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
                     .write_start(scope, &request.operation_id, &request.claim_id)
                     .await?
                 {
-                    WriteStart::Spent(LedgerHit::Transition(result)) => {
+                    WriteStart::Spent(LedgerHit::Transition(result), _) => {
                         return decode_outcome(&result);
                     }
-                    WriteStart::Spent(LedgerHit::Erased) => {
+                    WriteStart::Spent(LedgerHit::Erased, _) => {
                         return Err(ClaimError::OperationErased {
                             operation_id: request.operation_id.clone(),
                         });
                     }
                     WriteStart::Spent(
                         LedgerHit::Append(_) | LedgerHit::Tombstone(_) | LedgerHit::Deleted,
+                        _,
                     ) => {
                         return Err(ClaimError::OperationConflict {
                             operation_id: request.operation_id.clone(),
@@ -1229,6 +1305,13 @@ fn decode_outcome(bytes: &[u8]) -> ClaimResult<ClaimTransitionOutcome> {
         backend: BACKEND_NAME.to_string(),
         message: format!("a stored transition outcome could not be parsed: {error}"),
     })
+}
+
+/// Whether a statement failed on a primary-key or unique constraint.
+fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
+    error
+        .as_db_error()
+        .is_some_and(|db_error| db_error.code() == &SqlState::UNIQUE_VIOLATION)
 }
 
 /// Maps a PostgreSQL error into the claim-domain backend error.

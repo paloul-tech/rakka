@@ -407,6 +407,13 @@ incorrectly.
   append cannot bring the claim back. The store keeps one small row, with no
   content, for each erased or deleted operation, and never removes it.
 
+  **One operation id per claim.** Derive each tombstone's and each delete's
+  operation id from the claim it addresses (`ClaimOperationId::derive_tombstone`,
+  `derive_delete`). An id already spent on one claim answers
+  `claim-operation-conflict` when it is sent for another, so an application
+  that reuses one request id across a batch of deletes is told, rather than
+  being answered "done" for claims that are still there.
+
   **Erasure does not reach copies outside the graph.** The `ClaimAppend`
   request on the run record, the session memory the claim was mapped from,
   evidence artifacts, and, after a tombstone, the free-text reason of a trust
@@ -414,9 +421,26 @@ incorrectly.
   delete the claims and also discharge the retention of the runs that produced
   them.
 
+  **Nor the database's own copies.** After a tombstone or a delete the content
+  is gone from every row a query can read. PostgreSQL still holds the old row
+  versions until vacuum reclaims them, and write-ahead-log archives, backups,
+  and replicas hold them for as long as you keep those. Set backup retention
+  and vacuum policy to match the erasure promise you make.
+
+  **A stub can confirm a guess.** A tombstoned stub keeps the statement's
+  fingerprint, and a gated promotion in its history keeps a second one.
+  Neither is salted, so someone who knows or can enumerate the statement can
+  confirm it against the stub. Use `delete` when that is not acceptable.
+
   **Roll order on PostgreSQL.** First run `migrate` from the new build: its
   reads need the new column, and the migration is safe under binaries that
-  have not been upgraded. Then upgrade every binary that reads the graph. Only
+  have not been upgraded. The first run takes an exclusive lock on the claim
+  and ledger tables for catalog changes only, with no table scan or rewrite
+  under it; the scan that validates the wider ledger check runs afterwards
+  and does not block reads or writes. `migrate` sets no `lock_timeout`: if a
+  long-running session holds a lock on either table, the upgrade and the
+  statements queued behind it wait, so set one on the migrating session if you
+  would rather fail fast. Then upgrade every binary that reads the graph. Only
   then call `tombstone`, `delete`, or the sweep. A binary that was missed
   fails closed: it refuses a stub with `schema-version-ahead`, and answers a
   replay of an erased operation `claim-operation-conflict`.

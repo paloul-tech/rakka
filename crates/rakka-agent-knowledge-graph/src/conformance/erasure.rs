@@ -1193,3 +1193,87 @@ pub async fn erasure_operation_kinds(store: &dyn KnowledgeGraphStore, scopes: Co
         1
     );
 }
+
+/// An erasure operation id belongs to one claim. Replayed against a different
+/// claim it is a conflict — never a success that erased nothing, and never
+/// another claim's stub.
+pub async fn an_erasure_operation_id_belongs_to_one_claim(
+    store: &dyn KnowledgeGraphStore,
+    scopes: ConformanceScopes,
+) {
+    let scope = &scopes.primary;
+
+    // The shape of the mistake: an application erasing "everything about a
+    // subject" spends one request id on every claim's delete.
+    let first = conformance_claim(scope, "oc-first", "subject", "a");
+    let second = conformance_claim(scope, "oc-second", "subject", "b");
+    for claim in [&first, &second] {
+        store.append(scope, claim).await.expect("the claim appends");
+    }
+    let delete = delete_request(scope, &first.claim_id, "erase-request-1", None);
+    store
+        .delete(scope, &delete)
+        .await
+        .expect("the delete applies");
+
+    let mut reused = delete.clone();
+    reused.claim_id = second.claim_id.clone();
+    assert_eq!(
+        store
+            .delete(scope, &reused)
+            .await
+            .expect_err("a delete's operation id replayed against another claim is refused")
+            .code(),
+        "claim-operation-conflict"
+    );
+    assert_eq!(
+        serde_json::to_vec(&stored(store, scope, &second.claim_id).await)
+            .expect("the claim serializes"),
+        serde_json::to_vec(&second).expect("the claim serializes"),
+        "the claim the reused id named was not erased, and the caller was told so"
+    );
+    // The genuine replay still answers success.
+    store
+        .delete(scope, &delete)
+        .await
+        .expect("the delete's own replay answers success");
+
+    // The same for a tombstone: its replay answers its own claim's stub only.
+    let third = conformance_claim(scope, "oc-third", "subject", "c");
+    let fourth = conformance_claim(scope, "oc-fourth", "subject", "d");
+    for claim in [&third, &fourth] {
+        store.append(scope, claim).await.expect("the claim appends");
+    }
+    let tombstone = tombstone_request(
+        scope,
+        &third.claim_id,
+        "withdraw-request-1",
+        ClaimTombstoneReason::Withdrawn,
+    );
+    let stub = store
+        .tombstone(scope, &tombstone)
+        .await
+        .expect("the tombstone applies");
+
+    let mut reused = tombstone.clone();
+    reused.claim_id = fourth.claim_id.clone();
+    assert_eq!(
+        store
+            .tombstone(scope, &reused)
+            .await
+            .expect_err("a tombstone's operation id replayed against another claim is refused")
+            .code(),
+        "claim-operation-conflict"
+    );
+    assert!(
+        !stored(store, scope, &fourth.claim_id).await.is_tombstoned(),
+        "the claim the reused id named was not withdrawn"
+    );
+    assert_eq!(
+        store
+            .tombstone(scope, &tombstone)
+            .await
+            .expect("the tombstone's own replay answers its stub"),
+        stub
+    );
+}

@@ -213,6 +213,36 @@ pub async fn retention_ages_claims_by_trust_status(
     assert!(exists(store, scope, &verified.claim_id).await);
     assert!(exists(store, scope, &disputed.claim_id).await);
 
+    // The clock is the *last* transition, not the first. A claim disputed at 10
+    // and retracted at 50 entered `Retracted` at 50: it is due at 150, and a
+    // sweep that read its first transition would take it at 110.
+    let twice_moved = claim_resting_in(store, scope, "ra-twice", ClaimTrustStatus::Disputed).await;
+    let mut retract = transition_request(
+        scope,
+        &twice_moved.claim_id,
+        "retract-later",
+        ClaimTrustStatus::Retracted,
+    );
+    retract.occurred_at = AgentTimestampMillis::new(50);
+    store
+        .transition(
+            scope,
+            &retract,
+            &ClaimPromotionPolicy::ungated(),
+            AgentTimestampMillis::new(50),
+        )
+        .await
+        .expect("the retraction applies");
+    let report = full_pass(store, scope, &policy, 149).await;
+    assert_eq!(
+        report.deleted, 0,
+        "a claim retracted at 50 is not due at 149, whenever it was first disputed"
+    );
+    assert!(exists(store, scope, &twice_moved.claim_id).await);
+    let report = full_pass(store, scope, &policy, 150).await;
+    assert_eq!(report.deleted, 1, "it is due at 150");
+    assert!(!exists(store, scope, &twice_moved.claim_id).await);
+
     // A legal hold: the sweep reads nothing and deletes nothing, however due
     // the space is.
     let eager = KnowledgeSpaceRetentionPolicy::retain_all()

@@ -29,7 +29,8 @@ use rakka_agent_knowledge_graph::{
     KnowledgeGraphStore, KnowledgeSpaceScope, CLAIM_TOMBSTONE_MARKER,
 };
 use rakka_agent_knowledge_graph_postgres::{
-    PostgresKnowledgeGraphStore, TOMBSTONE_FENCE_TRANSITION_COUNT,
+    PostgresKnowledgeGraphStore, MIGRATION_SQL, MIGRATION_VALIDATE_SQL,
+    TOMBSTONE_FENCE_TRANSITION_COUNT,
 };
 use rakka_agent_workflow::{
     AgentAttributes, AgentTimestampMillis, ArtifactKind, ArtifactRef, RedactionStatus,
@@ -568,6 +569,11 @@ async fn postgres_migrates_the_earlier_schema_with_rows_when_dsn_is_set() {
 
     let store = PostgresKnowledgeGraphStore::new(client_in(&dsn, &schema).await);
     store.migrate().await.expect("the earlier schema migrates");
+    assert_eq!(
+        kind_check_validated(&raw).await,
+        Some(true),
+        "a full migration leaves the wider check validated"
+    );
     let migrated_filenodes = table_filenodes(&raw).await;
     let migrated_constraints = table_constraints(&raw).await;
     let migrated_rows = scope_rows(&raw, &scope).await;
@@ -1043,8 +1049,10 @@ async fn postgres_concurrent_tombstone_and_transition_stay_coherent_when_dsn_is_
 
         // A tombstone makes one more round trip than a transition before its
         // write, so started together the transition always wins. Holding the
-        // transition back by a growing step walks the two writes across each
-        // other, so the runs cover both orders and the window between them.
+        // transition back mixes the orders. The step is nominal: a runtime
+        // timer is far coarser than 40 microseconds, so each non-zero delay
+        // is really "up to about a millisecond, by timer phase". That is
+        // enough to produce both orders; neither is asserted to occur.
         let head_start = std::time::Duration::from_micros(u64::from(run % 8) * 40);
         let (tombstoned, transitioned) =
             tokio::join!(store_a.tombstone(&scope, &tombstone), async {
@@ -1394,8 +1402,8 @@ async fn postgres_concurrent_delete_and_transition_stay_coherent_when_dsn_is_set
         let delete = delete_request(&scope, &claim.claim_id, "erase", None);
 
         // As in the tombstone race: the delete makes one more round trip
-        // before its write, so the transition is held back by a growing step
-        // to walk the two writes across each other.
+        // before its write, so the transition is held back by a nominal step
+        // (coarsened by the runtime's timer) to mix the two orders.
         let head_start = std::time::Duration::from_micros(u64::from(run % 8) * 40);
         let (deleted, transitioned) = tokio::join!(store_a.delete(&scope, &delete), async {
             tokio::time::sleep(head_start).await;
@@ -1564,8 +1572,8 @@ async fn postgres_same_operation_races_converge_every_time_when_dsn_is_set() {
     // against the state the winner left behind. The window is the gap between
     // a store reading the ledger and reading the claim: a racer that commits
     // inside it leaves a ledger-less reader looking at a claim its own
-    // operation already moved. One read of both closes it; the runs walk the
-    // second racer across the first to land inside that window.
+    // operation already moved. One read of both closes it; the runs hold the
+    // second racer back by a nominal step to land some of them in that window.
     let Some(store_a) = store().await else { return };
     let store_b = store().await.expect("a second connection opens");
     let policy = ClaimPromotionPolicy::ungated();
@@ -1624,4 +1632,345 @@ async fn postgres_same_operation_races_converge_every_time_when_dsn_is_set() {
         first.unwrap_or_else(|error| panic!("run {run}: the first racer: {error}"));
         second.unwrap_or_else(|error| panic!("run {run}: the second racer: {error}"));
     }
+}
+
+/// How long a proof waits for a store call on another connection to reach the
+/// row lock it is meant to block on. If the call is slower than this the proof
+/// still passes — it then sees the committed state instead of waiting on it —
+/// so the pause can under-exercise the window but never fail it.
+const BLOCKED_WRITER_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Whether the ledger's kind check is validated, when the check exists.
+async fn kind_check_validated(client: &Client) -> Option<bool> {
+    client
+        .query_opt(
+            "SELECT convalidated FROM pg_constraint \
+             WHERE conrelid = 'rakka_agent_knowledge_claim_op'::regclass \
+               AND conname = 'rakka_agent_knowledge_claim_op_kind_check'",
+            &[],
+        )
+        .await
+        .expect("the catalog reads")
+        .map(|row| row.get(0))
+}
+
+#[tokio::test]
+async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_waited_when_dsn_is_set(
+) {
+    // The narrowest way a deleted claim could come back. A duplicate of an
+    // append that has not committed yet waits on the original's claim row. If
+    // the original commits and a delete of that claim then commits before the
+    // waiter looks again, the waiter finds no claim row and inserts one. Its
+    // ledger insert then meets the erased row — and must fail the whole
+    // statement there, not skip quietly and leave the claim restored.
+    //
+    // The interleaving is made exact by running the original append and the
+    // delete's effect in one transaction: when it commits, the waiter sees
+    // precisely "no claim row, an erased ledger row".
+    let Some(store) = store().await else { return };
+    let raw = client().await.expect("a raw connection opens");
+    let observer = client().await.expect("a second raw connection opens");
+    let scope = ConformanceScopes::unique("pg-append-waits-on-delete").primary;
+    let claim = distinctive_claim(&scope, "restored");
+
+    raw.batch_execute("BEGIN")
+        .await
+        .expect("the transaction opens");
+    let row = earlier_append(&raw, &scope, &claim).await;
+    assert!(row.get::<_, bool>("applied"));
+
+    // The duplicate: same operation, same claim, through the real store.
+    let duplicate = {
+        let store = store.clone();
+        let scope = scope.clone();
+        let claim = claim.clone();
+        tokio::spawn(async move { store.append(&scope, &claim).await })
+    };
+    tokio::time::sleep(BLOCKED_WRITER_PAUSE).await;
+
+    // The delete's effect: the claim row gone, its append erased.
+    let key: [&(dyn ToSql + Sync); 3] = [
+        &scope.tenant().as_str(),
+        &scope.space().as_str(),
+        &claim.claim_id.as_str(),
+    ];
+    raw.execute(
+        "DELETE FROM rakka_agent_knowledge_claim \
+         WHERE tenant = $1 AND space = $2 AND claim_id = $3",
+        &key,
+    )
+    .await
+    .expect("the claim row is deleted");
+    raw.execute(
+        "UPDATE rakka_agent_knowledge_claim_op SET kind = 'erased', result = ''::BYTEA \
+         WHERE tenant = $1 AND space = $2 AND operation_id = $3",
+        &[
+            &scope.tenant().as_str(),
+            &scope.space().as_str(),
+            &claim.operation_id.as_str(),
+        ],
+    )
+    .await
+    .expect("the ledger row is erased");
+    raw.batch_execute("COMMIT")
+        .await
+        .expect("the transaction commits");
+
+    let answered = duplicate.await.expect("the task completes");
+    assert_eq!(
+        answered
+            .expect_err("the duplicate append does not report a stored claim")
+            .code(),
+        "claim-operation-erased"
+    );
+    let rows = scope_rows(&observer, &scope).await;
+    assert!(
+        rows.iter().all(|row| row.starts_with(b"op|")),
+        "the deleted claim was not restored"
+    );
+    assert_eq!(statement_strings_in(&rows), Vec::<&str>::new());
+    assert!(store
+        .get(&scope, &claim.claim_id)
+        .await
+        .expect("the read answers")
+        .is_none());
+}
+
+#[tokio::test]
+async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when_dsn_is_set() {
+    // An erasure operation id belongs to one claim. The serial case is a
+    // conformance clause; this is the concurrent one. A delete under id X is
+    // in flight for some other claim — its ledger row written, not yet
+    // committed — when a delete under the same X arrives for this claim. The
+    // second must not apply and skip its ledger row: it waits, finds the id
+    // spent, and answers a conflict with its claim untouched.
+    let Some(store) = store().await else { return };
+    let raw = client().await.expect("a raw connection opens");
+    let observer = client().await.expect("a second raw connection opens");
+    let scope = ConformanceScopes::unique("pg-id-in-flight").primary;
+
+    for (kind, as_tombstone) in [("delete", false), ("delete", true)] {
+        let claim = conformance_claim(
+            &scope,
+            &format!("kept-{as_tombstone}"),
+            "node-a",
+            &format!("node-{as_tombstone}"),
+        );
+        store
+            .append(&scope, &claim)
+            .await
+            .expect("the claim appends");
+        let before = scope_rows(&observer, &scope).await;
+        let shared = ClaimOperationId::derive_delete(&scope, &claim.claim_id, "shared-request")
+            .expect("the operation id derives");
+
+        raw.batch_execute("BEGIN")
+            .await
+            .expect("the transaction opens");
+        raw.execute(
+            "INSERT INTO rakka_agent_knowledge_claim_op \
+                 (tenant, space, operation_id, kind, result) \
+             VALUES ($1, $2, $3, $4, ''::BYTEA)",
+            &[
+                &scope.tenant().as_str(),
+                &scope.space().as_str(),
+                &shared.as_str(),
+                &kind,
+            ],
+        )
+        .await
+        .expect("the other claim's ledger row is written, uncommitted");
+
+        let second = {
+            let store = store.clone();
+            let scope = scope.clone();
+            let claim_id = claim.claim_id.clone();
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                if as_tombstone {
+                    let mut request = tombstone_request(&scope, &claim_id, "unused");
+                    request.operation_id = shared;
+                    store.tombstone(&scope, &request).await.map(|_| ())
+                } else {
+                    let mut request = delete_request(&scope, &claim_id, "unused", None);
+                    request.operation_id = shared;
+                    store.delete(&scope, &request).await
+                }
+            })
+        };
+        tokio::time::sleep(BLOCKED_WRITER_PAUSE).await;
+        raw.batch_execute("COMMIT")
+            .await
+            .expect("the transaction commits");
+
+        let answered = second.await.expect("the task completes");
+        assert_eq!(
+            answered
+                .expect_err("an operation id spent on another claim is refused")
+                .code(),
+            "claim-operation-conflict",
+            "tombstone: {as_tombstone}"
+        );
+        let after = scope_rows(&observer, &scope).await;
+        assert_eq!(
+            after.len(),
+            before.len() + 1,
+            "only the other claim's ledger row was added"
+        );
+        assert_eq!(
+            store
+                .get(&scope, &claim.claim_id)
+                .await
+                .expect("the read answers"),
+            Some(claim),
+            "the claim the reused id named is exactly as it was"
+        );
+    }
+}
+
+#[tokio::test]
+async fn postgres_the_migration_validates_its_wider_check_without_blocking_writers_when_dsn_is_set()
+{
+    // Widening the ledger's check is two steps on purpose. The first replaces
+    // the check without scanning the table (`NOT VALID`), under a lock held
+    // only for a catalog change. The second validates it in a statement of its
+    // own, under a lock that does not conflict with a writer's — so the scan
+    // of a large ledger never stalls the graph.
+    let Some(dsn) = dsn() else { return };
+    let setup = connect(&dsn).await;
+    let schema = unique_schema("validate_step");
+    setup
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("the private schema is created");
+    let migrator = client_in(&dsn, &schema).await;
+    let writer = client_in(&dsn, &schema).await;
+    migrator
+        .batch_execute(MIGRATION_SQL_D12B0F8)
+        .await
+        .expect("the earlier schema applies");
+    let scope = ConformanceScopes::unique("pg-validate-step").primary;
+    let claim = conformance_claim(&scope, "existing", "node-a", "node-b");
+    assert!(earlier_append(&writer, &scope, &claim)
+        .await
+        .get::<_, bool>("applied"));
+
+    // Step one: the check is replaced, and is not yet validated.
+    migrator
+        .batch_execute(MIGRATION_SQL)
+        .await
+        .expect("the first migration step applies");
+    assert_eq!(
+        kind_check_validated(&migrator).await,
+        Some(false),
+        "the first step adds the wider check without scanning the ledger"
+    );
+    // Rows are checked against it from this moment, validated or not.
+    assert!(
+        probe_ledger_kind(&writer, &scope, "resurrect")
+            .await
+            .is_err(),
+        "an unvalidated check still refuses an undefined kind"
+    );
+
+    // A writer mid-transaction, holding the lock every ledger write holds.
+    writer
+        .batch_execute("BEGIN")
+        .await
+        .expect("the writer's transaction opens");
+    probe_ledger_kind(&writer, &scope, "erased")
+        .await
+        .expect("the writer inserts under the wider check");
+
+    // Step two validates while that writer is still open. A step that needed
+    // an exclusive table lock would wait here until the timeout.
+    migrator
+        .batch_execute("SET lock_timeout = '3s'")
+        .await
+        .expect("the lock timeout is set");
+    migrator
+        .batch_execute(MIGRATION_VALIDATE_SQL)
+        .await
+        .expect("validation does not wait for a writer");
+    writer
+        .batch_execute("COMMIT")
+        .await
+        .expect("the writer commits");
+    assert_eq!(kind_check_validated(&migrator).await, Some(true));
+
+    // Both steps are no-ops from here.
+    let constraints = table_constraints(&migrator).await;
+    migrator
+        .batch_execute(MIGRATION_SQL)
+        .await
+        .expect("the first step repeats");
+    migrator
+        .batch_execute(MIGRATION_VALIDATE_SQL)
+        .await
+        .expect("the second step repeats");
+    assert_eq!(table_constraints(&migrator).await, constraints);
+
+    setup
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .expect("the private schema is dropped");
+}
+
+#[tokio::test]
+async fn postgres_concurrent_migrators_upgrade_the_earlier_schema_when_dsn_is_set() {
+    // Several nodes of the new build start at once against a database an
+    // earlier build created. Every one runs the upgrade; all must succeed, and
+    // the schema must end migrated exactly once. Without the advisory lock the
+    // losers would find the column and the check already there mid-statement.
+    let Some(dsn) = dsn() else { return };
+    let setup = connect(&dsn).await;
+    let schema = unique_schema("upgrade_race");
+    setup
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("the private schema is created");
+    let raw = client_in(&dsn, &schema).await;
+    raw.batch_execute(MIGRATION_SQL_D12B0F8)
+        .await
+        .expect("the earlier schema applies");
+    let scope = ConformanceScopes::unique("pg-upgrade-race").primary;
+    let claim = conformance_claim(&scope, "existing", "node-a", "node-b");
+    assert!(earlier_append(&raw, &scope, &claim)
+        .await
+        .get::<_, bool>("applied"));
+
+    let mut migrators = Vec::new();
+    for _ in 0..6_u32 {
+        let dsn = dsn.clone();
+        let schema = schema.clone();
+        migrators.push(tokio::spawn(async move {
+            PostgresKnowledgeGraphStore::new(client_in(&dsn, &schema).await)
+                .migrate()
+                .await
+        }));
+    }
+    let mut failures = Vec::new();
+    for migrator in migrators {
+        if let Err(error) = migrator.await.expect("the migrator task completes") {
+            failures.push(error.to_string());
+        }
+    }
+
+    let validated = kind_check_validated(&raw).await;
+    let store = PostgresKnowledgeGraphStore::new(client_in(&dsn, &schema).await);
+    let read = store.get(&scope, &claim.claim_id).await;
+    let cleanup = setup
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await;
+    assert!(
+        failures.is_empty(),
+        "concurrent migrators raced the upgrade: {failures:?}"
+    );
+    assert_eq!(validated, Some(true), "the wider check ends validated");
+    assert_eq!(
+        read.expect("the migrated schema reads"),
+        Some(claim),
+        "the earlier build's row reads through the upgraded schema"
+    );
+    cleanup.expect("the private schema is dropped");
 }

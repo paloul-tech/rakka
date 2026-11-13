@@ -789,9 +789,11 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
     /// ([`Claim::apply_tombstone`]). The trust status does not move, and from
     /// here on it cannot: a later `transition` answers `claim-tombstoned`.
     ///
-    /// A replay returns the stub as first written. An absent or out-of-scope
-    /// claim answers `claim-not-found`; a claim already tombstoned under a
-    /// different operation answers `claim-tombstoned`. The ledger payloads of
+    /// A replay returns the stub as first written. An operation id belongs to
+    /// one claim: sent again for a different claim it answers
+    /// `claim-operation-conflict`. An absent or out-of-scope claim answers
+    /// `claim-not-found`; a claim already tombstoned under a different
+    /// operation answers `claim-tombstoned`. The ledger payloads of
     /// the claim's append and of every earlier transition are erased in the
     /// same step, so a replay of any of them answers `claim-operation-erased`.
     fn tombstone<'a>(
@@ -808,7 +810,11 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
     /// tombstone when it was a stub, are erased in the same step, so no
     /// replayed write can restore the claim: its id derives from an operation
     /// id whose ledger entry now says "erased". A replayed delete answers
-    /// success.
+    /// success. An operation id belongs to one claim: sent again for a
+    /// different claim that still exists, it answers
+    /// `claim-operation-conflict` rather than a success that erased nothing —
+    /// derive one id per claim
+    /// ([`ClaimOperationId::derive_delete`](crate::claim::ClaimOperationId::derive_delete)).
     ///
     /// An absent or out-of-scope claim answers `claim-not-found`. When the
     /// request carries an expectation that no longer holds, the delete
@@ -1340,7 +1346,17 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
                 .and_then(|operations| operations.get(request.operation_id.as_str()))
             {
                 return match entry {
-                    ClaimLedgerEntry::AppliedTombstone(stub) => Ok(stub.as_ref().clone()),
+                    // A replay answers its own claim's stub. The same id sent
+                    // for a different claim is not a replay: answering it would
+                    // hand back another claim's stub and withdraw nothing.
+                    ClaimLedgerEntry::AppliedTombstone(stub)
+                        if stub.claim_id == request.claim_id =>
+                    {
+                        Ok(stub.as_ref().clone())
+                    }
+                    ClaimLedgerEntry::AppliedTombstone(_) => Err(ClaimError::OperationConflict {
+                        operation_id: request.operation_id.clone(),
+                    }),
                     ClaimLedgerEntry::Erased => Err(ClaimError::OperationErased {
                         operation_id: request.operation_id.clone(),
                     }),
@@ -1397,7 +1413,21 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
                 .get(&key)
                 .and_then(|operations| operations.get(request.operation_id.as_str()))
             {
+                // A deleted claim can never exist again — its id derives from
+                // an operation id that is now erased — so a claim that is
+                // still here is not the one this delete removed. The id was
+                // reused for a different claim: a conflict, never a success
+                // that erased nothing.
+                let still_present = inner
+                    .claims
+                    .get(&key)
+                    .is_some_and(|claims| claims.contains_key(request.claim_id.as_str()));
                 return match entry {
+                    ClaimLedgerEntry::Deleted if still_present => {
+                        Err(ClaimError::OperationConflict {
+                            operation_id: request.operation_id.clone(),
+                        })
+                    }
                     ClaimLedgerEntry::Deleted => Ok(()),
                     ClaimLedgerEntry::Erased => Err(ClaimError::OperationErased {
                         operation_id: request.operation_id.clone(),

@@ -492,7 +492,7 @@ Post a report on issue #68 for the host, with the merge commit as the pin. It na
 
 ## 12. As built
 
-Built on branch `knowledge-graph-retention` on 2026-11-13, in seven commits after the plan (`c32c5a9` to the docs commit). This section records where the build differs from sections 1 to 10 and from the plan, and what each falsification proved.
+Built on branch `knowledge-graph-retention` on 2026-11-13: seven commits after the plan (`c32c5a9` to `57a1cc6`), then one commit of fixes from the whole-branch review (section 12.7). This section records where the build differs from sections 1 to 10 and from the plan, and what each falsification proved.
 
 ### 12.1 Names
 
@@ -519,7 +519,7 @@ Added beyond the design: `ClaimTombstoneRequest::to_tombstone()`, `ClaimOperatio
 3. **A due instant that overflows never arrives.** The plan wrote the due test with a saturating add. A saturated sum calls a claim due at `now = u64::MAX` before its window has run out, which is the anti-goal "the sweep deletes a claim that is not due". The build uses a checked add. A claim whose due instant overflows is never swept; it can still be deleted explicitly.
 4. **The sweep reads only the position of the cursor it is given.** It sizes its own pages from the batch bound.
 5. **PostgreSQL statements fence on `transition_count` alone.** Section 6.5 said the new build fences a stub row "on `tombstoned` and the fence value". The column holds the fence value for a stub and the count for a live row, so one comparison covers both, and it is what catches a tombstone landing between a delete's read and its write. `tombstoned` is checked on read, as drift.
-6. **The migration checks the catalog before it alters anything.** It uses one `DO` block instead of `ADD COLUMN IF NOT EXISTS`, which takes an exclusive table lock on every run even when the column exists. The wider `kind` check is added `NOT VALID` and then validated. A second `migrate` takes no table lock; the proof compares each table's storage file and each constraint's catalog id across it.
+6. **The migration checks the catalog before it alters anything, and validates in a second statement.** It uses one `DO` block instead of `ADD COLUMN IF NOT EXISTS`, which takes an exclusive table lock on every run even when the column exists. The first run holds an `ACCESS EXCLUSIVE` lock on the claim and ledger tables for catalog changes only: the wider `kind` check is added `NOT VALID`. `migrate` then runs `MIGRATION_VALIDATE_SQL` as a statement of its own, so the validating scan runs under a lock that does not block reads or writes. A repeat run rewrites nothing and takes no `ACCESS EXCLUSIVE` lock. It still takes the brief `SHARE` lock that `CREATE INDEX IF NOT EXISTS` takes, as it did before this change. `migrate` sets no `lock_timeout`. (An earlier draft of this item said a second run "takes no table lock" and that validating separately kept the scan off the exclusive lock while both ran in one batch. Both statements were wrong; the review measured it. See 12.7.)
 7. **Only the read that starts a write checks the fence value.** `get`, `query` and traversal refuse a row whose `tombstoned` column disagrees with its record. The read that starts a transition, tombstone or delete also refuses a stub row that does not hold the fence value, and a live row that does not hold its count.
 8. **The erasure proofs have their own test file,** `tests/postgres_erasure_proofs.rs`, with the three frozen `d12b0f8` statements at its top. The plan put them in `postgres_backend_proofs.rs`. The repository keeps one concern per test file.
 9. **"An earlier binary's replay answers `claim-operation-conflict`"** (section 8.3) is proven one step short of that code. The proof runs the `d12b0f8` append statement and asserts what it hands back: replayed, not applied, kind `erased`, payload empty and not null. `replayed_append` at `d12b0f8` maps any kind but `append` to `claim-operation-conflict`; that mapping was read, not run.
@@ -559,11 +559,40 @@ Each guard was removed, the named test was seen to fail, and the guard was resto
 | Erasing ledger rows rather than removing them, on delete | `postgres_an_earlier_binary_replaying_an_erased_append_cannot_restore_it_when_dsn_is_set` |
 | The delete's expectation comparison | `a_stale_delete_changes_nothing` and `retention_leaves_a_claim_that_moved` on PostgreSQL |
 | The fence in the delete statement | `postgres_concurrent_delete_and_transition_stay_coherent_when_dsn_is_set`, within its 48 runs |
+| The last transition, rather than the first, as the sweep's clock | `retention_ages_claims_by_trust_status` |
+| The advisory lock around `migrate` | `postgres_concurrent_migrators_upgrade_the_earlier_schema_when_dsn_is_set` |
 
 ### 12.5 The two races
 
-Started together, a transition always beat a tombstone or a delete, because each of those makes one more round trip before its write. All 24 first runs ended "transition first", so the other branch was never exercised. Both race proofs now hold the transition back by a stepped delay of up to 280 microseconds over 48 runs. Measured on the development database: 7 to 11 runs of 48 end "transition first". On a much slower database the mix will shift. Each branch is asserted whenever it occurs, and the serial "tombstone first" order is proven without a race by `a_stub_is_frozen`.
+Started together, a transition always beat a tombstone or a delete, because each of those makes one more round trip before its write. All 24 first runs ended "transition first", so the other branch was never exercised. Both race proofs now hold the transition back by a nominal step over 48 runs.
+
+The step is nominal because a runtime timer is far coarser than the 40 microseconds the code names: each non-zero delay is really "up to about a millisecond, by timer phase". It still mixes the orders. Across the builder's and the reviewer's runs, between 3 and 15 of 48 ended "transition first". Neither order is asserted to occur, so on a different machine one branch may go unexercised. Each branch is asserted whenever it does occur. The reviewer removed each statement's fence and saw the matching race proof fail 20 runs out of 20.
+
+Two orders are also proven without any race: the tombstone-first serial order by `a_stub_is_frozen`, and "a tombstone lands between a transition's read and its write" by the frozen-statement proof, since the new build's transition statement is the same text. A deterministic version of the remaining interleaving, holding the claim row locked from a second connection, is not built (deferred).
 
 ### 12.6 Not built
 
 Nothing in section 3's goals was left out. Section 11, the report on issue #68, follows the merge.
+
+### 12.7 After the whole-branch review
+
+One fresh reviewer read the branch at `57a1cc6` and found no critical defect, four important ones and seven minor ones. The builder re-graded three of the minor ones as important, by what a user gets if they ship. Seven were fixed in one pass, each with a test that failed first.
+
+| Finding | Fix | Proof |
+| --- | --- | --- |
+| A delete or tombstone replayed under an operation id that was spent on a different claim answered success, or the other claim's stub. An application reusing one request id across a batch of deletes would be told "done" for claims that were still there. | An erasure operation id belongs to one claim. Sent for a different claim it answers `claim-operation-conflict`. A deleted claim can never exist again, so a claim still present under a delete's id is not the one that delete removed; no ledger format changed. On PostgreSQL the tombstone and delete statements no longer skip a ledger row that is already there: the statement fails whole and the next read answers the conflict. | Clause `an_erasure_operation_id_belongs_to_one_claim` on both backends; `postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when_dsn_is_set` |
+| The migration validated the wider check inside the batch that added it. A batch is one transaction, so the scan of the whole ledger ran under an `ACCESS EXCLUSIVE` lock on both tables. The doc comment and 12.2 item 6 said otherwise. | Validation is its own statement, `MIGRATION_VALIDATE_SQL`. The doc comment, item 6 and the product docs now state the locks exactly. | `postgres_the_migration_validates_its_wider_check_without_blocking_writers_when_dsn_is_set`: validation completes while a writer's transaction is open |
+| Section 8.3's "two concurrent migrators both succeed" was proven only on an empty schema. | A proof that seeds the `d12b0f8` schema and runs six migrators. | `postgres_concurrent_migrators_upgrade_the_earlier_schema_when_dsn_is_set`. With the advisory lock removed it fails with deadlocks, three runs out of three. |
+| The lists of what erasure does not reach left out the database's own physical copies, and understated the fingerprints a stub keeps. | Added to all four lists: superseded row versions until vacuum, write-ahead-log archives, backups and replicas; and that the stub's two fingerprints are unsalted and can confirm a guess. | Docs only. |
+| **Re-graded from minor.** A duplicate append that waited on the original's uncommitted claim row could restore a claim deleted in the moment after the original committed. Its ledger insert skipped the erased row and left the claim in place. The reviewer could not make it happen and judged it nearly unreachable; it is this design's first anti-goal, and a statement-level reproduction exists. | The append's ledger insert no longer skips a row that is already there. The statement fails whole, and the append answers from the ledger. This changes an existing statement. | `postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_waited_when_dsn_is_set`. Before the fix it returned the restored claim. |
+| **Re-graded from minor.** The retention clause would have passed a sweep that read a claim's first transition instead of its last. | The clause now sweeps a claim disputed at 10 and retracted at 50, and asserts it is due at 150, not 110. | Reading the first transition fails `retention_ages_claims_by_trust_status`. |
+| **Re-graded from minor.** A retention policy read from configuration ignored keys it did not know, so a misspelt `legal_hold` meant no hold. | The policy refuses an unknown key. The session tier's policy does not; this one deletes shared knowledge. | `a_policy_with_a_key_it_does_not_know_is_refused` |
+
+Two things the review suggested and the builder did not do, for the owner to weigh:
+
+- **No `lock_timeout` in `migrate`.** A timeout turns a slow migration into a failed node start. That is the deploying application's choice, on its own session. The docs say so.
+- **The append fix above, and the one-statement read of 12.3, both change paths that existed before this slice.** Each closes a hole the new operations opened or shared. Neither was in the plan.
+
+Deferred, not fixed: a deterministic lock-held version of the two race proofs; the sweep's "moved" arm for a transition landing between its two reads, which no clause exercises; a clearer error for a claim whose transition rows disagree with its record, which today reports eight lost races; a golden-bytes test of a live claim's encoding; two nits in tests and comments.
+
+The graph's erasure and retention clauses now number fourteen.
