@@ -794,6 +794,22 @@ impl AgentRun {
             .any(|effect| &effect.effect_id == effect_id && effect.kind().outside_the_turn())
     }
 
+    /// Whether the run's checkpoint timer sweep acts on `checkpoint`.
+    ///
+    /// A waiting checkpoint is swept on a live run. On a run that has ended,
+    /// only one bound to an effect held outside the turn (a memory promotion
+    /// or a claim append) is. Expiring any other would apply a failure to an
+    /// effect of a run that already ended, so it is left waiting.
+    ///
+    /// `fire_checkpoint_timers` and the operational snapshot's `next_wake`
+    /// both read this one predicate, so the snapshot never reports a deadline
+    /// the sweep skips (issue #127).
+    pub(crate) fn timer_sweep_acts_on(&self, checkpoint: &AgentCheckpoint) -> bool {
+        checkpoint.status.is_waiting()
+            && (!self.status.is_terminal()
+                || self.holds_outside_the_turn_effect(&checkpoint.bound_effect.effect_id))
+    }
+
     /// Whether the record holds a park a binary before issue #106 left
     /// unresolvable:
     /// - a live run whose handoff cell the task already answered while the
@@ -6757,20 +6773,16 @@ fn fire_checkpoint_timers(
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     // Collect the ids first: applying an expiration mutates the effect list and
-    // the checkpoint set, so the sweep works from a stable snapshot of ids. An
-    // ended run keeps only the checkpoints bound to an effect held outside the
-    // turn.
+    // the checkpoint set, so the sweep works from a stable snapshot of ids.
+    // Which checkpoints it acts on is `timer_sweep_acts_on`, the predicate the
+    // operational snapshot's `next_wake` reads too.
     let checkpoint_ids: Vec<HumanCheckpointId> = state
         .run()
         .map(|run| {
-            let ended = run.status.is_terminal();
             run.loop_state
                 .open_checkpoints()
                 .iter()
-                .filter(|checkpoint| checkpoint.status.is_waiting())
-                .filter(|checkpoint| {
-                    !ended || run.holds_outside_the_turn_effect(&checkpoint.bound_effect.effect_id)
-                })
+                .filter(|checkpoint| run.timer_sweep_acts_on(checkpoint))
                 .map(|checkpoint| checkpoint.checkpoint_id.clone())
                 .collect()
         })

@@ -1059,6 +1059,35 @@ impl AgentCheckpoint {
         AgentCheckpointTimerOutcome::Pending
     }
 
+    /// The earliest deadline [`Self::on_timer`] can still act on, or `None`
+    /// when no timer will ever act on this checkpoint as it stands
+    /// (issue #127).
+    ///
+    /// Only a waiting checkpoint has one. Its hard expiry counts unless the
+    /// kind is [`AgentCheckpointKind::IndeterminateEffectReconciliation`],
+    /// which never expires. Its SLA due time counts only while it is
+    /// [`AgentCheckpointStatus::Open`] and has an escalation target: the timer
+    /// escalates nothing else, and escalation, by a timer or by a person,
+    /// spends the due time. When both count, the earlier answers. A deadline
+    /// that has passed but that no timer has fired yet is still answered,
+    /// because the next timer acts on it.
+    ///
+    /// It reads the record and never rewrites it: `due_at` and `expires_at`
+    /// keep what the record holds.
+    #[must_use]
+    pub fn next_timer_deadline(&self) -> Option<AgentTimestampMillis> {
+        if !self.status.is_waiting() {
+            return None;
+        }
+        let expiry = self
+            .expires_at
+            .filter(|_| self.kind != AgentCheckpointKind::IndeterminateEffectReconciliation);
+        let due = self.due_at.filter(|_| {
+            self.status == AgentCheckpointStatus::Open && self.escalation_target.is_some()
+        });
+        [expiry, due].into_iter().flatten().min()
+    }
+
     /// Cancels a waiting checkpoint because its run was cancelled, superseded, or
     /// terminated. A terminal checkpoint is left unchanged.
     pub fn cancel(&mut self, now: AgentTimestampMillis) {
@@ -1428,3 +1457,187 @@ impl Display for AgentCheckpointError {
 }
 
 impl Error for AgentCheckpointError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AgentEffectSpec, AgentId, AgentRunEffectRequest, AgentRunId, AgentToolCallId,
+        AgentToolCallRequest, AgentToolId, TenantId,
+    };
+
+    const KINDS: [AgentCheckpointKind; 3] = [
+        AgentCheckpointKind::Approval,
+        AgentCheckpointKind::SecurityAuthorization,
+        AgentCheckpointKind::IndeterminateEffectReconciliation,
+    ];
+
+    const STATUSES: [AgentCheckpointStatus; 8] = [
+        AgentCheckpointStatus::Open,
+        AgentCheckpointStatus::Escalated,
+        AgentCheckpointStatus::Resolved,
+        AgentCheckpointStatus::Denied,
+        AgentCheckpointStatus::Compensated,
+        AgentCheckpointStatus::Abandoned,
+        AgentCheckpointStatus::Expired,
+        AgentCheckpointStatus::Cancelled,
+    ];
+
+    /// Fails to compile when a kind or a status is added and the lists above
+    /// are not, so "every kind and every status" stays true.
+    #[allow(dead_code)]
+    fn every_kind_and_status_is_listed(kind: AgentCheckpointKind, status: AgentCheckpointStatus) {
+        match kind {
+            AgentCheckpointKind::Approval
+            | AgentCheckpointKind::SecurityAuthorization
+            | AgentCheckpointKind::IndeterminateEffectReconciliation => {}
+        }
+        match status {
+            AgentCheckpointStatus::Open
+            | AgentCheckpointStatus::Escalated
+            | AgentCheckpointStatus::Resolved
+            | AgentCheckpointStatus::Denied
+            | AgentCheckpointStatus::Compensated
+            | AgentCheckpointStatus::Abandoned
+            | AgentCheckpointStatus::Expired
+            | AgentCheckpointStatus::Cancelled => {}
+        }
+    }
+
+    fn at(millis: u64) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(millis)
+    }
+
+    /// A checkpoint of `kind` in `status`, due at 100 and expiring at 200,
+    /// escalating to `target` when one is given.
+    fn checkpoint(
+        kind: AgentCheckpointKind,
+        status: AgentCheckpointStatus,
+        target: Option<&str>,
+    ) -> AgentCheckpoint {
+        let scope = AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support").expect("the agent id is valid"),
+            AgentRunId::new("run-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let call = AgentToolCallRequest::new(
+            AgentToolCallId::new("call-1").expect("the call id is valid"),
+            AgentToolId::new("charge-card").expect("the tool id is valid"),
+            serde_json::json!({ "amount": 42 }),
+        )
+        .expect("the call is bounded");
+        let effect = AgentRunEffect::new(
+            &scope,
+            1,
+            0,
+            AgentRunEffectRequest::Tool {
+                call: Box::new(call),
+            },
+            &AgentEffectSpec::non_idempotent(),
+            AgentRevisionNumber::INITIAL,
+            at(1),
+        )
+        .expect("the effect derives");
+        let mut checkpoint = AgentCheckpoint::open(
+            HumanCheckpointId::new("ck-1"),
+            kind,
+            scope,
+            &effect,
+            "Decide whether to charge the card.",
+            PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "approver".to_string(),
+                display_name: None,
+            },
+            at(1),
+        )
+        .expect("the checkpoint opens")
+        .with_deadlines(Some(at(100)), Some(at(200)), target.map(str::to_string));
+        checkpoint.status = status;
+        checkpoint
+    }
+
+    /// The tie to `on_timer`: where the method answers a time, the timer acts
+    /// at that time and not a millisecond before it; where it answers nothing,
+    /// the timer never acts.
+    #[test]
+    fn the_next_timer_deadline_is_what_on_timer_acts_on() {
+        for kind in KINDS {
+            for status in STATUSES {
+                for target in [Some("ops-oncall"), None] {
+                    let held = checkpoint(kind, status, target);
+                    let case = format!("{kind} {status} target={target:?}");
+                    match held.next_timer_deadline() {
+                        Some(deadline) => {
+                            assert_ne!(
+                                held.clone().on_timer(deadline),
+                                AgentCheckpointTimerOutcome::Pending,
+                                "{case}: the timer acts at {deadline:?}"
+                            );
+                            assert_eq!(
+                                held.clone().on_timer(at(deadline.as_millis() - 1)),
+                                AgentCheckpointTimerOutcome::Pending,
+                                "{case}: the timer does nothing before {deadline:?}"
+                            );
+                        }
+                        None => assert_eq!(
+                            held.clone().on_timer(at(u64::MAX)),
+                            AgentCheckpointTimerOutcome::Pending,
+                            "{case}: no timer ever acts"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_next_timer_deadline_by_case() {
+        use AgentCheckpointKind::{Approval, IndeterminateEffectReconciliation as Reconciliation};
+        use AgentCheckpointStatus::{Escalated, Open};
+        let target = Some("ops-oncall");
+
+        assert_eq!(
+            checkpoint(Approval, Open, target).next_timer_deadline(),
+            Some(at(100)),
+            "an open approval with a target escalates at its due time"
+        );
+        assert_eq!(
+            checkpoint(Approval, Open, None).next_timer_deadline(),
+            Some(at(200)),
+            "with no target the due time escalates nothing"
+        );
+        assert_eq!(
+            checkpoint(Approval, Escalated, target).next_timer_deadline(),
+            Some(at(200)),
+            "an escalated approval's due time has been spent"
+        );
+        assert_eq!(
+            checkpoint(Reconciliation, Open, target).next_timer_deadline(),
+            Some(at(100)),
+            "an open reconciliation checkpoint with a target escalates"
+        );
+        assert_eq!(
+            checkpoint(Reconciliation, Escalated, target).next_timer_deadline(),
+            None,
+            "an escalated reconciliation checkpoint never expires"
+        );
+        let expiring =
+            checkpoint(Reconciliation, Open, None).with_deadlines(None, Some(at(200)), None);
+        assert_eq!(
+            expiring.next_timer_deadline(),
+            None,
+            "a reconciliation checkpoint ignores an expiry written onto it"
+        );
+        for kind in KINDS {
+            for status in STATUSES.into_iter().filter(|status| status.is_terminal()) {
+                assert_eq!(
+                    checkpoint(kind, status, target).next_timer_deadline(),
+                    None,
+                    "{kind} {status}: a terminal checkpoint has no deadline"
+                );
+            }
+        }
+    }
+}

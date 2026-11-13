@@ -5408,3 +5408,243 @@ async fn a_gated_promotion_commanded_while_winding_down_holds_the_run_until_answ
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// An ended run's `next_wake` reads only what its timer sweep acts on
+// (issue #127).
+// ---------------------------------------------------------------------------
+
+/// A world whose first turn calls a checkpoint-required tool beside one that
+/// fails, under `sla`, with the promotion spec gated too. The failure fences
+/// the gated call, so the run ends `Failed` still holding that call's
+/// approval, waiting: a checkpoint an ended run's timer sweep leaves alone.
+async fn failed_world_holding_a_tool_approval(
+    sla: rakka_agent::AgentCheckpointSla,
+) -> (Fixture, Stores) {
+    let stores = stores();
+    let call = |id: &str, tool: &str| {
+        AgentToolCallRequest::new(
+            AgentToolCallId::new(id).expect("call id"),
+            AgentToolId::new(tool).expect("tool id"),
+            serde_json::json!({ "query": "ticket" }),
+        )
+        .expect("the tool call is bounded")
+    };
+    let turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Let me charge the card and look that up.")
+        .with_tool_call(call("call-1", "charge-card"))
+        .with_tool_call(call("call-2", "flaky-tool"))
+        .with_usage(AgentModelUsage {
+            input_tokens: 8,
+            output_tokens: 4,
+            cost_micros: 2,
+            ..Default::default()
+        });
+    let dispatcher =
+        ScriptedDispatcher::with_adapter(DeterministicModelAdapter::new().with_turn_for(1, turn))
+            .with_tool_failure("flaky-tool", "tool-unavailable", "the tool is down")
+            .with_memory_promotion_executor(Arc::new(SessionMemoryPromotionExecutor::new(
+                stores.session.clone(),
+                stores.private.clone(),
+            )));
+    let policies = gated_promotion_policies(sla)
+        .with_tool_spec(
+            AgentToolId::new("charge-card").expect("tool id"),
+            rakka_agent::AgentEffectSpec::non_idempotent().with_checkpoint_required(),
+        )
+        .expect("the gated tool spec is valid");
+    let fx = Fixture::with_sink(
+        dispatcher,
+        rakka_agent::InMemoryAgentRunEffectSink::new(),
+        policies,
+        Arc::new(std::sync::atomic::AtomicU64::new(1)),
+    )
+    .with_memory(
+        AgentRunMemory::new(stores.session.clone(), stores.snapshots.clone())
+            .with_private_store(stores.private.clone()),
+    );
+    Box::pin(fx.instantiate_agent()).await;
+    Box::pin(fx.create_task()).await;
+    Box::pin(fx.pump()).await.expect("the loop runs to its end");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(
+        run.status,
+        AgentRunStatus::Failed,
+        "the failed call ended the run"
+    );
+    (fx, stores)
+}
+
+/// The run's operational snapshot, observed at the fixture's clock.
+async fn operational_snapshot(fx: &Fixture) -> rakka_agent::AgentOperationalSnapshot {
+    Box::pin(agent_operational_snapshot(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    ))
+    .await
+    .expect("the point query answers")
+    .expect("the run exists")
+}
+
+/// Applies the run's checkpoint timer command at exactly `at`, under `key`.
+async fn fire_checkpoint_timers_at(
+    fx: &Fixture,
+    at: AgentTimestampMillis,
+    key: &str,
+) -> AgentRunEntityReply {
+    fx.clock
+        .store(at.as_millis(), std::sync::atomic::Ordering::SeqCst);
+    apply_ok(
+        fx,
+        AgentRunEntityCommand::FireCheckpointTimers {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                key,
+            )
+            .expect("the timer key derives"),
+        },
+    )
+    .await
+}
+
+/// An ended run's `next_wake` reads only the checkpoints its timer sweep acts
+/// on. The run ended `Failed` holding a tool call's approval, which the sweep
+/// leaves waiting on an ended run, so that approval's deadline is never
+/// reported, though it is the earliest the run holds. A gated promotion
+/// commanded after the end opens a gate the sweep does act on, and `next_wake`
+/// is that gate's deadline. The timer at the approval's deadline changes
+/// nothing; the timer at each reported deadline changes the record; and once
+/// nothing is reported, a timer at any time changes no checkpoint.
+///
+/// The approval is reached through commands, not by editing the record: the
+/// failed sibling call fences the gated call, and nothing closes its approval.
+#[tokio::test]
+async fn an_ended_runs_next_wake_reads_only_what_its_sweep_acts_on() {
+    let sla = rakka_agent::AgentCheckpointSla {
+        due_after_ms: Some(1_000),
+        expire_after_ms: Some(5_000),
+        escalation_target: Some("ops-oncall".to_string()),
+    };
+    let (fx, _stores) = Box::pin(failed_world_holding_a_tool_approval(sla)).await;
+    let before = fx.run_snapshot().await.expect("the run exists");
+    let approval = the_open_checkpoint(&fx).await;
+    assert_eq!(approval.kind, AgentCheckpointKind::Approval);
+    assert_eq!(approval.status, rakka_agent::AgentCheckpointStatus::Open);
+    let gated_call = {
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .effects()
+            .iter()
+            .find(|effect| effect.effect_id == approval.bound_effect.effect_id)
+            .cloned()
+            .expect("the gated call is held")
+    };
+    assert_eq!(
+        gated_call.kind(),
+        AgentRunEffectKind::ToolCall,
+        "the approval binds an effect that is not outside the turn"
+    );
+    let skipped = approval
+        .next_timer_deadline()
+        .expect("on its own, the approval would wake at its due time");
+    assert_eq!(Some(skipped), approval.due_at);
+    assert_eq!(
+        operational_snapshot(&fx).await.next_wake,
+        None,
+        "the sweep skips the approval, so it wakes nothing"
+    );
+
+    let promotion = promote_gated(&fx, "gated").await;
+    let gate = the_gate_of(&fx, &promotion).await;
+    let gate_due = gate.due_at.expect("the SLA stamped the gate's due time");
+    let gate_expires = gate.expires_at.expect("the SLA stamped the gate's expiry");
+    assert!(
+        skipped < gate_due,
+        "the skipped approval's deadline is earlier"
+    );
+    let snapshot = operational_snapshot(&fx).await;
+    assert_eq!(snapshot.open_checkpoints.len(), 2);
+    assert_eq!(
+        snapshot.next_wake,
+        Some(gate_due),
+        "the gate's deadline is reported"
+    );
+    let stored = open_checkpoints(&fx).await;
+    for view in &snapshot.open_checkpoints {
+        let held = stored
+            .iter()
+            .find(|held| held.checkpoint_id == view.checkpoint_id)
+            .expect("each view names a stored checkpoint");
+        assert_eq!(
+            (view.due_at, view.expires_at),
+            (held.due_at, held.expires_at),
+            "the view carries the record's deadlines"
+        );
+    }
+
+    // The timer at the skipped approval's deadline changes nothing.
+    let held = open_checkpoints(&fx).await;
+    let reply = fire_checkpoint_timers_at(&fx, skipped, "timer-skipped").await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Unchanged { .. }),
+        "{reply:?}"
+    );
+    assert_eq!(open_checkpoints(&fx).await, held);
+    assert_terminal_unmoved(&fx, &before, "after the timer at the skipped deadline").await;
+
+    // The timer at each reported deadline changes the record, and only the
+    // gate moves.
+    let reply = fire_checkpoint_timers_at(&fx, gate_due, "timer-gate-due").await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    assert_eq!(
+        the_gate_of(&fx, &promotion).await.status,
+        rakka_agent::AgentCheckpointStatus::Escalated
+    );
+    assert_eq!(
+        operational_snapshot(&fx).await.next_wake,
+        Some(gate_expires),
+        "the escalated gate wakes at its expiry"
+    );
+    let reply = fire_checkpoint_timers_at(&fx, gate_expires, "timer-gate-expires").await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    assert_eq!(
+        promotion_record(&fx, &promotion).await.status,
+        AgentRunEffectStatus::Failed,
+        "the gate expired and failed its promotion"
+    );
+    assert!(
+        approval
+            .expires_at
+            .is_some_and(|expiry| expiry < gate_expires),
+        "the approval's own expiry has passed too"
+    );
+    assert_eq!(
+        open_checkpoints(&fx).await,
+        vec![approval.clone()],
+        "the approval is exactly as the run ended"
+    );
+    assert_eq!(operational_snapshot(&fx).await.next_wake, None);
+
+    // With nothing reported, the timer at any time changes no checkpoint.
+    let far = AgentTimestampMillis::new(1_000_000_000);
+    let reply = fire_checkpoint_timers_at(&fx, far, "timer-far").await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Unchanged { .. }),
+        "{reply:?}"
+    );
+    assert_eq!(open_checkpoints(&fx).await, vec![approval]);
+    assert_terminal_unmoved(&fx, &before, "after the timers").await;
+}
