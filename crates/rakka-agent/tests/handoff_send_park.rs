@@ -426,6 +426,134 @@ async fn a_park_left_without_its_checkpoint_heals_on_the_next_settle_pass() {
     assert_eq!(healed.status, AgentRunStatus::WaitingForReconciliation);
 }
 
+/// Issue #125: a delegation's send receipt does not settle a handoff send,
+/// though both are `A2aSendCall` effects. Delivered to the in-flight handoff
+/// send, it is refused `effect-outcome-mismatch` before anything changes: the
+/// send stays outstanding and the handoff cell does not move. And once the
+/// send has parked, a confirmed exhaustion of it is still refused
+/// `effect-policy-invalid` by the handoff rule, which runs before the guard.
+#[tokio::test]
+async fn a_foreign_outcome_does_not_settle_a_handoff_send() {
+    let (fixture, _segments) = parking_world(false, true).await;
+    // Answer only the model call, so the send is committed, dispatched and
+    // unanswered.
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("the run recovers");
+    run.settle_side_effects(&fixture.router, fixture.now())
+        .await
+        .expect("the run settles");
+    fixture
+        .dispatcher
+        .drive(&mut run, &fixture.router, fixture.now())
+        .await
+        .expect("the model call is answered");
+    drop(run);
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("the run recovers");
+    run.settle_side_effects(&fixture.router, fixture.now())
+        .await
+        .expect("the run settles");
+    drop(run);
+
+    let before = run_record(&fixture).await;
+    let send = send_effect(&before).clone();
+    assert_eq!(
+        send.status,
+        AgentRunEffectStatus::Ready,
+        "the send is in flight"
+    );
+    assert!(matches!(
+        send.request,
+        rakka_agent::AgentRunEffectRequest::A2aHandoff { .. }
+    ));
+    let cell = before
+        .loop_state
+        .handoff()
+        .expect("the cell is held")
+        .clone();
+    assert_eq!(cell.status, AgentHandoffStatus::Pending);
+
+    let receipt = rakka_agent::AgentRunEffectOutcome::A2aSend {
+        receipt: rakka_agent::AgentA2aSendReceipt {
+            delegation: rakka_agent::delegation_id_for(&run_scope(), send.turn, send.slot)
+                .expect("the delegation id derives"),
+            child_task: rakka_agent::AgentTaskId::new("child-elsewhere").expect("task id"),
+            child_run: None,
+            peer_status: "submitted".to_string(),
+        },
+    };
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("the run recovers");
+    let refusal = run
+        .apply(
+            AgentRunEntityCommand::RecordEffectResult {
+                operation_id: send
+                    .result_operation_id(&run_scope())
+                    .expect("the result operation id derives"),
+                effect_id: send.effect_id.clone(),
+                generation: send.generation,
+                attempt: send.attempts.saturating_add(1),
+                fence: 0,
+                outcome: Box::new(receipt),
+            },
+            &fixture.router,
+            fixture.now(),
+        )
+        .await
+        .expect_err("a delegation's receipt settles no handoff send");
+    assert_eq!(refusal.code(), "effect-outcome-mismatch", "{refusal}");
+    drop(run);
+    let after = run_record(&fixture).await;
+    assert_eq!(send_effect(&after), &send, "the send is unmoved");
+    assert_eq!(
+        after.loop_state.handoff(),
+        Some(&cell),
+        "the handoff cell is unmoved"
+    );
+    assert_eq!(after.status, before.status);
+
+    // The lost answer parks the send; confirming the exhaustion that parked
+    // it establishes nothing.
+    settle(&fixture).await;
+    let parked_run = run_record(&fixture).await;
+    let parked = send_effect(&parked_run).clone();
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    let checkpoints = parked_run.loop_state.open_checkpoints().to_vec();
+    assert_eq!(checkpoints.len(), 1, "the park carries its checkpoint");
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("the run recovers");
+    let refusal = run
+        .apply(
+            AgentRunEntityCommand::ResolveIndeterminateEffect {
+                operation_id: AgentOperationId::for_agent(
+                    AgentOperationKind::CheckpointResolution,
+                    &agent_scope(),
+                    "confirm-exhaustion",
+                )
+                .expect("the decision key derives"),
+                effect_id: parked.effect_id.clone(),
+                generation: parked.generation,
+                resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                    outcome: Box::new(rakka_agent::AgentRunEffectOutcome::exhausted(
+                        "handoff-unrecorded",
+                        "the operator saw the attempts run out",
+                    )),
+                }),
+                telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+            },
+            &fixture.router,
+            fixture.now(),
+        )
+        .await
+        .expect_err("a confirmed exhaustion of a handoff send is refused");
+    assert_eq!(refusal.code(), "effect-policy-invalid", "{refusal}");
+    drop(run);
+    let still = run_record(&fixture).await;
+    assert_eq!(send_effect(&still), &parked, "the parked send is unmoved");
+    assert_eq!(still.loop_state.handoff(), parked_run.loop_state.handoff());
+    assert_eq!(still.loop_state.open_checkpoints(), checkpoints.as_slice());
+}
+
 /// Issue #119: the task's answer settling a parked send applies exactly the
 /// resolution a `ConfirmedExecuted` decision would, so the run's stream
 /// records it as one `reconcile`, by deterministic policy, naming the

@@ -70,6 +70,14 @@ impl AgentGoalEvaluationExecutor for ScriptedEvaluator {
 /// The fixture world: one scripted model turn so the coordinator run stays
 /// live, and — when given — the wired evaluation executor.
 fn fixture_with(executor: Option<Arc<dyn AgentGoalEvaluationExecutor>>) -> Fixture {
+    fixture_under(executor, rakka_agent::AgentEffectPolicies::default())
+}
+
+/// [`fixture_with`] under explicit commit-time effect policies.
+fn fixture_under(
+    executor: Option<Arc<dyn AgentGoalEvaluationExecutor>>,
+    policies: rakka_agent::AgentEffectPolicies,
+) -> Fixture {
     let dispatcher = ScriptedDispatcher::with_adapter(
         DeterministicModelAdapter::new().with_turn_for(1, text_turn("investigating the ticket")),
     );
@@ -77,7 +85,12 @@ fn fixture_with(executor: Option<Arc<dyn AgentGoalEvaluationExecutor>>) -> Fixtu
         Some(executor) => dispatcher.with_goal_evaluation_executor(executor),
         None => dispatcher,
     };
-    Fixture::new(dispatcher)
+    Fixture::with_sink(
+        dispatcher,
+        rakka_agent::InMemoryAgentRunEffectSink::new(),
+        policies,
+        Arc::new(std::sync::atomic::AtomicU64::new(1)),
+    )
 }
 
 fn satisfying_fixture() -> Fixture {
@@ -908,6 +921,78 @@ async fn a_denied_human_review_fails_the_evaluation_and_the_goal_stays_active() 
     );
 }
 
+/// Issue #125: an evaluation record stamped with another generation does not
+/// settle the evaluation effect. The run refuses it `effect-outcome-mismatch`
+/// before anything changes: the effect stays outstanding, the goal-evaluation
+/// cell stays empty, and the goal stays active. The effect's own record still
+/// settles it afterwards.
+#[tokio::test]
+async fn a_foreign_outcome_does_not_settle_an_evaluation() {
+    let fx = satisfying_fixture();
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+    apply_run(
+        &fx,
+        evaluate_command("1", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the evaluation commits");
+
+    let effect = evaluation_effect(&fx).await;
+    let AgentRunEffectRequest::Evaluation { evaluation } = &effect.request else {
+        panic!("the effect carries an evaluation request");
+    };
+    let own = fx
+        .dispatcher
+        .evaluation_outcome(&run_scope(), &effect, evaluation, None, fx.now())
+        .await;
+    let rakka_agent::AgentRunEffectOutcome::Evaluation { mut record } = own else {
+        panic!("the evaluator answers with a record, got {own:?}");
+    };
+    assert_eq!(
+        (&record.effect_id, record.generation),
+        (&effect.effect_id, effect.generation),
+        "the dispatcher stamps the record with the effect's own identity"
+    );
+    record.generation = effect.generation.next();
+
+    let refusal = apply_run(
+        &fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: 1,
+            fence: 0,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::Evaluation { record }),
+        },
+    )
+    .await
+    .expect_err("a record from another generation settles nothing");
+    assert_eq!(refusal.code(), "effect-outcome-mismatch", "{refusal}");
+
+    let loop_state = run_loop_state(&fx).await;
+    assert!(
+        loop_state.goal_evaluation().is_none(),
+        "the evaluation cell is unmoved"
+    );
+    let held = loop_state
+        .effects()
+        .iter()
+        .find(|held| held.effect_id == effect.effect_id)
+        .expect("the effect is held");
+    assert_eq!(
+        (held.status, held.attempts, held.generation),
+        (effect.status, effect.attempts, effect.generation),
+        "the effect is unmoved"
+    );
+    assert_eq!(goal_view(&fx).await.status, AgentGoalStatus::Active);
+
+    answer_evaluation(&fx).await;
+    assert_eq!(goal_view(&fx).await.status, AgentGoalStatus::Satisfied);
+}
+
 #[test]
 fn the_evaluation_spec_defaults_read_only_with_two_attempts() {
     // An evaluation judges evidence and never mutates the world: read-only is
@@ -954,4 +1039,673 @@ async fn without_a_configured_evaluator_the_commanded_decision_still_stands() {
     // The run counter never moved: the whole flow was command-side.
     assert_eq!(fx.dispatcher.tool_calls(), 0);
     let _ = Ordering::SeqCst;
+}
+
+// ---------------------------------------------------------------------------
+// An evaluation opens the gate its deployment's spec requires (issue #126).
+// ---------------------------------------------------------------------------
+
+/// Which gate a deployment's goal-evaluation spec requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// A checkpoint alone.
+    Checkpoint,
+    /// A security authorization alone.
+    Authorization,
+    /// Both a checkpoint and a security authorization.
+    Both,
+}
+
+/// Policies whose goal-evaluation spec is the default one with `gate`
+/// required, so only the gate differs from what every other test runs under.
+fn gated_evaluation_policies(gate: Gate) -> rakka_agent::AgentEffectPolicies {
+    let policies = rakka_agent::AgentEffectPolicies::new();
+    let request = AgentRunEffectRequest::Evaluation {
+        evaluation: Box::new(goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    };
+    let spec = policies.spec_for(&request).clone();
+    let spec = match gate {
+        Gate::Checkpoint => spec.with_checkpoint_required(),
+        Gate::Authorization => spec.with_authorization_required(),
+        Gate::Both => spec
+            .with_checkpoint_required()
+            .with_authorization_required(),
+    };
+    policies
+        .with_goal_evaluation_spec(spec)
+        .expect("the gated evaluation spec is valid")
+}
+
+/// The satisfying fixture under a goal-evaluation spec that requires `gate`.
+fn gated_fixture(gate: Gate) -> Fixture {
+    fixture_under(
+        Some(Arc::new(ScriptedEvaluator {
+            outcome: AgentGoalEvaluationOutcome::Satisfied,
+        })),
+        gated_evaluation_policies(gate),
+    )
+}
+
+/// The checkpoints the run holds bound to `effect`, in the order it holds
+/// them.
+async fn gates_on(fx: &Fixture, effect: &AgentRunEffect) -> Vec<rakka_agent::AgentCheckpoint> {
+    run_loop_state(fx)
+        .await
+        .open_checkpoints()
+        .iter()
+        .filter(|checkpoint| checkpoint.bound_effect.effect_id == effect.effect_id)
+        .cloned()
+        .collect()
+}
+
+/// The principal who answers an evaluation's security authorization.
+fn authorizer() -> PrincipalRef {
+    PrincipalRef {
+        principal_type: "user".to_string(),
+        principal_id: "goal-authorizer".to_string(),
+        display_name: None,
+    }
+}
+
+/// Answers `gate` as `resolver` with `decision`.
+async fn resolve_gate(
+    fx: &Fixture,
+    gate: &rakka_agent::AgentCheckpoint,
+    resolver: PrincipalRef,
+    decision: rakka_agent::AgentApprovalDecision,
+) {
+    apply_run(
+        fx,
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "evaluation-gate",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id: gate.checkpoint_id.clone(),
+            resolver,
+            decision: Box::new(rakka_agent::AgentCheckpointDecision::Approval(decision)),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await
+    .expect("the decision applies");
+}
+
+/// An approval-family grant: one attempt, valid well past the test.
+fn approve() -> rakka_agent::AgentApprovalDecision {
+    rakka_agent::AgentApprovalDecision::Approve {
+        credential_binding: None,
+        expires_at: AgentTimestampMillis::new(1_000_000),
+        allowed_use_count: 1,
+    }
+}
+
+/// Runs the run's settle pass from durable state: it flushes every
+/// dispatchable effect and leaves a gated one without a grant `Pending`.
+async fn settle_run(fx: &Fixture) {
+    let mut run = fx.run();
+    let now = fx.now();
+    run.recover(now).await.expect("the run recovers");
+    run.settle_side_effects(&fx.router, now)
+        .await
+        .expect("the run settles");
+}
+
+/// The evaluation effect the run holds under `effect`'s id, whatever its
+/// status.
+async fn held_effect(fx: &Fixture, effect: &AgentRunEffect) -> AgentRunEffect {
+    run_loop_state(fx)
+        .await
+        .effects()
+        .iter()
+        .find(|held| held.effect_id == effect.effect_id)
+        .cloned()
+        .expect("the evaluation effect is held")
+}
+
+/// Issue #126: an evaluation whose spec requires authorization alone opens
+/// one `SecurityAuthorization` bound to the effect, in the command's own
+/// transition. Before the fix the evaluation recorded a gated effect with no
+/// gate, which no settle pass could dispatch, so it waited `Pending` with
+/// nothing that could answer it. A grant dispatches it, and the evaluator's
+/// record lands.
+#[tokio::test]
+async fn an_evaluation_requiring_authorization_alone_opens_a_security_authorization() {
+    let fx = gated_fixture(Gate::Authorization);
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+    apply_run(
+        &fx,
+        evaluate_command("1", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the evaluation commits");
+
+    let effect = evaluation_effect(&fx).await;
+    assert!(
+        effect.authorization_required && !effect.checkpoint_required,
+        "the spec requires authorization alone"
+    );
+    let gates = gates_on(&fx, &effect).await;
+    assert_eq!(
+        gates.len(),
+        1,
+        "the command opened one gate: {gates:?}; the effect is {:?}",
+        effect.status
+    );
+    assert_eq!(
+        gates[0].kind,
+        rakka_agent::AgentCheckpointKind::SecurityAuthorization
+    );
+    assert_eq!(gates[0].bound_effect.generation, effect.generation);
+
+    // The gate holds the effect: a settle pass does not dispatch it.
+    settle_run(&fx).await;
+    assert_eq!(
+        held_effect(&fx, &effect).await.status,
+        rakka_agent::AgentRunEffectStatus::Pending
+    );
+
+    // The grant dispatches it, and the record lands.
+    resolve_gate(&fx, &gates[0], authorizer(), approve()).await;
+    settle_run(&fx).await;
+    assert_eq!(
+        held_effect(&fx, &effect).await.status,
+        rakka_agent::AgentRunEffectStatus::Ready,
+        "the granted evaluation is dispatched"
+    );
+    answer_evaluation(&fx).await;
+    let loop_state = run_loop_state(&fx).await;
+    let cell = loop_state
+        .goal_evaluation()
+        .expect("the cell holds the record");
+    assert_eq!(cell.record.effect_id, effect.effect_id);
+    assert_eq!(cell.record.outcome, AgentGoalEvaluationOutcome::Satisfied);
+    assert_eq!(goal_view(&fx).await.status, AgentGoalStatus::Satisfied);
+}
+
+/// Issue #126: an evaluation whose spec requires both gates opens one
+/// `SecurityAuthorization`, the precedence every other gate-opening site
+/// uses, and no `Approval`: a plain approval cannot satisfy an authorization
+/// requirement.
+#[tokio::test]
+async fn an_evaluation_requiring_both_gates_opens_one_security_authorization() {
+    let fx = gated_fixture(Gate::Both);
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+    apply_run(
+        &fx,
+        evaluate_command("1", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the evaluation commits");
+
+    let effect = evaluation_effect(&fx).await;
+    assert!(
+        effect.authorization_required && effect.checkpoint_required,
+        "the spec requires both gates"
+    );
+    let open = run_loop_state(&fx).await.open_checkpoints().to_vec();
+    assert_eq!(open.len(), 1, "exactly one checkpoint is open: {open:?}");
+    assert_eq!(open[0].bound_effect.effect_id, effect.effect_id);
+    assert_eq!(
+        open[0].kind,
+        rakka_agent::AgentCheckpointKind::SecurityAuthorization
+    );
+    assert!(
+        open.iter()
+            .all(|checkpoint| checkpoint.kind != rakka_agent::AgentCheckpointKind::Approval),
+        "no approval is open"
+    );
+}
+
+/// Issue #126: a human review under a spec that requires authorization is
+/// gated by a `SecurityAuthorization` (its own checkpoint requirement plus
+/// the spec's authorization). The authorization's grant reaches the dispatch
+/// authority's granted dispatch, whose checkpoint is what the dispatcher
+/// builds a human review's verdict from, and the verdict names the
+/// authorizer.
+#[tokio::test]
+async fn a_human_review_under_an_authorization_spec_takes_its_verdict_from_the_authorizer() {
+    use rakka_agent::AgentDispatchAuthority as _;
+
+    let fx = gated_fixture(Gate::Authorization);
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+    let mut request = goal_evaluation_request(AgentRevisionNumber::INITIAL);
+    request.method = AgentGoalEvaluationMethod::HumanReview;
+    apply_run(&fx, evaluate_command("1", request))
+        .await
+        .expect("the human review commits");
+
+    let effect = evaluation_effect(&fx).await;
+    assert!(
+        effect.checkpoint_required && effect.authorization_required,
+        "a human review is checkpoint-gated, and the spec adds authorization"
+    );
+    let gates = gates_on(&fx, &effect).await;
+    assert_eq!(gates.len(), 1, "the command opened one gate: {gates:?}");
+    assert_eq!(
+        gates[0].kind,
+        rakka_agent::AgentCheckpointKind::SecurityAuthorization
+    );
+    resolve_gate(&fx, &gates[0], authorizer(), approve()).await;
+
+    // The dispatch authority hands the authorization's grant to the
+    // dispatcher as the granted dispatch's checkpoint.
+    let state = rakka_agent::load_agent_run_state(
+        &fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run state exists");
+    let intent = held_effect(&fx, &effect).await;
+    let authority = rakka_agent::AgentEntityAuthority::new(
+        fx.agents.clone(),
+        rakka_agent::AgentToolAuthority::new(rakka_agent::AgentToolRegistry::new()),
+    );
+    let decision = authority
+        .authorize(&run_scope(), &state, &intent, 1, fx.now())
+        .await
+        .expect("the authority answers");
+    let rakka_agent::AgentDispatchDecision::Granted(granted) = decision else {
+        panic!("the granted review is authorized, got {decision:?}");
+    };
+    let grant = granted
+        .checkpoint
+        .expect("the granted dispatch carries the authorization's grant");
+    assert_eq!(
+        grant.kind,
+        rakka_agent::AgentCheckpointKind::SecurityAuthorization
+    );
+    assert_eq!(grant.resolver, authorizer());
+
+    // The verdict is the authorizer's.
+    answer_evaluation(&fx).await;
+    let loop_state = run_loop_state(&fx).await;
+    let cell = loop_state
+        .goal_evaluation()
+        .expect("the cell holds the record");
+    assert_eq!(cell.record.outcome, AgentGoalEvaluationOutcome::Satisfied);
+    assert_eq!(cell.record.reason_code, "human-approved");
+    assert_eq!(cell.record.evaluated_by.as_ref(), Some(&authorizer()));
+    assert_eq!(goal_view(&fx).await.status, AgentGoalStatus::Satisfied);
+}
+
+/// Issue #126: an evaluation whose spec requires a checkpoint alone still
+/// opens an `Approval`, as before the fix.
+#[tokio::test]
+async fn an_evaluation_requiring_a_checkpoint_alone_still_opens_an_approval() {
+    let fx = gated_fixture(Gate::Checkpoint);
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+    apply_run(
+        &fx,
+        evaluate_command("1", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the evaluation commits");
+
+    let effect = evaluation_effect(&fx).await;
+    assert!(
+        effect.checkpoint_required && !effect.authorization_required,
+        "the spec requires a checkpoint alone"
+    );
+    let gates = gates_on(&fx, &effect).await;
+    assert_eq!(gates.len(), 1, "the command opened one gate: {gates:?}");
+    assert_eq!(gates[0].kind, rakka_agent::AgentCheckpointKind::Approval);
+    assert_eq!(gates[0].bound_effect.generation, effect.generation);
+}
+
+// ---------------------------------------------------------------------------
+// The tool-calling turn opens a gate only for an effect that still waits for
+// one (issue #126).
+// ---------------------------------------------------------------------------
+
+/// The tool the fixture's tool-calling turn calls.
+const LOOKUP: &str = "lookup";
+
+/// A model turn that calls the [`LOOKUP`] tool once.
+fn tool_calling_turn() -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Let me look that up.")
+        .with_tool_call(
+            rakka_agent::AgentToolCallRequest::new(
+                rakka_agent::AgentToolCallId::new("call-1").expect("the call id is valid"),
+                rakka_agent::AgentToolId::new(LOOKUP).expect("the tool id is valid"),
+                serde_json::json!({ "query": "ticket" }),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_usage(AgentModelUsage {
+            input_tokens: 8,
+            output_tokens: 4,
+            cost_micros: 2,
+            ..Default::default()
+        })
+}
+
+/// A goal-bearing world under `policies` whose turn-one model call answers
+/// with a call to [`LOOKUP`]. No evaluation executor is wired: a human review
+/// takes its verdict from its gate. Returned with the model call dispatched
+/// and unanswered.
+async fn tool_turn_world(policies: rakka_agent::AgentEffectPolicies) -> Fixture {
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new().with_turn_for(1, tool_calling_turn()),
+    )
+    .with_tool_result(
+        LOOKUP,
+        rakka_agent::AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    );
+    let fx = Fixture::with_sink(
+        dispatcher,
+        rakka_agent::InMemoryAgentRunEffectSink::new(),
+        policies,
+        Arc::new(std::sync::atomic::AtomicU64::new(1)),
+    );
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+    settle_run(&fx).await;
+    let loop_state = run_loop_state(&fx).await;
+    assert_eq!(
+        (loop_state.phase(), loop_state.turn()),
+        (rakka_agent::AgentLoopPhase::AwaitingModel, 1),
+        "the run awaits its model call"
+    );
+    fx
+}
+
+/// Commands a human review of the goal while the run awaits its model call,
+/// and returns the evaluation effect and the one `Approval` the command
+/// opened on it.
+async fn commanded_human_review(fx: &Fixture) -> (AgentRunEffect, rakka_agent::AgentCheckpoint) {
+    let mut request = goal_evaluation_request(AgentRevisionNumber::INITIAL);
+    request.method = AgentGoalEvaluationMethod::HumanReview;
+    apply_run(fx, evaluate_command("1", request))
+        .await
+        .expect("the human review commits");
+    let effect = evaluation_effect(fx).await;
+    assert_eq!(effect.turn, 1, "the evaluation belongs to turn one");
+    let gates = gates_on(fx, &effect).await;
+    assert_eq!(gates.len(), 1, "the command opened one gate: {gates:?}");
+    assert_eq!(gates[0].kind, rakka_agent::AgentCheckpointKind::Approval);
+    (effect, gates[0].clone())
+}
+
+/// Answers turn one's model call, and only it: the result's transition is
+/// the one that commits the turn's tool call and opens the turn's gates.
+async fn answer_with_the_tool_call(fx: &Fixture) {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    let answered = fx
+        .dispatcher
+        .drive(&mut run, &fx.router, fx.now())
+        .await
+        .expect("the model call is answered");
+    assert_eq!(answered, 1, "only the model call was answered");
+    let loop_state = run_loop_state(fx).await;
+    assert_eq!(
+        (loop_state.phase(), loop_state.turn()),
+        (rakka_agent::AgentLoopPhase::AwaitingTools, 1),
+        "the turn called its tool"
+    );
+}
+
+/// The one tool-call effect the run holds.
+async fn tool_effect(fx: &Fixture) -> AgentRunEffect {
+    let held: Vec<AgentRunEffect> = run_loop_state(fx)
+        .await
+        .effects()
+        .iter()
+        .filter(|effect| effect.kind() == AgentRunEffectKind::ToolCall)
+        .cloned()
+        .collect();
+    assert_eq!(held.len(), 1, "the turn recorded one tool effect: {held:?}");
+    held.into_iter().next().expect("one tool effect")
+}
+
+/// How a tool effect stands for its dispatch, leaving out its identity and
+/// timestamps, which derive from its slot and the clock.
+fn dispatch_of(
+    effect: &AgentRunEffect,
+) -> (
+    rakka_agent::AgentRunEffectStatus,
+    rakka_agent::AgentEffectGeneration,
+    u32,
+    bool,
+    AgentRunEffectRequest,
+) {
+    (
+        effect.status,
+        effect.generation,
+        effect.attempts,
+        effect.dispatched_at.is_some(),
+        effect.request.clone(),
+    )
+}
+
+/// The tool effect and the run status of the same world with no evaluation
+/// commanded, once its turn has called the tool.
+async fn uncommanded_tool_turn(
+    policies: rakka_agent::AgentEffectPolicies,
+) -> (AgentRunEffect, AgentRunStatus) {
+    let fx = tool_turn_world(policies).await;
+    answer_with_the_tool_call(&fx).await;
+    let tool = tool_effect(&fx).await;
+    assert!(
+        gates_on(&fx, &tool).await.is_empty(),
+        "the ungated tool has no gate"
+    );
+    // The control must have dispatched its tool, or the comparison with it
+    // would hold for a world that dispatched nothing.
+    assert_eq!(
+        tool.status,
+        rakka_agent::AgentRunEffectStatus::Ready,
+        "the control's tool is dispatched"
+    );
+    assert!(
+        tool.dispatched_at.is_some(),
+        "the control's tool is stamped dispatched"
+    );
+    (tool, run_status(&fx).await)
+}
+
+/// What a tool-calling turn must leave behind for an evaluation whose gate
+/// closed without a grant earlier in the turn: no checkpoint bound to it, the
+/// effect still `Failed`, no approval-family wait, and the turn's tool
+/// dispatched exactly as in the world with no evaluation commanded.
+async fn assert_no_gate_reopened(
+    fx: &Fixture,
+    evaluation: &AgentRunEffect,
+    policies: rakka_agent::AgentEffectPolicies,
+) {
+    let gates = gates_on(fx, evaluation).await;
+    assert!(
+        gates.is_empty(),
+        "no checkpoint is bound to the closed evaluation: {gates:?}"
+    );
+    assert_eq!(
+        held_effect(fx, evaluation).await.status,
+        rakka_agent::AgentRunEffectStatus::Failed,
+        "the evaluation is still failed"
+    );
+    let status = run_status(fx).await;
+    assert!(
+        !matches!(
+            status,
+            AgentRunStatus::WaitingForApproval | AgentRunStatus::WaitingForAuthorization
+        ),
+        "the run reports no approval-family wait: {status:?}"
+    );
+
+    let tool = tool_effect(fx).await;
+    assert!(gates_on(fx, &tool).await.is_empty(), "the tool has no gate");
+    let (control, control_status) = uncommanded_tool_turn(policies).await;
+    assert_eq!(
+        dispatch_of(&tool),
+        dispatch_of(&control),
+        "the tool is dispatched as in the world with no evaluation"
+    );
+    assert_eq!(
+        status, control_status,
+        "the run rests as in the world with no evaluation"
+    );
+}
+
+/// Issue #126, found by the design's section 9 probe: a human review denied
+/// while the run awaits its model call fails, and its gate closes. When that
+/// turn then calls a tool, the turn's gate block opens no fresh `Approval` on
+/// the failed evaluation, and the run reports no approval wait. Before the
+/// fix it did both, under default policies.
+#[tokio::test]
+async fn a_denied_evaluation_gets_no_fresh_gate_from_a_later_tool_turn() {
+    let policies = rakka_agent::AgentEffectPolicies::default();
+    let fx = tool_turn_world(policies.clone()).await;
+    let (effect, gate) = commanded_human_review(&fx).await;
+    resolve_gate(
+        &fx,
+        &gate,
+        PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "goal-approver".to_string(),
+            display_name: None,
+        },
+        rakka_agent::AgentApprovalDecision::Deny {
+            reason: "not convinced".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(
+        held_effect(&fx, &effect).await.status,
+        rakka_agent::AgentRunEffectStatus::Failed,
+        "the denial fails the evaluation"
+    );
+    assert!(
+        gates_on(&fx, &effect).await.is_empty(),
+        "the denial closed the gate"
+    );
+
+    answer_with_the_tool_call(&fx).await;
+    assert_no_gate_reopened(&fx, &effect, policies).await;
+}
+
+/// Issue #126: the same as a denial, with the evaluation's gate expired by the
+/// run's checkpoint timer under the deployment's SLA. The expiry fails the
+/// evaluation and closes its gate, and the later tool-calling turn opens no
+/// fresh one.
+#[tokio::test]
+async fn an_expired_evaluation_gate_is_not_reopened_by_a_later_tool_turn() {
+    let policies = rakka_agent::AgentEffectPolicies::default().with_checkpoint_sla(
+        rakka_agent::AgentCheckpointSla {
+            due_after_ms: None,
+            expire_after_ms: Some(1_000),
+            escalation_target: None,
+        },
+    );
+    let fx = tool_turn_world(policies.clone()).await;
+    let (effect, gate) = commanded_human_review(&fx).await;
+    let expires = gate.expires_at.expect("the SLA stamped an expiry");
+
+    fx.clock.store(expires.as_millis() + 1, Ordering::SeqCst);
+    apply_run(
+        &fx,
+        AgentRunEntityCommand::FireCheckpointTimers {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "timer",
+            )
+            .expect("the timer key derives"),
+        },
+    )
+    .await
+    .expect("the timer applies");
+    assert_eq!(
+        held_effect(&fx, &effect).await.status,
+        rakka_agent::AgentRunEffectStatus::Failed,
+        "the expiry fails the evaluation"
+    );
+    assert!(
+        gates_on(&fx, &effect).await.is_empty(),
+        "the expiry closed the gate"
+    );
+
+    answer_with_the_tool_call(&fx).await;
+    assert_no_gate_reopened(&fx, &effect, policies).await;
+}
+
+/// Issue #126: an evaluation whose gate is still open and ungranted when its
+/// turn calls a tool keeps that one gate, unchanged: the same checkpoint id
+/// and the same record. It is still the turn's approval wait, so the run
+/// reports it.
+#[tokio::test]
+async fn an_open_evaluation_gate_survives_a_later_tool_turn_unchanged() {
+    let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+    let (effect, gate) = commanded_human_review(&fx).await;
+
+    answer_with_the_tool_call(&fx).await;
+    let gates = gates_on(&fx, &effect).await;
+    assert_eq!(
+        gates.len(),
+        1,
+        "one gate is bound to the evaluation: {gates:?}"
+    );
+    assert_eq!(gates[0].checkpoint_id, gate.checkpoint_id);
+    assert_eq!(gates[0], gate, "the gate's record is unchanged");
+    assert_eq!(
+        held_effect(&fx, &effect).await.status,
+        rakka_agent::AgentRunEffectStatus::Pending,
+        "the evaluation still waits on its gate"
+    );
+    assert_eq!(run_status(&fx).await, AgentRunStatus::WaitingForApproval);
+}
+
+/// The tool-calling turn still opens the gate of a tool call the deployment
+/// gates, in the transition that records the call: after the one result that
+/// commits the turn, the tool effect is `Pending` and undispatched, and one
+/// gate of the spec's kind is bound to its generation, opened at the
+/// instant the effect was recorded.
+#[tokio::test]
+async fn a_gated_tool_call_still_opens_its_gate() {
+    let lookup = || rakka_agent::AgentToolId::new(LOOKUP).expect("the tool id is valid");
+    let non_idempotent = rakka_agent::AgentEffectSpec::non_idempotent;
+    for (spec, kind, status) in [
+        (
+            non_idempotent().with_checkpoint_required(),
+            rakka_agent::AgentCheckpointKind::Approval,
+            AgentRunStatus::WaitingForApproval,
+        ),
+        (
+            non_idempotent().with_authorization_required(),
+            rakka_agent::AgentCheckpointKind::SecurityAuthorization,
+            AgentRunStatus::WaitingForAuthorization,
+        ),
+    ] {
+        let policies = rakka_agent::AgentEffectPolicies::new()
+            .with_tool_spec(lookup(), spec)
+            .expect("the gated tool spec is valid");
+        let fx = tool_turn_world(policies).await;
+        answer_with_the_tool_call(&fx).await;
+
+        let tool = tool_effect(&fx).await;
+        assert_eq!(
+            tool.status,
+            rakka_agent::AgentRunEffectStatus::Pending,
+            "{kind:?}: the gated tool is not dispatched"
+        );
+        let gates = gates_on(&fx, &tool).await;
+        assert_eq!(gates.len(), 1, "{kind:?}: one gate: {gates:?}");
+        assert_eq!(gates[0].kind, kind);
+        assert_eq!(gates[0].bound_effect.generation, tool.generation);
+        assert_eq!(
+            gates[0].created_at, tool.created_at,
+            "{kind:?}: the gate opened in the transition that recorded the call"
+        );
+        assert_eq!(run_status(&fx).await, status);
+        assert_eq!(
+            fx.dispatcher.tool_calls(),
+            0,
+            "{kind:?}: the tool never ran"
+        );
+    }
 }

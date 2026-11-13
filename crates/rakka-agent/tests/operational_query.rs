@@ -10,19 +10,20 @@
 //! carry, and it is explicit about its own freshness rather than degrading
 //! the authoritative half (scenario 21).
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     agent_operational_snapshot, assemble_agent_session_view, AgentCancellationProgress,
-    AgentCheckpointDecision, AgentCheckpointDecisionOption, AgentCheckpointKind,
-    AgentDecisionEventSink, AgentDecisionKind, AgentEffectGeneration, AgentEffectPolicies,
-    AgentEffectSafetyClass, AgentEffectSpec, AgentFailureReason, AgentModelTurn, AgentModelUsage,
-    AgentObservabilityError, AgentObservabilityFuture, AgentOperationId, AgentOperationKind,
+    AgentCheckpoint, AgentCheckpointDecision, AgentCheckpointDecisionOption, AgentCheckpointKind,
+    AgentCheckpointSla, AgentCheckpointStatus, AgentDecisionEventSink, AgentDecisionKind,
+    AgentEffectGeneration, AgentEffectPolicies, AgentEffectSafetyClass, AgentEffectSpec,
+    AgentFailureReason, AgentModelTurn, AgentModelUsage, AgentObservabilityError,
+    AgentObservabilityFuture, AgentOperationId, AgentOperationKind, AgentOperationalSnapshot,
     AgentPendingEffectView, AgentReconciliationDecision, AgentRunEffectOutcome,
-    AgentRunEffectStatus, AgentRunEntityCommand, AgentRunStatus, AgentSchemaPolicy,
-    AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    AgentRunEffectStatus, AgentRunEntityCommand, AgentRunEntityReply, AgentRunStatus,
+    AgentSchemaPolicy, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
     AgentUnknownOutcomeEvidence, InMemoryAgentDecisionEventSink, InMemoryAgentRunEffectSink,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
@@ -63,12 +64,19 @@ fn proposing_turn(answer: &str) -> AgentModelTurn {
 /// A fixture whose tool is checkpoint-required, so the run parks on an
 /// approval before the tool may dispatch.
 fn checkpointed_fixture() -> Fixture {
+    checkpointed_fixture_under(AgentCheckpointSla::default())
+}
+
+/// [`checkpointed_fixture`], with the run stamping `sla` onto the checkpoints
+/// it opens.
+fn checkpointed_fixture_under(sla: AgentCheckpointSla) -> Fixture {
     let policies = AgentEffectPolicies::new()
         .with_tool_spec(
             AgentToolId::new("charge-card").expect("tool id"),
             AgentEffectSpec::non_idempotent().with_checkpoint_required(),
         )
-        .expect("the checkpoint-required tool spec is valid");
+        .expect("the checkpoint-required tool spec is valid")
+        .with_checkpoint_sla(sla);
     Fixture::with_sink(
         ScriptedDispatcher::new()
             .with_turn(tool_calling_turn("charge-card"))
@@ -307,12 +315,19 @@ fn decision_values(options: &[AgentCheckpointDecisionOption]) -> Vec<&str> {
 /// A fixture whose non-idempotent tool dispatches without a gate, so an
 /// ambiguous loss parks the run for reconciliation.
 fn reconcilable_fixture() -> Fixture {
+    reconcilable_fixture_under(AgentCheckpointSla::default())
+}
+
+/// [`reconcilable_fixture`], with the run stamping `sla` onto the checkpoints
+/// it opens.
+fn reconcilable_fixture_under(sla: AgentCheckpointSla) -> Fixture {
     let policies = AgentEffectPolicies::new()
         .with_tool_spec(
             AgentToolId::new("charge-card").expect("tool id"),
             AgentEffectSpec::non_idempotent(),
         )
-        .expect("the tool spec is valid");
+        .expect("the tool spec is valid")
+        .with_checkpoint_sla(sla);
     Fixture::with_sink(
         ScriptedDispatcher::new()
             .with_turn(tool_calling_turn("charge-card"))
@@ -1580,4 +1595,346 @@ async fn a_redispatch_does_not_inherit_the_superseded_generations_evidence() {
     assert_eq!(redispatched.generation, AgentEffectGeneration::FIRST.next());
     assert_eq!(redispatched.unknown_outcome, None);
     assert_eq!(redispatched.last_error_reason, None);
+}
+
+// ---------------------------------------------------------------------------
+// `next_wake` names only a deadline a timer will act on (issue #127).
+// ---------------------------------------------------------------------------
+
+/// An SLA that sets both deadlines: due a second after the checkpoint opens,
+/// expired five seconds after, escalated to `target` when one is given.
+fn both_deadlines(target: Option<&str>) -> AgentCheckpointSla {
+    AgentCheckpointSla {
+        due_after_ms: Some(1_000),
+        expire_after_ms: Some(5_000),
+        escalation_target: target.map(str::to_string),
+    }
+}
+
+/// Instantiates the agent, creates the task, and pumps the run until it parks
+/// on its approval.
+async fn park_on_approval(fx: &Fixture) {
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the run parks on its checkpoint");
+}
+
+/// The snapshot, observed at the fixture's clock.
+async fn snapshot_now(fx: &Fixture) -> AgentOperationalSnapshot {
+    agent_operational_snapshot(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists")
+}
+
+/// The checkpoints the stored run record holds.
+async fn stored_checkpoints(fx: &Fixture) -> Vec<AgentCheckpoint> {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.state()
+        .expect("state reads")
+        .loop_state()
+        .expect("the loop exists")
+        .open_checkpoints()
+        .to_vec()
+}
+
+/// Asserts every checkpoint view carries `due_at` and `expires_at` exactly as
+/// the stored record holds them: only `next_wake` passes over a deadline no
+/// timer acts on.
+async fn assert_views_carry_the_record(fx: &Fixture, snapshot: &AgentOperationalSnapshot) {
+    let stored = stored_checkpoints(fx).await;
+    for view in &snapshot.open_checkpoints {
+        let held = stored
+            .iter()
+            .find(|held| held.checkpoint_id == view.checkpoint_id)
+            .expect("each view names a stored checkpoint");
+        assert_eq!(
+            (view.due_at, view.expires_at),
+            (held.due_at, held.expires_at),
+            "{}: the view carries the record's deadlines",
+            view.checkpoint_id.as_str()
+        );
+    }
+}
+
+/// Applies the run's checkpoint timer command at exactly `at`, under `key`.
+async fn fire_checkpoint_timers_at(
+    fx: &Fixture,
+    at: AgentTimestampMillis,
+    key: &str,
+) -> AgentRunEntityReply {
+    fx.clock.store(at.as_millis(), Ordering::SeqCst);
+    let now = fx.now();
+    let mut run = fx.run();
+    run.recover(now).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::FireCheckpointTimers {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                key,
+            )
+            .expect("the timer key derives"),
+        },
+        &fx.router,
+        now,
+    )
+    .await
+    .expect("the timer command applies")
+}
+
+/// Escalation spends a checkpoint's due time, and `next_wake` stops reporting
+/// it. After the timer escalates an approval, `next_wake` is the approval's
+/// expiry, not the due time that has passed. A person's `Escalate`, which only
+/// a reconciliation checkpoint takes, spends it the same way; the run writes
+/// no expiry onto that kind, so `next_wake` is then `None`. Either way the
+/// view keeps the due time as the record holds it.
+#[tokio::test]
+async fn next_wake_drops_a_due_time_after_escalation() {
+    // The timer escalates an approval.
+    let fx = checkpointed_fixture_under(both_deadlines(Some("ops-oncall")));
+    park_on_approval(&fx).await;
+    let parked = snapshot_now(&fx).await;
+    assert_eq!(parked.open_checkpoints.len(), 1);
+    let view = &parked.open_checkpoints[0];
+    let due = view.due_at.expect("the SLA stamped a due time");
+    let expires = view.expires_at.expect("the SLA stamped an expiry");
+    assert_eq!(parked.next_wake, Some(due));
+
+    let reply = fire_checkpoint_timers_at(&fx, due, "timer-due").await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    let escalated = snapshot_now(&fx).await;
+    let view = &escalated.open_checkpoints[0];
+    assert_eq!(view.status, AgentCheckpointStatus::Escalated);
+    assert_eq!(
+        (view.due_at, view.expires_at),
+        (Some(due), Some(expires)),
+        "the view keeps the spent due time"
+    );
+    assert_views_carry_the_record(&fx, &escalated).await;
+    assert_eq!(
+        escalated.next_wake,
+        Some(expires),
+        "the past due time is not reported once the timer escalated"
+    );
+
+    // A person escalates a reconciliation checkpoint after its due time
+    // passed, before any timer fired.
+    let fx = reconcilable_fixture_under(both_deadlines(Some("ops-oncall")));
+    park_on_reconciliation(
+        &fx,
+        AgentRunEffectOutcome::indeterminate("connection-lost", "the worker died mid-invocation"),
+    )
+    .await;
+    let parked = snapshot_now(&fx).await;
+    assert_eq!(parked.open_checkpoints.len(), 1);
+    let view = &parked.open_checkpoints[0];
+    assert_eq!(
+        view.kind,
+        AgentCheckpointKind::IndeterminateEffectReconciliation
+    );
+    let due = view.due_at.expect("the SLA stamped a due time");
+    assert_eq!(
+        view.expires_at, None,
+        "the run writes no expiry onto a reconciliation checkpoint"
+    );
+    assert_eq!(parked.next_wake, Some(due));
+    let checkpoint_id = view.checkpoint_id.clone();
+
+    fx.clock.store(due.as_millis() + 1, Ordering::SeqCst);
+    let now = fx.now();
+    let mut run = fx.run();
+    run.recover(now).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "escalate",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id,
+            resolver: PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(AgentCheckpointDecision::Reconciliation(
+                AgentReconciliationDecision::Escalate,
+            )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+        &fx.router,
+        now,
+    )
+    .await
+    .expect("the escalation applies");
+    let escalated = snapshot_now(&fx).await;
+    let view = &escalated.open_checkpoints[0];
+    assert_eq!(view.status, AgentCheckpointStatus::Escalated);
+    assert_eq!(view.due_at, Some(due), "the view keeps the spent due time");
+    assert_views_carry_the_record(&fx, &escalated).await;
+    assert_eq!(
+        escalated.next_wake, None,
+        "the past due time is not reported once a person escalated, and no expiry is left"
+    );
+}
+
+/// The run stamps a due time whenever the SLA sets one, with or without an
+/// escalation target, but the timer escalates only toward a target. With
+/// none, `next_wake` is the expiry from the start: the due time is never
+/// reported, before or after it passes, and a timer at it changes nothing.
+#[tokio::test]
+async fn next_wake_ignores_a_due_time_with_no_escalation_target() {
+    let fx = checkpointed_fixture_under(both_deadlines(None));
+    park_on_approval(&fx).await;
+    let parked = snapshot_now(&fx).await;
+    assert_eq!(parked.open_checkpoints.len(), 1);
+    let view = &parked.open_checkpoints[0];
+    let due = view
+        .due_at
+        .expect("the run stamps the due time without a target");
+    let expires = view.expires_at.expect("the SLA stamped an expiry");
+    assert!(due < expires);
+    assert_views_carry_the_record(&fx, &parked).await;
+    assert_eq!(
+        parked.next_wake,
+        Some(expires),
+        "a due time with no target escalates nothing, so it is not reported"
+    );
+
+    let before = stored_checkpoints(&fx).await;
+    let reply = fire_checkpoint_timers_at(&fx, due, "timer-due").await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Unchanged { .. }),
+        "{reply:?}"
+    );
+    assert_eq!(
+        stored_checkpoints(&fx).await,
+        before,
+        "a timer at the due time changes nothing"
+    );
+    let overdue = snapshot_now(&fx).await;
+    assert!(overdue.observed_at > due);
+    assert_eq!(
+        overdue.next_wake,
+        Some(expires),
+        "the passed due time is still not reported"
+    );
+}
+
+/// A deadline that has passed but that no timer has fired yet is still the
+/// run's next wake: the next timer acts on it.
+#[tokio::test]
+async fn next_wake_reports_a_deadline_that_has_passed_but_not_fired() {
+    let fx = checkpointed_fixture_under(both_deadlines(Some("ops-oncall")));
+    park_on_approval(&fx).await;
+    let view = snapshot_now(&fx).await.open_checkpoints[0].clone();
+    let due = view.due_at.expect("the SLA stamped a due time");
+    let expires = view.expires_at.expect("the SLA stamped an expiry");
+
+    fx.clock.store(due.as_millis() + 100, Ordering::SeqCst);
+    let overdue = snapshot_now(&fx).await;
+    assert!(overdue.observed_at > due);
+    assert_eq!(
+        overdue.open_checkpoints[0].status,
+        AgentCheckpointStatus::Open
+    );
+    assert_eq!(
+        overdue.next_wake,
+        Some(due),
+        "an escalation no timer fired is still reported"
+    );
+
+    let late = AgentTimestampMillis::new(due.as_millis() + 200);
+    let reply = fire_checkpoint_timers_at(&fx, late, "timer-late").await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    fx.clock.store(expires.as_millis() + 100, Ordering::SeqCst);
+    let expired = snapshot_now(&fx).await;
+    assert!(expired.observed_at > expires);
+    assert_eq!(
+        expired.open_checkpoints[0].status,
+        AgentCheckpointStatus::Escalated
+    );
+    assert_eq!(
+        expired.next_wake,
+        Some(expires),
+        "an expiry no timer fired is still reported"
+    );
+}
+
+/// The run-level tie: the run's timer command at `next_wake` changes the
+/// stored record, and once `next_wake` is `None`, the timer at any later time
+/// changes none of the checkpoints. Walked for each shape of SLA, from the
+/// park until nothing is left to wake on, with the views checked against the
+/// record at every step.
+#[tokio::test]
+async fn the_timer_at_next_wake_changes_the_record() {
+    let slas = [
+        both_deadlines(Some("ops-oncall")),
+        both_deadlines(None),
+        AgentCheckpointSla {
+            due_after_ms: Some(1_000),
+            expire_after_ms: None,
+            escalation_target: Some("ops-oncall".to_string()),
+        },
+        AgentCheckpointSla {
+            due_after_ms: Some(1_000),
+            expire_after_ms: None,
+            escalation_target: None,
+        },
+        AgentCheckpointSla {
+            due_after_ms: None,
+            expire_after_ms: Some(5_000),
+            escalation_target: None,
+        },
+    ];
+    for sla in slas {
+        let fx = checkpointed_fixture_under(sla.clone());
+        park_on_approval(&fx).await;
+        let mut woken = 0;
+        loop {
+            let snapshot = snapshot_now(&fx).await;
+            assert_views_carry_the_record(&fx, &snapshot).await;
+            let before = stored_checkpoints(&fx).await;
+            let Some(at) = snapshot.next_wake else {
+                let far = AgentTimestampMillis::new(1_000_000_000);
+                let reply = fire_checkpoint_timers_at(&fx, far, "timer-far").await;
+                assert!(
+                    matches!(reply, AgentRunEntityReply::Unchanged { .. }),
+                    "{sla:?}: {reply:?}"
+                );
+                assert_eq!(
+                    stored_checkpoints(&fx).await,
+                    before,
+                    "{sla:?}: with nothing reported, no timer changes a checkpoint"
+                );
+                break;
+            };
+            woken += 1;
+            assert!(woken <= 2, "{sla:?}: one checkpoint wakes at most twice");
+            let reply = fire_checkpoint_timers_at(&fx, at, &format!("timer-{woken}")).await;
+            assert!(
+                matches!(reply, AgentRunEntityReply::Applied { .. }),
+                "{sla:?}: {reply:?}"
+            );
+            assert_ne!(
+                stored_checkpoints(&fx).await,
+                before,
+                "{sla:?}: the timer at next_wake acts on a checkpoint"
+            );
+        }
+    }
 }

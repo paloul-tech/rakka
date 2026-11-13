@@ -95,10 +95,10 @@ use crate::choreography::{
 use crate::decision_ledger::AgentDecisionLedger;
 use crate::definition::AgentRevisionNumber;
 use crate::effect::{
-    effect_id_for, AgentEffectError, AgentEffectGeneration, AgentEffectPolicies,
-    AgentEffectResolution, AgentEffectSpec, AgentMemoryPromotionRequest, AgentRunEffect,
-    AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
-    AgentRunEffectStatus, AgentToolResult, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
+    effect_id_for, AgentEffectError, AgentEffectGeneration, AgentEffectOutcomeSource,
+    AgentEffectPolicies, AgentEffectResolution, AgentEffectSpec, AgentMemoryPromotionRequest,
+    AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectRequest,
+    AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
 };
 use crate::identity::{
     AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
@@ -792,6 +792,22 @@ impl AgentRun {
             .effects()
             .iter()
             .any(|effect| &effect.effect_id == effect_id && effect.kind().outside_the_turn())
+    }
+
+    /// Whether the run's checkpoint timer sweep acts on `checkpoint`.
+    ///
+    /// A waiting checkpoint is swept on a live run. On a run that has ended,
+    /// only one bound to an effect held outside the turn (a memory promotion
+    /// or a claim append) is. Expiring any other would apply a failure to an
+    /// effect of a run that already ended, so it is left waiting.
+    ///
+    /// `fire_checkpoint_timers` and the operational snapshot's `next_wake`
+    /// both read this one predicate, so the snapshot never reports a deadline
+    /// the sweep skips (issue #127).
+    pub(crate) fn timer_sweep_acts_on(&self, checkpoint: &AgentCheckpoint) -> bool {
+        checkpoint.status.is_waiting()
+            && (!self.status.is_terminal()
+                || self.holds_outside_the_turn_effect(&checkpoint.bound_effect.effect_id))
     }
 
     /// Whether the record holds a park a binary before issue #106 left
@@ -4137,6 +4153,18 @@ fn evaluate_model_output(
     // ([specification 12](../../../docs/plans/rakka-agent/spec.md)). The
     // checkpoint and the effect commit in this one transition, so there is no
     // instant at which a gated effect exists without its gate.
+    //
+    // An effect held outside the turn (a memory promotion or a claim append)
+    // is skipped: its own command opened its gate in the transition that
+    // recorded it, and a gate the turn opened on one already denied would
+    // reopen a wait on a failed effect (issue #126).
+    //
+    // Only a `Pending` effect is gated here. A gated effect with no grant is
+    // never handed to the dispatcher, so an effect that still waits for its
+    // gate is always `Pending`; one that has settled waits for none. Without
+    // the check, a goal evaluation of this turn whose gate was denied or
+    // expired earlier in the turn would regain a gate on its failed effect,
+    // and the run would report an approval wait on it (issue #126).
     let gated: Vec<(AgentEffectId, AgentCheckpointKind)> = {
         let run = state.run_mut()?;
         run.loop_state
@@ -4144,19 +4172,14 @@ fn evaluate_model_output(
             .iter()
             .filter(|effect| {
                 effect.turn == turn
-                    && (effect.checkpoint_required || effect.authorization_required)
+                    && effect.is_pending()
+                    && !effect.kind().outside_the_turn()
                     && run.loop_state.grant_for(effect).is_none()
             })
-            .map(|effect| {
-                // A tool that requires both gates opens one security
-                // authorization: its resolution is an approval-family grant
-                // too, and the dispatch authority accepts it for either gate.
-                let kind = if effect.authorization_required {
-                    AgentCheckpointKind::SecurityAuthorization
-                } else {
-                    AgentCheckpointKind::Approval
-                };
-                (effect.effect_id.clone(), kind)
+            .filter_map(|effect| {
+                effect
+                    .gate_kind()
+                    .map(|kind| (effect.effect_id.clone(), kind))
             })
             .collect()
     };
@@ -4454,6 +4477,10 @@ fn build_proposal(
 /// completion unable to advance the loop twice
 /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md);
 /// [specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 10).
+/// A result that passes those fences but does not belong to the effect —
+/// another kind's success variant, or one naming another call, cell or
+/// generation — is refused `effect-outcome-mismatch` before anything changes
+/// (issue #125).
 #[allow(clippy::too_many_arguments)]
 fn record_effect_result(
     state: &mut AgentRunState,
@@ -4513,6 +4540,13 @@ fn record_effect_result(
             status: effect.status,
         });
     }
+    // After the stale fences, so a stale or duplicate delivery answers as it
+    // always has, whatever it carries; before the first mutation, so a result
+    // that belongs to another effect changes nothing. Applied, it would be
+    // read by its variant alone: a model turn would move the phase, a tool
+    // result would record under another call's id, and a receipt would
+    // settle another cell (issue #125).
+    effect.check_outcome(&outcome, AgentEffectOutcomeSource::Dispatcher)?;
     effect.record_attempt(attempt, fence);
 
     apply_effect_outcome(state, effect_id, &outcome, now)?;
@@ -5443,17 +5477,19 @@ fn drop_reconciliation_checkpoint(
 /// needs a fresh decision
 /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
+/// `ConfirmedExecuted` is refused `OutcomeMismatch` (`effect-outcome-mismatch`)
+/// unless its outcome settles the parked effect: the effect's own success
+/// variant, naming its own call, cell or generation, `Failed`, or
+/// `Exhausted`. Another outcome, such as a model turn or a goal evaluation,
+/// would move the run's phase or fill its goal-evaluation cell, so it is
+/// refused before anything changes, on a live run and an ended one alike.
+/// A confirmation that establishes nothing (`Indeterminate`, `Cancelled`, or
+/// the exhaustion that parked a handoff send) keeps `effect-policy-invalid`.
+///
 /// An ended run answers only an outside-the-turn effect it holds (a memory
 /// promotion or a claim append, whenever it parked); every other target is
 /// refused `Terminal`. A held one then meets the refusals a live run gives
-/// (stale generation, stale result). On an ended run `ConfirmedExecuted` is
-/// also refused `InvalidPolicy` (`effect-policy-invalid`) unless its outcome
-/// settles that effect: the effect's own success receipt (`MemoryPromotion`
-/// for a promotion, `ClaimAppend` for a claim append), `Failed`, or
-/// `Exhausted`. Another kind's outcome, such as a model turn or a goal
-/// evaluation, would move the ended run's phase or fill its goal-evaluation
-/// cell, so it is refused before anything changes. A live run keeps
-/// accepting whatever outcome it accepted before. On an ended run
+/// (stale generation, stale result, a foreign outcome). On an ended run
 /// `ConfirmedNotExecuted` is a person's assertion that the attempt never ran,
 /// so it takes the live arm and re-sends under a new generation rather than
 /// settling `Cancelled`; the run's status, terminal reason and terminal stamp
@@ -5520,37 +5556,17 @@ fn apply_indeterminate_resolution(
         }
         .into());
     }
-    // On an ended run a confirmation must settle the parked effect itself:
-    // its own success receipt (a promotion's or a claim append's), a
-    // definitive failure, or a spent retry budget. Any other outcome, such as
-    // a model turn or a goal evaluation, would be applied to the loop as if
-    // the run had produced it, moving the ended run's phase or owing its task
-    // an exchange, so it is refused before anything changes (issue #120).
-    if ended {
-        if let AgentEffectResolution::ConfirmedExecuted { outcome } = &resolution {
-            let kind = effect.kind();
-            let settles_the_effect = match outcome.as_ref() {
-                AgentRunEffectOutcome::MemoryPromotion { .. } => {
-                    kind == AgentRunEffectKind::MemoryPromotionCall
-                }
-                AgentRunEffectOutcome::ClaimAppend { .. } => {
-                    kind == AgentRunEffectKind::ClaimAppendCall
-                }
-                AgentRunEffectOutcome::Failed { .. } | AgentRunEffectOutcome::Exhausted { .. } => {
-                    true
-                }
-                _ => false,
-            };
-            if !settles_the_effect {
-                return Err(AgentEffectError::InvalidPolicy {
-                    message: format!(
-                        "an ended run's {kind} can be confirmed only with its own outcome, a \
-                         failure, or an exhaustion"
-                    ),
-                }
-                .into());
-            }
-        }
+    // A confirmation must settle the parked effect itself: its own success
+    // outcome, naming its own call, cell or generation, a definitive failure,
+    // or a spent retry budget. Any other outcome would be applied to the loop
+    // as if the effect had produced it, moving the run's phase, owing its
+    // task an exchange, or settling another cell, so it is refused
+    // `effect-outcome-mismatch` before anything changes, on every run. On an
+    // ended run, whose parked effect is a promotion or a claim append, it
+    // admits exactly what the ended-run rule of issue #120 admitted: the
+    // effect's own receipt, a failure, or an exhaustion (issue #125).
+    if let AgentEffectResolution::ConfirmedExecuted { outcome } = &resolution {
+        effect.check_outcome(outcome, AgentEffectOutcomeSource::Confirmation)?;
     }
 
     match resolution {
@@ -5645,14 +5661,7 @@ fn apply_indeterminate_resolution(
                 // ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)),
                 // so without a fresh checkpoint the new generation would sit
                 // undispatchable with no wait left to resolve.
-                let gate = if effect.authorization_required {
-                    Some(AgentCheckpointKind::SecurityAuthorization)
-                } else if effect.checkpoint_required {
-                    Some(AgentCheckpointKind::Approval)
-                } else {
-                    None
-                };
-                if let Some(kind) = gate {
+                if let Some(kind) = effect.gate_kind() {
                     open_effect_checkpoint(state, policies, effect_id, kind, now)?;
                 }
                 let run = state.run_mut()?;
@@ -5680,6 +5689,24 @@ fn apply_indeterminate_resolution(
 /// to be unknowable, parks the run in reconciliation. A run with such work, or
 /// a result proposal the task may already have decided, stays nonterminal
 /// until everything settles.
+///
+/// The cancel closes every waiting approval and authorization, and in the
+/// same transition it settles `Cancelled` every effect outside the turn (a
+/// memory promotion or a claim append) that is `Pending`, gated, and holds no
+/// grant for its generation (issue #126). The wind-down fence exempts both
+/// kinds, so without this such an effect would wait `Pending` behind a gate
+/// the cancel just closed, and hold the run `Cancelling` with nothing able to
+/// move it. It settles through [`apply_effect_outcome`], which releases its
+/// attempt reservation; it never dispatched, so it consumes no attempt. The
+/// rule reads the effect, not the checkpoint, so it also settles a record
+/// written before the command opened the gate, which holds such an effect
+/// with no gate at all. A granted effect is left alone: it is dispatchable,
+/// and rides the outbox as any exempt effect does on a winding-down run.
+///
+/// This keeps the invariant every path that closes such a gate holds: **a
+/// gated effect outside the turn that is `Pending` and ungranted always has a
+/// waiting gate.** A denial or expiry fails the effect, and a cancel cancels
+/// it.
 fn cancel(
     state: &mut AgentRunState,
     reason: String,
@@ -5714,6 +5741,31 @@ fn cancel(
         };
         run.loop_state.queue_decision(&scope, draft, now);
     }
+    // An ungranted gated effect outside the turn settles with its gate, which
+    // closed above if it had one: nothing can grant it now (issue #126).
+    let ungranted: Vec<AgentEffectId> = run
+        .loop_state
+        .effects()
+        .iter()
+        .filter(|effect| {
+            effect.kind().outside_the_turn()
+                && effect.is_pending()
+                && effect.gate_kind().is_some()
+                && run.loop_state.grant_for(effect).is_none()
+        })
+        .map(|effect| effect.effect_id.clone())
+        .collect();
+    for effect_id in &ungranted {
+        apply_effect_outcome(
+            state,
+            effect_id,
+            &AgentRunEffectOutcome::Cancelled {
+                reason: "run-cancelled".to_string(),
+            },
+            now,
+        )?;
+    }
+    let run = state.run_mut()?;
     if run.terminal_reason.is_none() {
         run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
             reason: bounded_detail(reason),
@@ -6115,8 +6167,11 @@ fn resolve_checkpoint(
             // pass now finds its grant and hands it to the sink. Another gated
             // effect may still hold the run on its own wait. An ended run's
             // status never moves: its gated effect rides the outbox without a
-            // wait status.
-            if !run.status.is_terminal() {
+            // wait status. Nor does a grant for an effect held outside the
+            // turn (a memory promotion or a claim append) move a live run's:
+            // that gate was never the run's wait, so whatever the run waited
+            // on, it still waits on (issue #126).
+            if !run.status.is_terminal() && !run.holds_outside_the_turn_effect(&bound_effect_id) {
                 run.status = checkpoint_wait_status(&run.loop_state);
             }
             state.updated_at = now;
@@ -6376,6 +6431,36 @@ fn check_post_terminal_memory_window(
     Ok(())
 }
 
+/// Opens the gate the deployment's spec configured for the memory promotion
+/// or claim append a command just recorded, in that command's own transition
+/// (issue #126). The gate's kind is the recorded effect's
+/// [`AgentRunEffect::gate_kind`]; an ungated effect opens nothing.
+///
+/// Such an effect is outside the turn: no later turn opens its gate, and the
+/// gate is never the run's wait, so nothing here writes the status or the
+/// phase. The same code runs on a live run and on one that has ended, where
+/// [`open_effect_checkpoint`] drops the decisions an ended run refuses. A run
+/// already holding the most open checkpoints it may refuses the command with
+/// `effect-pending-overflow`, and the whole transition is discarded with it.
+fn open_commanded_gate(
+    state: &mut AgentRunState,
+    policies: &AgentEffectPolicies,
+    effect_id: &AgentEffectId,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let gate = state.run().and_then(|run| {
+        run.loop_state
+            .effects()
+            .iter()
+            .find(|effect| &effect.effect_id == effect_id)
+            .and_then(AgentRunEffect::gate_kind)
+    });
+    if let Some(kind) = gate {
+        open_effect_checkpoint(state, policies, effect_id, kind, now)?;
+    }
+    Ok(())
+}
+
 /// Commits one memory-promotion effect from a deduplicated command
 /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -6387,7 +6472,10 @@ fn check_post_terminal_memory_window(
 /// The run's status and phase do not move — a promotion is not part of the
 /// turn, and whatever wait the run held, it still holds; the settle pass
 /// flushes owed session entries before dispatching effects, so the selection
-/// is durably in the store before the executor reads it.
+/// is durably in the store before the executor reads it. A promotion the
+/// deployment's spec gates opens its approval or authorization in this same
+/// transition ([`open_commanded_gate`]), so it is never `Pending` without the
+/// gate a person can answer.
 ///
 /// A promotion is not new work but a copy of work already recorded, so the
 /// wind-down does not fence it and a run that has ended still accepts it for
@@ -6467,7 +6555,9 @@ fn promote_memory(
     let slot = unresolved_effect_slot(state, turn, slot)?;
     let run = state.run_mut()?;
     let effect = AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
+    let effect_id = effect.effect_id.clone();
     run.loop_state.record_effect(effect)?;
+    open_commanded_gate(state, policies, &effect_id, now)?;
     state.updated_at = now;
     Ok(())
 }
@@ -6482,7 +6572,9 @@ fn promote_memory(
 /// re-checks per attempt — stamps the provenance from durable state alone,
 /// reserves the append's attempt budget, and records the effect. The
 /// dispatcher-side executor performs the store append inside its bounded
-/// attempt.
+/// attempt. An append the deployment's spec gates opens its approval or
+/// authorization in this same transition ([`open_commanded_gate`]), and the
+/// run's status and phase do not move.
 ///
 /// Like a promotion, an append is a record *about* the run's work rather than
 /// the work, so the wind-down does not fence it and a run that has ended
@@ -6546,7 +6638,9 @@ fn append_claim(
     let slot = unresolved_effect_slot(state, turn, slot)?;
     let run = state.run_mut()?;
     let effect = AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
+    let effect_id = effect.effect_id.clone();
     run.loop_state.record_effect(effect)?;
+    open_commanded_gate(state, policies, &effect_id, now)?;
     state.updated_at = now;
     Ok(())
 }
@@ -6556,10 +6650,13 @@ fn append_claim(
 ///
 /// The transition is bounded and performs no I/O: it fences, reserves the
 /// evaluation's attempt budget, and records the read-only effect — the
-/// promotion idiom. The run's status and phase do not move; a human review
-/// additionally opens the approval checkpoint whose grant is its verdict, in
-/// this same compare-and-set, so the effect stays `Pending` until an
-/// authorized decision exists.
+/// promotion idiom. The run's status and phase do not move. An evaluation
+/// whose spec gates it also opens its gate in this same compare-and-set, so
+/// the effect stays `Pending` until an authorized decision exists; a human
+/// review always does, because its grant is its verdict. The gate's kind is
+/// the effect's [`AgentRunEffect::gate_kind`]: a security authorization when
+/// the spec requires authorization, with or without a checkpoint, else an
+/// approval (issue #126).
 ///
 /// The fences, in order: a terminal or winding-down run evaluates nothing
 /// (`run-goal-evaluation-fenced` — an evaluation is new work); the request's
@@ -6582,7 +6679,7 @@ fn evaluate_goal(
     use crate::evaluation::AgentGoalEvaluationMethod;
 
     let scope = state.scope.clone();
-    let checkpoint_owed = {
+    let gate_owed = {
         let run = state.run_mut()?;
         if run.status.is_terminal() {
             return Err(AgentRunError::Terminal { status: run.status });
@@ -6639,7 +6736,7 @@ fn evaluate_goal(
         let effect =
             AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
         let effect_id = effect.effect_id.clone();
-        let checkpoint_owed = effect.checkpoint_required;
+        let gate = effect.gate_kind();
         run.loop_state.record_effect(effect)?;
         run.loop_state.queue_decision(
             &scope,
@@ -6650,16 +6747,10 @@ fn evaluate_goal(
             ),
             now,
         );
-        checkpoint_owed.then_some(effect_id)
+        gate.map(|kind| (effect_id, kind))
     };
-    if let Some(effect_id) = checkpoint_owed {
-        open_effect_checkpoint(
-            state,
-            policies,
-            &effect_id,
-            AgentCheckpointKind::Approval,
-            now,
-        )?;
+    if let Some((effect_id, kind)) = gate_owed {
+        open_effect_checkpoint(state, policies, &effect_id, kind, now)?;
     }
     state.updated_at = now;
     Ok(())
@@ -6690,20 +6781,16 @@ fn fire_checkpoint_timers(
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     // Collect the ids first: applying an expiration mutates the effect list and
-    // the checkpoint set, so the sweep works from a stable snapshot of ids. An
-    // ended run keeps only the checkpoints bound to an effect held outside the
-    // turn.
+    // the checkpoint set, so the sweep works from a stable snapshot of ids.
+    // Which checkpoints it acts on is `timer_sweep_acts_on`, the predicate the
+    // operational snapshot's `next_wake` reads too.
     let checkpoint_ids: Vec<HumanCheckpointId> = state
         .run()
         .map(|run| {
-            let ended = run.status.is_terminal();
             run.loop_state
                 .open_checkpoints()
                 .iter()
-                .filter(|checkpoint| checkpoint.status.is_waiting())
-                .filter(|checkpoint| {
-                    !ended || run.holds_outside_the_turn_effect(&checkpoint.bound_effect.effect_id)
-                })
+                .filter(|checkpoint| run.timer_sweep_acts_on(checkpoint))
                 .map(|checkpoint| checkpoint.checkpoint_id.clone())
                 .collect()
         })
@@ -8034,19 +8121,27 @@ where
             } => {
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
-                self.transition(now, records_decision, move |state| {
-                    resolve_indeterminate_effect(
-                        state,
-                        &effect_id,
-                        generation,
-                        *resolution,
-                        &policy,
-                        &policies,
-                        now,
-                    )?;
-                    Ok(operation_id)
-                })
-                .await?
+                // A `ConfirmedNotExecuted` re-sends a gated effect behind the
+                // new generation's gate, opened in this transition: its
+                // `checkpoint-open` segment closes once it commits, as the
+                // `PromoteMemory` arm's does (issue #126).
+                let marks = self.current_segment_marks();
+                let reply = self
+                    .transition(now, records_decision, move |state| {
+                        resolve_indeterminate_effect(
+                            state,
+                            &effect_id,
+                            generation,
+                            *resolution,
+                            &policy,
+                            &policies,
+                            now,
+                        )?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                self.close_checkpoint_open_segments_since(&marks, now);
+                reply
             }
             AgentRunEntityCommand::ResolveCheckpoint {
                 operation_id,
@@ -8057,20 +8152,26 @@ where
             } => {
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
-                self.transition(now, records_decision, move |state| {
-                    resolve_checkpoint(
-                        state,
-                        &checkpoint_id,
-                        resolver,
-                        *decision,
-                        operation_id.clone(),
-                        &policy,
-                        &policies,
-                        now,
-                    )?;
-                    Ok(operation_id)
-                })
-                .await?
+                // As above: a reconciliation decision that re-sends a gated
+                // effect opens the new generation's gate here.
+                let marks = self.current_segment_marks();
+                let reply = self
+                    .transition(now, records_decision, move |state| {
+                        resolve_checkpoint(
+                            state,
+                            &checkpoint_id,
+                            resolver,
+                            *decision,
+                            operation_id.clone(),
+                            &policy,
+                            &policies,
+                            now,
+                        )?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                self.close_checkpoint_open_segments_since(&marks, now);
+                reply
             }
             AgentRunEntityCommand::FireCheckpointTimers { operation_id } => {
                 if let Some(unchanged) = self.unchanged_by(fire_checkpoint_timers, now)? {
@@ -8138,39 +8239,57 @@ where
                 })
                 .await?
             }
+            // The three commands that record an effect and open its gate in
+            // their own transition (issue #126) close that gate's
+            // `checkpoint-open` segment once it commits, as the loop advance
+            // and the `RecordEffectResult` arm do: see
+            // [`Self::close_checkpoint_open_segments_since`]. A replay never
+            // reaches these arms, so it exports nothing.
             AgentRunEntityCommand::PromoteMemory {
                 operation_id,
                 promotion,
             } => {
                 let policies = self.policies.clone();
                 let session_wired = self.memory.is_some();
-                self.transition(now, records_decision, move |state| {
-                    promote_memory(state, *promotion, session_wired, &policies, now)?;
-                    Ok(operation_id)
-                })
-                .await?
+                let marks = self.current_segment_marks();
+                let reply = self
+                    .transition(now, records_decision, move |state| {
+                        promote_memory(state, *promotion, session_wired, &policies, now)?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                self.close_checkpoint_open_segments_since(&marks, now);
+                reply
             }
             AgentRunEntityCommand::AppendClaim {
                 operation_id,
                 append,
             } => {
                 let policies = self.policies.clone();
-                self.transition(now, records_decision, move |state| {
-                    append_claim(state, *append, &policies, now)?;
-                    Ok(operation_id)
-                })
-                .await?
+                let marks = self.current_segment_marks();
+                let reply = self
+                    .transition(now, records_decision, move |state| {
+                        append_claim(state, *append, &policies, now)?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                self.close_checkpoint_open_segments_since(&marks, now);
+                reply
             }
             AgentRunEntityCommand::EvaluateGoal {
                 operation_id,
                 evaluation,
             } => {
                 let policies = self.policies.clone();
-                self.transition(now, records_decision, move |state| {
-                    evaluate_goal(state, *evaluation, &policies, now)?;
-                    Ok(operation_id)
-                })
-                .await?
+                let marks = self.current_segment_marks();
+                let reply = self
+                    .transition(now, records_decision, move |state| {
+                        evaluate_goal(state, *evaluation, &policies, now)?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                self.close_checkpoint_open_segments_since(&marks, now);
+                reply
             }
         };
 
@@ -8976,6 +9095,50 @@ where
                 };
             self.close_segment_linked(segment, links);
         }
+    }
+
+    /// The marks a command's transition is measured against, read from the
+    /// cached record before the transition: [`segment_marks`] of its loop
+    /// state, or none when the run has no loop yet.
+    fn current_segment_marks(&self) -> AgentSegmentMarks {
+        self.state()
+            .ok()
+            .and_then(|state| state.loop_state().map(segment_marks))
+            .unwrap_or_default()
+    }
+
+    /// Closes one `checkpoint-open` segment per checkpoint a committed command
+    /// transition opened, diffed by identity against `marks` read before it
+    /// ([`Self::current_segment_marks`]), so a gate already open is not
+    /// exported again.
+    ///
+    /// The `PromoteMemory`, `AppendClaim` and `EvaluateGoal` arms call it after
+    /// their transition commits, and so do the `ResolveIndeterminateEffect`
+    /// and `ResolveCheckpoint` arms, whose `ConfirmedNotExecuted` re-sends a
+    /// gated effect behind the new generation's gate (issue #126). Without it
+    /// the gate those commands open would park without its segment, and the
+    /// gate's later resolution would link a parked span that was never
+    /// exported
+    /// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md)). The
+    /// two halves are synchronous, around the arm's own `transition` call,
+    /// rather than an async wrapper: a wrapper grows
+    /// [`Self::apply_command`]'s future (it holds the transition closure a
+    /// second time).
+    fn close_checkpoint_open_segments_since(
+        &self,
+        marks: &AgentSegmentMarks,
+        now: AgentTimestampMillis,
+    ) {
+        let opened = self
+            .state()
+            .ok()
+            .and_then(|state| {
+                state
+                    .loop_state()
+                    .map(|loop_state| segment_additions(loop_state, marks).1)
+            })
+            .unwrap_or_default();
+        self.close_checkpoint_open_segments(opened, now);
     }
 
     /// The checkpoint `command` resolves, when it is one of the two resolution

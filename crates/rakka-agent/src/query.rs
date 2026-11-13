@@ -779,7 +779,14 @@ pub struct AgentOperationalSnapshot {
     /// The bounded label of the wait the run is in, when it is waiting.
     pub wait_reason: Option<String>,
     /// The earliest durable checkpoint deadline that will wake the run, when
-    /// one is set. No agent run enters `WaitingForTimer`: a run waits on
+    /// one is set: the earliest [`AgentCheckpoint::next_timer_deadline`] over
+    /// the checkpoints the run's timer sweep acts on (issue #127). A due time
+    /// already spent by escalation, a due time with no escalation target, an
+    /// expiry on a reconciliation checkpoint, and any deadline on a checkpoint
+    /// an ended run's sweep skips are not reported; the checkpoint views
+    /// still carry them as the record holds them. A deadline that has passed
+    /// but that no timer has fired yet is still reported, because the next
+    /// timer acts on it. No agent run enters `WaitingForTimer`: a run waits on
     /// checkpoints, effects, children and handoffs, and timer wakes belong to
     /// the wake controller's epochs on the task, not to the run, so no timer
     /// occurrence ever appears here.
@@ -852,9 +859,8 @@ impl AgentOperationalSnapshot {
                     .open_checkpoints()
                     .iter()
                     // Only checkpoints the run is genuinely waiting on: a
-                    // resolved-but-not-yet-dropped one is not a live wait, and
-                    // its deadline must not surface as a `next_wake` — the same
-                    // `is_waiting` gate `has_open_checkpoint` uses.
+                    // resolved-but-not-yet-dropped one is not a live wait —
+                    // the same `is_waiting` gate `has_open_checkpoint` uses.
                     .filter(|checkpoint| checkpoint.status.is_waiting())
                     .map(|checkpoint: &AgentCheckpoint| {
                         // A checkpoint opened while the run was live keeps
@@ -885,11 +891,17 @@ impl AgentOperationalSnapshot {
                     .collect()
             })
             .unwrap_or_default();
-        let next_wake = open_checkpoints
-            .iter()
-            .flat_map(|checkpoint| [checkpoint.due_at, checkpoint.expires_at])
-            .flatten()
-            .min();
+        // Read from the records, not the views: only a deadline the run's
+        // timer sweep will act on is a wake (issue #127). The views above
+        // keep every deadline as the record holds it.
+        let next_wake = run.and_then(|run| {
+            run.loop_state
+                .open_checkpoints()
+                .iter()
+                .filter(|checkpoint| run.timer_sweep_acts_on(checkpoint))
+                .filter_map(AgentCheckpoint::next_timer_deadline)
+                .min()
+        });
         let wait_reason = run.and_then(|run| {
             run.status
                 .is_waiting()

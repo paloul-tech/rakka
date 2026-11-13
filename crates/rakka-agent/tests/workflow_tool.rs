@@ -1007,6 +1007,138 @@ async fn a_mismatched_start_receipt_settles_the_cell_failed_and_the_run_survives
     );
 }
 
+/// The held start effects whose cells the run holds, and those cells, read
+/// from durable state.
+async fn held_starts(
+    fixture: &Fixture,
+) -> (
+    Vec<AgentRunEffect>,
+    std::collections::BTreeMap<
+        rakka_agent::AgentWorkflowInvocationId,
+        Box<rakka_agent::AgentWorkflowInvocationCell>,
+    >,
+) {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let loop_state = state.loop_state().expect("loop state");
+    let starts = loop_state
+        .effects()
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect.request,
+                rakka_agent::AgentRunEffectRequest::WorkflowStart { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    (starts, loop_state.workflow_invocations().clone())
+}
+
+/// Delivers `receipt` as the dispatcher's result for `effect`.
+async fn deliver_start_receipt(
+    fixture: &Fixture,
+    effect: &AgentRunEffect,
+    receipt: rakka_agent::AgentWorkflowStartReceipt,
+) -> Result<rakka_agent::AgentRunEntityReply, rakka_agent::AgentRunError> {
+    let command = AgentRunEntityCommand::RecordEffectResult {
+        operation_id: effect.result_operation_id(&run_scope()).expect("derives"),
+        effect_id: effect.effect_id.clone(),
+        generation: effect.generation,
+        attempt: effect.attempts.saturating_add(1),
+        fence: 0,
+        outcome: Box::new(rakka_agent::AgentRunEffectOutcome::WorkflowStart { receipt }),
+    };
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.apply(command, &fixture.router, fixture.now()).await
+}
+
+/// Issue #125: a start receipt naming another held invocation settles
+/// neither start. Two invocations are in flight; invocation A's receipt,
+/// delivered to invocation B's start, is refused `effect-outcome-mismatch`
+/// before anything changes, and neither cell moves. Before the guard, B's
+/// start settled and cell A took the child. A receipt naming the right
+/// invocation and the wrong child run is not the guard's business: it still
+/// settles that cell `Failed { workflow-start-run-mismatch }`.
+#[tokio::test]
+async fn a_foreign_outcome_does_not_settle_a_workflow_start() {
+    let executor = RecordingWorkflowExecutor::new(StartMode::Started);
+    let turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Invoking the refund workflow twice and awaiting both.")
+        .with_tool_call(workflow_call("invoke-1"))
+        .with_tool_call(workflow_call("invoke-2"))
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({}),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let fixture = workflow_fixture(executor, turn);
+    create_workflow_task(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+
+    let (starts, cells_before) = held_starts(&fixture).await;
+    assert_eq!(starts.len(), 2, "both starts are committed");
+    assert_eq!(cells_before.len(), 2);
+    assert!(cells_before
+        .values()
+        .all(|cell| cell.status == AgentWorkflowInvocationStatus::Pending));
+    let invocation_of = |effect: &AgentRunEffect| match &effect.request {
+        rakka_agent::AgentRunEffectRequest::WorkflowStart { invocation } => {
+            invocation.invocation.clone()
+        }
+        other => panic!("not a start: {other:?}"),
+    };
+    let (start_a, start_b) = (&starts[0], &starts[1]);
+    let (invocation_a, invocation_b) = (invocation_of(start_a), invocation_of(start_b));
+    assert_ne!(invocation_a, invocation_b);
+
+    let refusal = deliver_start_receipt(
+        &fixture,
+        start_b,
+        rakka_agent::AgentWorkflowStartReceipt {
+            child_run: child_workflow_run_id(&invocation_a),
+            invocation: invocation_a.clone(),
+            adopted: false,
+        },
+    )
+    .await
+    .expect_err("another invocation's receipt settles nothing");
+    assert_eq!(refusal.code(), "effect-outcome-mismatch", "{refusal}");
+    let (starts_after, cells_after) = held_starts(&fixture).await;
+    assert_eq!(cells_after, cells_before, "neither cell moved");
+    assert_eq!(starts_after, starts, "neither start moved");
+
+    // The right invocation, the wrong child run: the cell settles failed.
+    deliver_start_receipt(
+        &fixture,
+        start_b,
+        rakka_agent::AgentWorkflowStartReceipt {
+            invocation: invocation_b.clone(),
+            child_run: rakka_agent_workflow::AgentRunId::new("foreign-run"),
+            adopted: false,
+        },
+    )
+    .await
+    .expect("the mismatched receipt applies as a definitive disposition");
+    let (_, cells) = held_starts(&fixture).await;
+    assert_eq!(
+        cells.get(&invocation_b).expect("cell B is held").status,
+        AgentWorkflowInvocationStatus::Failed {
+            code: "workflow-start-run-mismatch".to_string()
+        }
+    );
+    assert_eq!(
+        cells.get(&invocation_a),
+        cells_before.get(&invocation_a),
+        "cell A is unmoved"
+    );
+}
+
 /// A cancelled parent records a late workflow result as evidence and resumes
 /// nothing.
 #[tokio::test]

@@ -1163,6 +1163,65 @@ async fn settle(fx: &Fixture) {
         .expect("settle");
 }
 
+/// Issue #125: a memory promotion's receipt does not settle a claim append.
+/// Delivered to the in-flight append, it is refused `effect-outcome-mismatch`
+/// before anything changes: the append stays outstanding, no promotion
+/// receipt lands on the loop, and the run's wait does not move. Before the
+/// guard the append settled `Succeeded` with a promotion receipt beside it.
+#[tokio::test]
+async fn a_foreign_outcome_does_not_settle_a_claim_append() {
+    let fx = scripted_goal_fixture(RecordingClaimAppendExecutor::new()).await;
+    settle(&fx).await;
+    apply_append(&fx, "append-foreign", append_request("space-alpha"))
+        .await
+        .expect("the append applies");
+    settle(&fx).await;
+    let append = dispatched_effect(&fx, AgentRunEffectKind::ClaimAppendCall).await;
+    let resting = resting_at(&fx).await;
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let refusal = run
+        .apply(
+            AgentRunEntityCommand::RecordEffectResult {
+                operation_id: append
+                    .result_operation_id(&common::run_scope())
+                    .expect("the result operation id derives"),
+                effect_id: append.effect_id.clone(),
+                generation: append.generation,
+                attempt: append.attempts.saturating_add(1),
+                fence: 0,
+                outcome: Box::new(AgentRunEffectOutcome::MemoryPromotion {
+                    promoted: Vec::new(),
+                }),
+            },
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .expect_err("a promotion's receipt settles no claim append");
+    assert_eq!(refusal.code(), "effect-outcome-mismatch", "{refusal}");
+    drop(run);
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let held = committed_append(state)
+        .into_iter()
+        .find(|held| held.effect_id == append.effect_id)
+        .expect("the append is held");
+    assert_eq!(held, append, "the append is unmoved");
+    assert!(
+        state
+            .loop_state()
+            .expect("the loop is started")
+            .memory_promotions()
+            .is_empty(),
+        "no promotion receipt landed"
+    );
+    assert_eq!(resting_at(&fx).await, resting, "the run's wait is unmoved");
+}
+
 /// A goal world whose first turn calls a tool that answers, cranked to that
 /// tool's wait with an append committed beside it, both dispatched: the
 /// exact state a sweep that claims into live runs produces. Returns the tool
@@ -1288,4 +1347,264 @@ async fn a_claim_append_resolving_before_the_tool_result_rests_nothing() {
     fx.pump().await.expect("the loop runs to completion");
     let run = fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+// ===========================================================================
+// A gated claim append opens its gate at the command, outside the turn
+// (issue #126).
+// ===========================================================================
+
+/// Where the run waits: its phase, status and turn, whatever effects it
+/// holds outstanding.
+async fn wait_of(fx: &Fixture) -> (rakka_agent::AgentLoopPhase, AgentRunStatus, u64) {
+    let (phase, status, turn, _) = resting_at(fx).await;
+    (phase, status, turn)
+}
+
+/// A deployment that gates claim appends: the `AppendClaim` command opens the
+/// gate its spec configured in the command's own transition, on a live run
+/// and on an ended one: an `Approval` for a checkpoint, a
+/// `SecurityAuthorization` for an authorization. The gate moves no status,
+/// phase or terminal record, and a grant dispatches the append and lands the
+/// claim.
+#[tokio::test]
+async fn a_gated_claim_append_by_command_opens_its_gate() {
+    let gates = [
+        (
+            rakka_agent::AgentEffectSpec::idempotent(3)
+                .expect("the spec is valid")
+                .with_checkpoint_required(),
+            AgentCheckpointKind::Approval,
+        ),
+        (
+            rakka_agent::AgentEffectSpec::idempotent(3)
+                .expect("the spec is valid")
+                .with_authorization_required(),
+            AgentCheckpointKind::SecurityAuthorization,
+        ),
+    ];
+    for ended in [false, true] {
+        for (spec, kind) in gates.clone() {
+            let at = format!("ended: {ended}, {kind:?}");
+            let executor = RecordingClaimAppendExecutor::new();
+            let mut fx = if ended {
+                ended_goal_world(Ending::Completed, executor.clone()).await
+            } else {
+                let fx = scripted_goal_fixture(executor.clone()).await;
+                settle(&fx).await;
+                fx
+            };
+            fx.policies = rakka_agent::AgentEffectPolicies::new()
+                .with_claim_append_spec(spec)
+                .expect("the policies are valid");
+            let before = fx.run_snapshot().await.expect("the run exists");
+            let resting = wait_of(&fx).await;
+
+            let reply = apply_append(&fx, "gated", append_request("space-alpha"))
+                .await
+                .unwrap_or_else(|error| panic!("{at}: the append applies: {error}"));
+            assert!(matches!(reply, AgentRunEntityReply::Applied { .. }), "{at}");
+            common::assert_gate_invariant(&fx).await;
+            let append = {
+                let mut run = fx.run();
+                run.recover(fx.now()).await.expect("recover");
+                let appends = committed_append(run.state().expect("state"));
+                assert_eq!(appends.len(), 1, "{at}: one append");
+                appends.into_iter().next().expect("one append")
+            };
+            assert_eq!(append.status, AgentRunEffectStatus::Pending, "{at}");
+            let open = {
+                let mut run = fx.run();
+                run.recover(fx.now()).await.expect("recover");
+                run.state()
+                    .expect("state")
+                    .loop_state()
+                    .expect("the loop is started")
+                    .open_checkpoints()
+                    .to_vec()
+            };
+            assert_eq!(open.len(), 1, "{at}: the command opened one gate");
+            let gate: &AgentCheckpoint = &open[0];
+            assert_eq!(gate.kind, kind, "{at}");
+            assert_eq!(gate.bound_effect.effect_id, append.effect_id, "{at}");
+            assert_eq!(gate.bound_effect.generation, append.generation, "{at}");
+            assert_eq!(wait_of(&fx).await, resting, "{at}: the command");
+
+            let mut run = fx.run();
+            run.recover(fx.now()).await.expect("recover");
+            let reply = run
+                .apply(
+                    AgentRunEntityCommand::ResolveCheckpoint {
+                        operation_id: AgentOperationId::for_agent(
+                            AgentOperationKind::CheckpointResolution,
+                            &common::agent_scope(),
+                            "grant",
+                        )
+                        .expect("the decision key derives"),
+                        checkpoint_id: gate.checkpoint_id.clone(),
+                        resolver: PrincipalRef {
+                            principal_type: "service".to_string(),
+                            principal_id: "claims-reviewer".to_string(),
+                            display_name: None,
+                        },
+                        decision: Box::new(rakka_agent::AgentCheckpointDecision::Approval(
+                            rakka_agent::AgentApprovalDecision::Approve {
+                                credential_binding: None,
+                                expires_at: AgentTimestampMillis::new(u64::MAX / 2),
+                                allowed_use_count: 1,
+                            },
+                        )),
+                        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+                    },
+                    &fx.router,
+                    fx.now(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{at}: the grant applies: {error}"));
+            drop(run);
+            assert!(matches!(reply, AgentRunEntityReply::Applied { .. }), "{at}");
+            common::assert_gate_invariant(&fx).await;
+            assert_eq!(wait_of(&fx).await, resting, "{at}: the grant");
+
+            if ended {
+                fx.pump_post_terminal(AgentRunEffectKind::ClaimAppendCall)
+                    .await
+                    .unwrap_or_else(|error| panic!("{at}: {error}"));
+            } else {
+                let resolved = answer_append(&fx, &append).await;
+                assert_eq!(resolved.status, AgentRunEffectStatus::Succeeded, "{at}");
+            }
+            common::assert_gate_invariant(&fx).await;
+            assert_eq!(executor.invocations().len(), 1, "{at}: the claim landed");
+            let mut run = fx.run();
+            run.recover(fx.now()).await.expect("recover");
+            let appends = committed_append(run.state().expect("state"));
+            assert_eq!(
+                appends[0].status,
+                AgentRunEffectStatus::Succeeded,
+                "{at}: the append succeeded"
+            );
+            drop(run);
+            assert_eq!(wait_of(&fx).await, resting, "{at}: the receipt");
+            let after = fx.run_snapshot().await.expect("the run exists");
+            assert_eq!(after.status, before.status, "{at}: status");
+            assert_eq!(
+                after.terminal_reason, before.terminal_reason,
+                "{at}: reason"
+            );
+            assert_eq!(after.terminal_at, before.terminal_at, "{at}: stamp");
+        }
+    }
+}
+
+/// The claim half of the cancel rule (issue #126): a `Cancel` with a gated
+/// claim append's gate open settles the append `Cancelled` with its gate, in
+/// the cancel's own transition. The gate is cancelled, the append never
+/// dispatched, and no claim lands. Once turn one's model call settles, the
+/// run ends `Cancelled`.
+#[tokio::test]
+async fn a_cancel_settles_a_gated_claim_append_with_its_gate() {
+    let gates = [
+        (
+            rakka_agent::AgentEffectSpec::idempotent(3)
+                .expect("the spec is valid")
+                .with_checkpoint_required(),
+            AgentCheckpointKind::Approval,
+        ),
+        (
+            rakka_agent::AgentEffectSpec::idempotent(3)
+                .expect("the spec is valid")
+                .with_authorization_required(),
+            AgentCheckpointKind::SecurityAuthorization,
+        ),
+    ];
+    for (spec, kind) in gates {
+        let at = format!("{kind:?}");
+        let executor = RecordingClaimAppendExecutor::new();
+        let mut fx = scripted_goal_fixture(executor.clone()).await;
+        settle(&fx).await;
+        fx.policies = rakka_agent::AgentEffectPolicies::new()
+            .with_claim_append_spec(spec)
+            .expect("the policies are valid");
+
+        let reply = apply_append(&fx, "gated", append_request("space-alpha"))
+            .await
+            .unwrap_or_else(|error| panic!("{at}: the append applies: {error}"));
+        assert!(matches!(reply, AgentRunEntityReply::Applied { .. }), "{at}");
+        common::assert_gate_invariant(&fx).await;
+        let gate = {
+            let mut run = fx.run();
+            run.recover(fx.now()).await.expect("recover");
+            let open = run
+                .state()
+                .expect("state")
+                .loop_state()
+                .expect("the loop is started")
+                .open_checkpoints()
+                .to_vec();
+            assert_eq!(open.len(), 1, "{at}: the command opened one gate");
+            open.into_iter().next().expect("one gate")
+        };
+        assert_eq!(gate.kind, kind, "{at}");
+
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        let reply = run
+            .apply(
+                AgentRunEntityCommand::Cancel {
+                    operation_id: AgentOperationId::new(
+                        AgentOperationKind::Cancellation,
+                        [common::TENANT, common::AGENT, "1"],
+                    )
+                    .expect("the operation id derives"),
+                    reason: "operator stopped the work".to_string(),
+                },
+                &fx.router,
+                fx.now(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{at}: the cancel applies: {error}"));
+        drop(run);
+        assert!(matches!(reply, AgentRunEntityReply::Applied { .. }), "{at}");
+        common::assert_gate_invariant(&fx).await;
+
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        let state = run.state().expect("state");
+        let closed = state
+            .loop_state()
+            .expect("the loop is started")
+            .open_checkpoints()
+            .iter()
+            .find(|held| held.checkpoint_id == gate.checkpoint_id)
+            .map(|held| held.status);
+        assert_eq!(
+            closed,
+            Some(rakka_agent::AgentCheckpointStatus::Cancelled),
+            "{at}: the gate is cancelled"
+        );
+        let appends = committed_append(state);
+        assert_eq!(appends.len(), 1, "{at}: one append");
+        assert_eq!(
+            appends[0].status,
+            AgentRunEffectStatus::Cancelled,
+            "{at}: the append is settled with its gate"
+        );
+        assert_eq!(appends[0].attempts, 0, "{at}: it never dispatched");
+        drop(run);
+        assert_eq!(
+            fx.run_snapshot().await.expect("the run exists").status,
+            AgentRunStatus::Cancelling,
+            "{at}: the model call in flight still holds the run"
+        );
+
+        drive(&fx).await;
+        common::assert_gate_invariant(&fx).await;
+        assert_eq!(
+            fx.run_snapshot().await.expect("the run exists").status,
+            AgentRunStatus::Cancelled,
+            "{at}: nothing holds the run once the model call settles"
+        );
+        assert!(executor.invocations().is_empty(), "{at}: no claim landed");
+    }
 }

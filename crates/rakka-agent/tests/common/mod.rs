@@ -2614,6 +2614,65 @@ impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAutho
     }
 }
 
+/// An [`AgentDispatchAuthority`] decorator that grants a tool intent's call
+/// under another call id: on a `Granted` decision for a tool intent, the
+/// granted call is a copy of the intent's call with the id `relabelled-call`.
+///
+/// `AgentGrantedDispatch::tool_call` is a public field, so a custom authority
+/// that transforms a call need not keep its id. This is that authority.
+pub struct RelabelingAuthority<Inner>(pub Inner);
+
+impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for RelabelingAuthority<Inner> {
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        let inner = self.0.authorize(scope, run, intent, attempt, now);
+        Box::pin(async move {
+            match (inner.await?, &intent.request) {
+                (
+                    AgentDispatchDecision::Granted(mut granted),
+                    rakka_agent::AgentRunEffectRequest::Tool { call },
+                ) => {
+                    let mut relabelled: Box<AgentToolCallRequest> = call.clone();
+                    relabelled.call_id =
+                        AgentToolCallId::new("relabelled-call").expect("the call id is valid");
+                    granted.tool_call = Some(relabelled);
+                    Ok(AgentDispatchDecision::Granted(granted))
+                }
+                (decision, _) => Ok(decision),
+            }
+        })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a rakka_agent::AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentToolResponseDecision> {
+        // A wrapper forwards the boundary: the chain it wraps is the one that
+        // must run.
+        self.0.review_tool_response(scope, intent, tool, content)
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: rakka_agent::AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentModelResponseDecision> {
+        // A wrapper forwards the boundary: the chain it wraps is the one that
+        // must run.
+        self.0.review_model_response(scope, intent, turn)
+    }
+}
+
 /// A gate that answers one fixed refusal for every intent.
 ///
 /// The refusal's code and message are *application*-authored on the real
@@ -3806,4 +3865,45 @@ pub fn assert_decision_stream_whole(sink: &CountingDecisionSink, scope: &AgentRu
     let expected: Vec<u64> = (1..=sequences.len() as u64).collect();
     assert_eq!(sequences, expected, "the decision sequences must be 1..=n");
     assert_eq!(sink.duplicates(), 0, "no append may answer Duplicate");
+}
+
+/// Asserts the gate invariant of issue #126: every gated effect held outside
+/// the turn (a memory promotion or a claim append) that is `Pending` and holds
+/// no grant for its generation has a waiting approval or authorization
+/// checkpoint bound to that exact generation. Such an effect is not
+/// dispatchable, so without its gate it would wait forever on a decision no
+/// one can make. Shared by the promotion and claim-append tests.
+pub async fn assert_gate_invariant<A: AgentModelAdapter, S: AgentRunEffectSink>(
+    fx: &Fixture<A, S>,
+) {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let Some(loop_state) = state.loop_state() else {
+        return;
+    };
+    for effect in loop_state.effects() {
+        let owed = effect.kind().outside_the_turn()
+            && effect.status == AgentRunEffectStatus::Pending
+            && (effect.checkpoint_required || effect.authorization_required)
+            && loop_state.grant_for(effect).is_none();
+        if !owed {
+            continue;
+        }
+        let gated = loop_state.open_checkpoints().iter().any(|checkpoint| {
+            checkpoint.status.is_waiting()
+                && checkpoint.kind
+                    != rakka_agent::AgentCheckpointKind::IndeterminateEffectReconciliation
+                && checkpoint.bound_effect.effect_id == effect.effect_id
+                && checkpoint.bound_effect.generation == effect.generation
+        });
+        assert!(
+            gated,
+            "the gated {} effect {:?} is `Pending` and ungranted at generation {:?} with no \
+             waiting gate",
+            effect.kind(),
+            effect.effect_id,
+            effect.generation
+        );
+    }
 }

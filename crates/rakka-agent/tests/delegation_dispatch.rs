@@ -14,9 +14,9 @@ mod common;
 use std::sync::Arc;
 
 use common::{
-    delegation_config, delegation_tool_id, goal_spec_draft, goal_spec_with_delegation,
-    goal_task_creation_command, run_scope, task_definition, AuthorityFixture, Fixture, AGENT,
-    SKILL, TENANT,
+    create_fan_out_task, delegation_config, delegation_tool_id, fan_out_fixture, goal_spec_draft,
+    goal_spec_with_delegation, goal_task_creation_command, run_scope, task_definition,
+    AuthorityFixture, Fixture, SkillNamedExecutor, AGENT, SKILL, TENANT,
 };
 use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
@@ -416,6 +416,117 @@ async fn a_cancellation_fence_settles_the_unsent_delegation_cell() {
     assert!(
         fence_observed,
         "no crash point produced the committed-but-unsent send window; widen the sweep"
+    );
+}
+
+/// Issue #125: a send receipt naming the run's other held delegation settles
+/// neither send. Two delegations are in flight; delegation A's receipt,
+/// delivered to delegation B's send, is refused `effect-outcome-mismatch`
+/// before anything changes: both cells stay `Pending` and both sends stay
+/// outstanding. Before the guard, B's send settled and cell A took the child.
+#[tokio::test]
+async fn a_foreign_outcome_does_not_settle_a_delegation_send() {
+    let fixture = fan_out_fixture(SkillNamedExecutor::new());
+    create_fan_out_task(&fixture, None).await;
+    // Answer only the model call, so both sends are committed, dispatched
+    // and unanswered.
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.settle_side_effects(&fixture.router, fixture.now())
+        .await
+        .expect("settle");
+    fixture
+        .dispatcher
+        .drive(&mut run, &fixture.router, fixture.now())
+        .await
+        .expect("the model call is answered");
+    drop(run);
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.settle_side_effects(&fixture.router, fixture.now())
+        .await
+        .expect("settle");
+    let (sends, cells_before) = {
+        let loop_state = run
+            .state()
+            .expect("state")
+            .loop_state()
+            .expect("loop state");
+        let sends: Vec<AgentRunEffect> = loop_state
+            .effects()
+            .iter()
+            .filter(|effect| {
+                effect.kind() == AgentRunEffectKind::A2aSendCall
+                    && effect.status == rakka_agent::AgentRunEffectStatus::Ready
+            })
+            .cloned()
+            .collect();
+        (sends, loop_state.delegations().clone())
+    };
+    drop(run);
+    assert_eq!(sends.len(), 2, "both sends are in flight");
+    assert_eq!(cells_before.len(), 2);
+    assert!(cells_before
+        .values()
+        .all(|cell| cell.status == AgentDelegationStatus::Pending));
+    let delegation_of = |effect: &AgentRunEffect| match &effect.request {
+        rakka_agent::AgentRunEffectRequest::A2aSend { delegation } => delegation.delegation.clone(),
+        other => panic!("not a send: {other:?}"),
+    };
+    let (send_a, send_b) = (&sends[0], &sends[1]);
+    assert_ne!(delegation_of(send_a), delegation_of(send_b));
+
+    let receipt_a = fixture.dispatcher.answer(send_a).await;
+    assert!(
+        matches!(&receipt_a, rakka_agent::AgentRunEffectOutcome::A2aSend { receipt }
+            if receipt.delegation == delegation_of(send_a)),
+        "delegation A's own receipt: {receipt_a:?}"
+    );
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let refusal = run
+        .apply(
+            AgentRunEntityCommand::RecordEffectResult {
+                operation_id: send_b
+                    .result_operation_id(&run_scope())
+                    .expect("the result operation id derives"),
+                effect_id: send_b.effect_id.clone(),
+                generation: send_b.generation,
+                attempt: send_b.attempts.saturating_add(1),
+                fence: 0,
+                outcome: Box::new(receipt_a),
+            },
+            &fixture.router,
+            fixture.now(),
+        )
+        .await
+        .expect_err("another delegation's receipt settles nothing");
+    assert_eq!(refusal.code(), "effect-outcome-mismatch", "{refusal}");
+    drop(run);
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let loop_state = run
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("loop state");
+    assert_eq!(
+        loop_state.delegations(),
+        &cells_before,
+        "neither cell moved"
+    );
+    for send in [send_a, send_b] {
+        let held = loop_state
+            .effects()
+            .iter()
+            .find(|effect| effect.effect_id == send.effect_id)
+            .expect("the send is held");
+        assert_eq!(held.status, rakka_agent::AgentRunEffectStatus::Ready);
+    }
+    assert!(
+        loop_state.tool_results().is_empty(),
+        "no send result is recorded"
     );
 }
 
