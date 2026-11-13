@@ -27,6 +27,8 @@
 //!   born `Proposed`, structurally).
 //! - [`transition`] — append-only trust-transition records, requests, and
 //!   outcomes.
+//! - [`tombstone`] — the record a claim carries when its content was
+//!   withdrawn, and the stub's fixed markers.
 //! - [`promotion`] — the HITL/policy promotion gate over
 //!   `rakka-agent` checkpoint grants.
 //! - [`store`] — the portable [`KnowledgeGraphStore`] SPI, bounded
@@ -66,14 +68,15 @@ pub mod goal_claim_source;
 pub mod promotion;
 pub mod scope;
 pub mod store;
+pub mod tombstone;
 pub mod transition;
 
 pub use append_executor::KnowledgeGraphClaimAppendExecutor;
 pub use claim::{
     Claim, ClaimAccess, ClaimId, ClaimNodeId, ClaimObject, ClaimOperationId, ClaimPredicate,
-    ClaimProvenance, ClaimRecord, ClaimTrustStatus, CLAIM_MAX_ACL_CAPABILITIES,
-    CLAIM_MAX_EVIDENCE_ARTIFACTS, CLAIM_MAX_TRUST_TRANSITIONS, CLAIM_OBJECT_INLINE_MAX_BYTES,
-    CURRENT_CLAIM_SCHEMA_VERSION,
+    ClaimProvenance, ClaimRecord, ClaimTrustStatus, CLAIM_LIVE_SCHEMA_VERSION,
+    CLAIM_MAX_ACL_CAPABILITIES, CLAIM_MAX_EVIDENCE_ARTIFACTS, CLAIM_MAX_TRUST_TRANSITIONS,
+    CLAIM_OBJECT_INLINE_MAX_BYTES, CURRENT_CLAIM_SCHEMA_VERSION,
 };
 pub use error::{check_schema_window, ClaimError, ClaimFuture, ClaimRecordKind, ClaimResult};
 pub use goal_claim_source::KnowledgeGraphGoalClaimSource;
@@ -89,6 +92,7 @@ pub use store::{
     CLAIM_PAGE_DEFAULT_LIMIT, CLAIM_PAGE_MAX_ENTRIES, CLAIM_TRANSITION_PAGE_MAX_ENTRIES,
     CLAIM_TRAVERSAL_MAX_DEPTH, CLAIM_TRAVERSAL_MAX_EDGES, CLAIM_TRAVERSAL_MAX_NODES,
 };
+pub use tombstone::{ClaimTombstone, ClaimTombstoneReason, CLAIM_TOMBSTONE_MARKER};
 pub use transition::{
     ClaimPromotionReceipt, ClaimTransitionOutcome, ClaimTrustTransition,
     ClaimTrustTransitionRecord, ClaimTrustTransitionRequest, CLAIM_TRANSITION_REASON_MAX_LENGTH,

@@ -32,18 +32,34 @@ use std::collections::BTreeSet;
 
 use rakka_agent::{
     validate_identity_segment, AgentCapabilityId, AgentContentDigest, AgentDelegationId,
-    AgentGoalId, AgentId, AgentIdentityResult, AgentPolicyRef, AgentRevisionNumber, AgentRunId,
-    AgentTaskContent, AgentTaskId, MemoryClassification, MemoryEmbeddingRef,
-    AGENT_IDENTITY_MAX_LENGTH, AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH,
+    AgentGoalId, AgentId, AgentIdentityResult, AgentPolicyRef, AgentPrivateMemory,
+    AgentRevisionNumber, AgentRunId, AgentTaskContent, AgentTaskId, MemoryClassification,
+    MemoryEmbeddingRef, AGENT_IDENTITY_MAX_LENGTH, AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH,
 };
 use rakka_agent_workflow::{AgentEffectId, AgentTimestampMillis, ArtifactRef, StateSchemaVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{check_schema_window, ClaimError, ClaimRecordKind, ClaimResult};
 use crate::scope::KnowledgeSpaceScope;
+use crate::tombstone::{ClaimTombstone, CLAIM_TOMBSTONE_MARKER};
 
-/// Schema version this binary writes on every [`Claim`] record.
-pub const CURRENT_CLAIM_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+/// Newest [`Claim`] schema version this binary reads and writes.
+///
+/// Written only on a tombstoned claim. A live claim is still written at
+/// [`CLAIM_LIVE_SCHEMA_VERSION`], because it holds nothing a reader of that
+/// version cannot read; staging the bump this way means a binary from before
+/// tombstones existed refuses a stub with `schema-version-ahead` and never
+/// reads its markers as a statement, while every claim it could already read
+/// stays readable.
+///
+/// One consequence for a later change: because live claims stay one version
+/// behind, a bump to version 3 would put every live claim outside the default
+/// N/N+1 window. Whoever makes that bump must move live claims forward or
+/// widen the window.
+pub const CURRENT_CLAIM_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(2);
+
+/// Schema version this binary writes on a live (never tombstoned) [`Claim`].
+pub const CLAIM_LIVE_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
 
 /// Largest inline size a [`ClaimObject::Value`] may carry, in bytes.
 ///
@@ -528,6 +544,11 @@ pub struct Claim {
     /// The revision of that policy, when known.
     #[serde(default)]
     pub policy_revision: Option<AgentRevisionNumber>,
+    /// Set when the claim's content was withdrawn. Absent from a live claim's
+    /// encoding entirely, so a live claim serializes to the bytes it always
+    /// did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tombstone: Option<ClaimTombstone>,
 }
 
 impl Claim {
@@ -557,7 +578,7 @@ impl Claim {
         let claim_id = ClaimId::derive_appended(scope, &operation_id)?;
         let content_digest = statement_digest(&subject, &predicate, &object)?;
         let claim = Self {
-            schema_version: CURRENT_CLAIM_SCHEMA_VERSION,
+            schema_version: CLAIM_LIVE_SCHEMA_VERSION,
             claim_id,
             operation_id,
             subject,
@@ -575,6 +596,7 @@ impl Claim {
             embedding: None,
             policy: None,
             policy_revision: None,
+            tombstone: None,
         };
         claim.validate()?;
         Ok(claim)
@@ -631,13 +653,60 @@ impl Claim {
         self.schema_version
     }
 
+    /// The record of the claim's withdrawal, when its content was tombstoned.
+    #[must_use]
+    pub const fn tombstone(&self) -> Option<&ClaimTombstone> {
+        self.tombstone.as_ref()
+    }
+
+    /// Whether the claim is a tombstoned stub: its statement, evidence and
+    /// embedding withdrawn, its audit fields kept.
+    #[must_use]
+    pub const fn is_tombstoned(&self) -> bool {
+        self.tombstone.is_some()
+    }
+
+    /// Returns the claim as a tombstoned stub.
+    ///
+    /// The statement becomes the fixed markers, the evidence and the embedding
+    /// are dropped, and the record moves to
+    /// [`CURRENT_CLAIM_SCHEMA_VERSION`]. The trust status, the transition
+    /// count and the statement fingerprint are untouched: a tombstone is a
+    /// statement about content, not a verdict on truth, and the fingerprint
+    /// goes on describing the statement that was withdrawn. A stub is not
+    /// tombstoned twice (`claim-tombstoned`).
+    pub fn apply_tombstone(&self, tombstone: ClaimTombstone) -> ClaimResult<Self> {
+        if self.is_tombstoned() {
+            return Err(ClaimError::Tombstoned {
+                claim_id: self.claim_id.clone(),
+            });
+        }
+        let mut stub = self.clone();
+        stub.schema_version = CURRENT_CLAIM_SCHEMA_VERSION;
+        stub.subject = ClaimNodeId::new(CLAIM_TOMBSTONE_MARKER)?;
+        stub.predicate = ClaimPredicate::new(CLAIM_TOMBSTONE_MARKER)?;
+        stub.object = ClaimObject::Value(AgentPrivateMemory::tombstone_content());
+        stub.evidence = Vec::new();
+        stub.embedding = None;
+        stub.tombstone = Some(tombstone);
+        stub.validate()?;
+        Ok(stub)
+    }
+
     /// Returns the claim with one legal trust transition applied.
     ///
     /// This is the single legality enforcement point every backend shares: it
-    /// refuses an illegal `from -> to` pair and a full transition history, and
-    /// it is the only public way trust moves — the fields themselves stay
-    /// private, so no path can skip the table.
+    /// refuses a tombstoned claim, an illegal `from -> to` pair and a full
+    /// transition history, and it is the only public way trust moves — the
+    /// fields themselves stay private, so no path can skip the table.
     pub fn apply_transition(&self, to: ClaimTrustStatus) -> ClaimResult<Self> {
+        // A stub's trust is frozen, and says so before the table is consulted:
+        // an illegal move on a stub is still the stub's refusal.
+        if self.is_tombstoned() {
+            return Err(ClaimError::Tombstoned {
+                claim_id: self.claim_id.clone(),
+            });
+        }
         if !self.trust.may_transition_to(to) {
             return Err(ClaimError::IllegalTransition {
                 claim_id: self.claim_id.clone(),
@@ -680,6 +749,7 @@ impl Claim {
             embedding: self.embedding.clone(),
             policy: self.policy.clone(),
             policy_revision: self.policy_revision,
+            tombstone: self.tombstone.clone(),
         }
     }
 
@@ -715,13 +785,14 @@ impl Claim {
             embedding: record.embedding,
             policy: record.policy,
             policy_revision: record.policy_revision,
+            tombstone: record.tombstone,
         };
         claim.validate()?;
         Ok(claim)
     }
 
-    /// Validates every bound, the statement fingerprint, and the trust
-    /// coherence invariant.
+    /// Validates every bound, the statement fingerprint (or, for a tombstoned
+    /// stub, that it carries no content), and the trust coherence invariant.
     pub fn validate(&self) -> ClaimResult<()> {
         if let ClaimObject::Value(content) = &self.object {
             let bytes = content.size_bytes();
@@ -763,20 +834,38 @@ impl Claim {
         }
         // Record coherence, after the field bounds: a bound describes the
         // content (and answers with the specific refusal a writer needs), while
-        // these two describe whether the record contradicts itself.
-        //
-        // The statement fingerprint is re-derived, never trusted: it is the one
-        // field a loaded record could otherwise carry without describing the
-        // statement beside it. An audit fingerprint that disagrees with its own
-        // statement is worse than none — it tells an operator two claims differ
-        // when they do not, and it hides a row that was edited after the fact.
-        let derived = statement_digest(&self.subject, &self.predicate, &self.object)?;
-        if self.content_digest != derived {
-            return Err(ClaimError::StatementDigestMismatch {
-                claim_id: self.claim_id.clone(),
-                recorded: self.content_digest.clone(),
-                derived,
-            });
+        // these describe whether the record contradicts itself.
+        if self.is_tombstoned() {
+            // A stub holds exactly the markers and nothing else: a record
+            // marked tombstoned that still carries a statement, evidence or an
+            // embedding has not withdrawn anything. Its fingerprint is *not*
+            // re-derived, because it describes the withdrawn statement, which
+            // is no longer here to derive it from.
+            let content_free = self.subject.as_str() == CLAIM_TOMBSTONE_MARKER
+                && self.predicate.as_str() == CLAIM_TOMBSTONE_MARKER
+                && self.object == ClaimObject::Value(AgentPrivateMemory::tombstone_content())
+                && self.evidence.is_empty()
+                && self.embedding.is_none();
+            if !content_free {
+                return Err(ClaimError::TombstoneCarriesContent {
+                    claim_id: self.claim_id.clone(),
+                });
+            }
+        } else {
+            // The statement fingerprint is re-derived, never trusted: it is the
+            // one field a loaded record could otherwise carry without
+            // describing the statement beside it. An audit fingerprint that
+            // disagrees with its own statement is worse than none — it tells an
+            // operator two claims differ when they do not, and it hides a row
+            // that was edited after the fact.
+            let derived = statement_digest(&self.subject, &self.predicate, &self.object)?;
+            if self.content_digest != derived {
+                return Err(ClaimError::StatementDigestMismatch {
+                    claim_id: self.claim_id.clone(),
+                    recorded: self.content_digest.clone(),
+                    derived,
+                });
+            }
         }
         // Coherence: nothing transitions *to* Proposed, so the pair is a
         // bijection — a Proposed claim has no history and a claim with
@@ -849,6 +938,10 @@ pub struct ClaimRecord {
     /// The revision of that policy, when known.
     #[serde(default)]
     pub policy_revision: Option<AgentRevisionNumber>,
+    /// The record of the claim's withdrawal, when it is a tombstoned stub.
+    /// Absent from a live claim's encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone: Option<ClaimTombstone>,
 }
 
 /// Fingerprints the canonical statement (sorted keys, so structurally equal
@@ -876,9 +969,11 @@ fn statement_digest(
 
 #[cfg(test)]
 mod tests {
-    use rakka_agent::{KnowledgeSpaceId, TenantId};
+    use rakka_agent::{AgentPrivateMemory, KnowledgeSpaceId, TenantId};
+    use rakka_agent_workflow::PrincipalRef;
 
     use super::*;
+    use crate::tombstone::{ClaimTombstone, ClaimTombstoneReason, CLAIM_TOMBSTONE_MARKER};
 
     fn scope() -> KnowledgeSpaceScope {
         KnowledgeSpaceScope::new(
@@ -931,7 +1026,7 @@ mod tests {
         let claim = claim();
         assert_eq!(claim.trust(), ClaimTrustStatus::Proposed);
         assert_eq!(claim.transition_count(), 0);
-        assert_eq!(claim.schema_version(), CURRENT_CLAIM_SCHEMA_VERSION);
+        assert_eq!(claim.schema_version(), CLAIM_LIVE_SCHEMA_VERSION);
     }
 
     #[test]
@@ -1260,5 +1355,296 @@ mod tests {
         )
         .expect("the claim is valid");
         assert_ne!(a.content_digest, different.content_digest);
+    }
+
+    fn actor() -> PrincipalRef {
+        PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "privacy-officer".to_string(),
+            display_name: None,
+        }
+    }
+
+    fn tombstone(discriminator: &str) -> ClaimTombstone {
+        let claim = claim();
+        ClaimTombstone {
+            operation_id: ClaimOperationId::derive_transition(
+                &scope(),
+                &claim.claim_id,
+                discriminator,
+            )
+            .expect("the operation id derives"),
+            reason: ClaimTombstoneReason::Withdrawn,
+            actor: actor(),
+            tombstoned_at: AgentTimestampMillis::new(20),
+        }
+    }
+
+    /// A claim carrying every optional field a tombstone must clear or keep.
+    fn furnished_claim() -> Claim {
+        let mut access = ClaimAccess::default();
+        access
+            .required_read_capabilities
+            .insert(AgentCapabilityId::new("read-pii").expect("the capability is valid"));
+        claim()
+            .with_evidence(vec![artifact("a"), artifact("b")])
+            .expect("the evidence is within bounds")
+            .with_embedding(MemoryEmbeddingRef {
+                model: "embedder-v1".to_string(),
+                dimensions: 3,
+                version: AgentRevisionNumber::INITIAL,
+            })
+            .expect("the embedding is valid")
+            .with_access(access)
+            .expect("the access set is within bounds")
+            .with_policy(
+                AgentPolicyRef::new("retention-v1").expect("the policy ref is valid"),
+                Some(AgentRevisionNumber::INITIAL),
+            )
+    }
+
+    #[test]
+    fn a_tombstone_clears_the_statement_and_keeps_the_audit_fields() {
+        let original = furnished_claim();
+        let tombstone = tombstone("tombstone-1");
+        let stub = original
+            .apply_tombstone(tombstone.clone())
+            .expect("a live claim is tombstoned");
+
+        // Cleared: the whole statement, the evidence and the embedding.
+        assert_eq!(stub.subject.as_str(), CLAIM_TOMBSTONE_MARKER);
+        assert_eq!(stub.predicate.as_str(), CLAIM_TOMBSTONE_MARKER);
+        assert_eq!(
+            stub.object,
+            ClaimObject::Value(AgentPrivateMemory::tombstone_content())
+        );
+        assert!(stub.evidence.is_empty());
+        assert_eq!(stub.embedding, None);
+
+        // Kept: everything an audit needs.
+        assert_eq!(stub.claim_id, original.claim_id);
+        assert_eq!(stub.operation_id, original.operation_id);
+        assert_eq!(stub.provenance, original.provenance);
+        assert_eq!(stub.created_at, original.created_at);
+        assert_eq!(stub.confidence_bps, original.confidence_bps);
+        assert_eq!(stub.classification, original.classification);
+        assert_eq!(stub.access, original.access);
+        assert!(!stub.access.required_read_capabilities.is_empty());
+        assert_eq!(stub.policy, original.policy);
+        assert!(stub.policy.is_some());
+        assert_eq!(stub.policy_revision, original.policy_revision);
+        assert_eq!(stub.trust(), original.trust());
+        assert_eq!(stub.transition_count(), original.transition_count());
+        assert_eq!(stub.content_digest, original.content_digest);
+
+        assert_eq!(stub.tombstone(), Some(&tombstone));
+        assert!(stub.is_tombstoned());
+        assert!(!original.is_tombstoned());
+        assert_eq!(original.tombstone(), None);
+    }
+
+    #[test]
+    fn a_stub_restores_with_its_original_digest() {
+        let original = furnished_claim();
+        let stub = original
+            .apply_tombstone(tombstone("tombstone-1"))
+            .expect("a live claim is tombstoned");
+
+        let restored = Claim::restore(stub.to_record()).expect("a stub restores");
+        assert_eq!(restored, stub);
+        // Through serde too: a stub crosses the wire and comes back a stub.
+        let json = serde_json::to_string(&stub).expect("the stub serializes");
+        let decoded: Claim = serde_json::from_str(&json).expect("the stub deserializes");
+        assert_eq!(decoded, stub);
+
+        // The digest still describes the withdrawn statement, not the markers.
+        assert_eq!(restored.content_digest, original.content_digest);
+        let of_markers = statement_digest(&stub.subject, &stub.predicate, &stub.object)
+            .expect("the marker statement digests");
+        assert_ne!(restored.content_digest, of_markers);
+    }
+
+    #[test]
+    fn a_stub_that_carries_content_is_refused() {
+        let original = furnished_claim();
+        let stub = original
+            .apply_tombstone(tombstone("tombstone-1"))
+            .expect("a live claim is tombstoned");
+
+        let refusal = |record: ClaimRecord, what: &str| {
+            let error = Claim::restore(record).expect_err(what);
+            assert_eq!(error.code(), "claim-tombstone-content", "{what}");
+        };
+
+        let mut with_subject = stub.to_record();
+        with_subject.subject = original.subject.clone();
+        refusal(with_subject, "a stub that kept its subject is refused");
+
+        let mut with_predicate = stub.to_record();
+        with_predicate.predicate = original.predicate.clone();
+        refusal(with_predicate, "a stub that kept its predicate is refused");
+
+        let mut with_object = stub.to_record();
+        with_object.object = original.object.clone();
+        refusal(with_object, "a stub that kept its object is refused");
+
+        let mut with_evidence = stub.to_record();
+        with_evidence.evidence = vec![artifact("a")];
+        refusal(with_evidence, "a stub that kept evidence is refused");
+
+        let mut with_embedding = stub.to_record();
+        with_embedding.embedding = original.embedding.clone();
+        refusal(with_embedding, "a stub that kept its embedding is refused");
+
+        // The builders reach the same refusal: content cannot be put back.
+        assert_eq!(
+            stub.clone()
+                .with_evidence(vec![artifact("a")])
+                .expect_err("evidence cannot be attached to a stub")
+                .code(),
+            "claim-tombstone-content"
+        );
+
+        // The untouched stub still restores.
+        Claim::restore(stub.to_record()).expect("a content-free stub restores");
+    }
+
+    #[test]
+    fn a_stub_is_written_at_version_two_and_a_live_claim_at_version_one() {
+        assert_eq!(CLAIM_LIVE_SCHEMA_VERSION.get(), 1);
+        assert_eq!(CURRENT_CLAIM_SCHEMA_VERSION.get(), 2);
+
+        let live = claim();
+        assert_eq!(live.schema_version(), CLAIM_LIVE_SCHEMA_VERSION);
+
+        let moved = live
+            .apply_transition(ClaimTrustStatus::Disputed)
+            .expect("the transition applies");
+        assert_eq!(moved.schema_version(), CLAIM_LIVE_SCHEMA_VERSION);
+
+        let stub = moved
+            .apply_tombstone(tombstone("tombstone-1"))
+            .expect("a live claim is tombstoned");
+        assert_eq!(stub.schema_version(), CURRENT_CLAIM_SCHEMA_VERSION);
+        assert_eq!(
+            stub.to_record().schema_version,
+            CURRENT_CLAIM_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn a_live_claims_encoding_carries_no_tombstone_key() {
+        let live = furnished_claim();
+
+        let encoded = serde_json::to_value(&live).expect("the claim serializes");
+        assert!(encoded.get("tombstone").is_none());
+        assert_eq!(encoded["schema_version"], serde_json::json!(1));
+        let record = serde_json::to_value(live.to_record()).expect("the record serializes");
+        assert!(record.get("tombstone").is_none());
+        // The claim and its mirror are the same bytes, as they were before the
+        // tombstone field existed.
+        assert_eq!(encoded, record);
+
+        // A record written before the field existed: no key at all.
+        let restored: Claim =
+            serde_json::from_value(record).expect("a record with no tombstone key restores");
+        assert_eq!(restored.tombstone(), None);
+        assert_eq!(restored, live);
+
+        // A stub does carry the key.
+        let stub = live
+            .apply_tombstone(tombstone("tombstone-1"))
+            .expect("a live claim is tombstoned");
+        let encoded = serde_json::to_value(&stub).expect("the stub serializes");
+        assert!(encoded.get("tombstone").is_some());
+    }
+
+    #[test]
+    fn a_stub_refuses_a_transition_and_a_second_tombstone() {
+        let stub = claim()
+            .apply_tombstone(tombstone("tombstone-1"))
+            .expect("a live claim is tombstoned");
+
+        assert_eq!(
+            stub.apply_transition(ClaimTrustStatus::Retracted)
+                .expect_err("a stub's trust is frozen")
+                .code(),
+            "claim-tombstoned"
+        );
+        // Before the legality check: an illegal move on a stub is still the
+        // stub's refusal, not the table's.
+        assert_eq!(
+            stub.apply_transition(ClaimTrustStatus::Proposed)
+                .expect_err("a stub's trust is frozen")
+                .code(),
+            "claim-tombstoned"
+        );
+        assert_eq!(
+            stub.apply_tombstone(tombstone("tombstone-2"))
+                .expect_err("a stub is not tombstoned twice")
+                .code(),
+            "claim-tombstoned"
+        );
+    }
+
+    #[test]
+    fn a_transitioned_claim_keeps_its_trust_through_a_tombstone() {
+        let retracted = claim()
+            .apply_transition(ClaimTrustStatus::Disputed)
+            .expect("the dispute applies")
+            .apply_transition(ClaimTrustStatus::Retracted)
+            .expect("the retraction applies");
+        let stub = retracted
+            .apply_tombstone(tombstone("tombstone-1"))
+            .expect("a retracted claim is tombstoned");
+
+        assert_eq!(stub.trust(), ClaimTrustStatus::Retracted);
+        assert_eq!(stub.transition_count(), 2);
+        stub.validate().expect("the stub is coherent");
+
+        // The trust coherence invariant still binds a stub.
+        let mut incoherent = stub.to_record();
+        incoherent.transition_count = 0;
+        assert_eq!(
+            Claim::restore(incoherent)
+                .expect_err("a retracted stub with no history is incoherent")
+                .code(),
+            "claim-trust-incoherent"
+        );
+    }
+
+    #[test]
+    fn the_four_new_codes_are_stable() {
+        let claim = claim();
+        assert_eq!(
+            ClaimError::Tombstoned {
+                claim_id: claim.claim_id.clone()
+            }
+            .code(),
+            "claim-tombstoned"
+        );
+        assert_eq!(
+            ClaimError::OperationErased {
+                operation_id: claim.operation_id.clone()
+            }
+            .code(),
+            "claim-operation-erased"
+        );
+        assert_eq!(
+            ClaimError::TombstoneCarriesContent {
+                claim_id: claim.claim_id.clone()
+            }
+            .code(),
+            "claim-tombstone-content"
+        );
+        assert_eq!(
+            ClaimError::DeleteStale {
+                claim_id: claim.claim_id.clone()
+            }
+            .code(),
+            "claim-delete-stale"
+        );
+        assert_eq!(ClaimTombstoneReason::Withdrawn.as_label(), "withdrawn");
+        assert_eq!(ClaimTombstoneReason::Policy.as_label(), "policy");
     }
 }

@@ -261,6 +261,32 @@ pub enum ClaimError {
         /// Stable label of the unsupported capability.
         capability: String,
     },
+    /// The claim is a tombstoned stub: it cannot transition or be tombstoned
+    /// again.
+    Tombstoned {
+        /// Claim that was addressed.
+        claim_id: ClaimId,
+    },
+    /// The replayed operation's payload was erased by a later tombstone or
+    /// delete of its claim, so there is no original result left to return and
+    /// nothing may be written under it again.
+    OperationErased {
+        /// Operation id whose payload was erased.
+        operation_id: ClaimOperationId,
+    },
+    /// A record marked tombstoned still carries a statement, evidence or an
+    /// embedding.
+    TombstoneCarriesContent {
+        /// Claim that failed the invariant.
+        claim_id: ClaimId,
+    },
+    /// The claim is no longer in the state a delete expected: its transition
+    /// count or its tombstone state differs. Nothing was deleted, and the
+    /// operation id was not spent.
+    DeleteStale {
+        /// Claim that was addressed.
+        claim_id: ClaimId,
+    },
 }
 
 impl ClaimError {
@@ -293,6 +319,10 @@ impl ClaimError {
             Self::PromotionGrantScope { .. } => "claim-promotion-grant-scope",
             Self::PromotionGrantRejected { .. } => "claim-promotion-grant-rejected",
             Self::CapabilityUnsupported { .. } => "claim-capability-unsupported",
+            Self::Tombstoned { .. } => "claim-tombstoned",
+            Self::OperationErased { .. } => "claim-operation-erased",
+            Self::TombstoneCarriesContent { .. } => "claim-tombstone-content",
+            Self::DeleteStale { .. } => "claim-delete-stale",
         }
     }
 }
@@ -420,6 +450,24 @@ impl Display for ClaimError {
             Self::CapabilityUnsupported { capability } => write!(
                 f,
                 "the backend does not support the optional {capability} capability"
+            ),
+            Self::Tombstoned { claim_id } => write!(
+                f,
+                "claim {claim_id} is tombstoned: its content was withdrawn and its trust \
+                 status is frozen"
+            ),
+            Self::OperationErased { operation_id } => write!(
+                f,
+                "operation {operation_id} was erased when its claim was tombstoned or deleted"
+            ),
+            Self::TombstoneCarriesContent { claim_id } => write!(
+                f,
+                "claim {claim_id} is marked tombstoned but still carries a statement, \
+                 evidence or an embedding"
+            ),
+            Self::DeleteStale { claim_id } => write!(
+                f,
+                "claim {claim_id} is no longer in the state the delete expected"
             ),
         }
     }

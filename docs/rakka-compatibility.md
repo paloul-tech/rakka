@@ -199,7 +199,7 @@ One row per record kind the agent domain persists, keyed by the record's stable 
 | `CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION` | `rakka-agent-workflow` | 1 |
 | `CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION` | `rakka-agent-workflow` | 1 |
 | `MCP_DESCRIPTOR_SET_SCHEMA_VERSION` | `rakka-agent-mcp` | 2 |
-| `claim` | `rakka-agent-knowledge-graph` | 1 |
+| `claim` | `rakka-agent-knowledge-graph` | 2 |
 | `claim-trust-transition` | `rakka-agent-knowledge-graph` | 1 |
 
 The records above version 1, and what each bump requires of a rollout:
