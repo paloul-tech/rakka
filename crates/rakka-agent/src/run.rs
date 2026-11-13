@@ -5665,6 +5665,24 @@ fn apply_indeterminate_resolution(
 /// to be unknowable, parks the run in reconciliation. A run with such work, or
 /// a result proposal the task may already have decided, stays nonterminal
 /// until everything settles.
+///
+/// The cancel closes every waiting approval and authorization, and in the
+/// same transition it settles `Cancelled` every effect outside the turn (a
+/// memory promotion or a claim append) that is `Pending`, gated, and holds no
+/// grant for its generation (issue #126). The wind-down fence exempts both
+/// kinds, so without this such an effect would wait `Pending` behind a gate
+/// the cancel just closed, and hold the run `Cancelling` with nothing able to
+/// move it. It settles through [`apply_effect_outcome`], which releases its
+/// attempt reservation; it never dispatched, so it consumes no attempt. The
+/// rule reads the effect, not the checkpoint, so it also settles a record
+/// written before the command opened the gate, which holds such an effect
+/// with no gate at all. A granted effect is left alone: it is dispatchable,
+/// and rides the outbox as any exempt effect does on a winding-down run.
+///
+/// This keeps the invariant every path that closes such a gate holds: **a
+/// gated effect outside the turn that is `Pending` and ungranted always has a
+/// waiting gate.** A denial or expiry fails the effect, and a cancel cancels
+/// it.
 fn cancel(
     state: &mut AgentRunState,
     reason: String,
@@ -5699,6 +5717,31 @@ fn cancel(
         };
         run.loop_state.queue_decision(&scope, draft, now);
     }
+    // An ungranted gated effect outside the turn settles with its gate, which
+    // closed above if it had one: nothing can grant it now (issue #126).
+    let ungranted: Vec<AgentEffectId> = run
+        .loop_state
+        .effects()
+        .iter()
+        .filter(|effect| {
+            effect.kind().outside_the_turn()
+                && effect.is_pending()
+                && effect.gate_kind().is_some()
+                && run.loop_state.grant_for(effect).is_none()
+        })
+        .map(|effect| effect.effect_id.clone())
+        .collect();
+    for effect_id in &ungranted {
+        apply_effect_outcome(
+            state,
+            effect_id,
+            &AgentRunEffectOutcome::Cancelled {
+                reason: "run-cancelled".to_string(),
+            },
+            now,
+        )?;
+    }
+    let run = state.run_mut()?;
     if run.terminal_reason.is_none() {
         run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
             reason: bounded_detail(reason),

@@ -4309,9 +4309,18 @@ fn timer_command(key: &str) -> AgentRunEntityCommand {
 
 /// The operator's cancellation of the run.
 fn cancel_command() -> AgentRunEntityCommand {
+    cancel_command_under("1")
+}
+
+/// An operator's cancellation of the run under its own operation id, so a
+/// second cancel is a new command rather than a replay of the first.
+fn cancel_command_under(discriminator: &str) -> AgentRunEntityCommand {
     AgentRunEntityCommand::Cancel {
-        operation_id: AgentOperationId::new(AgentOperationKind::Cancellation, [TENANT, AGENT, "1"])
-            .expect("derivable"),
+        operation_id: AgentOperationId::new(
+            AgentOperationKind::Cancellation,
+            [TENANT, AGENT, discriminator],
+        )
+        .expect("derivable"),
         reason: "operator stopped the work".to_string(),
     }
 }
@@ -4576,11 +4585,9 @@ async fn a_commanded_gate_records_its_request_event() {
             "{gate:?}: a replay records nothing"
         );
 
-        // The cancel closes the gate as it closes any. The ungranted
-        // promotion it leaves behind is section 5.2.4's to settle, so the gate
-        // invariant is not asserted after it here.
         let reply = apply_ok(&fx, cancel_command()).await;
         assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+        assert_gate_invariant(&fx).await;
         let naming: Vec<_> = sink
             .events(&scope)
             .into_iter()
@@ -4837,5 +4844,554 @@ async fn a_gated_promotion_at_the_checkpoint_bound_is_refused_whole() {
         assert_eq!(after.0.len(), before.0.len(), "{attempt}: the effect count");
         assert_eq!(after.1, before.1, "{attempt}: the reserved attempts");
         assert_eq!(after, before, "{attempt}: the record is unmoved");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A cancel settles the ungranted gated promotion with its gate (issue #126,
+// section 5.2.4).
+// ---------------------------------------------------------------------------
+
+/// The attempts the run's budget holds reserved.
+async fn reserved_attempts(fx: &Fixture) -> u64 {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .budget()
+        .reserved_attempts()
+}
+
+/// Whether the run holds a grant for `effect`'s current generation.
+async fn holds_grant(fx: &Fixture, effect: &AgentRunEffect) -> bool {
+    let held = promotion_record(fx, effect).await;
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is started")
+        .grant_for(&held)
+        .is_some()
+}
+
+/// The status of the record the run holds for `gate`, `None` once the run
+/// dropped it.
+async fn gate_status(
+    fx: &Fixture,
+    gate: &AgentCheckpoint,
+) -> Option<rakka_agent::AgentCheckpointStatus> {
+    open_checkpoints(fx)
+        .await
+        .into_iter()
+        .find(|held| held.checkpoint_id == gate.checkpoint_id)
+        .map(|held| held.status)
+}
+
+/// A cancel with a promotion's gate open settles the promotion `Cancelled`
+/// with its gate, in the cancel's own transition: the gate is cancelled, the
+/// promotion never dispatched, and the attempts it reserved are released, so
+/// the run's reservation is what it was before the command. Once the turn's
+/// own in-flight work settles, the run ends `Cancelled`. Without the rule the
+/// promotion stays `Pending` with no gate and the run stays `Cancelling`,
+/// with nothing left that can move it.
+#[tokio::test]
+async fn a_cancel_settles_a_gated_promotion_with_its_gate() {
+    for rest in [Rest::AwaitingModel, Rest::AwaitingTools] {
+        for gate in Gate::ALL {
+            let at = format!("{rest:?}, {gate:?}");
+            let (fx, stores) = live_world(
+                rest,
+                policies_gating(gate, rakka_agent::AgentCheckpointSla::default()),
+            )
+            .await;
+            let reserved = reserved_attempts(&fx).await;
+            let promotion = promote_gated(&fx, "gated").await;
+            let opened = the_gate_of(&fx, &promotion).await;
+            assert!(
+                reserved_attempts(&fx).await > reserved,
+                "{at}: the command reserved the promotion's attempts"
+            );
+
+            let reply = apply_ok(&fx, cancel_command()).await;
+            assert!(
+                matches!(reply, AgentRunEntityReply::Applied { .. }),
+                "{at}: {reply:?}"
+            );
+            assert_gate_invariant(&fx).await;
+            assert_eq!(
+                gate_status(&fx, &opened).await,
+                Some(rakka_agent::AgentCheckpointStatus::Cancelled),
+                "{at}: the gate is cancelled"
+            );
+            let cancelled = promotion_record(&fx, &promotion).await;
+            assert_eq!(cancelled.status, AgentRunEffectStatus::Cancelled, "{at}");
+            assert_eq!(cancelled.attempts, 0, "{at}: it never dispatched");
+            assert_eq!(cancelled.generation, promotion.generation, "{at}");
+            assert_eq!(
+                reserved_attempts(&fx).await,
+                reserved,
+                "{at}: the promotion's reservation is released"
+            );
+            let winding = fx.run_snapshot().await.expect("the run exists");
+            assert_eq!(
+                winding.status,
+                AgentRunStatus::Cancelling,
+                "{at}: the turn's in-flight work still holds the run"
+            );
+
+            drive_turn(&fx).await;
+            assert_gate_invariant(&fx).await;
+            let ended = fx.run_snapshot().await.expect("the run exists");
+            assert_eq!(ended.status, AgentRunStatus::Cancelled, "{at}");
+            assert_eq!(ended.terminal_reason, winding.terminal_reason, "{at}");
+            assert!(
+                stores.private.is_empty(&agent_scope()),
+                "{at}: nothing was promoted"
+            );
+        }
+    }
+}
+
+/// A cancel leaves a granted promotion alone: holding its grant it is
+/// dispatchable, and it rides the outbox as an exempt effect does on a
+/// winding-down run. A grant is flushed `Ready` by its own command's settle
+/// pass, so the promotion is still `Pending` at a later cancel only when the
+/// grant's owner died between the commit and that flush: the run store's
+/// crash builds exactly that window, and kills the cancel's owner the same
+/// way, so the record shows what the cancel's own transition left. The next
+/// settle pass dispatches the promotion, its receipt lands, and the run ends
+/// `Cancelled`.
+#[tokio::test]
+async fn a_cancel_leaves_a_granted_promotion_to_dispatch() {
+    use rakka_agent::testkit::CrashPoint;
+
+    let (fx, stores) = live_world(
+        Rest::AwaitingModel,
+        policies_gating(Gate::Checkpoint, rakka_agent::AgentCheckpointSla::default()),
+    )
+    .await;
+    let promotion = promote_gated(&fx, "gated").await;
+    let gate = the_gate_of(&fx, &promotion).await;
+
+    // The grant commits, and its owner dies before the settle pass flushes it.
+    fx.runs.crash_at(1, CrashPoint::AfterWrite);
+    apply(&fx, grant_command(&gate.checkpoint_id, "grant"))
+        .await
+        .expect_err("the grant's owner dies once the grant commits");
+    fx.runs.assert_crash_fired(1, CrashPoint::AfterWrite);
+    fx.runs.survive();
+    assert_gate_invariant(&fx).await;
+    let granted = promotion_record(&fx, &promotion).await;
+    assert_eq!(granted.status, AgentRunEffectStatus::Pending, "unflushed");
+    assert!(holds_grant(&fx, &promotion).await, "the grant is held");
+    assert_eq!(
+        gate_status(&fx, &gate).await,
+        None,
+        "the grant resolved the gate"
+    );
+
+    // The cancel commits, and its owner dies the same way.
+    fx.runs.crash_at(1, CrashPoint::AfterWrite);
+    apply(&fx, cancel_command())
+        .await
+        .expect_err("the cancel's owner dies once the cancel commits");
+    fx.runs.assert_crash_fired(1, CrashPoint::AfterWrite);
+    fx.runs.survive();
+    assert_gate_invariant(&fx).await;
+    let after = promotion_record(&fx, &promotion).await;
+    assert_eq!(
+        after.status,
+        AgentRunEffectStatus::Pending,
+        "the cancel left the granted promotion to dispatch"
+    );
+    assert!(
+        holds_grant(&fx, &promotion).await,
+        "the grant is still held"
+    );
+    let winding = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(winding.status, AgentRunStatus::Cancelling);
+
+    crank(&fx).await;
+    assert_gate_invariant(&fx).await;
+    let dispatched = promotion_record(&fx, &promotion).await;
+    assert_eq!(
+        dispatched.status,
+        AgentRunEffectStatus::Ready,
+        "it dispatches"
+    );
+    let reply = answer_promotion(&fx, &dispatched).await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    assert_gate_invariant(&fx).await;
+    let done = promotion_record(&fx, &promotion).await;
+    assert_eq!(
+        done.status,
+        AgentRunEffectStatus::Succeeded,
+        "its receipt lands"
+    );
+    assert_eq!(stores.private.len(&agent_scope()), 1);
+
+    drive_turn(&fx).await;
+    assert_gate_invariant(&fx).await;
+    let ended = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(ended.status, AgentRunStatus::Cancelled);
+    assert_eq!(ended.terminal_reason, winding.terminal_reason);
+}
+
+/// A record a binary before the command opened the gate left: a gated
+/// promotion `Pending`, ungranted, with no gate at all. The rule reads the
+/// effect, not the checkpoint, so a cancel settles it `Cancelled` all the
+/// same and releases its attempts, and the run ends `Cancelled`.
+#[tokio::test]
+async fn a_cancel_settles_a_gated_promotion_that_has_no_gate() {
+    let (fx, stores) = live_world(
+        Rest::AwaitingModel,
+        policies_gating(Gate::Checkpoint, rakka_agent::AgentCheckpointSla::default()),
+    )
+    .await;
+    let reserved = reserved_attempts(&fx).await;
+    let promotion = promote_gated(&fx, "gated").await;
+    unbind_checkpoints(&fx).await;
+    assert!(open_checkpoints(&fx).await.is_empty(), "no gate is held");
+    let held = promotion_record(&fx, &promotion).await;
+    assert_eq!(held.status, AgentRunEffectStatus::Pending);
+    assert!(held.checkpoint_required, "the promotion is gated");
+    assert!(!holds_grant(&fx, &promotion).await, "and ungranted");
+
+    let reply = apply_ok(&fx, cancel_command()).await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    assert_gate_invariant(&fx).await;
+    let cancelled = promotion_record(&fx, &promotion).await;
+    assert_eq!(cancelled.status, AgentRunEffectStatus::Cancelled);
+    assert_eq!(cancelled.attempts, 0);
+    assert_eq!(reserved_attempts(&fx).await, reserved, "the reservation");
+    assert!(open_checkpoints(&fx).await.is_empty(), "no gate was opened");
+
+    drive_turn(&fx).await;
+    assert_gate_invariant(&fx).await;
+    let ended = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(ended.status, AgentRunStatus::Cancelled);
+    assert!(stores.private.is_empty(&agent_scope()));
+}
+
+/// The rule is scoped to the effects outside the turn. A compensation is
+/// exempt from the wind-down fence as a promotion is, and one the deployment
+/// gates waits `Pending` with no gate, since nothing opens a compensation's
+/// gate (issue #128 owns that). A cancel leaves such a compensation exactly
+/// as it was: what a cancel does to it is issue #128's to decide, not this
+/// rule's.
+#[tokio::test]
+async fn a_cancel_leaves_a_gated_compensation_as_it_was() {
+    let policies = rakka_agent::AgentEffectPolicies::new()
+        .with_tool_spec(
+            AgentToolId::new("lookup").expect("tool id"),
+            rakka_agent::AgentEffectSpec::non_idempotent(),
+        )
+        .expect("the tool spec is valid")
+        .with_compensation_spec(
+            rakka_agent::AgentEffectSpec::non_idempotent().with_checkpoint_required(),
+        )
+        .expect("the compensation spec is valid");
+    let (fx, _stores) = live_world(Rest::AwaitingTools, policies).await;
+    let tool = dispatched_effect(&fx, AgentRunEffectKind::ToolCall).await;
+    let reply = apply_ok(
+        &fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: tool
+                .result_operation_id(&run_scope())
+                .expect("result operation id"),
+            effect_id: tool.effect_id.clone(),
+            generation: tool.generation,
+            attempt: tool.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(AgentRunEffectOutcome::indeterminate(
+                "connection-lost",
+                "the worker died mid-invocation",
+            )),
+        },
+    )
+    .await;
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    assert_gate_invariant(&fx).await;
+    let reconcile = the_open_checkpoint(&fx).await;
+    assert_eq!(
+        reconcile.kind,
+        AgentCheckpointKind::IndeterminateEffectReconciliation
+    );
+    let reply = apply_ok(
+        &fx,
+        resolve_checkpoint_command(
+            &reconcile.checkpoint_id,
+            "compensate",
+            reconciliation(rakka_agent::AgentReconciliationDecision::Compensate {
+                compensation: rakka_agent::AgentCompensationRef::new("refund-charge")
+                    .expect("the compensation ref is valid"),
+            }),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    assert_gate_invariant(&fx).await;
+
+    /// The run's one compensation effect.
+    async fn compensation(fx: &Fixture) -> AgentRunEffect {
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        let state = run.state().expect("state");
+        let held: Vec<AgentRunEffect> = state
+            .loop_state()
+            .expect("the loop is started")
+            .effects()
+            .iter()
+            .filter(|effect| effect.kind() == AgentRunEffectKind::CompensationCall)
+            .cloned()
+            .collect();
+        assert_eq!(held.len(), 1, "one compensation is scheduled");
+        held.into_iter().next().expect("one compensation")
+    }
+    let scheduled = compensation(&fx).await;
+    assert_eq!(scheduled.status, AgentRunEffectStatus::Pending);
+    assert!(scheduled.checkpoint_required, "the compensation is gated");
+    assert!(
+        !open_checkpoints(&fx)
+            .await
+            .iter()
+            .any(|checkpoint| checkpoint.status.is_waiting()),
+        "and nothing opened its gate"
+    );
+    let reserved = reserved_attempts(&fx).await;
+
+    let reply = apply_ok(&fx, cancel_command()).await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    assert_gate_invariant(&fx).await;
+    assert_eq!(
+        compensation(&fx).await,
+        scheduled,
+        "the cancel left the compensation as it was"
+    );
+    assert_eq!(reserved_attempts(&fx).await, reserved, "the reservation");
+}
+
+/// A turn that calls two tools at once: `flaky-tool`, whose call fails, and
+/// `lookup`, which answers.
+fn two_tool_turn() -> AgentModelTurn {
+    let call = |id: &str, tool: &str| {
+        AgentToolCallRequest::new(
+            AgentToolCallId::new(id).expect("call id"),
+            AgentToolId::new(tool).expect("tool id"),
+            serde_json::json!({ "query": "ticket" }),
+        )
+        .expect("the tool call is bounded")
+    };
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Let me look that up two ways.")
+        .with_tool_call(call("call-1", "flaky-tool"))
+        .with_tool_call(call("call-2", "lookup"))
+        .with_usage(AgentModelUsage {
+            input_tokens: 8,
+            output_tokens: 4,
+            cost_micros: 2,
+            ..Default::default()
+        })
+}
+
+/// How a run comes to be winding down before a promotion is commanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Winding {
+    /// An operator's `Cancel`, with turn one's model call in flight.
+    Cancelled,
+    /// A failed tool, with the same turn's other tool in flight.
+    FailedTool,
+}
+
+impl Winding {
+    const ALL: [Self; 2] = [Self::Cancelled, Self::FailedTool];
+
+    /// The status the run ends with once nothing holds it.
+    fn ending(self) -> AgentRunStatus {
+        match self {
+            Self::Cancelled => AgentRunStatus::Cancelled,
+            Self::FailedTool => AgentRunStatus::Failed,
+        }
+    }
+}
+
+/// A live run under `policies`, wound down by `winding` with other work still
+/// in flight that holds it `Cancelling`. Returns the reason the wind-down
+/// began with.
+async fn winding_world(
+    winding: Winding,
+    policies: rakka_agent::AgentEffectPolicies,
+) -> (Fixture, Stores, Option<rakka_agent::AgentRunTerminalReason>) {
+    let (fx, stores) = match winding {
+        Winding::Cancelled => {
+            let (fx, stores) = live_world(Rest::AwaitingModel, policies).await;
+            let reply = apply_ok(&fx, cancel_command()).await;
+            assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+            assert_gate_invariant(&fx).await;
+            (fx, stores)
+        }
+        Winding::FailedTool => {
+            let stores = stores();
+            let dispatcher = ScriptedDispatcher::with_adapter(
+                DeterministicModelAdapter::new().with_turn_for(1, two_tool_turn()),
+            )
+            .with_tool_failure("flaky-tool", "tool-unavailable", "the tool is down")
+            .with_tool_result(
+                "lookup",
+                AgentTaskContent::inline(serde_json::json!({ "found": true }))
+                    .expect("the tool result is inline-bounded"),
+            )
+            .with_memory_promotion_executor(Arc::new(
+                SessionMemoryPromotionExecutor::new(stores.session.clone(), stores.private.clone()),
+            ));
+            let mut fx = Fixture::new(dispatcher).with_memory(
+                AgentRunMemory::new(stores.session.clone(), stores.snapshots.clone())
+                    .with_private_store(stores.private.clone()),
+            );
+            fx.policies = policies;
+            fx.instantiate_agent().await;
+            fx.create_task().await;
+            crank(&fx).await;
+            drive_turn(&fx).await;
+            crank(&fx).await;
+            let tools = dispatched_effects_of(&fx, AgentRunEffectKind::ToolCall).await;
+            assert_eq!(tools.len(), 2, "both tools are in flight");
+            let flaky = tools
+                .iter()
+                .find(|effect| {
+                    effect
+                        .request
+                        .tool_call()
+                        .is_some_and(|call| call.tool.as_str() == "flaky-tool")
+                })
+                .expect("the flaky tool is in flight");
+            let reply = answer_effect(&fx, flaky).await;
+            assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+            assert_gate_invariant(&fx).await;
+            (fx, stores)
+        }
+    };
+    let (_, status, _, outstanding) = resting_at(&fx).await;
+    assert_eq!(status, AgentRunStatus::Cancelling, "{winding:?}");
+    assert_eq!(outstanding, 1, "{winding:?}: one effect holds the run");
+    let reason = fx
+        .run_snapshot()
+        .await
+        .expect("the run exists")
+        .terminal_reason;
+    assert!(
+        reason.is_some(),
+        "{winding:?}: the wind-down has its reason"
+    );
+    (fx, stores, reason)
+}
+
+/// How the test closes a gate opened on a winding-down run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Close {
+    /// A person grants it.
+    Grant,
+    /// A further `Cancel` arrives.
+    Cancel,
+}
+
+/// A gated promotion commanded on a run already winding down, after a cancel
+/// or after a failed tool, opens its gate and moves neither the status nor
+/// the phase. Once the run's other work settles, the open gate alone holds the
+/// run `Cancelling` (section 5.2.4's consequence). A grant then moves nothing
+/// either: the promotion dispatches, and its receipt is what ends the run. A
+/// further `Cancel` instead settles the promotion `Cancelled` with its gate,
+/// and that ends the run. Either way it ends under the reason its wind-down
+/// began with.
+#[tokio::test]
+async fn a_gated_promotion_commanded_while_winding_down_holds_the_run_until_answered() {
+    for winding in Winding::ALL {
+        for close in [Close::Grant, Close::Cancel] {
+            let at = format!("{winding:?}, {close:?}");
+            let (fx, stores, reason) = winding_world(
+                winding,
+                policies_gating(Gate::Checkpoint, rakka_agent::AgentCheckpointSla::default()),
+            )
+            .await;
+            let winding_down = status_and_phase(&fx).await;
+
+            let promotion = promote_gated(&fx, "gated").await;
+            assert_eq!(
+                status_and_phase(&fx).await,
+                winding_down,
+                "{at}: the command"
+            );
+            assert_eq!(promotion.status, AgentRunEffectStatus::Pending, "{at}");
+            let gate = the_gate_of(&fx, &promotion).await;
+
+            // The run's other work settles, and the open gate alone holds it.
+            drive_turn(&fx).await;
+            assert_gate_invariant(&fx).await;
+            let (_, _, _, outstanding) = resting_at(&fx).await;
+            assert_eq!(outstanding, 1, "{at}: only the promotion is outstanding");
+            let held = status_and_phase(&fx).await;
+            assert_eq!(
+                held.0,
+                AgentRunStatus::Cancelling,
+                "{at}: the gate holds the run"
+            );
+            assert_eq!(the_gate_of(&fx, &promotion).await, gate, "{at}");
+
+            match close {
+                Close::Grant => {
+                    answer_gate(&fx, &gate, Answer::Grant).await;
+                    assert_eq!(status_and_phase(&fx).await, held, "{at}: the grant");
+                    let granted = promotion_record(&fx, &promotion).await;
+                    assert_eq!(granted.status, AgentRunEffectStatus::Ready, "{at}");
+                    let reply = answer_promotion(&fx, &granted).await;
+                    assert!(
+                        matches!(reply, AgentRunEntityReply::Applied { .. }),
+                        "{at}: {reply:?}"
+                    );
+                    assert_gate_invariant(&fx).await;
+                    let done = promotion_record(&fx, &promotion).await;
+                    assert_eq!(done.status, AgentRunEffectStatus::Succeeded, "{at}");
+                    assert_eq!(stores.private.len(&agent_scope()), 1, "{at}");
+                }
+                Close::Cancel => {
+                    let reply = apply_ok(&fx, cancel_command_under("again")).await;
+                    assert!(
+                        matches!(reply, AgentRunEntityReply::Applied { .. }),
+                        "{at}: {reply:?}"
+                    );
+                    assert_gate_invariant(&fx).await;
+                    let cancelled = promotion_record(&fx, &promotion).await;
+                    assert_eq!(cancelled.status, AgentRunEffectStatus::Cancelled, "{at}");
+                    assert_eq!(cancelled.attempts, 0, "{at}");
+                    assert_eq!(
+                        gate_status(&fx, &gate).await,
+                        Some(rakka_agent::AgentCheckpointStatus::Cancelled),
+                        "{at}: the gate is cancelled with it"
+                    );
+                    assert!(stores.private.is_empty(&agent_scope()), "{at}");
+                }
+            }
+            let ended = fx.run_snapshot().await.expect("the run exists");
+            assert_eq!(ended.status, winding.ending(), "{at}");
+            assert_eq!(
+                ended.terminal_reason, reason,
+                "{at}: the run ends under the reason its wind-down began with"
+            );
+        }
     }
 }
