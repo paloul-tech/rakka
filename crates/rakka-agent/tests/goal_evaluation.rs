@@ -908,6 +908,78 @@ async fn a_denied_human_review_fails_the_evaluation_and_the_goal_stays_active() 
     );
 }
 
+/// Issue #125: an evaluation record stamped with another generation does not
+/// settle the evaluation effect. The run refuses it `effect-outcome-mismatch`
+/// before anything changes: the effect stays outstanding, the goal-evaluation
+/// cell stays empty, and the goal stays active. The effect's own record still
+/// settles it afterwards.
+#[tokio::test]
+async fn a_foreign_outcome_does_not_settle_an_evaluation() {
+    let fx = satisfying_fixture();
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+    apply_run(
+        &fx,
+        evaluate_command("1", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the evaluation commits");
+
+    let effect = evaluation_effect(&fx).await;
+    let AgentRunEffectRequest::Evaluation { evaluation } = &effect.request else {
+        panic!("the effect carries an evaluation request");
+    };
+    let own = fx
+        .dispatcher
+        .evaluation_outcome(&run_scope(), &effect, evaluation, None, fx.now())
+        .await;
+    let rakka_agent::AgentRunEffectOutcome::Evaluation { mut record } = own else {
+        panic!("the evaluator answers with a record, got {own:?}");
+    };
+    assert_eq!(
+        (&record.effect_id, record.generation),
+        (&effect.effect_id, effect.generation),
+        "the dispatcher stamps the record with the effect's own identity"
+    );
+    record.generation = effect.generation.next();
+
+    let refusal = apply_run(
+        &fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: 1,
+            fence: 0,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::Evaluation { record }),
+        },
+    )
+    .await
+    .expect_err("a record from another generation settles nothing");
+    assert_eq!(refusal.code(), "effect-outcome-mismatch", "{refusal}");
+
+    let loop_state = run_loop_state(&fx).await;
+    assert!(
+        loop_state.goal_evaluation().is_none(),
+        "the evaluation cell is unmoved"
+    );
+    let held = loop_state
+        .effects()
+        .iter()
+        .find(|held| held.effect_id == effect.effect_id)
+        .expect("the effect is held");
+    assert_eq!(
+        (held.status, held.attempts, held.generation),
+        (effect.status, effect.attempts, effect.generation),
+        "the effect is unmoved"
+    );
+    assert_eq!(goal_view(&fx).await.status, AgentGoalStatus::Active);
+
+    answer_evaluation(&fx).await;
+    assert_eq!(goal_view(&fx).await.status, AgentGoalStatus::Satisfied);
+}
+
 #[test]
 fn the_evaluation_spec_defaults_read_only_with_two_attempts() {
     // An evaluation judges evidence and never mutates the world: read-only is

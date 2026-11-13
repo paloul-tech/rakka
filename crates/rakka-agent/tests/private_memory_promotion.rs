@@ -2682,7 +2682,7 @@ fn foreign_outcomes(effect: &AgentRunEffect) -> Vec<(&'static str, AgentRunEffec
 /// Confirms each foreign outcome against an ended run's parked promotion,
 /// through `ResolveCheckpoint` when `via_checkpoint` holds, else through
 /// `ResolveIndeterminateEffect`, and checks each is refused
-/// `effect-policy-invalid` with nothing moved. Then confirms `settling`, an
+/// `effect-outcome-mismatch` with nothing moved. Then confirms `settling`, an
 /// outcome that does settle the promotion, which the run accepts.
 async fn foreign_confirmations_are_refused(
     ending: Ending,
@@ -2718,7 +2718,7 @@ async fn foreign_confirmations_are_refused(
         let refusal = apply(&fx, confirm(label, outcome))
             .await
             .expect_err("a foreign outcome settles nothing");
-        assert_eq!(refusal.code(), "effect-policy-invalid", "{at}");
+        assert_eq!(refusal.code(), "effect-outcome-mismatch", "{at}");
         assert_eq!(
             loop_picture(&fx).await,
             picture,

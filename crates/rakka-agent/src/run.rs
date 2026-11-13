@@ -95,10 +95,10 @@ use crate::choreography::{
 use crate::decision_ledger::AgentDecisionLedger;
 use crate::definition::AgentRevisionNumber;
 use crate::effect::{
-    effect_id_for, AgentEffectError, AgentEffectGeneration, AgentEffectPolicies,
-    AgentEffectResolution, AgentEffectSpec, AgentMemoryPromotionRequest, AgentRunEffect,
-    AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
-    AgentRunEffectStatus, AgentToolResult, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
+    effect_id_for, AgentEffectError, AgentEffectGeneration, AgentEffectOutcomeSource,
+    AgentEffectPolicies, AgentEffectResolution, AgentEffectSpec, AgentMemoryPromotionRequest,
+    AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectRequest,
+    AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
 };
 use crate::identity::{
     AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
@@ -4454,6 +4454,10 @@ fn build_proposal(
 /// completion unable to advance the loop twice
 /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md);
 /// [specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 10).
+/// A result that passes those fences but does not belong to the effect —
+/// another kind's success variant, or one naming another call, cell or
+/// generation — is refused `effect-outcome-mismatch` before anything changes
+/// (issue #125).
 #[allow(clippy::too_many_arguments)]
 fn record_effect_result(
     state: &mut AgentRunState,
@@ -4513,6 +4517,13 @@ fn record_effect_result(
             status: effect.status,
         });
     }
+    // After the stale fences, so a stale or duplicate delivery answers as it
+    // always has, whatever it carries; before the first mutation, so a result
+    // that belongs to another effect changes nothing. Applied, it would be
+    // read by its variant alone: a model turn would move the phase, a tool
+    // result would record under another call's id, and a receipt would
+    // settle another cell (issue #125).
+    effect.check_outcome(&outcome, AgentEffectOutcomeSource::Dispatcher)?;
     effect.record_attempt(attempt, fence);
 
     apply_effect_outcome(state, effect_id, &outcome, now)?;
@@ -5443,17 +5454,19 @@ fn drop_reconciliation_checkpoint(
 /// needs a fresh decision
 /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
+/// `ConfirmedExecuted` is refused `OutcomeMismatch` (`effect-outcome-mismatch`)
+/// unless its outcome settles the parked effect: the effect's own success
+/// variant, naming its own call, cell or generation, `Failed`, or
+/// `Exhausted`. Another outcome, such as a model turn or a goal evaluation,
+/// would move the run's phase or fill its goal-evaluation cell, so it is
+/// refused before anything changes, on a live run and an ended one alike.
+/// A confirmation that establishes nothing (`Indeterminate`, `Cancelled`, or
+/// the exhaustion that parked a handoff send) keeps `effect-policy-invalid`.
+///
 /// An ended run answers only an outside-the-turn effect it holds (a memory
 /// promotion or a claim append, whenever it parked); every other target is
 /// refused `Terminal`. A held one then meets the refusals a live run gives
-/// (stale generation, stale result). On an ended run `ConfirmedExecuted` is
-/// also refused `InvalidPolicy` (`effect-policy-invalid`) unless its outcome
-/// settles that effect: the effect's own success receipt (`MemoryPromotion`
-/// for a promotion, `ClaimAppend` for a claim append), `Failed`, or
-/// `Exhausted`. Another kind's outcome, such as a model turn or a goal
-/// evaluation, would move the ended run's phase or fill its goal-evaluation
-/// cell, so it is refused before anything changes. A live run keeps
-/// accepting whatever outcome it accepted before. On an ended run
+/// (stale generation, stale result, a foreign outcome). On an ended run
 /// `ConfirmedNotExecuted` is a person's assertion that the attempt never ran,
 /// so it takes the live arm and re-sends under a new generation rather than
 /// settling `Cancelled`; the run's status, terminal reason and terminal stamp
@@ -5520,37 +5533,17 @@ fn apply_indeterminate_resolution(
         }
         .into());
     }
-    // On an ended run a confirmation must settle the parked effect itself:
-    // its own success receipt (a promotion's or a claim append's), a
-    // definitive failure, or a spent retry budget. Any other outcome, such as
-    // a model turn or a goal evaluation, would be applied to the loop as if
-    // the run had produced it, moving the ended run's phase or owing its task
-    // an exchange, so it is refused before anything changes (issue #120).
-    if ended {
-        if let AgentEffectResolution::ConfirmedExecuted { outcome } = &resolution {
-            let kind = effect.kind();
-            let settles_the_effect = match outcome.as_ref() {
-                AgentRunEffectOutcome::MemoryPromotion { .. } => {
-                    kind == AgentRunEffectKind::MemoryPromotionCall
-                }
-                AgentRunEffectOutcome::ClaimAppend { .. } => {
-                    kind == AgentRunEffectKind::ClaimAppendCall
-                }
-                AgentRunEffectOutcome::Failed { .. } | AgentRunEffectOutcome::Exhausted { .. } => {
-                    true
-                }
-                _ => false,
-            };
-            if !settles_the_effect {
-                return Err(AgentEffectError::InvalidPolicy {
-                    message: format!(
-                        "an ended run's {kind} can be confirmed only with its own outcome, a \
-                         failure, or an exhaustion"
-                    ),
-                }
-                .into());
-            }
-        }
+    // A confirmation must settle the parked effect itself: its own success
+    // outcome, naming its own call, cell or generation, a definitive failure,
+    // or a spent retry budget. Any other outcome would be applied to the loop
+    // as if the effect had produced it, moving the run's phase, owing its
+    // task an exchange, or settling another cell, so it is refused
+    // `effect-outcome-mismatch` before anything changes, on every run. On an
+    // ended run, whose parked effect is a promotion or a claim append, it
+    // admits exactly what the ended-run rule of issue #120 admitted: the
+    // effect's own receipt, a failure, or an exhaustion (issue #125).
+    if let AgentEffectResolution::ConfirmedExecuted { outcome } = &resolution {
+        effect.check_outcome(outcome, AgentEffectOutcomeSource::Confirmation)?;
     }
 
     match resolution {

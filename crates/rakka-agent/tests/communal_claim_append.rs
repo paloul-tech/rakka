@@ -1163,6 +1163,65 @@ async fn settle(fx: &Fixture) {
         .expect("settle");
 }
 
+/// Issue #125: a memory promotion's receipt does not settle a claim append.
+/// Delivered to the in-flight append, it is refused `effect-outcome-mismatch`
+/// before anything changes: the append stays outstanding, no promotion
+/// receipt lands on the loop, and the run's wait does not move. Before the
+/// guard the append settled `Succeeded` with a promotion receipt beside it.
+#[tokio::test]
+async fn a_foreign_outcome_does_not_settle_a_claim_append() {
+    let fx = scripted_goal_fixture(RecordingClaimAppendExecutor::new()).await;
+    settle(&fx).await;
+    apply_append(&fx, "append-foreign", append_request("space-alpha"))
+        .await
+        .expect("the append applies");
+    settle(&fx).await;
+    let append = dispatched_effect(&fx, AgentRunEffectKind::ClaimAppendCall).await;
+    let resting = resting_at(&fx).await;
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let refusal = run
+        .apply(
+            AgentRunEntityCommand::RecordEffectResult {
+                operation_id: append
+                    .result_operation_id(&common::run_scope())
+                    .expect("the result operation id derives"),
+                effect_id: append.effect_id.clone(),
+                generation: append.generation,
+                attempt: append.attempts.saturating_add(1),
+                fence: 0,
+                outcome: Box::new(AgentRunEffectOutcome::MemoryPromotion {
+                    promoted: Vec::new(),
+                }),
+            },
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .expect_err("a promotion's receipt settles no claim append");
+    assert_eq!(refusal.code(), "effect-outcome-mismatch", "{refusal}");
+    drop(run);
+
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let held = committed_append(state)
+        .into_iter()
+        .find(|held| held.effect_id == append.effect_id)
+        .expect("the append is held");
+    assert_eq!(held, append, "the append is unmoved");
+    assert!(
+        state
+            .loop_state()
+            .expect("the loop is started")
+            .memory_promotions()
+            .is_empty(),
+        "no promotion receipt landed"
+    );
+    assert_eq!(resting_at(&fx).await, resting, "the run's wait is unmoved");
+}
+
 /// A goal world whose first turn calls a tool that answers, cranked to that
 /// tool's wait with an append committed beside it, both dispatched: the
 /// exact state a sweep that claims into live runs produces. Returns the tool

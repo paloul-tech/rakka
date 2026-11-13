@@ -1891,8 +1891,6 @@ impl AgentRunEffect {
     /// effect's own. A failure outcome settles any effect, except that a
     /// confirmation may not report an unknown or fenced outcome. Pure: it
     /// reads the effect and changes nothing.
-    // Task 2 wires the callers; until then only the tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn check_outcome(
         &self,
         outcome: &AgentRunEffectOutcome,
@@ -2549,8 +2547,6 @@ pub enum AgentRunEffectOutcome {
 /// A dispatcher ran the effect and may report any outcome; a confirmation
 /// speaks for the caller who observed one, and can carry only an outcome that
 /// leaves the effect's result unknown or fenced no more.
-// Task 2 wires the callers; until then only the tests construct it.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentEffectOutcomeSource {
     /// The effect dispatcher reporting what its attempt produced.
@@ -2561,8 +2557,6 @@ pub(crate) enum AgentEffectOutcomeSource {
 
 impl AgentRunEffectOutcome {
     /// The stable label of this outcome's variant, for bounded diagnostics.
-    // Task 2 wires the callers; until then only the tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn variant_label(&self) -> &'static str {
         match self {
             Self::Model { .. } => "model",
