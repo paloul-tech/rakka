@@ -169,6 +169,36 @@ async fn an_operation_id_reused_across_erasure_kinds_is_a_conflict() {
 }
 
 #[tokio::test]
+async fn retention_ages_claims_out_by_a_window_per_trust_status() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::retention_ages_claims_by_trust_status(
+        &store,
+        ConformanceScopes::unique("retention-ages"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_retention_pass_is_bounded_and_resumes_from_its_cursor() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::retention_is_bounded_and_resumable(
+        &store,
+        ConformanceScopes::unique("retention-bounded"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn retention_keeps_a_claim_that_moved_under_the_sweep() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::retention_leaves_a_claim_that_moved(
+        &store,
+        ConformanceScopes::unique("retention-moved"),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn the_whole_contract_passes_as_one_suite() {
     // Exactly what a slice 2.4 backend runs, unchanged.
     let store = InMemoryKnowledgeGraphStore::new();

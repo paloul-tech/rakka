@@ -31,6 +31,9 @@
 //!   withdrawn, and the stub's fixed markers.
 //! - [`promotion`] — the HITL/policy promotion gate over
 //!   `rakka-agent` checkpoint grants.
+//! - [`retention`] — the per-space retention policy (a window per trust
+//!   status, a tombstone window, a legal hold) and the bounded sweep that
+//!   discharges it over any backend.
 //! - [`store`] — the portable [`KnowledgeGraphStore`] SPI, bounded
 //!   query/traversal types, capability reporting, and the in-memory
 //!   reference implementation.
@@ -52,9 +55,10 @@
 //!
 //! No communal retrieval/context-snapshot path (the `MemoryContextSnapshot`
 //! communal selection stays empty until it lands), no metrics counters, no
-//! sharded knowledge-space entity, no deletion, tombstone, or retention path
-//! (`Retracted` is the auditable withdrawal; the gap is recorded as owed in
-//! `docs/rakka-agent-security-validation-matrix.md`), no per-claim capability
+//! sharded knowledge-space entity, no agent-facing erasure path (tombstone,
+//! delete and the retention sweep are operations an application calls on the
+//! store; no run effect, command or tool reaches them), no bulk or
+//! whole-space erasure, no per-claim capability
 //! enforcement at read (the access set is carried, queryable data; its
 //! enforcement point is the communal retrieval and policy layer), and no
 //! cross-tenant federation. The run-entity claim-append effect this crate once
@@ -66,6 +70,7 @@ pub mod conformance;
 pub mod error;
 pub mod goal_claim_source;
 pub mod promotion;
+pub mod retention;
 pub mod scope;
 pub mod store;
 pub mod tombstone;
@@ -83,6 +88,11 @@ pub use goal_claim_source::KnowledgeGraphGoalClaimSource;
 pub use promotion::{
     claim_promotion_binding, claim_promotion_effect_id, validate_promotion, ClaimPromotionEvidence,
     ClaimPromotionPolicy,
+};
+pub use retention::{
+    discharge_knowledge_space_retention, KnowledgeSpaceRetentionPolicy,
+    KnowledgeSpaceRetentionReport, KnowledgeSpaceRetentionSweep,
+    KNOWLEDGE_SPACE_RETENTION_DEFAULT_MAX_BATCH,
 };
 pub use scope::KnowledgeSpaceScope;
 pub use store::{
