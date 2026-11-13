@@ -330,9 +330,25 @@ SELECT record, tombstoned FROM rakka_agent_knowledge_claim
 WHERE tenant = $1 AND space = $2 AND claim_id = $3
 ";
 
-const CLAIM_HEAD_SQL: &str = "
-SELECT record, tombstoned, transition_count FROM rakka_agent_knowledge_claim
-WHERE tenant = $1 AND space = $2 AND claim_id = $3
+/// What every fenced write starts from: the ledger row of its operation id
+/// and the head of its claim, read by **one statement** and therefore under
+/// one snapshot.
+///
+/// Read separately, the two leave a window: a racer running the same
+/// operation can commit between them, and a reader that saw no ledger row
+/// then sees a claim its own operation already moved — and refuses a replay
+/// it should have answered (`claim-transition-illegal` for a transition whose
+/// target the claim now holds, `claim-tombstoned` for a tombstone that
+/// already landed, `claim-not-found` for a delete that already did). A write
+/// commits its claim change and its ledger row together, so one snapshot sees
+/// both or neither.
+const WRITE_START_SQL: &str = "
+SELECT op.kind, op.result, claim.record, claim.tombstoned, claim.transition_count
+FROM (SELECT 1) AS one
+LEFT JOIN rakka_agent_knowledge_claim_op AS op
+       ON op.tenant = $1 AND op.space = $2 AND op.operation_id = $3
+LEFT JOIN rakka_agent_knowledge_claim AS claim
+       ON claim.tenant = $1 AND claim.space = $2 AND claim.claim_id = $4
 ";
 
 const LEDGER_SQL: &str = "
@@ -406,6 +422,17 @@ enum LedgerHit {
     Deleted,
     /// An operation whose payload was erased with its claim.
     Erased,
+}
+
+/// What one fenced write found when it read its operation and its claim
+/// together.
+enum WriteStart {
+    /// The operation id is already spent; the ledger answers.
+    Spent(LedgerHit),
+    /// The operation is new and the claim does not exist in the scope.
+    Absent,
+    /// The operation is new; the claim, and the fence its row holds.
+    Present(Box<Claim>, i32),
 }
 
 impl LedgerHit {
@@ -490,33 +517,53 @@ impl PostgresKnowledgeGraphStore {
         .transpose()
     }
 
-    /// Reads one claim with the fence its row holds, when the claim exists.
+    /// Reads, in one snapshot, the ledger row of one operation id and the
+    /// head of one claim — what every fenced write decides from.
     ///
-    /// The fence is the `transition_count` column: the claim's count for a
-    /// live row, [`TOMBSTONE_FENCE_TRANSITION_COUNT`] for a stub. Any other
-    /// pairing is drift, refused here so no write is ever fenced on it.
-    async fn claim_head(
+    /// A spent operation is answered from the ledger alone, without decoding
+    /// the claim: a replay does not depend on the state the claim has since
+    /// moved to. Otherwise the claim is decoded with the fence its row holds —
+    /// the `transition_count` column: the claim's count for a live row,
+    /// [`TOMBSTONE_FENCE_TRANSITION_COUNT`] for a stub. Any other pairing is
+    /// drift, refused here so no write is ever fenced on it.
+    async fn write_start(
         &self,
         scope: &KnowledgeSpaceScope,
+        operation_id: &ClaimOperationId,
         claim_id: &ClaimId,
-    ) -> ClaimResult<Option<(Claim, i32)>> {
-        let Some(head) = self
+    ) -> ClaimResult<WriteStart> {
+        let row = self
             .client
-            .query_opt(
-                CLAIM_HEAD_SQL,
+            .query_one(
+                WRITE_START_SQL,
                 &[
                     &scope.tenant().as_str(),
                     &scope.space().as_str(),
+                    &operation_id.as_str(),
                     &claim_id.as_str(),
                 ],
             )
             .await
-            .map_err(map_error)?
-        else {
-            return Ok(None);
+            .map_err(map_error)?;
+        if let Some(kind) = row.get::<_, Option<String>>("kind") {
+            let result: Option<Vec<u8>> = row.get("result");
+            return Ok(WriteStart::Spent(LedgerHit::from_row(
+                &kind,
+                result.unwrap_or_default(),
+            )?));
+        }
+        let Some(record) = row.get::<_, Option<Vec<u8>>>("record") else {
+            return Ok(WriteStart::Absent);
         };
-        let claim = decode_claim_row(&head)?;
-        let fence: i32 = head.get("transition_count");
+        let tombstoned: Option<bool> = row.get("tombstoned");
+        let fence: Option<i32> = row.get("transition_count");
+        let (Some(tombstoned), Some(fence)) = (tombstoned, fence) else {
+            return Err(ClaimError::Backend {
+                backend: BACKEND_NAME.to_string(),
+                message: "a claim row was read without its fence columns".to_string(),
+            });
+        };
+        let claim = decode_claim_columns(&record, tombstoned)?;
         let expected = if claim.is_tombstoned() {
             TOMBSTONE_FENCE_TRANSITION_COUNT
         } else {
@@ -525,7 +572,7 @@ impl PostgresKnowledgeGraphStore {
         if fence != expected {
             return Err(drift_error(&claim.claim_id));
         }
-        Ok(Some((claim, fence)))
+        Ok(WriteStart::Present(Box::new(claim), fence))
     }
 
     /// The candidate edges one frontier node yields, in ascending claim-id
@@ -872,33 +919,39 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
     ) -> ClaimFuture<'a, ClaimTransitionOutcome> {
         Box::pin(async move {
             for _ in 0..TRANSITION_CAS_MAX_ATTEMPTS {
-                // Ledger first, on every attempt: a replay answers the
-                // original outcome without re-running legality or the gate —
-                // a decided promotion is not re-litigated, even by a grant
-                // that has since expired.
-                match self
-                    .ledger_hit(scope, request.operation_id.as_str())
+                // The ledger first, on every attempt, and in the same
+                // snapshot as the claim: a replay answers the original outcome
+                // without re-running legality or the gate — a decided
+                // promotion is not re-litigated, even by a grant that has
+                // since expired — and never against a claim the same
+                // operation already moved.
+                let (claim, fence) = match self
+                    .write_start(scope, &request.operation_id, &request.claim_id)
                     .await?
                 {
-                    Some(LedgerHit::Transition(result)) => return decode_outcome(&result),
-                    Some(LedgerHit::Erased) => {
+                    WriteStart::Spent(LedgerHit::Transition(result)) => {
+                        return decode_outcome(&result);
+                    }
+                    WriteStart::Spent(LedgerHit::Erased) => {
                         return Err(ClaimError::OperationErased {
                             operation_id: request.operation_id.clone(),
                         });
                     }
-                    Some(LedgerHit::Append(_) | LedgerHit::Tombstone(_) | LedgerHit::Deleted) => {
+                    WriteStart::Spent(
+                        LedgerHit::Append(_) | LedgerHit::Tombstone(_) | LedgerHit::Deleted,
+                    ) => {
                         return Err(ClaimError::OperationConflict {
                             operation_id: request.operation_id.clone(),
                         });
                     }
-                    None => {}
-                }
-                let Some((claim, fence)) = self.claim_head(scope, &request.claim_id).await? else {
                     // Absent and out-of-scope are the same refusal
                     // (scenario 18).
-                    return Err(ClaimError::NotFound {
-                        claim_id: request.claim_id.clone(),
-                    });
+                    WriteStart::Absent => {
+                        return Err(ClaimError::NotFound {
+                            claim_id: request.claim_id.clone(),
+                        });
+                    }
+                    WriteStart::Present(claim, fence) => (*claim, fence),
                 };
 
                 // Refuses a stub (`claim-tombstoned`) before the table is
@@ -1031,15 +1084,10 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
 
     fn delete<'a>(
         &'a self,
-        _scope: &'a KnowledgeSpaceScope,
-        _request: &'a ClaimDeleteRequest,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimDeleteRequest,
     ) -> ClaimFuture<'a, ()> {
-        Box::pin(async move {
-            Err(ClaimError::Backend {
-                backend: BACKEND_NAME.to_string(),
-                message: "delete is not implemented for this backend yet".to_string(),
-            })
-        })
+        Box::pin(self.delete_claim(scope, request))
     }
 }
 
@@ -1151,8 +1199,12 @@ fn decode_claim(bytes: &[u8]) -> ClaimResult<Claim> {
 /// rather than preferred either way.
 fn decode_claim_row(row: &Row) -> ClaimResult<Claim> {
     let record: Vec<u8> = row.get("record");
-    let claim = decode_claim(&record)?;
-    let tombstoned: bool = row.get("tombstoned");
+    decode_claim_columns(&record, row.get("tombstoned"))
+}
+
+/// Decodes one claim from its record and the `tombstoned` column beside it.
+fn decode_claim_columns(record: &[u8], tombstoned: bool) -> ClaimResult<Claim> {
+    let claim = decode_claim(record)?;
     if tombstoned != claim.is_tombstoned() {
         return Err(drift_error(&claim.claim_id));
     }

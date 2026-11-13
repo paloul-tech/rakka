@@ -22,11 +22,11 @@ use rakka_agent_knowledge_graph::conformance::{
     conformance_claim, conformance_resolver, ConformanceScopes,
 };
 use rakka_agent_knowledge_graph::{
-    Claim, ClaimCursor, ClaimFilter, ClaimId, ClaimNodeId, ClaimObject, ClaimOperationId,
-    ClaimPredicate, ClaimPromotionPolicy, ClaimProvenance, ClaimTombstoneReason,
-    ClaimTombstoneRequest, ClaimTransitionCursor, ClaimTransitionOutcome, ClaimTrustStatus,
-    ClaimTrustTransition, ClaimTrustTransitionRequest, KnowledgeGraphStore, KnowledgeSpaceScope,
-    CLAIM_TOMBSTONE_MARKER,
+    Claim, ClaimCursor, ClaimDeleteExpectation, ClaimDeleteRequest, ClaimFilter, ClaimId,
+    ClaimNodeId, ClaimObject, ClaimOperationId, ClaimPredicate, ClaimPromotionPolicy,
+    ClaimProvenance, ClaimTombstoneReason, ClaimTombstoneRequest, ClaimTransitionCursor,
+    ClaimTransitionOutcome, ClaimTrustStatus, ClaimTrustTransition, ClaimTrustTransitionRequest,
+    KnowledgeGraphStore, KnowledgeSpaceScope, CLAIM_TOMBSTONE_MARKER,
 };
 use rakka_agent_knowledge_graph_postgres::{
     PostgresKnowledgeGraphStore, TOMBSTONE_FENCE_TRANSITION_COUNT,
@@ -143,6 +143,12 @@ const NOW: AgentTimestampMillis = AgentTimestampMillis::new(10);
 /// How many times the tombstone/transition race is run.
 const TOMBSTONE_RACE_RUNS: u32 = 48;
 
+/// How many times the delete/transition race is run.
+const DELETE_RACE_RUNS: u32 = 48;
+
+/// How many times each same-operation race is run.
+const SAME_OPERATION_RACE_RUNS: u32 = 64;
+
 async fn connect(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls)
         .await
@@ -217,6 +223,20 @@ fn tombstone_request(
         reason: ClaimTombstoneReason::Withdrawn,
         actor: conformance_resolver(),
         tombstoned_at: AgentTimestampMillis::new(20),
+    }
+}
+
+fn delete_request(
+    scope: &KnowledgeSpaceScope,
+    claim_id: &ClaimId,
+    discriminator: &str,
+    expected: Option<ClaimDeleteExpectation>,
+) -> ClaimDeleteRequest {
+    ClaimDeleteRequest {
+        claim_id: claim_id.clone(),
+        operation_id: ClaimOperationId::derive_delete(scope, claim_id, discriminator)
+            .expect("the operation id derives"),
+        expected,
     }
 }
 
@@ -1087,4 +1107,521 @@ async fn postgres_concurrent_tombstone_and_transition_stay_coherent_when_dsn_is_
     eprintln!(
         "tombstone/transition race: transition first {transition_first}, tombstone first {tombstone_first}"
     );
+}
+
+#[tokio::test]
+async fn postgres_delete_leaves_no_statement_bytes_when_dsn_is_set() {
+    // A delete removes the transition rows too, so — unlike a tombstone — it
+    // also reaches a transition reason that quoted the statement. Afterwards
+    // the scope's rows hold the statement nowhere, whether the claim was
+    // deleted live or as a stub.
+    let Some(store) = store().await else { return };
+    let raw = client().await.expect("a raw connection opens");
+    let policy = ClaimPromotionPolicy::ungated();
+
+    for tombstone_first in [false, true] {
+        let scope = ConformanceScopes::unique("pg-delete-bytes").primary;
+        let claim = distinctive_claim(&scope, "erased");
+        store
+            .append(&scope, &claim)
+            .await
+            .expect("the claim appends");
+        let mut dispute = transition_request(
+            &scope,
+            &claim.claim_id,
+            "dispute",
+            ClaimTrustStatus::Disputed,
+        );
+        dispute.reason = Some(format!("the reviewer quoted {SUBJECT} back"));
+        store
+            .transition(&scope, &dispute, &policy, NOW)
+            .await
+            .expect("the dispute applies");
+        let mut spent = vec![claim.operation_id.clone(), dispute.operation_id.clone()];
+
+        if tombstone_first {
+            let tombstone = tombstone_request(&scope, &claim.claim_id, "withdraw");
+            store
+                .tombstone(&scope, &tombstone)
+                .await
+                .expect("the tombstone applies");
+            spent.push(tombstone.operation_id);
+            // The stated exposure of a tombstone: it keeps the transition
+            // history whole, reason included. Only the delete below reaches it.
+            assert_eq!(
+                statement_strings_in(&scope_rows(&raw, &scope).await),
+                vec![SUBJECT],
+                "after a tombstone only the transition reason still quotes the statement"
+            );
+        } else {
+            assert_eq!(
+                statement_strings_in(&scope_rows(&raw, &scope).await),
+                STATEMENT_STRINGS
+            );
+        }
+
+        let delete = delete_request(&scope, &claim.claim_id, "erase", None);
+        store
+            .delete(&scope, &delete)
+            .await
+            .expect("the delete applies");
+
+        let after = scope_rows(&raw, &scope).await;
+        assert_eq!(
+            statement_strings_in(&after),
+            Vec::<&str>::new(),
+            "a delete leaves the statement's bytes nowhere in the scope"
+        );
+        assert_eq!(
+            after.len(),
+            spent.len() + 1,
+            "only ledger rows remain: one per spent operation, and the delete's own"
+        );
+        assert!(
+            after.iter().all(|row| row.starts_with(b"op|")),
+            "the claim row and every transition row are gone"
+        );
+        for operation_id in &spent {
+            let (kind, result) = ledger_row(&raw, &scope, operation_id)
+                .await
+                .expect("an erased ledger row is kept");
+            assert_eq!(kind, "erased");
+            assert!(result.is_empty());
+        }
+        let (kind, result) = ledger_row(&raw, &scope, &delete.operation_id)
+            .await
+            .expect("the delete has its ledger row");
+        assert_eq!(kind, "delete");
+        assert!(result.is_empty(), "a delete's ledger row holds no payload");
+
+        assert!(store
+            .get(&scope, &claim.claim_id)
+            .await
+            .expect("the read answers")
+            .is_none());
+        assert!(store
+            .transitions(&scope, &claim.claim_id, ClaimTransitionCursor::start())
+            .await
+            .expect("the history lists")
+            .transitions
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn postgres_an_earlier_binary_replaying_an_erased_append_cannot_restore_it_when_dsn_is_set() {
+    // The anti-goal this whole design turns on: a replayed append must not
+    // restore a deleted claim. An earlier binary retries the append it never
+    // got an answer for, with the original record. Its statement consults the
+    // ledger first and finds the row still there — erased, not removed — so
+    // it inserts nothing.
+    let Some(store) = store().await else { return };
+    let raw = client().await.expect("a raw connection opens");
+    let scope = ConformanceScopes::unique("pg-earlier-replay").primary;
+
+    let claim = distinctive_claim(&scope, "erased");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+    store
+        .delete(
+            &scope,
+            &delete_request(&scope, &claim.claim_id, "erase", None),
+        )
+        .await
+        .expect("the delete applies");
+    let before = scope_rows(&raw, &scope).await;
+
+    let row = earlier_append(&raw, &scope, &claim).await;
+    assert!(
+        row.get::<_, bool>("replayed"),
+        "the earlier statement finds the erased ledger row"
+    );
+    assert!(
+        !row.get::<_, bool>("applied"),
+        "the earlier statement inserts nothing"
+    );
+    // What `replayed_append` at `d12b0f8` does with this row: a kind other
+    // than `append` is `claim-operation-conflict`, and the payload is read as
+    // non-null bytes, so it neither panics nor decodes a claim.
+    let kind: Option<String> = row.get("replay_kind");
+    assert_eq!(kind.as_deref(), Some("erased"));
+    assert_ne!(kind.as_deref(), Some("append"));
+    let result: Option<Vec<u8>> = row.get("replay_result");
+    assert_eq!(
+        result,
+        Some(Vec::new()),
+        "the erased payload is empty bytes, never NULL"
+    );
+
+    assert_eq!(
+        scope_rows(&raw, &scope).await,
+        before,
+        "the replay changed no row"
+    );
+    assert!(
+        store
+            .get(&scope, &claim.claim_id)
+            .await
+            .expect("the read answers")
+            .is_none(),
+        "the claim was not restored"
+    );
+    assert_eq!(
+        statement_strings_in(&scope_rows(&raw, &scope).await),
+        Vec::<&str>::new()
+    );
+
+    // The same holds over a stub: the replay cannot put the statement back
+    // beside a tombstone either.
+    let withdrawn = distinctive_claim(&scope, "withdrawn");
+    store
+        .append(&scope, &withdrawn)
+        .await
+        .expect("the claim appends");
+    let stub = store
+        .tombstone(
+            &scope,
+            &tombstone_request(&scope, &withdrawn.claim_id, "withdraw"),
+        )
+        .await
+        .expect("the tombstone applies");
+    let row = earlier_append(&raw, &scope, &withdrawn).await;
+    assert!(row.get::<_, bool>("replayed"));
+    assert!(!row.get::<_, bool>("applied"));
+    assert_eq!(
+        row.get::<_, Option<String>>("replay_kind").as_deref(),
+        Some("erased")
+    );
+    assert_eq!(
+        store
+            .get(&scope, &withdrawn.claim_id)
+            .await
+            .expect("the read answers"),
+        Some(stub),
+        "the stub is untouched"
+    );
+    assert_eq!(
+        statement_strings_in(&scope_rows(&raw, &scope).await),
+        Vec::<&str>::new()
+    );
+}
+
+#[tokio::test]
+async fn postgres_an_earlier_transition_statement_against_a_deleted_claim_applies_nothing_when_dsn_is_set(
+) {
+    // An earlier binary read a live claim, a delete committed, and its
+    // transition statement then runs. There is no row to match: it writes no
+    // claim, no transition row and no ledger row, and its retry reads no
+    // claim (`claim-not-found`).
+    let Some(store) = store().await else { return };
+    let raw = client().await.expect("a raw connection opens");
+    let scope = ConformanceScopes::unique("pg-earlier-over-deleted").primary;
+
+    let claim = distinctive_claim(&scope, "erased");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+    let read_by_the_earlier_binary = store
+        .get(&scope, &claim.claim_id)
+        .await
+        .expect("the claim reads")
+        .expect("the claim exists");
+    store
+        .delete(
+            &scope,
+            &delete_request(&scope, &claim.claim_id, "erase", None),
+        )
+        .await
+        .expect("the delete applies");
+    let before = scope_rows(&raw, &scope).await;
+
+    let in_flight = transition_request(
+        &scope,
+        &claim.claim_id,
+        "in-flight",
+        ClaimTrustStatus::Disputed,
+    );
+    let row = earlier_transition(&raw, &scope, &read_by_the_earlier_binary, &in_flight).await;
+    assert!(!row.get::<_, bool>("replayed"));
+    assert!(
+        !row.get::<_, bool>("applied"),
+        "the earlier transition statement matches no row"
+    );
+    assert_eq!(
+        scope_rows(&raw, &scope).await,
+        before,
+        "no transition row and no ledger row was inserted"
+    );
+    assert!(ledger_row(&raw, &scope, &in_flight.operation_id)
+        .await
+        .is_none());
+    assert_eq!(
+        statement_strings_in(&scope_rows(&raw, &scope).await),
+        Vec::<&str>::new()
+    );
+}
+
+#[tokio::test]
+async fn postgres_concurrent_delete_and_transition_stay_coherent_when_dsn_is_set() {
+    // Two connections race a delete and a transition on one claim. Every run
+    // ends in one of the two serial outcomes: the transition landed first and
+    // the delete took it with the claim, its ledger row erased; or the delete
+    // landed first and the transition found no claim. Never a mixture — no
+    // orphaned transition row, no ledger row still holding the claim.
+    let Some(store_a) = store().await else { return };
+    let store_b = store().await.expect("a second connection opens");
+    let raw = client().await.expect("a raw connection opens");
+    let policy = ClaimPromotionPolicy::ungated();
+    let mut transition_first = 0_u32;
+    let mut delete_first = 0_u32;
+
+    for run in 0..DELETE_RACE_RUNS {
+        let scope = ConformanceScopes::unique("pg-race-delete").primary;
+        let claim = distinctive_claim(&scope, &format!("race-{run}"));
+        store_a
+            .append(&scope, &claim)
+            .await
+            .expect("the claim appends");
+        let dispute = transition_request(
+            &scope,
+            &claim.claim_id,
+            "dispute",
+            ClaimTrustStatus::Disputed,
+        );
+        let delete = delete_request(&scope, &claim.claim_id, "erase", None);
+
+        // As in the tombstone race: the delete makes one more round trip
+        // before its write, so the transition is held back by a growing step
+        // to walk the two writes across each other.
+        let head_start = std::time::Duration::from_micros(u64::from(run % 8) * 40);
+        let (deleted, transitioned) = tokio::join!(store_a.delete(&scope, &delete), async {
+            tokio::time::sleep(head_start).await;
+            store_b.transition(&scope, &dispute, &policy, NOW).await
+        },);
+        deleted.expect("an unconditional delete always lands: it retries a lost race");
+
+        assert!(
+            store_a
+                .get(&scope, &claim.claim_id)
+                .await
+                .expect("the read answers")
+                .is_none(),
+            "run {run}: the claim is gone"
+        );
+        let rows = scope_rows(&raw, &scope).await;
+        assert!(
+            rows.iter().all(|row| row.starts_with(b"op|")),
+            "run {run}: no claim row and no transition row survives the delete"
+        );
+        assert_eq!(
+            statement_strings_in(&rows),
+            Vec::<&str>::new(),
+            "run {run}: the statement survives in no row, whichever writer won"
+        );
+        let (kind, _) = ledger_row(&raw, &scope, &claim.operation_id)
+            .await
+            .expect("the append's ledger row is kept");
+        assert_eq!(kind, "erased");
+
+        match transitioned {
+            Ok(_) => {
+                transition_first += 1;
+                let (kind, result) = ledger_row(&raw, &scope, &dispute.operation_id)
+                    .await
+                    .expect("the transition's ledger row is kept");
+                assert_eq!(
+                    kind, "erased",
+                    "run {run}: the delete erased the transition it followed"
+                );
+                assert!(result.is_empty());
+            }
+            Err(error) => {
+                delete_first += 1;
+                assert_eq!(
+                    error.code(),
+                    "claim-not-found",
+                    "run {run}: a transition that lost to the delete finds no claim: {error}"
+                );
+                assert!(ledger_row(&raw, &scope, &dispute.operation_id)
+                    .await
+                    .is_none());
+            }
+        }
+    }
+    eprintln!(
+        "delete/transition race: transition first {transition_first}, delete first {delete_first}"
+    );
+}
+
+#[tokio::test]
+async fn postgres_a_stale_delete_writes_nothing_when_dsn_is_set() {
+    // A delete whose expectation no longer holds is refused before any write:
+    // every row of the scope is byte-identical, and no ledger row records the
+    // attempt — which is why the same operation id can be tried again.
+    let Some(store) = store().await else { return };
+    let raw = client().await.expect("a raw connection opens");
+    let scope = ConformanceScopes::unique("pg-stale-delete").primary;
+
+    let claim = distinctive_claim(&scope, "kept");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+    store
+        .transition(
+            &scope,
+            &transition_request(
+                &scope,
+                &claim.claim_id,
+                "dispute",
+                ClaimTrustStatus::Disputed,
+            ),
+            &ClaimPromotionPolicy::ungated(),
+            NOW,
+        )
+        .await
+        .expect("the dispute applies");
+    let before = scope_rows(&raw, &scope).await;
+
+    for expected in [
+        // The count the caller read before the dispute landed.
+        ClaimDeleteExpectation {
+            transition_count: 0,
+            tombstoned: false,
+        },
+        // The right count, but the caller read a stub.
+        ClaimDeleteExpectation {
+            transition_count: 1,
+            tombstoned: true,
+        },
+    ] {
+        let request = delete_request(&scope, &claim.claim_id, "erase", Some(expected));
+        assert_eq!(
+            store
+                .delete(&scope, &request)
+                .await
+                .expect_err("a stale delete is refused")
+                .code(),
+            "claim-delete-stale"
+        );
+        assert_eq!(
+            scope_rows(&raw, &scope).await,
+            before,
+            "a stale delete leaves every row byte-identical"
+        );
+        assert!(
+            ledger_row(&raw, &scope, &request.operation_id)
+                .await
+                .is_none(),
+            "a stale delete records nothing"
+        );
+    }
+
+    // A tombstone landing after the caller's read makes a live expectation
+    // stale, and the stub survives.
+    let stub = store
+        .tombstone(
+            &scope,
+            &tombstone_request(&scope, &claim.claim_id, "withdraw"),
+        )
+        .await
+        .expect("the tombstone applies");
+    let before = scope_rows(&raw, &scope).await;
+    let request = delete_request(
+        &scope,
+        &claim.claim_id,
+        "erase",
+        Some(ClaimDeleteExpectation {
+            transition_count: 1,
+            tombstoned: false,
+        }),
+    );
+    assert_eq!(
+        store
+            .delete(&scope, &request)
+            .await
+            .expect_err("a delete that read the live claim is stale against its stub")
+            .code(),
+        "claim-delete-stale"
+    );
+    assert_eq!(scope_rows(&raw, &scope).await, before);
+    assert_eq!(
+        store
+            .get(&scope, &claim.claim_id)
+            .await
+            .expect("the read answers"),
+        Some(stub)
+    );
+}
+
+#[tokio::test]
+async fn postgres_same_operation_races_converge_every_time_when_dsn_is_set() {
+    // Two connections race the *same* operation id. Exactly one applies, and
+    // the other must answer the winner's result — not a refusal decided
+    // against the state the winner left behind. The window is the gap between
+    // a store reading the ledger and reading the claim: a racer that commits
+    // inside it leaves a ledger-less reader looking at a claim its own
+    // operation already moved. One read of both closes it; the runs walk the
+    // second racer across the first to land inside that window.
+    let Some(store_a) = store().await else { return };
+    let store_b = store().await.expect("a second connection opens");
+    let policy = ClaimPromotionPolicy::ungated();
+
+    for run in 0..SAME_OPERATION_RACE_RUNS {
+        let head_start = std::time::Duration::from_micros(u64::from(run % 16) * 25);
+        let scope = ConformanceScopes::unique("pg-race-same-op").primary;
+
+        // The same transition: both racers answer the one applied outcome.
+        let moved = conformance_claim(&scope, &format!("moved-{run}"), "node-a", "node-b");
+        store_a
+            .append(&scope, &moved)
+            .await
+            .expect("the claim appends");
+        let dispute = transition_request(
+            &scope,
+            &moved.claim_id,
+            "dispute",
+            ClaimTrustStatus::Disputed,
+        );
+        let (first, second) =
+            tokio::join!(store_a.transition(&scope, &dispute, &policy, NOW), async {
+                tokio::time::sleep(head_start).await;
+                store_b.transition(&scope, &dispute, &policy, NOW).await
+            },);
+        let first = first.unwrap_or_else(|error| panic!("run {run}: the first racer: {error}"));
+        let second = second.unwrap_or_else(|error| panic!("run {run}: the second racer: {error}"));
+        assert_eq!(first, second, "run {run}: one transition, one outcome");
+
+        // The same tombstone: both racers answer the one stub.
+        let withdrawn = conformance_claim(&scope, &format!("withdrawn-{run}"), "node-a", "node-c");
+        store_a
+            .append(&scope, &withdrawn)
+            .await
+            .expect("the claim appends");
+        let tombstone = tombstone_request(&scope, &withdrawn.claim_id, "withdraw");
+        let (first, second) = tokio::join!(store_a.tombstone(&scope, &tombstone), async {
+            tokio::time::sleep(head_start).await;
+            store_b.tombstone(&scope, &tombstone).await
+        },);
+        let first = first.unwrap_or_else(|error| panic!("run {run}: the first racer: {error}"));
+        let second = second.unwrap_or_else(|error| panic!("run {run}: the second racer: {error}"));
+        assert_eq!(first, second, "run {run}: one tombstone, one stub");
+
+        // The same delete: both racers answer success.
+        let erased = conformance_claim(&scope, &format!("erased-{run}"), "node-a", "node-d");
+        store_a
+            .append(&scope, &erased)
+            .await
+            .expect("the claim appends");
+        let delete = delete_request(&scope, &erased.claim_id, "erase", None);
+        let (first, second) = tokio::join!(store_a.delete(&scope, &delete), async {
+            tokio::time::sleep(head_start).await;
+            store_b.delete(&scope, &delete).await
+        },);
+        first.unwrap_or_else(|error| panic!("run {run}: the first racer: {error}"));
+        second.unwrap_or_else(|error| panic!("run {run}: the second racer: {error}"));
+    }
 }
