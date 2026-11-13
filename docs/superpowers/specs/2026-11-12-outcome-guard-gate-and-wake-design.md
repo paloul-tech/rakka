@@ -315,3 +315,75 @@ Each guard gets a falsification: remove it, and a named test fails. PR #124's re
 ## 10. After the merge
 
 A short report on each of #125, #126 and #127 saying what landed and what changed for a deployment, then the three issues close. The report on #126 also names the two goal-evaluation fixes. #123 stays open, and so does the new issue for a gated compensation or workflow cancel (#128).
+
+## 11. As built
+
+What the build found that differs from sections 1-10, or that they left to the builder. Commits are on `outcome-guard-gate-and-wake`.
+
+### 11.1 Names
+
+- The guard is `AgentRunEffect::check_outcome(outcome, source)`, `pub(crate)` in `effect.rs` (`3e8d928`).
+- The role is `AgentEffectOutcomeSource`, `pub(crate)`, with `Dispatcher` and `Confirmation` (`3e8d928`).
+- `AgentEffectError::OutcomeMismatch` carries `effect` (the effect's `kind().as_label()`), `outcome` (the new `AgentRunEffectOutcome::variant_label`) and a fixed `detail`. A delegation send and a handoff send share the kind label `a2a-send-call` (`3e8d928`).
+- The gate-kind helper is `AgentRunEffect::gate_kind`, `pub(crate)`, on the effect (`ae6d108`). The tool-turn block, the re-send path, `promote_memory`, `append_claim` (through `open_commanded_gate`) and `evaluate_goal` all read it (`ae6d108`, `35fcb3d`).
+- The deadline method is `AgentCheckpoint::next_timer_deadline`, public, beside `on_timer` (`bfac254`).
+- The shared sweep predicate is `AgentRun::timer_sweep_acts_on`, `pub(crate)`. `fire_checkpoint_timers` and `AgentOperationalSnapshot`'s `next_wake` both read it (`bfac254`).
+
+### 11.2 The #125 proofs as built
+
+- All ten requests are proven in the guard's unit tests in `effect.rs`: each request's own variant admitted, every other success variant refused, the identity checks, and the failure outcomes by source (`3e8d928`).
+- On the run, the result path is proven on three effect kinds: a model call, a tool call and a memory promotion, each offered every other success variant (`tests/effect_outcome_guard.rs`, `f1a5f5a`).
+- The confirmation path is proven on a parked promotion offered three foreign outcomes (model, evaluation, claim append), through both resolution commands (same file).
+- Each other kind is proven once through the result path, in its own test file: evaluation, delegation send, handoff send, workflow start, claim append and compensation. A workflow cancel is proven by the unit tests only.
+- The `Evaluation` identity check was kept. `invoke_goal_evaluation` stamps the record with the intent's `effect_id` and `generation`, and no existing test failed the check. The crate suite passed with one existing test edited, `foreign_confirmations_are_refused`, whose expected code is the one section 5.1.2 changes.
+
+### 11.3 The dispatcher (Task 3, `dc1a547`)
+
+- Before the fix, the first reconciler test showed the expected unbounded re-query. Over eight passes the reconciler was queried eight times against a three-attempt budget. Each pass returned `effect-outcome-mismatch`, burned no attempt, and left the effect `Ready` and the run `WaitingForEffect` with no checkpoint. The winding-down case re-queried on every pass too.
+- The build found a defect in the existing `Unknown` arm, which section 2.1 assumed parks cleanly. At a spent budget it called `fleet.record_claim_failure` and then `park_indeterminate`, whose `settle_ticket_cancelled` recorded the same claim again. The second record answered `claim-fenced`. The park was durable, but the pass returned the error and the fleet index entry ended `Exhausted`. No existing test reached that branch.
+- Ruling: drop the first `record_claim_failure`. The park now settles the ticket once, the pass returns normally, and the fleet entry ends `Cancelled` with the code `indeterminate`, as every other park leaves it. This changes the existing `Unknown` arm too. `an_unknown_finding_at_a_spent_budget_parks_without_error` pins it.
+- Both findings share one helper, `settle_unknown_finding`, which takes the failed-attempt line and the two park codes.
+- Ruling on the line: section 5.1.4 says the failed-attempt line carries the code, and the plan's line (`reconciliation outcome mismatched`) had dropped it. The line is `effect-outcome-mismatch: the reconciled outcome does not fit the effect`. The `Unknown` arm keeps `reconciliation outcome unknown`.
+- The dispatcher also logs a `tracing::warn!` with static labels when it handles a mismatched finding.
+
+### 11.4 Command-opened gates (Task 4, `ae6d108`)
+
+- `assert_gate_invariant` lives in `tests/common/mod.rs`, so `private_memory_promotion.rs` and `communal_claim_append.rs` share one definition.
+- The checkpoint-bound test reaches the bound on checkpoints alone. Eight ungated promotions are dispatched and come back `Indeterminate` on the live run, so the run holds eight reconciliation checkpoints and one outstanding effect, the model call. `record_effect` cannot refuse, so the `effect-pending-overflow` comes from `record_checkpoint`.
+- Status precedence changes with two gates open. A gate on a promotion or claim append is no longer the turn's approval wait. So a run that holds a tool's `SecurityAuthorization` and a promotion's `Approval` reports `WaitingForAuthorization` where `36d742b` reported `WaitingForApproval`. No test holds both gates at once; this follows from `approval_family_wait`.
+
+### 11.5 Cancel (Task 5, `d1c1fa6`)
+
+- Section 5.2.4's premise is false. `fence_unsent_effects` sets a fenced `Pending` effect `Cancelled` without `settle_effect`, so it releases nothing.
+- The rule therefore settles through `apply_effect_outcome` with `Cancelled { reason: "run-cancelled" }`. Its shared tail releases the reservation and consumes no attempt.
+- A record an older binary already left `Cancelling`, with its gate cancelled and its promotion or claim append still `Pending`, is not repaired by a settle pass. A further `Cancel` under a fresh operation id re-enters `cancel` and settles it.
+- No existing test failed when the rule's `outside_the_turn` term was removed. `a_cancel_leaves_a_gated_compensation_as_it_was` was added to hold it. It pins today's behaviour for a gated compensation, which issue #128 may change.
+
+### 11.6 Goal evaluation (Task 6, `35fcb3d`)
+
+- No existing test pinned an `Approval` on an evaluation requiring both gates, so the anti-goal's exception in section 3 was not used.
+- The `SecurityAuthorization` grant reaches `granted.checkpoint` through the real dispatch authority. The dispatcher did not change.
+- The section 9 probe failed. A human-review evaluation denied while the run awaits its model call gets a fresh `Approval` from that turn's tool-call gate block when the turn calls a tool. The run then reports `WaitingForApproval` on a `Failed` effect. It reproduces with default policies.
+- Cause: the block selects effects of the current turn, not outside the turn, with no grant, and reads no status. The denial dropped the checkpoint, so `record_checkpoint` no longer holds its id and the reopen is new.
+- The gate block was left unchanged pending the owner's decision. The probe test was not committed; its body and output are in the task 6 report.
+
+### 11.7 Telemetry (Task 7, `568785c`; Task 7b, `e5a2a40`)
+
+- The first build wrapped `transition` in an async helper. It grew `AgentRunEntityStore::apply`'s future from 11,840 B to 12,416 B in a debug build. `a_gated_promotion_commanded_while_winding_down_holds_the_run_until_answered` then overflowed the 2 MiB test-thread stack.
+- The built shape keeps each arm's own `transition` call and puts the shared code in two synchronous helpers around it: `current_segment_marks` and `close_checkpoint_open_segments_since`. The `apply` future is 11,816 B.
+- That test ran within one 16 KiB page of the default stack before this batch too. An added task, 7b, made the promotion tests' margin robust, in test code only. It boxed the bottom helper awaits and the world builders' awaits, and flattened one arm of `winding_world`.
+- Before 7b the named test needed 2048 KiB of stack, and 32 of the file's 59 tests overflowed at 1.5 MiB. After it the named test needs 1456 KiB, and none overflows at 1.5 MiB.
+
+### 11.8 Wake deadlines (Task 8, `bfac254`)
+
+- Departure: after a person's `Escalate`, `next_wake` is `None`, not the `expires_at` the plan expected. A person can escalate only a reconciliation checkpoint (`check_decision_kind`), and the run writes no `expires_at` on one. The test escalates a reconciliation checkpoint for that half; the timer half asserts `expires_at`.
+- Departure: the ended-run state with an approval left open on a tool effect was built by commands, not by editing the stored record as the plan allowed. A gated tool call beside a sibling that fails definitively ends the run `Failed`, and the gated call's approval stays open.
+
+### 11.9 Found and left alone
+
+These are pre-existing and outside this design. Each is a follow-up candidate for the owner.
+
+- The re-send path in `apply_indeterminate_resolution` writes `WaitingForEffect` on a live run whatever the run rested on. A promotion re-sent while the run rests on its proposal or its children comes back `WaitingForEffect`, not `Running`. An ungated promotion behaves the same.
+- `fence_unsent_effects` does not release a fenced effect's reserved attempts. It matters only under an `EffectAttempts` limit.
+- A run can end `Failed` with a tool call's approval still open, and nothing can answer it.
+- A goal evaluation whose gate is denied earlier in a turn regains a gate when that turn later calls tools (section 11.6).
