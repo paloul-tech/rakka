@@ -19,11 +19,19 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    AgentEffectSpec, AgentModelTurn, AgentSegmentOperation, AgentSegmentOutcome, AgentSegmentSink,
-    AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId, AgentToolRegistry,
-    InMemoryAgentSegmentSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    claim_append_operation_id, evaluation_operation_id, load_agent_run_state,
+    promotion_operation_id, AgentCheckpoint, AgentCheckpointKind, AgentClaimAppendRequest,
+    AgentClaimObjectRequest, AgentEffectPolicies, AgentEffectSpec, AgentMemoryPromotionRequest,
+    AgentModelTurn, AgentPrivateMemoryKind, AgentRevisionNumber, AgentRunEffect,
+    AgentRunEffectKind, AgentRunEffectRequest, AgentRunEntityCommand, AgentRunEntityReply,
+    AgentRunMemory, AgentRunStatus, AgentSchemaPolicy, AgentSegmentOperation, AgentSegmentOutcome,
+    AgentSegmentSink, AgentTaskContent, AgentTaskEntityCommand, AgentTelemetrySegment,
+    AgentToolCallId, AgentToolCallRequest, AgentToolId, AgentToolRegistry,
+    InMemoryAgentRunEffectSink, InMemoryAgentSegmentSink, InMemoryContextSnapshotStore,
+    InMemorySessionMemoryStore, KnowledgeSpaceId, MemoryClassification, MemorySequence,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION, SEGMENT_ATTR_CHECKPOINT_KIND,
 };
-use rakka_agent_workflow::AgentTelemetryContext;
+use rakka_agent_workflow::{AgentTelemetryContext, PrincipalRef};
 
 mod common;
 
@@ -403,6 +411,404 @@ async fn a_checkpoint_park_closes_its_segment_and_holds_none_open() {
     // means in a system that never holds one at all.
     assert!(checkpoints[0].duration_ms().is_some());
     assert_eq!(checkpoints[0].outcome, AgentSegmentOutcome::Ok);
+}
+
+// ---------------------------------------------------------------------------
+// A gate a command opens exports its checkpoint-open segment (issue #126).
+// ---------------------------------------------------------------------------
+
+/// The knowledge space the fixture goal delegates, which a claim append names.
+const SPACE: &str = "space-alpha";
+
+/// The three run commands that record an effect and open its gate in the
+/// command's own transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Commanded {
+    /// `PromoteMemory`.
+    Promotion,
+    /// `AppendClaim`.
+    ClaimAppend,
+    /// `EvaluateGoal`.
+    Evaluation,
+}
+
+impl Commanded {
+    /// The commands a run accepts, in the order the tests apply them. An
+    /// ended run evaluates no goal, but still promotes memory and appends
+    /// claims inside its post-terminal window.
+    fn accepted(ended: bool) -> &'static [Self] {
+        if ended {
+            &[Self::Promotion, Self::ClaimAppend]
+        } else {
+            &[Self::Promotion, Self::ClaimAppend, Self::Evaluation]
+        }
+    }
+
+    /// The kind of effect the command records.
+    fn effect_kind(self) -> AgentRunEffectKind {
+        match self {
+            Self::Promotion => AgentRunEffectKind::MemoryPromotionCall,
+            Self::ClaimAppend => AgentRunEffectKind::ClaimAppendCall,
+            Self::Evaluation => AgentRunEffectKind::GoalEvaluationCall,
+        }
+    }
+
+    /// The command, under an operation id derived from `discriminator`.
+    fn command(self, discriminator: &str) -> AgentRunEntityCommand {
+        let scope = run_scope();
+        match self {
+            Self::Promotion => AgentRunEntityCommand::PromoteMemory {
+                operation_id: promotion_operation_id(&scope, discriminator)
+                    .expect("the operation id derives"),
+                promotion: Box::new(promotion_request()),
+            },
+            Self::ClaimAppend => AgentRunEntityCommand::AppendClaim {
+                operation_id: claim_append_operation_id(&scope, discriminator)
+                    .expect("the operation id derives"),
+                append: Box::new(claim_append_request()),
+            },
+            Self::Evaluation => AgentRunEntityCommand::EvaluateGoal {
+                operation_id: evaluation_operation_id(&scope, discriminator)
+                    .expect("the operation id derives"),
+                evaluation: Box::new(goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+            },
+        }
+    }
+}
+
+/// The service principal that requests a promotion or a claim append.
+fn curator() -> PrincipalRef {
+    PrincipalRef {
+        principal_type: "service".to_string(),
+        principal_id: "memory-curator".to_string(),
+        display_name: None,
+    }
+}
+
+/// A promotion of the task input, the first entry the session holds.
+fn promotion_request() -> AgentMemoryPromotionRequest {
+    AgentMemoryPromotionRequest {
+        from_sequence: MemorySequence::new(1),
+        to_sequence: MemorySequence::new(1),
+        kind: AgentPrivateMemoryKind::Semantic,
+        target: None,
+        confidence_bps: 9_000,
+        requested_by: curator(),
+        roles: None,
+    }
+}
+
+/// A claim append into [`SPACE`].
+fn claim_append_request() -> AgentClaimAppendRequest {
+    AgentClaimAppendRequest {
+        space: KnowledgeSpaceId::new(SPACE).expect("the space id is valid"),
+        subject: "finding".to_string(),
+        predicate: "links".to_string(),
+        object: AgentClaimObjectRequest::Value(
+            AgentTaskContent::inline(serde_json::json!({ "note": "observed" }))
+                .expect("the object is inline-bounded"),
+        ),
+        confidence_bps: 5_000,
+        classification: MemoryClassification::Unclassified,
+        evidence: Vec::new(),
+        requested_by: curator(),
+    }
+}
+
+/// Which gate a deployment's specs require.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// A checkpoint: the gate is an `Approval`.
+    Checkpoint,
+    /// An authorization: the gate is a `SecurityAuthorization`.
+    Authorization,
+}
+
+impl Gate {
+    const ALL: [Self; 2] = [Self::Checkpoint, Self::Authorization];
+
+    /// `spec`, requiring this gate.
+    fn require(self, spec: AgentEffectSpec) -> AgentEffectSpec {
+        match self {
+            Self::Checkpoint => spec.with_checkpoint_required(),
+            Self::Authorization => spec.with_authorization_required(),
+        }
+    }
+
+    /// The checkpoint kind the gate opens as.
+    fn kind(self) -> AgentCheckpointKind {
+        match self {
+            Self::Checkpoint => AgentCheckpointKind::Approval,
+            Self::Authorization => AgentCheckpointKind::SecurityAuthorization,
+        }
+    }
+}
+
+/// Policies under which a promotion, a claim append and a goal evaluation
+/// each require `gate`. The evaluation keeps its default spec otherwise.
+fn policies_gating(gate: Gate) -> AgentEffectPolicies {
+    let policies = AgentEffectPolicies::new();
+    let evaluation = policies
+        .spec_for(&AgentRunEffectRequest::Evaluation {
+            evaluation: Box::new(goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+        })
+        .clone();
+    let idempotent = || AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    policies
+        .with_memory_promotion_spec(gate.require(idempotent()))
+        .and_then(|policies| policies.with_claim_append_spec(gate.require(idempotent())))
+        .and_then(|policies| policies.with_goal_evaluation_spec(gate.require(evaluation)))
+        .expect("the gated policies are valid")
+}
+
+/// A traced goal-bearing run under `policies`, on which all three commands
+/// can commit: its goal names an evaluator and delegates [`SPACE`], and its
+/// session memory is wired. Live, it awaits its first model call; `ended`, it
+/// has run to `Completed`. No segment sink is wired, so a sink the test wires
+/// afterwards holds only what its own commands export.
+async fn commandable_world(policies: AgentEffectPolicies, ended: bool) -> Fixture {
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(
+                1,
+                AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_text("thinking"),
+            )
+            .with_turn_for(2, proposing_turn("resolved")),
+    );
+    let fx = Fixture::with_sink(
+        dispatcher,
+        InMemoryAgentRunEffectSink::new(),
+        policies,
+        Arc::new(std::sync::atomic::AtomicU64::new(1)),
+    )
+    .with_memory(AgentRunMemory::new(
+        Arc::new(InMemorySessionMemoryStore::new()),
+        Arc::new(InMemoryContextSnapshotStore::new()),
+    ));
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec_with_evaluator();
+    spec.knowledge_spaces
+        .insert(KnowledgeSpaceId::new(SPACE).expect("the space id is valid"));
+    let mut creation = goal_task_creation_command(task_definition(), goal_spec_draft(spec, true));
+    // The effects a command records carry the run's trace context, and a
+    // parked identity derives only from a traced one.
+    if let AgentTaskEntityCommand::Create { creation, .. } = &mut creation {
+        creation.telemetry = ingress_context();
+    }
+    fx.apply_task_command(creation)
+        .await
+        .expect("the goal task creates");
+    if ended {
+        fx.pump().await.expect("the loop runs to its end");
+        let run = fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(run.status, AgentRunStatus::Completed, "the run ended");
+    } else {
+        let mut run = fx.run();
+        let now = fx.now();
+        run.recover(now).await.expect("the run recovers");
+        run.settle_side_effects(&fx.router, now)
+            .await
+            .expect("the run settles");
+        let run = fx.run_snapshot().await.expect("the run exists");
+        assert!(!run.status.is_terminal(), "the run is live");
+    }
+    fx
+}
+
+/// Applies `command` to the run through a freshly recovered entity.
+async fn apply_run(fx: &Fixture, command: AgentRunEntityCommand) -> AgentRunEntityReply {
+    let mut run = fx.run();
+    let now = fx.now();
+    run.recover(now).await.expect("the run recovers");
+    run.apply(command, &fx.router, now)
+        .await
+        .expect("the command applies")
+}
+
+/// The run's one effect of `kind`, and the checkpoints open on it.
+async fn effect_and_gates(
+    fx: &Fixture,
+    kind: AgentRunEffectKind,
+) -> (AgentRunEffect, Vec<AgentCheckpoint>) {
+    let state = load_agent_run_state(&fx.runs, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+    let loop_state = state.loop_state().expect("the loop is started");
+    let effects: Vec<&AgentRunEffect> = loop_state
+        .effects()
+        .iter()
+        .filter(|effect| effect.kind() == kind)
+        .collect();
+    assert_eq!(effects.len(), 1, "the run holds one {kind} effect");
+    let effect = effects[0].clone();
+    let gates = loop_state
+        .open_checkpoints()
+        .iter()
+        .filter(|checkpoint| checkpoint.bound_effect.effect_id == effect.effect_id)
+        .cloned()
+        .collect();
+    (effect, gates)
+}
+
+/// Every `checkpoint-open` segment the sink holds, in the order they closed.
+fn checkpoint_opens(sink: &InMemoryAgentSegmentSink) -> Vec<AgentTelemetrySegment> {
+    sink.segments()
+        .into_iter()
+        .filter(|segment| matches!(segment.operation, AgentSegmentOperation::CheckpointOpen))
+        .collect()
+}
+
+/// Issue #126: a gate a command opens in its own transition exports its
+/// `checkpoint-open` segment, as a gate the loop opens does.
+///
+/// `PromoteMemory`, `AppendClaim` and `EvaluateGoal` are applied in turn to
+/// one run, under specs that gate all three, on a live run and (for the two
+/// kinds an ended run still accepts) on an ended one. Each command exports
+/// exactly one segment: the second and third are applied with the earlier
+/// gates still open, and export none of those again. The segment names the
+/// gate's kind and exports under the parked identity the checkpoint stores,
+/// so the gate's later resolution links a span that was exported
+/// ([specification 17.11]). Without the export, none of the commands
+/// exported anything.
+#[tokio::test]
+async fn a_commanded_gate_exports_its_checkpoint_open_segment() {
+    let mut exported = Vec::new();
+    let mut opened = Vec::new();
+    for gate in Gate::ALL {
+        for ended in [false, true] {
+            let sink = Arc::new(InMemoryAgentSegmentSink::new());
+            let fx = commandable_world(policies_gating(gate), ended)
+                .await
+                .with_segments(sink.clone());
+            for &commanded in Commanded::accepted(ended) {
+                let at = format!("{gate:?}, ended: {ended}, {commanded:?}");
+                let before = checkpoint_opens(&sink).len();
+                let reply = apply_run(&fx, commanded.command("gated")).await;
+                assert!(
+                    matches!(reply, AgentRunEntityReply::Applied { .. }),
+                    "{at}: {reply:?}"
+                );
+                let (effect, gates) = effect_and_gates(&fx, commanded.effect_kind()).await;
+                assert_eq!(gates.len(), 1, "{at}: the command opened its gate");
+                assert_eq!(gates[0].kind, gate.kind(), "{at}");
+                let segments = checkpoint_opens(&sink).split_off(before);
+                exported.push((at.clone(), segments.len()));
+                opened.push((at, effect, gates[0].clone(), segments));
+            }
+        }
+    }
+    let expected: Vec<_> = exported.iter().map(|(at, _)| (at.clone(), 1)).collect();
+    assert_eq!(
+        exported, expected,
+        "each command exports exactly one checkpoint-open segment"
+    );
+
+    for (at, effect, gate, segments) in opened {
+        let segment = &segments[0];
+        assert_eq!(
+            segment
+                .attributes
+                .get(SEGMENT_ATTR_CHECKPOINT_KIND)
+                .map(String::as_str),
+            Some(gate.kind.as_label()),
+            "{at}: the segment names the gate's kind"
+        );
+        let parked = AgentCheckpoint::parked_span_identity(&effect.telemetry, &gate.checkpoint_id)
+            .unwrap_or_else(|| panic!("{at}: a traced effect derives a parked identity"));
+        assert_eq!(
+            segment.span_id.as_deref(),
+            Some(parked.span_id.as_str()),
+            "{at}: the segment exports under the parked identity"
+        );
+        assert_eq!(
+            gate.telemetry.trace_parent.as_deref(),
+            Some(parked.trace_parent().as_str()),
+            "{at}: the checkpoint stores the identity the segment exports under"
+        );
+        assert_eq!(segment.outcome, AgentSegmentOutcome::Ok, "{at}");
+        assert!(segment.duration_ms().is_some(), "{at}: the segment ended");
+    }
+}
+
+/// The same three commands under specs that gate nothing open no gate and
+/// export no `checkpoint-open` segment, on a live run and on an ended one.
+#[tokio::test]
+async fn an_ungated_command_exports_no_checkpoint_open_segment() {
+    for ended in [false, true] {
+        let sink = Arc::new(InMemoryAgentSegmentSink::new());
+        let fx = commandable_world(AgentEffectPolicies::default(), ended)
+            .await
+            .with_segments(sink.clone());
+        for &commanded in Commanded::accepted(ended) {
+            let at = format!("ended: {ended}, {commanded:?}");
+            let reply = apply_run(&fx, commanded.command("ungated")).await;
+            assert!(
+                matches!(reply, AgentRunEntityReply::Applied { .. }),
+                "{at}: {reply:?}"
+            );
+            let (effect, gates) = effect_and_gates(&fx, commanded.effect_kind()).await;
+            assert!(
+                !effect.checkpoint_required && !effect.authorization_required,
+                "{at}: the spec gates nothing"
+            );
+            assert!(gates.is_empty(), "{at}: no gate opened: {gates:?}");
+        }
+        assert!(
+            !sink.segments().is_empty(),
+            "ended: {ended}: the sink is wired and the commands' settle passes closed segments"
+        );
+        assert!(
+            checkpoint_opens(&sink).is_empty(),
+            "ended: {ended}: no command exported a checkpoint-open segment: {:?}",
+            sink.operations()
+        );
+    }
+}
+
+/// A replayed gated command answers `Duplicate` from the operation log,
+/// opens nothing and exports no second `checkpoint-open` segment: each gate
+/// is exported once, by the command that opened it.
+#[tokio::test]
+async fn a_replayed_gated_command_exports_no_second_segment() {
+    for ended in [false, true] {
+        let sink = Arc::new(InMemoryAgentSegmentSink::new());
+        let fx = commandable_world(policies_gating(Gate::Checkpoint), ended)
+            .await
+            .with_segments(sink.clone());
+        for &commanded in Commanded::accepted(ended) {
+            let at = format!("ended: {ended}, {commanded:?}");
+            let command = commanded.command("replayed");
+            let reply = apply_run(&fx, command.clone()).await;
+            assert!(
+                matches!(reply, AgentRunEntityReply::Applied { .. }),
+                "{at}: {reply:?}"
+            );
+            let exported = checkpoint_opens(&sink);
+            let (_, gates) = effect_and_gates(&fx, commanded.effect_kind()).await;
+
+            let replay = apply_run(&fx, command).await;
+            assert!(
+                matches!(replay, AgentRunEntityReply::Duplicate { .. }),
+                "{at}: {replay:?}"
+            );
+            assert_eq!(
+                checkpoint_opens(&sink),
+                exported,
+                "{at}: the replay exported no segment"
+            );
+            assert_eq!(
+                effect_and_gates(&fx, commanded.effect_kind()).await.1,
+                gates,
+                "{at}: the replay opened nothing"
+            );
+        }
+        assert_eq!(
+            checkpoint_opens(&sink).len(),
+            Commanded::accepted(ended).len(),
+            "ended: {ended}: each gate was exported exactly once"
+        );
+    }
 }
 
 /// The in-memory sink is bounded, like the trait says every sink must be.

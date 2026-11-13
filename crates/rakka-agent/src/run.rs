@@ -8205,39 +8205,57 @@ where
                 })
                 .await?
             }
+            // The three commands that record an effect and open its gate in
+            // their own transition (issue #126) close that gate's
+            // `checkpoint-open` segment once it commits, as the loop advance
+            // and the `RecordEffectResult` arm do: see
+            // [`Self::close_checkpoint_open_segments_since`]. A replay never
+            // reaches these arms, so it exports nothing.
             AgentRunEntityCommand::PromoteMemory {
                 operation_id,
                 promotion,
             } => {
                 let policies = self.policies.clone();
                 let session_wired = self.memory.is_some();
-                self.transition(now, records_decision, move |state| {
-                    promote_memory(state, *promotion, session_wired, &policies, now)?;
-                    Ok(operation_id)
-                })
-                .await?
+                let marks = self.current_segment_marks();
+                let reply = self
+                    .transition(now, records_decision, move |state| {
+                        promote_memory(state, *promotion, session_wired, &policies, now)?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                self.close_checkpoint_open_segments_since(&marks, now);
+                reply
             }
             AgentRunEntityCommand::AppendClaim {
                 operation_id,
                 append,
             } => {
                 let policies = self.policies.clone();
-                self.transition(now, records_decision, move |state| {
-                    append_claim(state, *append, &policies, now)?;
-                    Ok(operation_id)
-                })
-                .await?
+                let marks = self.current_segment_marks();
+                let reply = self
+                    .transition(now, records_decision, move |state| {
+                        append_claim(state, *append, &policies, now)?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                self.close_checkpoint_open_segments_since(&marks, now);
+                reply
             }
             AgentRunEntityCommand::EvaluateGoal {
                 operation_id,
                 evaluation,
             } => {
                 let policies = self.policies.clone();
-                self.transition(now, records_decision, move |state| {
-                    evaluate_goal(state, *evaluation, &policies, now)?;
-                    Ok(operation_id)
-                })
-                .await?
+                let marks = self.current_segment_marks();
+                let reply = self
+                    .transition(now, records_decision, move |state| {
+                        evaluate_goal(state, *evaluation, &policies, now)?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                self.close_checkpoint_open_segments_since(&marks, now);
+                reply
             }
         };
 
@@ -9043,6 +9061,48 @@ where
                 };
             self.close_segment_linked(segment, links);
         }
+    }
+
+    /// The marks a command's transition is measured against, read from the
+    /// cached record before the transition: [`segment_marks`] of its loop
+    /// state, or none when the run has no loop yet.
+    fn current_segment_marks(&self) -> AgentSegmentMarks {
+        self.state()
+            .ok()
+            .and_then(|state| state.loop_state().map(segment_marks))
+            .unwrap_or_default()
+    }
+
+    /// Closes one `checkpoint-open` segment per checkpoint a committed command
+    /// transition opened, diffed by identity against `marks` read before it
+    /// ([`Self::current_segment_marks`]), so a gate already open is not
+    /// exported again.
+    ///
+    /// The `PromoteMemory`, `AppendClaim` and `EvaluateGoal` arms call it after
+    /// their transition commits (issue #126). Without it the gate those
+    /// commands open would park without its segment, and the gate's later
+    /// resolution would link a parked span that was never exported
+    /// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md)). The
+    /// two halves are synchronous, around the arm's own `transition` call,
+    /// rather than an async wrapper: a wrapper grows
+    /// [`Self::apply_command`]'s future (it holds the transition closure a
+    /// second time), and one test already runs within a 16 KiB page of a test
+    /// thread's 2 MiB stack, which that growth overflowed.
+    fn close_checkpoint_open_segments_since(
+        &self,
+        marks: &AgentSegmentMarks,
+        now: AgentTimestampMillis,
+    ) {
+        let opened = self
+            .state()
+            .ok()
+            .and_then(|state| {
+                state
+                    .loop_state()
+                    .map(|loop_state| segment_additions(loop_state, marks).1)
+            })
+            .unwrap_or_default();
+        self.close_checkpoint_open_segments(opened, now);
     }
 
     /// The checkpoint `command` resolves, when it is one of the two resolution
