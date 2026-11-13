@@ -1,6 +1,6 @@
 # Knowledge-graph retention, tombstone, and deletion (issue #68)
 
-Status: design, awaiting the owner's approval. Branch `knowledge-graph-retention`, off main `d12b0f8`.
+Status: design, approved by the owner on 2026-11-13. Branch `knowledge-graph-retention`, off main `d12b0f8`.
 
 ## 1. Intent
 
@@ -416,8 +416,8 @@ Erasing a subject's content therefore means deleting the claims and also dischar
 
 ## 7. Rollout and compatibility
 
-1. **Upgrade every binary that reads the graph.** That is each dispatcher that runs the append executor, anything that serves the goal view, and the application's own sweeps. During the roll nothing on disk changes: appends are still version 1 and no ledger row has a new kind.
-2. **Run `migrate` from the new build.**
+1. **Run `migrate` from the new build.** The new build's reads select the `tombstoned` column, so they need the migrated schema. The migration is safe under binaries from before this change: the new column has a default and their statements do not name it. (Corrected while planning: an earlier draft put this step second.)
+2. **Upgrade every binary that reads the graph.** That is each dispatcher that runs the append executor, anything that serves the goal view, and the application's own sweeps. During the roll no row changes: appends are still version 1 and no ledger row has a new kind.
 3. **Only then call `tombstone`, `delete` or the sweep.**
 
 A binary that was missed fails closed on a read and on a replay. A stub answers it `schema-version-ahead`, which fails the `query` page that contains the stub. A replay of an erased operation answers it `claim-operation-conflict`. Neither is misread, and neither restores content.
@@ -455,8 +455,9 @@ Added to `conformance.rs` and to `check_knowledge_graph_contract`, so the in-mem
 ### 8.3 PostgreSQL tests
 
 - **Migration from the earlier schema.** Tables created by the schema at `d12b0f8`, holding rows, migrate cleanly; a second run changes nothing; two concurrent migrators both succeed.
+- **An earlier binary still appends after the migration.** The append statement text of `d12b0f8` applies against the migrated schema.
 - **No bytes left.** After a tombstone, and again after a delete, no row of the three tables in that scope contains the statement's subject, predicate or object bytes, in any column or payload.
-- **Atomicity.** The statement count per operation is one.
+- **Atomicity.** A tombstone or a delete that races a transition ends in one of the two serial outcomes, never a mixture, and a refused delete writes nothing. (Reworded while planning: "one statement" is how it is built, and this is what a test can observe.)
 - **Columns agree with the record** for a stub row, except `transition_count`, which holds the fence value. A row whose `tombstoned` column disagrees with its record is refused as drift.
 - **An earlier binary cannot write over a stub.** The transition statement text of `d12b0f8`, bound to the count the claim had before the tombstone, is run against the stub row and applies nothing: the record, the transition table and the ledger are unchanged. Falsified by leaving the true count in the column.
 - **An earlier binary's replay of an erased operation** answers `claim-operation-conflict`, proven against the `d12b0f8` ledger read.
