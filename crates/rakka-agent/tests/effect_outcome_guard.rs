@@ -11,9 +11,11 @@
 //! that establishes nothing keeps `effect-policy-invalid`.
 //!
 //! These are live runs. The ended-run tests, which cover confirmations, live
-//! in `private_memory_promotion.rs`. Each other effect kind is tested once on
-//! a live run's result path, in its own file: `communal_claim_append.rs`, for
-//! one, offers a claim append a promotion's receipt.
+//! in `private_memory_promotion.rs`. Each other effect kind but one is tested
+//! once on a live run's result path, in its own file:
+//! `communal_claim_append.rs`, for one, offers a claim append a promotion's
+//! receipt. The exception is a workflow cancel: no test drives one through a
+//! run, and the guard's unit tests in `src/effect.rs` cover it.
 
 use std::sync::Arc;
 
