@@ -11,9 +11,9 @@ use rakka_agent_knowledge_graph::store::{
     ClaimTraversal, ClaimTraversalReport, KnowledgeGraphCapabilities,
 };
 use rakka_agent_knowledge_graph::{
-    Claim, ClaimFuture, ClaimId, ClaimPromotionPolicy, ClaimTransitionOutcome,
-    ClaimTrustTransitionRequest, InMemoryKnowledgeGraphStore, KnowledgeGraphStore,
-    KnowledgeSpaceScope,
+    Claim, ClaimFuture, ClaimId, ClaimPromotionPolicy, ClaimTombstoneRequest,
+    ClaimTransitionOutcome, ClaimTrustTransitionRequest, InMemoryKnowledgeGraphStore,
+    KnowledgeGraphStore, KnowledgeSpaceScope,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -92,6 +92,45 @@ async fn the_promotion_gate_fails_closed_and_stamps_receipts() {
 async fn the_capability_report_is_coherent() {
     let store = InMemoryKnowledgeGraphStore::new();
     conformance::capability_report_coherence(&store).await;
+}
+
+#[tokio::test]
+async fn a_tombstone_withdraws_content_and_keeps_the_audit_stub() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::tombstone_withdraws_content(&store, ConformanceScopes::unique("tombstone")).await;
+}
+
+#[tokio::test]
+async fn a_tombstoned_claim_is_hidden_from_discovery() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::tombstoned_claims_are_hidden_from_discovery(
+        &store,
+        ConformanceScopes::unique("tombstone-discovery"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_tombstoned_claim_is_frozen() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::a_stub_is_frozen(&store, ConformanceScopes::unique("tombstone-frozen")).await;
+}
+
+#[tokio::test]
+async fn a_tombstone_erases_every_earlier_operation_of_its_claim() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::tombstone_replay_and_erased_operations(
+        &store,
+        ConformanceScopes::unique("tombstone-replay"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_foreign_tombstone_reveals_and_withdraws_nothing() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::tombstone_isolation(&store, ConformanceScopes::unique("tombstone-isolation"))
+        .await;
 }
 
 #[tokio::test]
@@ -191,6 +230,14 @@ impl KnowledgeGraphStore for ShallowKnowledgeGraphStore {
         cursor: ClaimTransitionCursor,
     ) -> ClaimFuture<'a, ClaimTransitionPage> {
         self.inner.transitions(scope, claim_id, cursor)
+    }
+
+    fn tombstone<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimTombstoneRequest,
+    ) -> ClaimFuture<'a, Claim> {
+        self.inner.tombstone(scope, request)
     }
 }
 

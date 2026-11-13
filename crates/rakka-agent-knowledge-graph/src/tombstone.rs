@@ -17,7 +17,7 @@
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
-use crate::claim::ClaimOperationId;
+use crate::claim::{ClaimId, ClaimOperationId};
 
 /// The value a tombstoned claim holds in its subject and in its predicate.
 ///
@@ -67,4 +67,37 @@ pub struct ClaimTombstone {
     pub actor: PrincipalRef,
     /// When it was withdrawn. The retention sweep ages a stub from here.
     pub tombstoned_at: AgentTimestampMillis,
+}
+
+/// One tombstone of one claim, idempotent on its operation id.
+///
+/// The request names no trust status and no policy: any trust status can be
+/// tombstoned, and an explicit tombstone is not subject to a retention
+/// policy's legal hold — the hold governs the retention sweep only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimTombstoneRequest {
+    /// The claim whose content is withdrawn.
+    pub claim_id: ClaimId,
+    /// The idempotent key of this tombstone; see
+    /// [`ClaimOperationId::derive_tombstone`].
+    pub operation_id: ClaimOperationId,
+    /// Why the content is withdrawn.
+    pub reason: ClaimTombstoneReason,
+    /// Who withdraws it.
+    pub actor: PrincipalRef,
+    /// When it is withdrawn.
+    pub tombstoned_at: AgentTimestampMillis,
+}
+
+impl ClaimTombstoneRequest {
+    /// The record the stub will carry of this withdrawal.
+    #[must_use]
+    pub fn to_tombstone(&self) -> ClaimTombstone {
+        ClaimTombstone {
+            operation_id: self.operation_id.clone(),
+            reason: self.reason,
+            actor: self.actor.clone(),
+            tombstoned_at: self.tombstoned_at,
+        }
+    }
 }

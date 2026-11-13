@@ -247,6 +247,25 @@ impl ClaimOperationId {
         );
         Self::new(format!("claim-op-{}", derivation_digest(&input).value))
     }
+
+    /// Derives the key of one tombstone of one claim.
+    ///
+    /// The `claim-tombstone` salt keeps this domain disjoint from the append
+    /// and transition domains, in the same shape as
+    /// [`ClaimOperationId::derive_transition`].
+    pub fn derive_tombstone(
+        scope: &KnowledgeSpaceScope,
+        claim: &ClaimId,
+        discriminator: impl AsRef<str>,
+    ) -> AgentIdentityResult<Self> {
+        let input = format!(
+            "claim-tombstone|{}|{}|{}",
+            scope.key(),
+            claim,
+            discriminator.as_ref()
+        );
+        Self::new(format!("claim-op-{}", derivation_digest(&input).value))
+    }
 }
 
 impl ClaimId {
@@ -1088,6 +1107,30 @@ mod tests {
             ClaimOperationId::derive_append(&other, "op-1").expect("the operation id derives"),
             append_a
         );
+    }
+
+    #[test]
+    fn the_erasure_derivation_domains_are_disjoint_from_the_write_domains() {
+        let scope = scope();
+        let append =
+            ClaimOperationId::derive_append(&scope, "op-1").expect("the operation id derives");
+        let claim_id = ClaimId::derive_appended(&scope, &append).expect("the claim id derives");
+        let transition = ClaimOperationId::derive_transition(&scope, &claim_id, "op-1")
+            .expect("the operation id derives");
+        let tombstone = ClaimOperationId::derive_tombstone(&scope, &claim_id, "op-1")
+            .expect("the operation id derives");
+
+        // One discriminator, three kinds, three keys: a tombstone can never be
+        // spelled into an id a transition or an append already spent.
+        assert_ne!(tombstone, append);
+        assert_ne!(tombstone, transition);
+        // Stable: the writer reconstructs it on any node.
+        assert_eq!(
+            tombstone,
+            ClaimOperationId::derive_tombstone(&scope, &claim_id, "op-1")
+                .expect("the operation id derives")
+        );
+        assert!(tombstone.as_str().len() <= AGENT_IDENTITY_MAX_LENGTH);
     }
 
     #[test]

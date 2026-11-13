@@ -9,9 +9,9 @@
 //! [`crate::conformance`] harness is the enforcement mechanism, run unchanged
 //! against every implementation.
 //!
-//! The five core operations — append, get, query, traverse, transition — are
-//! mandatory: a backend that cannot serve them is not a conformant backend,
-//! so they are not "capabilities". Only genuinely optional features are
+//! The core operations — append, get, query, traverse, transition, and the
+//! erasure pair tombstone and delete — are mandatory: a backend that cannot
+//! serve them is not a conformant backend, so they are not "capabilities". Only genuinely optional features are
 //! reported through [`KnowledgeGraphCapabilities`]; `SemanticSearch` is
 //! declared now because the specification names it, but no search method
 //! ships in this slice — the refusal contract
@@ -31,6 +31,7 @@ use crate::claim::{Claim, ClaimId, ClaimNodeId, ClaimPredicate, ClaimTrustStatus
 use crate::error::{ClaimError, ClaimFuture};
 use crate::promotion::{validate_promotion, ClaimPromotionPolicy};
 use crate::scope::KnowledgeSpaceScope;
+use crate::tombstone::ClaimTombstoneRequest;
 use crate::transition::{
     ClaimTransitionOutcome, ClaimTrustTransition, ClaimTrustTransitionRequest,
 };
@@ -151,9 +152,14 @@ impl Default for KnowledgeGraphCapabilities {
 /// provenance dimensions ([specification 13.6](../../../docs/plans/rakka-agent/spec.md):
 /// provenance/trust filtering is a core SPI operation).
 ///
-/// The default filter matches everything. The provenance `effect` reference is
-/// deliberately not a query axis: an effect id is an audit pointer read off a
-/// claim, not a dimension a caller enumerates claims by.
+/// The default filter matches every *live* claim. A tombstoned stub is
+/// excluded unless the filter opts in with
+/// [`ClaimFilter::including_tombstoned`], and even then it answers only to the
+/// provenance, trust, classification, confidence and time axes — never to a
+/// subject, predicate or object filter, because its statement was withdrawn.
+/// The provenance `effect` reference is deliberately not a query axis: an
+/// effect id is an audit pointer read off a claim, not a dimension a caller
+/// enumerates claims by.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClaimFilter {
     trust: Option<BTreeSet<ClaimTrustStatus>>,
@@ -169,10 +175,11 @@ pub struct ClaimFilter {
     created_after: Option<AgentTimestampMillis>,
     created_before: Option<AgentTimestampMillis>,
     min_confidence_bps: Option<u16>,
+    include_tombstoned: bool,
 }
 
 impl ClaimFilter {
-    /// A filter that matches every claim.
+    /// A filter that matches every live claim.
     #[must_use]
     pub fn matching_all() -> Self {
         Self::default()
@@ -269,13 +276,35 @@ impl ClaimFilter {
         self
     }
 
+    /// Also admits tombstoned stubs, which a filter excludes by default.
+    ///
+    /// For audit and for the retention sweep. A stub still never matches a
+    /// subject, predicate or object filter.
+    #[must_use]
+    pub const fn including_tombstoned(mut self) -> Self {
+        self.include_tombstoned = true;
+        self
+    }
+
     /// Whether the filter admits a claim.
     ///
     /// The one shared predicate: every backend answers `query` with exactly
     /// this admission rule, which is what lets the conformance suite compare
-    /// implementations without reading their internals.
+    /// implementations without reading their internals — and what puts the
+    /// default exclusion of tombstoned stubs in one place for all of them.
     #[must_use]
     pub fn admits(&self, claim: &Claim) -> bool {
+        if claim.is_tombstoned() {
+            if !self.include_tombstoned {
+                return false;
+            }
+            // A stub's statement was withdrawn: it answers to no statement
+            // filter, neither the one it once satisfied nor one spelled as the
+            // marker it holds now.
+            if self.subject.is_some() || self.predicate.is_some() || self.object_node.is_some() {
+                return false;
+            }
+        }
         if let Some(trust) = &self.trust {
             if !trust.contains(&claim.trust()) {
                 return false;
@@ -652,6 +681,14 @@ pub struct ClaimTraversalReport {
 /// moved the record since (scenario 16), and a decided promotion gate is not
 /// re-evaluated on replay. An operation id reused across kinds fails
 /// `claim-operation-conflict`.
+///
+/// # Erasure
+///
+/// A tombstone withdraws one claim's content and keeps an auditable stub; it
+/// also erases the ledger payloads of the claim's append and of every earlier
+/// transition. A replay of an erased operation answers
+/// `claim-operation-erased` and writes nothing — which is what stops a
+/// replayed append from restoring what was withdrawn.
 pub trait KnowledgeGraphStore: Send + Sync + 'static {
     /// Stable name of the backing implementation, for diagnostics and error
     /// detail — never for dispatch decisions.
@@ -667,7 +704,10 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
     /// any trust but `Proposed` or any transition history fails
     /// `claim-append-not-proposed` (open decision 3); a claim whose id is not
     /// the one its own operation id derives in this scope fails
-    /// `claim-append-id-not-derived`.
+    /// `claim-append-id-not-derived`; a tombstoned stub fails
+    /// `claim-tombstoned`, because an append stores a live claim; and an
+    /// operation whose claim was since tombstoned or deleted fails
+    /// `claim-operation-erased`.
     ///
     /// That last check is what keeps claim identity *derived* rather than
     /// merely conventional. [`Claim::new`] cannot construct a mismatched
@@ -731,6 +771,26 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
         claim_id: &'a ClaimId,
         cursor: ClaimTransitionCursor,
     ) -> ClaimFuture<'a, ClaimTransitionPage>;
+
+    /// Withdraws one claim's content and returns the stub, idempotently on
+    /// the request's operation id.
+    ///
+    /// The stub keeps the claim's identity, provenance, classification,
+    /// access, trust status, transition history and statement fingerprint,
+    /// and loses its statement, evidence and embedding
+    /// ([`Claim::apply_tombstone`]). The trust status does not move, and from
+    /// here on it cannot: a later `transition` answers `claim-tombstoned`.
+    ///
+    /// A replay returns the stub as first written. An absent or out-of-scope
+    /// claim answers `claim-not-found`; a claim already tombstoned under a
+    /// different operation answers `claim-tombstoned`. The ledger payloads of
+    /// the claim's append and of every earlier transition are erased in the
+    /// same step, so a replay of any of them answers `claim-operation-erased`.
+    fn tombstone<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimTombstoneRequest,
+    ) -> ClaimFuture<'a, Claim>;
 }
 
 /// What one spent operation id resolved to.
@@ -740,6 +800,34 @@ enum ClaimLedgerEntry {
     AppliedAppend(Box<Claim>),
     /// The outcome a transition produced, exactly as produced.
     AppliedTransition(Box<ClaimTransitionOutcome>),
+    /// The stub a tombstone stored, exactly as stored.
+    AppliedTombstone(Box<Claim>),
+    /// The operation's payload was erased by a later tombstone of its claim.
+    /// The id stays spent and holds nothing.
+    Erased,
+}
+
+impl Inner {
+    /// Replaces the ledger payloads of a claim's append and of every
+    /// transition in its history with the content-free erased marker.
+    fn erase_operations(&mut self, key: &str, claim: &Claim) {
+        let mut spent = vec![claim.operation_id.as_str().to_string()];
+        if let Some(history) = self
+            .transitions
+            .get(key)
+            .and_then(|transitions| transitions.get(claim.claim_id.as_str()))
+        {
+            spent.extend(
+                history
+                    .iter()
+                    .map(|transition| transition.operation_id.as_str().to_string()),
+            );
+        }
+        let operations = self.operations.entry(key.to_string()).or_default();
+        for operation_id in spent {
+            operations.insert(operation_id, ClaimLedgerEntry::Erased);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -805,6 +893,13 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
     ) -> ClaimFuture<'a, Claim> {
         Box::pin(async move {
             claim.validate()?;
+            // An append stores a live claim. A stub can only come from the
+            // tombstone operation, which keeps the ledger honest about it.
+            if claim.is_tombstoned() {
+                return Err(ClaimError::Tombstoned {
+                    claim_id: claim.claim_id.clone(),
+                });
+            }
             if claim.trust() != ClaimTrustStatus::Proposed || claim.transition_count() != 0 {
                 return Err(ClaimError::AppendNotProposed {
                     claim_id: claim.claim_id.clone(),
@@ -831,7 +926,13 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
             {
                 return match entry {
                     ClaimLedgerEntry::AppliedAppend(original) => Ok(original.as_ref().clone()),
-                    ClaimLedgerEntry::AppliedTransition(_) => Err(ClaimError::OperationConflict {
+                    // Found before anything is written: this is what stops a
+                    // replayed append from restoring a withdrawn claim.
+                    ClaimLedgerEntry::Erased => Err(ClaimError::OperationErased {
+                        operation_id: claim.operation_id.clone(),
+                    }),
+                    ClaimLedgerEntry::AppliedTransition(_)
+                    | ClaimLedgerEntry::AppliedTombstone(_) => Err(ClaimError::OperationConflict {
                         operation_id: claim.operation_id.clone(),
                     }),
                 };
@@ -1062,9 +1163,14 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
                     // not re-litigated, even by a grant that has since
                     // expired.
                     ClaimLedgerEntry::AppliedTransition(original) => Ok(original.as_ref().clone()),
-                    ClaimLedgerEntry::AppliedAppend(_) => Err(ClaimError::OperationConflict {
+                    ClaimLedgerEntry::Erased => Err(ClaimError::OperationErased {
                         operation_id: request.operation_id.clone(),
                     }),
+                    ClaimLedgerEntry::AppliedAppend(_) | ClaimLedgerEntry::AppliedTombstone(_) => {
+                        Err(ClaimError::OperationConflict {
+                            operation_id: request.operation_id.clone(),
+                        })
+                    }
                 };
             }
             let Some(claim) = inner
@@ -1179,6 +1285,64 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
                 transitions: page,
                 next,
             })
+        })
+    }
+
+    fn tombstone<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimTombstoneRequest,
+    ) -> ClaimFuture<'a, Claim> {
+        Box::pin(async move {
+            let key = scope.key();
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("the in-memory graph lock is never poisoned");
+            if let Some(entry) = inner
+                .operations
+                .get(&key)
+                .and_then(|operations| operations.get(request.operation_id.as_str()))
+            {
+                return match entry {
+                    ClaimLedgerEntry::AppliedTombstone(stub) => Ok(stub.as_ref().clone()),
+                    ClaimLedgerEntry::Erased => Err(ClaimError::OperationErased {
+                        operation_id: request.operation_id.clone(),
+                    }),
+                    ClaimLedgerEntry::AppliedAppend(_) | ClaimLedgerEntry::AppliedTransition(_) => {
+                        Err(ClaimError::OperationConflict {
+                            operation_id: request.operation_id.clone(),
+                        })
+                    }
+                };
+            }
+            let Some(claim) = inner
+                .claims
+                .get(&key)
+                .and_then(|claims| claims.get(request.claim_id.as_str()))
+                .cloned()
+            else {
+                // Absent and out-of-scope are the same refusal (scenario 18).
+                return Err(ClaimError::NotFound {
+                    claim_id: request.claim_id.clone(),
+                });
+            };
+            // Refuses a claim that is already a stub (`claim-tombstoned`).
+            let stub = claim.apply_tombstone(request.to_tombstone())?;
+
+            // The claim's earlier operations stop answering with its content
+            // in the same step the content is withdrawn.
+            inner.erase_operations(&key, &claim);
+            inner
+                .claims
+                .entry(key.clone())
+                .or_default()
+                .insert(stub.claim_id.as_str().to_string(), stub.clone());
+            inner.operations.entry(key).or_default().insert(
+                request.operation_id.as_str().to_string(),
+                ClaimLedgerEntry::AppliedTombstone(Box::new(stub.clone())),
+            );
+            Ok(stub)
         })
     }
 }
