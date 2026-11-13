@@ -6626,10 +6626,13 @@ fn append_claim(
 ///
 /// The transition is bounded and performs no I/O: it fences, reserves the
 /// evaluation's attempt budget, and records the read-only effect — the
-/// promotion idiom. The run's status and phase do not move; a human review
-/// additionally opens the approval checkpoint whose grant is its verdict, in
-/// this same compare-and-set, so the effect stays `Pending` until an
-/// authorized decision exists.
+/// promotion idiom. The run's status and phase do not move. An evaluation
+/// whose spec gates it also opens its gate in this same compare-and-set, so
+/// the effect stays `Pending` until an authorized decision exists; a human
+/// review always does, because its grant is its verdict. The gate's kind is
+/// the effect's [`AgentRunEffect::gate_kind`]: a security authorization when
+/// the spec requires authorization, with or without a checkpoint, else an
+/// approval (issue #126).
 ///
 /// The fences, in order: a terminal or winding-down run evaluates nothing
 /// (`run-goal-evaluation-fenced` — an evaluation is new work); the request's
@@ -6652,7 +6655,7 @@ fn evaluate_goal(
     use crate::evaluation::AgentGoalEvaluationMethod;
 
     let scope = state.scope.clone();
-    let checkpoint_owed = {
+    let gate_owed = {
         let run = state.run_mut()?;
         if run.status.is_terminal() {
             return Err(AgentRunError::Terminal { status: run.status });
@@ -6709,7 +6712,7 @@ fn evaluate_goal(
         let effect =
             AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
         let effect_id = effect.effect_id.clone();
-        let checkpoint_owed = effect.checkpoint_required;
+        let gate = effect.gate_kind();
         run.loop_state.record_effect(effect)?;
         run.loop_state.queue_decision(
             &scope,
@@ -6720,16 +6723,10 @@ fn evaluate_goal(
             ),
             now,
         );
-        checkpoint_owed.then_some(effect_id)
+        gate.map(|kind| (effect_id, kind))
     };
-    if let Some(effect_id) = checkpoint_owed {
-        open_effect_checkpoint(
-            state,
-            policies,
-            &effect_id,
-            AgentCheckpointKind::Approval,
-            now,
-        )?;
+    if let Some((effect_id, kind)) = gate_owed {
+        open_effect_checkpoint(state, policies, &effect_id, kind, now)?;
     }
     state.updated_at = now;
     Ok(())
