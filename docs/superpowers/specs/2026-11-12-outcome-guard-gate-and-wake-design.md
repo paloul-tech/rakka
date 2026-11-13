@@ -344,7 +344,7 @@ What the build found that differs from sections 1-10, or that they left to the b
 - Ruling: drop the first `record_claim_failure`. The park now settles the ticket once, the pass returns normally, and the fleet entry ends `Cancelled` with the code `indeterminate`, as every other park leaves it. This changes the existing `Unknown` arm too. `an_unknown_finding_at_a_spent_budget_parks_without_error` pins it.
 - Both findings share one helper, `settle_unknown_finding`, which takes the failed-attempt line and the two park codes.
 - Ruling on the line: section 5.1.4 says the failed-attempt line carries the code, and the plan's line (`reconciliation outcome mismatched`) had dropped it. The line is `effect-outcome-mismatch: the reconciled outcome does not fit the effect`. The `Unknown` arm keeps `reconciliation outcome unknown`.
-- The dispatcher also logs a `tracing::warn!` with static labels when it handles a mismatched finding.
+- The dispatcher also logs a `tracing::warn!` with the effect id, generation and the error's static labels when it handles a mismatched finding.
 
 ### 11.4 Command-opened gates (Task 4, `ae6d108`)
 

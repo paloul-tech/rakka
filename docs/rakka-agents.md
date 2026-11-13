@@ -176,8 +176,11 @@ leaves behind is the same either way.
    compensation's result the id `compensation_call_id` derives for it. Any
    other outcome is refused `effect-outcome-mismatch` before anything
    changes, on every run; a stale or duplicate delivery still answers as
-   stale first. The dispatcher records a tool's result under the call id the
-   model asked for, even when the dispatch authority transformed the call.
+   stale first. A confirmation carrying `Indeterminate` or `Cancelled`, and
+   a confirmed exhaustion of a handoff send, still answer
+   `effect-policy-invalid`. The dispatcher records a tool's result under the
+   call id the model asked for, even when the dispatch authority transformed
+   the call.
    When a deployment's reconciler answers `Executed` with an outcome that
    does not fit the effect, the dispatcher handles the finding as `Unknown`:
    on a live run it burns one attempt and asks again on a later claim, and a
@@ -322,12 +325,11 @@ incorrectly.
   gate and, in the same transition, settles the effect `Cancelled` if it is
   still `Pending` and ungranted, releasing its attempt reservation; a
   granted one still dispatches. A run already at its bound on open
-  checkpoints refuses the command whole with `effect-pending-overflow`. A
-  compensation or workflow cancel the spec gates never opens its gate and
-  waits `Pending` (issue #128, open). If such
-  an effect's attempt may have run and its recovery retry is refused (the
-  agent was terminated just after the run ended), the generation parks
-  `Indeterminate` behind a reconciliation checkpoint, as a live run's does.
+  checkpoints refuses the command whole with `effect-pending-overflow`. If a
+  promotion's or claim append's attempt may have run and its recovery retry
+  is refused (the agent was terminated just after the run ended), the
+  generation parks `Indeterminate` behind a reconciliation checkpoint, as a
+  live run's does.
   An ended run's checkpoint lists `confirmed-completed`,
   `confirmed-not-executed`, `escalate` and `abandon-and-fail`, never
   `compensate`: one opened after the run ended is opened without it, and the
@@ -340,9 +342,9 @@ incorrectly.
   carries, which must be the effect's own receipt, a `Failed` or an
   `Exhausted`; any other outcome, such as a model turn, is refused
   `effect-outcome-mismatch`, as on a live run, because it would move the
-  ended run's loop.
-  `AbandonAndFail` fails that generation only. `ConfirmedNotExecuted` is a
-  person's assertion that the attempt never ran, not a probe: it re-sends
+  ended run's loop. A confirmation carrying `Indeterminate` or `Cancelled`
+  still answers `effect-policy-invalid`. `AbandonAndFail` fails that
+  generation only. `ConfirmedNotExecuted` is a person's assertion that the attempt never ran, not a probe: it re-sends
   under a new idempotency key, so if the first attempt did land, a re-sent
   claim append appends a second claim and a re-sent consolidation is refused
   on a stale revision. A person who does not know chooses `AbandonAndFail`:
@@ -359,11 +361,12 @@ incorrectly.
   the checkpoint for a park that has none. A gate on an ended run's
   promotion or claim append, whether it was open when the run ended or a
   command opened it after, is answered and timed as on a live run. The run's
-  status does not move. The decision events all
-  of this records follow the run's end event (see Observability below). A
-  compensation or workflow cancel parked on an ended run stays as it was
-  (issue #123), and every other resolution on an ended run is still refused
-  `run-terminal`. The
+  status does not move. The decision events all of this records follow the
+  run's end event (see Observability below). A compensation or workflow
+  cancel parked on an ended run stays as it was (issue #123), and every
+  other resolution on an ended run is still refused `run-terminal`. A
+  compensation or workflow cancel the spec gates never opens its gate and
+  waits `Pending` (issue #128, open). The
   retriever supplies a ranking and nothing else: every ranked identity is
   resolved through the authoritative store before it is admitted, so a foreign
   or forged record is dropped and counted, and an unauthorized read reveals
