@@ -94,6 +94,8 @@ struct DispatchFixture {
     promotions: Option<Arc<dyn rakka_agent::AgentMemoryPromotionExecutor>>,
     claim_appends: Option<Arc<dyn rakka_agent::AgentClaimAppendExecutor>>,
     segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
+    relabel_calls: bool,
+    session_memory: Option<rakka_agent::AgentRunMemory>,
 }
 
 impl DispatchFixture {
@@ -140,6 +142,8 @@ impl DispatchFixture {
             promotions: None,
             claim_appends: None,
             segments: None,
+            relabel_calls: false,
+            session_memory: None,
         }
     }
 
@@ -163,6 +167,23 @@ impl DispatchFixture {
     ) -> Self {
         self.fx = self.fx.with_memory(memory);
         self.promotions = Some(executor);
+        self
+    }
+
+    /// Wraps the pipeline's authority in [`RelabelingAuthority`], so every
+    /// tool call is granted under another call id.
+    fn with_relabelled_calls(mut self) -> Self {
+        self.relabel_calls = true;
+        self
+    }
+
+    /// Wires session memory to the run entity *and* the pipeline's delivery,
+    /// which drives the run too: the delivery records a tool result and its
+    /// settle pass moves the turn on in the same call, so session memory is
+    /// where the recorded call id can still be read.
+    fn with_session_memory(mut self, memory: rakka_agent::AgentRunMemory) -> Self {
+        self.fx = self.fx.with_memory(memory.clone());
+        self.session_memory = Some(memory);
         self
     }
 
@@ -194,6 +215,15 @@ impl DispatchFixture {
 
     /// A fresh dispatch worker over the shared durable stores.
     fn pipeline(&self) -> Pipeline {
+        let gate = AgentEntityAuthority::new(
+            self.fx.agents.clone(),
+            AgentToolAuthority::new(self.registry.clone()),
+        );
+        let gate: Arc<dyn rakka_agent::AgentDispatchAuthority> = if self.relabel_calls {
+            Arc::new(RelabelingAuthority(gate))
+        } else {
+            Arc::new(gate)
+        };
         let mut pipeline = AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new("worker-1"),
             self.workflow_store.clone(),
@@ -202,10 +232,7 @@ impl DispatchFixture {
             self.wf_clock.clone(),
             Arc::new(self.adapter.clone()),
             Arc::new(self.tools.clone()),
-            Arc::new(AgentEntityAuthority::new(
-                self.fx.agents.clone(),
-                AgentToolAuthority::new(self.registry.clone()),
-            )),
+            gate,
             Arc::new({
                 let mut delivery = InProcessRunResultDelivery::new(
                     self.fx.runs.clone(),
@@ -216,6 +243,9 @@ impl DispatchFixture {
                 .with_effect_policies(self.fx.policies.clone());
                 if let Some(metrics) = &self.fx.metrics {
                     delivery = delivery.with_metrics(metrics.clone());
+                }
+                if let Some(memory) = &self.session_memory {
+                    delivery = delivery.with_memory(memory.clone());
                 }
                 // The delivery drives the run entity too, so it is a driver
                 // under the every-driver rule: a result it records closes
@@ -737,6 +767,358 @@ async fn an_unknown_reconciliation_finding_is_requeried_before_any_retry() {
         fx.tools.invocation_count(TOOL),
         1,
         "an attempt never proven absent is never re-invoked"
+    );
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #125: an outcome that does not belong to its effect, as the dispatcher
+// receives it. A reconciler is application code, and its `Executed` finding
+// carries whatever outcome it built; the run refuses one that is not this
+// effect's. The dispatcher handles such a finding as the `Unknown` one it is:
+// it establishes nothing about this effect.
+// ---------------------------------------------------------------------------
+
+/// The attempt budget of the reconcileable tool the foreign-finding tests run.
+const RECONCILEABLE_ATTEMPTS: u32 = 3;
+
+/// How many lease expiries and passes the foreign-finding tests drive: well
+/// past the attempt budget, so a re-query per pass shows as more queries than
+/// attempts.
+const FOREIGN_FINDING_ROUNDS: usize = 8;
+
+/// A reconcileable tool of [`RECONCILEABLE_ATTEMPTS`] attempts, reconciled by
+/// `reconciler`.
+fn reconcileable_fixture(reconciler: ScriptedReconciler) -> DispatchFixture {
+    let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
+    let registry = tool_registry(
+        AgentEffectSpec::reconcileable(protocol, RECONCILEABLE_ATTEMPTS)
+            .expect("the spec is valid"),
+    );
+    DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged")),
+        registry,
+        None,
+        RecordingToolExecutor::new(),
+        reconciler,
+    )
+}
+
+/// A reconcileable tool whose reconciler answers `Executed` with `outcome` on
+/// every query: the script holds one finding, and [`ScriptedReconciler`]
+/// repeats its last.
+fn foreign_finding_fixture(outcome: AgentRunEffectOutcome) -> DispatchFixture {
+    reconcileable_fixture(ScriptedReconciler::new().with_finding(
+        AgentReconciliationFinding::Executed {
+            outcome: Box::new(outcome),
+        },
+    ))
+}
+
+impl DispatchFixture {
+    /// Runs the tool's first attempt and kills the worker after the
+    /// invocation: the tool committed and no receipt landed, so the attempt
+    /// is ambiguous and the next claim reconciles it.
+    async fn lose_the_tool_attempt(&self) {
+        self.pump_until_tool_ticket().await;
+        self.probe.arm(AgentDispatchWindow::AfterInvocation);
+        let _pass = self
+            .pipeline()
+            .pump_run(&run_scope())
+            .await
+            .expect("the pass runs");
+        assert_eq!(self.tools.invocation_count(TOOL), 1, "the target committed");
+    }
+
+    /// `rounds` times: expires the lease, settles the entities, and runs one
+    /// dispatch pass on a fresh worker. Answers the code of every pass that
+    /// returned an error, so a test can say that none did.
+    async fn pump_rounds(&self, rounds: usize) -> Vec<String> {
+        let mut errors = Vec::new();
+        for _round in 0..rounds {
+            self.expire_lease();
+            self.settle().await;
+            if let Err(error) = self.pipeline().pump_run(&run_scope()).await {
+                errors.push(error.code().to_string());
+            }
+        }
+        errors
+    }
+
+    /// The run's record of the effect in the given turn slot.
+    async fn effect_at(&self, slot: usize) -> rakka_agent::AgentRunEffect {
+        loop_state(self)
+            .await
+            .effects()
+            .iter()
+            .find(|effect| effect.slot == slot)
+            .cloned()
+            .expect("the effect is held")
+    }
+
+    /// The dispatcher fleet's index entry for one effect's ticket.
+    async fn fleet_entry(
+        &self,
+        effect: &rakka_agent::AgentRunEffect,
+    ) -> rakka_agent_workflow::AgentDispatchEntry {
+        use rakka_persistence::DurableStateStore;
+        self.fleet_store
+            .load(&rakka_agent_workflow::agent_dispatcher_fleet_persistence_id())
+            .await
+            .expect("the fleet store loads")
+            .expect("the fleet index exists")
+            .state
+            .entry(&rakka_agent_workflow::agent_dispatch_id(
+                &rakka_agent::workflow_run_id(&run_scope()),
+                &effect.dispatch_ticket_id(),
+            ))
+            .cloned()
+            .expect("the ticket is registered in the fleet index")
+    }
+
+    /// The outbox row one effect's ticket wrote to the run's workflow
+    /// substrate, where a burned attempt's failure line is kept.
+    async fn outbox_row(
+        &self,
+        effect: &rakka_agent::AgentRunEffect,
+    ) -> rakka_agent_workflow::substrate::OutboxEntry {
+        use rakka_persistence::DurableStateStore;
+        self.workflow_store
+            .load(&workflow_persistence_id(&run_scope()))
+            .await
+            .expect("the workflow store loads")
+            .expect("the workflow record exists")
+            .state
+            .outbox_entry(&rakka_agent_workflow::substrate::OutboxMessageId::new(
+                effect.dispatch_ticket_id().as_str(),
+            ))
+            .cloned()
+            .expect("the ticket's outbox row exists")
+    }
+}
+
+/// The state a finding that establishes nothing leaves once it parks: the
+/// tool ran once, its generation parked `Indeterminate` under `code`, the run
+/// waits on the one reconciliation checkpoint that park opened, and the
+/// ticket's fleet entry is settled cancelled as every park leaves it.
+async fn assert_parked_under(fx: &DispatchFixture, code: &str) {
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "an attempt never proven absent is never re-invoked"
+    );
+    let effect = fx.effect_at(1).await;
+    assert_eq!(effect.status, AgentRunEffectStatus::Indeterminate);
+    assert_eq!(
+        effect.last_error_code.as_deref(),
+        Some(code),
+        "the park says why the outcome is still unknown"
+    );
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::WaitingForReconciliation);
+    let state = loop_state(fx).await;
+    let open: Vec<_> = state
+        .open_checkpoints()
+        .iter()
+        .filter(|checkpoint| checkpoint.status.is_waiting())
+        .collect();
+    assert_eq!(open.len(), 1, "one checkpoint is open: {open:?}");
+    assert_eq!(
+        open[0].kind,
+        rakka_agent::AgentCheckpointKind::IndeterminateEffectReconciliation
+    );
+    assert_eq!(open[0].bound_effect.effect_id, effect.effect_id);
+    assert_eq!(open[0].bound_effect.generation, effect.generation);
+    // `park_indeterminate` settles the ticket `indeterminate`, whatever led
+    // to the park: the claim is recorded once, by the park.
+    let entry = fx.fleet_entry(&effect).await;
+    assert_eq!(
+        entry.status,
+        rakka_agent_workflow::AgentDispatchStatus::Cancelled
+    );
+    assert_eq!(entry.last_error_code.as_deref(), Some("indeterminate"));
+}
+
+#[tokio::test]
+async fn an_unknown_finding_at_a_spent_budget_parks_without_error() {
+    // The reconciler never establishes the outcome. Each query burns one
+    // attempt; the query that spends the budget parks the generation, and
+    // that pass settles cleanly like any other park.
+    let fx = reconcileable_fixture(ScriptedReconciler::new());
+    fx.start().await;
+    fx.lose_the_tool_attempt().await;
+
+    let errors = fx.pump_rounds(FOREIGN_FINDING_ROUNDS).await;
+
+    assert_eq!(errors, Vec::<String>::new(), "no pass returned an error");
+    assert_eq!(
+        fx.reconciler.queries(),
+        RECONCILEABLE_ATTEMPTS as usize,
+        "one query per attempt in the budget, not one per pass"
+    );
+    assert_parked_under(&fx, "reconciliation-exhausted").await;
+}
+
+#[tokio::test]
+async fn a_reconciler_finding_of_another_kind_is_handled_as_unknown() {
+    // The reconciler answers a tool effect with a model turn. That says
+    // nothing about the tool, so each query burns one attempt, the next claim
+    // asks again, and the spent budget parks the generation.
+    let fx = foreign_finding_fixture(AgentRunEffectOutcome::Model {
+        turn: Box::new(proposing_turn("charged")),
+    });
+    fx.start().await;
+    fx.lose_the_tool_attempt().await;
+
+    let errors = fx.pump_rounds(FOREIGN_FINDING_ROUNDS).await;
+
+    assert_eq!(errors, Vec::<String>::new(), "no pass returned an error");
+    assert_eq!(
+        fx.reconciler.queries(),
+        RECONCILEABLE_ATTEMPTS as usize,
+        "one query per attempt in the budget, not one per pass"
+    );
+    assert_parked_under(&fx, "effect-outcome-mismatch").await;
+    let row = fx.outbox_row(&fx.effect_at(1).await).await;
+    assert_eq!(
+        row.attempts()
+            .last_error()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("effect-outcome-mismatch: the reconciled outcome does not fit the effect"),
+        "the burned attempt's line names the code"
+    );
+}
+
+#[tokio::test]
+async fn a_reconciler_finding_under_another_calls_id_is_handled_as_unknown() {
+    // The right variant, for another call: the reconciler has established
+    // what happened to a call this effect is not.
+    let fx = foreign_finding_fixture(AgentRunEffectOutcome::Tool {
+        call_id: AgentToolCallId::new("call-elsewhere").expect("call id should be valid"),
+        content: AgentTaskContent::inline(serde_json::json!({ "receipt": "r-elsewhere" }))
+            .expect("the content is inline-bounded"),
+    });
+    fx.start().await;
+    fx.lose_the_tool_attempt().await;
+
+    let errors = fx.pump_rounds(FOREIGN_FINDING_ROUNDS).await;
+
+    assert_eq!(errors, Vec::<String>::new(), "no pass returned an error");
+    assert_eq!(
+        fx.reconciler.queries(),
+        RECONCILEABLE_ATTEMPTS as usize,
+        "one query per attempt in the budget, not one per pass"
+    );
+    assert_parked_under(&fx, "effect-outcome-mismatch").await;
+}
+
+#[tokio::test]
+async fn a_mismatched_finding_on_a_winding_down_run_parks_at_once() {
+    // As `Unknown` does on a cancelled run (scenario 57): the run cannot wait
+    // for a better answer, and the outcome is unknown and consequential, so
+    // the first mismatched finding parks it for the explicit decision.
+    let fx = foreign_finding_fixture(AgentRunEffectOutcome::Model {
+        turn: Box::new(proposing_turn("charged")),
+    });
+    fx.start().await;
+    fx.lose_the_tool_attempt().await;
+
+    let mut run = fx.fx.run();
+    run.recover(fx.fx.now()).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::Cancel {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Cancellation,
+                [TENANT, AGENT, "1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+        &fx.fx.router,
+        fx.fx.now(),
+    )
+    .await
+    .expect("cancellation applies");
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::Cancelling,
+        "the ambiguous effect keeps the run nonterminal"
+    );
+
+    let errors = fx.pump_rounds(FOREIGN_FINDING_ROUNDS).await;
+
+    assert_eq!(errors, Vec::<String>::new(), "no pass returned an error");
+    assert_eq!(
+        fx.reconciler.queries(),
+        1,
+        "a winding-down run parks on the first mismatched finding"
+    );
+    assert_parked_under(&fx, "effect-outcome-mismatch").await;
+    assert_eq!(
+        fx.fx
+            .run_snapshot()
+            .await
+            .expect("the run exists")
+            .terminal_reason
+            .as_ref()
+            .expect("the cancellation request is recorded")
+            .code(),
+        "cancellation-requested"
+    );
+}
+
+/// The recorded call id is read from session memory: the delivery that
+/// records the tool result also runs the run's settle pass, which records the
+/// turn and clears its tool results in the same call, so the session entry's
+/// source is where the id the run recorded still exists.
+#[tokio::test]
+async fn a_transformed_call_settles_under_the_intents_own_call_id() {
+    // A custom authority transforms the call and, with it, its id. The tool
+    // ran the granted call and its result is good; only the label would be
+    // wrong, so the dispatcher settles the result under the model's own id.
+    use rakka_agent::SessionMemoryStore;
+
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_relabelled_calls()
+    .with_session_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots));
+    fx.start().await;
+
+    assert_eq!(fx.try_pump().await, Ok(()), "the run accepts the result");
+
+    let invocations = fx.tools.invocations();
+    assert_eq!(invocations.len(), 1, "the tool ran once");
+    assert_eq!(
+        invocations[0].call_id, "relabelled-call",
+        "the granted call is the one that executed"
+    );
+    let page = session
+        .read(&run_scope(), rakka_agent::SessionMemoryCursor::start())
+        .await
+        .expect("the session reads");
+    let recorded: Vec<Option<&str>> = page
+        .entries
+        .iter()
+        .filter(|entry| entry.role == rakka_agent::MemoryEntryRole::ToolResult)
+        .map(|entry| entry.source.as_deref())
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![Some("call-1")],
+        "the result is recorded under the model's own call id"
     );
     let run = fx.fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);

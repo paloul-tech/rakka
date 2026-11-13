@@ -120,10 +120,11 @@ use crate::definition::{
     AgentCredentialBindingRef, AgentEffectSafetyClass, AgentSetupRevision, AgentToolId,
 };
 use crate::effect::{
-    compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentMemoryPromotionRequest,
-    AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
-    AgentRunEffectSink, AgentRunEffectStatus, AgentUnknownOutcomeEvidence,
-    AGENT_MEMORY_PROMOTION_MAX_ENTRIES, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
+    compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentEffectOutcomeSource,
+    AgentMemoryPromotionRequest, AgentReconciliationProtocolRef, AgentRunEffect,
+    AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus,
+    AgentUnknownOutcomeEvidence, AGENT_MEMORY_PROMOTION_MAX_ENTRIES, ATTR_AGENT_EFFECT_GENERATION,
+    ATTR_AGENT_EFFECT_ID,
 };
 use crate::identity::{AgentIdentityError, AgentRunScope, AgentScope};
 use crate::memory::{
@@ -3570,6 +3571,35 @@ where
         let finding = reconciler.reconcile(&protocol, scope, intent).await?;
         match finding {
             AgentReconciliationFinding::Executed { outcome } => {
+                if let Err(error) =
+                    intent.check_outcome(&outcome, AgentEffectOutcomeSource::Dispatcher)
+                {
+                    // The reconciler is application code, and an outcome that
+                    // belongs to another kind of effect or another call or
+                    // cell establishes nothing about this one. The run would
+                    // refuse it, and the ticket would be claimed and the
+                    // protocol asked again without bound, so it is handled as
+                    // the `Unknown` finding it is, under the mismatch code.
+                    tracing::warn!(
+                        effect_id = intent.effect_id.as_str(),
+                        generation = %intent.generation,
+                        %error,
+                        "the reconciler's outcome does not belong to the effect; handled as unknown"
+                    );
+                    return self
+                        .settle_unknown_finding(
+                            scope,
+                            claim,
+                            intent,
+                            attempt,
+                            winding_down,
+                            "effect-outcome-mismatch: the reconciled outcome does not fit the effect",
+                            "effect-outcome-mismatch",
+                            "effect-outcome-mismatch",
+                            pass,
+                        )
+                        .await;
+                }
                 // The authoritative outcome, recorded without re-invocation.
                 self.deliver_outcome(scope, intent, attempt, claim.fencing_token, *outcome, pass)
                     .await?;
@@ -3602,60 +3632,99 @@ where
                     .await
             }
             AgentReconciliationFinding::Unknown => {
-                if winding_down {
-                    // A cancelled run cannot wait for a better answer forever;
-                    // the outcome is unknown and consequential, so it parks
-                    // for the explicit decision (scenario 57).
-                    return self
-                        .park_indeterminate(
-                            scope,
-                            claim,
-                            intent,
-                            attempt,
-                            "reconciliation-unknown",
-                            INDETERMINATE_OUTCOME_MESSAGE,
-                            pass,
-                        )
-                        .await;
-                }
-                // Burn an attempt and leave the row retry-scheduled. A
-                // `Reconcileable` row re-enters recovery as ambiguous, so the
-                // later claim queries the protocol again rather than
-                // invoking; a spent budget parks the generation.
-                let message_id = OutboxMessageId::new(claim.effect_id.as_str());
-                let event = self
-                    .write_outbox(
-                        scope,
-                        &message_id,
-                        InboxWrite::Failed {
-                            line: "reconciliation outcome unknown",
-                            timed_out: true,
-                        },
-                    )
-                    .await?
-                    .expect("a failure record answers its event");
-                pass.failed_attempts += 1;
-                if matches!(
-                    event,
-                    WorkflowTelemetryEvent::OutboxDispatchExhausted { .. }
-                ) {
-                    self.fleet.record_claim_failure(&claim, &event).await?;
-                    return self
-                        .park_indeterminate(
-                            scope,
-                            claim,
-                            intent,
-                            attempt,
-                            "reconciliation-exhausted",
-                            INDETERMINATE_OUTCOME_MESSAGE,
-                            pass,
-                        )
-                        .await;
-                }
-                self.fleet.record_claim_failure(&claim, &event).await?;
-                Ok(ClaimConclusion::Settled)
+                self.settle_unknown_finding(
+                    scope,
+                    claim,
+                    intent,
+                    attempt,
+                    winding_down,
+                    "reconciliation outcome unknown",
+                    "reconciliation-unknown",
+                    "reconciliation-exhausted",
+                    pass,
+                )
+                .await
             }
         }
+    }
+
+    /// Settles a reconciliation finding that establishes nothing about the
+    /// intent: the reconciler's `Unknown`, or an `Executed` whose outcome does
+    /// not belong to it. `line` is the burned attempt's failure line;
+    /// `winding_down_code` and `exhausted_code` are the codes the two parks
+    /// carry.
+    ///
+    /// Either park settles the ticket, once: [`Self::park_indeterminate`]
+    /// records the claim's end as cancelled `indeterminate`, as every park
+    /// does, so the spent-budget branch records nothing for the claim before
+    /// it. A second record of the same claim is fenced, and the pass that
+    /// parked would answer an error.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_unknown_finding(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: AgentDispatchClaim,
+        intent: &AgentRunEffect,
+        attempt: u32,
+        winding_down: bool,
+        line: &str,
+        winding_down_code: &str,
+        exhausted_code: &str,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        if winding_down {
+            // A cancelled run cannot wait for a better answer forever; the
+            // outcome is unknown and consequential, so it parks for the
+            // explicit decision (scenario 57).
+            return self
+                .park_indeterminate(
+                    scope,
+                    claim,
+                    intent,
+                    attempt,
+                    winding_down_code,
+                    INDETERMINATE_OUTCOME_MESSAGE,
+                    pass,
+                )
+                .await;
+        }
+        // Burn an attempt and leave the row retry-scheduled. A `Reconcileable`
+        // row re-enters recovery as ambiguous, so the later claim queries the
+        // protocol again rather than invoking; a spent budget parks the
+        // generation.
+        let message_id = OutboxMessageId::new(claim.effect_id.as_str());
+        let event = self
+            .write_outbox(
+                scope,
+                &message_id,
+                InboxWrite::Failed {
+                    line,
+                    timed_out: true,
+                },
+            )
+            .await?
+            .expect("a failure record answers its event");
+        pass.failed_attempts += 1;
+        if matches!(
+            event,
+            WorkflowTelemetryEvent::OutboxDispatchExhausted { .. }
+        ) {
+            // The budget is spent: the park settles the ticket and records
+            // the claim's end, so nothing is recorded for the claim here.
+            return self
+                .park_indeterminate(
+                    scope,
+                    claim,
+                    intent,
+                    attempt,
+                    exhausted_code,
+                    INDETERMINATE_OUTCOME_MESSAGE,
+                    pass,
+                )
+                .await;
+        }
+        self.fleet.record_claim_failure(&claim, &event).await?;
+        Ok(ClaimConclusion::Settled)
     }
 
     /// Parks one generation as indeterminate, with nothing known beyond its
@@ -4128,6 +4197,10 @@ where
                 self.reviewed_model_outcome(scope, intent, turn).await
             }
             AgentRunEffectRequest::Tool { call } => {
+                // The result settles under the intent's own call id, whatever
+                // id a transformed call carries: the model asked for this
+                // call, and the run records the answer against it.
+                let call_id = call.call_id.clone();
                 let call: &AgentToolCallRequest = granted.tool_call.as_deref().unwrap_or(call);
                 // The tool name is a bounded class from the configured
                 // registry, which 17.6 permits in a span name; the call's
@@ -4146,14 +4219,8 @@ where
                     },
                 );
                 let content = executed?;
-                self.reviewed_tool_outcome(
-                    scope,
-                    intent,
-                    Some(&call.tool),
-                    call.call_id.clone(),
-                    content,
-                )
-                .await
+                self.reviewed_tool_outcome(scope, intent, Some(&call.tool), call_id, content)
+                    .await
             }
             AgentRunEffectRequest::Compensation { compensation, .. } => {
                 let Some(executor) = self.compensations.as_ref() else {

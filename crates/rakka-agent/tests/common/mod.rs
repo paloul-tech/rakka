@@ -2614,6 +2614,65 @@ impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAutho
     }
 }
 
+/// An [`AgentDispatchAuthority`] decorator that grants a tool intent's call
+/// under another call id: on a `Granted` decision for a tool intent, the
+/// granted call is a copy of the intent's call with the id `relabelled-call`.
+///
+/// `AgentGrantedDispatch::tool_call` is a public field, so a custom authority
+/// that transforms a call need not keep its id. This is that authority.
+pub struct RelabelingAuthority<Inner>(pub Inner);
+
+impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for RelabelingAuthority<Inner> {
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        let inner = self.0.authorize(scope, run, intent, attempt, now);
+        Box::pin(async move {
+            match (inner.await?, &intent.request) {
+                (
+                    AgentDispatchDecision::Granted(mut granted),
+                    rakka_agent::AgentRunEffectRequest::Tool { call },
+                ) => {
+                    let mut relabelled: Box<AgentToolCallRequest> = call.clone();
+                    relabelled.call_id =
+                        AgentToolCallId::new("relabelled-call").expect("the call id is valid");
+                    granted.tool_call = Some(relabelled);
+                    Ok(AgentDispatchDecision::Granted(granted))
+                }
+                (decision, _) => Ok(decision),
+            }
+        })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a rakka_agent::AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentToolResponseDecision> {
+        // A wrapper forwards the boundary: the chain it wraps is the one that
+        // must run.
+        self.0.review_tool_response(scope, intent, tool, content)
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: rakka_agent::AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentModelResponseDecision> {
+        // A wrapper forwards the boundary: the chain it wraps is the one that
+        // must run.
+        self.0.review_model_response(scope, intent, turn)
+    }
+}
+
 /// A gate that answers one fixed refusal for every intent.
 ///
 /// The refusal's code and message are *application*-authored on the real
