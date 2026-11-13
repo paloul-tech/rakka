@@ -168,6 +168,21 @@ leaves behind is the same either way.
    It settles `Exhausted`, as a spent budget does, and its failure reason is
    marked definitive; a run that fails on an effect records how many attempts
    it made and was allowed.
+   An outcome settles only the effect it belongs to: the success variant of
+   the effect's own request, naming the effect's own call, cell or
+   generation, or a failure outcome (`Failed`, `Exhausted`, `Indeterminate`
+   or `Cancelled` from a dispatcher; `Failed` or `Exhausted` from a person's
+   confirmation). A tool result carries the effect's own call id, and a
+   compensation's result the id `compensation_call_id` derives for it. Any
+   other outcome is refused `effect-outcome-mismatch` before anything
+   changes, on every run; a stale or duplicate delivery still answers as
+   stale first. The dispatcher records a tool's result under the call id the
+   model asked for, even when the dispatch authority transformed the call.
+   When a deployment's reconciler answers `Executed` with an outcome that
+   does not fit the effect, the dispatcher handles the finding as `Unknown`:
+   on a live run it burns one attempt and asks again on a later claim, and a
+   spent budget parks the generation; a winding-down run parks it at once.
+   The failed attempt's line and the park carry `effect-outcome-mismatch`.
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect
@@ -196,7 +211,12 @@ escalation — and every goal transition commits in the same compare-and-set as
 the task transition that decided it. A finite goal becomes `Satisfied` only
 through the configured evaluator's assessment of the current criteria revision
 against durable evidence; an agent may propose completion, and with an
-evaluator configured that proposal has one door.
+evaluator configured that proposal has one door. An evaluation the
+deployment's spec gates opens its gate in the `EvaluateGoal` command's own
+transition: a `SecurityAuthorization` when the spec requires authorization,
+with or without a checkpoint, else an `Approval`. A human review always opens
+one, and takes its verdict from that gate's grant. The command moves neither
+the run's status nor its phase.
 
 A continuous goal executes as bounded **epochs**. The wake controller derives
 one `AgentWakeId` per logical occurrence — from a schedule, an event, a
@@ -218,7 +238,18 @@ operational snapshot** from the durable record, with the revision it read,
 correct while every telemetry path is down. Each pending effect names its
 target (`tool:{tool id}` for a tool call), when it was handed to the sink, and
 its last error code and reason; each open checkpoint names the effect it gates,
-the decisions it allows, and its summary. The session view by `AgentRunId`
+the decisions it allows, and its summary. A run snapshot's `next_wake` is the
+earliest deadline the run's checkpoint timer will act on
+(`AgentCheckpoint::next_timer_deadline`). An expiry counts, except on a
+reconciliation checkpoint, which never expires. An SLA due time counts only
+while the checkpoint is `Open` and names an escalation target, so a due time an
+escalation has spent is not reported. A person can escalate only a
+reconciliation checkpoint, which carries no expiry, so after a person's
+`Escalate` that checkpoint adds nothing to `next_wake`. On an ended run a
+checkpoint not bound to a memory promotion or claim append adds nothing either,
+because the timer leaves it alone. A deadline that has passed but that no timer
+has fired yet is still reported. The checkpoint views keep `due_at` and
+`expires_at` as the record holds them. The session view by `AgentRunId`
 joins that snapshot with retained decision events and trace segments, exposes
 its own lag, and is a projection, never a second state machine.
 
@@ -280,7 +311,20 @@ incorrectly.
   and its outcome never rests one — a failure of either stays on the effect
   record rather than ending the run, and a run that has ended still accepts
   both for a deployment-configured window after its terminal stamp, its
-  effects riding the ordinary outbox the application keeps pumping. If such
+  effects riding the ordinary outbox the application keeps pumping. A
+  promotion or claim append the deployment's spec gates opens its gate in
+  the command's own transition, on a live run and on an ended one: a
+  `SecurityAuthorization` when the spec requires authorization, else an
+  `Approval`. The gate is not the turn's wait. It moves neither the run's
+  status nor its phase, it is listed among the snapshot's open checkpoints,
+  and a tool-calling turn never opens it. A grant dispatches the effect, and
+  a denial or an expiry fails that generation only. A `Cancel` closes the
+  gate and, in the same transition, settles the effect `Cancelled` if it is
+  still `Pending` and ungranted, releasing its attempt reservation; a
+  granted one still dispatches. A run already at its bound on open
+  checkpoints refuses the command whole with `effect-pending-overflow`. A
+  compensation or workflow cancel the spec gates never opens its gate and
+  waits `Pending` (issue #128, open). If such
   an effect's attempt may have run and its recovery retry is refused (the
   agent was terminated just after the run ended), the generation parks
   `Indeterminate` behind a reconciliation checkpoint, as a live run's does.
@@ -295,7 +339,8 @@ incorrectly.
   reason and stamp never move. `ConfirmedCompleted` records the outcome it
   carries, which must be the effect's own receipt, a `Failed` or an
   `Exhausted`; any other outcome, such as a model turn, is refused
-  `effect-policy-invalid`, because it would move the ended run's loop.
+  `effect-outcome-mismatch`, as on a live run, because it would move the
+  ended run's loop.
   `AbandonAndFail` fails that generation only. `ConfirmedNotExecuted` is a
   person's assertion that the attempt never ran, not a probe: it re-sends
   under a new idempotency key, so if the first attempt did land, a re-sent
@@ -311,10 +356,10 @@ incorrectly.
   session rows, a re-sent promotion settles without parking (`Exhausted`,
   code `memory-promotion-source-missing`, once its attempts run out). A timer
   escalates the checkpoint but never expires it, and the settle pass opens
-  the checkpoint for a park that has none. An approval left open on an
-  ended run's promotion or claim append is answered and timed as on a live
-  run: a grant dispatches the effect, and a denial or an expiry fails that
-  generation only. The run's status does not move. The decision events all
+  the checkpoint for a park that has none. A gate on an ended run's
+  promotion or claim append, whether it was open when the run ended or a
+  command opened it after, is answered and timed as on a live run. The run's
+  status does not move. The decision events all
   of this records follow the run's end event (see Observability below). A
   compensation or workflow cancel parked on an ended run stays as it was
   (issue #123), and every other resolution on an ended run is still refused
@@ -368,8 +413,12 @@ The loop, the entities, and the dispatcher close bounded **segments** for the
 operations a run performs, always compiled and feature-free; under `otel` they
 map to the pinned GenAI semantic-convention revision with a status, a stable
 `error.type`, and the attributes the tail-sampling retention classes select
-on. Metrics are catalogued as data with units, buckets, and bounded label keys,
-and a source scan holds the catalogue to the call sites. Decision events are
+on. The `PromoteMemory`, `AppendClaim` and `EvaluateGoal` commands close the
+`checkpoint-open` segment of a gate they open once the command commits, under
+the parked identity the checkpoint stores, as the loop does for a gate a turn
+opens; a replayed command closes none. Metrics are catalogued as data with
+units, buckets, and bounded label keys, and a source scan holds the catalogue
+to the call sites. Decision events are
 durable records with a bounded outbox and a sink that may lag but never blocks.
 The outbox is bounded by count (32) and by bytes
 (`AGENT_RUN_DECISION_OUTBOX_MAX_BYTES`, 40 KiB); an event over the byte bound on
@@ -396,11 +445,12 @@ effect's approval or authorization checkpoint stays open on the ended run and
 gets no close event; the run's end event closes it for readers. On an ended
 run, events can follow the run's end event: for a parked memory promotion or
 claim append, `request-reconciliation` (the checkpoint's open),
-`escalate-checkpoint` and `reconcile`; for an approval left open on one of
-them, `resolve-checkpoint` (its grant, denial or expiry); and for a re-sent
-gated generation, the `request-approval` or `request-authorization` of its new
-gate. `request-reconciliation`, `escalate-checkpoint` and `resolve-checkpoint`
-are written only under `Version2`; the other three are written under
+`escalate-checkpoint` and `reconcile`; for a gate left open on one of them,
+`resolve-checkpoint` (its grant, denial or expiry); and for a gated one
+commanded after the run ended, or a re-sent gated generation, the
+`request-approval` or `request-authorization` of its new gate.
+`request-reconciliation`, `escalate-checkpoint` and `resolve-checkpoint` are
+written only under `Version2`; the other three are written under
 `Version1` too. `AgentDecisionEventVocabulary` selects what is written:
 `Version1`, the default, writes only the kinds an earlier reader decodes
 (`request-approval`, `request-authorization`, `reconcile`, `complete`,
