@@ -298,6 +298,23 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
 ## Tests
 
+- Issue #68 ("knowledge-graph retention, tombstone and deletion") adds two required methods to `KnowledgeGraphStore`, four stable refusal codes, one optional field on the claim record, and a change to the PostgreSQL graph schema. **Source-breaking for an outside implementor.** `KnowledgeGraphStore::tombstone` and `KnowledgeGraphStore::delete` have no default body and no capability flag, because specification 13.1 makes them mandatory for every memory API. A store implemented outside this repository does not compile until it has both. The three implementations in this repository have them. **The four codes.** `claim-tombstoned`: the claim is a tombstoned stub, so it cannot transition, be tombstoned again, or be appended. `claim-operation-erased`: the replayed operation's payload was erased by a later tombstone or delete of its claim. `claim-tombstone-content`: a record marked tombstoned still carries a statement, evidence, or an embedding. `claim-delete-stale`: the claim is no longer in the state a delete expected. No existing code changes meaning. The claim-append executor treats all four as definitive refusals, so a retried append of an erased claim fails its effect once and does not end the run. **The claim record is at schema version 2, staged.** Version 2 carries `tombstone`, an optional field that is absent from a live claim's encoding. A claim is written at version 2 only when it is a tombstoned stub; a live claim is still written at version 1 and encodes to the same bytes as before (`CLAIM_LIVE_SCHEMA_VERSION`). A binary from before this change therefore reads every live claim as it always did and refuses a stub with `schema-version-ahead`, which also fails the query page that contains the stub. It never reads a stub's markers as a statement. **A consequence for the next bump.** Because live claims stay at version 1, a bump to version 3 would put every live claim outside the default N/N+1 window. Whoever makes that bump must move live claims forward or widen the window. **The PostgreSQL schema.** `migrate` adds `tombstoned BOOLEAN NOT NULL DEFAULT FALSE` to `rakka_agent_knowledge_claim` and widens the `kind` check on `rakka_agent_knowledge_claim_op` to `append`, `transition`, `tombstone`, `delete`, `erased`. It does both in place, only when they are not already there, and without rewriting a table. A tombstoned stub's row holds a reserved fence value, `TOMBSTONE_FENCE_TRANSITION_COUNT` (`i32::MAX`), in its `transition_count` column instead of the count; the true count stays in the record. An erased ledger row keeps its operation id with kind `erased` and an empty, non-null payload, and is never removed.
+
+  | Roll step | What to do | Why |
+  |---|---|---|
+  | 1 | Run `migrate` from the new build | The new build's reads select the `tombstoned` column. The migration is safe under earlier binaries: their insert does not name the column, and both ledger kinds they write are still allowed. |
+  | 2 | Upgrade every binary that reads the graph | During the roll no row changes: appends are still version 1 and no ledger row has a new kind. |
+  | 3 | Call `tombstone`, `delete`, or the retention sweep | Only now can a stub or an erased ledger row exist. |
+
+  | A binary from before this change | What it answers |
+  |---|---|
+  | Reads a tombstoned stub | `schema-version-ahead` |
+  | Replays an append or transition whose claim was since tombstoned or deleted | `claim-operation-conflict`. The ledger row is still there, so it inserts nothing. One path differs for one attempt: an append that loses a race to the erasure answers `claim-backend-failed`, and its retry answers the conflict. |
+  | Runs a transition it read before a tombstone committed | Nothing is written. Its statement is fenced on a count the stub's row no longer holds. Its retry reads the stub and answers `schema-version-ahead`. |
+  | Runs a transition it read before a delete committed | Nothing is written. Its retry answers `claim-not-found`. |
+
+  A rollback to the earlier build cannot misread a stub or restore erased content. After step 3 it refuses any query page that holds a stub, so a rollback is clean only while no stub exists. The PostgreSQL store also now reads an operation's ledger row and its claim in one statement before every transition, tombstone, and delete. Read separately, two callers racing the same operation could leave the loser refusing a replay it should have answered (`claim-transition-illegal` for a transition whose target the claim already held); both now get the one result.
+
 Run the default compatibility matrix:
 
 ```sh

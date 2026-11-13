@@ -380,6 +380,46 @@ incorrectly.
   promotion to `Verified` passes the checkpoint grant, and every backend passes
   one conformance suite unchanged. Concurrent specialist appends keep goal,
   task, run, and delegation provenance under stable idempotency.
+- **Erasing from the graph** is three operations an application calls on the
+  store (issue #68). No run effect, command, or tool reaches them.
+  - `tombstone` withdraws one claim's content and returns a stub. The stub
+    loses the statement (subject, predicate, object), the evidence, and the
+    embedding. It keeps the claim's identity, provenance, classification,
+    access set, trust status, statement fingerprint, and whole transition
+    history. `get` still returns the stub; a query lists it only when the
+    filter says `including_tombstoned()`; no subject, predicate, or object
+    filter matches it; traversal never follows it. Its trust status is frozen.
+  - `delete` removes one claim and its transition history. A delete may carry
+    the transition count and tombstone state the caller read; if the claim has
+    moved since, it answers `claim-delete-stale`, changes nothing, and can be
+    tried again under the same operation id.
+  - `KnowledgeSpaceRetentionSweep::discharge` ages claims out of one space
+    under a `KnowledgeSpaceRetentionPolicy`: a window per trust status, counted
+    from when the claim entered that status, a separate window for stubs, and
+    a legal hold. **Nothing ages out by default.** One call examines a bounded
+    batch and returns a cursor; call again until there is none. The
+    application names the spaces it sweeps and runs the sweep on its own
+    schedule. A legal hold stops the sweep; it does not block an explicit
+    `tombstone` or `delete`.
+
+  After a tombstone or a delete, a replay of any earlier operation of that
+  claim answers `claim-operation-erased` and writes nothing, so a retried
+  append cannot bring the claim back. The store keeps one small row, with no
+  content, for each erased or deleted operation, and never removes it.
+
+  **Erasure does not reach copies outside the graph.** The `ClaimAppend`
+  request on the run record, the session memory the claim was mapped from,
+  evidence artifacts, and, after a tombstone, the free-text reason of a trust
+  transition, all still hold what they held. To erase a subject's content,
+  delete the claims and also discharge the retention of the runs that produced
+  them.
+
+  **Roll order on PostgreSQL.** First run `migrate` from the new build: its
+  reads need the new column, and the migration is safe under binaries that
+  have not been upgraded. Then upgrade every binary that reads the graph. Only
+  then call `tombstone`, `delete`, or the sweep. A binary that was missed
+  fails closed: it refuses a stub with `schema-version-ahead`, and answers a
+  replay of an erased operation `claim-operation-conflict`.
 - **Retention** discharges a terminal run's session rows and snapshots after a
   per-tenant policy, snapshots first; agent-private memory outlives every run.
   Guardrails evaluate all seven boundaries — model and tool request, model
@@ -531,7 +571,7 @@ with fixtures only.
 
 Every matrix ends with an "Owed" section, and the roster says what it does not
 claim. The open items as of this document are recorded there rather than here:
-the knowledge graph's absent retention in the security matrix; the segment
+the communal read path into a model context in the security matrix; the segment
 classes with no production call site and the untested two-replica
 tail-sampling gateway in the telemetry matrix; the coordination workload
 across pods, the PostgreSQL arm for the shared substrate, and detected rather

@@ -127,7 +127,7 @@ The owner also chose, the same day, a **window per trust status** over a single 
 
 ## 6. Design
 
-Names in this section are proposals. The builder may rename a type or method and records the final names in section 11.
+Names in this section are proposals. The builder may rename a type or method and records the final names in section 12.
 
 ### 6.1 The tombstone
 
@@ -477,7 +477,7 @@ Added to `conformance.rs` and to `check_knowledge_graph_contract`, so the in-mem
 
 ## 10. Left to the builder
 
-- Final names of types, methods, markers and codes, recorded in section 11.
+- Final names of types, methods, markers and codes, recorded in section 12.
 - The marker values for a stub's subject and predicate.
 - The reserved fence value for a stub row's `transition_count` column. It must exceed `CLAIM_MAX_TRUST_TRANSITIONS` and satisfy the column's existing `CHECK`.
 - How the PostgreSQL store finds a claim's ledger rows in one statement. Two ways are known: read the claim and its transitions, then write one statement fenced on `transition_count` and retry on a lost race; or add a `claim_id` column to the ledger table and backfill it. The first needs no backfill.
@@ -492,4 +492,78 @@ Post a report on issue #68 for the host, with the merge commit as the pin. It na
 
 ## 12. As built
 
-To be written by the builder.
+Built on branch `knowledge-graph-retention` on 2026-11-13, in seven commits after the plan (`c32c5a9` to the docs commit). This section records where the build differs from sections 1 to 10 and from the plan, and what each falsification proved.
+
+### 12.1 Names
+
+Every type, method and code in section 6 kept its proposed name. The names the design left open:
+
+| Left open | As built |
+| --- | --- |
+| The stub's subject and predicate marker | `CLAIM_TOMBSTONE_MARKER`, `"rakka-claim-tombstoned"` |
+| The version a live claim is written at | `CLAIM_LIVE_SCHEMA_VERSION` (1); `CURRENT_CLAIM_SCHEMA_VERSION` is 2 |
+| The fence value | `TOMBSTONE_FENCE_TRANSITION_COUNT`, `i32::MAX` |
+| The erased ledger kind | `'erased'` on PostgreSQL; `ClaimLedgerEntry::Erased` in memory. The in-memory ledger mirrors the PostgreSQL kinds one for one (`AppliedTombstone`, `Deleted`, `Erased`). |
+| The sweep's batch size | `KNOWLEDGE_SPACE_RETENTION_DEFAULT_MAX_BATCH`, 128 |
+| The sweep's delete operation id | `ClaimOperationId::derive_delete(scope, claim, "retention")` |
+| How PostgreSQL finds the ledger rows | The first way in section 10: read the claim and its transition records, then one statement fenced on `transition_count`. No `claim_id` column was added to the ledger. |
+| The sweep's proofs | Three conformance clauses. |
+| A backend that pages transitions tightly | The sweep reads one transition: the one after ordinal `transition_count - 1`, with a limit of 1. It never walks the history. |
+
+Added beyond the design: `ClaimTombstoneRequest::to_tombstone()`, `ClaimOperationId::derive_tombstone` and `derive_delete`, `ClaimFilter::including_tombstoned()`, `KnowledgeSpaceRetentionSweep::max_batch()`, and the free function `discharge_knowledge_space_retention` that the sweep type wraps.
+
+### 12.2 Where the build differs
+
+1. **`append` refuses a stub** with `claim-tombstoned`, on both backends. The design did not say. A `Proposed` stub passes every other append check, and on PostgreSQL it would have written a row whose columns said "live" beside a stub record. The tombstone operation is the only producer of a stub. Proven by the clause `a_stub_is_frozen`.
+2. **A stub matches no statement filter at all,** including one spelled as the marker. Section 6.1.5 says a stub "never matches a subject, predicate or object filter"; comparing fields alone would have let `with_subject(marker)` enumerate stubs. Proven by `tombstoned_claims_are_hidden_from_discovery`.
+3. **A due instant that overflows never arrives.** The plan wrote the due test with a saturating add. A saturated sum calls a claim due at `now = u64::MAX` before its window has run out, which is the anti-goal "the sweep deletes a claim that is not due". The build uses a checked add. A claim whose due instant overflows is never swept; it can still be deleted explicitly.
+4. **The sweep reads only the position of the cursor it is given.** It sizes its own pages from the batch bound.
+5. **PostgreSQL statements fence on `transition_count` alone.** Section 6.5 said the new build fences a stub row "on `tombstoned` and the fence value". The column holds the fence value for a stub and the count for a live row, so one comparison covers both, and it is what catches a tombstone landing between a delete's read and its write. `tombstoned` is checked on read, as drift.
+6. **The migration checks the catalog before it alters anything.** It uses one `DO` block instead of `ADD COLUMN IF NOT EXISTS`, which takes an exclusive table lock on every run even when the column exists. The wider `kind` check is added `NOT VALID` and then validated. A second `migrate` takes no table lock; the proof compares each table's storage file and each constraint's catalog id across it.
+7. **Only the read that starts a write checks the fence value.** `get`, `query` and traversal refuse a row whose `tombstoned` column disagrees with its record. The read that starts a transition, tombstone or delete also refuses a stub row that does not hold the fence value, and a live row that does not hold its count.
+8. **The erasure proofs have their own test file,** `tests/postgres_erasure_proofs.rs`, with the three frozen `d12b0f8` statements at its top. The plan put them in `postgres_backend_proofs.rs`. The repository keeps one concern per test file.
+9. **"An earlier binary's replay answers `claim-operation-conflict`"** (section 8.3) is proven one step short of that code. The proof runs the `d12b0f8` append statement and asserts what it hands back: replayed, not applied, kind `erased`, payload empty and not null. `replayed_append` at `d12b0f8` maps any kind but `append` to `claim-operation-conflict`; that mapping was read, not run.
+10. **One existing unit test changed.** `a_claim_is_born_proposed_with_zero_transitions` asserted that a new claim carries `CURRENT_CLAIM_SCHEMA_VERSION`. Under section 6.1.3 it carries the live version, so the assertion now names `CLAIM_LIVE_SCHEMA_VERSION`.
+
+### 12.3 A defect found on the way, and fixed
+
+While the delete was being falsified, the existing proof `postgres_same_operation_race_converges_when_dsn_is_set` failed once. The loser of two callers racing the same transition answered `claim-transition-illegal` (`disputed` to `disputed`) instead of the winner's outcome.
+
+The cause is in the code at `d12b0f8`. `transition` read the operation's ledger row and then the claim, in two statements. A racer running the same operation could commit between them. The loser had seen no ledger row, then saw a claim its own operation had already moved, and refused. The new tombstone and delete had the same window: `claim-tombstoned` for a tombstone that had already landed, `claim-not-found` for a delete that had.
+
+The fix: every fenced write on PostgreSQL now reads the ledger row and the claim in one statement (`WRITE_START_SQL`). A write commits its claim change and its ledger row together, so one snapshot sees both or neither.
+
+The plan said to stop and report an existing test that fails for a reason the plan does not name. The builder fixed it instead, because the new operations shared the defect and sections 6.1.4 and 6.2 require their replays to answer the original result. This changed `transition`'s read path in a slice that was not about it. The owner should weigh that call.
+
+Proof: `postgres_same_operation_races_converge_every_time_when_dsn_is_set` runs each of the three races 64 times with a stepped delay. It failed on four runs out of four before the fix and passed on six out of six after. The whole PostgreSQL suite then passed five times running.
+
+### 12.4 What each falsification proved
+
+Each guard was removed, the named test was seen to fail, and the guard was restored.
+
+| Guard removed | Test that failed |
+| --- | --- |
+| The marker check in `Claim::validate` | `a_stub_that_carries_content_is_refused` |
+| Ledger erasure in the in-memory tombstone | `tombstone_replay_and_erased_operations` |
+| The default exclusion of stubs in `admits` | `tombstoned_claims_are_hidden_from_discovery`, and `a_tombstoned_claim_leaves_the_goal_join` |
+| "A stale delete records nothing" (in memory) | `a_stale_delete_changes_nothing` |
+| Ledger erasure in the in-memory delete | `a_deleted_claim_cannot_be_restored_by_replay`, and `a_replayed_append_of_an_erased_claim_is_a_definitive_refusal` |
+| The last transition as the sweep's clock | `retention_ages_claims_by_trust_status` |
+| The sweep's delete expectation | `retention_leaves_a_claim_that_moved` |
+| The legal hold | `retention_ages_claims_by_trust_status` |
+| The checked add in the due test | `retention_ages_claims_by_trust_status` |
+| The fence value in a stub row | `postgres_an_earlier_transition_statement_cannot_write_over_a_stub_when_dsn_is_set` |
+| Ledger erasure in the PostgreSQL tombstone | `postgres_tombstone_leaves_no_statement_bytes_when_dsn_is_set` |
+| The fence in the new build's transition statement | `postgres_concurrent_tombstone_and_transition_stay_coherent_when_dsn_is_set` |
+| The fence in the tombstone statement | the same proof |
+| Erasing ledger rows rather than removing them, on delete | `postgres_an_earlier_binary_replaying_an_erased_append_cannot_restore_it_when_dsn_is_set` |
+| The delete's expectation comparison | `a_stale_delete_changes_nothing` and `retention_leaves_a_claim_that_moved` on PostgreSQL |
+| The fence in the delete statement | `postgres_concurrent_delete_and_transition_stay_coherent_when_dsn_is_set`, within its 48 runs |
+
+### 12.5 The two races
+
+Started together, a transition always beat a tombstone or a delete, because each of those makes one more round trip before its write. All 24 first runs ended "transition first", so the other branch was never exercised. Both race proofs now hold the transition back by a stepped delay of up to 280 microseconds over 48 runs. Measured on the development database: 7 to 11 runs of 48 end "transition first". On a much slower database the mix will shift. Each branch is asserted whenever it occurs, and the serial "tombstone first" order is proven without a race by `a_stub_is_frozen`.
+
+### 12.6 Not built
+
+Nothing in section 3's goals was left out. Section 11, the report on issue #68, follows the merge.

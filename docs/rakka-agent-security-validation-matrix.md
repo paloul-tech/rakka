@@ -143,7 +143,7 @@ inside the mutator, and is what that arrangement was verified for.
 | Authorize before revealing existence | Wrong scope ≡ absent | Wrong scope ≡ absent | Wrong scope ≡ absent, byte-identical | `authorization_isolation` conformance clause |
 | Stable idempotent operation ids | Yes | First-writer-wins | Operation ledger | Yes |
 | Provenance and classification preserved | Yes | Yes | Yes | Yes |
-| Retention, tombstone, deletion | `purge_run`, now with a caller and a conformance clause | `purge_run`, purged first | Retention, tombstone, delete, `purge_expired` | **None — owed** |
+| Retention, tombstone, deletion | `purge_run`, now with a caller and a conformance clause | `purge_run`, purged first | Retention, tombstone, delete, `purge_expired` | `tombstone`, `delete`, and a per-space retention sweep with a window per trust status. Thirteen conformance clauses, listed under "One contract, every backend" |
 | Resolved credentials excluded | `secret_exclusion.rs` | same | same | Not swept |
 | Authoritative records distinguished from derived indexes | n/a | n/a | The store answers; the index only ranks | n/a |
 
@@ -172,11 +172,6 @@ inside the mutator, and is what that arrangement was verified for.
   `MemoryContextSnapshot::communal_claims` is a permanently empty placeholder.
   Until it exists there is no communal poisoning surface to defend. Tracked as
   [#69](https://github.com/paloul-tech/rakka/issues/69).
-- **Knowledge-graph retention, tombstone, and deletion** — an absolute
-  specification 13.1 requirement with no implementation on any backend.
-  `Retracted` is a trust transition that preserves content. Operational the
-  moment a consumer writes claims, which gap slice 2 made practical; tracked
-  as [#68](https://github.com/paloul-tech/rakka/issues/68).
 - **Descriptor/endpoint revision pinning across recovery.** Generic tool
   intents record no descriptor digest; the workflow tool records one that
   nothing compares.
@@ -192,6 +187,32 @@ inside the mutator, and is what that arrangement was verified for.
   auditable, and no memory surface is reachable from A2A or the operational
   query. Any surface that ever exposes purge to a caller MUST authorize the
   scope first and SHOULD collapse the count.
+- **Erasing a claim does not reach the copies outside the graph.** A `delete`
+  or `tombstone` on the communal graph removes the claim's content from the
+  graph's own rows and from its replay ledger, and from nothing else. What
+  still holds the content afterwards:
+  - **The run record.** The `ClaimAppend` effect request on the run that asked
+    for the append keeps the subject, predicate, object, and evidence
+    references. Rakka does not purge run records.
+  - **Session memory.** A tool result the claim was mapped from stays in the
+    run's session memory until that run's retention is discharged.
+  - **Evidence artifacts.** The store holds references only; the artifacts are
+    the application's.
+  - **Transition reasons, after a tombstone.** A tombstone keeps the whole
+    transition history, free-text reasons included. A reason that quotes the
+    statement survives a tombstone and is removed only by a delete.
+    `postgres_delete_leaves_no_statement_bytes_when_dsn_is_set` shows both
+    halves.
+  - **Context snapshots,** once issue
+    [#69](https://github.com/paloul-tech/rakka/issues/69) embeds claims in
+    them. The rule below for private memory will apply unchanged.
+
+  Erasing a subject's content therefore means deleting the claims and also
+  discharging the retention of the runs that produced them. Rakka keeps no
+  reverse index from a claim to the run records that copied it, for the reason
+  the next item gives. The tombstone also keeps the statement's fingerprint:
+  someone who already knows a statement can confirm it against the stub, and a
+  caller who cannot accept that uses `delete`.
 - **Cross-tier erasure.** A private `delete` does not discharge an erasure
   request on its own: the snapshots of every run that embedded the memory must
   also be purged. Required by scenario 17's retry determinism — a store that
@@ -255,6 +276,46 @@ under `RAKKA_POSTGRES_PGVECTOR_REQUIRED=1` with no skips, so the shared suite
 holds on both backends unchanged — the acceptance shape slice 2.4 established
 for the knowledge graph.
 
+The communal graph holds the same two erasure rows under its own suite,
+`rakka_agent_knowledge_graph::conformance`, which the in-memory store, a test
+backend with tighter declared limits, and PostgreSQL all run unchanged
+(issue #68):
+
+| Clause | What a non-conformant backend does | Proven by |
+| --- | --- | --- |
+| Tombstone withdraws content | Keeps the statement, evidence, or embedding on the stub, or drops the provenance or the transition history | `tombstone_withdraws_content` |
+| A stub is hidden from discovery | Lists a stub in a default query, lets a subject, predicate, or object filter match one, or follows a tombstoned edge | `tombstoned_claims_are_hidden_from_discovery` |
+| A stub is frozen | Lets a stub's trust status move, tombstones it twice, or appends one | `a_stub_is_frozen` |
+| Tombstone and delete erasure | Lets a replayed append or transition return or restore withdrawn content | `tombstone_replay_and_erased_operations`, `a_deleted_claim_cannot_be_restored_by_replay` |
+| Delete erases | Leaves the claim, a transition, or a listing of it behind | `delete_erases_a_claim` |
+| Stale delete | Deletes a claim whose transition count or tombstone state differs from what the caller read, or spends the operation id on the refusal | `a_stale_delete_changes_nothing` |
+| Erasure isolation | Answers a foreign-scope tombstone or delete differently from an absent claim, or acts on it | `tombstone_isolation`, `delete_isolation` |
+| Operation kinds | Lets one operation id serve two kinds of operation | `erasure_operation_kinds` |
+| Retention purge | Ignores a legal hold, purges before the window elapses, ages a claim from its creation instead of its last transition, or judges a stub by its trust status | `retention_ages_claims_by_trust_status` |
+| Retention is bounded | Examines more than its batch, or skips or repeats a claim across a cursor | `retention_is_bounded_and_resumable` |
+| Retention leaves a claim that moved | Deletes a claim whose trust moved, or that was tombstoned, between the sweep's read and its delete | `retention_leaves_a_claim_that_moved` |
+
+What only a live database can prove is in
+`crates/rakka-agent-knowledge-graph-postgres/tests/postgres_erasure_proofs.rs`.
+It runs the append and transition statements of the build before this change,
+frozen byte for byte, against the current schema:
+
+| Property | Proven by |
+| --- | --- |
+| The earlier schema migrates in place with its rows, and a second migration rewrites nothing | `postgres_migrates_the_earlier_schema_with_rows_when_dsn_is_set` |
+| An earlier binary still appends and transitions after the migration | `postgres_an_earlier_binary_still_appends_after_the_migration_when_dsn_is_set` |
+| No statement bytes remain in any row after a tombstone, or after a delete | `postgres_tombstone_leaves_no_statement_bytes_when_dsn_is_set`, `postgres_delete_leaves_no_statement_bytes_when_dsn_is_set` |
+| An earlier binary's in-flight transition cannot write a statement back over a stub, or over a deleted claim | `postgres_an_earlier_transition_statement_cannot_write_over_a_stub_when_dsn_is_set`, `postgres_an_earlier_transition_statement_against_a_deleted_claim_applies_nothing_when_dsn_is_set` |
+| An earlier binary's replayed append cannot restore a deleted claim | `postgres_an_earlier_binary_replaying_an_erased_append_cannot_restore_it_when_dsn_is_set` |
+| A tombstone or delete racing a transition ends in one of the two serial outcomes | `postgres_concurrent_tombstone_and_transition_stay_coherent_when_dsn_is_set`, `postgres_concurrent_delete_and_transition_stay_coherent_when_dsn_is_set` |
+| A stale delete writes nothing | `postgres_a_stale_delete_writes_nothing_when_dsn_is_set` |
+| A stub row's columns agree with its record, except the fence value, and drift is refused | `postgres_a_stub_row_holds_markers_and_the_fence_when_dsn_is_set` |
+| Two callers racing the same operation both get its one result | `postgres_same_operation_races_converge_every_time_when_dsn_is_set` |
+
+Verified against PostgreSQL 17.5 on 2026-11-13: the graph crate's three test
+files pass with no skips (8 backend proofs, 26 conformance clauses, 12 erasure
+proofs).
+
 ## Repeatable commands
 
 ```sh
@@ -269,6 +330,11 @@ cargo test -p rakka-agent --test tenant_isolation
 # The store tiers, against any PostgreSQL:
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test -p rakka-agent-postgres --test memory_conformance
+
+# The communal graph's contract, erasure and retention included:
+cargo test -p rakka-agent-knowledge-graph --test knowledge_graph_conformance
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
+  cargo test -p rakka-agent-knowledge-graph-postgres
 
 # The whole contract, against a pgvector-enabled image, with no silent skips:
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5433/postgres \
