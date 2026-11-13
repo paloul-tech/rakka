@@ -42,6 +42,7 @@
 //! | Bounded traversal | deterministic breadth-first expansion with explicit budget cuts | [`bounded_traversal`] |
 //! | Trust transition and audit | the 4×4 legality table, cross-kind operation conflicts, the history cap, replay convergence, and the gated promotion | [`transition_legality_and_replay`], [`promotion_gate`] |
 //! | Tombstone (specification 13.1) | withdraw one claim's content, keep the auditable stub, and refuse every replay of its earlier operations | [`tombstone_withdraws_content`], [`tombstoned_claims_are_hidden_from_discovery`], [`a_stub_is_frozen`], [`tombstone_replay_and_erased_operations`], [`tombstone_isolation`] |
+//! | Delete (specification 13.1) | remove one claim and its history so that no replayed write restores it, fenced on the state the caller read | [`delete_erases_a_claim`], [`a_deleted_claim_cannot_be_restored_by_replay`], [`a_stale_delete_changes_nothing`], [`delete_isolation`], [`erasure_operation_kinds`] |
 //! | Migration | backend-owned: idempotent schema application and the concurrent-migrator race | each backend crate's own migration tests |
 //!
 //! Migration deliberately has no shared clause: the portable SPI has no
@@ -78,8 +79,10 @@ use crate::transition::ClaimTrustTransitionRequest;
 mod erasure;
 
 pub use erasure::{
-    a_stub_is_frozen, tombstone_isolation, tombstone_replay_and_erased_operations,
-    tombstone_withdraws_content, tombstoned_claims_are_hidden_from_discovery,
+    a_deleted_claim_cannot_be_restored_by_replay, a_stale_delete_changes_nothing, a_stub_is_frozen,
+    delete_erases_a_claim, delete_isolation, erasure_operation_kinds, tombstone_isolation,
+    tombstone_replay_and_erased_operations, tombstone_withdraws_content,
+    tombstoned_claims_are_hidden_from_discovery,
 };
 
 /// The two scopes a conformance clause works with: the scope under test, and
@@ -1343,6 +1346,12 @@ pub async fn check_knowledge_graph_contract(store: &dyn KnowledgeGraphStore) {
     tombstone_replay_and_erased_operations(store, ConformanceScopes::unique("tombstone-replay"))
         .await;
     tombstone_isolation(store, ConformanceScopes::unique("tombstone-isolation")).await;
+    delete_erases_a_claim(store, ConformanceScopes::unique("delete")).await;
+    a_deleted_claim_cannot_be_restored_by_replay(store, ConformanceScopes::unique("delete-replay"))
+        .await;
+    a_stale_delete_changes_nothing(store, ConformanceScopes::unique("delete-stale")).await;
+    delete_isolation(store, ConformanceScopes::unique("delete-isolation")).await;
+    erasure_operation_kinds(store, ConformanceScopes::unique("erasure-kinds")).await;
 }
 
 #[cfg(test)]

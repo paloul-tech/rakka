@@ -11,7 +11,7 @@ use rakka_agent_knowledge_graph::store::{
     ClaimTraversal, ClaimTraversalReport, KnowledgeGraphCapabilities,
 };
 use rakka_agent_knowledge_graph::{
-    Claim, ClaimFuture, ClaimId, ClaimPromotionPolicy, ClaimTombstoneRequest,
+    Claim, ClaimDeleteRequest, ClaimFuture, ClaimId, ClaimPromotionPolicy, ClaimTombstoneRequest,
     ClaimTransitionOutcome, ClaimTrustTransitionRequest, InMemoryKnowledgeGraphStore,
     KnowledgeGraphStore, KnowledgeSpaceScope,
 };
@@ -134,6 +134,41 @@ async fn a_foreign_tombstone_reveals_and_withdraws_nothing() {
 }
 
 #[tokio::test]
+async fn a_delete_removes_a_claim_and_its_history() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::delete_erases_a_claim(&store, ConformanceScopes::unique("delete")).await;
+}
+
+#[tokio::test]
+async fn no_replay_restores_a_deleted_claim() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::a_deleted_claim_cannot_be_restored_by_replay(
+        &store,
+        ConformanceScopes::unique("delete-replay"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_stale_delete_changes_and_spends_nothing() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::a_stale_delete_changes_nothing(&store, ConformanceScopes::unique("delete-stale"))
+        .await;
+}
+
+#[tokio::test]
+async fn a_foreign_delete_reveals_and_removes_nothing() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::delete_isolation(&store, ConformanceScopes::unique("delete-isolation")).await;
+}
+
+#[tokio::test]
+async fn an_operation_id_reused_across_erasure_kinds_is_a_conflict() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::erasure_operation_kinds(&store, ConformanceScopes::unique("erasure-kinds")).await;
+}
+
+#[tokio::test]
 async fn the_whole_contract_passes_as_one_suite() {
     // Exactly what a slice 2.4 backend runs, unchanged.
     let store = InMemoryKnowledgeGraphStore::new();
@@ -238,6 +273,14 @@ impl KnowledgeGraphStore for ShallowKnowledgeGraphStore {
         request: &'a ClaimTombstoneRequest,
     ) -> ClaimFuture<'a, Claim> {
         self.inner.tombstone(scope, request)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimDeleteRequest,
+    ) -> ClaimFuture<'a, ()> {
+        self.inner.delete(scope, request)
     }
 }
 

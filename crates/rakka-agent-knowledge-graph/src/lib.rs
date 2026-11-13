@@ -93,7 +93,8 @@ pub use store::{
     CLAIM_TRAVERSAL_MAX_DEPTH, CLAIM_TRAVERSAL_MAX_EDGES, CLAIM_TRAVERSAL_MAX_NODES,
 };
 pub use tombstone::{
-    ClaimTombstone, ClaimTombstoneReason, ClaimTombstoneRequest, CLAIM_TOMBSTONE_MARKER,
+    ClaimDeleteExpectation, ClaimDeleteRequest, ClaimTombstone, ClaimTombstoneReason,
+    ClaimTombstoneRequest, CLAIM_TOMBSTONE_MARKER,
 };
 pub use transition::{
     ClaimPromotionReceipt, ClaimTransitionOutcome, ClaimTrustTransition,

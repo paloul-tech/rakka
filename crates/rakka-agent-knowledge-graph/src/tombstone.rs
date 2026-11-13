@@ -101,3 +101,34 @@ impl ClaimTombstoneRequest {
         }
     }
 }
+
+/// The state a delete expects its claim to still be in.
+///
+/// Both halves are compared. The transition count alone is not enough: a
+/// tombstone does not change it, so a caller that read a live claim could
+/// otherwise delete the stub an operator made of it a moment later, with the
+/// provenance and history the operator meant to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimDeleteExpectation {
+    /// The transition count the caller read.
+    pub transition_count: u32,
+    /// Whether the claim the caller read was a tombstoned stub.
+    pub tombstoned: bool,
+}
+
+/// One hard delete of one claim, idempotent on its operation id.
+///
+/// The request carries no actor: a delete leaves nothing behind to record one
+/// on, and who erased what belongs in the application's own audit log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimDeleteRequest {
+    /// The claim to remove.
+    pub claim_id: ClaimId,
+    /// The idempotent key of this delete; see
+    /// [`ClaimOperationId::derive_delete`].
+    pub operation_id: ClaimOperationId,
+    /// When set, the delete applies only if the claim is still in the state
+    /// the caller read; otherwise it answers `claim-delete-stale`, changes
+    /// nothing and spends nothing.
+    pub expected: Option<ClaimDeleteExpectation>,
+}

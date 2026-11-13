@@ -22,8 +22,9 @@ use rakka_agent::{
 };
 use rakka_agent_knowledge_graph::conformance::ConformanceScopes;
 use rakka_agent_knowledge_graph::{
-    ClaimCursor, ClaimFilter, InMemoryKnowledgeGraphStore, KnowledgeGraphClaimAppendExecutor,
-    KnowledgeGraphStore, KnowledgeSpaceScope,
+    ClaimCursor, ClaimDeleteRequest, ClaimFilter, ClaimId, ClaimOperationId,
+    InMemoryKnowledgeGraphStore, KnowledgeGraphClaimAppendExecutor, KnowledgeGraphStore,
+    KnowledgeSpaceScope,
 };
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 use serde_json::json;
@@ -265,4 +266,70 @@ async fn a_store_refusal_is_definitive_rather_than_retryable() {
         .await
         .expect("the query answers");
     assert!(stored.claims.is_empty(), "a refused append writes nothing");
+}
+
+/// A retried append whose claim was since deleted is a definitive refusal, not
+/// a retryable error and not a second append: the store's ledger says the
+/// operation was erased, and retrying could never change that answer
+/// ([specification 13.4](../../docs/plans/rakka-agent/spec.md): a definitively
+/// failed append does not end the run).
+#[tokio::test]
+async fn a_replayed_append_of_an_erased_claim_is_a_definitive_refusal() {
+    let store = Arc::new(InMemoryKnowledgeGraphStore::new());
+    let executor = KnowledgeGraphClaimAppendExecutor::new(store.clone());
+    let scopes = ConformanceScopes::unique("append-executor-erased");
+    let scope = run_scope(&scopes.primary);
+    let request = append_request(
+        scopes.primary.space().clone(),
+        AgentClaimObjectRequest::Node("evidence".to_string()),
+    );
+    let effect = intent(&scope, 0, &request);
+
+    let claim = match executor
+        .execute(&scope, &effect, &request, &provenance(), NOW)
+        .await
+        .expect("the append reaches the store")
+    {
+        AgentClaimAppendFinding::Appended { claim } => claim,
+        other => panic!("expected an appended claim, got {other:?}"),
+    };
+
+    // An application erases the claim.
+    let claim_id = ClaimId::new(claim.as_str()).expect("the claim id is valid");
+    store
+        .delete(
+            &scopes.primary,
+            &ClaimDeleteRequest {
+                operation_id: ClaimOperationId::derive_delete(&scopes.primary, &claim_id, "erase")
+                    .expect("the operation id derives"),
+                claim_id,
+                expected: None,
+            },
+        )
+        .await
+        .expect("the delete applies");
+
+    // The same intent again — a retry after an ambiguous loss.
+    match executor
+        .execute(&scope, &effect, &request, &provenance(), NOW)
+        .await
+        .expect("an erased operation is a finding, never a transport error")
+    {
+        AgentClaimAppendFinding::Refused { code, .. } => {
+            assert_eq!(code, "claim-operation-erased");
+        }
+        other => panic!("expected a definitive refusal, got {other:?}"),
+    }
+    let stored = store
+        .query(
+            &scopes.primary,
+            &ClaimFilter::matching_all().including_tombstoned(),
+            ClaimCursor::start(),
+        )
+        .await
+        .expect("the query answers");
+    assert!(
+        stored.claims.is_empty(),
+        "the retry did not restore the deleted claim"
+    );
 }

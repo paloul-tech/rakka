@@ -266,6 +266,26 @@ impl ClaimOperationId {
         );
         Self::new(format!("claim-op-{}", derivation_digest(&input).value))
     }
+
+    /// Derives the key of one delete of one claim.
+    ///
+    /// The `claim-delete` salt keeps this domain disjoint from the append,
+    /// transition and tombstone domains. A caller that derives it from a
+    /// fixed discriminator — as the retention sweep does — converges every
+    /// re-drive on one delete.
+    pub fn derive_delete(
+        scope: &KnowledgeSpaceScope,
+        claim: &ClaimId,
+        discriminator: impl AsRef<str>,
+    ) -> AgentIdentityResult<Self> {
+        let input = format!(
+            "claim-delete|{}|{}|{}",
+            scope.key(),
+            claim,
+            discriminator.as_ref()
+        );
+        Self::new(format!("claim-op-{}", derivation_digest(&input).value))
+    }
 }
 
 impl ClaimId {
@@ -1120,10 +1140,21 @@ mod tests {
         let tombstone = ClaimOperationId::derive_tombstone(&scope, &claim_id, "op-1")
             .expect("the operation id derives");
 
-        // One discriminator, three kinds, three keys: a tombstone can never be
-        // spelled into an id a transition or an append already spent.
+        let delete = ClaimOperationId::derive_delete(&scope, &claim_id, "op-1")
+            .expect("the operation id derives");
+
+        // One discriminator, four kinds, four keys: a tombstone or a delete
+        // can never be spelled into an id another kind already spent.
         assert_ne!(tombstone, append);
         assert_ne!(tombstone, transition);
+        assert_ne!(delete, append);
+        assert_ne!(delete, transition);
+        assert_ne!(delete, tombstone);
+        assert_eq!(
+            delete,
+            ClaimOperationId::derive_delete(&scope, &claim_id, "op-1")
+                .expect("the operation id derives")
+        );
         // Stable: the writer reconstructs it on any node.
         assert_eq!(
             tombstone,

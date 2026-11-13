@@ -31,7 +31,7 @@ use crate::claim::{Claim, ClaimId, ClaimNodeId, ClaimPredicate, ClaimTrustStatus
 use crate::error::{ClaimError, ClaimFuture};
 use crate::promotion::{validate_promotion, ClaimPromotionPolicy};
 use crate::scope::KnowledgeSpaceScope;
-use crate::tombstone::ClaimTombstoneRequest;
+use crate::tombstone::{ClaimDeleteRequest, ClaimTombstoneRequest};
 use crate::transition::{
     ClaimTransitionOutcome, ClaimTrustTransition, ClaimTrustTransitionRequest,
 };
@@ -688,7 +688,15 @@ pub struct ClaimTraversalReport {
 /// also erases the ledger payloads of the claim's append and of every earlier
 /// transition. A replay of an erased operation answers
 /// `claim-operation-erased` and writes nothing — which is what stops a
-/// replayed append from restoring what was withdrawn.
+/// replayed append from restoring what was withdrawn. A delete removes the
+/// claim and its transition history outright, erases the same payloads plus a
+/// tombstone's, and records its own content-free marker so that its replay
+/// answers success. Erased and deleted ledger entries are never removed: each
+/// is an operation id with no content, kept so the id stays spent.
+///
+/// Both are required methods with no default body and no capability flag:
+/// [specification 13.1](../../../docs/plans/rakka-agent/spec.md) makes them
+/// mandatory for every memory API, so a backend cannot omit them silently.
 pub trait KnowledgeGraphStore: Send + Sync + 'static {
     /// Stable name of the backing implementation, for diagnostics and error
     /// detail — never for dispatch decisions.
@@ -791,6 +799,26 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
         scope: &'a KnowledgeSpaceScope,
         request: &'a ClaimTombstoneRequest,
     ) -> ClaimFuture<'a, Claim>;
+
+    /// Removes one claim and every transition of it, idempotently on the
+    /// request's operation id.
+    ///
+    /// Afterwards `get` answers `None` and `transitions` the empty page. The
+    /// ledger payloads of the claim's append, of every transition, and of its
+    /// tombstone when it was a stub, are erased in the same step, so no
+    /// replayed write can restore the claim: its id derives from an operation
+    /// id whose ledger entry now says "erased". A replayed delete answers
+    /// success.
+    ///
+    /// An absent or out-of-scope claim answers `claim-not-found`. When the
+    /// request carries an expectation that no longer holds, the delete
+    /// answers `claim-delete-stale`, changes nothing, and records nothing —
+    /// the same operation id may be tried again.
+    fn delete<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimDeleteRequest,
+    ) -> ClaimFuture<'a, ()>;
 }
 
 /// What one spent operation id resolved to.
@@ -802,16 +830,22 @@ enum ClaimLedgerEntry {
     AppliedTransition(Box<ClaimTransitionOutcome>),
     /// The stub a tombstone stored, exactly as stored.
     AppliedTombstone(Box<Claim>),
-    /// The operation's payload was erased by a later tombstone of its claim.
-    /// The id stays spent and holds nothing.
+    /// A delete that applied. Content-free: its replay answers success.
+    Deleted,
+    /// The operation's payload was erased by a later tombstone or delete of
+    /// its claim. The id stays spent and holds nothing.
     Erased,
 }
 
 impl Inner {
-    /// Replaces the ledger payloads of a claim's append and of every
-    /// transition in its history with the content-free erased marker.
+    /// Replaces the ledger payloads of a claim's append, of every transition
+    /// in its history, and of its tombstone when it is a stub, with the
+    /// content-free erased marker.
     fn erase_operations(&mut self, key: &str, claim: &Claim) {
         let mut spent = vec![claim.operation_id.as_str().to_string()];
+        if let Some(tombstone) = claim.tombstone() {
+            spent.push(tombstone.operation_id.as_str().to_string());
+        }
         if let Some(history) = self
             .transitions
             .get(key)
@@ -932,7 +966,8 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
                         operation_id: claim.operation_id.clone(),
                     }),
                     ClaimLedgerEntry::AppliedTransition(_)
-                    | ClaimLedgerEntry::AppliedTombstone(_) => Err(ClaimError::OperationConflict {
+                    | ClaimLedgerEntry::AppliedTombstone(_)
+                    | ClaimLedgerEntry::Deleted => Err(ClaimError::OperationConflict {
                         operation_id: claim.operation_id.clone(),
                     }),
                 };
@@ -1166,11 +1201,11 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
                     ClaimLedgerEntry::Erased => Err(ClaimError::OperationErased {
                         operation_id: request.operation_id.clone(),
                     }),
-                    ClaimLedgerEntry::AppliedAppend(_) | ClaimLedgerEntry::AppliedTombstone(_) => {
-                        Err(ClaimError::OperationConflict {
-                            operation_id: request.operation_id.clone(),
-                        })
-                    }
+                    ClaimLedgerEntry::AppliedAppend(_)
+                    | ClaimLedgerEntry::AppliedTombstone(_)
+                    | ClaimLedgerEntry::Deleted => Err(ClaimError::OperationConflict {
+                        operation_id: request.operation_id.clone(),
+                    }),
                 };
             }
             let Some(claim) = inner
@@ -1309,11 +1344,11 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
                     ClaimLedgerEntry::Erased => Err(ClaimError::OperationErased {
                         operation_id: request.operation_id.clone(),
                     }),
-                    ClaimLedgerEntry::AppliedAppend(_) | ClaimLedgerEntry::AppliedTransition(_) => {
-                        Err(ClaimError::OperationConflict {
-                            operation_id: request.operation_id.clone(),
-                        })
-                    }
+                    ClaimLedgerEntry::AppliedAppend(_)
+                    | ClaimLedgerEntry::AppliedTransition(_)
+                    | ClaimLedgerEntry::Deleted => Err(ClaimError::OperationConflict {
+                        operation_id: request.operation_id.clone(),
+                    }),
                 };
             }
             let Some(claim) = inner
@@ -1343,6 +1378,73 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
                 ClaimLedgerEntry::AppliedTombstone(Box::new(stub.clone())),
             );
             Ok(stub)
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimDeleteRequest,
+    ) -> ClaimFuture<'a, ()> {
+        Box::pin(async move {
+            let key = scope.key();
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("the in-memory graph lock is never poisoned");
+            if let Some(entry) = inner
+                .operations
+                .get(&key)
+                .and_then(|operations| operations.get(request.operation_id.as_str()))
+            {
+                return match entry {
+                    ClaimLedgerEntry::Deleted => Ok(()),
+                    ClaimLedgerEntry::Erased => Err(ClaimError::OperationErased {
+                        operation_id: request.operation_id.clone(),
+                    }),
+                    ClaimLedgerEntry::AppliedAppend(_)
+                    | ClaimLedgerEntry::AppliedTransition(_)
+                    | ClaimLedgerEntry::AppliedTombstone(_) => Err(ClaimError::OperationConflict {
+                        operation_id: request.operation_id.clone(),
+                    }),
+                };
+            }
+            let Some(claim) = inner
+                .claims
+                .get(&key)
+                .and_then(|claims| claims.get(request.claim_id.as_str()))
+                .cloned()
+            else {
+                // Absent and out-of-scope are the same refusal (scenario 18).
+                return Err(ClaimError::NotFound {
+                    claim_id: request.claim_id.clone(),
+                });
+            };
+            // The fence, before anything is written or recorded: a stale
+            // delete spends nothing, so the same operation id can be tried
+            // again once the claim is due in the state it is actually in.
+            if let Some(expected) = request.expected {
+                if expected.transition_count != claim.transition_count()
+                    || expected.tombstoned != claim.is_tombstoned()
+                {
+                    return Err(ClaimError::DeleteStale {
+                        claim_id: request.claim_id.clone(),
+                    });
+                }
+            }
+
+            inner.erase_operations(&key, &claim);
+            if let Some(claims) = inner.claims.get_mut(&key) {
+                claims.remove(claim.claim_id.as_str());
+            }
+            if let Some(transitions) = inner.transitions.get_mut(&key) {
+                transitions.remove(claim.claim_id.as_str());
+            }
+            inner.operations.entry(key).or_default().insert(
+                request.operation_id.as_str().to_string(),
+                ClaimLedgerEntry::Deleted,
+            );
+            Ok(())
         })
     }
 }

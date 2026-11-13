@@ -74,7 +74,7 @@ use rakka_agent_knowledge_graph::store::{
     ClaimTraversal, ClaimTraversalDirection, ClaimTraversalReport, KnowledgeGraphCapabilities,
     KnowledgeGraphStore,
 };
-use rakka_agent_knowledge_graph::tombstone::ClaimTombstoneRequest;
+use rakka_agent_knowledge_graph::tombstone::{ClaimDeleteRequest, ClaimTombstoneRequest};
 use rakka_agent_knowledge_graph::transition::{
     ClaimTransitionOutcome, ClaimTrustTransition, ClaimTrustTransitionRecord,
     ClaimTrustTransitionRequest,
@@ -856,6 +856,19 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
             Err(ClaimError::Backend {
                 backend: BACKEND_NAME.to_string(),
                 message: "tombstone is not implemented for this backend yet".to_string(),
+            })
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        _scope: &'a KnowledgeSpaceScope,
+        _request: &'a ClaimDeleteRequest,
+    ) -> ClaimFuture<'a, ()> {
+        Box::pin(async move {
+            Err(ClaimError::Backend {
+                backend: BACKEND_NAME.to_string(),
+                message: "delete is not implemented for this backend yet".to_string(),
             })
         })
     }
