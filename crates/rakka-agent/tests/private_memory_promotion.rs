@@ -170,7 +170,10 @@ async fn crank(fx: &Fixture) {
     let mut run = fx.run();
     let now = fx.now();
     run.recover(now).await.expect("recover");
-    run.settle_side_effects(&fx.router, now)
+    // Boxed, here and in the helpers below: a debug build copies an awaited
+    // future onto its caller's stack, and these tests nest several helpers
+    // deep.
+    Box::pin(run.settle_side_effects(&fx.router, now))
         .await
         .expect("settle");
 }
@@ -184,7 +187,7 @@ async fn apply(
     let mut run = fx.run();
     let now = fx.now();
     run.recover(now).await.expect("recover");
-    run.apply(command, &fx.router, now).await
+    Box::pin(run.apply(command, &fx.router, now)).await
 }
 
 /// Applies one command that must succeed.
@@ -795,16 +798,16 @@ async fn memory_promotion_survives_any_owner_loss() {
                 fx.history.clone(),
             );
             if task.recover(now).await.is_ok() {
-                let _ = task.settle_side_effects(&fx.router, now).await;
+                let _ = Box::pin(task.settle_side_effects(&fx.router, now)).await;
             }
             let mut run = fx.run();
             let now = fx.now();
             if run.recover(now).await.is_err() {
                 continue;
             }
-            let _ = run.settle_side_effects(&fx.router, now).await;
+            let _ = Box::pin(run.settle_side_effects(&fx.router, now)).await;
             let command = promote_command(promotion(1, 1), "sweep");
-            match run.apply(command, &fx.router, fx.now()).await {
+            match Box::pin(run.apply(command, &fx.router, fx.now())).await {
                 Ok(AgentRunEntityReply::Applied { .. })
                 | Ok(AgentRunEntityReply::Duplicate { .. }) => {}
                 Ok(_) | Err(_) => continue,
@@ -813,7 +816,7 @@ async fn memory_promotion_survives_any_owner_loss() {
             // result can complete the run: a result racing completion is
             // refused as terminal (the documented convergence), which is
             // truthful but would make the receipt racy.
-            let _ = run.settle_side_effects(&fx.router, fx.now()).await;
+            let _ = Box::pin(run.settle_side_effects(&fx.router, fx.now())).await;
             let Ok(state) = run.state() else { continue };
             let outstanding = state.loop_state().and_then(|loop_state| {
                 loop_state
@@ -850,7 +853,7 @@ async fn memory_promotion_survives_any_owner_loss() {
                 fence: 0,
                 outcome: Box::new(outcome),
             };
-            match run.apply(result, &fx.router, fx.now()).await {
+            match Box::pin(run.apply(result, &fx.router, fx.now())).await {
                 Ok(_) => return true,
                 Err(_) => continue,
             }
@@ -954,8 +957,7 @@ async fn drive_turn(fx: &Fixture) {
     let mut run = fx.run();
     let now = fx.now();
     run.recover(now).await.expect("recover");
-    fx.dispatcher
-        .drive(&mut run, &fx.router, fx.now())
+    Box::pin(fx.dispatcher.drive(&mut run, &fx.router, fx.now()))
         .await
         .expect("answer the dispatched effects");
 }
@@ -1309,40 +1311,42 @@ async fn ended_world_with_policies(
             .with_decision_event_vocabulary(vocabulary),
         None => fx,
     };
-    fx.instantiate_agent().await;
+    Box::pin(fx.instantiate_agent()).await;
     match attempt_ceiling {
         Some(ceiling) => {
-            fx.create_task_with(
-                task_definition().with_budgets(rakka_agent::AgentBudgetCeilings {
+            Box::pin(fx.create_task_with(task_definition().with_budgets(
+                rakka_agent::AgentBudgetCeilings {
                     max_loop_iterations: Some(3),
                     max_effect_attempts: Some(ceiling),
                     ..rakka_agent::AgentBudgetCeilings::unbounded()
-                }),
-            )
+                },
+            )))
             .await;
         }
-        None => fx.create_task().await,
+        None => Box::pin(fx.create_task()).await,
     }
     if ending == Ending::Cancelled {
         crank(&fx).await;
         let mut run = fx.run();
         run.recover(fx.now()).await.expect("recover");
-        run.apply(
-            AgentRunEntityCommand::Cancel {
-                operation_id: AgentOperationId::new(
-                    AgentOperationKind::Cancellation,
-                    [common::TENANT, common::AGENT, "1"],
-                )
-                .expect("derivable"),
-                reason: "operator stopped the work".to_string(),
-            },
-            &fx.router,
-            fx.now(),
+        Box::pin(
+            run.apply(
+                AgentRunEntityCommand::Cancel {
+                    operation_id: AgentOperationId::new(
+                        AgentOperationKind::Cancellation,
+                        [common::TENANT, common::AGENT, "1"],
+                    )
+                    .expect("derivable"),
+                    reason: "operator stopped the work".to_string(),
+                },
+                &fx.router,
+                fx.now(),
+            ),
         )
         .await
         .expect("the cancel applies");
     }
-    fx.pump().await.expect("the loop runs to its end");
+    Box::pin(fx.pump()).await.expect("the loop runs to its end");
     let run = fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, ending.status(), "the world ended as scripted");
     assert!(
@@ -2919,19 +2923,21 @@ async fn a_post_terminal_promotion_survives_any_owner_loss() {
             if run.recover(fx.now()).await.is_err() {
                 continue;
             }
-            match run
-                .apply(
-                    promote_command(promotion(1, 1), "sweep"),
-                    &fx.router,
-                    fx.now(),
-                )
-                .await
+            match Box::pin(run.apply(
+                promote_command(promotion(1, 1), "sweep"),
+                &fx.router,
+                fx.now(),
+            ))
+            .await
             {
                 Ok(AgentRunEntityReply::Applied { .. })
                 | Ok(AgentRunEntityReply::Duplicate { .. }) => {}
                 Ok(_) | Err(_) => continue,
             }
-            if run.settle_side_effects(&fx.router, fx.now()).await.is_err() {
+            if Box::pin(run.settle_side_effects(&fx.router, fx.now()))
+                .await
+                .is_err()
+            {
                 continue;
             }
             let Ok(state) = run.state() else { continue };
@@ -2969,7 +2975,7 @@ async fn a_post_terminal_promotion_survives_any_owner_loss() {
                 fence: 0,
                 outcome: Box::new(outcome),
             };
-            match run.apply(result, &fx.router, fx.now()).await {
+            match Box::pin(run.apply(result, &fx.router, fx.now())).await {
                 Ok(_) => return true,
                 Err(_) => continue,
             }
@@ -3311,8 +3317,7 @@ async fn deliver(fx: &Fixture, envelope: &rakka_agent::AgentExchangeEnvelope) {
     let mut run = fx.run();
     let now = fx.now();
     run.recover(now).await.expect("recover");
-    let reply = run
-        .accept(envelope, &fx.router, now)
+    let reply = Box::pin(run.accept(envelope, &fx.router, now))
         .await
         .expect("the delivery succeeds");
     assert!(reply.result().is_accepted(), "the child result is accepted");
@@ -3564,7 +3569,7 @@ async fn unbind_checkpoints(fx: &Fixture) {
 async fn settle_pass(fx: &Fixture) {
     let mut run = fx.run();
     run.recover(fx.now()).await.expect("recover");
-    run.settle_side_effects(&fx.router, fx.now())
+    Box::pin(run.settle_side_effects(&fx.router, fx.now()))
         .await
         .expect("settle");
 }
@@ -4195,8 +4200,8 @@ async fn live_world(rest: Rest, policies: rakka_agent::AgentEffectPolicies) -> (
         Rest::OnProposal => promoting_world(),
     };
     fx.policies = policies;
-    fx.instantiate_agent().await;
-    fx.create_task().await;
+    Box::pin(fx.instantiate_agent()).await;
+    Box::pin(fx.create_task()).await;
     crank(&fx).await;
     match rest {
         Rest::AwaitingModel => {}
@@ -5239,7 +5244,15 @@ async fn winding_world(
 ) -> (Fixture, Stores, Option<rakka_agent::AgentRunTerminalReason>) {
     let (fx, stores) = match winding {
         Winding::Cancelled => {
-            let (fx, stores) = live_world(Rest::AwaitingModel, policies).await;
+            // `live_world(Rest::AwaitingModel, policies)`, flattened so this
+            // frame does not nest a whole `live_world` frame.
+            let (mut fx, stores) = tool_promoting_world();
+            fx.policies = policies;
+            Box::pin(fx.instantiate_agent()).await;
+            Box::pin(fx.create_task()).await;
+            crank(&fx).await;
+            let (phase, _, turn, _) = resting_at(&fx).await;
+            assert_eq!((phase, turn), (AgentLoopPhase::AwaitingModel, 1));
             let reply = apply_ok(&fx, cancel_command()).await;
             assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
             assert_gate_invariant(&fx).await;
@@ -5264,8 +5277,8 @@ async fn winding_world(
                     .with_private_store(stores.private.clone()),
             );
             fx.policies = policies;
-            fx.instantiate_agent().await;
-            fx.create_task().await;
+            Box::pin(fx.instantiate_agent()).await;
+            Box::pin(fx.create_task()).await;
             crank(&fx).await;
             drive_turn(&fx).await;
             crank(&fx).await;

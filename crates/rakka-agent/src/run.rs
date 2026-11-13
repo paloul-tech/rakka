@@ -9086,8 +9086,7 @@ where
     /// two halves are synchronous, around the arm's own `transition` call,
     /// rather than an async wrapper: a wrapper grows
     /// [`Self::apply_command`]'s future (it holds the transition closure a
-    /// second time), and one test already runs within a 16 KiB page of a test
-    /// thread's 2 MiB stack, which that growth overflowed.
+    /// second time).
     fn close_checkpoint_open_segments_since(
         &self,
         marks: &AgentSegmentMarks,
