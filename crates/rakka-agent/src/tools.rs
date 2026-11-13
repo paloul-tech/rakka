@@ -2365,7 +2365,6 @@ impl AgentToolAuthority {
     /// the definition (and setup) envelope so a definition narrowed after the
     /// settings were accepted still fails closed.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn authorize_model(
         &self,
         context: &AgentAuthorityContext<'_>,
