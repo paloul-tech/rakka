@@ -4158,6 +4158,13 @@ fn evaluate_model_output(
     // is skipped: its own command opened its gate in the transition that
     // recorded it, and a gate the turn opened on one already denied would
     // reopen a wait on a failed effect (issue #126).
+    //
+    // Only a `Pending` effect is gated here. A gated effect with no grant is
+    // never handed to the dispatcher, so an effect that still waits for its
+    // gate is always `Pending`; one that has settled waits for none. Without
+    // the check, a goal evaluation of this turn whose gate was denied or
+    // expired earlier in the turn would regain a gate on its failed effect,
+    // and the run would report an approval wait on it (issue #126).
     let gated: Vec<(AgentEffectId, AgentCheckpointKind)> = {
         let run = state.run_mut()?;
         run.loop_state
@@ -4165,6 +4172,7 @@ fn evaluate_model_output(
             .iter()
             .filter(|effect| {
                 effect.turn == turn
+                    && effect.is_pending()
                     && !effect.kind().outside_the_turn()
                     && run.loop_state.grant_for(effect).is_none()
             })

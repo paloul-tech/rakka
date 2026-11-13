@@ -359,13 +359,14 @@ What the build found that differs from sections 1-10, or that they left to the b
 - A record an older binary already left `Cancelling`, with its gate cancelled and its promotion or claim append still `Pending`, is not repaired by a settle pass. A further `Cancel` under a fresh operation id re-enters `cancel` and settles it.
 - No existing test failed when the rule's `outside_the_turn` term was removed. `a_cancel_leaves_a_gated_compensation_as_it_was` was added to hold it. It pins today's behaviour for a gated compensation, which issue #128 may change.
 
-### 11.6 Goal evaluation (Task 6, `35fcb3d`)
+### 11.6 Goal evaluation (Task 6, `35fcb3d`; Task 10)
 
 - No existing test pinned an `Approval` on an evaluation requiring both gates, so the anti-goal's exception in section 3 was not used.
 - The `SecurityAuthorization` grant reaches `granted.checkpoint` through the real dispatch authority. The dispatcher did not change.
-- The section 9 probe failed. A human-review evaluation denied while the run awaits its model call gets a fresh `Approval` from that turn's tool-call gate block when the turn calls a tool. The run then reports `WaitingForApproval` on a `Failed` effect. It reproduces with default policies.
-- Cause: the block selects effects of the current turn, not outside the turn, with no grant, and reads no status. The denial dropped the checkpoint, so `record_checkpoint` no longer holds its id and the reopen is new.
-- The gate block was left unchanged pending the owner's decision. The probe test was not committed; its body and output are in the task 6 report.
+- The section 9 probe failed. A human-review evaluation denied while the run awaited its model call got a fresh `Approval` from that turn's tool-call gate block when the turn called a tool. The run then reported `WaitingForApproval` on a `Failed` effect. It reproduced with default policies.
+- Cause: the block selected effects of the current turn, not outside the turn, with no grant, and read no status. The denial dropped the checkpoint, so `record_checkpoint` no longer held its id and the reopen was new.
+- Owner's decision (2026-11-12): fold the fix into this batch. It was built as Task 10, in the commit "Open a tool-calling turn's gate only for an effect that still waits for one (issue #126)". The gate block's filter now also requires the effect to be `Pending`. A gated effect with no grant is never handed to the dispatcher, so an effect that still waits for its gate is always `Pending`, and one that has settled waits for none. Nothing else in the block changed.
+- The probe is committed as `a_denied_evaluation_gets_no_fresh_gate_from_a_later_tool_turn` in `tests/goal_evaluation.rs`. Beside it: `an_expired_evaluation_gate_is_not_reopened_by_a_later_tool_turn`, the same with the gate expired by the run's timer; `an_open_evaluation_gate_survives_a_later_tool_turn_unchanged`; and `a_gated_tool_call_still_opens_its_gate`. Removing the `Pending` term fails the first two.
 
 ### 11.7 Telemetry (Task 7, `568785c`; Task 7b, `e5a2a40`)
 
@@ -386,4 +387,3 @@ These are pre-existing and outside this design. Each is a follow-up candidate fo
 - The re-send path in `apply_indeterminate_resolution` writes `WaitingForEffect` on a live run whatever the run rested on. A promotion re-sent while the run rests on its proposal or its children comes back `WaitingForEffect`, not `Running`. An ungated promotion behaves the same.
 - `fence_unsent_effects` does not release a fenced effect's reserved attempts. It matters only under an `EffectAttempts` limit.
 - A run can end `Failed` with a tool call's approval still open, and nothing can answer it.
-- A goal evaluation whose gate is denied earlier in a turn regains a gate when that turn later calls tools (section 11.6).
