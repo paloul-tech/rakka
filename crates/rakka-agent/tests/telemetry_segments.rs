@@ -20,10 +20,12 @@ use std::sync::Arc;
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     claim_append_operation_id, evaluation_operation_id, load_agent_run_state,
-    promotion_operation_id, AgentCheckpoint, AgentCheckpointKind, AgentClaimAppendRequest,
-    AgentClaimObjectRequest, AgentEffectPolicies, AgentEffectSpec, AgentMemoryPromotionRequest,
-    AgentModelTurn, AgentPrivateMemoryKind, AgentRevisionNumber, AgentRunEffect,
-    AgentRunEffectKind, AgentRunEffectRequest, AgentRunEntityCommand, AgentRunEntityReply,
+    promotion_operation_id, AgentApprovalDecision, AgentCheckpoint, AgentCheckpointDecision,
+    AgentCheckpointKind, AgentClaimAppendRequest, AgentClaimObjectRequest, AgentEffectPolicies,
+    AgentEffectResolution, AgentEffectSpec, AgentMemoryPromotionRequest, AgentModelTurn,
+    AgentOperationId, AgentOperationKind, AgentPrivateMemoryKind, AgentReconciliationDecision,
+    AgentRevisionNumber, AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome,
+    AgentRunEffectRequest, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunEntityReply,
     AgentRunMemory, AgentRunStatus, AgentSchemaPolicy, AgentSegmentOperation, AgentSegmentOutcome,
     AgentSegmentSink, AgentTaskContent, AgentTaskEntityCommand, AgentTelemetrySegment,
     AgentToolCallId, AgentToolCallRequest, AgentToolId, AgentToolRegistry,
@@ -31,7 +33,7 @@ use rakka_agent::{
     InMemorySessionMemoryStore, KnowledgeSpaceId, MemoryClassification, MemorySequence,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION, SEGMENT_ATTR_CHECKPOINT_KIND,
 };
-use rakka_agent_workflow::{AgentTelemetryContext, PrincipalRef};
+use rakka_agent_workflow::{AgentTelemetryContext, AgentTimestampMillis, PrincipalRef};
 
 mod common;
 
@@ -808,6 +810,261 @@ async fn a_replayed_gated_command_exports_no_second_segment() {
             Commanded::accepted(ended).len(),
             "ended: {ended}: each gate was exported exactly once"
         );
+    }
+}
+
+/// The two commands that answer a parked generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolving {
+    /// `ResolveIndeterminateEffect`.
+    Effect,
+    /// `ResolveCheckpoint`, on the reconciliation checkpoint.
+    Checkpoint,
+}
+
+impl Resolving {
+    const ALL: [Self; 2] = [Self::Effect, Self::Checkpoint];
+
+    /// The command answering `parked`, whose reconciliation checkpoint is
+    /// `reconciliation`: `ConfirmedExecuted` with `executed` when it is given,
+    /// else `ConfirmedNotExecuted`.
+    fn command(
+        self,
+        key: &str,
+        parked: &AgentRunEffect,
+        reconciliation: &AgentCheckpoint,
+        executed: Option<AgentRunEffectOutcome>,
+    ) -> AgentRunEntityCommand {
+        let operation_id = AgentOperationId::for_agent(
+            AgentOperationKind::CheckpointResolution,
+            &agent_scope(),
+            key,
+        )
+        .expect("the decision key derives");
+        let resolution = match executed {
+            Some(outcome) => AgentEffectResolution::ConfirmedExecuted {
+                outcome: Box::new(outcome),
+            },
+            None => AgentEffectResolution::ConfirmedNotExecuted,
+        };
+        match self {
+            Self::Effect => AgentRunEntityCommand::ResolveIndeterminateEffect {
+                operation_id,
+                effect_id: parked.effect_id.clone(),
+                generation: parked.generation,
+                resolution: Box::new(resolution),
+                telemetry: AgentTelemetryContext::default(),
+            },
+            Self::Checkpoint => {
+                let decision = if resolution == AgentEffectResolution::ConfirmedNotExecuted {
+                    AgentReconciliationDecision::ConfirmedNotExecuted
+                } else {
+                    AgentReconciliationDecision::ConfirmedCompleted {
+                        resolution: Box::new(resolution),
+                    }
+                };
+                AgentRunEntityCommand::ResolveCheckpoint {
+                    operation_id,
+                    checkpoint_id: reconciliation.checkpoint_id.clone(),
+                    resolver: curator(),
+                    decision: Box::new(AgentCheckpointDecision::Reconciliation(decision)),
+                    telemetry: AgentTelemetryContext::default(),
+                }
+            }
+        }
+    }
+}
+
+/// Commands a promotion on `fx`'s live run, grants its gate when the spec
+/// opened one, and parks its dispatched generation `Indeterminate`. Returns
+/// the parked effect and the reconciliation checkpoint the park opened.
+async fn parked_promotion(fx: &Fixture) -> (AgentRunEffect, AgentCheckpoint) {
+    let reply = apply_run(fx, Commanded::Promotion.command("parked")).await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    let (_, gates) = effect_and_gates(fx, AgentRunEffectKind::MemoryPromotionCall).await;
+    if let Some(gate) = gates.first() {
+        let grant = AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "grant",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id: gate.checkpoint_id.clone(),
+            resolver: curator(),
+            decision: Box::new(AgentCheckpointDecision::Approval(
+                AgentApprovalDecision::Approve {
+                    credential_binding: None,
+                    expires_at: AgentTimestampMillis::new(u64::MAX / 2),
+                    allowed_use_count: 1,
+                },
+            )),
+            telemetry: AgentTelemetryContext::default(),
+        };
+        let reply = apply_run(fx, grant).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{reply:?}"
+        );
+    }
+    let (dispatched, _) = effect_and_gates(fx, AgentRunEffectKind::MemoryPromotionCall).await;
+    assert_eq!(dispatched.status, AgentRunEffectStatus::Ready, "dispatched");
+    let reply = apply_run(
+        fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: dispatched
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: dispatched.effect_id.clone(),
+            generation: dispatched.generation,
+            attempt: dispatched.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the recovery retry was refused",
+            )),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    let (parked, gates) = effect_and_gates(fx, AgentRunEffectKind::MemoryPromotionCall).await;
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    assert_eq!(
+        gates.len(),
+        1,
+        "the park opened its reconciliation checkpoint"
+    );
+    assert_eq!(
+        gates[0].kind,
+        AgentCheckpointKind::IndeterminateEffectReconciliation
+    );
+    (parked, gates[0].clone())
+}
+
+/// Issue #126: a gated generation re-sent by a person's `ConfirmedNotExecuted`
+/// opens the new generation's gate in the resolution's own transition, and
+/// that gate exports its `checkpoint-open` segment as every other gate does.
+///
+/// A gated promotion is granted, dispatched and parked `Indeterminate` on a
+/// live run, then answered through `ResolveIndeterminateEffect` and, in a
+/// second world, through `ResolveCheckpoint`. Each answer exports exactly one
+/// segment: the new gate's, naming its kind and exporting under the parked
+/// identity the new checkpoint stores. Without it the gate's later resolution
+/// would link a parked span that was never exported
+/// ([specification 17.11]). A resolution that opens no gate exports none: an
+/// ungated promotion re-sent the same way, and a gated one confirmed
+/// executed.
+#[tokio::test]
+async fn a_re_sent_gated_generation_exports_its_checkpoint_open_segment() {
+    for gate in Gate::ALL {
+        for resolving in Resolving::ALL {
+            let at = format!("{gate:?}, {resolving:?}");
+            let sink = Arc::new(InMemoryAgentSegmentSink::new());
+            let fx = Box::pin(commandable_world(policies_gating(gate), false))
+                .await
+                .with_segments(sink.clone());
+            let (parked, reconciliation) = parked_promotion(&fx).await;
+            let before = checkpoint_opens(&sink).len();
+
+            let reply = apply_run(
+                &fx,
+                resolving.command("not-executed", &parked, &reconciliation, None),
+            )
+            .await;
+            assert!(
+                matches!(reply, AgentRunEntityReply::Applied { .. }),
+                "{at}: {reply:?}"
+            );
+            let (resent, gates) =
+                effect_and_gates(&fx, AgentRunEffectKind::MemoryPromotionCall).await;
+            assert_eq!(resent.generation, parked.generation.next(), "{at}");
+            assert_eq!(gates.len(), 1, "{at}: the new generation's gate: {gates:?}");
+            let new_gate = &gates[0];
+            assert_eq!(new_gate.kind, gate.kind(), "{at}");
+            assert_eq!(new_gate.bound_effect.generation, resent.generation, "{at}");
+
+            let segments = checkpoint_opens(&sink).split_off(before);
+            assert_eq!(
+                segments.len(),
+                1,
+                "{at}: the resolution exports exactly one checkpoint-open segment: {:?}",
+                sink.operations()
+            );
+            let segment = &segments[0];
+            assert_eq!(
+                segment
+                    .attributes
+                    .get(SEGMENT_ATTR_CHECKPOINT_KIND)
+                    .map(String::as_str),
+                Some(gate.kind().as_label()),
+                "{at}: the segment names the gate's kind"
+            );
+            let identity =
+                AgentCheckpoint::parked_span_identity(&resent.telemetry, &new_gate.checkpoint_id)
+                    .unwrap_or_else(|| panic!("{at}: a traced effect derives a parked identity"));
+            assert_eq!(
+                segment.span_id.as_deref(),
+                Some(identity.span_id.as_str()),
+                "{at}: the segment exports under the parked identity"
+            );
+            assert_eq!(
+                new_gate.telemetry.trace_parent.as_deref(),
+                Some(identity.trace_parent().as_str()),
+                "{at}: the checkpoint stores the identity the segment exports under"
+            );
+            assert_eq!(segment.outcome, AgentSegmentOutcome::Ok, "{at}");
+            assert!(segment.duration_ms().is_some(), "{at}: the segment ended");
+        }
+    }
+
+    // Resolutions that open no gate export no segment.
+    for resolving in Resolving::ALL {
+        for (label, policies, executed) in [
+            (
+                "ungated, not executed",
+                AgentEffectPolicies::default(),
+                None,
+            ),
+            (
+                "gated, executed",
+                policies_gating(Gate::Checkpoint),
+                Some(AgentRunEffectOutcome::MemoryPromotion {
+                    promoted: Vec::new(),
+                }),
+            ),
+        ] {
+            let at = format!("{label}, {resolving:?}");
+            let sink = Arc::new(InMemoryAgentSegmentSink::new());
+            let fx = Box::pin(commandable_world(policies, false))
+                .await
+                .with_segments(sink.clone());
+            let (parked, reconciliation) = parked_promotion(&fx).await;
+            let before = checkpoint_opens(&sink).len();
+
+            let reply = apply_run(
+                &fx,
+                resolving.command("resolved", &parked, &reconciliation, executed),
+            )
+            .await;
+            assert!(
+                matches!(reply, AgentRunEntityReply::Applied { .. }),
+                "{at}: {reply:?}"
+            );
+            let (_, gates) = effect_and_gates(&fx, AgentRunEffectKind::MemoryPromotionCall).await;
+            assert!(gates.is_empty(), "{at}: no gate opened: {gates:?}");
+            assert_eq!(
+                checkpoint_opens(&sink).len(),
+                before,
+                "{at}: the resolution exported no checkpoint-open segment: {:?}",
+                sink.operations()
+            );
+        }
     }
 }
 

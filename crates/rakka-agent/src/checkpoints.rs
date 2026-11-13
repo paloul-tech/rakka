@@ -1483,8 +1483,10 @@ mod tests {
         AgentCheckpointStatus::Cancelled,
     ];
 
-    /// Fails to compile when a kind or a status is added and the lists above
-    /// are not, so "every kind and every status" stays true.
+    /// The matches below fail to compile when a kind or a status is added,
+    /// which forces a look at the lists above. The lists themselves would
+    /// compile unchanged, and "every kind and every status" would stop being
+    /// true.
     #[allow(dead_code)]
     fn every_kind_and_status_is_listed(kind: AgentCheckpointKind, status: AgentCheckpointStatus) {
         match kind {

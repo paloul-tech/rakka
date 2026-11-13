@@ -960,6 +960,17 @@ async fn an_unknown_finding_at_a_spent_budget_parks_without_error() {
         "one query per attempt in the budget, not one per pass"
     );
     assert_parked_under(&fx, "reconciliation-exhausted").await;
+    // `settle_unknown_finding` takes the line and the two park codes as
+    // adjacent strings: the line and the park code are pinned apart.
+    let row = fx.outbox_row(&fx.effect_at(1).await).await;
+    assert_eq!(
+        row.attempts()
+            .last_error()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("reconciliation outcome unknown"),
+        "the burned attempt's line is the unknown finding's"
+    );
 }
 
 #[tokio::test]

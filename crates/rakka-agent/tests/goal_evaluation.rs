@@ -1496,6 +1496,17 @@ async fn uncommanded_tool_turn(
         gates_on(&fx, &tool).await.is_empty(),
         "the ungated tool has no gate"
     );
+    // The control must have dispatched its tool, or the comparison with it
+    // would hold for a world that dispatched nothing.
+    assert_eq!(
+        tool.status,
+        rakka_agent::AgentRunEffectStatus::Ready,
+        "the control's tool is dispatched"
+    );
+    assert!(
+        tool.dispatched_at.is_some(),
+        "the control's tool is stamped dispatched"
+    );
     (tool, run_status(&fx).await)
 }
 

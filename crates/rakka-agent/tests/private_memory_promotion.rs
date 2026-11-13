@@ -4403,7 +4403,9 @@ async fn a_gated_promotion_by_command_opens_its_gate_on_a_live_run() {
 /// command that opens it, a grant, a denial and an expiry each leave the
 /// run's status and phase where they were. A granted promotion dispatches and
 /// its receipt lands; a denied or expired one fails, and the run does not
-/// wind down.
+/// wind down. The gate invariant is asserted after every step: after the
+/// command by `promote_gated`, after the grant, denial or expiry by
+/// `answer_gate`, and after the receipt below.
 #[tokio::test]
 async fn a_promotion_gate_moves_no_status_or_phase() {
     for rest in Rest::ALL {
@@ -4660,6 +4662,131 @@ async fn a_tool_calling_turn_opens_no_gate_for_a_promotion() {
         promotion_record(&fx, &promotion).await.status,
         AgentRunEffectStatus::Failed
     );
+}
+
+/// The turn's one tool effect, whatever its status, and the one waiting
+/// gate bound to its generation.
+async fn the_tool_and_its_gate(fx: &Fixture) -> (AgentRunEffect, AgentCheckpoint) {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let loop_state = state.loop_state().expect("the loop is started");
+    let tools: Vec<&AgentRunEffect> = loop_state
+        .effects()
+        .iter()
+        .filter(|effect| effect.kind() == AgentRunEffectKind::ToolCall)
+        .collect();
+    assert_eq!(tools.len(), 1, "the turn recorded one tool effect");
+    let tool = tools[0].clone();
+    let gates: Vec<AgentCheckpoint> = loop_state
+        .open_checkpoints()
+        .iter()
+        .filter(|checkpoint| {
+            checkpoint.status.is_waiting()
+                && checkpoint.bound_effect.effect_id == tool.effect_id
+                && checkpoint.bound_effect.generation == tool.generation
+        })
+        .cloned()
+        .collect();
+    assert_eq!(gates.len(), 1, "one gate is bound to the tool: {gates:?}");
+    (tool, gates[0].clone())
+}
+
+/// Status precedence with two gates open (issue #126). A tool's
+/// `SecurityAuthorization` is the turn's wait. A promotion's `Approval` is
+/// outside the turn and is not, so it never outranks the tool's gate.
+///
+/// In each order (the promotion commanded while the run awaits its model
+/// call, or after the turn's tool gate opened), the run holds both gates and
+/// reports `WaitingForAuthorization`. When the promotion comes first, its
+/// approval is open as the tool-calling turn writes the status: a run that
+/// counted it reported `WaitingForApproval`. A grant of the promotion leaves
+/// the status as it was. A grant of the tool then moves the run to
+/// `WaitingForEffect`, its tool dispatched.
+#[tokio::test]
+async fn a_tool_gate_and_a_promotion_gate_open_together() {
+    for promotion_first in [true, false] {
+        let at = format!("promotion first: {promotion_first}");
+        let policies =
+            policies_gating(Gate::Checkpoint, rakka_agent::AgentCheckpointSla::default())
+                .with_tool_spec(
+                    AgentToolId::new("lookup").expect("the tool id is valid"),
+                    rakka_agent::AgentEffectSpec::idempotent(3)
+                        .expect("the spec is valid")
+                        .with_authorization_required(),
+                )
+                .expect("the gated tool spec is valid");
+        let rest = if promotion_first {
+            Rest::AwaitingModel
+        } else {
+            Rest::AwaitingTools
+        };
+        let (fx, _stores) = Box::pin(live_world(rest, policies)).await;
+        let promotion = if promotion_first {
+            let promotion = promote_gated(&fx, "gated").await;
+            // The model answers with the tool call, whose gate the turn
+            // opens beside the promotion's.
+            drive_turn(&fx).await;
+            assert_gate_invariant(&fx).await;
+            promotion
+        } else {
+            promote_gated(&fx, "gated").await
+        };
+        let promotion_gate = the_gate_of(&fx, &promotion).await;
+        assert_eq!(promotion_gate.kind, AgentCheckpointKind::Approval, "{at}");
+        let (tool, tool_gate) = the_tool_and_its_gate(&fx).await;
+        assert_eq!(
+            tool_gate.kind,
+            AgentCheckpointKind::SecurityAuthorization,
+            "{at}"
+        );
+        assert_eq!(tool.status, AgentRunEffectStatus::Pending, "{at}");
+        assert_eq!(open_checkpoints(&fx).await.len(), 2, "{at}: both gates");
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (
+                AgentRunStatus::WaitingForAuthorization,
+                AgentLoopPhase::AwaitingTools
+            ),
+            "{at}: the tool's authorization is the run's wait"
+        );
+
+        answer_gate(&fx, &promotion_gate, Answer::Grant).await;
+        assert_eq!(
+            promotion_record(&fx, &promotion).await.status,
+            AgentRunEffectStatus::Ready,
+            "{at}: the granted promotion dispatched"
+        );
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (
+                AgentRunStatus::WaitingForAuthorization,
+                AgentLoopPhase::AwaitingTools
+            ),
+            "{at}: the promotion's grant moves nothing"
+        );
+
+        let reply = apply_ok(&fx, grant_command(&tool_gate.checkpoint_id, "grant-tool")).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{at}: {reply:?}"
+        );
+        assert_gate_invariant(&fx).await;
+        assert!(open_checkpoints(&fx).await.is_empty(), "{at}");
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (
+                AgentRunStatus::WaitingForEffect,
+                AgentLoopPhase::AwaitingTools
+            ),
+            "{at}: the tool's grant ends the authorization wait"
+        );
+        let dispatched = dispatched_effect(&fx, AgentRunEffectKind::ToolCall).await;
+        assert_eq!(
+            dispatched.effect_id, tool.effect_id,
+            "{at}: the granted tool dispatched"
+        );
+    }
 }
 
 /// A replayed gated `PromoteMemory` opens no second gate: the second delivery

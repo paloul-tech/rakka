@@ -10,8 +10,10 @@
 //! duplicate delivery still answers its stale error first, and a confirmation
 //! that establishes nothing keeps `effect-policy-invalid`.
 //!
-//! These are live runs; the ended-run halves live in
-//! `private_memory_promotion.rs` and `communal_claim_append.rs`.
+//! These are live runs. The ended-run tests, which cover confirmations, live
+//! in `private_memory_promotion.rs`. Each other effect kind is tested once on
+//! a live run's result path, in its own file: `communal_claim_append.rs`, for
+//! one, offers a claim append a promotion's receipt.
 
 use std::sync::Arc;
 
@@ -813,6 +815,82 @@ async fn a_stale_mismatched_result_still_answers_stale() {
     )
     .await
     .expect_err("a settled effect settles nothing");
+    assert_eq!(refusal.code(), "run-stale-effect-result", "{refusal}");
+    assert!(
+        matches!(refusal, AgentRunError::StaleEffectResult { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(run_state_json(&fx).await, before, "the state moved");
+}
+
+/// The confirmation path holds the same order (design 5.1.3): a foreign
+/// `ConfirmedExecuted` sent through `ResolveIndeterminateEffect` answers its
+/// stale error before the outcome guard. Sent to a superseded generation it
+/// answers `StaleEffectGeneration`, and sent to a settled effect
+/// `StaleEffectResult`, as the effect's own receipt would. The run's state
+/// does not move. `ResolveCheckpoint` cannot reach either case: the
+/// reconciliation checkpoint goes with the generation it parked.
+#[tokio::test]
+async fn a_stale_mismatched_confirmation_still_answers_stale() {
+    let (fx, _stores, parked, checkpoint) = live_parked_promotion().await;
+
+    // A person says the first generation never ran: the second is minted.
+    apply_ok(
+        &fx,
+        resolve_checkpoint_command(
+            &checkpoint.checkpoint_id,
+            "not-executed",
+            AgentCheckpointDecision::Reconciliation(
+                AgentReconciliationDecision::ConfirmedNotExecuted,
+            ),
+        ),
+    )
+    .await;
+    crank(&fx).await;
+    let current = dispatched_effect(&fx, AgentRunEffectKind::MemoryPromotionCall).await;
+    assert_eq!(current.generation, parked.generation.next());
+
+    let confirm_model_turn = |key: &str, generation: AgentEffectGeneration| {
+        resolve_indeterminate(
+            key,
+            &current,
+            generation,
+            AgentEffectResolution::ConfirmedExecuted {
+                outcome: Box::new(AgentRunEffectOutcome::Model {
+                    turn: Box::new(tool_calling_turn("lookup")),
+                }),
+            },
+        )
+    };
+    let before = run_state_json(&fx).await;
+    let refusal = apply(&fx, confirm_model_turn("superseded", parked.generation))
+        .await
+        .expect_err("a superseded generation settles nothing");
+    assert_eq!(refusal.code(), "run-stale-effect-generation", "{refusal}");
+    assert!(
+        matches!(refusal, AgentRunError::StaleEffectGeneration { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(run_state_json(&fx).await, before, "the state moved");
+
+    // The current generation settles on its own receipt; a foreign
+    // confirmation for it afterwards finds it settled.
+    deliver(
+        &fx,
+        &current,
+        AgentRunEffectOutcome::MemoryPromotion {
+            promoted: Vec::new(),
+        },
+    )
+    .await
+    .expect("the promotion's own receipt applies");
+    let settled = effect_record(&fx, &current).await;
+    assert_eq!(settled.status, AgentRunEffectStatus::Succeeded);
+
+    let before = run_state_json(&fx).await;
+    let refusal = apply(&fx, confirm_model_turn("settled", settled.generation))
+        .await
+        .expect_err("a settled effect settles nothing");
     assert_eq!(refusal.code(), "run-stale-effect-result", "{refusal}");
     assert!(
         matches!(refusal, AgentRunError::StaleEffectResult { .. }),

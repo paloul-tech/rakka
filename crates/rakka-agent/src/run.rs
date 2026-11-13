@@ -8121,19 +8121,27 @@ where
             } => {
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
-                self.transition(now, records_decision, move |state| {
-                    resolve_indeterminate_effect(
-                        state,
-                        &effect_id,
-                        generation,
-                        *resolution,
-                        &policy,
-                        &policies,
-                        now,
-                    )?;
-                    Ok(operation_id)
-                })
-                .await?
+                // A `ConfirmedNotExecuted` re-sends a gated effect behind the
+                // new generation's gate, opened in this transition: its
+                // `checkpoint-open` segment closes once it commits, as the
+                // `PromoteMemory` arm's does (issue #126).
+                let marks = self.current_segment_marks();
+                let reply = self
+                    .transition(now, records_decision, move |state| {
+                        resolve_indeterminate_effect(
+                            state,
+                            &effect_id,
+                            generation,
+                            *resolution,
+                            &policy,
+                            &policies,
+                            now,
+                        )?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                self.close_checkpoint_open_segments_since(&marks, now);
+                reply
             }
             AgentRunEntityCommand::ResolveCheckpoint {
                 operation_id,
@@ -8144,20 +8152,26 @@ where
             } => {
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
-                self.transition(now, records_decision, move |state| {
-                    resolve_checkpoint(
-                        state,
-                        &checkpoint_id,
-                        resolver,
-                        *decision,
-                        operation_id.clone(),
-                        &policy,
-                        &policies,
-                        now,
-                    )?;
-                    Ok(operation_id)
-                })
-                .await?
+                // As above: a reconciliation decision that re-sends a gated
+                // effect opens the new generation's gate here.
+                let marks = self.current_segment_marks();
+                let reply = self
+                    .transition(now, records_decision, move |state| {
+                        resolve_checkpoint(
+                            state,
+                            &checkpoint_id,
+                            resolver,
+                            *decision,
+                            operation_id.clone(),
+                            &policy,
+                            &policies,
+                            now,
+                        )?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                self.close_checkpoint_open_segments_since(&marks, now);
+                reply
             }
             AgentRunEntityCommand::FireCheckpointTimers { operation_id } => {
                 if let Some(unchanged) = self.unchanged_by(fire_checkpoint_timers, now)? {
@@ -9099,9 +9113,12 @@ where
     /// exported again.
     ///
     /// The `PromoteMemory`, `AppendClaim` and `EvaluateGoal` arms call it after
-    /// their transition commits (issue #126). Without it the gate those
-    /// commands open would park without its segment, and the gate's later
-    /// resolution would link a parked span that was never exported
+    /// their transition commits, and so do the `ResolveIndeterminateEffect`
+    /// and `ResolveCheckpoint` arms, whose `ConfirmedNotExecuted` re-sends a
+    /// gated effect behind the new generation's gate (issue #126). Without it
+    /// the gate those commands open would park without its segment, and the
+    /// gate's later resolution would link a parked span that was never
+    /// exported
     /// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md)). The
     /// two halves are synchronous, around the arm's own `transition` call,
     /// rather than an async wrapper: a wrapper grows
