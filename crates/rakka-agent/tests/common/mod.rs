@@ -3866,3 +3866,44 @@ pub fn assert_decision_stream_whole(sink: &CountingDecisionSink, scope: &AgentRu
     assert_eq!(sequences, expected, "the decision sequences must be 1..=n");
     assert_eq!(sink.duplicates(), 0, "no append may answer Duplicate");
 }
+
+/// Asserts the gate invariant of issue #126: every gated effect held outside
+/// the turn (a memory promotion or a claim append) that is `Pending` and holds
+/// no grant for its generation has a waiting approval or authorization
+/// checkpoint bound to that exact generation. Such an effect is not
+/// dispatchable, so without its gate it would wait forever on a decision no
+/// one can make. Shared by the promotion and claim-append tests.
+pub async fn assert_gate_invariant<A: AgentModelAdapter, S: AgentRunEffectSink>(
+    fx: &Fixture<A, S>,
+) {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let Some(loop_state) = state.loop_state() else {
+        return;
+    };
+    for effect in loop_state.effects() {
+        let owed = effect.kind().outside_the_turn()
+            && effect.status == AgentRunEffectStatus::Pending
+            && (effect.checkpoint_required || effect.authorization_required)
+            && loop_state.grant_for(effect).is_none();
+        if !owed {
+            continue;
+        }
+        let gated = loop_state.open_checkpoints().iter().any(|checkpoint| {
+            checkpoint.status.is_waiting()
+                && checkpoint.kind
+                    != rakka_agent::AgentCheckpointKind::IndeterminateEffectReconciliation
+                && checkpoint.bound_effect.effect_id == effect.effect_id
+                && checkpoint.bound_effect.generation == effect.generation
+        });
+        assert!(
+            gated,
+            "the gated {} effect {:?} is `Pending` and ungranted at generation {:?} with no \
+             waiting gate",
+            effect.kind(),
+            effect.effect_id,
+            effect.generation
+        );
+    }
+}

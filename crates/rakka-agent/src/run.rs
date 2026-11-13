@@ -4137,6 +4137,11 @@ fn evaluate_model_output(
     // ([specification 12](../../../docs/plans/rakka-agent/spec.md)). The
     // checkpoint and the effect commit in this one transition, so there is no
     // instant at which a gated effect exists without its gate.
+    //
+    // An effect held outside the turn (a memory promotion or a claim append)
+    // is skipped: its own command opened its gate in the transition that
+    // recorded it, and a gate the turn opened on one already denied would
+    // reopen a wait on a failed effect (issue #126).
     let gated: Vec<(AgentEffectId, AgentCheckpointKind)> = {
         let run = state.run_mut()?;
         run.loop_state
@@ -4144,19 +4149,13 @@ fn evaluate_model_output(
             .iter()
             .filter(|effect| {
                 effect.turn == turn
-                    && (effect.checkpoint_required || effect.authorization_required)
+                    && !effect.kind().outside_the_turn()
                     && run.loop_state.grant_for(effect).is_none()
             })
-            .map(|effect| {
-                // A tool that requires both gates opens one security
-                // authorization: its resolution is an approval-family grant
-                // too, and the dispatch authority accepts it for either gate.
-                let kind = if effect.authorization_required {
-                    AgentCheckpointKind::SecurityAuthorization
-                } else {
-                    AgentCheckpointKind::Approval
-                };
-                (effect.effect_id.clone(), kind)
+            .filter_map(|effect| {
+                effect
+                    .gate_kind()
+                    .map(|kind| (effect.effect_id.clone(), kind))
             })
             .collect()
     };
@@ -5638,14 +5637,7 @@ fn apply_indeterminate_resolution(
                 // ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)),
                 // so without a fresh checkpoint the new generation would sit
                 // undispatchable with no wait left to resolve.
-                let gate = if effect.authorization_required {
-                    Some(AgentCheckpointKind::SecurityAuthorization)
-                } else if effect.checkpoint_required {
-                    Some(AgentCheckpointKind::Approval)
-                } else {
-                    None
-                };
-                if let Some(kind) = gate {
+                if let Some(kind) = effect.gate_kind() {
                     open_effect_checkpoint(state, policies, effect_id, kind, now)?;
                 }
                 let run = state.run_mut()?;
@@ -6108,8 +6100,11 @@ fn resolve_checkpoint(
             // pass now finds its grant and hands it to the sink. Another gated
             // effect may still hold the run on its own wait. An ended run's
             // status never moves: its gated effect rides the outbox without a
-            // wait status.
-            if !run.status.is_terminal() {
+            // wait status. Nor does a grant for an effect held outside the
+            // turn (a memory promotion or a claim append) move a live run's:
+            // that gate was never the run's wait, so whatever the run waited
+            // on, it still waits on (issue #126).
+            if !run.status.is_terminal() && !run.holds_outside_the_turn_effect(&bound_effect_id) {
                 run.status = checkpoint_wait_status(&run.loop_state);
             }
             state.updated_at = now;
@@ -6369,6 +6364,36 @@ fn check_post_terminal_memory_window(
     Ok(())
 }
 
+/// Opens the gate the deployment's spec configured for the memory promotion
+/// or claim append a command just recorded, in that command's own transition
+/// (issue #126). The gate's kind is the recorded effect's
+/// [`AgentRunEffect::gate_kind`]; an ungated effect opens nothing.
+///
+/// Such an effect is outside the turn: no later turn opens its gate, and the
+/// gate is never the run's wait, so nothing here writes the status or the
+/// phase. The same code runs on a live run and on one that has ended, where
+/// [`open_effect_checkpoint`] drops the decisions an ended run refuses. A run
+/// already holding the most open checkpoints it may refuses the command with
+/// `effect-pending-overflow`, and the whole transition is discarded with it.
+fn open_commanded_gate(
+    state: &mut AgentRunState,
+    policies: &AgentEffectPolicies,
+    effect_id: &AgentEffectId,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let gate = state.run().and_then(|run| {
+        run.loop_state
+            .effects()
+            .iter()
+            .find(|effect| &effect.effect_id == effect_id)
+            .and_then(AgentRunEffect::gate_kind)
+    });
+    if let Some(kind) = gate {
+        open_effect_checkpoint(state, policies, effect_id, kind, now)?;
+    }
+    Ok(())
+}
+
 /// Commits one memory-promotion effect from a deduplicated command
 /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -6380,7 +6405,10 @@ fn check_post_terminal_memory_window(
 /// The run's status and phase do not move — a promotion is not part of the
 /// turn, and whatever wait the run held, it still holds; the settle pass
 /// flushes owed session entries before dispatching effects, so the selection
-/// is durably in the store before the executor reads it.
+/// is durably in the store before the executor reads it. A promotion the
+/// deployment's spec gates opens its approval or authorization in this same
+/// transition ([`open_commanded_gate`]), so it is never `Pending` without the
+/// gate a person can answer.
 ///
 /// A promotion is not new work but a copy of work already recorded, so the
 /// wind-down does not fence it and a run that has ended still accepts it for
@@ -6460,7 +6488,9 @@ fn promote_memory(
     let slot = unresolved_effect_slot(state, turn, slot)?;
     let run = state.run_mut()?;
     let effect = AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
+    let effect_id = effect.effect_id.clone();
     run.loop_state.record_effect(effect)?;
+    open_commanded_gate(state, policies, &effect_id, now)?;
     state.updated_at = now;
     Ok(())
 }
@@ -6475,7 +6505,9 @@ fn promote_memory(
 /// re-checks per attempt — stamps the provenance from durable state alone,
 /// reserves the append's attempt budget, and records the effect. The
 /// dispatcher-side executor performs the store append inside its bounded
-/// attempt.
+/// attempt. An append the deployment's spec gates opens its approval or
+/// authorization in this same transition ([`open_commanded_gate`]), and the
+/// run's status and phase do not move.
 ///
 /// Like a promotion, an append is a record *about* the run's work rather than
 /// the work, so the wind-down does not fence it and a run that has ended
@@ -6539,7 +6571,9 @@ fn append_claim(
     let slot = unresolved_effect_slot(state, turn, slot)?;
     let run = state.run_mut()?;
     let effect = AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
+    let effect_id = effect.effect_id.clone();
     run.loop_state.record_effect(effect)?;
+    open_commanded_gate(state, policies, &effect_id, now)?;
     state.updated_at = now;
     Ok(())
 }

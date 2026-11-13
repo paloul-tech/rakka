@@ -2042,6 +2042,25 @@ impl AgentRunEffect {
         self.request.kind()
     }
 
+    /// The kind of checkpoint that gates this effect's dispatch, when its
+    /// spec requires one: a security authorization when authorization is
+    /// required, with or without a checkpoint, else an approval when a
+    /// checkpoint is required, else none.
+    ///
+    /// An effect that requires both gates opens one security authorization:
+    /// its grant is an approval-family grant too, and the dispatch authority
+    /// accepts it for either gate. Every site that opens an effect's gate
+    /// reads the kind here, so they cannot disagree.
+    pub(crate) const fn gate_kind(&self) -> Option<crate::checkpoints::AgentCheckpointKind> {
+        if self.authorization_required {
+            Some(crate::checkpoints::AgentCheckpointKind::SecurityAuthorization)
+        } else if self.checkpoint_required {
+            Some(crate::checkpoints::AgentCheckpointKind::Approval)
+        } else {
+            None
+        }
+    }
+
     /// Whether the effect has been committed but not yet handed to the sink.
     #[must_use]
     pub const fn is_pending(&self) -> bool {

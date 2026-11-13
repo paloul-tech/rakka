@@ -1174,11 +1174,24 @@ impl AgentLoopState {
     /// because a pending human decision is the wait an operator can act on
     /// first. A reconciliation checkpoint is not an approval-family wait — the
     /// indeterminate effect it gates drives the run's status instead.
+    ///
+    /// Nor is the gate of an effect held outside the turn (a memory promotion
+    /// or a claim append). Its own command opened it, and it is not the
+    /// turn's wait: the turn neither waits on such an effect nor rests on its
+    /// outcome, so its gate is visible among the open checkpoints but moves
+    /// no status (issue #126).
     #[must_use]
     pub fn approval_family_wait(&self) -> Option<crate::checkpoints::AgentCheckpointKind> {
         let mut wait = None;
         for checkpoint in &self.open_checkpoints {
             if !checkpoint.status.is_waiting() {
+                continue;
+            }
+            let outside_the_turn = self.effects.iter().any(|effect| {
+                effect.effect_id == checkpoint.bound_effect.effect_id
+                    && effect.kind().outside_the_turn()
+            });
+            if outside_the_turn {
                 continue;
             }
             match checkpoint.kind {
