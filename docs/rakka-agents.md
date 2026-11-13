@@ -324,7 +324,10 @@ incorrectly.
   a denial or an expiry fails that generation only. A `Cancel` closes the
   gate and, in the same transition, settles the effect `Cancelled` if it is
   still `Pending` and ungranted, releasing its attempt reservation; a
-  granted one still dispatches. A run already at its bound on open
+  granted one still dispatches. A wind-down that is not a cancel, such as
+  one after a failed effect, leaves the gate open, and the open gate keeps
+  the run from ending until it is answered, it expires, or a `Cancel`
+  arrives. A run already at its bound on open
   checkpoints refuses the command whole with `effect-pending-overflow`. If a
   promotion's or claim append's attempt may have run and its recovery retry
   is refused (the agent was terminated just after the run ended), the
