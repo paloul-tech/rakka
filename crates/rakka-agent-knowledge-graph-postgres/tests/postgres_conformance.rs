@@ -114,6 +114,46 @@ async fn the_capability_report_is_coherent_when_dsn_is_set() {
 }
 
 #[tokio::test]
+async fn a_tombstone_withdraws_content_and_keeps_the_audit_stub_when_dsn_is_set() {
+    let Some(store) = store().await else { return };
+    conformance::tombstone_withdraws_content(&store, ConformanceScopes::unique("pg-tombstone"))
+        .await;
+}
+
+#[tokio::test]
+async fn a_tombstoned_claim_is_hidden_from_discovery_when_dsn_is_set() {
+    let Some(store) = store().await else { return };
+    conformance::tombstoned_claims_are_hidden_from_discovery(
+        &store,
+        ConformanceScopes::unique("pg-tombstone-discovery"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_tombstoned_claim_is_frozen_when_dsn_is_set() {
+    let Some(store) = store().await else { return };
+    conformance::a_stub_is_frozen(&store, ConformanceScopes::unique("pg-tombstone-frozen")).await;
+}
+
+#[tokio::test]
+async fn a_tombstone_erases_every_earlier_operation_of_its_claim_when_dsn_is_set() {
+    let Some(store) = store().await else { return };
+    conformance::tombstone_replay_and_erased_operations(
+        &store,
+        ConformanceScopes::unique("pg-tombstone-replay"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_foreign_tombstone_reveals_and_withdraws_nothing_when_dsn_is_set() {
+    let Some(store) = store().await else { return };
+    conformance::tombstone_isolation(&store, ConformanceScopes::unique("pg-tombstone-isolation"))
+        .await;
+}
+
+#[tokio::test]
 async fn scenario_20_the_whole_contract_passes_unchanged_when_dsn_is_set() {
     // The M2 acceptance gate: the umbrella the in-memory reference runs, on a
     // structurally different backend, with zero agent-domain change.
