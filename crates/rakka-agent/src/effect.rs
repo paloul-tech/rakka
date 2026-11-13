@@ -1884,6 +1884,108 @@ pub struct AgentRunEffect {
 }
 
 impl AgentRunEffect {
+    /// Whether `outcome`, offered by `source`, belongs to this effect.
+    ///
+    /// A success outcome must be the variant its request kind produces and,
+    /// where the outcome names a call, cell or generation, must name this
+    /// effect's own. A failure outcome settles any effect, except that a
+    /// confirmation may not report an unknown or fenced outcome. Pure: it
+    /// reads the effect and changes nothing.
+    // Task 2 wires the callers; until then only the tests call it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn check_outcome(
+        &self,
+        outcome: &AgentRunEffectOutcome,
+        source: AgentEffectOutcomeSource,
+    ) -> AgentEffectResult<()> {
+        const OTHER_KIND: &str = "the outcome belongs to another kind of effect";
+        const OTHER_IDENTITY: &str = "the outcome names another call, cell or generation";
+        const BAD_SOURCE: &str = "a confirmation cannot carry this outcome";
+
+        let refuse = |detail: &'static str| AgentEffectError::OutcomeMismatch {
+            effect: self.kind().as_label(),
+            outcome: outcome.variant_label(),
+            detail,
+        };
+        let identity = |same: bool| {
+            if same {
+                Ok(())
+            } else {
+                Err(refuse(OTHER_IDENTITY))
+            }
+        };
+
+        match outcome {
+            AgentRunEffectOutcome::Failed { .. } | AgentRunEffectOutcome::Exhausted { .. } => {
+                return Ok(());
+            }
+            AgentRunEffectOutcome::Indeterminate { .. }
+            | AgentRunEffectOutcome::Cancelled { .. } => {
+                return match source {
+                    AgentEffectOutcomeSource::Dispatcher => Ok(()),
+                    AgentEffectOutcomeSource::Confirmation => Err(refuse(BAD_SOURCE)),
+                };
+            }
+            _ => {}
+        }
+
+        match (&self.request, outcome) {
+            (AgentRunEffectRequest::Model { .. }, AgentRunEffectOutcome::Model { .. }) => Ok(()),
+            (AgentRunEffectRequest::Tool { call }, AgentRunEffectOutcome::Tool { call_id, .. }) => {
+                identity(*call_id == call.call_id)
+            }
+            (
+                AgentRunEffectRequest::Compensation { .. },
+                AgentRunEffectOutcome::Tool { call_id, .. },
+            ) => identity(*call_id == compensation_call_id(self)),
+            (
+                AgentRunEffectRequest::MemoryPromotion { .. },
+                AgentRunEffectOutcome::MemoryPromotion { .. },
+            ) => Ok(()),
+            (
+                AgentRunEffectRequest::Evaluation { .. },
+                AgentRunEffectOutcome::Evaluation { record },
+            ) => {
+                identity(record.effect_id == self.effect_id && record.generation == self.generation)
+            }
+            (
+                AgentRunEffectRequest::A2aSend { delegation },
+                AgentRunEffectOutcome::A2aSend { receipt },
+            ) => identity(receipt.delegation == delegation.delegation),
+            (
+                AgentRunEffectRequest::A2aHandoff { handoff },
+                AgentRunEffectOutcome::A2aHandoff { receipt },
+            ) => identity(receipt.handoff == handoff.handoff),
+            (
+                AgentRunEffectRequest::WorkflowStart { invocation },
+                AgentRunEffectOutcome::WorkflowStart { receipt },
+            ) => identity(receipt.invocation == invocation.invocation),
+            (
+                AgentRunEffectRequest::WorkflowCancel { .. },
+                AgentRunEffectOutcome::WorkflowCancel { .. },
+            ) => Ok(()),
+            (
+                AgentRunEffectRequest::ClaimAppend { .. },
+                AgentRunEffectOutcome::ClaimAppend { .. },
+            ) => Ok(()),
+            // Every request kind is named above: a new one fails to compile in
+            // the arms below, not silently refuse here.
+            (
+                AgentRunEffectRequest::Model { .. }
+                | AgentRunEffectRequest::Tool { .. }
+                | AgentRunEffectRequest::Compensation { .. }
+                | AgentRunEffectRequest::MemoryPromotion { .. }
+                | AgentRunEffectRequest::Evaluation { .. }
+                | AgentRunEffectRequest::A2aSend { .. }
+                | AgentRunEffectRequest::A2aHandoff { .. }
+                | AgentRunEffectRequest::WorkflowStart { .. }
+                | AgentRunEffectRequest::WorkflowCancel { .. }
+                | AgentRunEffectRequest::ClaimAppend { .. },
+                _,
+            ) => Err(refuse(OTHER_KIND)),
+        }
+    }
+
     /// Commits a new effect at its first generation.
     ///
     /// The identity is derived from the run, the turn, and the slot, so a
@@ -2442,7 +2544,43 @@ pub enum AgentRunEffectOutcome {
     },
 }
 
+/// Who is offering an outcome to [`AgentRunEffect::check_outcome`].
+///
+/// A dispatcher ran the effect and may report any outcome; a confirmation
+/// speaks for the caller who observed one, and can carry only an outcome that
+/// leaves the effect's result unknown or fenced no more.
+// Task 2 wires the callers; until then only the tests construct it.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentEffectOutcomeSource {
+    /// The effect dispatcher reporting what its attempt produced.
+    Dispatcher,
+    /// A confirmation of a result observed elsewhere.
+    Confirmation,
+}
+
 impl AgentRunEffectOutcome {
+    /// The stable label of this outcome's variant, for bounded diagnostics.
+    // Task 2 wires the callers; until then only the tests call it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn variant_label(&self) -> &'static str {
+        match self {
+            Self::Model { .. } => "model",
+            Self::Tool { .. } => "tool",
+            Self::MemoryPromotion { .. } => "memory-promotion",
+            Self::Evaluation { .. } => "evaluation",
+            Self::A2aSend { .. } => "a2a-send",
+            Self::A2aHandoff { .. } => "a2a-handoff",
+            Self::WorkflowStart { .. } => "workflow-start",
+            Self::WorkflowCancel { .. } => "workflow-cancel",
+            Self::ClaimAppend { .. } => "claim-append",
+            Self::Failed { .. } => "failed",
+            Self::Exhausted { .. } => "exhausted",
+            Self::Indeterminate { .. } => "indeterminate",
+            Self::Cancelled { .. } => "cancelled",
+        }
+    }
+
     /// A definitive failure with no deciding identity beyond its code.
     #[must_use]
     pub fn failed(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -2877,6 +3015,17 @@ pub enum AgentEffectError {
         /// What made it unenforceable.
         message: String,
     },
+    /// An outcome was offered to an effect it does not belong to: another kind
+    /// of effect, another call, cell or generation, or a source that may not
+    /// carry it.
+    OutcomeMismatch {
+        /// The kind label of the effect the outcome was offered to.
+        effect: &'static str,
+        /// The variant label of the outcome.
+        outcome: &'static str,
+        /// A fixed, bounded reason.
+        detail: &'static str,
+    },
     /// The effect sink rejected a dispatch.
     Sink {
         /// Stable machine-readable code.
@@ -2898,6 +3047,7 @@ impl AgentEffectError {
             Self::ContentTooLarge { .. } => "effect-content-too-large",
             Self::PendingOverflow { .. } => "effect-pending-overflow",
             Self::InvalidPolicy { .. } => "effect-policy-invalid",
+            Self::OutcomeMismatch { .. } => "effect-outcome-mismatch",
             Self::Sink { .. } => "effect-sink-failed",
         }
     }
@@ -2928,6 +3078,14 @@ impl Display for AgentEffectError {
             Self::InvalidPolicy { message } => {
                 write!(f, "the effect policy cannot be honored: {message}")
             }
+            Self::OutcomeMismatch {
+                effect,
+                outcome,
+                detail,
+            } => write!(
+                f,
+                "the {outcome} outcome does not settle this {effect} effect: {detail}"
+            ),
             Self::Sink { code, message } => {
                 write!(f, "the effect sink rejected a dispatch ({code}): {message}")
             }
@@ -3300,5 +3458,554 @@ mod tests {
             reason: "fenced".to_string(),
         };
         assert_eq!(cancelled.clone().with_reason(reason), cancelled);
+    }
+
+    // ----- The outcome guard ------------------------------------------------
+
+    fn guard_scope() -> AgentRunScope {
+        scope()
+    }
+
+    fn guard_call_id(name: &str) -> AgentToolCallId {
+        AgentToolCallId::new(name).expect("the call id is valid")
+    }
+
+    fn guard_delegation(slot: usize) -> crate::delegation::AgentDelegationRecord {
+        let scope = guard_scope();
+        let delegation = crate::delegation::delegation_id_for(&scope, 1, slot)
+            .expect("the delegation id derives");
+        crate::delegation::AgentDelegationRecord {
+            environments: Default::default(),
+            knowledge_spaces: Default::default(),
+            delegation: delegation.clone(),
+            goal: None,
+            parent_task: AgentTaskId::new("ticket-1").expect("the task id is valid"),
+            parent_run: scope,
+            lineage: Vec::new(),
+            ancestors: Vec::new(),
+            depth: 1,
+            requested_skill: crate::definition::AgentCapabilityId::new("skill")
+                .expect("the capability id is valid"),
+            resolved: crate::delegation::AgentDelegationTarget::new(
+                AgentId::new("specialist").expect("the agent id is valid"),
+                crate::definition::AgentTaskDefinitionId::new("specialist-definition")
+                    .expect("the definition id is valid"),
+            ),
+            a2a_message_id: delegation.as_str().to_string(),
+            deduplication_key: delegation.as_str().to_string(),
+            turn: 1,
+            slot,
+            effect: AgentEffectId::new("effect-1"),
+            call_id: guard_call_id("delegate-1"),
+            input: AgentTaskContent::inline(serde_json::json!({"input": "x"}))
+                .expect("the input is inline-bounded"),
+            result_schema: None,
+            budget: None,
+            granted_descendants: None,
+            deadline: None,
+            definition_revision: AgentRevisionNumber::INITIAL,
+            settings_revision: AgentRevisionNumber::INITIAL,
+            telemetry: Default::default(),
+            created_at: AgentTimestampMillis::new(1),
+        }
+    }
+
+    fn guard_handoff(slot: usize) -> crate::coordination::AgentHandoffRecord {
+        let scope = guard_scope();
+        let handoff =
+            crate::coordination::handoff_id_for(&scope, 1, slot).expect("the handoff id derives");
+        crate::coordination::AgentHandoffRecord {
+            handoff: handoff.clone(),
+            goal: None,
+            task: AgentTaskId::new("ticket-1").expect("the task id is valid"),
+            source_run: scope,
+            source_generation: crate::task::AgentAssignmentGeneration::new(1),
+            requested_skill: crate::definition::AgentCapabilityId::new("billing")
+                .expect("the skill id is valid"),
+            resolved: crate::delegation::AgentDelegationTarget::new(
+                AgentId::new("billing-agent").expect("the agent id is valid"),
+                crate::definition::AgentTaskDefinitionId::new("resolve-ticket")
+                    .expect("the definition id is valid"),
+            ),
+            reason: "needs billing authority".to_string(),
+            policy_revision: AgentRevisionNumber::INITIAL,
+            definition_revision: AgentRevisionNumber::INITIAL,
+            settings_revision: AgentRevisionNumber::INITIAL,
+            context: Vec::new(),
+            a2a_message_id: handoff.as_str().to_string(),
+            deduplication_key: handoff.as_str().to_string(),
+            turn: 1,
+            slot,
+            effect: AgentEffectId::new("effect-1"),
+            call_id: guard_call_id("handoff-1"),
+            telemetry: Default::default(),
+            created_at: AgentTimestampMillis::new(1),
+        }
+    }
+
+    fn guard_invocation(slot: usize) -> crate::workflow_tool::AgentWorkflowInvocationRecord {
+        let scope = guard_scope();
+        let schema = |id: &str| {
+            crate::task::AgentSchemaRef::new(
+                crate::task::AgentSchemaId::new(id).expect("the schema id is valid"),
+                AgentRevisionNumber::new(1),
+            )
+        };
+        let descriptor = crate::workflow_tool::AgentWorkflowToolDescriptor::new(
+            crate::definition::AgentWorkflowToolId::new("refund-flow")
+                .expect("the tool id is valid"),
+            "refund",
+            rakka_agent_workflow::WorkflowDefinitionVersion::new("v1"),
+            "Runs the compiled refund workflow.",
+            schema("refund-input"),
+            schema("refund-output"),
+        )
+        .expect("the descriptor is valid");
+        let invocation = crate::workflow_tool::workflow_invocation_id_for(&scope, 1, slot)
+            .expect("the invocation id derives");
+        crate::workflow_tool::AgentWorkflowInvocationRecord {
+            invocation: invocation.clone(),
+            goal: None,
+            parent_task: AgentTaskId::new("ticket-1").expect("the task id is valid"),
+            parent_run: scope,
+            workflow_tool: descriptor.workflow_tool.clone(),
+            descriptor_version: descriptor.version,
+            descriptor_digest: descriptor.schema_digest(),
+            workflow_type: descriptor.workflow_type.clone(),
+            definition_version: descriptor.definition_version.clone(),
+            required_capabilities: descriptor.required_capabilities.clone(),
+            child_run: crate::workflow_tool::child_workflow_run_id(&invocation),
+            deduplication_key: invocation.as_str().to_string(),
+            turn: 1,
+            slot,
+            effect: AgentEffectId::new("effect-1"),
+            call_id: guard_call_id("workflow-1"),
+            input: AgentTaskContent::inline(serde_json::json!({"order": "o-1"}))
+                .expect("the input is inline-bounded"),
+            deadline: None,
+            definition_revision: AgentRevisionNumber::new(1),
+            settings_revision: AgentRevisionNumber::new(1),
+            telemetry: Default::default(),
+            created_at: AgentTimestampMillis::new(1),
+        }
+    }
+
+    fn guard_principal() -> PrincipalRef {
+        PrincipalRef {
+            principal_type: "service".to_string(),
+            principal_id: "guard".to_string(),
+            display_name: None,
+        }
+    }
+
+    fn guard_evaluation_record(
+        effect_id: AgentEffectId,
+        generation: AgentEffectGeneration,
+    ) -> crate::evaluation::AgentGoalEvaluationRecord {
+        let scope = guard_scope();
+        crate::evaluation::AgentGoalEvaluationRecord::new(
+            crate::evaluation::goal_evaluation_record_id(&scope, 1, 0, generation)
+                .expect("the record id derives"),
+            AgentGoalId::for_root_task(&AgentTaskId::new("ticket-1").expect("task id")),
+            crate::definition::AgentPolicyRef::new("evaluator").expect("the policy ref is valid"),
+            crate::evaluation::AgentGoalEvaluationMethodKind::DeterministicAssertion,
+            AgentRevisionNumber::INITIAL,
+            crate::evaluation::AgentGoalEvaluationOutcome::Satisfied,
+            "ok",
+            Vec::new(),
+            None,
+            effect_id,
+            generation,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the record is valid")
+    }
+
+    /// An effect carrying `request`, and the success outcome that settles it.
+    fn guard_effect(request: AgentRunEffectRequest) -> AgentRunEffect {
+        let mut effect = model_effect(&AgentEffectSpec::read_only());
+        effect.request = request;
+        effect
+    }
+
+    fn guard_tool_request() -> AgentRunEffectRequest {
+        AgentRunEffectRequest::Tool {
+            call: Box::new(
+                AgentToolCallRequest::new(
+                    guard_call_id("call-1"),
+                    AgentToolId::new("lookup").expect("the tool id is valid"),
+                    serde_json::json!({}),
+                )
+                .expect("the call is valid"),
+            ),
+        }
+    }
+
+    fn guard_tool_outcome(call_id: AgentToolCallId) -> AgentRunEffectOutcome {
+        AgentRunEffectOutcome::Tool {
+            call_id,
+            content: AgentTaskContent::inline(serde_json::json!({"ok": true}))
+                .expect("the content is inline-bounded"),
+        }
+    }
+
+    /// One effect per request kind, each paired with its own success outcome.
+    fn guard_fixtures() -> Vec<(AgentRunEffect, AgentRunEffectOutcome)> {
+        let scope = guard_scope();
+        let context = AgentContextSnapshotRef::for_turn(&scope, 1).expect("the reference derives");
+        let mut fixtures = Vec::new();
+
+        let model = guard_effect(AgentRunEffectRequest::Model {
+            context,
+            profile: None,
+        });
+        fixtures.push((
+            model,
+            AgentRunEffectOutcome::Model {
+                turn: Box::new(AgentModelTurn::new(AgentRevisionNumber::INITIAL)),
+            },
+        ));
+
+        fixtures.push((
+            guard_effect(guard_tool_request()),
+            guard_tool_outcome(guard_call_id("call-1")),
+        ));
+
+        let compensation = guard_effect(AgentRunEffectRequest::Compensation {
+            compensation: crate::checkpoints::AgentCompensationRef::new("refund-charge")
+                .expect("the ref is valid"),
+            compensated: AgentEffectId::new("effect-0"),
+            compensated_generation: AgentEffectGeneration::new(1),
+        });
+        let compensation_outcome = guard_tool_outcome(compensation_call_id(&compensation));
+        fixtures.push((compensation, compensation_outcome));
+
+        fixtures.push((
+            guard_effect(AgentRunEffectRequest::MemoryPromotion {
+                promotion: Box::new(AgentMemoryPromotionRequest {
+                    from_sequence: crate::memory::MemorySequence::new(1),
+                    to_sequence: crate::memory::MemorySequence::new(2),
+                    kind: crate::memory::AgentPrivateMemoryKind::Semantic,
+                    target: None,
+                    confidence_bps: 9_000,
+                    requested_by: guard_principal(),
+                    roles: None,
+                }),
+            }),
+            AgentRunEffectOutcome::MemoryPromotion {
+                promoted: Vec::new(),
+            },
+        ));
+
+        let evaluation = guard_effect(AgentRunEffectRequest::Evaluation {
+            evaluation: Box::new(crate::evaluation::AgentGoalEvaluationRequest {
+                goal: AgentGoalId::for_root_task(&AgentTaskId::new("ticket-1").expect("task id")),
+                evaluator: crate::definition::AgentPolicyRef::new("evaluator")
+                    .expect("the policy ref is valid"),
+                criteria_revision: AgentRevisionNumber::INITIAL,
+                method: crate::evaluation::AgentGoalEvaluationMethod::DeterministicAssertion {
+                    assertion: crate::definition::AgentPolicyRef::new("assertion")
+                        .expect("the policy ref is valid"),
+                },
+                evidence: Vec::new(),
+                requested_by: guard_principal(),
+            }),
+        });
+        let evaluation_outcome = AgentRunEffectOutcome::Evaluation {
+            record: Box::new(guard_evaluation_record(
+                evaluation.effect_id.clone(),
+                evaluation.generation,
+            )),
+        };
+        fixtures.push((evaluation, evaluation_outcome));
+
+        let delegation = guard_delegation(0);
+        fixtures.push((
+            guard_effect(AgentRunEffectRequest::A2aSend {
+                delegation: Box::new(delegation.clone()),
+            }),
+            AgentRunEffectOutcome::A2aSend {
+                receipt: guard_send_receipt(&delegation),
+            },
+        ));
+
+        let handoff = guard_handoff(0);
+        fixtures.push((
+            guard_effect(AgentRunEffectRequest::A2aHandoff {
+                handoff: Box::new(handoff.clone()),
+            }),
+            AgentRunEffectOutcome::A2aHandoff {
+                receipt: guard_handoff_receipt(&handoff),
+            },
+        ));
+
+        let invocation = guard_invocation(0);
+        fixtures.push((
+            guard_effect(AgentRunEffectRequest::WorkflowStart {
+                invocation: Box::new(invocation.clone()),
+            }),
+            AgentRunEffectOutcome::WorkflowStart {
+                receipt: guard_start_receipt(&invocation),
+            },
+        ));
+
+        fixtures.push((
+            guard_effect(AgentRunEffectRequest::WorkflowCancel {
+                invocation: Box::new(guard_invocation(0)),
+                reason: "operator".to_string(),
+            }),
+            AgentRunEffectOutcome::WorkflowCancel {
+                already_finished: false,
+            },
+        ));
+
+        fixtures.push((
+            guard_effect(AgentRunEffectRequest::ClaimAppend {
+                append: Box::new(AgentClaimAppendRequest {
+                    space: KnowledgeSpaceId::new("space").expect("the space id is valid"),
+                    subject: "finding".to_string(),
+                    predicate: "links".to_string(),
+                    object: AgentClaimObjectRequest::Node("evidence".to_string()),
+                    confidence_bps: 5_000,
+                    classification: MemoryClassification::Unclassified,
+                    evidence: Vec::new(),
+                    requested_by: guard_principal(),
+                }),
+                provenance: Box::new(AgentClaimAppendProvenance {
+                    agent: AgentId::new("support").expect("the agent id is valid"),
+                    goal: None,
+                    task: AgentTaskId::new("ticket-1").expect("the task id is valid"),
+                    run: AgentRunId::new("t-gen-1").expect("the run id is valid"),
+                    delegation: None,
+                }),
+            }),
+            AgentRunEffectOutcome::ClaimAppend {
+                claim: crate::identity::AgentCommunalClaimId::new("claim-1")
+                    .expect("the claim id is valid"),
+            },
+        ));
+
+        fixtures
+    }
+
+    fn guard_send_receipt(
+        delegation: &crate::delegation::AgentDelegationRecord,
+    ) -> crate::delegation::AgentA2aSendReceipt {
+        crate::delegation::AgentA2aSendReceipt {
+            delegation: delegation.delegation.clone(),
+            child_task: AgentTaskId::new("child-1").expect("the task id is valid"),
+            child_run: None,
+            peer_status: "submitted".to_string(),
+        }
+    }
+
+    fn guard_handoff_receipt(
+        handoff: &crate::coordination::AgentHandoffRecord,
+    ) -> crate::coordination::AgentA2aHandoffReceipt {
+        crate::coordination::AgentA2aHandoffReceipt {
+            handoff: handoff.handoff.clone(),
+            target_generation: None,
+            peer_status: "submitted".to_string(),
+        }
+    }
+
+    fn guard_start_receipt(
+        invocation: &crate::workflow_tool::AgentWorkflowInvocationRecord,
+    ) -> crate::workflow_tool::AgentWorkflowStartReceipt {
+        crate::workflow_tool::AgentWorkflowStartReceipt {
+            invocation: invocation.invocation.clone(),
+            child_run: invocation.child_run.clone(),
+            adopted: false,
+        }
+    }
+
+    const BOTH_SOURCES: [AgentEffectOutcomeSource; 2] = [
+        AgentEffectOutcomeSource::Dispatcher,
+        AgentEffectOutcomeSource::Confirmation,
+    ];
+
+    fn refusal(
+        effect: &AgentRunEffect,
+        outcome: &AgentRunEffectOutcome,
+        source: AgentEffectOutcomeSource,
+    ) -> AgentEffectError {
+        effect
+            .check_outcome(outcome, source)
+            .expect_err("the guard refuses this outcome")
+    }
+
+    #[test]
+    fn the_guard_admits_each_requests_own_success_variant() {
+        let fixtures = guard_fixtures();
+        assert_eq!(fixtures.len(), 10, "one fixture per request kind");
+        for (effect, own) in &fixtures {
+            for source in BOTH_SOURCES {
+                effect.check_outcome(own, source).unwrap_or_else(|error| {
+                    panic!("{} refused: {error}", effect.kind().as_label())
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn the_guard_refuses_another_requests_success_variant() {
+        let fixtures = guard_fixtures();
+        for (index, kind_label) in [(1, "tool"), (3, "memory-promotion")] {
+            let (effect, _) = &fixtures[index];
+            let mut others = 0;
+            let mut seen = std::collections::BTreeSet::new();
+            for (_, outcome) in &fixtures {
+                let label = outcome.variant_label();
+                if label == kind_label || !seen.insert(label) {
+                    continue;
+                }
+                others += 1;
+                for source in BOTH_SOURCES {
+                    let error = refusal(effect, outcome, source);
+                    assert_eq!(error.code(), "effect-outcome-mismatch");
+                    match error {
+                        AgentEffectError::OutcomeMismatch {
+                            effect: effect_label,
+                            outcome: outcome_label,
+                            detail,
+                        } => {
+                            assert_eq!(effect_label, effect.kind().as_label());
+                            assert_eq!(outcome_label, label);
+                            assert_eq!(detail, "the outcome belongs to another kind of effect");
+                        }
+                        other => panic!("unexpected error {other:?}"),
+                    }
+                }
+            }
+            assert_eq!(others, 8, "every other success variant is exercised");
+        }
+    }
+
+    #[test]
+    fn the_guard_checks_identity_inside_a_kind() {
+        let fixtures = guard_fixtures();
+        // Fixture order: model, tool, compensation, memory promotion,
+        // evaluation, send, handoff, start, cancel, claim append.
+        let by_kind = |label: &str| {
+            let index = match label {
+                "tool" => 1,
+                "compensation" => 2,
+                "evaluation" => 4,
+                "a2a-send" => 5,
+                "a2a-handoff" => 6,
+                "workflow-start" => 7,
+                other => panic!("no fixture named {other}"),
+            };
+            fixtures[index].0.clone()
+        };
+        let mismatch_detail = "the outcome names another call, cell or generation";
+        let assert_identity_refused = |effect: &AgentRunEffect, outcome: &AgentRunEffectOutcome| {
+            for source in BOTH_SOURCES {
+                match refusal(effect, outcome, source) {
+                    AgentEffectError::OutcomeMismatch { detail, .. } => {
+                        assert_eq!(detail, mismatch_detail)
+                    }
+                    other => panic!("unexpected error {other:?}"),
+                }
+            }
+        };
+
+        // A tool effect answers only its own call.
+        let tool = by_kind("tool");
+        assert_identity_refused(&tool, &guard_tool_outcome(guard_call_id("call-other")));
+
+        // A compensation answers only under its derived call id.
+        let compensation = by_kind("compensation");
+        let derived = compensation_call_id(&compensation);
+        for source in BOTH_SOURCES {
+            compensation
+                .check_outcome(&guard_tool_outcome(derived.clone()), source)
+                .expect("the derived call id is admitted");
+        }
+        assert_identity_refused(&compensation, &guard_tool_outcome(guard_call_id("call-1")));
+
+        // An evaluation answers only its own effect and generation.
+        let evaluation = by_kind("evaluation");
+        let other_effect = AgentRunEffectOutcome::Evaluation {
+            record: Box::new(guard_evaluation_record(
+                AgentEffectId::new("effect-other"),
+                evaluation.generation,
+            )),
+        };
+        assert_identity_refused(&evaluation, &other_effect);
+        let other_generation = AgentRunEffectOutcome::Evaluation {
+            record: Box::new(guard_evaluation_record(
+                evaluation.effect_id.clone(),
+                evaluation.generation.next(),
+            )),
+        };
+        assert_identity_refused(&evaluation, &other_generation);
+
+        // A send, a handoff and a start answer only their own cell.
+        let send = by_kind("a2a-send");
+        assert_identity_refused(
+            &send,
+            &AgentRunEffectOutcome::A2aSend {
+                receipt: guard_send_receipt(&guard_delegation(1)),
+            },
+        );
+        let handoff = by_kind("a2a-handoff");
+        assert_identity_refused(
+            &handoff,
+            &AgentRunEffectOutcome::A2aHandoff {
+                receipt: guard_handoff_receipt(&guard_handoff(1)),
+            },
+        );
+        let start = by_kind("workflow-start");
+        assert_identity_refused(
+            &start,
+            &AgentRunEffectOutcome::WorkflowStart {
+                receipt: guard_start_receipt(&guard_invocation(1)),
+            },
+        );
+    }
+
+    #[test]
+    fn the_guard_admits_failure_outcomes_by_source() {
+        let failed = AgentRunEffectOutcome::failed("code", "message");
+        let exhausted = AgentRunEffectOutcome::exhausted("code", "message");
+        let indeterminate = AgentRunEffectOutcome::indeterminate("code", "message");
+        let cancelled = AgentRunEffectOutcome::Cancelled {
+            reason: "fenced".to_string(),
+        };
+        for (effect, _) in guard_fixtures() {
+            for outcome in [&failed, &exhausted, &indeterminate, &cancelled] {
+                effect
+                    .check_outcome(outcome, AgentEffectOutcomeSource::Dispatcher)
+                    .expect("the dispatcher may settle any effect with a failure outcome");
+            }
+            for outcome in [&failed, &exhausted] {
+                effect
+                    .check_outcome(outcome, AgentEffectOutcomeSource::Confirmation)
+                    .expect("a confirmation may carry a definitive failure");
+            }
+            for outcome in [&indeterminate, &cancelled] {
+                match refusal(&effect, outcome, AgentEffectOutcomeSource::Confirmation) {
+                    AgentEffectError::OutcomeMismatch { detail, .. } => {
+                        assert_eq!(detail, "a confirmation cannot carry this outcome")
+                    }
+                    other => panic!("unexpected error {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_outcome_mismatch_code_is_stable() {
+        let error = AgentEffectError::OutcomeMismatch {
+            effect: "tool",
+            outcome: "model",
+            detail: "the outcome belongs to another kind of effect",
+        };
+        assert_eq!(error.code(), "effect-outcome-mismatch");
+        assert_eq!(
+            error.to_string(),
+            "the model outcome does not settle this tool effect: the outcome belongs to another kind of effect"
+        );
     }
 }
