@@ -27,8 +27,13 @@
 //!   born `Proposed`, structurally).
 //! - [`transition`] — append-only trust-transition records, requests, and
 //!   outcomes.
+//! - [`tombstone`] — the record a claim carries when its content was
+//!   withdrawn, and the stub's fixed markers.
 //! - [`promotion`] — the HITL/policy promotion gate over
 //!   `rakka-agent` checkpoint grants.
+//! - [`retention`] — the per-space retention policy (a window per trust
+//!   status, a tombstone window, a legal hold) and the bounded sweep that
+//!   discharges it over any backend.
 //! - [`store`] — the portable [`KnowledgeGraphStore`] SPI, bounded
 //!   query/traversal types, capability reporting, and the in-memory
 //!   reference implementation.
@@ -50,9 +55,10 @@
 //!
 //! No communal retrieval/context-snapshot path (the `MemoryContextSnapshot`
 //! communal selection stays empty until it lands), no metrics counters, no
-//! sharded knowledge-space entity, no deletion, tombstone, or retention path
-//! (`Retracted` is the auditable withdrawal; the gap is recorded as owed in
-//! `docs/rakka-agent-security-validation-matrix.md`), no per-claim capability
+//! sharded knowledge-space entity, no agent-facing erasure path (tombstone,
+//! delete and the retention sweep are operations an application calls on the
+//! store; no run effect, command or tool reaches them), no bulk or
+//! whole-space erasure, no per-claim capability
 //! enforcement at read (the access set is carried, queryable data; its
 //! enforcement point is the communal retrieval and policy layer), and no
 //! cross-tenant federation. The run-entity claim-append effect this crate once
@@ -64,22 +70,29 @@ pub mod conformance;
 pub mod error;
 pub mod goal_claim_source;
 pub mod promotion;
+pub mod retention;
 pub mod scope;
 pub mod store;
+pub mod tombstone;
 pub mod transition;
 
 pub use append_executor::KnowledgeGraphClaimAppendExecutor;
 pub use claim::{
     Claim, ClaimAccess, ClaimId, ClaimNodeId, ClaimObject, ClaimOperationId, ClaimPredicate,
-    ClaimProvenance, ClaimRecord, ClaimTrustStatus, CLAIM_MAX_ACL_CAPABILITIES,
-    CLAIM_MAX_EVIDENCE_ARTIFACTS, CLAIM_MAX_TRUST_TRANSITIONS, CLAIM_OBJECT_INLINE_MAX_BYTES,
-    CURRENT_CLAIM_SCHEMA_VERSION,
+    ClaimProvenance, ClaimRecord, ClaimTrustStatus, CLAIM_LIVE_SCHEMA_VERSION,
+    CLAIM_MAX_ACL_CAPABILITIES, CLAIM_MAX_EVIDENCE_ARTIFACTS, CLAIM_MAX_TRUST_TRANSITIONS,
+    CLAIM_OBJECT_INLINE_MAX_BYTES, CURRENT_CLAIM_SCHEMA_VERSION,
 };
 pub use error::{check_schema_window, ClaimError, ClaimFuture, ClaimRecordKind, ClaimResult};
 pub use goal_claim_source::KnowledgeGraphGoalClaimSource;
 pub use promotion::{
     claim_promotion_binding, claim_promotion_effect_id, validate_promotion, ClaimPromotionEvidence,
     ClaimPromotionPolicy,
+};
+pub use retention::{
+    discharge_knowledge_space_retention, KnowledgeSpaceRetentionPolicy,
+    KnowledgeSpaceRetentionReport, KnowledgeSpaceRetentionSweep,
+    KNOWLEDGE_SPACE_RETENTION_DEFAULT_MAX_BATCH,
 };
 pub use scope::KnowledgeSpaceScope;
 pub use store::{
@@ -88,6 +101,10 @@ pub use store::{
     KnowledgeGraphCapabilities, KnowledgeGraphCapability, KnowledgeGraphStore,
     CLAIM_PAGE_DEFAULT_LIMIT, CLAIM_PAGE_MAX_ENTRIES, CLAIM_TRANSITION_PAGE_MAX_ENTRIES,
     CLAIM_TRAVERSAL_MAX_DEPTH, CLAIM_TRAVERSAL_MAX_EDGES, CLAIM_TRAVERSAL_MAX_NODES,
+};
+pub use tombstone::{
+    ClaimDeleteExpectation, ClaimDeleteRequest, ClaimTombstone, ClaimTombstoneReason,
+    ClaimTombstoneRequest, CLAIM_TOMBSTONE_MARKER,
 };
 pub use transition::{
     ClaimPromotionReceipt, ClaimTransitionOutcome, ClaimTrustTransition,

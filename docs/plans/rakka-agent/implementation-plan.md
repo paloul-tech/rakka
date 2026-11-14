@@ -5111,7 +5111,14 @@ with design weight in
 - **Owed onward,** in the consumer's order of value, each now tracked:
   knowledge-graph retention, tombstone, and deletion
   ([#68](https://github.com/paloul-tech/rakka/issues/68)) — operational the
-  moment a consumer writes claims; the per-settle-pass write amplification
+  moment a consumer writes claims, and **done**: `tombstone` and `delete` on
+  `KnowledgeGraphStore`, and `KnowledgeSpaceRetentionSweep`, proven by the
+  fourteen erasure and retention clauses of
+  `rakka_agent_knowledge_graph::conformance` on both backends and by
+  `rakka-agent-knowledge-graph-postgres/tests/postgres_erasure_proofs.rs`
+  (design and as-built record:
+  `docs/superpowers/specs/2026-11-13-knowledge-graph-retention-tombstone-deletion-design.md`);
+  the per-settle-pass write amplification
   ([#25](https://github.com/paloul-tech/rakka/issues/25)), re-dated rather
   than measured here, and widened by the terminal-run flush this slice adds;
   the communal read path into a model context

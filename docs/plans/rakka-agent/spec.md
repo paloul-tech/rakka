@@ -1560,6 +1560,44 @@ winds down and for the window after it ends `Completed`, `Failed`, or
 `Cancelled`, refused past the window or on an unstamped terminal record, and
 retried rather than parked when an attempt is ambiguous.
 
+The graph provides the retention, tombstone, and deletion semantics Section
+13.1 requires of every memory API. All three are operations an application
+calls on the store; no run effect, command, or tool reaches them.
+
+- A **tombstone** withdraws one claim's content and keeps an auditable stub.
+  It clears the whole statement (subject, predicate, and object), the evidence
+  references, and the embedding metadata. It MUST preserve the claim's
+  identity, provenance, classification, ACL, trust status, statement
+  fingerprint, and every trust transition. A tombstone is a statement about
+  content, not a verdict on truth: it does not move the trust status, and a
+  tombstoned claim's trust status can no longer move.
+- A **delete** removes one claim and every trust transition of it.
+- After either, a replay of any earlier operation of that claim MUST NOT
+  return or restore the withdrawn content. The store keeps each erased
+  operation id, with no payload, and answers its replay with a stable refusal.
+- A **retention sweep** ages claims out of one knowledge space. The policy is
+  deployment configuration with a window per trust status, measured from when
+  the claim entered that status, a separate window for tombstoned stubs, and a
+  legal hold. There is no built-in window: a status with none is retained. The
+  sweep MUST NOT delete a claim whose trust status moved, or that was
+  tombstoned, between its read and its delete.
+
+Erasing a claim does not reach copies of its content outside the graph: the
+`ClaimAppend` effect request on the run that asked for the append, the session
+memory the claim was mapped from, evidence artifacts, and, after a tombstone,
+the free-text reason of a trust transition. It does not reach the backing
+database's own physical copies either: superseded row versions awaiting
+reclamation, write-ahead-log archives, backups, and replicas, whose retention
+is the deployment's. A tombstoned stub keeps unsalted fingerprints of the
+withdrawn statement, so a party who can guess the statement can confirm it; a
+caller who cannot accept that MUST delete instead. Erasing a subject's content
+therefore means deleting the claims and also discharging the retention of the
+runs that produced them.
+
+An erasure operation id belongs to one claim. Replayed for the claim it
+erased it answers the original result; sent for a different claim it MUST be
+refused as a conflict, never answered as a success that erased nothing.
+
 ### 13.5 Memory Context Snapshot
 
 Before every model effect, the run MUST persist an immutable

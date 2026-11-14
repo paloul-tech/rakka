@@ -17,10 +17,10 @@ use rakka_agent::{
 };
 use rakka_agent_knowledge_graph::{
     Claim, ClaimNodeId, ClaimObject, ClaimOperationId, ClaimPredicate, ClaimProvenance,
-    InMemoryKnowledgeGraphStore, KnowledgeGraphGoalClaimSource, KnowledgeGraphStore,
-    KnowledgeSpaceScope,
+    ClaimTombstoneReason, ClaimTombstoneRequest, InMemoryKnowledgeGraphStore,
+    KnowledgeGraphGoalClaimSource, KnowledgeGraphStore, KnowledgeSpaceScope,
 };
-use rakka_agent_workflow::AgentTimestampMillis;
+use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 
 const NOW: AgentTimestampMillis = AgentTimestampMillis::new(10);
 
@@ -212,5 +212,56 @@ async fn the_limit_and_the_named_spaces_bound_the_join() {
     assert!(
         refs.is_empty(),
         "a space the source was never given is not joined"
+    );
+}
+
+/// A tombstoned claim's content was withdrawn, so the goal view stops listing
+/// it: the join reads the store's default discovery, which hides a stub.
+#[tokio::test]
+async fn a_tombstoned_claim_leaves_the_goal_join() {
+    let store = Arc::new(InMemoryKnowledgeGraphStore::new());
+    let scope = space_scope();
+    let kept = append_claim(&store, &scope, "append-1", &goal(), false).await;
+    let withdrawn = append_claim(&store, &scope, "append-2", &goal(), false).await;
+
+    let stub = store
+        .tombstone(
+            &scope,
+            &ClaimTombstoneRequest {
+                claim_id: withdrawn.claim_id.clone(),
+                operation_id: ClaimOperationId::derive_tombstone(
+                    &scope,
+                    &withdrawn.claim_id,
+                    "withdraw",
+                )
+                .expect("the operation id derives"),
+                reason: ClaimTombstoneReason::Withdrawn,
+                actor: PrincipalRef {
+                    principal_type: "user".to_string(),
+                    principal_id: "privacy-officer".to_string(),
+                    display_name: None,
+                },
+                tombstoned_at: AgentTimestampMillis::new(20),
+            },
+        )
+        .await
+        .expect("the tombstone applies");
+    // The stub still names the goal in its provenance: it is the store's
+    // default discovery that keeps it out, not a provenance mismatch.
+    assert_eq!(stub.provenance.goal.as_ref(), Some(&goal()));
+
+    let source = KnowledgeGraphGoalClaimSource::new(store).with_space(space());
+    let refs = source
+        .claims_for_goal(&tenant(), &goal(), 16)
+        .await
+        .expect("the source answers");
+    let answered: Vec<&str> = refs
+        .iter()
+        .map(|reference| reference.claim.as_str())
+        .collect();
+    assert_eq!(
+        answered,
+        [kept.claim_id.as_str()],
+        "the goal view lists only the live claim"
     );
 }

@@ -41,6 +41,9 @@
 //! | Bounded query | keyset cursor walk under the effective (declared) page limit | [`bounded_queries`] |
 //! | Bounded traversal | deterministic breadth-first expansion with explicit budget cuts | [`bounded_traversal`] |
 //! | Trust transition and audit | the 4×4 legality table, cross-kind operation conflicts, the history cap, replay convergence, and the gated promotion | [`transition_legality_and_replay`], [`promotion_gate`] |
+//! | Tombstone (specification 13.1) | withdraw one claim's content, keep the auditable stub, and refuse every replay of its earlier operations | [`tombstone_withdraws_content`], [`tombstoned_claims_are_hidden_from_discovery`], [`a_stub_is_frozen`], [`tombstone_replay_and_erased_operations`], [`tombstone_isolation`] |
+//! | Delete (specification 13.1) | remove one claim and its history so that no replayed write restores it, fenced on the state the caller read | [`delete_erases_a_claim`], [`a_deleted_claim_cannot_be_restored_by_replay`], [`a_stale_delete_changes_nothing`], [`delete_isolation`], [`erasure_operation_kinds`], [`an_erasure_operation_id_belongs_to_one_claim`] |
+//! | Retention (specification 13.1) | age claims out of one space by a window per trust status, bounded and resumable, never a claim that moved under the sweep | [`retention_ages_claims_by_trust_status`], [`retention_is_bounded_and_resumable`], [`retention_leaves_a_claim_that_moved`] |
 //! | Migration | backend-owned: idempotent schema application and the concurrent-migrator race | each backend crate's own migration tests |
 //!
 //! Migration deliberately has no shared clause: the portable SPI has no
@@ -73,6 +76,21 @@ use crate::store::{
     CLAIM_PAGE_MAX_ENTRIES, CLAIM_TRAVERSAL_MAX_DEPTH,
 };
 use crate::transition::ClaimTrustTransitionRequest;
+
+mod erasure;
+mod retention;
+
+pub use erasure::{
+    a_deleted_claim_cannot_be_restored_by_replay, a_stale_delete_changes_nothing, a_stub_is_frozen,
+    an_erasure_operation_id_belongs_to_one_claim, delete_erases_a_claim, delete_isolation,
+    erasure_operation_kinds, tombstone_isolation, tombstone_replay_and_erased_operations,
+    tombstone_withdraws_content, tombstoned_claims_are_hidden_from_discovery,
+};
+
+pub use retention::{
+    retention_ages_claims_by_trust_status, retention_is_bounded_and_resumable,
+    retention_leaves_a_claim_that_moved,
+};
 
 /// The two scopes a conformance clause works with: the scope under test, and
 /// a foreign scope (different tenant *and* different space id) proving
@@ -248,7 +266,7 @@ pub fn promotion_grant_for(
 
 /// A promotion request carrying the given evidence, at transition
 /// discriminator `discriminator`.
-fn promotion_request(
+pub(crate) fn promotion_request(
     scope: &KnowledgeSpaceScope,
     claim: &Claim,
     discriminator: &str,
@@ -270,7 +288,7 @@ fn promotion_request(
 }
 
 /// A non-promotion transition request.
-fn transition_request(
+pub(crate) fn transition_request(
     scope: &KnowledgeSpaceScope,
     claim_id: &ClaimId,
     discriminator: &str,
@@ -294,7 +312,7 @@ fn transition_request(
 /// and serve it, so one page is not guaranteed to hold everything a filter
 /// admits. Only [`bounded_queries`] — the clause about paging itself — inspects
 /// pages directly.
-async fn drained_query(
+pub(crate) async fn drained_query(
     store: &dyn KnowledgeGraphStore,
     scope: &KnowledgeSpaceScope,
     filter: &ClaimFilter,
@@ -1325,6 +1343,30 @@ pub async fn check_knowledge_graph_contract(store: &dyn KnowledgeGraphStore) {
     transition_legality_and_replay(store, ConformanceScopes::unique("legality")).await;
     promotion_gate(store, ConformanceScopes::unique("gate")).await;
     capability_report_coherence(store).await;
+    tombstone_withdraws_content(store, ConformanceScopes::unique("tombstone")).await;
+    tombstoned_claims_are_hidden_from_discovery(
+        store,
+        ConformanceScopes::unique("tombstone-discovery"),
+    )
+    .await;
+    a_stub_is_frozen(store, ConformanceScopes::unique("tombstone-frozen")).await;
+    tombstone_replay_and_erased_operations(store, ConformanceScopes::unique("tombstone-replay"))
+        .await;
+    tombstone_isolation(store, ConformanceScopes::unique("tombstone-isolation")).await;
+    delete_erases_a_claim(store, ConformanceScopes::unique("delete")).await;
+    a_deleted_claim_cannot_be_restored_by_replay(store, ConformanceScopes::unique("delete-replay"))
+        .await;
+    a_stale_delete_changes_nothing(store, ConformanceScopes::unique("delete-stale")).await;
+    delete_isolation(store, ConformanceScopes::unique("delete-isolation")).await;
+    erasure_operation_kinds(store, ConformanceScopes::unique("erasure-kinds")).await;
+    an_erasure_operation_id_belongs_to_one_claim(
+        store,
+        ConformanceScopes::unique("erasure-one-claim"),
+    )
+    .await;
+    retention_ages_claims_by_trust_status(store, ConformanceScopes::unique("retention-ages")).await;
+    retention_is_bounded_and_resumable(store, ConformanceScopes::unique("retention-bounded")).await;
+    retention_leaves_a_claim_that_moved(store, ConformanceScopes::unique("retention-moved")).await;
 }
 
 #[cfg(test)]

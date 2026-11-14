@@ -11,9 +11,9 @@ use rakka_agent_knowledge_graph::store::{
     ClaimTraversal, ClaimTraversalReport, KnowledgeGraphCapabilities,
 };
 use rakka_agent_knowledge_graph::{
-    Claim, ClaimFuture, ClaimId, ClaimPromotionPolicy, ClaimTransitionOutcome,
-    ClaimTrustTransitionRequest, InMemoryKnowledgeGraphStore, KnowledgeGraphStore,
-    KnowledgeSpaceScope,
+    Claim, ClaimDeleteRequest, ClaimFuture, ClaimId, ClaimPromotionPolicy, ClaimTombstoneRequest,
+    ClaimTransitionOutcome, ClaimTrustTransitionRequest, InMemoryKnowledgeGraphStore,
+    KnowledgeGraphStore, KnowledgeSpaceScope,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -92,6 +92,120 @@ async fn the_promotion_gate_fails_closed_and_stamps_receipts() {
 async fn the_capability_report_is_coherent() {
     let store = InMemoryKnowledgeGraphStore::new();
     conformance::capability_report_coherence(&store).await;
+}
+
+#[tokio::test]
+async fn a_tombstone_withdraws_content_and_keeps_the_audit_stub() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::tombstone_withdraws_content(&store, ConformanceScopes::unique("tombstone")).await;
+}
+
+#[tokio::test]
+async fn a_tombstoned_claim_is_hidden_from_discovery() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::tombstoned_claims_are_hidden_from_discovery(
+        &store,
+        ConformanceScopes::unique("tombstone-discovery"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_tombstoned_claim_is_frozen() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::a_stub_is_frozen(&store, ConformanceScopes::unique("tombstone-frozen")).await;
+}
+
+#[tokio::test]
+async fn a_tombstone_erases_every_earlier_operation_of_its_claim() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::tombstone_replay_and_erased_operations(
+        &store,
+        ConformanceScopes::unique("tombstone-replay"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_foreign_tombstone_reveals_and_withdraws_nothing() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::tombstone_isolation(&store, ConformanceScopes::unique("tombstone-isolation"))
+        .await;
+}
+
+#[tokio::test]
+async fn a_delete_removes_a_claim_and_its_history() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::delete_erases_a_claim(&store, ConformanceScopes::unique("delete")).await;
+}
+
+#[tokio::test]
+async fn no_replay_restores_a_deleted_claim() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::a_deleted_claim_cannot_be_restored_by_replay(
+        &store,
+        ConformanceScopes::unique("delete-replay"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_stale_delete_changes_and_spends_nothing() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::a_stale_delete_changes_nothing(&store, ConformanceScopes::unique("delete-stale"))
+        .await;
+}
+
+#[tokio::test]
+async fn a_foreign_delete_reveals_and_removes_nothing() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::delete_isolation(&store, ConformanceScopes::unique("delete-isolation")).await;
+}
+
+#[tokio::test]
+async fn an_operation_id_reused_across_erasure_kinds_is_a_conflict() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::erasure_operation_kinds(&store, ConformanceScopes::unique("erasure-kinds")).await;
+}
+
+#[tokio::test]
+async fn an_erasure_operation_id_replayed_against_another_claim_is_a_conflict() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::an_erasure_operation_id_belongs_to_one_claim(
+        &store,
+        ConformanceScopes::unique("erasure-one-claim"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn retention_ages_claims_out_by_a_window_per_trust_status() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::retention_ages_claims_by_trust_status(
+        &store,
+        ConformanceScopes::unique("retention-ages"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_retention_pass_is_bounded_and_resumes_from_its_cursor() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::retention_is_bounded_and_resumable(
+        &store,
+        ConformanceScopes::unique("retention-bounded"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn retention_keeps_a_claim_that_moved_under_the_sweep() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::retention_leaves_a_claim_that_moved(
+        &store,
+        ConformanceScopes::unique("retention-moved"),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -191,6 +305,22 @@ impl KnowledgeGraphStore for ShallowKnowledgeGraphStore {
         cursor: ClaimTransitionCursor,
     ) -> ClaimFuture<'a, ClaimTransitionPage> {
         self.inner.transitions(scope, claim_id, cursor)
+    }
+
+    fn tombstone<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimTombstoneRequest,
+    ) -> ClaimFuture<'a, Claim> {
+        self.inner.tombstone(scope, request)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimDeleteRequest,
+    ) -> ClaimFuture<'a, ()> {
+        self.inner.delete(scope, request)
     }
 }
 

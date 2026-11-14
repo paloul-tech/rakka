@@ -18,15 +18,27 @@
 //!   domain crate's `restore` doors, so schema-window gating, statement-digest
 //!   re-derivation, and trust-coherence checks run fail-closed on every load.
 //!   The columns beside it (`subject`, `predicate`, `object_node`, `trust`,
-//!   `transition_count`) are denormalized only for traversal predicates and
-//!   the compare-and-set fence; a row whose columns drift from its own record
-//!   is refused, never silently preferred.
+//!   `transition_count`, `tombstoned`) are denormalized only for traversal
+//!   predicates and the compare-and-set fence; a row whose columns drift from
+//!   its own record is refused, never silently preferred.
 //! - **Every write is one data-modifying-CTE statement** — one implicit
 //!   transaction on the shared pipelined client, never `BEGIN`/`COMMIT` — so
 //!   a claim mutation, its transition row, and its operation-ledger row commit
 //!   or fail together. The ledger stores each operation's original result;
 //!   a replay answers those bytes, never a re-derivation (scenario 16), and a
 //!   decided promotion gate is not re-evaluated on replay.
+//! - **Erasure rewrites the ledger in the same statement.** A tombstone
+//!   replaces the claim row with a content-free stub and sets the ledger rows
+//!   of the claim's append and of every earlier transition to an `erased`
+//!   kind with an empty payload; a delete removes the claim row and its
+//!   transition rows and erases the same ledger rows, plus a tombstone's. An
+//!   erased row keeps its operation id, which is what stops a replayed append
+//!   from restoring the claim: the statement finds the row before it would
+//!   insert anything. Erased and deleted ledger rows are kept for good.
+//! - **A stub row's `transition_count` column holds a fence value**
+//!   ([`TOMBSTONE_FENCE_TRANSITION_COUNT`]), not the count, so a transition
+//!   statement from a binary that predates tombstones cannot match a stub and
+//!   write the statement back over it.
 //! - **Queries are keyset scans with the shared admission rule.**
 //!   [`rakka_agent_knowledge_graph::store::ClaimFilter`] deliberately exposes
 //!   no field accessors, so its predicate cannot be pushed into SQL; the store
@@ -52,6 +64,16 @@
 //! applied by [`PostgresKnowledgeGraphStore::migrate`], idempotently, under
 //! the crate's own advisory lock.
 //!
+//! # Rolling this build out
+//!
+//! Run `migrate` from this build **first**: its reads select the `tombstoned`
+//! column. The migration is safe under binaries from before tombstones — the
+//! new column has a default their statements never name, and the ledger's
+//! check only widens. Then upgrade every binary that reads the graph, and only
+//! then call `tombstone`, `delete` or the retention sweep. A binary that was
+//! missed fails closed: a stub answers it `schema-version-ahead`, and a replay
+//! of an erased operation answers it `claim-operation-conflict`.
+//!
 //! Gated tests run only when `RAKKA_POSTGRES_TEST_DSN` is set, like the other
 //! PostgreSQL adapter crates:
 //!
@@ -74,14 +96,19 @@ use rakka_agent_knowledge_graph::store::{
     ClaimTraversal, ClaimTraversalDirection, ClaimTraversalReport, KnowledgeGraphCapabilities,
     KnowledgeGraphStore,
 };
+use rakka_agent_knowledge_graph::tombstone::{ClaimDeleteRequest, ClaimTombstoneRequest};
 use rakka_agent_knowledge_graph::transition::{
     ClaimTransitionOutcome, ClaimTrustTransition, ClaimTrustTransitionRecord,
     ClaimTrustTransitionRequest,
 };
 use rakka_agent_knowledge_graph::ClaimTrustStatus;
+use rakka_agent_knowledge_graph::CLAIM_TOMBSTONE_MARKER;
 use rakka_agent_workflow::AgentTimestampMillis;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Row};
+
+mod erasure;
 
 /// Stable backend name, reported for diagnostics and error detail.
 pub const BACKEND_NAME: &str = "postgres";
@@ -116,6 +143,23 @@ pub const MIGRATION_LOCK_ID: i64 = 982_451_927;
 /// [`transition`]: KnowledgeGraphStore::transition
 pub const TRANSITION_CAS_MAX_ATTEMPTS: usize = 8;
 
+/// The value a tombstoned stub's row holds in its `transition_count` column.
+///
+/// Not the claim's transition count — that stays in the authoritative record —
+/// but a reserved value above every count a claim can reach
+/// (`CLAIM_MAX_TRUST_TRANSITIONS` is 32), so **no reader can hold it as an
+/// expectation**. It exists for binaries from before tombstones: their
+/// transition statement fences only on the transition count they read, and a
+/// tombstone does not change that count. Had the stub row kept it, a
+/// transition such a binary had in flight when the tombstone committed would
+/// still match the row and write the full statement back over the stub. With
+/// the fence value in the column, that update matches nothing.
+///
+/// This is the one stated exception to "the denormalized columns agree with
+/// the record", and the drift check knows it: a stub row holding any other
+/// value is refused as drift.
+pub const TOMBSTONE_FENCE_TRANSITION_COUNT: i32 = i32::MAX;
+
 /// Rows one query-scan batch reads before admission filtering.
 const QUERY_SCAN_BATCH_ROWS: i64 = 256;
 
@@ -129,9 +173,40 @@ const QUERY_SCAN_BATCH_ROWS: i64 = 256;
 /// `transition_count` is the compare-and-set fence. The `record` column is
 /// the authoritative claim, re-validated fail-closed on every load. The
 /// operation ledger is scope-wide — not claim-scoped — which is what makes an
-/// operation id reused across kinds detectable (`claim-operation-conflict`),
-/// and its `result` is `NOT NULL` because this crate has no deletion path:
-/// `Retracted` is the auditable withdrawal.
+/// operation id reused across kinds detectable (`claim-operation-conflict`).
+/// Its `result` stays `NOT NULL` through erasure: an erased row and a delete's
+/// own row hold empty bytes, never `NULL`, so a binary from before tombstones
+/// that reads one decodes a value rather than panicking on a null.
+///
+/// Fresh tables are created in the current shape. Existing ones are upgraded
+/// in place by the trailing block, which adds the `tombstoned` column and
+/// widens the ledger's `kind` check — each only when it is not already there.
+///
+/// What the upgrade costs, stated exactly, because it runs while earlier
+/// binaries are serving:
+///
+/// - The whole of this text is one statement batch and so one transaction.
+///   The first time it runs against an earlier schema it takes an `ACCESS
+///   EXCLUSIVE` lock on the claim table (for the column) and on the ledger
+///   table (for the check), and holds both until the batch commits. Nothing in
+///   the batch scans or rewrites a table — a column with a constant default is
+///   a catalog change, and the wider check is added `NOT VALID` — so the locks
+///   are held for catalog work only.
+/// - The scan that validates the wider check is **not** here. It is
+///   [`MIGRATION_VALIDATE_SQL`], which [`PostgresKnowledgeGraphStore::migrate`]
+///   runs as a statement of its own, under a lock a writer does not conflict
+///   with.
+/// - A repeat run alters nothing and takes no `ACCESS EXCLUSIVE` lock. It
+///   still takes the brief `SHARE` lock `CREATE INDEX IF NOT EXISTS` always
+///   takes on a table whose index already exists.
+/// - The batch sets no `lock_timeout`. A session holding a conflicting lock on
+///   either table (a long `pg_dump`, say) makes the upgrade wait, and
+///   statements arriving behind it wait too. A deployment that would rather
+///   fail fast sets `lock_timeout` on the session it migrates from.
+///
+/// Both changes are safe under a binary from before tombstones that is still
+/// appending: its insert does not name the new column, and both kinds it
+/// writes are in the wider check.
 pub const MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS rakka_agent_knowledge_claim (
     tenant TEXT NOT NULL,
@@ -144,6 +219,7 @@ CREATE TABLE IF NOT EXISTS rakka_agent_knowledge_claim (
     trust TEXT NOT NULL CHECK (trust IN ('proposed', 'verified', 'disputed', 'retracted')),
     transition_count INTEGER NOT NULL CHECK (transition_count >= 0),
     record BYTEA NOT NULL,
+    tombstoned BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (tenant, space, claim_id)
 );
 
@@ -167,15 +243,97 @@ CREATE TABLE IF NOT EXISTS rakka_agent_knowledge_claim_op (
     tenant TEXT NOT NULL,
     space TEXT NOT NULL,
     operation_id TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('append', 'transition')),
+    kind TEXT NOT NULL,
     result BYTEA NOT NULL,
-    PRIMARY KEY (tenant, space, operation_id)
+    PRIMARY KEY (tenant, space, operation_id),
+    CONSTRAINT rakka_agent_knowledge_claim_op_kind_check
+        CHECK (kind IN ('append', 'transition', 'tombstone', 'delete', 'erased'))
 );
+
+DO $migrate$
+DECLARE
+    stale RECORD;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'rakka_agent_knowledge_claim'::regclass
+          AND attname = 'tombstoned'
+          AND NOT attisdropped
+    ) THEN
+        ALTER TABLE rakka_agent_knowledge_claim
+            ADD COLUMN tombstoned BOOLEAN NOT NULL DEFAULT FALSE;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'rakka_agent_knowledge_claim_op'::regclass
+          AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%''erased''%'
+    ) THEN
+        FOR stale IN
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'rakka_agent_knowledge_claim_op'::regclass
+              AND contype = 'c'
+              AND pg_get_constraintdef(oid) LIKE '%kind%'
+        LOOP
+            EXECUTE format(
+                'ALTER TABLE rakka_agent_knowledge_claim_op DROP CONSTRAINT %I',
+                stale.conname
+            );
+        END LOOP;
+        ALTER TABLE rakka_agent_knowledge_claim_op
+            ADD CONSTRAINT rakka_agent_knowledge_claim_op_kind_check
+            CHECK (kind IN ('append', 'transition', 'tombstone', 'delete', 'erased'))
+            NOT VALID;
+    END IF;
+END
+$migrate$;
+"#;
+
+/// Validates the ledger's widened `kind` check, when [`MIGRATION_SQL`] left
+/// it unvalidated.
+///
+/// A statement of its own, and so a transaction of its own: `VALIDATE
+/// CONSTRAINT` takes a `SHARE UPDATE EXCLUSIVE` lock, which reads and writes
+/// do not conflict with, but only once the `ACCESS EXCLUSIVE` lock the check
+/// was added under has been released by a commit. Run inside the batch that
+/// added the check, the scan of the whole ledger would happen under that
+/// exclusive lock and stall every graph statement for as long as it took.
+///
+/// The check refuses new rows from the moment it is added, validated or not,
+/// and every row written before it passed the narrower check it replaced, so
+/// validation cannot fail and nothing depends on it having run. It is run so
+/// an upgraded schema ends identical to a fresh one. A repeat run does nothing.
+pub const MIGRATION_VALIDATE_SQL: &str = r#"
+DO $validate$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'rakka_agent_knowledge_claim_op'::regclass
+          AND conname = 'rakka_agent_knowledge_claim_op_kind_check'
+          AND NOT convalidated
+    ) THEN
+        ALTER TABLE rakka_agent_knowledge_claim_op
+            VALIDATE CONSTRAINT rakka_agent_knowledge_claim_op_kind_check;
+    END IF;
+END
+$validate$;
 "#;
 
 /// One append: the ledger is consulted, the claim row and its ledger row are
 /// written together, and the final row reports which door answered — all one
 /// statement, so there is no crash window between the claim and its ledger.
+///
+/// The ledger insert carries no `ON CONFLICT` clause, on purpose. It runs only
+/// when the claim row was inserted, so a ledger row already there means the
+/// operation id was spent between this statement's snapshot and its insert —
+/// and the one way that happens for an honest writer is the dangerous one: a
+/// duplicate of an append waits on the original's uncommitted claim row, the
+/// original commits, a delete of that claim commits, and the duplicate then
+/// finds no claim row and inserts it. Skipping the ledger insert there would
+/// leave a deleted claim restored beside its erased ledger row. Failing it
+/// aborts the whole statement, claim insert included; `append` then reads the
+/// ledger and answers from it.
 const APPEND_SQL: &str = "
 WITH existing_op AS (
     SELECT kind, result FROM rakka_agent_knowledge_claim_op
@@ -191,7 +349,6 @@ WITH existing_op AS (
 ), ins_op AS (
     INSERT INTO rakka_agent_knowledge_claim_op (tenant, space, operation_id, kind, result)
     SELECT $1, $2, $3, 'append', $10 FROM ins_claim
-    ON CONFLICT (tenant, space, operation_id) DO NOTHING
 )
 SELECT EXISTS (SELECT 1 FROM existing_op) AS replayed,
        (SELECT kind   FROM existing_op)   AS replay_kind,
@@ -228,13 +385,29 @@ SELECT EXISTS (SELECT 1 FROM existing_op) AS replayed,
 ";
 
 const GET_SQL: &str = "
-SELECT record FROM rakka_agent_knowledge_claim
+SELECT record, tombstoned FROM rakka_agent_knowledge_claim
 WHERE tenant = $1 AND space = $2 AND claim_id = $3
 ";
 
-const CLAIM_HEAD_SQL: &str = "
-SELECT record, transition_count FROM rakka_agent_knowledge_claim
-WHERE tenant = $1 AND space = $2 AND claim_id = $3
+/// What every fenced write starts from: the ledger row of its operation id
+/// and the head of its claim, read by **one statement** and therefore under
+/// one snapshot.
+///
+/// Read separately, the two leave a window: a racer running the same
+/// operation can commit between them, and a reader that saw no ledger row
+/// then sees a claim its own operation already moved — and refuses a replay
+/// it should have answered (`claim-transition-illegal` for a transition whose
+/// target the claim now holds, `claim-tombstoned` for a tombstone that
+/// already landed, `claim-not-found` for a delete that already did). A write
+/// commits its claim change and its ledger row together, so one snapshot sees
+/// both or neither.
+const WRITE_START_SQL: &str = "
+SELECT op.kind, op.result, claim.record, claim.tombstoned, claim.transition_count
+FROM (SELECT 1) AS one
+LEFT JOIN rakka_agent_knowledge_claim_op AS op
+       ON op.tenant = $1 AND op.space = $2 AND op.operation_id = $3
+LEFT JOIN rakka_agent_knowledge_claim AS claim
+       ON claim.tenant = $1 AND claim.space = $2 AND claim.claim_id = $4
 ";
 
 const LEDGER_SQL: &str = "
@@ -243,14 +416,14 @@ WHERE tenant = $1 AND space = $2 AND operation_id = $3
 ";
 
 const QUERY_SCAN_FIRST_SQL: &str = "
-SELECT claim_id, record FROM rakka_agent_knowledge_claim
+SELECT claim_id, record, tombstoned FROM rakka_agent_knowledge_claim
 WHERE tenant = $1 AND space = $2
 ORDER BY claim_id
 LIMIT $3
 ";
 
 const QUERY_SCAN_AFTER_SQL: &str = "
-SELECT claim_id, record FROM rakka_agent_knowledge_claim
+SELECT claim_id, record, tombstoned FROM rakka_agent_knowledge_claim
 WHERE tenant = $1 AND space = $2 AND claim_id > $3
 ORDER BY claim_id
 LIMIT $4
@@ -268,8 +441,9 @@ LIMIT $5
 /// the `LIMIT`, so a budget's worth of candidates is a budget's worth of
 /// followable edges, never a shorter answer post-filtered in Rust.
 const TRAVERSAL_EDGE_SCAN_SQL: &str = "
-SELECT claim_id, record FROM rakka_agent_knowledge_claim
+SELECT claim_id, record, tombstoned FROM rakka_agent_knowledge_claim
 WHERE tenant = $1 AND space = $2
+  AND NOT tombstoned
   AND object_node IS NOT NULL
   AND trust = ANY($3)
   AND ($4::TEXT[] IS NULL OR predicate = ANY($4))
@@ -283,10 +457,62 @@ ORDER BY claim_id
 LIMIT $8
 ";
 
+/// The ledger kind of an applied append.
+const KIND_APPEND: &str = "append";
+/// The ledger kind of an applied transition.
+const KIND_TRANSITION: &str = "transition";
+/// The ledger kind of an applied tombstone; its payload is the stub.
+const KIND_TOMBSTONE: &str = "tombstone";
+/// The ledger kind of an applied delete; its payload is empty.
+const KIND_DELETE: &str = "delete";
+/// The ledger kind of an operation whose payload a later tombstone or delete
+/// of its claim erased; its payload is empty.
+const KIND_ERASED: &str = "erased";
+
 /// What the operation ledger answered for one operation id.
 enum LedgerHit {
+    /// An applied append, with the claim it stored.
     Append(Vec<u8>),
+    /// An applied transition, with the outcome it produced.
     Transition(Vec<u8>),
+    /// An applied tombstone, with the stub it stored.
+    Tombstone(Vec<u8>),
+    /// An applied delete.
+    Deleted,
+    /// An operation whose payload was erased with its claim.
+    Erased,
+}
+
+/// What one fenced write found when it read its operation and its claim
+/// together.
+enum WriteStart {
+    /// The operation id is already spent; the ledger answers. The flag says
+    /// whether the claim the request names exists in the scope, which is how
+    /// an erasure tells its own replay from the same id sent for another
+    /// claim.
+    Spent(LedgerHit, bool),
+    /// The operation is new and the claim does not exist in the scope.
+    Absent,
+    /// The operation is new; the claim, and the fence its row holds.
+    Present(Box<Claim>, i32),
+}
+
+impl LedgerHit {
+    /// Reads one ledger row. An unrecognized kind is a failure, never a guess:
+    /// a row this build cannot interpret must not be replayed as an append.
+    fn from_row(kind: &str, result: Vec<u8>) -> ClaimResult<Self> {
+        match kind {
+            KIND_APPEND => Ok(Self::Append(result)),
+            KIND_TRANSITION => Ok(Self::Transition(result)),
+            KIND_TOMBSTONE => Ok(Self::Tombstone(result)),
+            KIND_DELETE => Ok(Self::Deleted),
+            KIND_ERASED => Ok(Self::Erased),
+            other => Err(ClaimError::Backend {
+                backend: BACKEND_NAME.to_string(),
+                message: format!("the ledger holds an operation of unknown kind {other:?}"),
+            }),
+        }
+    }
 }
 
 /// The PostgreSQL [`KnowledgeGraphStore`].
@@ -318,7 +544,13 @@ impl PostgresKnowledgeGraphStore {
             .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
             .await
             .map_err(map_error)?;
-        let applied = self.client.batch_execute(MIGRATION_SQL).await;
+        // Two batches, two transactions: the validating scan must not run under
+        // the exclusive locks the first batch takes (see
+        // `MIGRATION_VALIDATE_SQL`).
+        let applied = match self.client.batch_execute(MIGRATION_SQL).await {
+            Ok(()) => self.client.batch_execute(MIGRATION_VALIDATE_SQL).await,
+            Err(error) => Err(error),
+        };
         let unlocked = self
             .client
             .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
@@ -346,15 +578,70 @@ impl PostgresKnowledgeGraphStore {
             )
             .await
             .map_err(map_error)?;
-        Ok(row.map(|row| {
+        row.map(|row| {
             let kind: String = row.get("kind");
-            let result: Vec<u8> = row.get("result");
-            if kind == "transition" {
-                LedgerHit::Transition(result)
-            } else {
-                LedgerHit::Append(result)
-            }
-        }))
+            LedgerHit::from_row(&kind, row.get("result"))
+        })
+        .transpose()
+    }
+
+    /// Reads, in one snapshot, the ledger row of one operation id and the
+    /// head of one claim — what every fenced write decides from.
+    ///
+    /// A spent operation is answered from the ledger alone, without decoding
+    /// the claim: a replay does not depend on the state the claim has since
+    /// moved to. Otherwise the claim is decoded with the fence its row holds —
+    /// the `transition_count` column: the claim's count for a live row,
+    /// [`TOMBSTONE_FENCE_TRANSITION_COUNT`] for a stub. Any other pairing is
+    /// drift, refused here so no write is ever fenced on it.
+    async fn write_start(
+        &self,
+        scope: &KnowledgeSpaceScope,
+        operation_id: &ClaimOperationId,
+        claim_id: &ClaimId,
+    ) -> ClaimResult<WriteStart> {
+        let row = self
+            .client
+            .query_one(
+                WRITE_START_SQL,
+                &[
+                    &scope.tenant().as_str(),
+                    &scope.space().as_str(),
+                    &operation_id.as_str(),
+                    &claim_id.as_str(),
+                ],
+            )
+            .await
+            .map_err(map_error)?;
+        let record: Option<Vec<u8>> = row.get("record");
+        if let Some(kind) = row.get::<_, Option<String>>("kind") {
+            let result: Option<Vec<u8>> = row.get("result");
+            return Ok(WriteStart::Spent(
+                LedgerHit::from_row(&kind, result.unwrap_or_default())?,
+                record.is_some(),
+            ));
+        }
+        let Some(record) = record else {
+            return Ok(WriteStart::Absent);
+        };
+        let tombstoned: Option<bool> = row.get("tombstoned");
+        let fence: Option<i32> = row.get("transition_count");
+        let (Some(tombstoned), Some(fence)) = (tombstoned, fence) else {
+            return Err(ClaimError::Backend {
+                backend: BACKEND_NAME.to_string(),
+                message: "a claim row was read without its fence columns".to_string(),
+            });
+        };
+        let claim = decode_claim_columns(&record, tombstoned)?;
+        let expected = if claim.is_tombstoned() {
+            TOMBSTONE_FENCE_TRANSITION_COUNT
+        } else {
+            int_count(claim.transition_count())?
+        };
+        if fence != expected {
+            return Err(drift_error(&claim.claim_id));
+        }
+        Ok(WriteStart::Present(Box::new(claim), fence))
     }
 
     /// The candidate edges one frontier node yields, in ascending claim-id
@@ -439,6 +726,13 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
             // The same precedence as the reference implementation: bounds,
             // born-`Proposed`, derived identity — all before any I/O.
             claim.validate()?;
+            // An append stores a live claim: a stub row is written only by the
+            // tombstone statement, which sets its columns and its fence.
+            if claim.is_tombstoned() {
+                return Err(ClaimError::Tombstoned {
+                    claim_id: claim.claim_id.clone(),
+                });
+            }
             if claim.trust() != ClaimTrustStatus::Proposed || claim.transition_count() != 0 {
                 return Err(ClaimError::AppendNotProposed {
                     claim_id: claim.claim_id.clone(),
@@ -465,16 +759,22 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
                 &transition_count,
                 &record,
             ];
-            let row = self
-                .client
-                .query_one(APPEND_SQL, &params)
-                .await
-                .map_err(map_error)?;
-            if row.get::<_, bool>("replayed") {
-                return replayed_append(&row, &claim.operation_id);
-            }
-            if row.get::<_, bool>("applied") {
-                return Ok(claim.clone());
+            match self.client.query_one(APPEND_SQL, &params).await {
+                Ok(row) => {
+                    if row.get::<_, bool>("replayed") {
+                        return replayed_append(&row, &claim.operation_id);
+                    }
+                    if row.get::<_, bool>("applied") {
+                        return Ok(claim.clone());
+                    }
+                }
+                // The claim row went in and the ledger row was already there:
+                // the operation id was spent while this statement waited. The
+                // statement aborted whole, so nothing was written — the ledger
+                // decides below, and an erased row answers
+                // `claim-operation-erased` instead of a restored claim.
+                Err(error) if is_unique_violation(&error) => {}
+                Err(error) => return Err(map_error(error)),
             }
             // Neither door answered: a concurrent writer got between the
             // ledger read and the insert. Re-consult the ledger once — a
@@ -482,9 +782,14 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
             // whose presence under a different operation is the id collision.
             match self.ledger_hit(scope, claim.operation_id.as_str()).await? {
                 Some(LedgerHit::Append(result)) => decode_claim(&result),
-                Some(LedgerHit::Transition(_)) => Err(ClaimError::OperationConflict {
+                Some(LedgerHit::Erased) => Err(ClaimError::OperationErased {
                     operation_id: claim.operation_id.clone(),
                 }),
+                Some(LedgerHit::Transition(_) | LedgerHit::Tombstone(_) | LedgerHit::Deleted) => {
+                    Err(ClaimError::OperationConflict {
+                        operation_id: claim.operation_id.clone(),
+                    })
+                }
                 None => {
                     let occupied = self
                         .client
@@ -689,47 +994,44 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
     ) -> ClaimFuture<'a, ClaimTransitionOutcome> {
         Box::pin(async move {
             for _ in 0..TRANSITION_CAS_MAX_ATTEMPTS {
-                // Ledger first, on every attempt: a replay answers the
-                // original outcome without re-running legality or the gate —
-                // a decided promotion is not re-litigated, even by a grant
-                // that has since expired.
-                match self
-                    .ledger_hit(scope, request.operation_id.as_str())
+                // The ledger first, on every attempt, and in the same
+                // snapshot as the claim: a replay answers the original outcome
+                // without re-running legality or the gate — a decided
+                // promotion is not re-litigated, even by a grant that has
+                // since expired — and never against a claim the same
+                // operation already moved.
+                let (claim, fence) = match self
+                    .write_start(scope, &request.operation_id, &request.claim_id)
                     .await?
                 {
-                    Some(LedgerHit::Transition(result)) => return decode_outcome(&result),
-                    Some(LedgerHit::Append(_)) => {
+                    WriteStart::Spent(LedgerHit::Transition(result), _) => {
+                        return decode_outcome(&result);
+                    }
+                    WriteStart::Spent(LedgerHit::Erased, _) => {
+                        return Err(ClaimError::OperationErased {
+                            operation_id: request.operation_id.clone(),
+                        });
+                    }
+                    WriteStart::Spent(
+                        LedgerHit::Append(_) | LedgerHit::Tombstone(_) | LedgerHit::Deleted,
+                        _,
+                    ) => {
                         return Err(ClaimError::OperationConflict {
                             operation_id: request.operation_id.clone(),
                         });
                     }
-                    None => {}
-                }
-                let Some(head) = self
-                    .client
-                    .query_opt(
-                        CLAIM_HEAD_SQL,
-                        &[
-                            &scope.tenant().as_str(),
-                            &scope.space().as_str(),
-                            &request.claim_id.as_str(),
-                        ],
-                    )
-                    .await
-                    .map_err(map_error)?
-                else {
                     // Absent and out-of-scope are the same refusal
                     // (scenario 18).
-                    return Err(ClaimError::NotFound {
-                        claim_id: request.claim_id.clone(),
-                    });
+                    WriteStart::Absent => {
+                        return Err(ClaimError::NotFound {
+                            claim_id: request.claim_id.clone(),
+                        });
+                    }
+                    WriteStart::Present(claim, fence) => (*claim, fence),
                 };
-                let claim = decode_claim_row(&head)?;
-                let fence: i32 = head.get("transition_count");
-                if fence != int_count(claim.transition_count())? {
-                    return Err(drift_error(&claim.claim_id));
-                }
 
+                // Refuses a stub (`claim-tombstoned`) before the table is
+                // consulted: a stub's trust is frozen.
                 let updated = claim.apply_transition(request.to)?;
                 let gate = if request.to == ClaimTrustStatus::Verified {
                     validate_promotion(scope, &claim, policy, request.promotion.as_deref(), now)?
@@ -795,7 +1097,9 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
                     return Ok(outcome);
                 }
                 // The fence moved: a concurrent operation won the race. Loop —
-                // the fresh read re-runs legality against the state that won.
+                // the fresh read re-runs legality against the state that won,
+                // which may now be a stub (`claim-tombstoned`) or no claim at
+                // all (`claim-not-found`).
             }
             Err(ClaimError::Backend {
                 backend: BACKEND_NAME.to_string(),
@@ -845,6 +1149,22 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
             Ok(ClaimTransitionPage { transitions, next })
         })
     }
+
+    fn tombstone<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimTombstoneRequest,
+    ) -> ClaimFuture<'a, Claim> {
+        Box::pin(self.tombstone_claim(scope, request))
+    }
+
+    fn delete<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimDeleteRequest,
+    ) -> ClaimFuture<'a, ()> {
+        Box::pin(self.delete_claim(scope, request))
+    }
 }
 
 /// The neighbor an edge yields for a frontier node, per direction — the
@@ -869,7 +1189,12 @@ fn replayed_append(row: &Row, operation_id: &ClaimOperationId) -> ClaimResult<Cl
     let kind: Option<String> = row.get("replay_kind");
     let result: Option<Vec<u8>> = row.get("replay_result");
     match (kind.as_deref(), result) {
-        (Some("append"), Some(result)) => decode_claim(&result),
+        (Some(KIND_APPEND), Some(result)) => decode_claim(&result),
+        // Found before anything was inserted: this is what stops a replayed
+        // append from restoring a tombstoned or deleted claim.
+        (Some(KIND_ERASED), _) => Err(ClaimError::OperationErased {
+            operation_id: operation_id.clone(),
+        }),
         (Some(_), _) => Err(ClaimError::OperationConflict {
             operation_id: operation_id.clone(),
         }),
@@ -889,7 +1214,10 @@ fn replayed_transition(
     let kind: Option<String> = row.get("replay_kind");
     let result: Option<Vec<u8>> = row.get("replay_result");
     match (kind.as_deref(), result) {
-        (Some("transition"), Some(result)) => decode_outcome(&result),
+        (Some(KIND_TRANSITION), Some(result)) => decode_outcome(&result),
+        (Some(KIND_ERASED), _) => Err(ClaimError::OperationErased {
+            operation_id: operation_id.clone(),
+        }),
         (Some(_), _) => Err(ClaimError::OperationConflict {
             operation_id: operation_id.clone(),
         }),
@@ -939,9 +1267,24 @@ fn decode_claim(bytes: &[u8]) -> ClaimResult<Claim> {
     Claim::restore(record)
 }
 
+/// Decodes one claim row, refusing a `tombstoned` column that disagrees with
+/// the record it sits beside.
+///
+/// Every read statement selects the column, so a stub record under a live
+/// column — or a live record under a stub column — is refused on every load
+/// rather than preferred either way.
 fn decode_claim_row(row: &Row) -> ClaimResult<Claim> {
     let record: Vec<u8> = row.get("record");
-    decode_claim(&record)
+    decode_claim_columns(&record, row.get("tombstoned"))
+}
+
+/// Decodes one claim from its record and the `tombstoned` column beside it.
+fn decode_claim_columns(record: &[u8], tombstoned: bool) -> ClaimResult<Claim> {
+    let claim = decode_claim(record)?;
+    if tombstoned != claim.is_tombstoned() {
+        return Err(drift_error(&claim.claim_id));
+    }
+    Ok(claim)
 }
 
 /// Decodes a transition through its record mirror and
@@ -962,6 +1305,13 @@ fn decode_outcome(bytes: &[u8]) -> ClaimResult<ClaimTransitionOutcome> {
         backend: BACKEND_NAME.to_string(),
         message: format!("a stored transition outcome could not be parsed: {error}"),
     })
+}
+
+/// Whether a statement failed on a primary-key or unique constraint.
+fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
+    error
+        .as_db_error()
+        .is_some_and(|db_error| db_error.code() == &SqlState::UNIQUE_VIOLATION)
 }
 
 /// Maps a PostgreSQL error into the claim-domain backend error.
