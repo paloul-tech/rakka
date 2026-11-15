@@ -391,6 +391,7 @@ fn chain_provenance(
     rakka_agent::AgentTaskDelegationProvenance {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
             .expect("the delegation id derives"),
         parent_task: AgentTaskId::new("root-task").expect("task id should be valid"),
@@ -518,6 +519,7 @@ async fn an_unaccounted_ancestry_refuses_sub_delegation() {
     let provenance = rakka_agent::AgentTaskDelegationProvenance {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
             .expect("the delegation id derives"),
         parent_task: AgentTaskId::new("root-task").expect("task id should be valid"),
@@ -560,6 +562,7 @@ async fn an_incoherent_ancestry_refuses_the_child_creation() {
     let provenance = rakka_agent::AgentTaskDelegationProvenance {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
             .expect("the delegation id derives"),
         parent_task: AgentTaskId::new("root-task").expect("task id should be valid"),

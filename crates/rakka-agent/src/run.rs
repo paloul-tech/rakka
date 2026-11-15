@@ -3187,23 +3187,23 @@ fn plan_delegation_call(
     let environments = envelope
         .map(|env| env.environments.clone())
         .unwrap_or_default();
-    let knowledge_spaces = match envelope.and_then(|env| env.knowledge_spaces.as_ref()) {
-        Some(granted) => target
-            .knowledge_spaces
-            .intersection(granted)
-            .cloned()
-            .collect(),
-        None if envelope.is_some_and(|env| !env.lineage.is_empty()) => {
-            // A chain whose own grant statement predates the field cannot
-            // prove what it may re-delegate: deny-when-unknown, the
-            // ancestry-gap posture.
-            std::collections::BTreeSet::new()
-        }
-        None => target.knowledge_spaces.clone(),
-    };
+    // The read capabilities ride the same rule: one shared derivation, so
+    // the two delegated dimensions cannot drift apart.
+    let has_lineage = envelope.is_some_and(|env| !env.lineage.is_empty());
+    let knowledge_spaces = crate::delegation::delegated_grant(
+        &target.knowledge_spaces,
+        envelope.and_then(|env| env.knowledge_spaces.as_ref()),
+        has_lineage,
+    );
+    let read_capabilities = crate::delegation::delegated_grant(
+        &target.read_capabilities,
+        envelope.and_then(|env| env.read_capabilities.as_ref()),
+        has_lineage,
+    );
     let record = AgentDelegationRecord {
         environments,
         knowledge_spaces,
+        read_capabilities,
         delegation: delegation_id.clone(),
         goal,
         parent_task: task,
@@ -12206,6 +12206,7 @@ mod tests {
             let record = crate::delegation::AgentDelegationRecord {
                 environments: Default::default(),
                 knowledge_spaces: Default::default(),
+                read_capabilities: Default::default(),
                 delegation: delegation.clone(),
                 goal: None,
                 parent_task: AgentTaskId::new(&long).expect("the task id is valid"),

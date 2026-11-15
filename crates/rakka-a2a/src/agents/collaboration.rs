@@ -296,6 +296,7 @@ impl AgentCollaborationMetadata {
         Ok(AgentTaskDelegationProvenance {
             environments,
             knowledge_spaces,
+            read_capabilities: std::collections::BTreeSet::new(),
             delegation: AgentDelegationId::new(&self.delegation)?,
             parent_task: AgentTaskId::new(&self.parent_task)?,
             parent_run,
@@ -450,6 +451,7 @@ impl AgentHandoffCollaborationMetadata {
             policy_revision: AgentRevisionNumber::new(self.policy_revision),
             context: self.context.clone(),
             knowledge_spaces,
+            read_capabilities: std::collections::BTreeSet::new(),
         })
     }
 }

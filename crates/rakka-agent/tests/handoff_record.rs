@@ -905,3 +905,186 @@ async fn pre_slice_records_decode_without_the_handoff_fields() {
         "an absent handoff never reaches the serialized view"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #69: a handoff carries the catalog's read-capability statement for
+// its target, and the target's run envelope holds that statement narrowed by
+// the task's own grant — a handoff can never widen what a task may read.
+// ---------------------------------------------------------------------------
+
+fn read_capabilities(ids: &[&str]) -> std::collections::BTreeSet<rakka_agent::AgentCapabilityId> {
+    ids.iter()
+        .map(|id| rakka_agent::AgentCapabilityId::new(*id).expect("the capability id is valid"))
+        .collect()
+}
+
+/// The handoff fixture's wiring with a catalog that states the read
+/// capabilities the handoff target is delegated.
+fn handoff_config_delegating_reads(ids: &[&str]) -> rakka_agent::AgentRunDelegationConfig {
+    let mut target = common::handoff_target();
+    for capability in read_capabilities(ids) {
+        target = target.with_read_capability(capability);
+    }
+    rakka_agent::AgentRunDelegationConfig::new(
+        common::delegation_tool_id(),
+        Arc::new(
+            rakka_agent::StaticAgentDelegationCatalog::new()
+                .with_target(common::skill_id(), common::delegation_target())
+                .with_target(common::handoff_skill_id(), target),
+        ),
+        std::collections::BTreeSet::from([
+            rakka_agent::AgentCoordinationCapabilityKind::Delegation,
+            rakka_agent::AgentCoordinationCapabilityKind::Handoff,
+        ]),
+    )
+    .expect("the delegation configuration declares the capability")
+    .with_handoff(rakka_agent::AgentHandoffPolicy::new(
+        handoff_tool_id(),
+        rakka_agent::AgentRevisionNumber::INITIAL,
+    ))
+    .expect("the handoff configuration declares the capability")
+}
+
+fn fixture_handing_off_reads(ids: &[&str]) -> Fixture {
+    let fixture = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn(handoff_turn(handoff_arguments()))
+            .with_turn(proposing_turn()),
+    ))
+    .with_delegation(handoff_config_delegating_reads(ids));
+    let executor = ApplyingHandoffExecutor::over(&fixture);
+    let _ = fixture
+        .dispatcher
+        .clone()
+        .with_a2a_handoff_executor(executor);
+    fixture
+}
+
+/// Drives the transfer to the target's own run and answers the
+/// read-capability statement of that run's delegation envelope.
+async fn target_read_capabilities_after_transfer(
+    fixture: &Fixture,
+) -> Option<std::collections::BTreeSet<rakka_agent::AgentCapabilityId>> {
+    fixture.instantiate_agent_at(handoff_target_scope()).await;
+    fixture.pump().await.expect("the loop should converge");
+    for _ in 0..16 {
+        fixture
+            .settle_task_at(&common::task_scope())
+            .await
+            .expect("the task should settle");
+        let now = fixture.now();
+        let mut target = fixture.run_at(&handoff_target_run_scope());
+        target.recover(now).await.expect("the target run recovers");
+        target
+            .settle_side_effects(&fixture.router, fixture.now())
+            .await
+            .expect("the target run settles");
+        let answered = fixture
+            .dispatcher
+            .drive(&mut target, &fixture.router, fixture.now())
+            .await
+            .expect("the dispatcher drives the target");
+        let terminal = target
+            .state()
+            .ok()
+            .and_then(|state| state.status())
+            .is_some_and(AgentRunStatus::is_terminal);
+        if terminal && answered == 0 {
+            break;
+        }
+    }
+    let mut target = fixture.run_at(&handoff_target_run_scope());
+    target.recover(fixture.now()).await.expect("recover");
+    target
+        .state()
+        .expect("the target run state reads")
+        .loop_state()
+        .expect("the target run has a loop")
+        .delegation_envelope()
+        .expect("the target run carries an envelope")
+        .read_capabilities
+        .clone()
+}
+
+/// At the root the task holds no statement of its own, so the catalog's
+/// statement for the target becomes the target's grant.
+#[tokio::test]
+async fn a_root_handoff_grants_the_targets_stated_read_capabilities() {
+    let fixture = fixture_handing_off_reads(&["claims.read.a", "claims.read.b"]);
+    create_goal_task(&fixture).await;
+
+    assert_eq!(
+        target_read_capabilities_after_transfer(&fixture).await,
+        Some(read_capabilities(&["claims.read.a", "claims.read.b"]))
+    );
+    let task = fixture.task_snapshot().await;
+    assert_eq!(
+        task.handoff
+            .as_deref()
+            .expect("the transfer is recorded")
+            .read_capabilities,
+        read_capabilities(&["claims.read.a", "claims.read.b"])
+    );
+}
+
+/// A delegated task that is handed off keeps its own grant as the ceiling:
+/// the target reads the catalog's statement intersected with it.
+#[tokio::test]
+async fn a_delegated_tasks_handoff_intersects_the_targets_statement_with_its_grant() {
+    let fixture = fixture_handing_off_reads(&["claims.read.a", "claims.read.b"]);
+    fixture.instantiate_agent().await;
+    let parent_run = AgentRunScope::new(
+        common::tenant(),
+        rakka_agent::AgentId::new("root-coordinator").expect("the agent id is valid"),
+        rakka_agent::AgentRunId::new("root-task-gen-1").expect("the run id is valid"),
+    )
+    .expect("the scope is valid");
+    let delegation =
+        rakka_agent::delegation_id_for(&parent_run, 2, 0).expect("the delegation id derives");
+    let provenance: rakka_agent::AgentTaskDelegationProvenance = serde_json::from_value(json!({
+        "delegation": delegation,
+        "parent_task": "root-task",
+        "parent_run": parent_run,
+        "lineage": [],
+        "depth": 1,
+        "requested_skill": common::SKILL,
+        "capability_scopes": [],
+        "credential_bindings": [],
+        "result_schema": null,
+        "budget": null,
+        "deadline": null,
+        "read_capabilities": ["claims.read.a", "claims.read.c"]
+    }))
+    .expect("the provenance decodes");
+    fixture
+        .apply_task_command(AgentTaskEntityCommand::Create {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::TaskCreation,
+                [common::TENANT, common::TASK, "1"],
+            )
+            .expect("the operation id derives"),
+            creation: Box::new(rakka_agent::AgentTaskCreation {
+                definition: handoff_task_definition(),
+                input: AgentTaskContent::inline(json!({ "text": "hello" }))
+                    .expect("the input is inline-bounded"),
+                assignee: Some(common::agent_id()),
+                team: None,
+                goal: None,
+                goal_mode: Default::default(),
+                goal_spec: None,
+                parent: Some(provenance.parent_task.clone()),
+                dependencies: Vec::new(),
+                escrow: None,
+                wake: None,
+                delegation: Some(Box::new(provenance)),
+                telemetry: Default::default(),
+            }),
+        })
+        .await
+        .expect("the delegated child task creates");
+
+    assert_eq!(
+        target_read_capabilities_after_transfer(&fixture).await,
+        Some(read_capabilities(&["claims.read.a"]))
+    );
+}

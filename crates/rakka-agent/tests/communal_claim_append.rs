@@ -239,6 +239,7 @@ async fn a_delegated_specialist_appends_under_its_grant_with_its_delegation_stam
     let mut provenance = rakka_agent::AgentTaskDelegationProvenance {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         delegation: delegation.clone(),
         parent_task: rakka_agent::AgentTaskId::new("parent-task").expect("the task id is valid"),
         parent_run,

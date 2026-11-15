@@ -2159,6 +2159,7 @@ impl ApplyingHandoffExecutor {
             policy_revision: record.policy_revision,
             context: record.context.clone(),
             knowledge_spaces: record.resolved.knowledge_spaces.clone(),
+            read_capabilities: record.resolved.read_capabilities.clone(),
         }
     }
 
@@ -2504,6 +2505,7 @@ pub async fn create_real_child(
     let provenance = rakka_agent::AgentTaskDelegationProvenance {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         delegation: delegation.clone(),
         parent_task: task_scope().task().clone(),
         parent_run: run_scope(),

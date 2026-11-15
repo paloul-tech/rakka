@@ -709,6 +709,7 @@ async fn an_aged_out_replay_converges_on_its_own_child_instead_of_conflicting() 
         AgentDelegationRecord {
             environments: Default::default(),
             knowledge_spaces: Default::default(),
+            read_capabilities: Default::default(),
             a2a_message_id: delegation.as_str().to_string(),
             deduplication_key: original_key.clone(),
             delegation,
@@ -869,6 +870,7 @@ async fn an_aged_out_replay_the_child_still_remembers_converges_without_the_prob
         AgentDelegationRecord {
             environments: Default::default(),
             knowledge_spaces: Default::default(),
+            read_capabilities: Default::default(),
             a2a_message_id: delegation.as_str().to_string(),
             deduplication_key: original_key.clone(),
             delegation,
@@ -1013,6 +1015,7 @@ async fn an_aged_out_replay_converges_under_a_read_denying_authorizer() {
     let record = AgentDelegationRecord {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         a2a_message_id: delegation.as_str().to_string(),
         deduplication_key: delegation.as_str().to_string(),
         delegation,

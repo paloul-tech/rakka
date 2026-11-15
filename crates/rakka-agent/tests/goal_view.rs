@@ -267,6 +267,7 @@ async fn create_child(
     let provenance_record = rakka_agent::AgentTaskDelegationProvenance {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         delegation: delegation.clone(),
         parent_task: task_scope().task().clone(),
         parent_run: run_scope(),
@@ -1447,4 +1448,59 @@ async fn a_pending_handoff_joins_the_view_and_resolves_the_source_run() {
         "the goal view and the operational snapshot derive one collaboration shape"
     );
     assert!(snapshot.collaboration.handoff.is_some());
+}
+
+/// The edge view of a delegation shows the read capabilities it delegated,
+/// beside its knowledge spaces (issue #69).
+#[test]
+fn a_delegation_edge_shows_its_read_capabilities() {
+    let parent_run = run_scope();
+    let delegation =
+        rakka_agent::delegation_id_for(&parent_run, 1, 0).expect("the delegation id derives");
+    let record: AgentDelegationRecord = serde_json::from_value(json!({
+        "delegation": delegation,
+        "goal": null,
+        "parent_task": "goal-root",
+        "parent_run": parent_run,
+        "lineage": [],
+        "depth": 1,
+        "requested_skill": "translate",
+        "resolved": {
+            "agent": "translator",
+            "endpoint": null,
+            "task_definition": "translate",
+            "capability_scopes": [],
+            "credential_bindings": [],
+            "result_schema": null,
+            "compatibility": null,
+            "read_capabilities": ["claims.read.a", "claims.read.b"]
+        },
+        "a2a_message_id": delegation,
+        "deduplication_key": delegation,
+        "turn": 1,
+        "slot": 0,
+        "effect": "effect-1",
+        "call_id": "call-1",
+        "input": { "inline": { "text": "hello" } },
+        "result_schema": null,
+        "budget": null,
+        "granted_descendants": null,
+        "deadline": null,
+        "read_capabilities": ["claims.read.a"],
+        "definition_revision": 1,
+        "settings_revision": 1,
+        "created_at": 1
+    }))
+    .expect("the record decodes");
+    let cell = rakka_agent::AgentDelegationCell::pending(Box::new(record));
+
+    let edge = rakka_agent::AgentGoalDelegationEdgeView::derive(&cell);
+    assert_eq!(
+        edge.read_capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claims.read.a"],
+        "the edge shows what the record delegated, not what the catalog stated"
+    );
 }

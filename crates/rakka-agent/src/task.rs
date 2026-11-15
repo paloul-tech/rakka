@@ -2378,6 +2378,12 @@ pub struct AgentTaskHandoff {
     /// statement, so a handoff can never widen communal access.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
+    /// The capabilities for reading communal claims the catalog explicitly
+    /// delegates to the target. The envelope derivation intersects the task's
+    /// own grant with this statement, so a handoff can never widen what the
+    /// task may read.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub read_capabilities: BTreeSet<crate::AgentCapabilityId>,
     /// Where the transfer stands.
     pub status: AgentTaskHandoffStatus,
     /// Whether the handoff-result exchange to the source has settled: the
@@ -2469,6 +2475,11 @@ pub struct AgentTaskHandoffRequest {
     /// target.
     #[serde(default)]
     pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
+    /// The capabilities for reading communal claims the catalog explicitly
+    /// delegates to the target. Omitted when empty, so a request that
+    /// delegates none has the bytes it had before the field existed.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub read_capabilities: BTreeSet<crate::AgentCapabilityId>,
 }
 
 /// The task's *latest* team board claim: the bounded materialized provenance
@@ -5060,21 +5071,23 @@ fn delegation_envelope_for(
         .filter(|handoff| !matches!(handoff.status, AgentTaskHandoffStatus::Refused { .. }))
     {
         if let Some(env) = envelope.as_deref_mut() {
-            env.knowledge_spaces = Some(match env.knowledge_spaces.take() {
-                Some(granted) => handoff
-                    .knowledge_spaces
-                    .intersection(&granted)
-                    .cloned()
-                    .collect(),
-                // A chain without its own grant statement cannot prove what
-                // it may pass on: deny-when-unknown, the ancestry-gap
-                // posture the delegation door takes.
-                None if !env.lineage.is_empty() => BTreeSet::new(),
-                // At the root the definition envelope still bounds every
-                // append, and the catalog's explicit statement becomes the
-                // grant — the delegation door's root posture.
-                None => handoff.knowledge_spaces.clone(),
-            });
+            // The delegation door's own rule, shared with it: a statement the
+            // task holds is intersected; a chain without one cannot prove
+            // what it may pass on and grants nothing; at the root the
+            // definition envelope still bounds everything, and the catalog's
+            // explicit statement becomes the grant. Read capabilities ride
+            // the same rule as knowledge spaces.
+            let has_lineage = !env.lineage.is_empty();
+            env.knowledge_spaces = Some(crate::delegation::delegated_grant(
+                &handoff.knowledge_spaces,
+                env.knowledge_spaces.as_ref(),
+                has_lineage,
+            ));
+            env.read_capabilities = Some(crate::delegation::delegated_grant(
+                &handoff.read_capabilities,
+                env.read_capabilities.as_ref(),
+                has_lineage,
+            ));
         }
     }
     envelope
@@ -5103,6 +5116,9 @@ fn delegation_envelope_base(
             // set when one exists and no statement otherwise.
             knowledge_spaces: (!spec.knowledge_spaces.is_empty())
                 .then(|| spec.knowledge_spaces.clone()),
+            // A goal specification states no read capability: no statement,
+            // and the definition and setup envelopes govern the root's reads.
+            read_capabilities: None,
         }));
     }
     if let Some(provenance) = task.delegation.as_deref() {
@@ -5135,6 +5151,9 @@ fn delegation_envelope_base(
             // provenance's set, which decodes empty — no communal access —
             // for a chain recorded before the field existed.
             knowledge_spaces: Some(provenance.knowledge_spaces.clone()),
+            // The same explicit statement for reads: the provenance's set,
+            // empty for a chain recorded before the field existed.
+            read_capabilities: Some(provenance.read_capabilities.clone()),
         }));
     }
     // The definition is the cap no creation shape escapes: a run with no
@@ -5157,6 +5176,7 @@ fn delegation_envelope_base(
             // A plain or epoch task carries no goal scope and no chain: no
             // grant statement, and the definition envelope governs.
             knowledge_spaces: None,
+            read_capabilities: None,
         })
     })
 }
@@ -6200,6 +6220,7 @@ fn record_handoff(
         policy_revision: request.policy_revision,
         context: request.context.clone(),
         knowledge_spaces: request.knowledge_spaces.clone(),
+        read_capabilities: request.read_capabilities.clone(),
         status: AgentTaskHandoffStatus::Initiated,
         result_settled: false,
         recorded_at: now,

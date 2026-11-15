@@ -791,6 +791,7 @@ async fn an_assignments_exhausted_delegated_child_owes_its_delegation_result() {
     delegated.delegation = Some(Box::new(rakka_agent::AgentTaskDelegationProvenance {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         delegation,
         parent_task: AgentTaskId::new("parent-task").expect("task id should be valid"),
         parent_run,

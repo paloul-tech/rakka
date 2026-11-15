@@ -392,6 +392,9 @@ pub struct AgentGoalDelegationEdgeView {
     pub deadline: Option<AgentTimestampMillis>,
     /// The communal knowledge spaces explicitly delegated to the child.
     pub knowledge_spaces: BTreeSet<KnowledgeSpaceId>,
+    /// The capabilities for reading communal claims explicitly delegated to
+    /// the child.
+    pub read_capabilities: BTreeSet<crate::AgentCapabilityId>,
 }
 
 impl AgentGoalDelegationEdgeView {
@@ -414,6 +417,7 @@ impl AgentGoalDelegationEdgeView {
             budget: cell.record.budget,
             deadline: cell.record.deadline,
             knowledge_spaces: cell.record.knowledge_spaces.clone(),
+            read_capabilities: cell.record.read_capabilities.clone(),
         }
     }
 }

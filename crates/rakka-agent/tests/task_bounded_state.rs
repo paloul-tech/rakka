@@ -1275,6 +1275,7 @@ async fn the_widest_delegation_provenance_fits_the_task_record() {
     let provenance = rakka_agent::AgentTaskDelegationProvenance {
         environments,
         knowledge_spaces,
+        read_capabilities: Default::default(),
         delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
             .expect("the delegation id derives"),
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
@@ -1397,6 +1398,7 @@ async fn an_oversized_delegation_provenance_refuses_the_creation() {
     let provenance = rakka_agent::AgentTaskDelegationProvenance {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
             .expect("the delegation id derives"),
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
@@ -1478,6 +1480,7 @@ async fn a_cross_tenant_parent_run_refuses_the_creation() {
     let provenance = rakka_agent::AgentTaskDelegationProvenance {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         delegation: rakka_agent::delegation_id_for(&foreign_parent, 2, 0)
             .expect("the delegation id derives"),
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
