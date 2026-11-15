@@ -57,6 +57,7 @@ pub mod budget;
 pub mod checkpoints;
 pub mod choreography;
 pub mod client;
+pub mod communal;
 pub mod conversation;
 pub mod coordination;
 pub mod decision_ledger;
@@ -149,6 +150,17 @@ pub use client::{
     AgentClientTaskRequest, AgentClientTaskResultRequest, AgentClientTaskState,
     AgentClientTaskView, AgentClientTransport, RakkaAgentClient,
 };
+pub use communal::{
+    derive_communal_query, AgentCommunalClaimAuthority, AgentCommunalClaimRetriever,
+    AgentCommunalClaimTrust, AgentCommunalReadGrant, AgentCommunalReadGrantSource,
+    AgentCommunalRetrieval, AgentEntityCommunalReadGrants, CommunalClaimObject,
+    CommunalClaimProvenance, CommunalClaimRecord, CommunalClaimStatement, CommunalRetrievalOutcome,
+    CommunalRetrievalPolicy, CommunalRetrievalQuery, CommunalRetrievalReport, RankedCommunalClaim,
+    AGENT_COMMUNAL_CLAIM_EVIDENCE_REF_MAX_BYTES, AGENT_COMMUNAL_CLAIM_MAX_EVIDENCE,
+    AGENT_COMMUNAL_CLAIM_MAX_READ_CAPABILITIES, AGENT_COMMUNAL_CLAIM_OBJECT_INLINE_MAX_BYTES,
+    AGENT_COMMUNAL_RETRIEVAL_MAX_SPACES, AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_BYTES,
+    AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_ENTRIES,
+};
 pub use decision_ledger::{AgentDecisionLedger, AGENT_DECISION_LEDGER_CAPACITY};
 pub use dispatch::{
     accept_model_response_unchanged, accept_tool_response_unchanged, workflow_run_id,
@@ -229,11 +241,11 @@ pub use memory::{
     PrivateMemoryExpectation, PrivateMemoryPage, PrivateMemoryScope, PrivateMemoryTombstoneRequest,
     SessionMemoryCursor, SessionMemoryEntry, SessionMemoryPage, SessionMemoryStore,
     SessionPurgeOutcome, SessionRetentionPolicy, SessionWindowPolicy, SnapshotBudget,
-    SnapshotIngressRecord, SnapshotPrivateMemory, SnapshotRetrieval, SnapshotSessionEntry,
-    AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH, AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES,
-    AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES, AGENT_SESSION_MEMORY_ENTRY_MAX_BYTES,
-    AGENT_SESSION_WINDOW_MAX_ENTRIES, AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES,
-    AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_ENTRIES,
+    SnapshotCommunalClaim, SnapshotCommunalRetrieval, SnapshotIngressRecord, SnapshotPrivateMemory,
+    SnapshotRetrieval, SnapshotSessionEntry, AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH,
+    AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES, AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES,
+    AGENT_SESSION_MEMORY_ENTRY_MAX_BYTES, AGENT_SESSION_WINDOW_MAX_ENTRIES,
+    AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES, AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_ENTRIES,
 };
 pub use memory_retention::{
     backfill_run_terminal_stamp, discharge_run_memory_retention, AgentMemoryRetentionReport,
@@ -270,10 +282,11 @@ pub use observability::{
     AGENT_METRIC_FIELDS, AGENT_SEGMENT_ERROR_CODE_MAX_LENGTH, AGENT_SEGMENT_ERROR_TYPES,
     AGENT_TELEMETRY_LINK_KINDS, AGENT_TELEMETRY_MAX_SPAN_LINKS, AGENT_TELEMETRY_SIGNALS,
     DEFAULT_AGENT_SEGMENT_SINK_CAPACITY, LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT,
-    LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST, METRIC_AGENT_DECISIONS,
-    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_DEPENDENCY_OUTCOMES,
-    METRIC_AGENT_DISPATCH_WRITE_RETRIES, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_EPOCHS,
+    LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST,
+    METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES, METRIC_AGENT_COMMUNAL_RETRIEVALS,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
+    METRIC_AGENT_DEPENDENCY_OUTCOMES, METRIC_AGENT_DISPATCH_WRITE_RETRIES,
+    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_EPOCHS,
     METRIC_AGENT_EXCHANGE_UNSETTLEABLE, METRIC_AGENT_FAN_IN_RESOLUTIONS,
     METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION, METRIC_AGENT_GOAL_STATUS,
     METRIC_AGENT_HANDOFF_RESULTS, METRIC_AGENT_HUMAN_RESULTS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
@@ -324,9 +337,9 @@ pub use query::{
 };
 pub use retrieval::{
     assemble_context, derive_retrieval_query, embed_memory_vector, memory_embedding_text,
-    AgentMemoryEmbedder, AgentMemoryRetrieval, AgentPrivateMemoryRetriever, AssembledContext,
-    InMemoryPrivateMemoryRetriever, MemoryRetrievalOutcome, MemoryRetrievalPolicy,
-    MemoryRetrievalQuery, RetrievalReport, RetrievedPrivateMemory,
+    tokenize_search_text, AgentMemoryEmbedder, AgentMemoryRetrieval, AgentPrivateMemoryRetriever,
+    AssembledContext, InMemoryPrivateMemoryRetriever, MemoryRetrievalOutcome,
+    MemoryRetrievalPolicy, MemoryRetrievalQuery, RetrievalReport, RetrievedPrivateMemory,
     AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH, AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS,
     AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES, AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES,
     AGENT_MEMORY_RETRIEVAL_RESOLUTION_FACTOR, AGENT_MEMORY_RETRIEVAL_SCAN_MAX_ENTRIES,
@@ -478,6 +491,7 @@ pub use identity::{
 pub use schema::{
     previous_schema_version, AgentRecordKind, AgentSchemaCompatibility, AgentSchemaError,
     AgentSchemaPolicy, AgentSchemaResult, VersionedAgentRecord,
+    AGENT_MEMORY_CONTEXT_SNAPSHOT_WITHOUT_COMMUNAL_SCHEMA_VERSION,
     CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION, CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION,
     CURRENT_AGENT_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
     CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION, CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,

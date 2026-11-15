@@ -264,6 +264,18 @@ pub struct AgentDelegationTarget {
     /// specialist is delegated no communal access.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
+    /// The capabilities for reading communal claims the catalog explicitly
+    /// delegates to this specialist.
+    ///
+    /// The same kind of statement as [`Self::knowledge_spaces`]: where the
+    /// delegating run was itself delegated, the interception intersects it
+    /// with what that run was delegated, so a chain can only narrow. At a
+    /// root the statement becomes the child's grant as it stands. It is not
+    /// intersected with the root agent's own definition, so this catalog
+    /// entry is what bounds a root's delegation. Empty means the specialist
+    /// is delegated no read capability.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub read_capabilities: BTreeSet<AgentCapabilityId>,
 }
 
 impl AgentDelegationTarget {
@@ -279,6 +291,7 @@ impl AgentDelegationTarget {
             result_schema: None,
             compatibility: None,
             knowledge_spaces: BTreeSet::new(),
+            read_capabilities: BTreeSet::new(),
         }
     }
 
@@ -294,6 +307,14 @@ impl AgentDelegationTarget {
     #[must_use]
     pub fn with_knowledge_space(mut self, space: crate::identity::KnowledgeSpaceId) -> Self {
         self.knowledge_spaces.insert(space);
+        self
+    }
+
+    /// Explicitly delegates one capability for reading communal claims to the
+    /// specialist.
+    #[must_use]
+    pub fn with_read_capability(mut self, capability: AgentCapabilityId) -> Self {
+        self.read_capabilities.insert(capability);
         self
     }
 
@@ -571,6 +592,11 @@ pub struct AgentDelegationRecord {
     /// means none.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
+    /// The capabilities for reading communal claims explicitly delegated to
+    /// the child: the catalog's statement intersected with the parent's own
+    /// grant; empty means none.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub read_capabilities: BTreeSet<AgentCapabilityId>,
     /// The agent definition revision the parent decided under.
     pub definition_revision: AgentRevisionNumber,
     /// The agent settings revision the parent decided under.
@@ -931,6 +957,11 @@ pub struct AgentTaskDelegationProvenance {
     /// could have appended communally either.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
+    /// The capabilities for reading communal claims explicitly delegated to
+    /// this task. Empty means none were, including a provenance recorded
+    /// before the field existed: nothing that old was delegated a read.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub read_capabilities: BTreeSet<AgentCapabilityId>,
 }
 
 impl AgentTaskDelegationProvenance {
@@ -1081,6 +1112,42 @@ pub struct AgentRunDelegationEnvelope {
     /// envelopes; `Some(empty)` is explicitly nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge_spaces: Option<BTreeSet<crate::identity::KnowledgeSpaceId>>,
+    /// The capabilities for reading communal claims explicitly delegated to
+    /// this run.
+    ///
+    /// A **grant** with the meaning of [`Self::knowledge_spaces`]: `None` is
+    /// no statement, and a communal read then fails closed when lineage
+    /// exists while the definition and setup envelopes govern at the root;
+    /// `Some(set)` is the exact set the run may read with, still inside those
+    /// envelopes; `Some(empty)` is explicitly nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_capabilities: Option<BTreeSet<AgentCapabilityId>>,
+}
+
+/// The grant one explicit statement yields under the grant of the run that
+/// passes it on ([specification 8.5](../../../docs/plans/rakka-agent/spec.md):
+/// children inherit only explicitly delegated access).
+///
+/// One rule for every delegated dimension and every door that passes a grant
+/// on, so the delegation door and the handoff step cannot drift apart:
+///
+/// - the holder has a statement of its own: the two are intersected, so a
+///   catalog can never widen what the holder has;
+/// - the holder has lineage and no statement: nothing. A chain whose own
+///   statement predates the field cannot prove what it may pass on, which is
+///   the deny-when-unknown posture the ancestry gap takes;
+/// - the holder is a root with no statement: the statement itself, because
+///   the definition envelope still bounds everything a root does.
+pub(crate) fn delegated_grant<T: Ord + Clone>(
+    statement: &BTreeSet<T>,
+    holder: Option<&BTreeSet<T>>,
+    holder_has_lineage: bool,
+) -> BTreeSet<T> {
+    match holder {
+        Some(granted) => statement.intersection(granted).cloned().collect(),
+        None if holder_has_lineage => BTreeSet::new(),
+        None => statement.clone(),
+    }
 }
 
 /// The wiring one run entity needs to serve delegation and handoff
@@ -1566,6 +1633,7 @@ mod tests {
         let provenance = AgentTaskDelegationProvenance {
             environments: Default::default(),
             knowledge_spaces: Default::default(),
+            read_capabilities: Default::default(),
             delegation: delegation_id_for(&scope(), 1, 0).expect("delegation id"),
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),
             parent_run: scope(),
@@ -1598,6 +1666,7 @@ mod tests {
         let provenance = AgentTaskDelegationProvenance {
             environments: Default::default(),
             knowledge_spaces: Default::default(),
+            read_capabilities: Default::default(),
             delegation: delegation_id_for(&scope(), 1, 0).expect("delegation id"),
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),
             parent_run: scope(),
@@ -1679,6 +1748,7 @@ mod tests {
         let record = AgentDelegationRecord {
             environments: Default::default(),
             knowledge_spaces: Default::default(),
+            read_capabilities: Default::default(),
             delegation: delegation_id_for(&scope(), 1, 0).expect("delegation id"),
             goal: None,
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),
@@ -1723,5 +1793,40 @@ mod tests {
             }
         );
         assert_eq!(cell.settled_at, Some(AgentTimestampMillis::new(2)));
+    }
+
+    /// The one rule every delegated grant follows (issue #69), arm by arm. The
+    /// middle arm cannot be reached through a live delegation today — a
+    /// delegated child always records a statement — so it is held here: it is
+    /// what a chain persisted before a grant field existed decodes to.
+    #[test]
+    fn a_delegated_grant_is_the_statement_intersected_with_the_holders() {
+        let statement = BTreeSet::from(["a", "b"]);
+        let holder = BTreeSet::from(["a", "c"]);
+        assert_eq!(
+            delegated_grant(&statement, Some(&holder), true),
+            BTreeSet::from(["a"])
+        );
+        assert_eq!(
+            delegated_grant(&statement, Some(&holder), false),
+            BTreeSet::from(["a"]),
+            "a holder's own statement binds at the root too"
+        );
+        assert!(
+            delegated_grant(&statement, Some(&BTreeSet::new()), false).is_empty(),
+            "a holder granted explicitly nothing passes nothing on"
+        );
+    }
+
+    #[test]
+    fn a_child_of_a_parent_with_lineage_and_no_statement_gets_none() {
+        let statement = BTreeSet::from(["a", "b"]);
+        assert!(delegated_grant(&statement, None, true).is_empty());
+    }
+
+    #[test]
+    fn a_root_without_a_statement_passes_the_statement_on() {
+        let statement = BTreeSet::from(["a", "b"]);
+        assert_eq!(delegated_grant(&statement, None, false), statement);
     }
 }

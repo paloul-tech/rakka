@@ -580,6 +580,7 @@ fn delegation_record(input: Value) -> AgentDelegationRecord {
     AgentDelegationRecord {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         a2a_message_id: delegation.as_str().to_string(),
         deduplication_key: delegation.as_str().to_string(),
         delegation,

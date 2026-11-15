@@ -709,6 +709,7 @@ async fn an_aged_out_replay_converges_on_its_own_child_instead_of_conflicting() 
         AgentDelegationRecord {
             environments: Default::default(),
             knowledge_spaces: Default::default(),
+            read_capabilities: Default::default(),
             a2a_message_id: delegation.as_str().to_string(),
             deduplication_key: original_key.clone(),
             delegation,
@@ -869,6 +870,7 @@ async fn an_aged_out_replay_the_child_still_remembers_converges_without_the_prob
         AgentDelegationRecord {
             environments: Default::default(),
             knowledge_spaces: Default::default(),
+            read_capabilities: Default::default(),
             a2a_message_id: delegation.as_str().to_string(),
             deduplication_key: original_key.clone(),
             delegation,
@@ -1013,6 +1015,7 @@ async fn an_aged_out_replay_converges_under_a_read_denying_authorizer() {
     let record = AgentDelegationRecord {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         a2a_message_id: delegation.as_str().to_string(),
         deduplication_key: delegation.as_str().to_string(),
         delegation,
@@ -1409,6 +1412,7 @@ async fn ancestors_ride_the_wire_and_omit_when_empty() {
         result_schema: None,
         environments: vec!["workspace-1".to_string()],
         knowledge_spaces: vec!["space-1".to_string()],
+        read_capabilities: Vec::new(),
     };
     let wire = chained.to_value();
     assert_eq!(wire["ancestors"], json!(["root-coordinator"]));
@@ -1510,4 +1514,251 @@ async fn a_forged_ancestry_fails_closed_at_ingress() {
         ),
         other => panic!("the forged ancestry should refuse as a task error, got {other}"),
     }
+}
+
+/// The bytes both collaboration envelopes had before read capabilities
+/// existed, captured at `86cf087` and never to be edited: a record that
+/// delegates no read capability must put today's envelope on the wire, so a
+/// receiver that predates the field still parses it.
+///
+/// The records are decoded from JSON rather than built from struct literals,
+/// so this pin needs no edit when a record gains a field.
+#[test]
+fn the_collaboration_envelopes_keep_their_bytes_without_read_capabilities() {
+    use rakka_a2a::agents::{AgentCollaborationMetadata, AgentHandoffCollaborationMetadata};
+
+    const DELEGATION_ENVELOPE_86CF087: &str = r#"{"schema":1,"delegation":"delegation-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","parent-task":"goal-root","parent-run":"acme/support/run-1","goal":null,"lineage":[],"depth":1,"requested-skill":"billing.refund","capability-scopes":[],"credential-bindings":[],"budget":null,"deadline":null,"result-schema":null,"knowledge-spaces":["support-kb"]}"#;
+    const HANDOFF_ENVELOPE_86CF087: &str = r#"{"schema":1,"handoff":"handoff-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source-agent":"support","source-run":"run-1","source-generation":1,"target-agent":"billing","target-task-definition":"refund","result-schema":null,"reason":"needs billing authority","policy-revision":1,"knowledge-spaces":["support-kb"]}"#;
+
+    let delegation = format!("delegation-{}", "c".repeat(64));
+    let record: AgentDelegationRecord = serde_json::from_value(json!({
+        "delegation": delegation,
+        "goal": null,
+        "parent_task": "goal-root",
+        "parent_run": "acme/support/run-1",
+        "lineage": [],
+        "depth": 1,
+        "requested_skill": "billing.refund",
+        "resolved": {
+            "agent": "billing",
+            "endpoint": null,
+            "task_definition": "refund",
+            "capability_scopes": [],
+            "credential_bindings": [],
+            "result_schema": null,
+            "compatibility": null,
+            "knowledge_spaces": ["support-kb"]
+        },
+        "a2a_message_id": delegation,
+        "deduplication_key": delegation,
+        "turn": 1,
+        "slot": 0,
+        "effect": "effect-1",
+        "call_id": "call-1",
+        "input": { "inline": { "text": "hello" } },
+        "result_schema": null,
+        "budget": null,
+        "granted_descendants": 3,
+        "deadline": null,
+        "knowledge_spaces": ["support-kb"],
+        "definition_revision": 1,
+        "settings_revision": 1,
+        "created_at": 1
+    }))
+    .expect("the earlier delegation record decodes");
+    assert_eq!(
+        serde_json::to_string(&AgentCollaborationMetadata::from_record(&record))
+            .expect("the envelope encodes"),
+        DELEGATION_ENVELOPE_86CF087
+    );
+
+    let handoff = format!("handoff-{}", "a".repeat(64));
+    let record: rakka_agent::AgentHandoffRecord = serde_json::from_value(json!({
+        "handoff": handoff,
+        "goal": null,
+        "task": "task-1",
+        "source_run": "acme/support/run-1",
+        "source_generation": 1,
+        "requested_skill": "billing.refund",
+        "resolved": {
+            "agent": "billing",
+            "endpoint": null,
+            "task_definition": "refund",
+            "capability_scopes": [],
+            "credential_bindings": [],
+            "result_schema": null,
+            "compatibility": null,
+            "knowledge_spaces": ["support-kb"]
+        },
+        "reason": "needs billing authority",
+        "policy_revision": 1,
+        "definition_revision": 1,
+        "settings_revision": 1,
+        "context": [],
+        "a2a_message_id": handoff,
+        "deduplication_key": handoff,
+        "turn": 7,
+        "slot": 0,
+        "effect": "effect-1",
+        "call_id": "call-1",
+        "created_at": 1
+    }))
+    .expect("the earlier handoff record decodes");
+    assert_eq!(
+        serde_json::to_string(&AgentHandoffCollaborationMetadata::from_record(&record))
+            .expect("the envelope encodes"),
+        HANDOFF_ENVELOPE_86CF087
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #69: read capabilities ride the collaboration envelope beside
+// knowledge spaces, under the wire name `read-capabilities`.
+// ---------------------------------------------------------------------------
+
+/// A delegation record that delegates the given read capabilities, decoded
+/// from JSON so the test names only what it is about.
+fn record_delegating_reads(read: &[&str]) -> AgentDelegationRecord {
+    let delegation = format!("delegation-{}", "c".repeat(64));
+    serde_json::from_value(json!({
+        "delegation": delegation,
+        "goal": null,
+        "parent_task": "goal-root",
+        "parent_run": "acme/support/run-1",
+        "lineage": [],
+        "depth": 1,
+        "requested_skill": "billing.refund",
+        "resolved": {
+            "agent": "billing",
+            "endpoint": null,
+            "task_definition": "refund",
+            "capability_scopes": [],
+            "credential_bindings": [],
+            "result_schema": null,
+            "compatibility": null,
+            "read_capabilities": ["claims.read.a", "claims.read.b"]
+        },
+        "a2a_message_id": delegation,
+        "deduplication_key": delegation,
+        "turn": 1,
+        "slot": 0,
+        "effect": "effect-1",
+        "call_id": "call-1",
+        "input": { "inline": { "text": "hello" } },
+        "result_schema": null,
+        "budget": null,
+        "granted_descendants": null,
+        "deadline": null,
+        "read_capabilities": read,
+        "definition_revision": 1,
+        "settings_revision": 1,
+        "created_at": 1
+    }))
+    .expect("the delegation record decodes")
+}
+
+/// The record's set — the catalog's statement already narrowed by the
+/// parent's grant, not the statement itself — crosses the wire and validates
+/// into the child's provenance.
+#[test]
+fn read_capabilities_cross_from_the_record_to_the_provenance() {
+    use rakka_a2a::agents::AgentCollaborationMetadata;
+
+    let envelope =
+        AgentCollaborationMetadata::from_record(&record_delegating_reads(&["claims.read.a"]));
+    let wire = envelope.to_value();
+    assert_eq!(wire["read-capabilities"], json!(["claims.read.a"]));
+
+    let received: AgentCollaborationMetadata =
+        serde_json::from_value(wire).expect("the envelope decodes");
+    let provenance = received.to_provenance().expect("the envelope validates");
+    assert_eq!(
+        provenance
+            .read_capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claims.read.a"]
+    );
+
+    // A record that delegates none puts no key on the wire.
+    let none = AgentCollaborationMetadata::from_record(&record_delegating_reads(&[]));
+    assert!(none.to_value().get("read-capabilities").is_none());
+    assert!(none
+        .to_provenance()
+        .expect("the envelope validates")
+        .read_capabilities
+        .is_empty());
+}
+
+/// A read capability that cannot be a capability id fails the whole send at
+/// the receiving surface, as an invalid knowledge space does: a grant is
+/// never partly honored.
+#[test]
+fn an_invalid_read_capability_id_fails_the_send() {
+    use rakka_a2a::agents::AgentCollaborationMetadata;
+
+    let mut envelope =
+        AgentCollaborationMetadata::from_record(&record_delegating_reads(&["claims.read.a"]));
+    envelope
+        .to_provenance()
+        .expect("the valid envelope validates");
+    envelope.read_capabilities.push(String::new());
+    assert!(envelope.to_provenance().is_err());
+}
+
+/// A receiver on the binary before the field refuses a send that carries
+/// read capabilities, because the envelope refuses unknown fields. The grant
+/// is refused in transit, never silently dropped.
+#[test]
+fn an_envelope_carrying_read_capabilities_is_refused_by_the_earlier_shape() {
+    use rakka_a2a::agents::{
+        AgentCollaborationBudget, AgentCollaborationMetadata, AgentCollaborationSchemaRef,
+    };
+
+    /// `AgentCollaborationMetadata` as it stood at `86cf087`.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct AgentCollaborationMetadata86cf087 {
+        schema: u32,
+        delegation: String,
+        parent_task: String,
+        parent_run: String,
+        #[serde(default)]
+        goal: Option<String>,
+        #[serde(default)]
+        lineage: Vec<String>,
+        #[serde(default)]
+        ancestors: Vec<String>,
+        depth: u32,
+        requested_skill: String,
+        #[serde(default)]
+        capability_scopes: Vec<String>,
+        #[serde(default)]
+        credential_bindings: Vec<String>,
+        #[serde(default)]
+        budget: Option<AgentCollaborationBudget>,
+        #[serde(default)]
+        deadline: Option<u64>,
+        #[serde(default)]
+        result_schema: Option<AgentCollaborationSchemaRef>,
+        #[serde(default)]
+        environments: Vec<String>,
+        #[serde(default)]
+        knowledge_spaces: Vec<String>,
+    }
+
+    let without = AgentCollaborationMetadata::from_record(&record_delegating_reads(&[]));
+    serde_json::from_value::<AgentCollaborationMetadata86cf087>(without.to_value())
+        .expect("a send carrying no read capability is one the earlier shape reads");
+
+    let with =
+        AgentCollaborationMetadata::from_record(&record_delegating_reads(&["claims.read.a"]));
+    let error = serde_json::from_value::<AgentCollaborationMetadata86cf087>(with.to_value())
+        .expect_err("the earlier shape refuses a send carrying read capabilities");
+    assert!(
+        error.to_string().contains("read-capabilities"),
+        "the refusal names the field it does not know: {error}"
+    );
 }

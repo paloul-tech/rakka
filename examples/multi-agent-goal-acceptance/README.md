@@ -26,6 +26,21 @@ cargo run -p rakka-example-multi-agent-goal-acceptance
 `tests/acceptance.rs` runs the same flow and asserts this transcript
 verbatim, plus the typed facts behind every line.
 
+`tests/communal_read_path.rs` builds the same world with the communal read
+path wired into every run (`World::with_communal_read_path`): the knowledge
+graph's retriever and authority, the read grant taken from each run's own
+agent entity, and the default policy. One verified claim requires a read
+capability, and four agents each take one model turn. The agent granted the
+claim's space and capability gets a version 2 context snapshot that holds the
+claim; the agent without the space gets a version 1 snapshot; the agent
+without the capability, and the agent granted a different space, search and
+select nothing. The walk itself wires no communal bundle, so its transcript
+and its snapshots are unchanged.
+
+```sh
+cargo test -p rakka-example-multi-agent-goal-acceptance --test communal_read_path
+```
+
 ## Expected stdout
 
 ```text

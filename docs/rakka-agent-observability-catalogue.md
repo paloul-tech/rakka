@@ -53,6 +53,8 @@ without re-bucketing.
 | `rakka.agent.telemetry.export.unmappable` | Counter | `{record}` | `backend` | — | Records a telemetry sink refused as unmappable. |
 | `rakka.agent.memory.retrievals` | Counter | `{retrieval}` | `backend`, `outcome` | — | Private-memory retrievals run by context-snapshot assembly. |
 | `rakka.agent.memory.ingress.outcomes` | Counter | `{record}` | `outcome` | — | Memory-ingress guardrail outcomes on retrieved records. |
+| `rakka.agent.communal.retrievals` | Counter | `{retrieval}` | `backend`, `outcome` | — | Communal-claim retrievals run by context-snapshot assembly. |
+| `rakka.agent.communal.ingress.outcomes` | Counter | `{record}` | `outcome` | — | Re-check, guardrail and coverage outcomes on ranked communal claims. |
 | `rakka.agent.wake.dispositions` | Counter | `{wake}` | `outcome`, `trigger` | — | Wake dispositions the continuous controller durably recorded. |
 | `rakka.agent.wakes` | Counter | `{wake}` | `outcome`, `trigger` | — | Wake delivery attempts made by the shared scanner. |
 | `rakka.agent.epochs` | Counter | `{epoch}` | `outcome` | — | Continuous-goal epoch admissions and results. |

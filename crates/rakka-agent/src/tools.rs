@@ -1599,6 +1599,13 @@ impl AgentToolAuthority {
     /// an empty chain: nothing would evaluate the boundary, which is the
     /// condition this attestation exists to rule out.
     ///
+    /// The attestation covers **every** retrieval bundle the memory carries:
+    /// the private one ([`AgentRunMemory::with_retrieval`]) and the communal
+    /// one ([`AgentRunMemory::with_communal_retrieval`]). Each evaluates the
+    /// memory-ingress boundary over its own tier, so each must declare this
+    /// authority's chain; one that differs is refused even beside one that
+    /// matches. A memory with only a communal bundle can attest.
+    ///
     /// Use [`Self::attests`] to re-check a memory assembled separately.
     ///
     /// Without this attestation the authority does not count `MemoryIngress`
@@ -1611,20 +1618,27 @@ impl AgentToolAuthority {
     /// # Errors
     ///
     /// [`AgentGuardrailError::ChainMismatch`] (`guardrail-chain-mismatch`)
-    /// when the two declarations differ, when this authority carries no chain
-    /// at all, or when the memory carries no retrieval bundle. The refusal
+    /// when any bundle's declaration differs from this authority's, when this
+    /// authority carries no chain at all, or when the memory carries no
+    /// retrieval bundle of either tier. The refusal
     /// lands at wiring time, so a misconfigured deployment fails at startup
     /// rather than at its first tool call.
     pub fn with_memory_ingress(
         mut self,
         memory: &AgentRunMemory,
     ) -> Result<Self, AgentGuardrailError> {
-        let installed = self.declared_by(memory);
+        let installed = Self::declared_by(memory);
         let mine = self.declared_chain();
-        if installed.is_none() || installed != mine {
+        // Every bundle present must declare this authority's own chain, and
+        // at least one must be present. The refusal reports the first bundle
+        // that differs, or no bundle at all.
+        let differing = installed
+            .iter()
+            .find(|declared| Some(*declared) != mine.as_ref());
+        if installed.is_empty() || mine.is_none() || differing.is_some() {
             return Err(AgentGuardrailError::ChainMismatch {
                 authority: mine,
-                retrieval: installed,
+                retrieval: differing.or(installed.first()).cloned(),
             });
         }
         self.memory_ingress_attested = true;
@@ -1641,14 +1655,18 @@ impl AgentToolAuthority {
     /// chain the dispatch gate enforces.
     ///
     /// `false` when this authority never attested, when it carries no chain,
-    /// when the memory carries no bundle, or when the two declarations differ.
+    /// when the memory carries no bundle of either tier, or when any bundle's
+    /// declaration differs from this authority's.
     #[must_use]
     pub fn attests(&self, memory: &AgentRunMemory) -> bool {
         if !self.memory_ingress_attested {
             return false;
         }
-        let installed = self.declared_by(memory);
-        installed.is_some() && installed == self.declared_chain()
+        let Some(mine) = self.declared_chain() else {
+            return false;
+        };
+        let installed = Self::declared_by(memory);
+        !installed.is_empty() && installed.iter().all(|declared| *declared == mine)
     }
 
     /// Attests that the A2A surface this deployment serves evaluates the
@@ -1718,12 +1736,23 @@ impl AgentToolAuthority {
             .map(AgentGuardrailChain::declaration_digest)
     }
 
-    /// The chain declaration the run memory's retrieval bundle carries, when
-    /// it carries one.
-    fn declared_by(&self, memory: &AgentRunMemory) -> Option<AgentContentDigest> {
-        memory
+    /// The chain declaration of every retrieval bundle the run memory
+    /// carries: the private bundle's, then the communal bundle's. Empty when
+    /// the memory carries neither.
+    ///
+    /// Both bundles evaluate the memory-ingress boundary, each over its own
+    /// tier, so the boundary is covered only when every one of them runs the
+    /// chain the dispatch gate enforces. A memory with one matching bundle
+    /// and one that differs would otherwise attest a stage that half of what
+    /// reaches the model never passed.
+    fn declared_by(memory: &AgentRunMemory) -> Vec<AgentContentDigest> {
+        let private = memory
             .retrieval()
-            .map(|retrieval| retrieval.guardrails().declaration_digest())
+            .map(|retrieval| retrieval.guardrails().declaration_digest());
+        let communal = memory
+            .communal_retrieval()
+            .map(|communal| communal.guardrails().declaration_digest());
+        private.into_iter().chain(communal).collect()
     }
 
     /// The boundaries this authority's coverage check treats as evaluated.

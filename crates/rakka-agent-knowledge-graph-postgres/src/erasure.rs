@@ -54,6 +54,11 @@ ORDER BY ordinal
 ///
 /// The stub row's `transition_count` is set to the fence value (`$6`), which
 /// is what a binary from before tombstones can never match.
+///
+/// The row's search words are cleared here too: they are derived from the
+/// statement being withdrawn. The claim table's trigger would clear them if
+/// this statement did not, and it is what covers a binary from before the
+/// search index; this statement says so itself rather than lean on it.
 const TOMBSTONE_SQL: &str = "
 WITH existing_op AS (
     SELECT kind, result FROM rakka_agent_knowledge_claim_op
@@ -61,7 +66,7 @@ WITH existing_op AS (
 ), upd AS (
     UPDATE rakka_agent_knowledge_claim
     SET subject = $5, predicate = $5, object_node = NULL, tombstoned = TRUE,
-        transition_count = $6, record = $7
+        transition_count = $6, record = $7, search_tokens = NULL
     WHERE tenant = $1 AND space = $2 AND claim_id = $4
       AND transition_count = $8
       AND NOT EXISTS (SELECT 1 FROM existing_op)

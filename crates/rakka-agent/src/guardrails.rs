@@ -255,6 +255,13 @@ pub struct AgentGuardrailContext<'a> {
     /// [`AgentGuardrailBoundary::MemoryIngress`]. `None` at boundaries that
     /// name no memory.
     pub memory: Option<&'a crate::memory::AgentPrivateMemoryId>,
+    /// The communal claim being retrieved, at
+    /// [`AgentGuardrailBoundary::MemoryIngress`]. `None` at boundaries that
+    /// name no claim, and for a private memory.
+    pub claim: Option<&'a crate::identity::AgentCommunalClaimId>,
+    /// The knowledge space that holds [`Self::claim`]. Set exactly when the
+    /// claim is.
+    pub claim_space: Option<&'a crate::identity::KnowledgeSpaceId>,
 }
 
 impl<'a> AgentGuardrailContext<'a> {
@@ -277,6 +284,8 @@ impl<'a> AgentGuardrailContext<'a> {
             subject,
             tool: None,
             memory: None,
+            claim: None,
+            claim_space: None,
         }
     }
 
@@ -297,6 +306,23 @@ impl<'a> AgentGuardrailContext<'a> {
     #[must_use]
     pub const fn with_memory(mut self, memory: &'a crate::memory::AgentPrivateMemoryId) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Names the communal claim whose retrieval is being evaluated, and the
+    /// knowledge space that holds it.
+    ///
+    /// A claim's identity is unique only within its space, so the two travel
+    /// together: a stage that scopes a policy to a space, or records which
+    /// claim it decided on, reads both here.
+    #[must_use]
+    pub const fn with_claim(
+        mut self,
+        claim: &'a crate::identity::AgentCommunalClaimId,
+        space: &'a crate::identity::KnowledgeSpaceId,
+    ) -> Self {
+        self.claim = Some(claim);
+        self.claim_space = Some(space);
         self
     }
 }

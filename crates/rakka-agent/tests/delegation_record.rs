@@ -542,6 +542,7 @@ fn pre_slice_records_decode_without_the_fan_out_fields() {
     let record = AgentDelegationRecord {
         environments: Default::default(),
         knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
         delegation: delegation.clone(),
         goal: None,
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
@@ -605,4 +606,280 @@ fn pre_slice_records_decode_without_the_fan_out_fields() {
     let spec: rakka_agent::AgentGoalSpec =
         serde_json::from_value(spec).expect("a pre-slice goal spec decodes");
     assert!(spec.fan_in.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #69: read capabilities travel beside knowledge spaces. A catalog
+// states what a specialist may read; the record holds that statement narrowed
+// by the delegating run's own grant; the child's run envelope holds the
+// provenance's set.
+// ---------------------------------------------------------------------------
+
+fn read_capability(id: &str) -> rakka_agent::AgentCapabilityId {
+    rakka_agent::AgentCapabilityId::new(id).expect("the capability id is valid")
+}
+
+fn read_capabilities(ids: &[&str]) -> std::collections::BTreeSet<rakka_agent::AgentCapabilityId> {
+    ids.iter().map(|id| read_capability(id)).collect()
+}
+
+/// A delegation config whose catalog states the read capabilities the
+/// specialist is delegated.
+fn config_delegating_reads(ids: &[&str]) -> rakka_agent::AgentRunDelegationConfig {
+    let mut target = common::delegation_target();
+    for id in ids {
+        target = target.with_read_capability(read_capability(id));
+    }
+    rakka_agent::AgentRunDelegationConfig::new(
+        delegation_tool_id(),
+        Arc::new(
+            rakka_agent::StaticAgentDelegationCatalog::new()
+                .with_target(common::skill_id(), target),
+        ),
+        std::collections::BTreeSet::from([
+            rakka_agent::AgentCoordinationCapabilityKind::Delegation,
+        ]),
+    )
+    .expect("the delegation configuration declares the capability")
+}
+
+fn fixture_delegating_reads(executor: Arc<StubSendExecutor>, ids: &[&str]) -> Fixture {
+    Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(delegating_turn(json!({
+                    "skill": SKILL,
+                    "input": { "text": "hello" },
+                })))
+                .with_turn(proposing_turn()),
+        )
+        .with_a2a_send_executor(executor),
+    )
+    .with_delegation(config_delegating_reads(ids))
+}
+
+/// The provenance of a task one delegation created, decoded from the shape a
+/// provenance had before read capabilities existed, then given `read`.
+fn child_provenance(read: Option<&[&str]>) -> rakka_agent::AgentTaskDelegationProvenance {
+    let parent_run = AgentRunScope::new(
+        common::tenant(),
+        rakka_agent::AgentId::new("root-coordinator").expect("the agent id is valid"),
+        rakka_agent::AgentRunId::new("root-task-gen-1").expect("the run id is valid"),
+    )
+    .expect("the scope is valid");
+    let delegation = delegation_id_for(&parent_run, 2, 0).expect("the delegation id derives");
+    let mut value = json!({
+        "delegation": delegation,
+        "parent_task": "root-task",
+        "parent_run": parent_run,
+        "lineage": [],
+        "depth": 1,
+        "requested_skill": SKILL,
+        "capability_scopes": [],
+        "credential_bindings": [],
+        "result_schema": null,
+        "budget": null,
+        "deadline": null
+    });
+    if let Some(read) = read {
+        value["read_capabilities"] = json!(read);
+    }
+    serde_json::from_value(value).expect("the provenance decodes")
+}
+
+async fn create_delegated_child(
+    fixture: &Fixture,
+    provenance: rakka_agent::AgentTaskDelegationProvenance,
+) {
+    fixture.instantiate_agent().await;
+    fixture
+        .apply_task_command(rakka_agent::AgentTaskEntityCommand::Create {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::TaskCreation,
+                [common::TENANT, common::TASK, "1"],
+            )
+            .expect("the operation id derives"),
+            creation: Box::new(rakka_agent::AgentTaskCreation {
+                definition: task_definition(),
+                input: AgentTaskContent::inline(json!({ "text": "hello" }))
+                    .expect("the input is inline-bounded"),
+                assignee: Some(common::agent_id()),
+                team: None,
+                goal: None,
+                goal_mode: Default::default(),
+                goal_spec: None,
+                parent: Some(provenance.parent_task.clone()),
+                dependencies: Vec::new(),
+                escrow: None,
+                wake: None,
+                delegation: Some(Box::new(provenance)),
+                telemetry: Default::default(),
+            }),
+        })
+        .await
+        .expect("the delegated child task creates");
+}
+
+/// The read-capability statement of the fixture run's delegation envelope:
+/// the outer `None` is a run with no envelope at all.
+async fn envelope_read_capabilities(
+    fixture: &Fixture,
+) -> Option<Option<std::collections::BTreeSet<rakka_agent::AgentCapabilityId>>> {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("the run recovers");
+    run.state()
+        .expect("the run state reads")
+        .loop_state()
+        .expect("the run has a loop")
+        .delegation_envelope()
+        .map(|envelope| envelope.read_capabilities.clone())
+}
+
+fn first_sent(executor: &StubSendExecutor) -> AgentDelegationRecord {
+    executor
+        .seen
+        .lock()
+        .expect("the record log should not be poisoned")
+        .first()
+        .cloned()
+        .expect("the delegation was sent")
+}
+
+/// At the root no run holds a grant statement, the definition envelope still
+/// bounds every read, and the catalog's statement becomes the child's grant.
+#[tokio::test]
+async fn a_root_delegation_gets_the_targets_statement() {
+    let executor = StubSendExecutor::sent("child-task-1");
+    let fixture = fixture_delegating_reads(executor.clone(), &["claims.read.a", "claims.read.b"]);
+    create_goal_task(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    let record = first_sent(&executor);
+    assert_eq!(
+        record.read_capabilities,
+        read_capabilities(&["claims.read.a", "claims.read.b"])
+    );
+    assert_eq!(record.resolved.read_capabilities, record.read_capabilities);
+}
+
+/// A run that was itself delegated passes on only what it holds: the
+/// catalog's statement intersected with its own grant, so a catalog can never
+/// widen what the parent may read.
+#[tokio::test]
+async fn a_child_gets_the_targets_read_capabilities_intersected_with_the_parents_grant() {
+    let executor = StubSendExecutor::sent("grandchild-task-1");
+    let fixture = fixture_delegating_reads(executor.clone(), &["claims.read.a", "claims.read.b"]);
+    create_delegated_child(
+        &fixture,
+        child_provenance(Some(&["claims.read.a", "claims.read.c"])),
+    )
+    .await;
+    fixture.pump().await.expect("the loop should converge");
+
+    assert_eq!(
+        first_sent(&executor).read_capabilities,
+        read_capabilities(&["claims.read.a"])
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_childs_envelope_carries_its_provenance_read_capabilities() {
+    let executor = StubSendExecutor::sent("grandchild-task-1");
+    let fixture = fixture_delegating_reads(executor, &[]);
+    create_delegated_child(&fixture, child_provenance(Some(&["claims.read.a"]))).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    assert_eq!(
+        envelope_read_capabilities(&fixture).await,
+        Some(Some(read_capabilities(&["claims.read.a"])))
+    );
+}
+
+/// A provenance recorded before the field decodes to the empty set, and the
+/// run's grant is then explicitly nothing: the fail-closed reading, since
+/// nothing that old was delegated a read.
+#[tokio::test]
+async fn a_provenance_recorded_before_the_field_decodes_to_no_read_capabilities() {
+    let provenance = child_provenance(None);
+    assert!(provenance.read_capabilities.is_empty());
+
+    let executor = StubSendExecutor::sent("grandchild-task-1");
+    let fixture = fixture_delegating_reads(executor.clone(), &["claims.read.a"]);
+    create_delegated_child(&fixture, provenance).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    assert_eq!(
+        envelope_read_capabilities(&fixture).await,
+        Some(Some(std::collections::BTreeSet::new()))
+    );
+    assert!(
+        first_sent(&executor).read_capabilities.is_empty(),
+        "a run granted nothing passes nothing on, whatever the catalog states"
+    );
+}
+
+/// A goal root and a plain task record no read-capability statement: the
+/// definition and setup envelopes alone govern what such a run reads.
+#[tokio::test]
+async fn a_goal_root_and_a_plain_task_have_no_read_capability_statement() {
+    let executor = StubSendExecutor::sent("child-task-1");
+    let fixture = fixture_delegating_reads(executor, &["claims.read.a"]);
+    create_goal_task(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+    assert_eq!(envelope_read_capabilities(&fixture).await, Some(None));
+
+    let plain = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new().with_turn(proposing_turn()),
+    ));
+    plain.instantiate_agent().await;
+    plain.create_task().await;
+    plain.pump().await.expect("the loop should converge");
+    assert_eq!(
+        envelope_read_capabilities(&plain).await.flatten(),
+        None,
+        "a plain task's run carries no read-capability statement"
+    );
+}
+
+/// A delegation record written before the field decodes with no read
+/// capability, on the record and on its resolved target.
+#[test]
+fn a_record_recorded_before_the_field_decodes_to_no_read_capabilities() {
+    let parent_run = run_scope();
+    let delegation = delegation_id_for(&parent_run, 1, 0).expect("the delegation id derives");
+    let record: AgentDelegationRecord = serde_json::from_value(json!({
+        "delegation": delegation,
+        "goal": null,
+        "parent_task": "goal-root",
+        "parent_run": parent_run,
+        "lineage": [],
+        "depth": 1,
+        "requested_skill": SKILL,
+        "resolved": {
+            "agent": "translator",
+            "endpoint": null,
+            "task_definition": "translate",
+            "capability_scopes": [],
+            "credential_bindings": [],
+            "result_schema": null,
+            "compatibility": null
+        },
+        "a2a_message_id": delegation,
+        "deduplication_key": delegation,
+        "turn": 1,
+        "slot": 0,
+        "effect": "effect-1",
+        "call_id": "call-1",
+        "input": { "inline": { "text": "hello" } },
+        "result_schema": null,
+        "budget": null,
+        "granted_descendants": null,
+        "deadline": null,
+        "definition_revision": 1,
+        "settings_revision": 1,
+        "created_at": 1
+    }))
+    .expect("an earlier record decodes");
+    assert!(record.read_capabilities.is_empty());
+    assert!(record.resolved.read_capabilities.is_empty());
 }

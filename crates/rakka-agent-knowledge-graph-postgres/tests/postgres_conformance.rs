@@ -233,6 +233,19 @@ async fn retention_keeps_a_claim_that_moved_under_the_sweep_when_dsn_is_set() {
 }
 
 #[tokio::test]
+async fn keyword_search_ranks_admitted_claims_when_dsn_is_set() {
+    // The same clause the in-memory reference passes: this backend answers
+    // through its index, and must answer the same hits in the same order.
+    let Some(store) = store().await else { return };
+    assert!(
+        rakka_agent_knowledge_graph::KnowledgeGraphStore::capabilities(&store)
+            .supports(rakka_agent_knowledge_graph::KnowledgeGraphCapability::KeywordSearch),
+        "the PostgreSQL backend reports keyword search"
+    );
+    conformance::keyword_search(&store, ConformanceScopes::unique("pg-keyword-search")).await;
+}
+
+#[tokio::test]
 async fn scenario_20_the_whole_contract_passes_unchanged_when_dsn_is_set() {
     // The M2 acceptance gate: the umbrella the in-memory reference runs, on a
     // structurally different backend, with zero agent-domain change.

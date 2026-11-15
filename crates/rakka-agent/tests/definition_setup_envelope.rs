@@ -695,3 +695,83 @@ fn a_settings_revision_records_who_accepted_it() {
     assert_eq!(provenance.causation_id.as_str(), "cause-9");
     assert_eq!(provenance.audit_ref.as_str(), "audit-9");
 }
+
+/// A definition whose envelope grants two read capabilities beside everything
+/// [`granted_envelope`] grants.
+fn definition_granting_reads() -> AgentDefinitionRevision {
+    let mut envelope = granted_envelope();
+    envelope
+        .read_capabilities
+        .insert(capability("claims.read.support"));
+    envelope
+        .read_capabilities
+        .insert(capability("claims.read.finance"));
+    let definition = AgentDefinition::new(
+        rakka_agent::AgentDefinitionId::new("support-v1").expect("definition id should be valid"),
+        "Resolves customer support tickets end to end.",
+        envelope,
+    )
+    .expect("definition should be valid");
+    AgentDefinitionRevision::initial(definition, provenance(1))
+}
+
+#[test]
+fn a_setup_that_adds_a_read_capability_is_refused() {
+    let mut envelope = narrowed_envelope();
+    envelope
+        .read_capabilities
+        .insert(capability("claims.read.finance"));
+
+    assert_eq!(
+        setup_violation_codes(envelope),
+        vec!["widened-read-capability"]
+    );
+}
+
+#[test]
+fn a_setup_may_narrow_read_capabilities() {
+    let definition = definition_granting_reads();
+
+    let mut subset = narrowed_envelope();
+    subset
+        .read_capabilities
+        .insert(capability("claims.read.support"));
+    AgentSetupRevision::new(
+        AgentRevisionNumber::INITIAL,
+        &definition,
+        subset,
+        provenance(2),
+    )
+    .expect("a setup holding one of the granted read capabilities is a narrowing");
+
+    AgentSetupRevision::new(
+        AgentRevisionNumber::INITIAL,
+        &definition,
+        narrowed_envelope(),
+        provenance(2),
+    )
+    .expect("a setup holding no read capability is a narrowing");
+}
+
+/// The read grant means nothing outside communal reads: a capability the
+/// definition names only as a read capability is still not one any tool may
+/// exercise.
+#[test]
+fn read_capabilities_authorize_nothing_but_reads() {
+    let mut envelope = narrowed_envelope();
+    envelope
+        .tools
+        .get_mut(&tool("search"))
+        .expect("the narrowed envelope keeps the search tool")
+        .capabilities
+        .insert(capability("claims.read.finance"));
+
+    let error = AgentSetupRevision::new(
+        AgentRevisionNumber::INITIAL,
+        &definition_granting_reads(),
+        envelope,
+        provenance(2),
+    )
+    .expect_err("a tool may not exercise a capability granted only for reads");
+    assert_eq!(error.violation_codes(), vec!["widened-tool-capability"]);
+}

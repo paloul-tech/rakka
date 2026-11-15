@@ -120,7 +120,9 @@ inside the mutator, and is what that arrangement was verified for.
 | Immediate revocation re-checked before external invocation | `AgentEntityAuthority::authorize` re-loads durable state per attempt | `wait_invalidation.rs` (12 tests), `tool_authority.rs` | Met, **not atomic** with the invocation (below) |
 | Credentials resolved only for the bounded attempt, never logged or persisted | Resolution between durable `Started` and `invoke`, dropped after; `AgentEphemeralCredential` has no `Serialize` and a redacting `Debug` | `secret_exclusion.rs` (14 tests), incl. a kill *while the credential is live* | Met |
 | Memory retrieval enforces tenant, agent, classification before ranking | `MemoryRetrievalQuery::admits` as pre-ranking predicates, and — new — the authoritative store resolves every ranked identity | `memory_scope_fence.rs`, `private_memory_retrieval.rs` | Met; *purpose* restrictions remain unmodelled |
-| Communal memory treated as an injection source; provenance and trust available to the context builder | — | — | **Not applicable yet**: communal retrieval is unwired, so no claim reaches a model context |
+| Communal memory treated as an injection source; provenance and trust available to the context builder | Every claim on its way into a snapshot is resolved through the authoritative store, re-checked, and evaluated at the memory-ingress boundary on its statement, with its id and space in the context. A blocked claim, a claim a stage would checkpoint, and a transform that changes what a claim points at are dropped. The snapshot carries each claim's trust state and provenance beside its statement. The communal bundle's chain is attested with the private one | `communal_claim_retrieval.rs` (29 tests), `memory_guardrail_chain_consistency.rs`, `communal_snapshot_record.rs` | Met for the boundary; **what a stage decides is the deployment's**. A claim is evaluated as its statement object, not as bare content, so a stage written for private memory allows every claim until it branches on `context.claim` (see "Delegated to the deployment"). Rendering the claims as untrusted data in a prompt is the application's model adapter's |
+| A communal claim is read only by a run granted its space and holding its required read capabilities, checked before ranking and again on the record | `CommunalRetrievalQuery::admits` on the authoritative record; the retriever is never called for a space outside the effective grant; the grant is the definition's, narrowed by setup and by the run's delegation envelope, which the run entity hands to assembly. A read capability authorizes no tool dispatch | `communal_claim_retrieval.rs`, `communal_read_grant.rs`, `communal_run_grant.rs` (the run entity's own envelope reaches assembly), `tool_authority.rs` (`a_read_capability_authorizes_no_tool_dispatch`), the graph's `keyword_search` conformance clause, and `communal_read_path.rs` in `examples/multi-agent-goal-acceptance` with real entities | Met, with one named exception: a handoff of a task that carries no delegation envelope is not narrowed by the catalog (see "Owed"). *Purpose* restrictions remain unmodelled |
+| Only reviewed claims reach a model context by default | `CommunalRetrievalPolicy::verified_only` is the default; `Retracted` is refused whatever a policy says | `communal_claim_retrieval.rs` (`a_record_the_query_no_longer_admits_is_rejected`), `communal.rs` unit tests | Met; admitting `Proposed` is a deployment's explicit choice |
 | Tool arguments, prompts, raw memory, credentials, high-cardinality ids never metric labels | `validate_agent_domain_metric_attributes` per observation | `agent_metrics.rs`, and `secret_exclusion.rs` over the whole emitted *series set* | Met |
 
 ## MCP client, specification 16 (Phase 7 slice 7.7)
@@ -145,7 +147,7 @@ inside the mutator, and is what that arrangement was verified for.
 | Provenance and classification preserved | Yes | Yes | Yes | Yes |
 | Retention, tombstone, deletion | `purge_run`, now with a caller and a conformance clause | `purge_run`, purged first | Retention, tombstone, delete, `purge_expired` | `tombstone`, `delete`, and a per-space retention sweep with a window per trust status. Fourteen conformance clauses, listed under "One contract, every backend" |
 | Resolved credentials excluded | `secret_exclusion.rs` | same | same | Not swept |
-| Authoritative records distinguished from derived indexes | n/a | n/a | The store answers; the index only ranks | n/a |
+| Authoritative records distinguished from derived indexes | n/a | n/a | The store answers; the index only ranks | The store answers; a ranking only names identities, and on PostgreSQL a search-index row its record does not admit is refused as drift |
 
 ## Delegated to the deployment, and named here so it is not assumed
 
@@ -164,14 +166,51 @@ inside the mutator, and is what that arrangement was verified for.
 - **What an executor puts in its error text.** Rakka bounds it and persists it;
   it cannot know what is secret inside it. The contract is stated on all nine
   executor traits and on the credential resolver.
+- **What a memory-ingress stage does with a communal claim.** Rakka evaluates
+  every claim at the boundary and requires the communal bundle to carry the
+  dispatch authority's chain. It hands a stage the claim's statement object,
+  with the text under `object.value.inline`, where a private memory is handed
+  its bare content. A stage that was written for private memory and inspects
+  a top-level string therefore allows every claim. The stage must branch on
+  `AgentGuardrailContext::claim` before the bundle is wired; nothing in Rakka
+  can check that it does.
 
 ## Owed, and why
 
-- **Communal retrieval into a model context**, `SnapshotCommunalClaim`, and
-  per-claim read-capability enforcement. Deferred by slice 4.6;
-  `MemoryContextSnapshot::communal_claims` is a permanently empty placeholder.
-  Until it exists there is no communal poisoning surface to defend. Tracked as
-  [#69](https://github.com/paloul-tech/rakka/issues/69).
+- **Meaning-based communal search.** The communal read path (issue #69)
+  ranks by shared words only. A claim that answers the turn in other words is
+  not found, and a deployment cannot yet rank claims by embedding. Tracked as
+  [#140](https://github.com/paloul-tech/rakka/issues/140).
+- **The communal search index spans tenants.** On PostgreSQL the word index is
+  one index over the claim table. Every statement carries its tenant and space
+  and returns only that scope's rows, so nothing is disclosed, but the work a
+  search does for a common word grows with how many claims of every tenant
+  hold it. A deployment that needs the cost isolated per tenant runs a
+  database per tenant.
+- **A claim a run has read stays in that run's snapshots.** See "Erasing a
+  claim does not reach the copies outside the graph" below.
+- **A handoff of a task with no delegation envelope is not narrowed.** The
+  handoff step narrows the envelope a task carries. A plain task (no goal, no
+  delegation) whose definition declares no delegation ceilings carries none,
+  so its handoff records the catalog's knowledge spaces and read capabilities
+  and applies neither: the target run reads and appends under its own agent's
+  definition and setup. The target never exceeds what its own definition
+  grants; what is missing is the catalog's narrowing. This predates the read
+  path for knowledge-space appends, and the read path inherits it. Pinned by
+  `handoff_record.rs::a_plain_task_with_no_envelope_is_not_narrowed_by_its_handoff`.
+  Until it is closed, declare delegation ceilings on the task definition or
+  root the task in a goal where a handoff must narrow.
+- **A cancelled graph migration keeps its lock.** `migrate` on the PostgreSQL
+  graph store holds a session-level advisory lock, and a cancelled or
+  timed-out call leaves it held on that connection. Other migrators then wait
+  with no error and no named holder until the connection closes. The wait has
+  no bound and no diagnostic. The first run after this change lasts as long as
+  two index builds, which makes a startup deadline likelier to fire.
+- **No durable mark of a degraded communal search.** A space whose search
+  failed is listed among the spaces searched, and a grant that could not be
+  read leaves an ordinary version 1 snapshot. "Searched and found nothing" and
+  "the search failed" differ only on a counter that carries no run label. The
+  private tier has the same gap.
 - **Descriptor/endpoint revision pinning across recovery.** Generic tool
   intents record no descriptor digest; the workflow tool records one that
   nothing compares.
@@ -203,9 +242,13 @@ inside the mutator, and is what that arrangement was verified for.
     statement survives a tombstone and is removed only by a delete.
     `postgres_delete_leaves_no_statement_bytes_when_dsn_is_set` shows both
     halves.
-  - **Context snapshots,** once issue
-    [#69](https://github.com/paloul-tech/rakka/issues/69) embeds claims in
-    them. The rule below for private memory will apply unchanged.
+  - **Context snapshots.** A run wired with the communal read path (issue
+    #69) embeds the claims a turn selected in that turn's snapshot: statement,
+    provenance, and evidence references. The snapshot is immutable and keeps
+    its copy until the run's snapshot purge; a claim erased afterwards cannot
+    enter a later snapshot. The rule below for private memory applies
+    unchanged, and Rakka keeps no index from a claim to the snapshots that
+    hold it.
   - **The database's own physical copies.** The no-bytes proofs are logical:
     they read every row a query can reach. PostgreSQL keeps the superseded row
     versions, in the table, its out-of-line storage, and its indexes, until
@@ -213,8 +256,17 @@ inside the mutator, and is what that arrangement was verified for.
     replicas hold them for as long as the deployment keeps those. Backup
     retention and vacuum policy are the deployment's.
 
+  What erasure does reach, beyond the claim's own rows and its replay ledger,
+  is the PostgreSQL search index: a tombstone clears the claim's search words
+  in its one statement, a delete removes the row, and a table trigger clears
+  the words of any tombstoned row, whichever binary wrote the tombstone
+  (`postgres_tombstone_clears_the_search_words_when_dsn_is_set`,
+  `postgres_an_earlier_tombstone_statement_clears_the_search_words_when_dsn_is_set`,
+  `postgres_delete_leaves_no_row_when_dsn_is_set`).
+
   Erasing a subject's content therefore means deleting the claims and also
-  discharging the retention of the runs that produced them. Rakka keeps no
+  discharging the retention of the runs that produced them and of the runs
+  that read them. Rakka keeps no
   reverse index from a claim to the run records that copied it, for the reason
   the next item gives. The tombstone also keeps the statement's fingerprint,
   and a gated promotion in the stub's history keeps the gate's own digest of
@@ -326,9 +378,27 @@ frozen byte for byte, against the current schema:
 | A stub row's columns agree with its record, except the fence value, and drift is refused | `postgres_a_stub_row_holds_markers_and_the_fence_when_dsn_is_set` |
 | Two callers racing the same operation both get its one result | `postgres_same_operation_races_converge_every_time_when_dsn_is_set` |
 
-Verified against PostgreSQL 17.5 on 2026-11-13: the graph crate's three test
-files pass with no skips (8 backend proofs, 27 conformance clauses, 16 erasure
-proofs).
+Keyword search (issue #69) is one more clause of the same suite, run only by
+a backend that reports the `keyword-search` capability, and a second file of
+live-database proofs,
+`crates/rakka-agent-knowledge-graph-postgres/tests/postgres_search_index_proofs.rs`:
+
+| Property | Proven by |
+| --- | --- |
+| Admission precedes ranking: a claim the search does not admit (trust, classification, confidence, required capability, a stub, another scope) takes no hit slot; hits are ordered by score and then claim id | `keyword_search` (conformance clause; in-memory and PostgreSQL) |
+| A store without the capability refuses a search instead of answering "nothing found" | `a_store_without_the_capability_refuses_search` |
+| The earlier schema migrates in place without a rewrite, a fresh schema is created in the same shape, and a repeat migration alters nothing | `postgres_the_search_migration_rewrites_nothing_when_dsn_is_set`, `postgres_a_fresh_schema_is_created_in_the_migrated_shape_when_dsn_is_set`, `postgres_a_second_search_migration_alters_nothing_when_dsn_is_set` |
+| An index a failed build left invalid is rebuilt; concurrent migrators of this build do not deadlock | `postgres_an_invalid_search_index_is_rebuilt_when_dsn_is_set`, `postgres_concurrent_search_migrators_do_not_deadlock_when_dsn_is_set` |
+| Every statement of the earlier build still works on the migrated table | `postgres_every_earlier_statement_still_works_after_the_search_migration_when_dsn_is_set` |
+| A tombstone clears the search words, from this build and from an earlier one, and a delete leaves no row | `postgres_tombstone_clears_the_search_words_when_dsn_is_set`, `postgres_an_earlier_tombstone_statement_clears_the_search_words_when_dsn_is_set`, `postgres_delete_leaves_no_row_when_dsn_is_set` |
+| An index column that drifted from its record cannot put a claim in front of a reader the record would refuse | `postgres_a_drifted_capability_column_cannot_leak_a_claim_when_dsn_is_set`, `postgres_a_drifted_classification_column_cannot_leak_a_claim_when_dsn_is_set`, `postgres_drifted_search_words_cannot_surface_a_claim_when_dsn_is_set` |
+| A claim an earlier binary appended is reported `unindexed`, and the indexing pass makes it searchable | `postgres_an_earlier_binarys_claim_is_reported_unindexed_when_dsn_is_set`, `postgres_the_indexing_pass_makes_an_earlier_claim_searchable_when_dsn_is_set` |
+| The indexing pass is idempotent, bounded, scoped, skips a damaged record, and loses to a tombstone | `postgres_the_indexing_pass_is_idempotent_when_dsn_is_set`, `postgres_the_indexing_pass_clamps_its_limit_when_dsn_is_set`, `postgres_the_indexing_pass_stays_in_its_scope_when_dsn_is_set`, `postgres_the_indexing_pass_skips_a_damaged_record_when_dsn_is_set`, `postgres_a_tombstone_beats_the_indexing_pass_when_dsn_is_set`, `postgres_two_indexing_passes_at_once_index_every_claim_once_when_dsn_is_set` |
+| The search reads the word index rather than scanning the scope | `postgres_search_uses_the_word_index_when_dsn_is_set` |
+
+Verified against PostgreSQL 17.5 on 2026-11-14: the graph crate's four test
+files pass with no skips (8 backend proofs, 28 conformance clauses, 16 erasure
+proofs, 27 search-index proofs).
 
 ## Repeatable commands
 
@@ -336,6 +406,10 @@ proofs).
 cargo test -p rakka-agent --test memory_store_contract
 cargo test -p rakka-agent --test memory_scope_fence
 cargo test -p rakka-agent --test memory_guardrail_chain_consistency
+cargo test -p rakka-agent --test communal_claim_retrieval
+cargo test -p rakka-agent --test communal_read_grant
+cargo test -p rakka-agent --test communal_run_grant
+cargo test -p rakka-agent --test communal_snapshot_record
 cargo test -p rakka-agent --test memory_retention
 cargo test -p rakka-agent --test secret_exclusion
 cargo test -p rakka-agent --test executor_isolation
@@ -345,8 +419,10 @@ cargo test -p rakka-agent --test tenant_isolation
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test -p rakka-agent-postgres --test memory_conformance
 
-# The communal graph's contract, erasure and retention included:
+# The communal graph's contract, erasure, retention and search included:
 cargo test -p rakka-agent-knowledge-graph --test knowledge_graph_conformance
+cargo test -p rakka-agent-knowledge-graph --test communal_retrieval
+cargo test -p rakka-example-multi-agent-goal-acceptance --test communal_read_path
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test -p rakka-agent-knowledge-graph-postgres
 

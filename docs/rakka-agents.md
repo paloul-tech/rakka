@@ -37,8 +37,8 @@ enforced row names the test behind it:
 | `rakka-agent-workflow` | The durable execution kernel the agent domain runs on: durable inbox and outbox acceptance, the dispatcher fleet and its claim filters, timers and triggers, runtime events, the compiled execution IR and graph scheduler, and the OTLP bridge. | `agent-workflow` (default) |
 | `rakka-agent` | The agent domain: the five entity classes and their choreography, the loop runtime, the model adapter trait, effects and tool authority, budgets, admission, guardrails, checkpoints, goals and wakes, delegation and coordination, memory traits and retrieval, telemetry, operational queries, schema policy, and a deterministic testkit. | `agent`; `agent-rig` adds the Rig-backed model adapter, `agent-otel` the GenAI convention mapping |
 | `rakka-agent-postgres` | PostgreSQL session memory, context snapshots, agent-private long-term records, the pgvector retriever, and their migrations. | — (depend on it directly) |
-| `rakka-agent-knowledge-graph` | The communal knowledge graph: provenance-bearing claims, the trust lattice, the promotion gate, the portable store SPI, an in-memory reference store, and the backend conformance harness. | — |
-| `rakka-agent-knowledge-graph-postgres` | The graph's relational backend. | — |
+| `rakka-agent-knowledge-graph` | The communal knowledge graph: provenance-bearing claims, the trust lattice, the promotion gate, the portable store SPI with optional keyword search, the adapters that serve `rakka-agent`'s communal read ports, an in-memory reference store, and the backend conformance harness. | — |
+| `rakka-agent-knowledge-graph-postgres` | The graph's relational backend, with an indexed keyword search and the pass that indexes earlier claims. | — |
 | `rakka-agent-mcp` | The MCP client adapter: server bindings with operator-declared tool policies, publish-time descriptor sync, a tool listing for choosing tools before any binding names them, the dispatch executor over an injected transport client with a required egress check, and the child-process launcher seam. | `agent-mcp` |
 | `rakka-a2a` (`agents` feature) | The typed A2A surface over the entities: ingress, the state projection, the agent-management and collaboration extensions, replay, and the goal view. | `a2a-agents`; `a2a-otel` adds the ingress span |
 
@@ -380,6 +380,130 @@ incorrectly.
   promotion to `Verified` passes the checkpoint grant, and every backend passes
   one conformance suite unchanged. Concurrent specialist appends keep goal,
   task, run, and delegation provenance under stable idempotency.
+- **Reading the graph into a model context** is the communal read path
+  (issue #69). A run reads nothing from the graph until its memory is wired
+  with a bundle: `AgentRunMemory::with_communal_retrieval(AgentCommunalRetrieval::new(retriever, authority, grants, guardrails, policy))`.
+  An unwired run behaves, and writes its snapshots, exactly as before.
+  - **What happens on a turn.** After the session window and the private
+    selection are assembled, the same assembly derives a query from the recent
+    session text, reads the run's read grant, and searches each granted
+    knowledge space, in ascending id order, up to the policy's `max_spaces`
+    (4 by default, 16 at most). The rankings are merged best first. Each
+    ranked identity is then resolved through the authority, in the space whose
+    ranking named it, and the record the authority answers is re-checked,
+    evaluated at the memory-ingress guardrail boundary, and embedded in the
+    snapshot's `communal_claims`: up to 8 claims and 64 KiB of statements and
+    evidence references by default, 16 claims at most. A claim whose record is
+    outside a claim's bounds, an evidence reference over 2 KiB among them, is
+    not read. The selection is a prefix of the merged
+    ranking: the walk stops at the first claim that does not fit, and does not
+    skip it for a smaller one.
+  - **A ranking is not authority.** A retriever answers identities and scores
+    and nothing else. Trust state, classification, confidence and required
+    capabilities are decided on the authoritative record at the moment of the
+    turn, so a claim retracted, tombstoned, deleted or reclassified since it
+    was indexed is not read. A claim of another space or tenant is simply
+    absent, and is counted `unverified`.
+  - **Three things bound what a run reads.**
+    1. *The space.* A run searches only the knowledge spaces its definition
+       grants (`knowledge_spaces` on the authority envelope), narrowed by its
+       setup and by its delegation. A space outside that grant is never named
+       to the retriever.
+    2. *The claim's own requirements.* A claim may require read capabilities
+       (`ClaimAccess::required_read_capabilities`). A run reads it only when
+       its **read capabilities** hold every one. Read capabilities are a set
+       of their own on the authority envelope
+       (`AgentAuthorityEnvelope::read_capabilities`): they are not tool
+       capabilities, and holding one authorizes no tool dispatch. A setup may
+       only narrow the set, and an autonomous admission is refused when the
+       envelope would hold one it was not admitted with
+       (`widened-read-capability`). A delegation passes on what the catalog's
+       target states (`AgentDelegationTarget::with_read_capability`). When the
+       delegating run was itself delegated, that statement is intersected with
+       what the run was delegated. At a root (a goal-bearing or plain task) it
+       is passed on as it stands: it is not intersected with the root agent's
+       own definition, so the catalog is what bounds a root's delegation, and
+       a root can pass on a read capability it does not itself hold. A
+       delegated run holds what its delegation states and no more: stating
+       nothing delegates nothing. A handoff follows the same rule **when the task carries a
+       delegation envelope**: a goal-bearing task, a delegated task, or a task
+       whose definition declares delegation ceilings. A plain task with none
+       of those carries no envelope, and its handoff is recorded but narrows
+       nothing: the target run reads, and appends, under its own agent's
+       definition and setup. Declare delegation ceilings on the task
+       definition, or root the task in a goal, where a handoff must narrow.
+    3. *The policy.* `CommunalRetrievalPolicy` names the trust states and
+       classifications a deployment admits into a model context at all.
+       **The default admits only `Verified`, `Unclassified` claims.** A
+       `Proposed` claim is one agent's unreviewed assertion; admitting it is a
+       decision a deployment makes with
+       `CommunalRetrievalPolicy::verified_only().with_trust(...)`. No policy
+       can admit a `Retracted` claim.
+  - **Claims are untrusted input.** Each claim's statement is evaluated by the
+    bundle's memory-ingress chain, as JSON `{"subject", "predicate",
+    "object"}`, with the claim id and its space in the guardrail context
+    (`AgentGuardrailContext::claim`, `claim_space`). A blocked claim, and one
+    a stage would park on a checkpoint, is dropped. A stage may rewrite the
+    subject, the predicate, or an inline value; a transform that changes a
+    node object or an artifact reference, or that is not a valid statement,
+    drops the claim. **A stage written for private memory does not protect
+    claims until it reads this shape.** A private memory is evaluated as its
+    bare content; a claim is evaluated as the statement object, with its text
+    under `object.value.inline`. A stage that inspects a top-level string
+    therefore allows every claim, and one that replaces the value with a bare
+    string drops every claim. Branch on `context.claim` in each memory-ingress
+    stage before wiring the bundle. The chain must be the one the dispatch
+    authority declares: `AgentToolAuthority::with_memory_ingress` attests the private
+    and the communal bundle together, and refuses a memory in which either
+    carries a different chain (`guardrail-chain-mismatch`). Rakka selects claims and records
+    them; rendering them into a prompt is the application's model adapter's
+    job, and it must present them as untrusted data, with each claim's trust
+    state and provenance, which the snapshot carries for that purpose.
+  - **The graph's adapters.** `rakka-agent` declares three ports and cannot see
+    the graph crate. `KnowledgeGraphCommunalRetriever` and
+    `KnowledgeGraphCommunalAuthority` (in `rakka-agent-knowledge-graph`)
+    implement two of them over any `KnowledgeGraphStore`; the retriever
+    refuses a store that does not report the `keyword-search` capability.
+    `AgentEntityCommunalReadGrants` implements the third from the run's own
+    agent entity, and from its setup when given a setup resolver.
+  - **Search is by shared words.** `KnowledgeGraphStore::search` is an
+    optional store operation. A claim's words are those of its subject, its
+    predicate, and its object (a node id, or the text of an inline value; a
+    value held by artifact reference gives none). Words are runs of
+    alphanumeric characters, lowercased. Nothing is normalized or segmented:
+    a decomposed accent splits a word where the precomposed letter does not,
+    text without spaces (Chinese, Japanese) is one word per run, and case
+    folding is Unicode lowercasing only, so `STRASSE` does not match `Straße`.
+    Such text is not found, and the search does not say so. A claim is a hit
+    when it shares at least one word with the query, and its score is the
+    share of the query's words it holds. Restrictions apply before ranking, so a claim the reader
+    may not read takes no place in the ranking. There is no meaning-based
+    search yet (issue #140).
+  - **A fault never fails the turn.** A grant that cannot be read selects
+    nothing; a space whose search fails costs that space's ranking and the
+    others continue; an authority fault part-way keeps the claims already
+    verified. Each is counted `degraded`. The counters are
+    `rakka.agent.communal.retrievals` (`backend`, `outcome`) and
+    `rakka.agent.communal.ingress.outcomes` (`outcome`); no label carries
+    claim text, a claim id, a space id or the query.
+  - **`index-incomplete`.** A backend that indexes its claims can hold claims
+    its index does not cover. PostgreSQL does after an upgrade, and whenever a
+    node on an earlier build appends: search does not find such a claim, and
+    says so. The snapshot's communal record carries `index_incomplete`, and
+    the outcome counter counts `index-incomplete`. The remedy is the
+    deployment's: call `PostgresKnowledgeGraphStore::index_claims` for the
+    space until it answers no cursor. No loop in Rakka calls it.
+  - **What a snapshot keeps.** A snapshot is immutable and is reused on every
+    retry of its turn. A claim that is tombstoned, deleted, retracted, or put
+    out of the run's reach after it was selected stays in the snapshots that
+    already hold it, until the run's snapshot purge. It cannot enter a later
+    snapshot. Rakka keeps no index from a claim to the snapshots that hold it.
+  - **The snapshot record.** A snapshot for whose turn a communal search ran
+    is written at schema version 2 and carries `communal`, the record of the
+    search: the query, the spaces searched, the policy in force, and the
+    definition and setup revisions the grant was read under. Every other
+    snapshot is still written at version 1 with the bytes it always had. The
+    roll order is in [`rakka-compatibility.md`](rakka-compatibility.md).
 - **Erasing from the graph** is three operations an application calls on the
   store (issue #68). No run effect, command, or tool reaches them.
   - `tombstone` withdraws one claim's content and returns a stub. The stub
@@ -414,12 +538,19 @@ incorrectly.
   that reuses one request id across a batch of deletes is told, rather than
   being answered "done" for claims that are still there.
 
+  **Erasure reaches the search index.** On PostgreSQL a claim's search words
+  are held beside its row. A tombstone clears them in its one statement, a
+  delete removes the row, and a trigger on the table clears the words of any
+  tombstoned row, so the rule holds for a tombstone written by a binary from
+  before the index too.
+
   **Erasure does not reach copies outside the graph.** The `ClaimAppend`
   request on the run record, the session memory the claim was mapped from,
-  evidence artifacts, and, after a tombstone, the free-text reason of a trust
-  transition, all still hold what they held. To erase a subject's content,
-  delete the claims and also discharge the retention of the runs that produced
-  them.
+  evidence artifacts, the context snapshots of runs that read the claim, and,
+  after a tombstone, the free-text reason of a trust transition, all still
+  hold what they held. To erase a subject's content, delete the claims and
+  also discharge the retention of the runs that produced them and of the runs
+  that read them.
 
   **Nor the database's own copies.** After a tombstone or a delete the content
   is gone from every row a query can read. PostgreSQL still holds the old row
@@ -448,8 +579,9 @@ incorrectly.
   per-tenant policy, snapshots first; agent-private memory outlives every run.
   Guardrails evaluate all seven boundaries — model and tool request, model
   and tool response, memory ingress, A2A ingress and egress — and a
-  deployment attests that the chain its retrieval bundle and its A2A surface
-  evaluate is the chain its dispatch authority declares
+  deployment attests that the chain its retrieval bundles, private and
+  communal, and its A2A surface evaluate is the chain its dispatch authority
+  declares
   (`with_memory_ingress`, `with_a2a_guardrails`). A blocked model response
   fails the effect once under `guardrail-blocked`; the run's record names the
   stage and the reason code that decided beside that code; a transformed one
@@ -540,8 +672,10 @@ The security matrix records the posture clause by clause. The rules that hold
 by construction: no resolved credential or secret is persisted anywhere
 (durable state, effects, memory, runtime events, telemetry, logs, metrics,
 snapshots); setup and settings revisions can only narrow a definition; a tool
-call is undispatchable until every gate passes; retrieved memory is untrusted
-input to the guardrail chain and can never widen a capability; failure text an
+call is undispatchable until every gate passes; retrieved memory, private and
+communal, is untrusted input to the guardrail chain and can never widen a
+capability; a communal claim is read only by a run granted its space and
+holding every read capability it requires; failure text an
 executor or resolver returns is bounded before it is persisted, and never a
 credential; and workload isolation is routed at the claim by execution class.
 Authentication, tenant resolution, and what an execution class isolates are
@@ -585,7 +719,7 @@ with fixtures only.
 | `examples/minimal-local-agent-workflow` | The smallest durable command boundary of the kernel: a `StartRun` accepted into a durable inbox, recovered, executed once. |
 | `examples/durable-agent-acceptance` | The M1 statement: one sharded agent from ingress through checkpoints, dispatcher and owner loss, reconciliation, and a terminal result. |
 | `examples/continuous-goal-acceptance` | The M3 statement: one continuous goal through wakes, coalescing, downtime, backoff, fencing, renewal, and retirement. |
-| `examples/multi-agent-goal-acceptance` | The M4 statement: a root goal delegating to specialists, invoking a workflow tool, surviving root and child loss, and reaching `Satisfied` through its evaluator. |
+| `examples/multi-agent-goal-acceptance` | The M4 statement: a root goal delegating to specialists, invoking a workflow tool, surviving root and child loss, and reaching `Satisfied` through its evaluator. Its `tests/communal_read_path.rs` wires the communal read path into the same world and shows a run reading only the claims it is granted. |
 | `examples/coordination-capability-acceptance` | The M5 statement: a board claim, a handoff, a human-owned upstream, a moderated conversation, and cursor replay across pod loss. |
 | `examples/multi-pod-agent-fault-soak` | Two real processes, a shared durable directory, and a sweep that aborts a pod at every durable write. Gated. |
 | `examples/agent-otlp-export-acceptance` | A real OpenTelemetry SDK exporting one real run over OTLP to an in-process receiver, asserted on the decoded protobuf. |
@@ -595,8 +729,7 @@ with fixtures only.
 
 Every matrix ends with an "Owed" section, and the roster says what it does not
 claim. The open items as of this document are recorded there rather than here:
-the communal read path into a model context in the security matrix; the segment
-classes with no production call site and the untested two-replica
+the segment classes with no production call site and the untested two-replica
 tail-sampling gateway in the telemetry matrix; the coordination workload
 across pods, the PostgreSQL arm for the shared substrate, and detected rather
 than announced departure in the fault-injection matrix. The items a consumer

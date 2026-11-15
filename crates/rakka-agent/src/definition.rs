@@ -561,6 +561,8 @@ pub enum AgentEnvelopeDimension {
     Collaborator,
     /// A knowledge space the definition never granted access to.
     KnowledgeSpace,
+    /// A capability for reading communal claims the definition never granted.
+    ReadCapability,
     /// A shared environment the definition never granted access to.
     Environment,
     /// A credential binding the definition never authorized.
@@ -591,6 +593,7 @@ impl AgentEnvelopeDimension {
             Self::TaskDefinition => "unaccepted-task-definition",
             Self::Collaborator => "unauthorized-collaborator",
             Self::KnowledgeSpace => "widened-knowledge-access",
+            Self::ReadCapability => "widened-read-capability",
             Self::Environment => "widened-environment-access",
             Self::CredentialBinding => "widened-credential-access",
             Self::CoordinationCapability => "unauthorized-coordination-capability",
@@ -655,6 +658,15 @@ pub struct AgentAuthorityEnvelope {
     pub collaborators: BTreeSet<AgentId>,
     /// Knowledge spaces the agent may read or contribute to.
     pub knowledge_spaces: BTreeSet<KnowledgeSpaceId>,
+    /// Capabilities the agent holds for reading communal claims.
+    ///
+    /// A communal claim may require capabilities of its reader; a run reads a
+    /// claim only when its grant holds every one. The set means nothing outside
+    /// communal reads: it authorizes no tool, no append and no dispatch. It is
+    /// omitted when empty, so an envelope that grants none has the bytes it had
+    /// before the field existed.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub read_capabilities: BTreeSet<AgentCapabilityId>,
     /// Shared environments the agent may reach through declared tools.
     pub environments: BTreeSet<AgentEnvironmentRef>,
     /// Logical credential bindings the agent's dispatches may resolve.
@@ -777,6 +789,13 @@ impl AgentAuthorityEnvelope {
             &candidate.knowledge_spaces,
             AgentEnvelopeDimension::KnowledgeSpace,
             "knowledge space",
+            &mut violations,
+        );
+        collect_subset_violations(
+            &self.read_capabilities,
+            &candidate.read_capabilities,
+            AgentEnvelopeDimension::ReadCapability,
+            "read capability",
             &mut violations,
         );
         collect_subset_violations(

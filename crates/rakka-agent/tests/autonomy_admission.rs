@@ -605,3 +605,53 @@ async fn an_admission_survives_any_agent_owner_loss_exactly_once() {
     })
     .await;
 }
+
+/// A read capability is authority like any other dimension of the envelope
+/// ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)): an admitted
+/// agent whose definition gains one is refused as widened by the existing
+/// derivation, and a fresh admission over the wider envelope clears it.
+#[test]
+fn a_definition_that_gains_a_read_capability_is_widened_until_readmitted() {
+    let admitted = admittable_envelope();
+    let decide = |envelope: AgentAuthorityEnvelope| {
+        AutonomyAdmissionDecision::new(
+            [AgentOperationClass::BoundedAsync].into_iter().collect(),
+            AgentRevisionNumber::INITIAL,
+            AgentRevisionNumber::INITIAL,
+            envelope,
+            AgentAdmissionEvaluator::Service("risk-policy-service".to_string()),
+            every_requirement(),
+            provenance(2).accepted_at,
+        )
+        .expect("a complete admission")
+    };
+    let decision = decide(admitted.clone());
+    let now = provenance(3).accepted_at;
+    decision
+        .admits(AgentOperationClass::BoundedAsync, &admitted, now)
+        .expect("the admitted envelope is admitted");
+
+    let mut widened = admitted;
+    widened.read_capabilities.insert(
+        rakka_agent::AgentCapabilityId::new("claims.read.finance")
+            .expect("capability id should be valid"),
+    );
+    let refusal = decision
+        .admits(AgentOperationClass::BoundedAsync, &widened, now)
+        .expect_err("a read capability the admission never covered widens it");
+    assert_eq!(refusal.code(), "admission-widened");
+    let rakka_agent::AgentAdmissionRefusal::Widened { violations } = refusal else {
+        panic!("the refusal is the existing widening one");
+    };
+    assert_eq!(
+        violations
+            .iter()
+            .map(rakka_agent::AgentEnvelopeViolation::reason_code)
+            .collect::<Vec<_>>(),
+        vec!["widened-read-capability"]
+    );
+
+    decide(widened.clone())
+        .admits(AgentOperationClass::BoundedAsync, &widened, now)
+        .expect("re-admission over the wider envelope clears the refusal");
+}

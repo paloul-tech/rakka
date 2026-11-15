@@ -690,6 +690,7 @@ mod tests {
         let record = AgentDelegationRecord {
             environments: Default::default(),
             knowledge_spaces: Default::default(),
+            read_capabilities: Default::default(),
             delegation: delegation.clone(),
             goal: None,
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),

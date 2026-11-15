@@ -1443,3 +1443,38 @@ async fn a_pre_crash_revocation_blocks_dispatch_after_any_owner_loss() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #69: a read capability authorizes communal reads and nothing else. A
+// deployment binding that exercises a capability the definition names only in
+// `read_capabilities` is refused at dispatch exactly as if the definition had
+// never named it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_read_capability_authorizes_no_tool_dispatch() {
+    let capability =
+        rakka_agent::AgentCapabilityId::new("claims.read.finance").expect("the capability id");
+    let spec = AgentEffectSpec::idempotent(2).expect("the spec is valid");
+    let registry = AgentToolRegistry::new()
+        .register(rakka_agent::AgentToolBinding::new(
+            tool_descriptor(TOOL),
+            AgentToolDeclaration::new(spec.safety_class).with_capability(capability.clone()),
+            spec.max_attempts,
+        ))
+        .expect("the tool should register");
+    let mut envelope = envelope_for_registry(&registry);
+    envelope
+        .tools
+        .get_mut(&tool_id())
+        .expect("the tool is declared")
+        .capabilities
+        .clear();
+    envelope.read_capabilities.insert(capability);
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None).with_envelope(envelope);
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(fx.terminal_failure_code().await, "widened-tool-capability");
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+}

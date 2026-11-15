@@ -100,6 +100,7 @@ impl AgentA2aHandoffSendExecutor for ApplyingHandoffExecutor {
                 policy_revision: handoff.policy_revision,
                 context: handoff.context.clone(),
                 knowledge_spaces: handoff.resolved.knowledge_spaces.clone(),
+                read_capabilities: handoff.resolved.read_capabilities.clone(),
             };
             let mut store = AgentTaskEntityStore::new(
                 scope,

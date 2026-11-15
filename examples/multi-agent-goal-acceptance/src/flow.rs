@@ -316,7 +316,7 @@ fn replay_intent(scope: &AgentRunScope) -> AgentRunEffect {
 /// production caller does across a shard handoff: the entity's durable
 /// state is the identity, and a routed retry lands on the re-materialized
 /// owner.
-async fn ask_retrying<M, R>(
+pub async fn ask_retrying<M, R>(
     entity: &rakka_sharding::ShardedEntityRef<M>,
     build: impl Fn(rakka_core::ReplyTo<R>) -> M,
     context: &str,
@@ -339,7 +339,7 @@ where
 }
 
 /// Instantiates one agent under an explicit authority envelope.
-async fn instantiate(
+pub async fn instantiate(
     world: &World,
     scope: &AgentScope,
     definition_id: &str,
@@ -422,7 +422,7 @@ async fn round(
 }
 
 /// Pumps one task/run pair until the run terminates or nothing moves.
-async fn pump(
+pub async fn pump(
     world: &World,
     task_scope: &AgentTaskScope,
     run_scope: &AgentRunScope,

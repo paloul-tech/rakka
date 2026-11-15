@@ -25,6 +25,19 @@ use rakka_agent::{
     METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_MODEL_TOKENS,
     METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TURN_DURATION, METRIC_AGENT_WAKE_DISPOSITIONS,
 };
+use rakka_agent::{
+    AgentCommunalClaimAuthority, AgentCommunalClaimId, AgentCommunalClaimRetriever,
+    AgentCommunalClaimTrust, AgentCommunalReadGrant, AgentCommunalReadGrantSource,
+    AgentCommunalRetrieval, AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain,
+    AgentGuardrailContext, AgentGuardrailOutcome, AgentGuardrailStage, AgentGuardrailStageId,
+    AgentRevisionNumber, AgentRunMemory, AgentRunScope, CommunalClaimObject,
+    CommunalClaimProvenance, CommunalClaimRecord, CommunalClaimStatement, CommunalRetrievalOutcome,
+    CommunalRetrievalPolicy, CommunalRetrievalQuery, InMemoryContextSnapshotStore,
+    InMemorySessionMemoryStore, KnowledgeSpaceId, MemoryClassification, MemoryFuture,
+    RankedCommunalClaim, TenantId, METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES,
+    METRIC_AGENT_COMMUNAL_RETRIEVALS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+    METRIC_AGENT_MEMORY_RETRIEVALS,
+};
 use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
 use rakka_core::{InMemoryMetricsRecorder, MetricKind};
 
@@ -1125,4 +1138,389 @@ async fn a_direction_the_provider_did_not_report_records_no_sample() {
     let tokens = snapshot.observations_named(METRIC_AGENT_MODEL_TOKENS);
     assert_eq!(tokens.len(), 1);
     assert_eq!(tokens[0].value(), 120.0);
+}
+
+// ---------------------------------------------------------------------------
+// The communal tier's own two counters (issue #69).
+// ---------------------------------------------------------------------------
+
+const COMMUNAL_SPACE: &str = "space-ledger-q3";
+const COMMUNAL_CLAIM_OK: &str = "claim-harbour-ok";
+const COMMUNAL_CLAIM_BLOCKED: &str = "claim-harbour-blocked";
+const COMMUNAL_CLAIM_GHOST: &str = "claim-harbour-ghost";
+const COMMUNAL_SUBJECT: &str = "shipment-zanzibar";
+const COMMUNAL_TEXT: &str = "quarantined at the mombasa depot";
+
+/// A retriever that ranks three claims in one space and nothing elsewhere,
+/// and says that space's index is behind.
+struct RankingRetriever;
+
+impl AgentCommunalClaimRetriever for RankingRetriever {
+    fn backend_name(&self) -> &'static str {
+        "ranking-double"
+    }
+
+    fn retriever_version(&self) -> AgentRevisionNumber {
+        AgentRevisionNumber::INITIAL
+    }
+
+    fn retrieve<'a>(
+        &'a self,
+        _tenant: &'a TenantId,
+        space: &'a KnowledgeSpaceId,
+        _query: &'a CommunalRetrievalQuery,
+        _now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, CommunalRetrievalOutcome> {
+        Box::pin(async move {
+            if space.as_str() != COMMUNAL_SPACE {
+                return Ok(CommunalRetrievalOutcome::default());
+            }
+            Ok(CommunalRetrievalOutcome {
+                ranked: [
+                    (COMMUNAL_CLAIM_OK, 9_000),
+                    (COMMUNAL_CLAIM_GHOST, 8_000),
+                    (COMMUNAL_CLAIM_BLOCKED, 7_000),
+                ]
+                .into_iter()
+                .map(|(claim, relevance_bps)| RankedCommunalClaim {
+                    claim: AgentCommunalClaimId::new(claim).expect("the claim id is valid"),
+                    relevance_bps,
+                })
+                .collect(),
+                index_watermark: None,
+                index_incomplete: true,
+            })
+        })
+    }
+}
+
+/// An authority that holds every ranked claim but the ghost.
+struct HoldingAuthority;
+
+impl AgentCommunalClaimAuthority for HoldingAuthority {
+    fn backend_name(&self) -> &'static str {
+        "holding-double"
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        _tenant: &'a TenantId,
+        space: &'a KnowledgeSpaceId,
+        claim: &'a AgentCommunalClaimId,
+        _now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, Option<CommunalClaimRecord>> {
+        Box::pin(async move {
+            if claim.as_str() == COMMUNAL_CLAIM_GHOST {
+                return Ok(None);
+            }
+            let statement = CommunalClaimStatement {
+                subject: COMMUNAL_SUBJECT.to_string(),
+                predicate: "status".to_string(),
+                object: CommunalClaimObject::Value(
+                    AgentTaskContent::inline(serde_json::json!(COMMUNAL_TEXT))
+                        .expect("the value is inline-bounded"),
+                ),
+            };
+            Ok(Some(CommunalClaimRecord {
+                claim_id: claim.clone(),
+                space: space.clone(),
+                statement_digest: statement.digest(),
+                statement,
+                trust: AgentCommunalClaimTrust::Verified,
+                provenance: CommunalClaimProvenance {
+                    agent: agent_id(),
+                    goal: None,
+                    task: None,
+                    run: None,
+                    delegation: None,
+                },
+                evidence: Vec::new(),
+                created_at: AgentTimestampMillis::new(1),
+                confidence_bps: 5_000,
+                classification: MemoryClassification::Unclassified,
+                required_read_capabilities: Default::default(),
+            }))
+        })
+    }
+}
+
+/// A grant of five spaces, one more than the default policy searches.
+struct FiveSpaces;
+
+impl AgentCommunalReadGrantSource for FiveSpaces {
+    fn backend_name(&self) -> &'static str {
+        "five-spaces-double"
+    }
+
+    fn read_grant<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, Option<AgentCommunalReadGrant>> {
+        Box::pin(async move {
+            Ok(Some(AgentCommunalReadGrant {
+                spaces: [
+                    COMMUNAL_SPACE,
+                    "space-a",
+                    "space-b",
+                    "space-c",
+                    "space-zz-uncounted",
+                ]
+                .into_iter()
+                .map(|space| KnowledgeSpaceId::new(space).expect("the space id is valid"))
+                .collect(),
+                read_capabilities: Default::default(),
+                definition_revision: AgentRevisionNumber::INITIAL,
+                setup_revision: None,
+            }))
+        })
+    }
+}
+
+/// Blocks one claim and reports on every other.
+struct BlockOneClaim;
+
+impl AgentGuardrail for BlockOneClaim {
+    fn evaluate(
+        &self,
+        context: &AgentGuardrailContext<'_>,
+        _content: &serde_json::Value,
+    ) -> AgentGuardrailOutcome {
+        if context
+            .claim
+            .is_some_and(|claim| claim.as_str() == COMMUNAL_CLAIM_BLOCKED)
+        {
+            AgentGuardrailOutcome::Block {
+                reason_code: "poisoned-claim".to_string(),
+                evidence: None,
+            }
+        } else {
+            AgentGuardrailOutcome::ReportOnly {
+                reason_code: "seen".to_string(),
+                evidence: None,
+            }
+        }
+    }
+}
+
+/// A grant source with nothing to grant.
+struct NoGrant;
+
+impl AgentCommunalReadGrantSource for NoGrant {
+    fn backend_name(&self) -> &'static str {
+        "no-grant-double"
+    }
+
+    fn read_grant<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, Option<AgentCommunalReadGrant>> {
+        Box::pin(async move { Ok(None) })
+    }
+}
+
+/// A two-turn run whose memory carries a communal bundle and no private one.
+/// Each turn assembles one snapshot, and each has text to search for.
+async fn communal_metrics(
+    grants: Arc<dyn AgentCommunalReadGrantSource>,
+) -> rakka_core::MetricsSnapshot {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let chain = AgentGuardrailChain::new(AgentRevisionNumber::new(7))
+        .with_stage(
+            AgentGuardrailStage::new(
+                AgentGuardrailStageId::new("claim-stage").expect("the stage id is valid"),
+                AgentRevisionNumber::new(2),
+                Arc::new(BlockOneClaim),
+            )
+            .at_boundary(AgentGuardrailBoundary::MemoryIngress),
+        )
+        .expect("the stage registers");
+    let memory = AgentRunMemory::new(
+        Arc::new(InMemorySessionMemoryStore::new()),
+        Arc::new(InMemoryContextSnapshotStore::new()),
+    )
+    .with_communal_retrieval(AgentCommunalRetrieval::new(
+        Arc::new(RankingRetriever),
+        Arc::new(HoldingAuthority),
+        grants,
+        chain,
+        CommunalRetrievalPolicy::default(),
+    ));
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(
+                1,
+                AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                    .with_text("checking where the zanzibar shipment is"),
+            )
+            .with_turn_for(2, proposing_turn("resolved")),
+    );
+    let fx = Fixture::new(dispatcher)
+        .with_memory(memory)
+        .with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the loop should run to completion");
+    metrics.snapshot()
+}
+
+/// The communal tier counts under its own two names, with the retriever's
+/// backend and a bounded outcome, and moves neither private counter: the
+/// metric name is the tier
+/// ([specification 17.10](../../../docs/plans/rakka-agent/spec.md)).
+#[tokio::test]
+async fn a_communal_retrieval_counts_under_its_own_names() {
+    let snapshot = communal_metrics(Arc::new(FiveSpaces)).await;
+
+    let label = |key: &str, value: &str| (key.to_string(), value.to_string());
+    let retrievals = labels_of(&snapshot, METRIC_AGENT_COMMUNAL_RETRIEVALS);
+    assert!(
+        retrievals.contains(&vec![
+            label("backend", "ranking-double"),
+            label("outcome", "retrieved")
+        ]),
+        "a search that ran is counted as retrieved: {retrievals:?}"
+    );
+    assert!(
+        retrievals
+            .iter()
+            .all(|labels| labels[0] == label("backend", "ranking-double")),
+        "every count names the bundle's retriever: {retrievals:?}"
+    );
+    assert_eq!(
+        retrievals
+            .iter()
+            .filter(|labels| labels[1] == label("outcome", "retrieved"))
+            .count(),
+        2,
+        "one search per assembled snapshot: the run took two model turns"
+    );
+    assert_eq!(retrievals.len(), 2, "and nothing else was counted");
+    assert!(snapshot
+        .observations_named(METRIC_AGENT_COMMUNAL_RETRIEVALS)
+        .iter()
+        .all(|observation| observation.kind() == MetricKind::Counter));
+
+    let mut outcomes: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for observation in snapshot.observations_named(METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES) {
+        assert_eq!(observation.attributes().len(), 1);
+        assert_eq!(observation.attributes()[0].key(), "outcome");
+        *outcomes
+            .entry(observation.attributes()[0].value().to_string())
+            .or_default() += observation.value();
+    }
+    assert_eq!(
+        outcomes,
+        std::collections::BTreeMap::from([
+            ("blocked".to_string(), 2.0),
+            ("reported".to_string(), 2.0),
+            ("unverified".to_string(), 2.0),
+            ("index-incomplete".to_string(), 2.0),
+            ("spaces-capped".to_string(), 2.0),
+        ]),
+        "each outcome that happened is counted once per snapshot, and no other is"
+    );
+
+    assert!(
+        snapshot
+            .observations_named(METRIC_AGENT_MEMORY_RETRIEVALS)
+            .is_empty()
+            && snapshot
+                .observations_named(METRIC_AGENT_MEMORY_INGRESS_OUTCOMES)
+                .is_empty(),
+        "the private tier's counters describe the private tier only"
+    );
+}
+
+/// Nothing a claim says, and nothing that identifies it, is a label: not its
+/// words, its subject, its id, its space, or the query that found it.
+#[tokio::test]
+async fn communal_counters_carry_no_claim_text_or_ids() {
+    let snapshot = communal_metrics(Arc::new(FiveSpaces)).await;
+
+    let mut seen = 0;
+    for name in [
+        METRIC_AGENT_COMMUNAL_RETRIEVALS,
+        METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES,
+    ] {
+        for observation in snapshot.observations_named(name) {
+            seen += 1;
+            let attributes: Vec<(&str, &str)> = observation
+                .attributes()
+                .iter()
+                .map(|attribute| (attribute.key(), attribute.value()))
+                .collect();
+            validate_agent_domain_metric_attributes(&attributes)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            for (key, value) in attributes {
+                for forbidden in [
+                    "harbour",
+                    "claim-",
+                    "space-",
+                    "ledger",
+                    "zanzibar",
+                    "mombasa",
+                    "quarantined",
+                    "shipment",
+                    "poisoned",
+                ] {
+                    assert!(
+                        !value.contains(forbidden),
+                        "{name} labels `{key}` with `{value}`, which carries `{forbidden}`"
+                    );
+                }
+            }
+        }
+    }
+    assert!(seen >= 6, "the run recorded the counters this test reads");
+}
+
+/// A run that carries a communal bundle and is granted nothing counts each
+/// turn as `skipped`, so a deployment can tell "wired and reading nothing"
+/// from "not wired". Nothing was ranked, so no outcome is counted.
+#[tokio::test]
+async fn a_communal_bundle_that_searches_nothing_counts_skipped() {
+    let snapshot = communal_metrics(Arc::new(NoGrant)).await;
+
+    let label = |key: &str, value: &str| (key.to_string(), value.to_string());
+    assert_eq!(
+        labels_of(&snapshot, METRIC_AGENT_COMMUNAL_RETRIEVALS),
+        vec![
+            vec![
+                label("backend", "ranking-double"),
+                label("outcome", "skipped")
+            ];
+            2
+        ]
+    );
+    assert!(snapshot
+        .observations_named(METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES)
+        .is_empty());
+}
+
+/// A run with no communal bundle records neither communal counter.
+#[tokio::test]
+async fn a_run_without_a_communal_bundle_counts_no_communal_retrieval() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn("resolved")),
+    );
+    let fx = Fixture::new(dispatcher)
+        .with_memory(AgentRunMemory::new(
+            Arc::new(InMemorySessionMemoryStore::new()),
+            Arc::new(InMemoryContextSnapshotStore::new()),
+        ))
+        .with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the loop should run to completion");
+
+    let snapshot = metrics.snapshot();
+    assert!(snapshot
+        .observations_named(METRIC_AGENT_COMMUNAL_RETRIEVALS)
+        .is_empty());
+    assert!(snapshot
+        .observations_named(METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES)
+        .is_empty());
 }

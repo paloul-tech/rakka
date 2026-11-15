@@ -120,15 +120,16 @@ use crate::observability::{
     AgentDecisionEventSink, AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionOutcome,
     AgentDecisionSource, AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink,
     AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT,
-    LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST, METRIC_AGENT_DECISIONS,
-    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_FAN_IN_RESOLUTIONS,
-    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
-    METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION, METRIC_AGENT_RECOVERY_EVENTS,
-    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
-    METRIC_AGENT_TURN_DURATION, METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND,
-    SEGMENT_ATTR_EFFECT_ATTEMPT, SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS,
-    SEGMENT_ATTR_SETTINGS_REVISION,
+    LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST,
+    METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES, METRIC_AGENT_COMMUNAL_RETRIEVALS,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
+    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
+    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION,
+    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_TURN_DURATION,
+    METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND, SEGMENT_ATTR_EFFECT_ATTEMPT,
+    SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS, SEGMENT_ATTR_SETTINGS_REVISION,
 };
 use crate::query::AgentCheckpointBoundEffectView;
 use crate::schema::{
@@ -3187,23 +3188,23 @@ fn plan_delegation_call(
     let environments = envelope
         .map(|env| env.environments.clone())
         .unwrap_or_default();
-    let knowledge_spaces = match envelope.and_then(|env| env.knowledge_spaces.as_ref()) {
-        Some(granted) => target
-            .knowledge_spaces
-            .intersection(granted)
-            .cloned()
-            .collect(),
-        None if envelope.is_some_and(|env| !env.lineage.is_empty()) => {
-            // A chain whose own grant statement predates the field cannot
-            // prove what it may re-delegate: deny-when-unknown, the
-            // ancestry-gap posture.
-            std::collections::BTreeSet::new()
-        }
-        None => target.knowledge_spaces.clone(),
-    };
+    // The read capabilities ride the same rule: one shared derivation, so
+    // the two delegated dimensions cannot drift apart.
+    let has_lineage = envelope.is_some_and(|env| !env.lineage.is_empty());
+    let knowledge_spaces = crate::delegation::delegated_grant(
+        &target.knowledge_spaces,
+        envelope.and_then(|env| env.knowledge_spaces.as_ref()),
+        has_lineage,
+    );
+    let read_capabilities = crate::delegation::delegated_grant(
+        &target.read_capabilities,
+        envelope.and_then(|env| env.read_capabilities.as_ref()),
+        has_lineage,
+    );
     let record = AgentDelegationRecord {
         environments,
         knowledge_spaces,
+        read_capabilities,
         delegation: delegation_id.clone(),
         goal,
         parent_task: task,
@@ -8692,6 +8693,13 @@ where
         if pending.is_empty() {
             return Ok(0);
         }
+        // What this run was delegated narrows what it may read communally. It
+        // is fixed when the run accepts its assignment, so one read serves
+        // every snapshot of this pass.
+        let delegation: Option<crate::delegation::AgentRunDelegationEnvelope> = self
+            .state()?
+            .loop_state()
+            .and_then(|loop_state| loop_state.delegation_envelope().cloned());
 
         let mut persisted = 0;
         for (turn, reference) in pending {
@@ -8707,6 +8715,7 @@ where
             let assembled = crate::retrieval::assemble_context(
                 &memory,
                 &self.scope,
+                delegation.as_ref(),
                 &reference,
                 turn,
                 AgentRevisionNumber::INITIAL,
@@ -8752,6 +8761,52 @@ where
                         record_agent_domain_counter(
                             self.metrics.as_ref(),
                             METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+                            count as u64,
+                            &[("outcome", outcome)],
+                        )
+                        .ok();
+                    }
+                }
+            }
+
+            // The communal tier, under its own two names: the metric name is
+            // what tells the tiers apart. Counted for every snapshot of a run
+            // that carries a communal bundle, so a turn that searched nothing
+            // is a visible `skipped` rather than a missing series.
+            if let Some(bundle) = memory.communal_retrieval() {
+                let report = assembled.communal;
+                record_agent_domain_counter(
+                    self.metrics.as_ref(),
+                    METRIC_AGENT_COMMUNAL_RETRIEVALS,
+                    1,
+                    &[
+                        ("backend", bundle.retriever().backend_name()),
+                        ("outcome", report.outcome_label()),
+                    ],
+                )
+                .ok();
+                for (outcome, count) in [
+                    ("blocked", report.blocked),
+                    ("transformed", report.transformed),
+                    ("reported", report.reported),
+                    ("checkpoint-refused", report.checkpoint_refused),
+                    ("rejected", report.rejected),
+                    // The retriever named a claim the authority does not hold
+                    // in the space that was searched: the two disagree about
+                    // what the space holds.
+                    ("unverified", report.unverified),
+                    ("resolution-capped", usize::from(report.resolution_capped)),
+                    // A searched space holds claims its index does not cover,
+                    // so this selection could not consider them. The
+                    // deployment's indexing pass is behind.
+                    ("index-incomplete", usize::from(report.index_incomplete)),
+                    // The run is granted more spaces than its policy searches.
+                    ("spaces-capped", usize::from(report.spaces_capped)),
+                ] {
+                    if count > 0 {
+                        record_agent_domain_counter(
+                            self.metrics.as_ref(),
+                            METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES,
                             count as u64,
                             &[("outcome", outcome)],
                         )
@@ -12206,6 +12261,7 @@ mod tests {
             let record = crate::delegation::AgentDelegationRecord {
                 environments: Default::default(),
                 knowledge_spaces: Default::default(),
+                read_capabilities: Default::default(),
                 delegation: delegation.clone(),
                 goal: None,
                 parent_task: AgentTaskId::new(&long).expect("the task id is valid"),

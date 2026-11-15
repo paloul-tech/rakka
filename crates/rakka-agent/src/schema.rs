@@ -151,7 +151,25 @@ pub const CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION: StateSchemaVersion =
 /// the earlier shape, and every record written so far carries an empty
 /// selection, which the reshaped field still loads. The first reshape after a
 /// release must bump it.
+///
+/// Version 2 is that bump (issue #69): the communal selection became
+/// claim-shaped, and a record of the communal search was added. The stamp is
+/// staged, as [`CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION`]'s is. A
+/// snapshot is written as version 2 exactly when a communal search ran, and
+/// as [`AGENT_MEMORY_CONTEXT_SNAPSHOT_WITHOUT_COMMUNAL_SCHEMA_VERSION`]
+/// otherwise, with the bytes and digest it had before. This constant is the
+/// highest version this binary reads and writes.
 pub const CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(2);
+
+/// The schema version of a [`crate::memory::MemoryContextSnapshot`] that
+/// records no communal search: version 1, the only version there was before
+/// the communal read path.
+///
+/// A run with no communal bundle, or one whose turn searched no knowledge
+/// space, writes this version, so a binary from before the read path still
+/// reads everything such a run writes.
+pub const AGENT_MEMORY_CONTEXT_SNAPSHOT_WITHOUT_COMMUNAL_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 
 /// Current schema version of a persisted

@@ -1142,6 +1142,7 @@ async fn real_child_tasks_return_results_through_the_exchange_fabric() {
         let provenance = rakka_agent::AgentTaskDelegationProvenance {
             environments: Default::default(),
             knowledge_spaces: Default::default(),
+            read_capabilities: Default::default(),
             delegation: delegation.clone(),
             parent_task: task_scope().task().clone(),
             parent_run: run_scope(),

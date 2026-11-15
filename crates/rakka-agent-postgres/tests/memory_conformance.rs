@@ -291,3 +291,151 @@ async fn the_whole_memory_contract_passes_unchanged_when_dsn_is_set() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #69: the snapshot store and the snapshot's two versions.
+//
+// A snapshot is version 2 exactly when a communal search ran. This store
+// keeps a snapshot as its own encoding and checks its version on load, so no
+// code here changed; these proofs hold that a version 2 snapshot round-trips
+// through it and that a version 1 snapshot still loads.
+// ---------------------------------------------------------------------------
+
+/// A snapshot of one session entry in a scope of its own.
+async fn session_snapshot(label: &str) -> rakka_agent::MemoryContextSnapshot {
+    use rakka_agent::SessionMemoryStore;
+
+    let scope = memory_conformance::MemoryConformanceScopes::unique(label).primary;
+    let session = rakka_agent::InMemorySessionMemoryStore::new();
+    let entry = rakka_agent::SessionMemoryEntry::new(
+        rakka_agent::MemoryEntryId::derive(&scope, "turn-1-user").expect("the entry id derives"),
+        rakka_agent::MemoryOperationId::derive(&scope, "turn-1-user")
+            .expect("the operation id derives"),
+        rakka_agent::MemorySequence::new(1),
+        rakka_agent::MemoryEntryRole::User,
+        rakka_agent::AgentTaskContent::inline(serde_json::json!({ "text": "where is my order" }))
+            .expect("the content is bounded"),
+        1,
+        None,
+        rakka_agent::MemoryClassification::Unclassified,
+        AgentTimestampMillis::new(5),
+    )
+    .expect("the entry is bounded");
+    session
+        .append(&scope, &entry)
+        .await
+        .expect("the entry appends");
+    let reference =
+        rakka_agent::AgentContextSnapshotRef::for_turn(&scope, 1).expect("the reference derives");
+    rakka_agent::assemble_session_context(
+        &session,
+        &scope,
+        &reference,
+        1,
+        &rakka_agent::SessionWindowPolicy::recent_window(),
+        rakka_agent::AgentRevisionNumber::INITIAL,
+        AgentTimestampMillis::new(10),
+    )
+    .await
+    .expect("the snapshot assembles")
+}
+
+#[tokio::test]
+async fn postgres_a_version_2_snapshot_persists_and_loads_when_dsn_is_set() {
+    use rakka_agent::{ContextSnapshotStore, VersionedAgentRecord};
+
+    let Some(store) = snapshots().await else {
+        return;
+    };
+    let mut snapshot = session_snapshot("snapshot-version-2").await;
+    let statement = rakka_agent::CommunalClaimStatement {
+        subject: "order-42".to_string(),
+        predicate: "status".to_string(),
+        object: rakka_agent::CommunalClaimObject::Value(
+            rakka_agent::AgentTaskContent::inline(serde_json::json!("delayed at customs"))
+                .expect("the value is bounded"),
+        ),
+    };
+    let space = rakka_agent::KnowledgeSpaceId::new("space-a").expect("the space id is valid");
+    snapshot.set_communal(
+        rakka_agent::SnapshotCommunalRetrieval {
+            query: "where is my order".to_string(),
+            retriever: "postgres".to_string(),
+            retriever_version: rakka_agent::AgentRevisionNumber::INITIAL,
+            index_watermark: None,
+            spaces: vec![space.clone()],
+            trust: [rakka_agent::AgentCommunalClaimTrust::Verified].into(),
+            classifications: [rakka_agent::MemoryClassification::Unclassified].into(),
+            min_confidence_bps: 0,
+            index_incomplete: true,
+            ingress_revision: Some(rakka_agent::AgentRevisionNumber::new(3)),
+            definition_revision: rakka_agent::AgentRevisionNumber::new(2),
+            setup_revision: None,
+        },
+        vec![rakka_agent::SnapshotCommunalClaim {
+            claim_id: rakka_agent::AgentCommunalClaimId::new("claim-1")
+                .expect("the claim id is valid"),
+            space,
+            trust: rakka_agent::AgentCommunalClaimTrust::Verified,
+            statement_digest: statement.digest(),
+            statement,
+            provenance: rakka_agent::CommunalClaimProvenance {
+                agent: rakka_agent::AgentId::new("scout").expect("the agent id is valid"),
+                goal: None,
+                task: None,
+                run: None,
+                delegation: None,
+            },
+            evidence: Vec::new(),
+            created_at: AgentTimestampMillis::new(1),
+            classification: rakka_agent::MemoryClassification::Unclassified,
+            confidence_bps: 5_000,
+            relevance_bps: 7_500,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+        }],
+        64,
+    );
+    assert_eq!(snapshot.schema_version().get(), 2);
+
+    let stored = store
+        .persist(&snapshot)
+        .await
+        .expect("a version 2 snapshot persists");
+    assert_eq!(stored, snapshot);
+    let loaded = store
+        .load(&snapshot.scope, &snapshot.reference)
+        .await
+        .expect("a version 2 snapshot loads")
+        .expect("the snapshot is stored");
+    assert_eq!(loaded, snapshot);
+    assert_eq!(loaded.schema_version().get(), 2);
+    assert_eq!(loaded.communal_claims.len(), 1);
+    assert!(loaded
+        .communal
+        .is_some_and(|communal| communal.index_incomplete));
+}
+
+#[tokio::test]
+async fn postgres_a_version_1_snapshot_still_loads_when_dsn_is_set() {
+    use rakka_agent::{ContextSnapshotStore, VersionedAgentRecord};
+
+    let Some(store) = snapshots().await else {
+        return;
+    };
+    let snapshot = session_snapshot("snapshot-version-1").await;
+    assert_eq!(snapshot.schema_version().get(), 1);
+
+    store
+        .persist(&snapshot)
+        .await
+        .expect("a version 1 snapshot persists");
+    let loaded = store
+        .load(&snapshot.scope, &snapshot.reference)
+        .await
+        .expect("a version 1 snapshot loads under a binary whose current version is 2")
+        .expect("the snapshot is stored");
+    assert_eq!(loaded, snapshot);
+    assert_eq!(loaded.schema_version().get(), 1);
+    assert!(loaded.communal.is_none());
+}
