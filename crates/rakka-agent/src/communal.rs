@@ -44,17 +44,23 @@ use std::sync::Arc;
 use rakka_agent_workflow::{AgentTimestampMillis, ArtifactRef};
 use serde::{Deserialize, Serialize};
 
+use rakka_persistence::DurableStateStore;
+
+use crate::agent::{load_agent_entity_state, AgentEntityState};
 use crate::definition::{AgentCapabilityId, AgentRevisionNumber};
+use crate::delegation::{delegated_grant, AgentRunDelegationEnvelope};
+use crate::dispatch::AgentRunSetupResolver;
 use crate::guardrails::AgentGuardrailChain;
 use crate::identity::{
     validate_identity_segment, AgentCommunalClaimId, AgentDelegationId, AgentGoalId, AgentId,
-    AgentRunId, AgentRunScope, AgentTaskId, KnowledgeSpaceId, TenantId,
+    AgentRunId, AgentRunScope, AgentScope, AgentTaskId, KnowledgeSpaceId, TenantId,
 };
 use crate::memory::{MemoryClassification, MemoryError, MemoryFuture};
 use crate::retrieval::{
     AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS, AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES,
     AGENT_MEMORY_RETRIEVAL_RESOLUTION_FACTOR,
 };
+use crate::schema::AgentSchemaPolicy;
 use crate::task::{AgentContentDigest, AgentTaskContent};
 
 /// Most communal claims one context snapshot may select.
@@ -434,6 +440,42 @@ pub struct AgentCommunalReadGrant {
     pub setup_revision: Option<AgentRevisionNumber>,
 }
 
+impl AgentCommunalReadGrant {
+    /// The run's **effective** read grant: this grant narrowed by the run's
+    /// delegation envelope.
+    ///
+    /// Each set follows the rule a communal append already follows, through
+    /// the one function every delegated grant is derived by:
+    ///
+    /// - the envelope states a set: the two are intersected, so a delegation
+    ///   can only ever narrow what the definition and setup grant;
+    /// - the envelope has lineage and states nothing: nothing. A chain whose
+    ///   statement predates the field cannot prove what it was delegated;
+    /// - the envelope is a root's and states nothing, or there is no envelope
+    ///   at all: the grant as answered.
+    #[must_use]
+    pub fn narrowed_by(&self, envelope: Option<&AgentRunDelegationEnvelope>) -> Self {
+        let Some(envelope) = envelope else {
+            return self.clone();
+        };
+        let has_lineage = !envelope.lineage.is_empty();
+        Self {
+            spaces: delegated_grant(
+                &self.spaces,
+                envelope.knowledge_spaces.as_ref(),
+                has_lineage,
+            ),
+            read_capabilities: delegated_grant(
+                &self.read_capabilities,
+                envelope.read_capabilities.as_ref(),
+                has_lineage,
+            ),
+            definition_revision: self.definition_revision,
+            setup_revision: self.setup_revision,
+        }
+    }
+}
+
 /// Answers what one run's agent may read communally.
 pub trait AgentCommunalReadGrantSource: Send + Sync + 'static {
     /// Stable name of the backing implementation, for diagnostics.
@@ -446,6 +488,138 @@ pub trait AgentCommunalReadGrantSource: Send + Sync + 'static {
         scope: &'a AgentRunScope,
         now: AgentTimestampMillis,
     ) -> MemoryFuture<'a, Option<AgentCommunalReadGrant>>;
+}
+
+/// The reference [`AgentCommunalReadGrantSource`]: the grant read from the
+/// agent entity's durable state.
+///
+/// It reads what the dispatch gate reads
+/// ([`AgentEntityAuthority`](crate::dispatch::AgentEntityAuthority)): the
+/// agent's definition and lifecycle status through
+/// [`load_agent_entity_state`], and the run's setup through an optional
+/// [`AgentRunSetupResolver`]. So a suspension, a termination or a narrower
+/// definition reaches the very next assembly, with the agent fully
+/// passivated.
+///
+/// - No agent state, or an agent whose lifecycle status the dispatcher would
+///   refuse to dispatch for: no grant.
+/// - No setup: the definition envelope's knowledge spaces and read
+///   capabilities.
+/// - A setup: the intersection of the definition's sets and the setup's.
+///   Intersecting, rather than taking the setup's, means a definition
+///   narrowed after the setup was admitted still binds.
+pub struct AgentEntityCommunalReadGrants<Store>
+where
+    Store: DurableStateStore<AgentEntityState>,
+{
+    store: Arc<Store>,
+    policy: AgentSchemaPolicy,
+    setups: Option<Arc<dyn AgentRunSetupResolver>>,
+}
+
+impl<Store> AgentEntityCommunalReadGrants<Store>
+where
+    Store: DurableStateStore<AgentEntityState>,
+{
+    /// A grant source over the agent entity store, reading agent states under
+    /// the given schema-compatibility policy.
+    #[must_use]
+    pub fn new(store: Arc<Store>, policy: AgentSchemaPolicy) -> Self {
+        Self {
+            store,
+            policy,
+            setups: None,
+        }
+    }
+
+    /// Resolves each run's setup through the given resolver, which must be
+    /// the one the deployment's dispatch authority uses: a run reads under
+    /// the setup it dispatches under.
+    #[must_use]
+    pub fn with_setups(mut self, setups: Arc<dyn AgentRunSetupResolver>) -> Self {
+        self.setups = Some(setups);
+        self
+    }
+}
+
+impl<Store> Debug for AgentEntityCommunalReadGrants<Store>
+where
+    Store: DurableStateStore<AgentEntityState>,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentEntityCommunalReadGrants")
+            .field("agents", &self.store.backend_name())
+            .field("setups", &self.setups.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The name [`AgentEntityCommunalReadGrants`] reports.
+const AGENT_ENTITY_GRANT_BACKEND: &str = "agent-entity";
+
+impl<Store> AgentCommunalReadGrantSource for AgentEntityCommunalReadGrants<Store>
+where
+    Store: DurableStateStore<AgentEntityState> + Send + Sync + 'static,
+{
+    fn backend_name(&self) -> &'static str {
+        AGENT_ENTITY_GRANT_BACKEND
+    }
+
+    fn read_grant<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        _now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, Option<AgentCommunalReadGrant>> {
+        Box::pin(async move {
+            let backend = |error: &dyn fmt::Display| MemoryError::Backend {
+                backend: AGENT_ENTITY_GRANT_BACKEND.to_string(),
+                message: error.to_string(),
+            };
+            let agent = AgentScope::new(scope.tenant().clone(), scope.agent().clone())
+                .map_err(|error| backend(&error))?;
+            let state = load_agent_entity_state(self.store.as_ref(), &agent, &self.policy)
+                .await
+                .map_err(|error| backend(&error))?;
+            let Some(state) = state else {
+                return Ok(None);
+            };
+            // An agent that may not dispatch may not read either.
+            if !state.status().permits_dispatch() {
+                return Ok(None);
+            }
+            let definition = state.definition();
+            let granted = definition.envelope();
+            let setup = self
+                .setups
+                .as_ref()
+                .and_then(|setups| setups.setup_for(scope));
+            Ok(Some(match setup {
+                None => AgentCommunalReadGrant {
+                    spaces: granted.knowledge_spaces.clone(),
+                    read_capabilities: granted.read_capabilities.clone(),
+                    definition_revision: definition.revision(),
+                    setup_revision: None,
+                },
+                Some(setup) => {
+                    let narrowed = setup.envelope();
+                    AgentCommunalReadGrant {
+                        spaces: granted
+                            .knowledge_spaces
+                            .intersection(&narrowed.knowledge_spaces)
+                            .cloned()
+                            .collect(),
+                        read_capabilities: granted
+                            .read_capabilities
+                            .intersection(&narrowed.read_capabilities)
+                            .cloned()
+                            .collect(),
+                        definition_revision: definition.revision(),
+                        setup_revision: Some(setup.revision()),
+                    }
+                }
+            }))
+        })
+    }
 }
 
 /// What a deployment admits into a model context from the communal tier, and
