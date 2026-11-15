@@ -583,6 +583,10 @@ async fn a_granted_admitted_claim_is_embedded_from_the_authoritative_record() {
     assert_eq!(
         assembled.snapshot.budget.communal_claim_bytes,
         held.statement.size_bytes()
+            + serde_json::to_vec(&held.evidence)
+                .expect("the evidence encodes")
+                .len(),
+        "a claim costs its statement and its evidence references"
     );
     assert_eq!(
         assembled.snapshot.content_digest,
@@ -1447,4 +1451,111 @@ async fn the_private_half_is_unchanged_by_a_communal_bundle() {
     assert_eq!(with.snapshot.session, without.snapshot.session);
     assert_eq!(selected_ids(&with), ["claim-1"]);
     assert_eq!((version(&without), version(&with)), (1, 2));
+}
+
+// ---------------------------------------------------------------------------
+// Evidence references are part of what a claim costs a snapshot.
+// ---------------------------------------------------------------------------
+
+/// An artifact reference whose URI is `uri_bytes` long.
+fn artifact_with_uri(id: &str, uri_bytes: usize) -> ArtifactRef {
+    ArtifactRef {
+        uri: "u".repeat(uri_bytes),
+        ..artifact(id)
+    }
+}
+
+fn evidence_bytes(evidence: &[ArtifactRef]) -> usize {
+    serde_json::to_vec(evidence)
+        .expect("the evidence encodes")
+        .len()
+}
+
+#[tokio::test]
+async fn a_record_with_an_oversized_evidence_reference_is_rejected() {
+    // A reference names an artifact. One that carries a megabyte is not a
+    // reference, and a snapshot copies whatever a claim carries into every
+    // turn that selects it.
+    let world = World::granted(&["s1"], &[]).await;
+    let mut bloated = text_record("s1", "claim-bloated", "delayed");
+    bloated.evidence = vec![artifact_with_uri("evidence-1", 1024 * 1024)];
+    assert!(bloated.validate().is_err());
+    world.authority.holding(bloated);
+    world
+        .authority
+        .holding(text_record("s1", "claim-ok", "fine"));
+    world.retriever.answering(
+        "s1",
+        ranking(&[("claim-bloated", 9_000), ("claim-ok", 8_000)]),
+    );
+
+    let assembled = world.assemble().await;
+    assert_eq!(selected_ids(&assembled), ["claim-ok"]);
+    assert_eq!(assembled.communal.rejected, 1);
+    assert!(
+        assembled.snapshot.size_bytes() < 64 * 1024,
+        "the snapshot holds no megabyte of anyone's evidence"
+    );
+
+    // A reference at the bound is a claim like any other.
+    let mut bounded = text_record("s1", "claim-bounded", "delayed");
+    let overhead = evidence_bytes(&[artifact_with_uri("evidence-1", 0)]) - 2;
+    bounded.evidence = vec![artifact_with_uri(
+        "evidence-1",
+        rakka_agent::AGENT_COMMUNAL_CLAIM_EVIDENCE_REF_MAX_BYTES - overhead,
+    )];
+    bounded
+        .validate()
+        .expect("a reference of exactly the bound validates");
+    bounded.evidence = vec![artifact_with_uri(
+        "evidence-1",
+        rakka_agent::AGENT_COMMUNAL_CLAIM_EVIDENCE_REF_MAX_BYTES - overhead + 1,
+    )];
+    assert!(
+        bounded.validate().is_err(),
+        "one byte over the bound does not"
+    );
+}
+
+#[tokio::test]
+async fn evidence_references_count_against_the_byte_budget() {
+    let world = World::granted(&["s1"], &[]).await;
+    let mut first = text_record("s1", "claim-first", "ok");
+    first.evidence = vec![artifact_with_uri("evidence-1", 400)];
+    let mut second = text_record("s1", "claim-second", "ok");
+    second.evidence = vec![artifact_with_uri("evidence-2", 400)];
+    let first_bytes = first.statement.size_bytes() + evidence_bytes(&first.evidence);
+    let statements_alone = first.statement.size_bytes() + second.statement.size_bytes();
+    // Room for both statements several times over, and for one claim's
+    // evidence, and not for the second claim's evidence too.
+    let budget = first_bytes + statements_alone;
+    assert!(budget < first_bytes * 2);
+    world.authority.holding(first);
+    world.authority.holding(second);
+    world.retriever.answering(
+        "s1",
+        ranking(&[("claim-first", 9_000), ("claim-second", 8_000)]),
+    );
+    let world = World {
+        policy: CommunalRetrievalPolicy::default().with_max_bytes(budget),
+        ..world
+    };
+
+    let assembled = world.assemble().await;
+    assert_eq!(selected_ids(&assembled), ["claim-first"]);
+    assert_eq!(
+        assembled.snapshot.budget.communal_claim_bytes, first_bytes,
+        "the budget records what the claim cost: its statement and its evidence references"
+    );
+
+    // A claim with no evidence still costs exactly its statement.
+    let world = World::granted(&["s1"], &[]).await;
+    let plain = text_record("s1", "claim-plain", "ok");
+    let plain_bytes = plain.statement.size_bytes();
+    world.authority.holding(plain);
+    world
+        .retriever
+        .answering("s1", ranking(&[("claim-plain", 9_000)]));
+    let assembled = world.assemble().await;
+    assert_eq!(assembled.snapshot.budget.communal_claim_bytes, plain_bytes);
 }

@@ -1087,7 +1087,8 @@ pub struct SnapshotBudget {
     pub private_memory_bytes: usize,
     /// How many communal claims the snapshot selected.
     pub communal_claims: usize,
-    /// The serialized byte size of the selected communal claims' statements.
+    /// The serialized byte size of the selected communal claims' statements
+    /// and evidence references.
     /// Omitted when zero, so a snapshot that selected no claim has the bytes
     /// it had before the field existed.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -1301,7 +1302,7 @@ impl MemoryContextSnapshot {
     /// This is the only way a communal selection enters a snapshot, so the
     /// version rule cannot be skipped: a snapshot carries a communal record
     /// if and only if it is version 2. `bytes` is the serialized size of the
-    /// selected statements, for the budget. Each claim's relevance is clamped
+    /// selected statements and their evidence references, for the budget. Each claim's relevance is clamped
     /// to 10000 basis points, and the content digest is recomputed.
     ///
     /// Call it for every search that ran, including one that selected

@@ -120,8 +120,8 @@ inside the mutator, and is what that arrangement was verified for.
 | Immediate revocation re-checked before external invocation | `AgentEntityAuthority::authorize` re-loads durable state per attempt | `wait_invalidation.rs` (12 tests), `tool_authority.rs` | Met, **not atomic** with the invocation (below) |
 | Credentials resolved only for the bounded attempt, never logged or persisted | Resolution between durable `Started` and `invoke`, dropped after; `AgentEphemeralCredential` has no `Serialize` and a redacting `Debug` | `secret_exclusion.rs` (14 tests), incl. a kill *while the credential is live* | Met |
 | Memory retrieval enforces tenant, agent, classification before ranking | `MemoryRetrievalQuery::admits` as pre-ranking predicates, and — new — the authoritative store resolves every ranked identity | `memory_scope_fence.rs`, `private_memory_retrieval.rs` | Met; *purpose* restrictions remain unmodelled |
-| Communal memory treated as an injection source; provenance and trust available to the context builder | Every claim on its way into a snapshot is resolved through the authoritative store, re-checked, and evaluated at the memory-ingress boundary on its statement, with its id and space in the context. A blocked claim, a claim a stage would checkpoint, and a transform that changes what a claim points at are dropped. The snapshot carries each claim's trust state and provenance beside its statement. The communal bundle's chain is attested with the private one | `communal_claim_retrieval.rs` (27 tests), `memory_guardrail_chain_consistency.rs`, `communal_snapshot_record.rs` | Met; rendering the claims as untrusted data in a prompt is the application's model adapter's |
-| A communal claim is read only by a run granted its space and holding its required read capabilities, checked before ranking and again on the record | `CommunalRetrievalQuery::admits` on the authoritative record; the retriever is never called for a space outside the effective grant; the grant is the definition's, narrowed by setup and by delegation. A read capability authorizes no tool dispatch | `communal_claim_retrieval.rs`, `communal_read_grant.rs`, `tool_authority.rs` (`a_read_capability_authorizes_no_tool_dispatch`), the graph's `keyword_search` conformance clause, and `communal_read_path.rs` in `examples/multi-agent-goal-acceptance` with real entities | Met; *purpose* restrictions remain unmodelled |
+| Communal memory treated as an injection source; provenance and trust available to the context builder | Every claim on its way into a snapshot is resolved through the authoritative store, re-checked, and evaluated at the memory-ingress boundary on its statement, with its id and space in the context. A blocked claim, a claim a stage would checkpoint, and a transform that changes what a claim points at are dropped. The snapshot carries each claim's trust state and provenance beside its statement. The communal bundle's chain is attested with the private one | `communal_claim_retrieval.rs` (29 tests), `memory_guardrail_chain_consistency.rs`, `communal_snapshot_record.rs` | Met for the boundary; **what a stage decides is the deployment's**. A claim is evaluated as its statement object, not as bare content, so a stage written for private memory allows every claim until it branches on `context.claim` (see "Delegated to the deployment"). Rendering the claims as untrusted data in a prompt is the application's model adapter's |
+| A communal claim is read only by a run granted its space and holding its required read capabilities, checked before ranking and again on the record | `CommunalRetrievalQuery::admits` on the authoritative record; the retriever is never called for a space outside the effective grant; the grant is the definition's, narrowed by setup and by the run's delegation envelope, which the run entity hands to assembly. A read capability authorizes no tool dispatch | `communal_claim_retrieval.rs`, `communal_read_grant.rs`, `communal_run_grant.rs` (the run entity's own envelope reaches assembly), `tool_authority.rs` (`a_read_capability_authorizes_no_tool_dispatch`), the graph's `keyword_search` conformance clause, and `communal_read_path.rs` in `examples/multi-agent-goal-acceptance` with real entities | Met, with one named exception: a handoff of a task that carries no delegation envelope is not narrowed by the catalog (see "Owed"). *Purpose* restrictions remain unmodelled |
 | Only reviewed claims reach a model context by default | `CommunalRetrievalPolicy::verified_only` is the default; `Retracted` is refused whatever a policy says | `communal_claim_retrieval.rs` (`a_record_the_query_no_longer_admits_is_rejected`), `communal.rs` unit tests | Met; admitting `Proposed` is a deployment's explicit choice |
 | Tool arguments, prompts, raw memory, credentials, high-cardinality ids never metric labels | `validate_agent_domain_metric_attributes` per observation | `agent_metrics.rs`, and `secret_exclusion.rs` over the whole emitted *series set* | Met |
 
@@ -166,6 +166,14 @@ inside the mutator, and is what that arrangement was verified for.
 - **What an executor puts in its error text.** Rakka bounds it and persists it;
   it cannot know what is secret inside it. The contract is stated on all nine
   executor traits and on the credential resolver.
+- **What a memory-ingress stage does with a communal claim.** Rakka evaluates
+  every claim at the boundary and requires the communal bundle to carry the
+  dispatch authority's chain. It hands a stage the claim's statement object,
+  with the text under `object.value.inline`, where a private memory is handed
+  its bare content. A stage that was written for private memory and inspects
+  a top-level string therefore allows every claim. The stage must branch on
+  `AgentGuardrailContext::claim` before the bundle is wired; nothing in Rakka
+  can check that it does.
 
 ## Owed, and why
 
@@ -181,6 +189,28 @@ inside the mutator, and is what that arrangement was verified for.
   database per tenant.
 - **A claim a run has read stays in that run's snapshots.** See "Erasing a
   claim does not reach the copies outside the graph" below.
+- **A handoff of a task with no delegation envelope is not narrowed.** The
+  handoff step narrows the envelope a task carries. A plain task (no goal, no
+  delegation) whose definition declares no delegation ceilings carries none,
+  so its handoff records the catalog's knowledge spaces and read capabilities
+  and applies neither: the target run reads and appends under its own agent's
+  definition and setup. The target never exceeds what its own definition
+  grants; what is missing is the catalog's narrowing. This predates the read
+  path for knowledge-space appends, and the read path inherits it. Pinned by
+  `handoff_record.rs::a_plain_task_with_no_envelope_is_not_narrowed_by_its_handoff`.
+  Until it is closed, declare delegation ceilings on the task definition or
+  root the task in a goal where a handoff must narrow.
+- **A cancelled graph migration keeps its lock.** `migrate` on the PostgreSQL
+  graph store holds a session-level advisory lock, and a cancelled or
+  timed-out call leaves it held on that connection. Other migrators then wait
+  with no error and no named holder until the connection closes. The wait has
+  no bound and no diagnostic. The first run after this change lasts as long as
+  two index builds, which makes a startup deadline likelier to fire.
+- **No durable mark of a degraded communal search.** A space whose search
+  failed is listed among the spaces searched, and a grant that could not be
+  read leaves an ordinary version 1 snapshot. "Searched and found nothing" and
+  "the search failed" differ only on a counter that carries no run label. The
+  private tier has the same gap.
 - **Descriptor/endpoint revision pinning across recovery.** Generic tool
   intents record no descriptor digest; the workflow tool records one that
   nothing compares.
@@ -378,6 +408,7 @@ cargo test -p rakka-agent --test memory_scope_fence
 cargo test -p rakka-agent --test memory_guardrail_chain_consistency
 cargo test -p rakka-agent --test communal_claim_retrieval
 cargo test -p rakka-agent --test communal_read_grant
+cargo test -p rakka-agent --test communal_run_grant
 cargo test -p rakka-agent --test communal_snapshot_record
 cargo test -p rakka-agent --test memory_retention
 cargo test -p rakka-agent --test secret_exclusion

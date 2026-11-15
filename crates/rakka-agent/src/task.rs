@@ -2380,8 +2380,12 @@ pub struct AgentTaskHandoff {
     pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
     /// The capabilities for reading communal claims the catalog explicitly
     /// delegates to the target. The envelope derivation intersects the task's
-    /// own grant with this statement, so a handoff can never widen what the
-    /// task may read.
+    /// own grant with this statement, so a handoff of a task that carries a
+    /// delegation envelope can never widen what the task may read. A task
+    /// that carries none (a plain task whose definition declares no
+    /// delegation ceilings) is not narrowed: the statement is recorded here
+    /// and the target reads under its own agent's definition and setup, as
+    /// it does for [`Self::knowledge_spaces`].
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub read_capabilities: BTreeSet<crate::AgentCapabilityId>,
     /// Where the transfer stands.
@@ -5070,6 +5074,14 @@ fn delegation_envelope_for(
         .as_deref()
         .filter(|handoff| !matches!(handoff.status, AgentTaskHandoffStatus::Refused { .. }))
     {
+        // A task with no base envelope gets none here either, so its handoff
+        // narrows nothing: the target's run is bounded by its own agent's
+        // definition and setup alone, for communal appends as for reads.
+        // That is how knowledge spaces behaved before read capabilities
+        // joined them, it is pinned by
+        // `a_plain_task_with_no_envelope_is_not_narrowed_by_its_handoff`, and
+        // closing it means synthesizing a root envelope for such a task,
+        // which changes what its target may append.
         if let Some(env) = envelope.as_deref_mut() {
             // The delegation door's own rule, shared with it: a statement the
             // task holds is intersected; a chain without one cannot prove

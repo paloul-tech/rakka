@@ -392,8 +392,10 @@ incorrectly.
     ranked identity is then resolved through the authority, in the space whose
     ranking named it, and the record the authority answers is re-checked,
     evaluated at the memory-ingress guardrail boundary, and embedded in the
-    snapshot's `communal_claims`: up to 8 claims and 64 KiB of statements by
-    default, 16 claims at most. The selection is a prefix of the merged
+    snapshot's `communal_claims`: up to 8 claims and 64 KiB of statements and
+    evidence references by default, 16 claims at most. A claim whose record is
+    outside a claim's bounds, an evidence reference over 2 KiB among them, is
+    not read. The selection is a prefix of the merged
     ranking: the walk stops at the first claim that does not fit, and does not
     skip it for a smaller one.
   - **A ranking is not authority.** A retriever answers identities and scores
@@ -412,12 +414,24 @@ incorrectly.
        its **read capabilities** hold every one. Read capabilities are a set
        of their own on the authority envelope
        (`AgentAuthorityEnvelope::read_capabilities`): they are not tool
-       capabilities, and holding one authorizes no tool dispatch. A setup or
-       settings revision may only narrow the set (`widened-read-capability`).
-       A delegation or handoff passes on only what the catalog's target states
-       (`AgentDelegationTarget::with_read_capability`), intersected with what
-       the delegating run itself holds. A delegated run holds what its
-       delegation states and no more: stating nothing delegates nothing.
+       capabilities, and holding one authorizes no tool dispatch. A setup may
+       only narrow the set, and an autonomous admission is refused when the
+       envelope would hold one it was not admitted with
+       (`widened-read-capability`). A delegation passes on what the catalog's
+       target states (`AgentDelegationTarget::with_read_capability`). When the
+       delegating run was itself delegated, that statement is intersected with
+       what the run was delegated. At a root (a goal-bearing or plain task) it
+       is passed on as it stands: it is not intersected with the root agent's
+       own definition, so the catalog is what bounds a root's delegation, and
+       a root can pass on a read capability it does not itself hold. A
+       delegated run holds what its delegation states and no more: stating
+       nothing delegates nothing. A handoff follows the same rule **when the task carries a
+       delegation envelope**: a goal-bearing task, a delegated task, or a task
+       whose definition declares delegation ceilings. A plain task with none
+       of those carries no envelope, and its handoff is recorded but narrows
+       nothing: the target run reads, and appends, under its own agent's
+       definition and setup. Declare delegation ceilings on the task
+       definition, or root the task in a goal, where a handoff must narrow.
     3. *The policy.* `CommunalRetrievalPolicy` names the trust states and
        classifications a deployment admits into a model context at all.
        **The default admits only `Verified`, `Unclassified` claims.** A
@@ -432,8 +446,14 @@ incorrectly.
     a stage would park on a checkpoint, is dropped. A stage may rewrite the
     subject, the predicate, or an inline value; a transform that changes a
     node object or an artifact reference, or that is not a valid statement,
-    drops the claim. The chain must be the one the dispatch authority
-    declares: `AgentToolAuthority::with_memory_ingress` attests the private
+    drops the claim. **A stage written for private memory does not protect
+    claims until it reads this shape.** A private memory is evaluated as its
+    bare content; a claim is evaluated as the statement object, with its text
+    under `object.value.inline`. A stage that inspects a top-level string
+    therefore allows every claim, and one that replaces the value with a bare
+    string drops every claim. Branch on `context.claim` in each memory-ingress
+    stage before wiring the bundle. The chain must be the one the dispatch
+    authority declares: `AgentToolAuthority::with_memory_ingress` attests the private
     and the communal bundle together, and refuses a memory in which either
     carries a different chain (`guardrail-chain-mismatch`). Rakka selects claims and records
     them; rendering them into a prompt is the application's model adapter's
@@ -450,9 +470,13 @@ incorrectly.
     optional store operation. A claim's words are those of its subject, its
     predicate, and its object (a node id, or the text of an inline value; a
     value held by artifact reference gives none). Words are runs of
-    alphanumeric characters, lowercased. A claim is a hit when it shares at
-    least one word with the query, and its score is the share of the query's
-    words it holds. Restrictions apply before ranking, so a claim the reader
+    alphanumeric characters, lowercased. Nothing is normalized or segmented:
+    a decomposed accent splits a word where the precomposed letter does not,
+    text without spaces (Chinese, Japanese) is one word per run, and case
+    folding is Unicode lowercasing only, so `STRASSE` does not match `Straße`.
+    Such text is not found, and the search does not say so. A claim is a hit
+    when it shares at least one word with the query, and its score is the
+    share of the query's words it holds. Restrictions apply before ranking, so a claim the reader
     may not read takes no place in the ranking. There is no meaning-based
     search yet (issue #140).
   - **A fault never fails the turn.** A grant that cannot be read selects

@@ -909,7 +909,9 @@ async fn pre_slice_records_decode_without_the_handoff_fields() {
 // ---------------------------------------------------------------------------
 // Issue #69: a handoff carries the catalog's read-capability statement for
 // its target, and the target's run envelope holds that statement narrowed by
-// the task's own grant — a handoff can never widen what a task may read.
+// the task's own grant. Where the task carries an envelope, a handoff can
+// never widen what it may read. A task that carries none (the last test
+// below) is not narrowed at all.
 // ---------------------------------------------------------------------------
 
 fn read_capabilities(ids: &[&str]) -> std::collections::BTreeSet<rakka_agent::AgentCapabilityId> {
@@ -965,6 +967,17 @@ fn fixture_handing_off_reads(ids: &[&str]) -> Fixture {
 async fn target_read_capabilities_after_transfer(
     fixture: &Fixture,
 ) -> Option<std::collections::BTreeSet<rakka_agent::AgentCapabilityId>> {
+    target_envelope_after_transfer(fixture)
+        .await
+        .expect("the target run carries an envelope")
+        .read_capabilities
+}
+
+/// Drives the transfer to the target's own run and answers that run's
+/// delegation envelope, when it carries one.
+async fn target_envelope_after_transfer(
+    fixture: &Fixture,
+) -> Option<rakka_agent::AgentRunDelegationEnvelope> {
     fixture.instantiate_agent_at(handoff_target_scope()).await;
     fixture.pump().await.expect("the loop should converge");
     for _ in 0..16 {
@@ -1001,9 +1014,7 @@ async fn target_read_capabilities_after_transfer(
         .loop_state()
         .expect("the target run has a loop")
         .delegation_envelope()
-        .expect("the target run carries an envelope")
-        .read_capabilities
-        .clone()
+        .cloned()
 }
 
 /// At the root the task holds no statement of its own, so the catalog's
@@ -1087,4 +1098,63 @@ async fn a_delegated_tasks_handoff_intersects_the_targets_statement_with_its_gra
         target_read_capabilities_after_transfer(&fixture).await,
         Some(read_capabilities(&["claims.read.a"]))
     );
+}
+
+/// **A known gap, pinned so it cannot change unnoticed.** A plain task (no
+/// goal, no delegation) whose definition declares no delegation ceilings
+/// carries no envelope, and the handoff step narrows an envelope: with none,
+/// there is nothing to narrow. The handoff records the catalog's statement,
+/// and the target's run carries no envelope at all, so its communal reads and
+/// appends are bounded by the target agent's own definition and setup, not by
+/// what the catalog stated. The same holds for knowledge spaces, and did
+/// before read capabilities existed.
+///
+/// The target still reads nothing its own definition does not grant. What is
+/// missing is the catalog's narrowing. A deployment that needs it for plain
+/// tasks declares delegation ceilings on the task definition, or roots the
+/// task in a goal: either gives the task an envelope, and the two tests above
+/// then apply.
+#[tokio::test]
+async fn a_plain_task_with_no_envelope_is_not_narrowed_by_its_handoff() {
+    let fixture = fixture_handing_off_reads(&["claims.read.a", "claims.read.b"]);
+    fixture.instantiate_agent().await;
+    assert!(
+        handoff_task_definition().delegation.is_none(),
+        "the definition declares no delegation ceilings"
+    );
+    fixture.create_task_with(handoff_task_definition()).await;
+
+    let envelope = target_envelope_after_transfer(&fixture).await;
+
+    let task = fixture.task_snapshot().await;
+    let handoff = task.handoff.as_deref().expect("the transfer is recorded");
+    assert!(
+        matches!(
+            handoff.status,
+            rakka_agent::AgentTaskHandoffStatus::Accepted
+        ),
+        "the transfer was accepted, got {:?}",
+        handoff.status
+    );
+    assert_eq!(
+        handoff.read_capabilities,
+        read_capabilities(&["claims.read.a", "claims.read.b"]),
+        "the catalog's statement is on the record"
+    );
+    assert_eq!(
+        envelope, None,
+        "and the target's run carries no envelope to hold it"
+    );
+
+    // What that means for a read: the target's whole grant, unnarrowed.
+    let grant = rakka_agent::AgentCommunalReadGrant {
+        spaces: std::collections::BTreeSet::from([rakka_agent::KnowledgeSpaceId::new(
+            "space-alpha",
+        )
+        .expect("the space id is valid")]),
+        read_capabilities: read_capabilities(&["claims.read.a", "claims.read.b", "claims.read.z"]),
+        definition_revision: rakka_agent::AgentRevisionNumber::INITIAL,
+        setup_revision: None,
+    };
+    assert_eq!(grant.narrowed_by(envelope.as_ref()), grant);
 }

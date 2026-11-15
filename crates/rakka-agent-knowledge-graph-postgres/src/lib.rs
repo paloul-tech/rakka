@@ -739,6 +739,17 @@ impl PostgresKnowledgeGraphStore {
     /// migration to its end before starting or restarting a node on an
     /// earlier build.
     ///
+    /// # Do not cancel
+    ///
+    /// The advisory lock is a session lock, released by the last statement
+    /// of this call. A call that is dropped or timed out part-way never
+    /// reaches that statement, and the lock stays held on the connection.
+    /// Every other migrator then waits, with no error, for as long as that
+    /// connection lives; a retry on the same connection succeeds, because a
+    /// session lock is re-entrant, and still leaves one hold behind. After a
+    /// cancelled `migrate`, close the connection. Do not run `migrate` under
+    /// a deadline shorter than the index builds.
+    ///
     /// # Errors
     ///
     /// Returns [`ClaimError::Backend`] if the DDL cannot be applied.

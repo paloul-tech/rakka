@@ -267,9 +267,12 @@ pub struct AgentDelegationTarget {
     /// The capabilities for reading communal claims the catalog explicitly
     /// delegates to this specialist.
     ///
-    /// The same kind of statement as [`Self::knowledge_spaces`]: the
-    /// interception intersects it with the parent's own grant, so a catalog
-    /// can never widen what the parent may read. Empty means the specialist
+    /// The same kind of statement as [`Self::knowledge_spaces`]: where the
+    /// delegating run was itself delegated, the interception intersects it
+    /// with what that run was delegated, so a chain can only narrow. At a
+    /// root the statement becomes the child's grant as it stands. It is not
+    /// intersected with the root agent's own definition, so this catalog
+    /// entry is what bounds a root's delegation. Empty means the specialist
     /// is delegated no read capability.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub read_capabilities: BTreeSet<AgentCapabilityId>,

@@ -72,8 +72,8 @@ use crate::task::{AgentContentDigest, AgentTaskContent};
 /// Most communal claims one context snapshot may select.
 pub const AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_ENTRIES: usize = 16;
 
-/// Largest total serialized statement content the communal claims of one
-/// snapshot may embed, in bytes.
+/// Largest total serialized statement and evidence-reference content the
+/// communal claims of one snapshot may embed, in bytes.
 pub const AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_BYTES: usize = 64 * 1024;
 
 /// Most knowledge spaces one assembly searches.
@@ -94,6 +94,17 @@ pub const AGENT_COMMUNAL_CLAIM_MAX_EVIDENCE: usize = 16;
 /// Most read capabilities a [`CommunalClaimRecord`] may require. Equal to the
 /// knowledge graph's own bound.
 pub const AGENT_COMMUNAL_CLAIM_MAX_READ_CAPABILITIES: usize = 16;
+
+/// Most serialized bytes one evidence reference of a [`CommunalClaimRecord`]
+/// may take.
+///
+/// A reference names an artifact: an id, a URI, a checksum and a little
+/// metadata. It is not content. The knowledge graph bounds how many
+/// references a claim carries and not how large each is, and a snapshot
+/// copies a selected claim's references into every turn that selects it, so
+/// the read path bounds them itself: a claim carrying a larger reference is
+/// not read.
+pub const AGENT_COMMUNAL_CLAIM_EVIDENCE_REF_MAX_BYTES: usize = 2048;
 
 /// The trust state of a communal claim, as this crate names it
 /// ([specification 13.4](../../../docs/plans/rakka-agent/spec.md)).
@@ -281,16 +292,21 @@ impl CommunalClaimRecord {
     /// Rejects a record outside the bounds a claim has: a statement that does
     /// not validate, a digest that does not describe the statement beside it,
     /// more than [`AGENT_COMMUNAL_CLAIM_MAX_EVIDENCE`] evidence references,
-    /// more than [`AGENT_COMMUNAL_CLAIM_MAX_READ_CAPABILITIES`] required
-    /// capabilities, or a confidence over 10000 basis points.
+    /// an evidence reference over
+    /// [`AGENT_COMMUNAL_CLAIM_EVIDENCE_REF_MAX_BYTES`], more than
+    /// [`AGENT_COMMUNAL_CLAIM_MAX_READ_CAPABILITIES`] required capabilities,
+    /// or a confidence over 10000 basis points.
     ///
     /// An authority is an adapter over a store this crate cannot see. The
-    /// bounds are checked here so that nothing an adapter answers can put an
-    /// unbounded value into a snapshot.
+    /// bounds are checked here so that every part of a record whose size an
+    /// adapter chooses (the statement and the evidence references) is bounded
+    /// before it can enter a snapshot. The identifiers are bounded by their
+    /// own types.
     ///
     /// # Errors
     ///
-    /// As [`CommunalClaimStatement::validate`], plus
+    /// As [`CommunalClaimStatement::validate`], plus `memory-entry-too-large`
+    /// for an oversized evidence reference and
     /// `memory-confidence-out-of-range`.
     pub fn validate(&self) -> Result<(), MemoryError> {
         self.statement.validate()?;
@@ -305,6 +321,15 @@ impl CommunalClaimRecord {
                  are allowed",
                 self.evidence.len()
             )));
+        }
+        for reference in &self.evidence {
+            let bytes = serde_json::to_vec(reference).map_or(usize::MAX, |bytes| bytes.len());
+            if bytes > AGENT_COMMUNAL_CLAIM_EVIDENCE_REF_MAX_BYTES {
+                return Err(MemoryError::EntryTooLarge {
+                    bytes,
+                    maximum: AGENT_COMMUNAL_CLAIM_EVIDENCE_REF_MAX_BYTES,
+                });
+            }
         }
         if self.required_read_capabilities.len() > AGENT_COMMUNAL_CLAIM_MAX_READ_CAPABILITIES {
             return Err(invalid(&format!(
@@ -675,10 +700,11 @@ impl CommunalRetrievalPolicy {
         self
     }
 
-    /// Sets the selection's statement byte budget, clamped to
-    /// `1..=`[`AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_BYTES`]. Selection stops at
-    /// the first claim that would exceed it, so the selection stays a prefix
-    /// of the ranking.
+    /// Sets the selection's byte budget, clamped to
+    /// `1..=`[`AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_BYTES`]. A claim costs the
+    /// serialized size of its statement and of its evidence references.
+    /// Selection stops at the first claim that would exceed the budget, so
+    /// the selection stays a prefix of the ranking.
     #[must_use]
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes.clamp(1, AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_BYTES);
@@ -732,7 +758,7 @@ impl CommunalRetrievalPolicy {
         self.max_results
     }
 
-    /// The selection's statement byte budget.
+    /// The selection's byte budget, over statements and evidence references.
     #[must_use]
     pub const fn max_bytes(&self) -> usize {
         self.max_bytes
@@ -1226,12 +1252,16 @@ pub(crate) async fn select_communal_claims(
 
         // Stop at the first claim that does not fit, rather than skipping it
         // for a smaller one ranked below: the selection stays a prefix of the
-        // ranking that survived the checks.
-        let statement_bytes = statement.size_bytes();
-        if selected_bytes.saturating_add(statement_bytes) > policy.max_bytes() {
+        // ranking that survived the checks. A claim costs what the snapshot
+        // will hold of it whose size the claim decides: its statement as
+        // included and its evidence references.
+        let claim_bytes = statement
+            .size_bytes()
+            .saturating_add(evidence_size_bytes(&record.evidence));
+        if selected_bytes.saturating_add(claim_bytes) > policy.max_bytes() {
             break;
         }
-        selected_bytes += statement_bytes;
+        selected_bytes += claim_bytes;
 
         // Outcome accounting follows the budget check, so every count here
         // describes a claim the snapshot actually embeds.
@@ -1294,6 +1324,15 @@ pub(crate) async fn select_communal_claims(
         selected_bytes,
     );
     report
+}
+
+/// What a claim's evidence references cost a snapshot's byte budget: their
+/// serialized size, and nothing for a claim that carries none.
+fn evidence_size_bytes(evidence: &[ArtifactRef]) -> usize {
+    if evidence.is_empty() {
+        return 0;
+    }
+    serde_json::to_vec(evidence).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 /// The index watermark one snapshot records for a search of several spaces:
