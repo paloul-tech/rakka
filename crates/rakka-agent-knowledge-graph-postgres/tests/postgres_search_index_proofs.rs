@@ -20,6 +20,9 @@ use std::collections::BTreeSet;
 
 use rakka_agent_knowledge_graph::{ClaimSearch, ClaimSearchReport};
 use rakka_agent_knowledge_graph_postgres::CLAIM_SEARCH_SQL;
+use rakka_agent_knowledge_graph_postgres::{
+    CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS, CLAIM_SEARCH_INDEX_WRITE_SQL,
+};
 
 use rakka_agent::{AgentCapabilityId, AgentId, AgentTaskContent, MemoryClassification};
 use rakka_agent_knowledge_graph::conformance::{conformance_resolver, ConformanceScopes};
@@ -1640,4 +1643,358 @@ async fn postgres_search_uses_the_word_index_when_dsn_is_set() {
     assert_eq!(rows[0].get::<_, String>("claim_id"), "claim-77");
 
     schema.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The indexing pass.
+// ---------------------------------------------------------------------------
+
+/// Pages the indexing pass to its end and answers the totals.
+async fn index_to_the_end(
+    store: &PostgresKnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    limit: usize,
+) -> (u64, u64) {
+    let (mut indexed, mut skipped) = (0, 0);
+    let mut after: Option<ClaimId> = None;
+    loop {
+        let page = store
+            .index_claims(scope, after.as_ref(), limit)
+            .await
+            .expect("the indexing pass answers");
+        indexed += page.indexed;
+        skipped += page.skipped;
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return (indexed, skipped),
+        }
+    }
+}
+
+/// How many live rows of one scope have no search words.
+async fn unindexed_rows(raw: &Client, scope: &KnowledgeSpaceScope) -> i64 {
+    raw.query_one(
+        "SELECT count(*) FROM rakka_agent_knowledge_claim \
+         WHERE tenant = $1 AND space = $2 AND search_tokens IS NULL AND NOT tombstoned",
+        &[&scope.tenant().as_str(), &scope.space().as_str()],
+    )
+    .await
+    .expect("the rows count")
+    .get(0)
+}
+
+/// Appends `count` claims with the earlier binary's statement: live rows with
+/// no index. Each holds the word `customs` and a word of its own.
+async fn earlier_claims(raw: &Client, scope: &KnowledgeSpaceScope, count: usize) -> Vec<Claim> {
+    let mut claims = Vec::with_capacity(count);
+    for index in 0..count {
+        let claim = text_claim(
+            scope,
+            &format!("earlier-{index}"),
+            "order",
+            "status",
+            &format!("held at customs parcel{index}"),
+        );
+        assert!(earlier_append(raw, scope, &claim)
+            .await
+            .get::<_, bool>("applied"));
+        claims.push(claim);
+    }
+    claims
+}
+
+#[tokio::test]
+async fn postgres_the_indexing_pass_makes_an_earlier_claim_searchable_when_dsn_is_set() {
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-index-pass").primary;
+    let claims = earlier_claims(&raw, &scope, 3).await;
+    let search = admitting_all("customs", &[]);
+    let before = store
+        .search(&scope, &search)
+        .await
+        .expect("the search answers");
+    assert!(before.hits.is_empty() && before.unindexed);
+
+    // Two rows a page: the first page is full and hands back a cursor, the
+    // second reads the one row left and ends the pass.
+    let first = store
+        .index_claims(&scope, None, 2)
+        .await
+        .expect("the indexing pass answers");
+    assert_eq!((first.indexed, first.skipped), (2, 0));
+    let cursor = first.next.expect("a full page hands back a cursor");
+    let second = store
+        .index_claims(&scope, Some(&cursor), 2)
+        .await
+        .expect("the indexing pass answers");
+    assert_eq!((second.indexed, second.skipped, second.next), (1, 0, None));
+
+    let after = store
+        .search(&scope, &search)
+        .await
+        .expect("the search answers");
+    let mut expected: Vec<ClaimId> = claims.iter().map(|claim| claim.claim_id.clone()).collect();
+    expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(
+        hit_ids(&after),
+        expected,
+        "every earlier claim is now a hit"
+    );
+    assert!(!after.unindexed);
+    // A row the pass indexed holds what the append would have written.
+    for claim in &claims {
+        assert_eq!(
+            index_columns(&raw, &scope, &claim.claim_id).await,
+            Some(IndexColumns {
+                tokens: Some(sorted_tokens(claim)),
+                classification: Some("unclassified".to_string()),
+                confidence_bps: Some(5_000),
+                read_capabilities: Some(Vec::new()),
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn postgres_the_indexing_pass_is_idempotent_when_dsn_is_set() {
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-index-again").primary;
+    earlier_claims(&raw, &scope, 3).await;
+    assert_eq!(index_to_the_end(&store, &scope, 2).await, (3, 0));
+
+    let again = store
+        .index_claims(&scope, None, 2)
+        .await
+        .expect("the indexing pass answers");
+    assert_eq!((again.indexed, again.skipped, again.next), (0, 0, None));
+
+    // A space that never held an unindexed claim answers the same.
+    let empty = ConformanceScopes::unique("pg-index-empty").primary;
+    let nothing = store
+        .index_claims(&empty, None, 2)
+        .await
+        .expect("the indexing pass answers");
+    assert_eq!(
+        (nothing.indexed, nothing.skipped, nothing.next),
+        (0, 0, None)
+    );
+}
+
+#[tokio::test]
+async fn postgres_the_indexing_pass_skips_a_damaged_record_when_dsn_is_set() {
+    // One record this build cannot decode does not stop the pass. It is
+    // counted, the rows after it are indexed, and it stays unindexed, so its
+    // space keeps saying so until the record is repaired or erased.
+    let Some(dsn) = dsn() else { return };
+    let (schema, raw, store) = PrivateSchema::migrated(&dsn, "search_damaged").await;
+    let scope = ConformanceScopes::unique("pg-index-damaged").primary;
+    let mut claims = earlier_claims(&raw, &scope, 4).await;
+    claims.sort_by(|a, b| a.claim_id.as_str().cmp(b.claim_id.as_str()));
+    // The first row in the pass's order, so everything else comes after it.
+    doctor(&raw, &scope, &claims[0].claim_id, "record = 'not json'").await;
+
+    assert_eq!(index_to_the_end(&store, &scope, 2).await, (3, 1));
+    assert_eq!(unindexed_rows(&raw, &scope).await, 1);
+    let report = store
+        .search(&scope, &admitting_all("customs", &[]))
+        .await
+        .expect("the search answers");
+    assert_eq!(
+        hit_ids(&report),
+        claims[1..]
+            .iter()
+            .map(|claim| claim.claim_id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        report.unindexed,
+        "a claim the pass could not index is still reported"
+    );
+
+    schema.drop().await;
+}
+
+#[tokio::test]
+async fn postgres_the_indexing_pass_clamps_its_limit_when_dsn_is_set() {
+    // Three hundred unindexed rows the pass can read and not decode: each
+    // counts as read, which is what the limit bounds.
+    let Some(dsn) = dsn() else { return };
+    let (schema, raw, store) = PrivateSchema::migrated(&dsn, "search_clamp").await;
+    let scope = ConformanceScopes::unique("pg-index-clamp").primary;
+    raw.execute(
+        "INSERT INTO rakka_agent_knowledge_claim \
+            (tenant, space, claim_id, operation_id, subject, predicate, trust, \
+             transition_count, record) \
+         SELECT $1, $2, 'claim-' || lpad(g::TEXT, 4, '0'), 'op-' || g, 's', 'p', 'proposed', 0, \
+                'not json'::BYTEA \
+         FROM generate_series(1, 300) AS g",
+        &[&scope.tenant().as_str(), &scope.space().as_str()],
+    )
+    .await
+    .expect("the rows are planted");
+
+    let one = store
+        .index_claims(&scope, None, 0)
+        .await
+        .expect("the indexing pass answers");
+    assert_eq!(
+        one.indexed + one.skipped,
+        1,
+        "a limit of zero reads one row"
+    );
+    assert_eq!(
+        one.next.as_ref().map(ClaimId::as_str),
+        Some("claim-0001"),
+        "the cursor is the last row read"
+    );
+
+    let most = store
+        .index_claims(&scope, None, 10_000)
+        .await
+        .expect("the indexing pass answers");
+    assert_eq!(CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS, 256);
+    assert_eq!(most.indexed + most.skipped, 256);
+    assert_eq!(most.next.as_ref().map(ClaimId::as_str), Some("claim-0256"));
+
+    let rest = store
+        .index_claims(&scope, most.next.as_ref(), 10_000)
+        .await
+        .expect("the indexing pass answers");
+    assert_eq!((rest.indexed + rest.skipped, rest.next), (44, None));
+
+    schema.drop().await;
+}
+
+#[tokio::test]
+async fn postgres_a_tombstone_beats_the_indexing_pass_when_dsn_is_set() {
+    // The pass read a live row; a tombstone lands before the pass writes. The
+    // write's own condition refuses the row, so the withdrawn statement's
+    // words never reach it and the pass does not count it.
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-index-tombstone").primary;
+    let claim = earlier_claims(&raw, &scope, 1).await.remove(0);
+    let words = sorted_tokens(&claim);
+    store
+        .tombstone(
+            &scope,
+            &tombstone_request(&scope, &claim.claim_id, "withdraw"),
+        )
+        .await
+        .expect("the tombstone applies");
+
+    let written = raw
+        .execute(
+            CLAIM_SEARCH_INDEX_WRITE_SQL,
+            &[
+                &scope.tenant().as_str(),
+                &scope.space().as_str(),
+                &claim.claim_id.as_str(),
+                &words,
+                &"unclassified",
+                &5_000_i32,
+                &Vec::<String>::new(),
+            ],
+        )
+        .await
+        .expect("the pass's write statement runs");
+    assert_eq!(written, 0, "the write refuses a row that is now a stub");
+    assert_eq!(
+        index_columns(&raw, &scope, &claim.claim_id)
+            .await
+            .expect("the stub row is kept")
+            .tokens,
+        None
+    );
+
+    // And a row the pass already indexed is not written twice.
+    let scope = ConformanceScopes::unique("pg-index-once").primary;
+    let live = earlier_claims(&raw, &scope, 1).await.remove(0);
+    assert_eq!(index_to_the_end(&store, &scope, 8).await, (1, 0));
+    let again = raw
+        .execute(
+            CLAIM_SEARCH_INDEX_WRITE_SQL,
+            &[
+                &scope.tenant().as_str(),
+                &scope.space().as_str(),
+                &live.claim_id.as_str(),
+                &vec!["overwritten".to_string()],
+                &"unclassified",
+                &5_000_i32,
+                &Vec::<String>::new(),
+            ],
+        )
+        .await
+        .expect("the pass's write statement runs");
+    assert_eq!(again, 0, "the write refuses a row that is already indexed");
+    assert_eq!(
+        index_columns(&raw, &scope, &live.claim_id)
+            .await
+            .and_then(|columns| columns.tokens),
+        Some(sorted_tokens(&live))
+    );
+}
+
+#[tokio::test]
+async fn postgres_two_indexing_passes_at_once_index_every_claim_once_when_dsn_is_set() {
+    // Two nodes run the pass over one space at the same moment. Neither
+    // errors, every claim ends indexed, and no claim is counted twice.
+    let Some(dsn) = dsn() else { return };
+    let Some((raw, _store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-index-two").primary;
+    earlier_claims(&raw, &scope, 40).await;
+
+    let mut passes = Vec::new();
+    for _ in 0..2 {
+        let store = PostgresKnowledgeGraphStore::new(connect(&dsn).await);
+        let scope = scope.clone();
+        passes.push(tokio::spawn(async move {
+            index_to_the_end(&store, &scope, 7).await
+        }));
+    }
+    let mut indexed = 0;
+    for pass in passes {
+        let (pass_indexed, pass_skipped) = pass.await.expect("the pass runs");
+        assert_eq!(pass_skipped, 0);
+        indexed += pass_indexed;
+    }
+    assert_eq!(indexed, 40, "every claim is indexed by exactly one pass");
+    assert_eq!(unindexed_rows(&raw, &scope).await, 0);
+}
+
+#[tokio::test]
+async fn postgres_the_indexing_pass_stays_in_its_scope_when_dsn_is_set() {
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scopes = ConformanceScopes::unique("pg-index-scope");
+    let other_space = KnowledgeSpaceScope::new(
+        scopes.primary.tenant().clone(),
+        rakka_agent::KnowledgeSpaceId::new("space-other").expect("the space id is valid"),
+    )
+    .expect("the scope is valid");
+    earlier_claims(&raw, &scopes.primary, 2).await;
+    earlier_claims(&raw, &scopes.foreign, 2).await;
+    earlier_claims(&raw, &other_space, 2).await;
+
+    assert_eq!(index_to_the_end(&store, &scopes.primary, 8).await, (2, 0));
+
+    assert_eq!(unindexed_rows(&raw, &scopes.primary).await, 0);
+    assert_eq!(
+        unindexed_rows(&raw, &scopes.foreign).await,
+        2,
+        "another tenant's claims are not indexed by this pass"
+    );
+    assert_eq!(
+        unindexed_rows(&raw, &other_space).await,
+        2,
+        "another space's claims are not indexed by this pass"
+    );
 }

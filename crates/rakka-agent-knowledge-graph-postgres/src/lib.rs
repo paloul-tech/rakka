@@ -47,6 +47,17 @@
 //!   Nothing is lost — the cursor resumes by claim-id position, not offset —
 //!   and the cost is linear in one scope's corpus, the same exactness-first
 //!   trade the pgvector retriever documents.
+//! - **Keyword search is an index on the claim row, and the record still
+//!   decides.** Four columns hold a claim's search words and the three fields
+//!   a search restricts on; the statement that inserts the claim writes them.
+//!   A search restricts and ranks in SQL through a GIN index over the words,
+//!   with no bound on how many claims it considers, and every row it returns
+//!   is then decoded, checked with the shared admission rule and scored with
+//!   the shared scorer against its own record. A row the record does not
+//!   admit is drift, refused like any other. A tombstone clears the words in
+//!   its one statement, a delete removes the row, and a trigger on the table
+//!   clears the words of any tombstoned row, so a withdrawn statement's words
+//!   never outlive it whichever binary withdraws it (see [`MIGRATION_SQL`]).
 //! - **Traversal is the reference breadth-first expansion over bounded
 //!   per-node queries.** A recursive CTE cannot express the global spent-edge
 //!   set, the deterministic frontier-order/claim-id-order edge sequence, or
@@ -73,6 +84,27 @@
 //! then call `tombstone`, `delete` or the retention sweep. A binary that was
 //! missed fails closed: a stub answers it `schema-version-ahead`, and a replay
 //! of an erased operation answers it `claim-operation-conflict`.
+//!
+//! # The search index
+//!
+//! `migrate` adds the search index: four nullable columns and a trigger as
+//! catalog-only changes, then two indexes built `CONCURRENTLY`, each in a
+//! statement of its own, so that no reader or writer is blocked. The index
+//! builds take time in proportion to the claim table. Run this `migrate` to
+//! its end before starting or restarting a node on a build from before the
+//! index: such a node's own `migrate` can deadlock with a build in progress
+//! (see [`PostgresKnowledgeGraphStore::migrate`]).
+//!
+//! A claim appended by this build is searchable as soon as it is stored. A
+//! claim that predates the migration, or that a node on an earlier build
+//! appends afterwards, has no index: search does not find it and reports
+//! `unindexed` for its space. [`PostgresKnowledgeGraphStore::index_claims`]
+//! indexes such claims a bounded page at a time. No loop in Rakka calls it; a
+//! deployment calls it for each space until it answers no cursor, and again
+//! whenever a search reports `unindexed`.
+//!
+//! Rolling back needs no schema change. An earlier build ignores the four
+//! columns, and the trigger keeps clearing a tombstoned row's words under it.
 //!
 //! Gated tests run only when `RAKKA_POSTGRES_TEST_DSN` is set, like the other
 //! PostgreSQL adapter crates:
@@ -112,7 +144,10 @@ use tokio_postgres::{Client, Row};
 mod erasure;
 mod search;
 
-pub use search::CLAIM_SEARCH_SQL;
+pub use search::{
+    ClaimSearchIndexPage, CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS, CLAIM_SEARCH_INDEX_WRITE_SQL,
+    CLAIM_SEARCH_SQL,
+};
 
 /// Stable backend name, reported for diagnostics and error detail.
 pub const BACKEND_NAME: &str = "postgres";

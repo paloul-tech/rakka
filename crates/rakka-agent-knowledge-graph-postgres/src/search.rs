@@ -10,7 +10,7 @@
 //! order candidates; every row it returns is then decoded and checked against
 //! its own record, and a column that disagrees is refused as drift.
 
-use rakka_agent_knowledge_graph::claim::Claim;
+use rakka_agent_knowledge_graph::claim::{Claim, ClaimId};
 use rakka_agent_knowledge_graph::error::ClaimResult;
 use rakka_agent_knowledge_graph::scope::KnowledgeSpaceScope;
 use rakka_agent_knowledge_graph::{
@@ -177,5 +177,159 @@ impl PostgresKnowledgeGraphStore {
             .map_err(map_error)?
             .get("unindexed");
         Ok(ClaimSearchReport { hits, unindexed })
+    }
+}
+
+/// Largest number of rows one [`PostgresKnowledgeGraphStore::index_claims`]
+/// page reads.
+pub const CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS: usize = 256;
+
+/// One bounded page of [`PostgresKnowledgeGraphStore::index_claims`]
+/// progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimSearchIndexPage {
+    /// How many claims this page indexed: rows this call's own write changed.
+    /// A row another pass indexed first, or a tombstone withdrew first, is
+    /// not counted.
+    pub indexed: u64,
+    /// How many rows this page read and could not index because their record
+    /// cannot be decoded by this build. Such a row stays unindexed, so its
+    /// space keeps reporting `unindexed` until the record is repaired or
+    /// erased; a non-zero count is the signal to look.
+    pub skipped: u64,
+    /// The cursor for the next page: the last claim this page read, when the
+    /// page was full. `None` when the page read fewer rows than its limit,
+    /// which is the end of the pass.
+    pub next: Option<ClaimId>,
+}
+
+/// The pass's read: the live rows of one space that have no search words,
+/// after a cursor, in claim-id order. Exactly the rows the partial index
+/// [`UNINDEXED_INDEX_NAME`](crate::UNINDEXED_INDEX_NAME) holds.
+const CLAIM_SEARCH_INDEX_READ_SQL: &str = "
+SELECT claim_id, record, tombstoned
+FROM rakka_agent_knowledge_claim
+WHERE tenant = $1 AND space = $2
+  AND search_tokens IS NULL AND NOT tombstoned
+  AND claim_id > $3
+ORDER BY claim_id
+LIMIT $4
+";
+
+/// The pass's write: one row's four index columns, only where the row is
+/// still live and still unindexed.
+///
+/// That condition is what makes the pass safe beside everything else. A
+/// tombstone that lands between the pass's read and this write wins: the row
+/// is a stub, the condition refuses it, and the withdrawn statement's words
+/// never reach it (the claim table's trigger would clear them if they did).
+/// A second pass over the same row finds it indexed and changes nothing, so
+/// a row is indexed once however many passes run. The statement reports how
+/// many rows it changed, which is how the pass counts.
+///
+/// Public so that a test can run exactly this text against a row the pass
+/// could no longer see.
+pub const CLAIM_SEARCH_INDEX_WRITE_SQL: &str = "
+UPDATE rakka_agent_knowledge_claim
+SET search_tokens = $4, search_classification = $5,
+    search_confidence_bps = $6, search_read_capabilities = $7
+WHERE tenant = $1 AND space = $2 AND claim_id = $3
+  AND search_tokens IS NULL AND NOT tombstoned
+";
+
+impl PostgresKnowledgeGraphStore {
+    /// Indexes one bounded page of the claims of one space that have no
+    /// search index yet.
+    ///
+    /// A claim has no index when it was appended before the search migration,
+    /// or by a node on a build from before it. Search does not find such a
+    /// claim and reports `unindexed` for its space; this pass is what indexes
+    /// it. **No loop in Rakka calls it.** A deployment calls it for each
+    /// space, feeding each page's [`ClaimSearchIndexPage::next`] back as
+    /// `after`, until a page answers no cursor.
+    ///
+    /// Each page reads at most `limit` rows (clamped to
+    /// `1..=`[`CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS`]) in claim-id order after
+    /// the cursor, derives each row's index from its record, and writes it
+    /// only where the row is still live and still unindexed
+    /// ([`CLAIM_SEARCH_INDEX_WRITE_SQL`]). A record this build cannot decode
+    /// is counted in [`ClaimSearchIndexPage::skipped`] and passed over; it
+    /// does not stop the pass.
+    ///
+    /// The pass is idempotent and safe to run at any time, on any number of
+    /// nodes at once, while the store is serving. It only ever touches the
+    /// addressed tenant and space.
+    ///
+    /// # Errors
+    ///
+    /// Returns `claim-backend-failed` when the database cannot be reached. A
+    /// damaged record is never an error.
+    pub async fn index_claims(
+        &self,
+        scope: &KnowledgeSpaceScope,
+        after: Option<&ClaimId>,
+        limit: usize,
+    ) -> ClaimResult<ClaimSearchIndexPage> {
+        let limit = limit.clamp(1, CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS);
+        // Every claim id sorts after the empty string.
+        let after = after.map_or("", ClaimId::as_str);
+        let rows = self
+            .client
+            .query(
+                CLAIM_SEARCH_INDEX_READ_SQL,
+                &[
+                    &scope.tenant().as_str(),
+                    &scope.space().as_str(),
+                    &after,
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(map_error)?;
+
+        let mut page = ClaimSearchIndexPage {
+            indexed: 0,
+            skipped: 0,
+            next: None,
+        };
+        let full = rows.len() == limit;
+        let mut last: Option<String> = None;
+        for row in rows {
+            let claim_id: String = row.get("claim_id");
+            // The record is the only source of the index. One that cannot be
+            // decoded, or that is not the claim its own row names, has no
+            // index this build could vouch for.
+            let claim = decode_claim_row(&row)
+                .ok()
+                .filter(|claim| claim.claim_id.as_str() == claim_id);
+            match claim {
+                Some(claim) => {
+                    let index = search_columns(&claim);
+                    let written = self
+                        .client
+                        .execute(
+                            CLAIM_SEARCH_INDEX_WRITE_SQL,
+                            &[
+                                &scope.tenant().as_str(),
+                                &scope.space().as_str(),
+                                &claim_id,
+                                &index.tokens,
+                                &index.classification,
+                                &index.confidence_bps,
+                                &index.read_capabilities,
+                            ],
+                        )
+                        .await
+                        .map_err(map_error)?;
+                    page.indexed += written;
+                }
+                None => page.skipped += 1,
+            }
+            last = Some(claim_id);
+        }
+        if full {
+            page.next = last.map(ClaimId::new).transpose()?;
+        }
+        Ok(page)
     }
 }
