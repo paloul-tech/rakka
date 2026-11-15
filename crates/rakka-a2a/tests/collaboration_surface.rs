@@ -1511,3 +1511,98 @@ async fn a_forged_ancestry_fails_closed_at_ingress() {
         other => panic!("the forged ancestry should refuse as a task error, got {other}"),
     }
 }
+
+/// The bytes both collaboration envelopes had before read capabilities
+/// existed, captured at `86cf087` and never to be edited: a record that
+/// delegates no read capability must put today's envelope on the wire, so a
+/// receiver that predates the field still parses it.
+///
+/// The records are decoded from JSON rather than built from struct literals,
+/// so this pin needs no edit when a record gains a field.
+#[test]
+fn the_collaboration_envelopes_keep_their_bytes_without_read_capabilities() {
+    use rakka_a2a::agents::{AgentCollaborationMetadata, AgentHandoffCollaborationMetadata};
+
+    const DELEGATION_ENVELOPE_86CF087: &str = r#"{"schema":1,"delegation":"delegation-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","parent-task":"goal-root","parent-run":"acme/support/run-1","goal":null,"lineage":[],"depth":1,"requested-skill":"billing.refund","capability-scopes":[],"credential-bindings":[],"budget":null,"deadline":null,"result-schema":null,"knowledge-spaces":["support-kb"]}"#;
+    const HANDOFF_ENVELOPE_86CF087: &str = r#"{"schema":1,"handoff":"handoff-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source-agent":"support","source-run":"run-1","source-generation":1,"target-agent":"billing","target-task-definition":"refund","result-schema":null,"reason":"needs billing authority","policy-revision":1,"knowledge-spaces":["support-kb"]}"#;
+
+    let delegation = format!("delegation-{}", "c".repeat(64));
+    let record: AgentDelegationRecord = serde_json::from_value(json!({
+        "delegation": delegation,
+        "goal": null,
+        "parent_task": "goal-root",
+        "parent_run": "acme/support/run-1",
+        "lineage": [],
+        "depth": 1,
+        "requested_skill": "billing.refund",
+        "resolved": {
+            "agent": "billing",
+            "endpoint": null,
+            "task_definition": "refund",
+            "capability_scopes": [],
+            "credential_bindings": [],
+            "result_schema": null,
+            "compatibility": null,
+            "knowledge_spaces": ["support-kb"]
+        },
+        "a2a_message_id": delegation,
+        "deduplication_key": delegation,
+        "turn": 1,
+        "slot": 0,
+        "effect": "effect-1",
+        "call_id": "call-1",
+        "input": { "inline": { "text": "hello" } },
+        "result_schema": null,
+        "budget": null,
+        "granted_descendants": 3,
+        "deadline": null,
+        "knowledge_spaces": ["support-kb"],
+        "definition_revision": 1,
+        "settings_revision": 1,
+        "created_at": 1
+    }))
+    .expect("the earlier delegation record decodes");
+    assert_eq!(
+        serde_json::to_string(&AgentCollaborationMetadata::from_record(&record))
+            .expect("the envelope encodes"),
+        DELEGATION_ENVELOPE_86CF087
+    );
+
+    let handoff = format!("handoff-{}", "a".repeat(64));
+    let record: rakka_agent::AgentHandoffRecord = serde_json::from_value(json!({
+        "handoff": handoff,
+        "goal": null,
+        "task": "task-1",
+        "source_run": "acme/support/run-1",
+        "source_generation": 1,
+        "requested_skill": "billing.refund",
+        "resolved": {
+            "agent": "billing",
+            "endpoint": null,
+            "task_definition": "refund",
+            "capability_scopes": [],
+            "credential_bindings": [],
+            "result_schema": null,
+            "compatibility": null,
+            "knowledge_spaces": ["support-kb"]
+        },
+        "reason": "needs billing authority",
+        "policy_revision": 1,
+        "definition_revision": 1,
+        "settings_revision": 1,
+        "context": [],
+        "a2a_message_id": handoff,
+        "deduplication_key": handoff,
+        "turn": 7,
+        "slot": 0,
+        "effect": "effect-1",
+        "call_id": "call-1",
+        "created_at": 1
+    }))
+    .expect("the earlier handoff record decodes");
+    assert_eq!(
+        serde_json::to_string(&AgentHandoffCollaborationMetadata::from_record(&record))
+            .expect("the envelope encodes"),
+        HANDOFF_ENVELOPE_86CF087
+    );
+}
