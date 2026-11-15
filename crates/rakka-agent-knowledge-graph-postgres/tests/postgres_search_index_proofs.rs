@@ -16,18 +16,23 @@
 //! Every test is gated on `RAKKA_POSTGRES_TEST_DSN` and passes silently
 //! without it.
 
-use rakka_agent::{AgentId, AgentTaskContent, MemoryClassification};
+use std::collections::BTreeSet;
+
+use rakka_agent::{AgentCapabilityId, AgentId, AgentTaskContent, MemoryClassification};
 use rakka_agent_knowledge_graph::conformance::{conformance_resolver, ConformanceScopes};
 use rakka_agent_knowledge_graph::{
-    Claim, ClaimId, ClaimNodeId, ClaimObject, ClaimOperationId, ClaimPredicate, ClaimProvenance,
-    ClaimTombstoneReason, ClaimTombstoneRequest, ClaimTransitionOutcome, ClaimTrustStatus,
-    ClaimTrustTransition, ClaimTrustTransitionRequest, KnowledgeSpaceScope, CLAIM_TOMBSTONE_MARKER,
+    claim_search_tokens, Claim, ClaimAccess, ClaimDeleteRequest, ClaimId, ClaimNodeId, ClaimObject,
+    ClaimOperationId, ClaimPredicate, ClaimPromotionPolicy, ClaimProvenance, ClaimTombstoneReason,
+    ClaimTombstoneRequest, ClaimTransitionOutcome, ClaimTrustStatus, ClaimTrustTransition,
+    ClaimTrustTransitionRequest, KnowledgeGraphStore, KnowledgeSpaceScope, CLAIM_TOMBSTONE_MARKER,
 };
 use rakka_agent_knowledge_graph_postgres::{
     PostgresKnowledgeGraphStore, SEARCH_TOKENS_INDEX_NAME, SEARCH_TRIGGER_NAME,
     TOMBSTONE_FENCE_TRANSITION_COUNT, UNINDEXED_INDEX_NAME,
 };
-use rakka_agent_workflow::AgentTimestampMillis;
+use rakka_agent_workflow::{
+    AgentAttributes, AgentTimestampMillis, ArtifactKind, ArtifactRef, RedactionStatus,
+};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, NoTls, Row};
 
@@ -235,6 +240,15 @@ async fn connect(dsn: &str) -> Client {
 
 fn dsn() -> Option<String> {
     std::env::var("RAKKA_POSTGRES_TEST_DSN").ok()
+}
+
+/// A raw client and a migrated store in the shared schema, for the proofs
+/// that change nothing another test could see.
+async fn shared() -> Option<(Client, PostgresKnowledgeGraphStore)> {
+    let dsn = dsn()?;
+    let store = PostgresKnowledgeGraphStore::new(connect(&dsn).await);
+    store.migrate().await.expect("the schema applies");
+    Some((connect(&dsn).await, store))
 }
 
 /// A client whose session resolves the tables in a private schema.
@@ -928,4 +942,345 @@ async fn postgres_every_earlier_statement_still_works_after_the_search_migration
     );
 
     schema.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The index is written with the claim and erased with the claim.
+// ---------------------------------------------------------------------------
+
+/// The four index columns of one claim row; `None` when the row is absent.
+#[derive(Debug, PartialEq, Eq)]
+struct IndexColumns {
+    tokens: Option<Vec<String>>,
+    classification: Option<String>,
+    confidence_bps: Option<i32>,
+    read_capabilities: Option<Vec<String>>,
+}
+
+async fn index_columns(
+    raw: &Client,
+    scope: &KnowledgeSpaceScope,
+    claim_id: &ClaimId,
+) -> Option<IndexColumns> {
+    raw.query_opt(
+        "SELECT search_tokens, search_classification, search_confidence_bps, \
+                search_read_capabilities \
+         FROM rakka_agent_knowledge_claim \
+         WHERE tenant = $1 AND space = $2 AND claim_id = $3",
+        &[
+            &scope.tenant().as_str(),
+            &scope.space().as_str(),
+            &claim_id.as_str(),
+        ],
+    )
+    .await
+    .expect("the row reads")
+    .map(|row| IndexColumns {
+        tokens: row.get(0),
+        classification: row.get(1),
+        confidence_bps: row.get(2),
+        read_capabilities: row.get(3),
+    })
+}
+
+/// The claim's search words, in the order the column holds them.
+fn sorted_tokens(claim: &Claim) -> Vec<String> {
+    claim_search_tokens(claim).into_iter().collect()
+}
+
+fn capability(id: &str) -> AgentCapabilityId {
+    AgentCapabilityId::new(id).expect("the capability id is valid")
+}
+
+/// A sensitive, guarded claim: every index column has something to hold.
+fn guarded_claim(scope: &KnowledgeSpaceScope, discriminator: &str) -> Claim {
+    Claim::new(
+        scope,
+        ClaimOperationId::derive_append(scope, discriminator).expect("the operation id derives"),
+        ClaimNodeId::new("Order-42").expect("the node id is valid"),
+        ClaimPredicate::new("shipping_status").expect("the predicate is valid"),
+        ClaimObject::Value(
+            AgentTaskContent::inline(serde_json::json!("Delayed at customs"))
+                .expect("the value is inline-bounded"),
+        ),
+        ClaimProvenance::for_agent(AgentId::new("scout").expect("the agent id is valid")),
+        7_250,
+        MemoryClassification::Sensitive,
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the claim is valid")
+    .with_access(ClaimAccess {
+        required_read_capabilities: BTreeSet::from([capability("cap-b"), capability("cap-a")]),
+    })
+    .expect("the access set is bounded")
+}
+
+#[tokio::test]
+async fn postgres_append_writes_the_index_columns_when_dsn_is_set() {
+    // The statement that inserts the claim writes its index, so a claim is
+    // searchable as soon as it is stored: there is no second write to lose.
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-append").primary;
+    let claim = guarded_claim(&scope, "indexed");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+
+    assert_eq!(
+        index_columns(&raw, &scope, &claim.claim_id).await,
+        Some(IndexColumns {
+            tokens: Some(sorted_tokens(&claim)),
+            classification: Some("sensitive".to_string()),
+            confidence_bps: Some(7_250),
+            read_capabilities: Some(vec!["cap-a".to_string(), "cap-b".to_string()]),
+        })
+    );
+    assert_eq!(
+        sorted_tokens(&claim),
+        ["42", "at", "customs", "delayed", "order", "shipping", "status"]
+    );
+
+    // A claim that requires nothing holds an empty array, not NULL: `NULL`
+    // would make "requires nothing" indistinguishable from "not indexed".
+    let open = text_claim(&scope, "open", "order-43", "status", "delivered");
+    store
+        .append(&scope, &open)
+        .await
+        .expect("the claim appends");
+    let columns = index_columns(&raw, &scope, &open.claim_id)
+        .await
+        .expect("the row exists");
+    assert_eq!(columns.read_capabilities, Some(Vec::new()));
+    assert_eq!(columns.classification.as_deref(), Some("unclassified"));
+
+    // A replayed append changes nothing.
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the replay answers");
+    assert_eq!(
+        index_columns(&raw, &scope, &claim.claim_id)
+            .await
+            .and_then(|columns| columns.tokens),
+        Some(sorted_tokens(&claim))
+    );
+}
+
+#[tokio::test]
+async fn postgres_an_artifact_object_is_indexed_by_its_subject_and_predicate_when_dsn_is_set() {
+    // A value held by reference gives the index no words: nothing of the
+    // reference itself (its id, its location, its checksum) is searchable.
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-artifact").primary;
+    let claim = Claim::new(
+        &scope,
+        ClaimOperationId::derive_append(&scope, "referenced").expect("the operation id derives"),
+        ClaimNodeId::new("order-42").expect("the node id is valid"),
+        ClaimPredicate::new("manifest").expect("the predicate is valid"),
+        ClaimObject::Value(AgentTaskContent::artifact(ArtifactRef {
+            artifact_id: "secretartifactid".to_string(),
+            kind: ArtifactKind::File,
+            uri: "s3://evidence/secreturi".to_string(),
+            checksum: Some("sha256:secretchecksum".to_string()),
+            content_type: Some("application/json".to_string()),
+            byte_len: Some(64),
+            retention_class: None,
+            encryption: None,
+            redaction: RedactionStatus::Unredacted,
+            created_at: AgentTimestampMillis::new(1),
+            metadata: AgentAttributes::default(),
+        })),
+        ClaimProvenance::for_agent(AgentId::new("scout").expect("the agent id is valid")),
+        5_000,
+        MemoryClassification::Unclassified,
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the claim is valid");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+
+    assert_eq!(
+        index_columns(&raw, &scope, &claim.claim_id)
+            .await
+            .and_then(|columns| columns.tokens),
+        Some(vec![
+            "42".to_string(),
+            "manifest".to_string(),
+            "order".to_string()
+        ])
+    );
+}
+
+#[tokio::test]
+async fn postgres_a_transition_leaves_the_index_columns_when_dsn_is_set() {
+    // Nothing the index copies can change after the append, and trust is a
+    // column of its own, so a transition writes none of the four.
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-transition").primary;
+    let claim = guarded_claim(&scope, "moved");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+    let before = index_columns(&raw, &scope, &claim.claim_id).await;
+
+    store
+        .transition(
+            &scope,
+            &transition_request(
+                &scope,
+                &claim.claim_id,
+                "dispute",
+                ClaimTrustStatus::Disputed,
+            ),
+            &ClaimPromotionPolicy::ungated(),
+            NOW,
+        )
+        .await
+        .expect("the transition applies");
+
+    assert!(before
+        .as_ref()
+        .is_some_and(|columns| columns.tokens.is_some()));
+    assert_eq!(index_columns(&raw, &scope, &claim.claim_id).await, before);
+}
+
+#[tokio::test]
+async fn postgres_tombstone_clears_the_search_words_when_dsn_is_set() {
+    // The search words are derived from the statement a tombstone withdraws,
+    // so the tombstone's one statement clears them.
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-tombstone").primary;
+    let claim = guarded_claim(&scope, "withdrawn");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+    assert!(index_columns(&raw, &scope, &claim.claim_id)
+        .await
+        .is_some_and(|columns| columns.tokens.is_some()));
+
+    store
+        .tombstone(
+            &scope,
+            &tombstone_request(&scope, &claim.claim_id, "withdraw"),
+        )
+        .await
+        .expect("the tombstone applies");
+
+    let columns = index_columns(&raw, &scope, &claim.claim_id)
+        .await
+        .expect("the stub row is kept");
+    assert_eq!(columns.tokens, None, "a stub row holds no search words");
+}
+
+/// Appends a guarded claim through the store and tombstones it with the
+/// `86cf087` statement, which does not name `search_tokens`. Answers the
+/// row's search words afterwards.
+async fn words_after_an_earlier_tombstone(
+    raw: &Client,
+    store: &PostgresKnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+) -> Option<Vec<String>> {
+    let claim = guarded_claim(scope, "withdrawn-earlier");
+    store
+        .append(scope, &claim)
+        .await
+        .expect("the claim appends");
+    assert_eq!(
+        index_columns(raw, scope, &claim.claim_id)
+            .await
+            .and_then(|columns| columns.tokens),
+        Some(sorted_tokens(&claim)),
+        "the claim is indexed before it is withdrawn"
+    );
+    let row = earlier_tombstone(
+        raw,
+        scope,
+        &claim,
+        &tombstone_request(scope, &claim.claim_id, "withdraw"),
+        &[&claim.operation_id],
+    )
+    .await;
+    assert!(
+        row.get::<_, bool>("applied"),
+        "the earlier tombstone applies"
+    );
+    index_columns(raw, scope, &claim.claim_id)
+        .await
+        .expect("the stub row is kept")
+        .tokens
+}
+
+#[tokio::test]
+async fn postgres_an_earlier_tombstone_statement_clears_the_search_words_when_dsn_is_set() {
+    // A node on the earlier binary withdraws a claim this build indexed. Its
+    // statement knows nothing of the index, and the words are still gone when
+    // it commits: the database clears them.
+    let Some(dsn) = dsn() else { return };
+    let (schema, raw, store) = PrivateSchema::migrated(&dsn, "search_trigger").await;
+    let scope = ConformanceScopes::unique("pg-search-trigger").primary;
+    assert_eq!(
+        words_after_an_earlier_tombstone(&raw, &store, &scope).await,
+        None,
+        "an earlier binary's tombstone must not leave a withdrawn statement's words"
+    );
+    schema.drop().await;
+
+    // The same statement without the trigger leaves the words where they
+    // were. That is what proves the trigger, and nothing else, clears them.
+    let (schema, raw, store) = PrivateSchema::migrated(&dsn, "search_no_trigger").await;
+    raw.batch_execute(&format!(
+        "DROP TRIGGER {SEARCH_TRIGGER_NAME} ON rakka_agent_knowledge_claim"
+    ))
+    .await
+    .expect("the trigger is dropped");
+    let scope = ConformanceScopes::unique("pg-search-no-trigger").primary;
+    let left = words_after_an_earlier_tombstone(&raw, &store, &scope).await;
+    assert!(
+        left.is_some_and(|words| words.contains(&"customs".to_string())),
+        "without the trigger the earlier statement leaves the words in the row"
+    );
+    schema.drop().await;
+}
+
+#[tokio::test]
+async fn postgres_delete_leaves_no_row_when_dsn_is_set() {
+    // A delete removes the row, and the index with it.
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-delete").primary;
+    let claim = guarded_claim(&scope, "removed");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+    assert!(index_columns(&raw, &scope, &claim.claim_id).await.is_some());
+
+    store
+        .delete(
+            &scope,
+            &ClaimDeleteRequest {
+                claim_id: claim.claim_id.clone(),
+                operation_id: ClaimOperationId::derive_delete(&scope, &claim.claim_id, "remove")
+                    .expect("the operation id derives"),
+                expected: None,
+            },
+        )
+        .await
+        .expect("the delete applies");
+
+    assert_eq!(index_columns(&raw, &scope, &claim.claim_id).await, None);
 }

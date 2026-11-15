@@ -109,6 +109,7 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Row};
 
 mod erasure;
+mod search;
 
 /// Stable backend name, reported for diagnostics and error detail.
 pub const BACKEND_NAME: &str = "postgres";
@@ -455,6 +456,10 @@ $validate$;
 /// leave a deleted claim restored beside its erased ledger row. Failing it
 /// aborts the whole statement, claim insert included; `append` then reads the
 /// ledger and answers from it.
+///
+/// The claim insert also writes the row's search index (`$11` to `$14`), so a
+/// claim is searchable as soon as it is stored and no second write exists
+/// that could be lost.
 const APPEND_SQL: &str = "
 WITH existing_op AS (
     SELECT kind, result FROM rakka_agent_knowledge_claim_op
@@ -462,8 +467,10 @@ WITH existing_op AS (
 ), ins_claim AS (
     INSERT INTO rakka_agent_knowledge_claim
         (tenant, space, claim_id, operation_id, subject, predicate,
-         object_node, trust, transition_count, record)
-    SELECT $1, $2, $4, $3, $5, $6, $7, $8, $9, $10
+         object_node, trust, transition_count, record,
+         search_tokens, search_classification, search_confidence_bps,
+         search_read_capabilities)
+    SELECT $1, $2, $4, $3, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
     WHERE NOT EXISTS (SELECT 1 FROM existing_op)
     ON CONFLICT (tenant, space, claim_id) DO NOTHING
     RETURNING claim_id
@@ -946,7 +953,8 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
             }
             let record = encode(&claim.to_record())?;
             let transition_count = 0_i32;
-            let params: [&(dyn ToSql + Sync); 10] = [
+            let index = search::search_columns(claim);
+            let params: [&(dyn ToSql + Sync); 14] = [
                 &scope.tenant().as_str(),
                 &scope.space().as_str(),
                 &claim.operation_id.as_str(),
@@ -957,6 +965,10 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
                 &claim.trust().as_label(),
                 &transition_count,
                 &record,
+                &index.tokens,
+                &index.classification,
+                &index.confidence_bps,
+                &index.read_capabilities,
             ];
             match self.client.query_one(APPEND_SQL, &params).await {
                 Ok(row) => {
