@@ -89,11 +89,13 @@
 //!
 //! `migrate` adds the search index: four nullable columns and a trigger as
 //! catalog-only changes, then two indexes built `CONCURRENTLY`, each in a
-//! statement of its own, so that no reader or writer is blocked. The index
-//! builds take time in proportion to the claim table. Run this `migrate` to
-//! its end before starting or restarting a node on a build from before the
-//! index: such a node's own `migrate` can deadlock with a build in progress
-//! (see [`PostgresKnowledgeGraphStore::migrate`]).
+//! statement of its own, so that no reader or writer is blocked. The first
+//! run holds an `ACCESS EXCLUSIVE` lock on the claim table for the catalog
+//! changes alone: no row is scanned or rewritten under it. The index builds
+//! take time in proportion to the claim table. Run this `migrate` to its end
+//! before starting or restarting a node on a build from before the index:
+//! such a node's own `migrate` can deadlock with a build in progress (see
+//! [`PostgresKnowledgeGraphStore::migrate`]).
 //!
 //! A claim appended by this build is searchable as soon as it is stored. A
 //! claim that predates the migration, or that a node on an earlier build
@@ -105,6 +107,17 @@
 //!
 //! Rolling back needs no schema change. An earlier build ignores the four
 //! columns, and the trigger keeps clearing a tombstoned row's words under it.
+//!
+//! Erasure reaches the index. A tombstone clears the claim's search words in
+//! its one statement, a delete removes the row, and the trigger enforces the
+//! rule for any statement that forgets: a tombstoned row holds no search
+//! words. The index therefore joins the claim row, the transition rows and
+//! the replay ledger as what a tombstone and a delete clear (issue #68).
+//!
+//! The store's `search` is what
+//! [`rakka_agent_knowledge_graph::KnowledgeGraphCommunalRetriever`] ranks
+//! with, which is how an indexed claim reaches a model context. The full
+//! roll order is in `docs/rakka-compatibility.md`.
 //!
 //! Gated tests run only when `RAKKA_POSTGRES_TEST_DSN` is set, like the other
 //! PostgreSQL adapter crates:

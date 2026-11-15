@@ -992,9 +992,10 @@ pub struct SnapshotSessionEntry {
 /// One retrieval query a snapshot ran, with the retriever version that ran it
 /// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// Phase 2 populates these for private and communal retrieval; a session-only
-/// snapshot records the bounded-window read that assembled it, so the exact
-/// retrieval that produced a model input is always reconstructable.
+/// A session-only snapshot records the bounded-window read that assembled
+/// it, and a private retrieval adds its own entry, so the exact retrieval
+/// that produced a model input is always reconstructable. A communal search
+/// is recorded apart, on [`SnapshotCommunalRetrieval`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRetrieval {
     /// The bounded query text or window descriptor.
@@ -1201,10 +1202,10 @@ pub struct SnapshotCommunalRetrieval {
 /// it assembled.
 ///
 /// The private selections are filled by the slice 2.2 retrieval path when a
-/// retriever is wired ([`crate::retrieval::assemble_context`]); the communal
-/// selections stay empty until the phase-2 graph slice delivers that store.
-/// The scopes were fixed in phase 1 so a session-only snapshot and a phase-2
-/// snapshot share one record shape.
+/// retriever is wired ([`crate::retrieval::assemble_context`]), and the
+/// communal selections by the communal read path when a communal bundle is
+/// ([`crate::communal`]). A snapshot with neither is a session-only record of
+/// the same shape.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MemoryContextSnapshot {
     schema_version: StateSchemaVersion,
