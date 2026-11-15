@@ -163,6 +163,20 @@ pub const TOMBSTONE_FENCE_TRANSITION_COUNT: i32 = i32::MAX;
 /// Rows one query-scan batch reads before admission filtering.
 const QUERY_SCAN_BATCH_ROWS: i64 = 256;
 
+/// Name of the GIN index over a claim row's search words: what answers
+/// "which claims share a word with this query". A compatibility surface: the
+/// migration finds, validates and rebuilds the index by this name.
+pub const SEARCH_TOKENS_INDEX_NAME: &str = "rakka_agent_knowledge_claim_search_tokens";
+
+/// Name of the partial index over live claim rows that have no search words
+/// yet: what answers "does this space hold claims the search index does not
+/// cover", and the cursor of the indexing pass. A compatibility surface.
+pub const UNINDEXED_INDEX_NAME: &str = "rakka_agent_knowledge_claim_unindexed";
+
+/// Name of the row trigger, and of the function it runs, that clears a
+/// tombstoned claim row's search words. A compatibility surface.
+pub const SEARCH_TRIGGER_NAME: &str = "rakka_agent_knowledge_claim_clear_search";
+
 /// Idempotent schema for the communal knowledge-graph tables.
 ///
 /// `claim_id` collates as `"C"` so SQL ordering and range comparisons are
@@ -207,6 +221,46 @@ const QUERY_SCAN_BATCH_ROWS: i64 = 256;
 /// Both changes are safe under a binary from before tombstones that is still
 /// appending: its insert does not name the new column, and both kinds it
 /// writes are in the wider check.
+///
+/// # The search index
+///
+/// A claim row also carries a keyword-search index (issue #69): four nullable
+/// columns, a trigger and two indexes.
+///
+/// - `search_tokens` holds the claim's search words
+///   ([`claim_search_tokens`](rakka_agent_knowledge_graph::claim_search_tokens)),
+///   compared bytewise. `NULL` means the row is not indexed; an indexed claim
+///   with no words holds an empty array.
+/// - `search_classification`, `search_confidence_bps` and
+///   `search_read_capabilities` copy three fields of the record that never
+///   change after the append, so a search can restrict before it ranks.
+///
+/// **A tombstoned row holds no search words, and the database enforces it.**
+/// The row trigger [`SEARCH_TRIGGER_NAME`] sets `search_tokens` to `NULL` on
+/// any inserted or updated row whose `tombstoned` is true. Its `WHEN` clause
+/// lets it fire only for a tombstoned row that still holds words, so an
+/// ordinary write pays nothing for it. The rule therefore holds for a binary
+/// from before the index, whose tombstone statement does not name the column,
+/// and for any statement written later that forgets to.
+///
+/// What this part of the upgrade costs while earlier binaries serve:
+///
+/// - In this batch, the four columns are added by one `ALTER TABLE` and the
+///   trigger is created, each only when absent. Nullable columns with no
+///   default and a trigger are catalog changes: under the `ACCESS EXCLUSIVE`
+///   lock the batch already takes on the claim table, nothing is scanned or
+///   rewritten.
+/// - The two indexes are **not** here. `CREATE INDEX CONCURRENTLY` cannot run
+///   inside a transaction, so [`PostgresKnowledgeGraphStore::migrate`] sends
+///   each as a statement of its own after this batch. A concurrent build does
+///   not block reads or writes; it takes time in proportion to the table, and
+///   waits for the transactions that were open when it began.
+/// - A repeat run alters nothing: no column, no trigger, no function and no
+///   index is written again.
+///
+/// An earlier binary's append leaves the four columns `NULL`, which is what
+/// "not indexed" means; its trust transition and its delete do not involve
+/// them; and its tombstone is covered by the trigger.
 pub const MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS rakka_agent_knowledge_claim (
     tenant TEXT NOT NULL,
@@ -220,6 +274,10 @@ CREATE TABLE IF NOT EXISTS rakka_agent_knowledge_claim (
     transition_count INTEGER NOT NULL CHECK (transition_count >= 0),
     record BYTEA NOT NULL,
     tombstoned BOOLEAN NOT NULL DEFAULT FALSE,
+    search_tokens TEXT[] COLLATE "C",
+    search_classification TEXT,
+    search_confidence_bps INTEGER,
+    search_read_capabilities TEXT[] COLLATE "C",
     PRIMARY KEY (tenant, space, claim_id)
 );
 
@@ -286,9 +344,72 @@ BEGIN
             CHECK (kind IN ('append', 'transition', 'tombstone', 'delete', 'erased'))
             NOT VALID;
     END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'rakka_agent_knowledge_claim'::regclass
+          AND attname = 'search_tokens'
+          AND NOT attisdropped
+    ) THEN
+        ALTER TABLE rakka_agent_knowledge_claim
+            ADD COLUMN search_tokens TEXT[] COLLATE "C",
+            ADD COLUMN search_classification TEXT,
+            ADD COLUMN search_confidence_bps INTEGER,
+            ADD COLUMN search_read_capabilities TEXT[] COLLATE "C";
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgrelid = 'rakka_agent_knowledge_claim'::regclass
+          AND tgname = 'rakka_agent_knowledge_claim_clear_search'
+          AND NOT tgisinternal
+    ) THEN
+        CREATE OR REPLACE FUNCTION rakka_agent_knowledge_claim_clear_search() RETURNS trigger
+        LANGUAGE plpgsql AS $clear$
+        BEGIN
+            NEW.search_tokens := NULL;
+            RETURN NEW;
+        END
+        $clear$;
+
+        CREATE TRIGGER rakka_agent_knowledge_claim_clear_search
+            BEFORE INSERT OR UPDATE ON rakka_agent_knowledge_claim
+            FOR EACH ROW
+            WHEN (NEW.tombstoned AND NEW.search_tokens IS NOT NULL)
+            EXECUTE FUNCTION rakka_agent_knowledge_claim_clear_search();
+    END IF;
 END
 $migrate$;
 "#;
+
+/// The two search indexes, by name, each with the statement that builds it.
+///
+/// Each statement is sent alone by
+/// [`PostgresKnowledgeGraphStore::migrate`]: a concurrent build cannot share
+/// a transaction with anything.
+const SEARCH_INDEX_BUILDS: [(&str, &str); 2] = [
+    (
+        SEARCH_TOKENS_INDEX_NAME,
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS rakka_agent_knowledge_claim_search_tokens \
+         ON rakka_agent_knowledge_claim USING GIN (search_tokens)",
+    ),
+    (
+        UNINDEXED_INDEX_NAME,
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS rakka_agent_knowledge_claim_unindexed \
+         ON rakka_agent_knowledge_claim (tenant, space, claim_id) \
+         WHERE search_tokens IS NULL AND NOT tombstoned",
+    ),
+];
+
+/// The pause between two attempts to take the migration lock: fifty
+/// milliseconds, spent in the database so the crate needs no timer of its
+/// own. The statement ends by itself, so nothing can wait on it for long.
+const MIGRATION_LOCK_PAUSE_SQL: &str = "SELECT pg_sleep(0.05)";
+
+/// Whether one index exists and is valid; no row when it does not exist.
+const INDEX_VALID_SQL: &str = "
+SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)
+";
 
 /// Validates the ledger's widened `kind` check, when [`MIGRATION_SQL`] left
 /// it unvalidated.
@@ -536,19 +657,43 @@ impl PostgresKnowledgeGraphStore {
 
     /// Applies the idempotent schema under the crate's advisory lock.
     ///
+    /// Three steps, each its own transaction: [`MIGRATION_SQL`], then
+    /// [`MIGRATION_VALIDATE_SQL`], then the two search indexes, each built
+    /// `CONCURRENTLY` in a statement of its own so that a build never blocks a
+    /// reader or a writer. A concurrent build that was cancelled leaves an
+    /// invalid index behind, which `IF NOT EXISTS` would keep; such an index
+    /// is dropped and built again.
+    ///
+    /// The index builds take time in proportion to the claim table and wait
+    /// for transactions that were open when they began, so the first run
+    /// against a large table returns when the builds do. A repeat run alters
+    /// nothing.
+    ///
+    /// Migrators on this build serialize on the advisory lock without holding
+    /// anything while they wait, so any number may start at once. **A node on
+    /// a build from before the search index is different:** its `migrate`
+    /// blocks inside `pg_advisory_lock`, holding a snapshot, and a concurrent
+    /// index build waits for every older snapshot. If such a node starts its
+    /// own `migrate` while the indexes are first being built, the two wait on
+    /// each other and PostgreSQL fails one of them with `deadlock detected`.
+    /// Nothing is damaged: a cancelled build leaves an invalid index, which
+    /// the next run of this `migrate` drops and builds again. Run the first
+    /// migration to its end before starting or restarting a node on an
+    /// earlier build.
+    ///
     /// # Errors
     ///
     /// Returns [`ClaimError::Backend`] if the DDL cannot be applied.
     pub async fn migrate(&self) -> ClaimResult<()> {
-        self.client
-            .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
-            .await
-            .map_err(map_error)?;
+        self.lock_for_migration().await.map_err(map_error)?;
         // Two batches, two transactions: the validating scan must not run under
         // the exclusive locks the first batch takes (see
         // `MIGRATION_VALIDATE_SQL`).
         let applied = match self.client.batch_execute(MIGRATION_SQL).await {
-            Ok(()) => self.client.batch_execute(MIGRATION_VALIDATE_SQL).await,
+            Ok(()) => match self.client.batch_execute(MIGRATION_VALIDATE_SQL).await {
+                Ok(()) => self.build_search_indexes().await,
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
         let unlocked = self
@@ -557,6 +702,60 @@ impl PostgresKnowledgeGraphStore {
             .await;
         applied.map_err(map_error)?;
         unlocked.map_err(map_error)?;
+        Ok(())
+    }
+
+    /// Takes the crate's migration lock, waiting for another migrator without
+    /// holding anything while it waits.
+    ///
+    /// The lock is *tried*, never waited on. A concurrent index build waits
+    /// for every transaction whose snapshot is older than its own, and a
+    /// session blocked inside `pg_advisory_lock` holds exactly such a
+    /// snapshot for as long as it is blocked. Two migrators would then wait
+    /// on each other, the second for the lock and the first for the second's
+    /// snapshot, and PostgreSQL would break the cycle by failing one with
+    /// `deadlock detected`. Each attempt here is a statement that ends at
+    /// once, and so is each pause between attempts.
+    async fn lock_for_migration(&self) -> Result<(), tokio_postgres::Error> {
+        loop {
+            let locked: bool = self
+                .client
+                .query_one("SELECT pg_try_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
+                .await?
+                .get(0);
+            if locked {
+                return Ok(());
+            }
+            self.client.batch_execute(MIGRATION_LOCK_PAUSE_SQL).await?;
+        }
+    }
+
+    /// Builds the two search indexes without blocking a reader or a writer,
+    /// replacing any that an earlier cancelled build left invalid.
+    ///
+    /// Called under the migration's advisory lock, so two migrators never
+    /// build the same index at once. Every statement is sent alone: a
+    /// concurrent build or drop cannot run inside a transaction, and a
+    /// multi-statement batch is one.
+    async fn build_search_indexes(&self) -> Result<(), tokio_postgres::Error> {
+        for (name, build) in SEARCH_INDEX_BUILDS {
+            let valid = self
+                .client
+                .query_opt(INDEX_VALID_SQL, &[&name])
+                .await?
+                .map(|row| row.get::<_, bool>(0));
+            match valid {
+                // Built and usable: nothing to do, and nothing is sent.
+                Some(true) => continue,
+                Some(false) => {
+                    self.client
+                        .batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS {name}"))
+                        .await?;
+                }
+                None => {}
+            }
+            self.client.batch_execute(build).await?;
+        }
         Ok(())
     }
 
