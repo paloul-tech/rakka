@@ -34,6 +34,10 @@
 //! - [`retention`] — the per-space retention policy (a window per trust
 //!   status, a tombstone window, a legal hold) and the bounded sweep that
 //!   discharges it over any backend.
+//! - [`search`] — the keyword search a store may offer: the query, the
+//!   shared word rule, the score and the ranking order.
+//! - [`communal_retrieval`] — the communal read ports of `rakka-agent`,
+//!   served from a store.
 //! - [`store`] — the portable [`KnowledgeGraphStore`] SPI, bounded
 //!   query/traversal types, capability reporting, and the in-memory
 //!   reference implementation.
@@ -51,21 +55,31 @@
 //! ([specification 19](../../docs/plans/rakka-agent/spec.md)); production
 //! durability claims are never based on the in-memory implementation.
 //!
+//! # Reading claims into a model context
+//!
+//! [`communal_retrieval`] implements the two communal read ports
+//! `rakka-agent` declares. [`KnowledgeGraphCommunalRetriever`] ranks a
+//! space's claims by keyword [`search`](KnowledgeGraphStore::search), and
+//! [`KnowledgeGraphCommunalAuthority`] answers the claim a ranking named.
+//! Context assembly in `rakka-agent` decides on the record the authority
+//! answers, which is where a claim's trust status, classification and
+//! required read capabilities are enforced for a reading run. The store SPI
+//! itself still enforces none of them on `get` or `query`: those are
+//! operations an application calls, and the access set stays carried,
+//! queryable data there.
+//!
 //! # Non-goals, still
 //!
-//! No communal retrieval/context-snapshot path (the `MemoryContextSnapshot`
-//! communal selection stays empty until it lands), no metrics counters, no
-//! sharded knowledge-space entity, no agent-facing erasure path (tombstone,
-//! delete and the retention sweep are operations an application calls on the
-//! store; no run effect, command or tool reaches them), no bulk or
-//! whole-space erasure, no per-claim capability
-//! enforcement at read (the access set is carried, queryable data; its
-//! enforcement point is the communal retrieval and policy layer), and no
-//! cross-tenant federation. The run-entity claim-append effect this crate once
-//! deferred landed with scenario 33 ([`append_executor`]).
+//! No metrics counters, no sharded knowledge-space entity, no agent-facing
+//! erasure path (tombstone, delete and the retention sweep are operations an
+//! application calls on the store; no run effect, command or tool reaches
+//! them), no bulk or whole-space erasure, no meaning-based (embedding)
+//! search, and no cross-tenant federation. The run-entity claim-append effect
+//! this crate once deferred landed with scenario 33 ([`append_executor`]).
 
 pub mod append_executor;
 pub mod claim;
+pub mod communal_retrieval;
 pub mod conformance;
 pub mod error;
 pub mod goal_claim_source;
@@ -84,6 +98,7 @@ pub use claim::{
     CLAIM_MAX_ACL_CAPABILITIES, CLAIM_MAX_EVIDENCE_ARTIFACTS, CLAIM_MAX_TRUST_TRANSITIONS,
     CLAIM_OBJECT_INLINE_MAX_BYTES, CURRENT_CLAIM_SCHEMA_VERSION,
 };
+pub use communal_retrieval::{KnowledgeGraphCommunalAuthority, KnowledgeGraphCommunalRetriever};
 pub use error::{check_schema_window, ClaimError, ClaimFuture, ClaimRecordKind, ClaimResult};
 pub use goal_claim_source::KnowledgeGraphGoalClaimSource;
 pub use promotion::{
