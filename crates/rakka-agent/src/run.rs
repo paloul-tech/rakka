@@ -8692,6 +8692,13 @@ where
         if pending.is_empty() {
             return Ok(0);
         }
+        // What this run was delegated narrows what it may read communally. It
+        // is fixed when the run accepts its assignment, so one read serves
+        // every snapshot of this pass.
+        let delegation: Option<crate::delegation::AgentRunDelegationEnvelope> = self
+            .state()?
+            .loop_state()
+            .and_then(|loop_state| loop_state.delegation_envelope().cloned());
 
         let mut persisted = 0;
         for (turn, reference) in pending {
@@ -8707,6 +8714,7 @@ where
             let assembled = crate::retrieval::assemble_context(
                 &memory,
                 &self.scope,
+                delegation.as_ref(),
                 &reference,
                 turn,
                 AgentRevisionNumber::INITIAL,

@@ -151,14 +151,14 @@ pub use client::{
     AgentClientTaskView, AgentClientTransport, RakkaAgentClient,
 };
 pub use communal::{
-    AgentCommunalClaimAuthority, AgentCommunalClaimRetriever, AgentCommunalClaimTrust,
-    AgentCommunalReadGrant, AgentCommunalReadGrantSource, AgentCommunalRetrieval,
-    AgentEntityCommunalReadGrants, CommunalClaimObject, CommunalClaimProvenance,
-    CommunalClaimRecord, CommunalClaimStatement, CommunalRetrievalOutcome, CommunalRetrievalPolicy,
-    CommunalRetrievalQuery, RankedCommunalClaim, AGENT_COMMUNAL_CLAIM_MAX_EVIDENCE,
-    AGENT_COMMUNAL_CLAIM_MAX_READ_CAPABILITIES, AGENT_COMMUNAL_CLAIM_OBJECT_INLINE_MAX_BYTES,
-    AGENT_COMMUNAL_RETRIEVAL_MAX_SPACES, AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_BYTES,
-    AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_ENTRIES,
+    derive_communal_query, AgentCommunalClaimAuthority, AgentCommunalClaimRetriever,
+    AgentCommunalClaimTrust, AgentCommunalReadGrant, AgentCommunalReadGrantSource,
+    AgentCommunalRetrieval, AgentEntityCommunalReadGrants, CommunalClaimObject,
+    CommunalClaimProvenance, CommunalClaimRecord, CommunalClaimStatement, CommunalRetrievalOutcome,
+    CommunalRetrievalPolicy, CommunalRetrievalQuery, CommunalRetrievalReport, RankedCommunalClaim,
+    AGENT_COMMUNAL_CLAIM_MAX_EVIDENCE, AGENT_COMMUNAL_CLAIM_MAX_READ_CAPABILITIES,
+    AGENT_COMMUNAL_CLAIM_OBJECT_INLINE_MAX_BYTES, AGENT_COMMUNAL_RETRIEVAL_MAX_SPACES,
+    AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_BYTES, AGENT_SNAPSHOT_COMMUNAL_CLAIM_MAX_ENTRIES,
 };
 pub use decision_ledger::{AgentDecisionLedger, AGENT_DECISION_LEDGER_CAPACITY};
 pub use dispatch::{

@@ -62,7 +62,9 @@ use std::sync::Arc;
 
 use rakka_agent_workflow::AgentTimestampMillis;
 
+use crate::communal::CommunalRetrievalReport;
 use crate::definition::AgentRevisionNumber;
+use crate::delegation::AgentRunDelegationEnvelope;
 use crate::guardrails::{
     AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailDisposition,
 };
@@ -539,11 +541,33 @@ pub fn derive_retrieval_query(
     window: &[crate::memory::SnapshotSessionEntry],
     policy: &MemoryRetrievalPolicy,
 ) -> Option<MemoryRetrievalQuery> {
+    let text = derive_query_text(window, policy.query_entries())?;
+    Some(
+        MemoryRetrievalQuery::new(text)
+            .with_limit(policy.max_results())
+            .with_max_bytes(policy.max_bytes())
+            .with_min_confidence_bps(policy.min_confidence_bps())
+            .with_classifications(policy.classifications().clone()),
+    )
+}
+
+/// The query text both retrieval tiers derive from one assembled session
+/// window: the last `query_entries` non-summary entries' inline text, oldest
+/// first, joined by newlines, truncated to
+/// [`AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES`] keeping the tail. `None` when
+/// the window holds no embeddable text.
+///
+/// One function, so the private and the communal tier of one snapshot cannot
+/// derive their text by two rules.
+pub(crate) fn derive_query_text(
+    window: &[crate::memory::SnapshotSessionEntry],
+    query_entries: usize,
+) -> Option<String> {
     let mut recent: Vec<&crate::memory::SnapshotSessionEntry> = window
         .iter()
         .rev()
         .filter(|entry| entry.role != MemoryEntryRole::Summary)
-        .take(policy.query_entries())
+        .take(query_entries)
         .collect();
     recent.reverse();
 
@@ -564,14 +588,7 @@ pub fn derive_retrieval_query(
         }
         text = text[start..].to_string();
     }
-
-    Some(
-        MemoryRetrievalQuery::new(text)
-            .with_limit(policy.max_results())
-            .with_max_bytes(policy.max_bytes())
-            .with_min_confidence_bps(policy.min_confidence_bps())
-            .with_classifications(policy.classifications().clone()),
-    )
+    Some(text)
 }
 
 // ===========================================================================
@@ -1025,8 +1042,10 @@ impl RetrievalReport {
 pub struct AssembledContext {
     /// The assembled snapshot, ready to persist.
     pub snapshot: MemoryContextSnapshot,
-    /// What the retrieval did.
+    /// What the private retrieval did.
     pub retrieval: RetrievalReport,
+    /// What the communal retrieval did.
+    pub communal: CommunalRetrievalReport,
 }
 
 /// Assembles the immutable context snapshot one model turn is computed from,
@@ -1066,6 +1085,19 @@ pub struct AssembledContext {
 /// part-way through does, and this snapshot is immutable. A session-store
 /// error propagates, as it always has.
 ///
+/// # The communal half
+///
+/// When the bundle carries an
+/// [`AgentCommunalRetrieval`](crate::communal::AgentCommunalRetrieval), the
+/// communal claims the run may read are selected after the private half, by
+/// the same rules, into [`MemoryContextSnapshot::communal_claims`]. What the
+/// run may read is its agent's grant narrowed by `delegation`, the envelope
+/// the run accepted its assignment under; `None` is a run that was delegated
+/// nothing. The communal half changes nothing the private half wrote, and a
+/// communal fault degrades to a smaller communal selection: it never fails
+/// the assembly and never costs the turn its private memories. See
+/// [`crate::communal`].
+///
 /// # The selection is always a rank prefix
 ///
 /// Selection walks the surviving ranked records in order and *stops* at the
@@ -1081,6 +1113,7 @@ pub struct AssembledContext {
 pub async fn assemble_context(
     memory: &AgentRunMemory,
     scope: &AgentRunScope,
+    delegation: Option<&AgentRunDelegationEnvelope>,
     reference: &AgentContextSnapshotRef,
     turn: u64,
     policy_revision: AgentRevisionNumber,
@@ -1097,17 +1130,43 @@ pub async fn assemble_context(
     )
     .await?;
 
+    // The private half runs first and is complete before the communal half
+    // starts: the communal half adds to the snapshot and changes nothing the
+    // private half wrote.
+    let retrieval = select_private_memories(memory, scope, &mut snapshot, now).await;
+    // Boxed: the settle pass that awaits this assembly is already a deep
+    // future, and the communal walk holds a ranking and a record across its
+    // awaits.
+    let communal = Box::pin(crate::communal::select_communal_claims(
+        memory,
+        scope,
+        delegation,
+        &mut snapshot,
+        now,
+    ))
+    .await;
+
+    Ok(AssembledContext {
+        snapshot,
+        retrieval,
+        communal,
+    })
+}
+
+/// The private half of [`assemble_context`]: retrieves, re-checks, evaluates
+/// and embeds the run's private memories into `snapshot`, and answers what it
+/// did. Infallible: every failure degrades.
+async fn select_private_memories(
+    memory: &AgentRunMemory,
+    scope: &AgentRunScope,
+    snapshot: &mut MemoryContextSnapshot,
+    now: AgentTimestampMillis,
+) -> RetrievalReport {
     let Some(retrieval) = memory.retrieval() else {
-        return Ok(AssembledContext {
-            snapshot,
-            retrieval: RetrievalReport::default(),
-        });
+        return RetrievalReport::default();
     };
     let Some(query) = derive_retrieval_query(&snapshot.session, retrieval.policy()) else {
-        return Ok(AssembledContext {
-            snapshot,
-            retrieval: RetrievalReport::default(),
-        });
+        return RetrievalReport::default();
     };
 
     let mut report = RetrievalReport {
@@ -1131,10 +1190,7 @@ pub async fn assemble_context(
                 index_watermark: None,
             });
             snapshot.content_digest = snapshot.compute_digest();
-            return Ok(AssembledContext {
-                snapshot,
-                retrieval: report,
-            });
+            return report;
         }
     };
 
@@ -1345,10 +1401,7 @@ pub async fn assemble_context(
     });
     snapshot.content_digest = snapshot.compute_digest();
 
-    Ok(AssembledContext {
-        snapshot,
-        retrieval: report,
-    })
+    report
 }
 
 /// The value the memory-ingress boundary evaluates: the inline content
@@ -1372,7 +1425,7 @@ fn content_as_value(content: &AgentTaskContent) -> Result<serde_json::Value, Mem
 
 /// Truncates an index watermark to its bound, deterministically, at a
 /// character boundary.
-fn bounded_watermark(watermark: String) -> String {
+pub(crate) fn bounded_watermark(watermark: String) -> String {
     if watermark.len() <= AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH {
         return watermark;
     }
@@ -1865,6 +1918,7 @@ mod tests {
         assemble_context(
             &memory,
             &scope,
+            None,
             &reference,
             1,
             AgentRevisionNumber::INITIAL,
@@ -1915,6 +1969,7 @@ mod tests {
         let assembled = assemble_context(
             &memory,
             &scope,
+            None,
             &reference,
             1,
             AgentRevisionNumber::INITIAL,
@@ -1959,6 +2014,7 @@ mod tests {
         let assembled = assemble_context(
             &memory,
             &scope,
+            None,
             &reference,
             1,
             AgentRevisionNumber::INITIAL,
@@ -2083,6 +2139,7 @@ mod tests {
         let assembled = assemble_context(
             &memory,
             &scope,
+            None,
             &reference,
             1,
             AgentRevisionNumber::INITIAL,
@@ -2159,6 +2216,7 @@ mod tests {
         let assembled = assemble_context(
             &memory,
             &scope,
+            None,
             &reference,
             1,
             AgentRevisionNumber::INITIAL,
@@ -2218,6 +2276,7 @@ mod tests {
         let assembled = assemble_context(
             &memory,
             &scope,
+            None,
             &reference,
             1,
             AgentRevisionNumber::INITIAL,
@@ -2286,6 +2345,7 @@ mod tests {
         let assembled = assemble_context(
             &memory,
             &scope,
+            None,
             &reference,
             1,
             AgentRevisionNumber::INITIAL,

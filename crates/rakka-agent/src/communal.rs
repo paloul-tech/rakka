@@ -50,15 +50,21 @@ use crate::agent::{load_agent_entity_state, AgentEntityState};
 use crate::definition::{AgentCapabilityId, AgentRevisionNumber};
 use crate::delegation::{delegated_grant, AgentRunDelegationEnvelope};
 use crate::dispatch::AgentRunSetupResolver;
-use crate::guardrails::AgentGuardrailChain;
+use crate::guardrails::{
+    AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailDisposition,
+};
 use crate::identity::{
     validate_identity_segment, AgentCommunalClaimId, AgentDelegationId, AgentGoalId, AgentId,
     AgentRunId, AgentRunScope, AgentScope, AgentTaskId, KnowledgeSpaceId, TenantId,
+    AGENT_IDENTITY_MAX_LENGTH,
 };
-use crate::memory::{MemoryClassification, MemoryError, MemoryFuture};
+use crate::memory::{
+    AgentRunMemory, MemoryClassification, MemoryContextSnapshot, MemoryError, MemoryFuture,
+    SnapshotCommunalClaim, SnapshotCommunalRetrieval, SnapshotIngressRecord, SnapshotSessionEntry,
+};
 use crate::retrieval::{
-    AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS, AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES,
-    AGENT_MEMORY_RETRIEVAL_RESOLUTION_FACTOR,
+    bounded_watermark, derive_query_text, AGENT_MEMORY_RETRIEVAL_MAX_RESOLUTIONS,
+    AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES, AGENT_MEMORY_RETRIEVAL_RESOLUTION_FACTOR,
 };
 use crate::schema::AgentSchemaPolicy;
 use crate::task::{AgentContentDigest, AgentTaskContent};
@@ -873,6 +879,436 @@ impl Debug for AgentCommunalRetrieval {
             .field("policy", &self.policy)
             .finish()
     }
+}
+
+// ===========================================================================
+// Selecting communal claims into a context snapshot
+// ([specification 13.4, 13.5 and 16](../../../docs/plans/rakka-agent/spec.md)).
+// ===========================================================================
+
+/// A bounded telemetry summary of one assembly's communal retrieval; never a
+/// correctness input.
+///
+/// It has every field of the private tier's
+/// [`RetrievalReport`](crate::retrieval::RetrievalReport), with the same
+/// meaning, and three that only a search of several spaces has.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommunalRetrievalReport {
+    /// Whether a communal retrieval was tried: a bundle was wired, a query
+    /// was derived, and the run's grant was read or its read failed.
+    ///
+    /// A run that is granted no space is not a retrieval that found nothing.
+    /// It is skipped, and this stays false.
+    pub attempted: bool,
+    /// Whether the retrieval was cut short by a backend failure: the grant
+    /// could not be read, a space's search failed, or the authority failed
+    /// part-way through the walk.
+    ///
+    /// A failed grant read selects nothing. A failed search costs that
+    /// space's ranking and the others continue. An authority failure keeps
+    /// the prefix already verified.
+    pub degraded: bool,
+    /// How many claims the snapshot selected.
+    pub selected: usize,
+    /// How many resolved records the fail-closed re-checks rejected, plus how
+    /// many ranked identities repeated one already walked.
+    pub rejected: usize,
+    /// How many ranked identities the authority did not hold in the space
+    /// that was searched.
+    ///
+    /// Named for what is observed, as the private tier's is: a claim of
+    /// another space or tenant, an identity that never existed, and a claim
+    /// tombstoned or deleted since it was indexed all land here. A non-zero
+    /// value means the retriever and the authority disagree about what the
+    /// space holds.
+    pub unverified: usize,
+    /// How many claims a memory-ingress stage blocked, including transforms
+    /// the boundary cannot apply.
+    pub blocked: usize,
+    /// How many selections a memory-ingress stage transformed.
+    pub transformed: usize,
+    /// How many report-only findings the selections carry.
+    pub reported: usize,
+    /// How many claims a `require-checkpoint` outcome dropped fail-closed.
+    pub checkpoint_refused: usize,
+    /// Whether the walk stopped at
+    /// [`CommunalRetrievalPolicy::max_resolutions`] with ranked identities
+    /// left unresolved. Nothing failed; the rankings were longer than this
+    /// deployment resolves.
+    pub resolution_capped: bool,
+    /// How many knowledge spaces were asked for a ranking, including one
+    /// whose search failed.
+    pub spaces_searched: usize,
+    /// Whether the run's effective grant named more spaces than
+    /// [`CommunalRetrievalPolicy::max_spaces`], so that some were not
+    /// searched.
+    pub spaces_capped: bool,
+    /// Whether a searched space held claims its backend's index does not
+    /// cover, so that this selection could not consider them.
+    pub index_incomplete: bool,
+}
+
+impl CommunalRetrievalReport {
+    /// The bounded outcome label for metrics: `skipped`, `degraded`, or
+    /// `retrieved`.
+    #[must_use]
+    pub const fn outcome_label(&self) -> &'static str {
+        if !self.attempted {
+            "skipped"
+        } else if self.degraded {
+            "degraded"
+        } else {
+            "retrieved"
+        }
+    }
+}
+
+/// Derives the communal query one snapshot's assembly runs, from the session
+/// window that same assembly selected.
+///
+/// The text is derived exactly as the private tier's is
+/// ([`derive_retrieval_query`](crate::retrieval::derive_retrieval_query)):
+/// the last [`CommunalRetrievalPolicy::query_entries`] non-summary entries'
+/// inline text, oldest first, joined by newlines, truncated to
+/// [`AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES`](crate::retrieval::AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES)
+/// keeping the tail. Everything else is the policy's, and `reader` is the
+/// capabilities of the run's effective read grant. `None` when the window
+/// holds no text to search for.
+#[must_use]
+pub fn derive_communal_query(
+    window: &[SnapshotSessionEntry],
+    policy: &CommunalRetrievalPolicy,
+    reader: BTreeSet<AgentCapabilityId>,
+) -> Option<CommunalRetrievalQuery> {
+    let text = derive_query_text(window, policy.query_entries())?;
+    Some(CommunalRetrievalQuery {
+        text,
+        limit: policy.max_results(),
+        min_confidence_bps: policy.min_confidence_bps(),
+        classifications: policy.classifications().clone(),
+        trust: policy.trust().clone(),
+        reader,
+    })
+}
+
+/// The ceiling on a statement a memory-ingress transform may answer, in
+/// serialized bytes.
+///
+/// A statement is two identifiers and an object value, each bounded, so the
+/// ceiling is their sum with room for the JSON around them and for escaping.
+/// A transform over it is blocked by the chain itself, as
+/// `guardrail-transform-oversized`. One under it is still decoded and
+/// validated field by field.
+const COMMUNAL_STATEMENT_TRANSFORM_MAX_BYTES: usize =
+    AGENT_COMMUNAL_CLAIM_OBJECT_INLINE_MAX_BYTES + 4 * AGENT_IDENTITY_MAX_LENGTH + 256;
+
+/// The statement a memory-ingress transform turned `original` into, when the
+/// transform is one the boundary can apply.
+///
+/// The output must decode as a statement that validates. A stage may rewrite
+/// the subject, the predicate, or an inline value. It may not change what a
+/// claim points at: a node object stays that node, an artifact reference
+/// stays that reference, and an object never changes kind. Those are
+/// identities, and a stage that rewrote one would put a statement in front of
+/// a model that no claim makes.
+fn applicable_transform(
+    original: &CommunalClaimStatement,
+    transformed: &serde_json::Value,
+) -> Option<CommunalClaimStatement> {
+    let transformed: CommunalClaimStatement = serde_json::from_value(transformed.clone()).ok()?;
+    transformed.validate().ok()?;
+    let applicable = match (&original.object, &transformed.object) {
+        (CommunalClaimObject::Node(before), CommunalClaimObject::Node(after)) => before == after,
+        (CommunalClaimObject::Value(before), CommunalClaimObject::Value(after)) => {
+            match (before.inline_value(), after.inline_value()) {
+                (Some(_), Some(_)) => true,
+                (None, None) => before == after,
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    applicable.then_some(transformed)
+}
+
+/// One entry of the merged ranking: a claim, the space whose ranking named
+/// it, and its clamped score.
+struct MergedRanking {
+    space: KnowledgeSpaceId,
+    claim: AgentCommunalClaimId,
+    relevance_bps: u16,
+}
+
+/// The communal half of
+/// [`assemble_context`](crate::retrieval::assemble_context): searches the
+/// spaces the run may read, resolves and re-checks every ranked claim,
+/// evaluates each at the memory-ingress boundary, and embeds what survives
+/// into `snapshot`.
+///
+/// Infallible, because memory is never the correctness source
+/// ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)): every
+/// failure degrades to a smaller selection and is said on the report.
+///
+/// The snapshot is touched only when at least one space was searched. A run
+/// with no bundle, no text to search for, no grant or no granted space leaves
+/// it exactly as the session and private halves wrote it, which is a version
+/// 1 record with the bytes it always had.
+pub(crate) async fn select_communal_claims(
+    memory: &AgentRunMemory,
+    scope: &AgentRunScope,
+    delegation: Option<&AgentRunDelegationEnvelope>,
+    snapshot: &mut MemoryContextSnapshot,
+    now: AgentTimestampMillis,
+) -> CommunalRetrievalReport {
+    let mut report = CommunalRetrievalReport::default();
+    let Some(bundle) = memory.communal_retrieval() else {
+        return report;
+    };
+    let policy = bundle.policy();
+
+    // 1. The query, before anything is read: a turn with nothing to search
+    //    for costs no grant read. The reader is filled in once it is known.
+    let Some(mut query) = derive_communal_query(&snapshot.session, policy, BTreeSet::new()) else {
+        return report;
+    };
+
+    // 2. The grant. A source that cannot answer degrades the turn to no
+    //    communal selection: nothing may be searched on a grant nobody read.
+    let grant = match bundle.grants().read_grant(scope, now).await {
+        Ok(Some(grant)) => grant.narrowed_by(delegation),
+        Ok(None) => return report,
+        Err(_) => {
+            report.attempted = true;
+            report.degraded = true;
+            return report;
+        }
+    };
+    if grant.spaces.is_empty() {
+        return report;
+    }
+    report.attempted = true;
+    report.spaces_capped = grant.spaces.len() > policy.max_spaces();
+    query.reader = grant.read_capabilities.clone();
+
+    // 3. One search per granted space, in ascending id order. A space outside
+    //    the effective grant is never named to the retriever at all.
+    let tenant = scope.tenant();
+    let retriever = bundle.retriever();
+    let mut searched: Vec<KnowledgeSpaceId> = Vec::new();
+    let mut merged: Vec<MergedRanking> = Vec::new();
+    let mut watermarks: Vec<Option<String>> = Vec::new();
+    for space in grant.spaces.iter().take(policy.max_spaces()) {
+        searched.push(space.clone());
+        match retriever.retrieve(tenant, space, &query, now).await {
+            Ok(outcome) => {
+                report.index_incomplete |= outcome.index_incomplete;
+                watermarks.push(outcome.index_watermark);
+                merged.extend(outcome.ranked.into_iter().map(|ranked| MergedRanking {
+                    space: space.clone(),
+                    claim: ranked.claim,
+                    relevance_bps: ranked.relevance_bps.min(10_000),
+                }));
+            }
+            // One space's outage costs that space's ranking. The others are
+            // independent searches and continue.
+            Err(_) => report.degraded = true,
+        }
+    }
+    report.spaces_searched = searched.len();
+
+    // 4. One ranking: best first, ties broken by space and then claim so the
+    //    order is a function of the answers and not of their arrival.
+    merged.sort_by(|a, b| {
+        b.relevance_bps
+            .cmp(&a.relevance_bps)
+            .then_with(|| a.space.cmp(&b.space))
+            .then_with(|| a.claim.cmp(&b.claim))
+    });
+
+    // 5. The walk.
+    let chain = bundle.guardrails();
+    let mut selections: Vec<SnapshotCommunalClaim> = Vec::new();
+    let mut selected_bytes = 0usize;
+    let mut seen: BTreeSet<(KnowledgeSpaceId, AgentCommunalClaimId)> = BTreeSet::new();
+    let mut resolved = 0usize;
+
+    for ranked in merged {
+        if selections.len() >= policy.max_results() {
+            break;
+        }
+        // A claim's identity is unique within its space, so the pair is what
+        // repeats. Dedup precedes the read, so a ranking that names one claim
+        // many times cannot multiply the reads.
+        if !seen.insert((ranked.space.clone(), ranked.claim.clone())) {
+            report.rejected += 1;
+            continue;
+        }
+        // The resolution ceiling, checked immediately before the read it
+        // bounds, so the length of an adapter's answer cannot decide how many
+        // point reads the settle pass performs.
+        if resolved >= policy.max_resolutions() {
+            report.resolution_capped = true;
+            break;
+        }
+        resolved += 1;
+
+        // The ranking names; the authority answers. The claim is resolved in
+        // the space whose ranking named it, so a claim of another space or
+        // another tenant is simply not there.
+        let record = match bundle
+            .authority()
+            .resolve(tenant, &ranked.space, &ranked.claim, now)
+            .await
+        {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                report.unverified += 1;
+                continue;
+            }
+            Err(_) => {
+                // Stop and keep what is already verified, as the private
+                // tier does: every selection held is a record this authority
+                // answered, and the snapshot is immutable.
+                report.degraded = true;
+                break;
+            }
+        };
+
+        // Fail-closed re-checks over the authoritative record. It must be the
+        // claim that was asked for, in the space that was asked, within a
+        // claim's bounds, and one this query may be answered with: trust,
+        // classification, confidence and the reader's capabilities are all
+        // decided here, on the record, whatever the ranking implied.
+        if record.claim_id != ranked.claim
+            || record.space != ranked.space
+            || record.validate().is_err()
+            || !query.admits(&record)
+        {
+            report.rejected += 1;
+            continue;
+        }
+
+        // The memory-ingress boundary: one evaluation per claim, on the
+        // statement, with the claim's identity in the context.
+        let context = AgentGuardrailContext::new(AgentGuardrailBoundary::MemoryIngress, scope)
+            .with_claim(&record.claim_id, &record.space);
+        let decision = chain.evaluate_bounded(
+            &context,
+            &record.statement.to_json(),
+            COMMUNAL_STATEMENT_TRANSFORM_MAX_BYTES,
+        );
+        match &decision.disposition {
+            AgentGuardrailDisposition::Blocked { .. } => {
+                report.blocked += 1;
+                continue;
+            }
+            AgentGuardrailDisposition::CheckpointRequired { .. } => {
+                // Fail-closed drop: there is no checkpoint plumbing at
+                // snapshot assembly, and parking a model turn on a per-claim
+                // grant would make memory a liveness gate.
+                report.checkpoint_refused += 1;
+                continue;
+            }
+            AgentGuardrailDisposition::Allowed => {}
+        }
+
+        let (statement, statement_digest) = if decision.transformed {
+            let Some(transformed) = applicable_transform(&record.statement, &decision.content)
+            else {
+                report.blocked += 1;
+                continue;
+            };
+            let digest = transformed.digest();
+            (transformed, digest)
+        } else {
+            (record.statement, record.statement_digest)
+        };
+
+        // Stop at the first claim that does not fit, rather than skipping it
+        // for a smaller one ranked below: the selection stays a prefix of the
+        // ranking that survived the checks.
+        let statement_bytes = statement.size_bytes();
+        if selected_bytes.saturating_add(statement_bytes) > policy.max_bytes() {
+            break;
+        }
+        selected_bytes += statement_bytes;
+
+        // Outcome accounting follows the budget check, so every count here
+        // describes a claim the snapshot actually embeds.
+        if decision.transformed {
+            report.transformed += 1;
+        }
+        report.reported += decision.reports.len();
+
+        selections.push(SnapshotCommunalClaim {
+            claim_id: record.claim_id,
+            space: record.space,
+            trust: record.trust,
+            statement,
+            statement_digest,
+            provenance: record.provenance,
+            evidence: record.evidence,
+            created_at: record.created_at,
+            classification: record.classification,
+            confidence_bps: record.confidence_bps,
+            // The one value a ranking legitimately owns.
+            relevance_bps: ranked.relevance_bps,
+            transforms: decision
+                .transforms
+                .iter()
+                .map(|transform| SnapshotIngressRecord {
+                    stage: transform.stage.clone(),
+                    revision: transform.revision,
+                    reason_code: transform.reason_code.clone(),
+                })
+                .collect(),
+            reports: decision
+                .reports
+                .iter()
+                .map(|finding| SnapshotIngressRecord {
+                    stage: finding.stage.clone(),
+                    revision: finding.revision,
+                    reason_code: finding.reason_code.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    report.selected = selections.len();
+    snapshot.set_communal(
+        SnapshotCommunalRetrieval {
+            query: query.text,
+            retriever: retriever.backend_name().to_string(),
+            retriever_version: retriever.retriever_version(),
+            index_watermark: common_watermark(watermarks),
+            spaces: searched,
+            trust: policy.trust().clone(),
+            classifications: policy.classifications().clone(),
+            min_confidence_bps: policy.min_confidence_bps(),
+            index_incomplete: report.index_incomplete,
+            ingress_revision: Some(chain.revision()),
+            definition_revision: grant.definition_revision,
+            setup_revision: grant.setup_revision,
+        },
+        selections,
+        selected_bytes,
+    );
+    report
+}
+
+/// The index watermark one snapshot records for a search of several spaces:
+/// the watermark every answering space reported, when they all reported the
+/// same one, and nothing otherwise.
+///
+/// A snapshot has one watermark field. Spaces whose indexes stand at
+/// different points have no single position to record, and recording one of
+/// them would claim it for the others.
+fn common_watermark(watermarks: Vec<Option<String>>) -> Option<String> {
+    let mut watermarks = watermarks.into_iter();
+    let first = watermarks.next()??;
+    watermarks
+        .all(|watermark| watermark.as_deref() == Some(first.as_str()))
+        .then(|| bounded_watermark(first))
 }
 
 #[cfg(test)]
