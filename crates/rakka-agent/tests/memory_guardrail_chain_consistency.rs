@@ -682,3 +682,176 @@ fn the_four_evaluated_sets_nest_strictly() {
     assert!(AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES.contains(&AgentGuardrailBoundary::A2aIngress));
     assert!(AGENT_A2A_ATTESTED_GUARDRAIL_BOUNDARIES.contains(&AgentGuardrailBoundary::A2aEgress));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #69: the attestation covers every retrieval bundle a memory carries.
+// A communal bundle evaluates the same memory-ingress boundary a private one
+// does, so it must run the chain the dispatch gate enforces.
+// ---------------------------------------------------------------------------
+
+/// The three communal ports, answering nothing: the bundle's chain is all
+/// these tests are about.
+struct NoClaims;
+
+impl rakka_agent::AgentCommunalClaimRetriever for NoClaims {
+    fn backend_name(&self) -> &'static str {
+        "no-claims"
+    }
+
+    fn retriever_version(&self) -> AgentRevisionNumber {
+        AgentRevisionNumber::INITIAL
+    }
+
+    fn retrieve<'a>(
+        &'a self,
+        _tenant: &'a rakka_agent::TenantId,
+        _space: &'a rakka_agent::KnowledgeSpaceId,
+        _query: &'a rakka_agent::CommunalRetrievalQuery,
+        _now: AgentTimestampMillis,
+    ) -> rakka_agent::MemoryFuture<'a, rakka_agent::CommunalRetrievalOutcome> {
+        Box::pin(async { Ok(rakka_agent::CommunalRetrievalOutcome::default()) })
+    }
+}
+
+impl rakka_agent::AgentCommunalClaimAuthority for NoClaims {
+    fn backend_name(&self) -> &'static str {
+        "no-claims"
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        _tenant: &'a rakka_agent::TenantId,
+        _space: &'a rakka_agent::KnowledgeSpaceId,
+        _claim: &'a rakka_agent::AgentCommunalClaimId,
+        _now: AgentTimestampMillis,
+    ) -> rakka_agent::MemoryFuture<'a, Option<rakka_agent::CommunalClaimRecord>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+impl rakka_agent::AgentCommunalReadGrantSource for NoClaims {
+    fn backend_name(&self) -> &'static str {
+        "no-claims"
+    }
+
+    fn read_grant<'a>(
+        &'a self,
+        _scope: &'a rakka_agent::AgentRunScope,
+        _now: AgentTimestampMillis,
+    ) -> rakka_agent::MemoryFuture<'a, Option<rakka_agent::AgentCommunalReadGrant>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+/// A communal bundle carrying the given chain.
+fn communal_with(chain: AgentGuardrailChain) -> rakka_agent::AgentCommunalRetrieval {
+    rakka_agent::AgentCommunalRetrieval::new(
+        Arc::new(NoClaims),
+        Arc::new(NoClaims),
+        Arc::new(NoClaims),
+        chain,
+        rakka_agent::CommunalRetrievalPolicy::default(),
+    )
+}
+
+fn authority_with(chain: AgentGuardrailChain) -> AgentToolAuthority {
+    AgentToolAuthority::new(tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::non_idempotent(),
+    ))
+    .with_guardrails(chain)
+}
+
+/// A communal bundle running another chain is refused even though the private
+/// bundle beside it matches: one matching bundle does not vouch for the other.
+#[test]
+fn a_communal_bundle_with_another_chain_is_refused_beside_a_matching_private_bundle() {
+    let memory = memory_with(deployment_chain(7))
+        .with_communal_retrieval(communal_with(deployment_chain(8)));
+    let error = authority_with(deployment_chain(7))
+        .with_memory_ingress(&memory)
+        .expect_err("the communal bundle declares a different evaluation");
+    assert_eq!(error.code(), "guardrail-chain-mismatch");
+
+    // An empty chain at the same revision is the shape a deployment lands in.
+    let emptied = memory_with(deployment_chain(7)).with_communal_retrieval(communal_with(
+        AgentGuardrailChain::new(AgentRevisionNumber::new(7)),
+    ));
+    let error = authority_with(deployment_chain(7))
+        .with_memory_ingress(&emptied)
+        .expect_err("an empty communal chain runs no stage");
+    assert_eq!(error.code(), "guardrail-chain-mismatch");
+
+    // And the other way round: a matching communal bundle does not vouch for
+    // a private bundle that drifted.
+    let private_drifted = memory_with(deployment_chain(8))
+        .with_communal_retrieval(communal_with(deployment_chain(7)));
+    let error = authority_with(deployment_chain(7))
+        .with_memory_ingress(&private_drifted)
+        .expect_err("the private bundle declares a different evaluation");
+    assert_eq!(error.code(), "guardrail-chain-mismatch");
+
+    // Both matching attests.
+    let both = memory_with(deployment_chain(7))
+        .with_communal_retrieval(communal_with(deployment_chain(7)));
+    let authority = authority_with(deployment_chain(7))
+        .with_memory_ingress(&both)
+        .expect("both bundles carry the authority's chain");
+    assert!(authority.attests(&both));
+}
+
+/// A deployment that wires only the communal tier can attest: the boundary is
+/// evaluated, by the communal bundle.
+#[test]
+fn a_communal_only_memory_with_the_matching_chain_attests() {
+    let memory =
+        memory_without_retrieval().with_communal_retrieval(communal_with(deployment_chain(7)));
+    let authority = authority_with(deployment_chain(7))
+        .with_memory_ingress(&memory)
+        .expect("the communal bundle carries the authority's chain");
+
+    assert_eq!(
+        authority.evaluated_boundaries(),
+        AGENT_MEMORY_ATTESTED_GUARDRAIL_BOUNDARIES,
+    );
+    assert!(authority.attests(&memory));
+
+    let drifted =
+        memory_without_retrieval().with_communal_retrieval(communal_with(deployment_chain(8)));
+    let error = authority_with(deployment_chain(7))
+        .with_memory_ingress(&drifted)
+        .expect_err("a communal-only memory with another chain is refused");
+    assert_eq!(error.code(), "guardrail-chain-mismatch");
+}
+
+/// `attests` re-checks every bundle of a memory assembled elsewhere.
+#[test]
+fn attests_is_false_when_the_communal_bundle_drifted() {
+    let attested = memory_with(deployment_chain(7))
+        .with_communal_retrieval(communal_with(deployment_chain(7)));
+    let authority = authority_with(deployment_chain(7))
+        .with_memory_ingress(&attested)
+        .expect("the attestation holds");
+
+    let drifted = memory_with(deployment_chain(7))
+        .with_communal_retrieval(communal_with(deployment_chain(8)));
+    assert!(
+        !authority.attests(&drifted),
+        "a communal bundle that drifted is not the chain the gate enforces"
+    );
+    assert!(
+        authority.attests(&memory_with(deployment_chain(7))),
+        "the same memory without the communal bundle still attests"
+    );
+}
+
+/// Nothing changes for a memory that wires neither tier's retrieval: the
+/// boundary is evaluated nowhere, and that cannot be attested.
+#[test]
+fn a_memory_with_no_bundle_of_either_kind_is_still_refused() {
+    let error = authority_with(deployment_chain(7))
+        .with_memory_ingress(&memory_without_retrieval())
+        .expect_err("a memory with no bundle evaluates the boundary nowhere");
+    assert_eq!(error.code(), "guardrail-chain-mismatch");
+    assert!(!authority_with(deployment_chain(7)).attests(&memory_without_retrieval()));
+}
