@@ -191,6 +191,12 @@ pub struct AgentCollaborationMetadata {
     /// [`Self::environments`]: a grant must never be silently dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub knowledge_spaces: Vec<String>,
+    /// The capabilities for reading communal claims explicitly delegated to
+    /// the child. Omitted when empty, with the cross-version posture of
+    /// [`Self::knowledge_spaces`]: a receiver that predates the field refuses
+    /// a send that carries one, so a grant is never silently dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_capabilities: Vec<String>,
 }
 
 impl AgentCollaborationMetadata {
@@ -246,6 +252,11 @@ impl AgentCollaborationMetadata {
                 .iter()
                 .map(|space| space.as_str().to_string())
                 .collect(),
+            read_capabilities: record
+                .read_capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect(),
         }
     }
 
@@ -293,10 +304,14 @@ impl AgentCollaborationMetadata {
         for space in &self.knowledge_spaces {
             knowledge_spaces.insert(KnowledgeSpaceId::new(space)?);
         }
+        let mut read_capabilities = std::collections::BTreeSet::new();
+        for capability in &self.read_capabilities {
+            read_capabilities.insert(AgentCapabilityId::new(capability)?);
+        }
         Ok(AgentTaskDelegationProvenance {
             environments,
             knowledge_spaces,
-            read_capabilities: std::collections::BTreeSet::new(),
+            read_capabilities,
             delegation: AgentDelegationId::new(&self.delegation)?,
             parent_task: AgentTaskId::new(&self.parent_task)?,
             parent_run,
@@ -378,6 +393,11 @@ pub struct AgentHandoffCollaborationMetadata {
     /// cross-version posture: a grant must never be silently dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub knowledge_spaces: Vec<String>,
+    /// The capabilities for reading communal claims the catalog explicitly
+    /// delegates to the target. Omitted when empty, with the same
+    /// cross-version posture as [`Self::knowledge_spaces`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_capabilities: Vec<String>,
 }
 
 impl AgentHandoffCollaborationMetadata {
@@ -408,6 +428,12 @@ impl AgentHandoffCollaborationMetadata {
                 .iter()
                 .map(|space| space.as_str().to_string())
                 .collect(),
+            read_capabilities: record
+                .resolved
+                .read_capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect(),
         }
     }
 
@@ -427,6 +453,10 @@ impl AgentHandoffCollaborationMetadata {
         let mut knowledge_spaces = std::collections::BTreeSet::new();
         for space in &self.knowledge_spaces {
             knowledge_spaces.insert(KnowledgeSpaceId::new(space)?);
+        }
+        let mut read_capabilities = std::collections::BTreeSet::new();
+        for capability in &self.read_capabilities {
+            read_capabilities.insert(AgentCapabilityId::new(capability)?);
         }
         Ok(AgentTaskHandoffRequest {
             handoff: AgentHandoffId::new(&self.handoff)?,
@@ -451,7 +481,7 @@ impl AgentHandoffCollaborationMetadata {
             policy_revision: AgentRevisionNumber::new(self.policy_revision),
             context: self.context.clone(),
             knowledge_spaces,
-            read_capabilities: std::collections::BTreeSet::new(),
+            read_capabilities,
         })
     }
 }

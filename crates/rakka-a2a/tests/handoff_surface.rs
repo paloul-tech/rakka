@@ -1311,3 +1311,73 @@ async fn a_cleared_handoff_reason_refuses_the_transfer_at_either_boundary() {
         );
     }
 }
+
+/// The catalog's read-capability statement for the handoff target crosses the
+/// wire as `read-capabilities` and validates into the handoff request
+/// (issue #69); a handoff that delegates none puts no key on the wire, and an
+/// invalid id fails the whole send.
+#[test]
+fn read_capabilities_cross_from_the_handoff_to_the_request() {
+    use rakka_a2a::agents::AgentHandoffCollaborationMetadata;
+
+    let record_delegating = |read: &[&str]| -> AgentHandoffRecord {
+        let handoff = format!("handoff-{}", "a".repeat(64));
+        serde_json::from_value(json!({
+            "handoff": handoff,
+            "goal": null,
+            "task": "task-1",
+            "source_run": "acme/support/run-1",
+            "source_generation": 1,
+            "requested_skill": "billing.refund",
+            "resolved": {
+                "agent": "billing",
+                "endpoint": null,
+                "task_definition": "refund",
+                "capability_scopes": [],
+                "credential_bindings": [],
+                "result_schema": null,
+                "compatibility": null,
+                "read_capabilities": read
+            },
+            "reason": "needs billing authority",
+            "policy_revision": 1,
+            "definition_revision": 1,
+            "settings_revision": 1,
+            "context": [],
+            "a2a_message_id": handoff,
+            "deduplication_key": handoff,
+            "turn": 7,
+            "slot": 0,
+            "effect": "effect-1",
+            "call_id": "call-1",
+            "created_at": 1
+        }))
+        .expect("the handoff record decodes")
+    };
+
+    let mut envelope =
+        AgentHandoffCollaborationMetadata::from_record(&record_delegating(&["claims.read.a"]));
+    let wire = envelope.to_value();
+    assert_eq!(wire["read-capabilities"], json!(["claims.read.a"]));
+    let received: AgentHandoffCollaborationMetadata =
+        serde_json::from_value(wire).expect("the envelope decodes");
+    assert_eq!(
+        received
+            .to_request()
+            .expect("the envelope validates")
+            .read_capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claims.read.a"]
+    );
+
+    let none = AgentHandoffCollaborationMetadata::from_record(&record_delegating(&[]));
+    assert!(none.to_value().get("read-capabilities").is_none());
+
+    envelope.read_capabilities.push(String::new());
+    assert!(
+        envelope.to_request().is_err(),
+        "an invalid read capability fails the whole send"
+    );
+}
