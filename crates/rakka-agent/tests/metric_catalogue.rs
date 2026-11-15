@@ -243,3 +243,33 @@ fn every_telemetry_signal_the_crate_writes_is_catalogued() {
         );
     }
 }
+
+/// The communal tier has its own two counters, each with the label set of its
+/// private sibling: the metric name is what tells the tiers apart
+/// ([specification 17.10](../../../docs/plans/rakka-agent/spec.md)).
+#[test]
+fn the_communal_counters_are_catalogued_beside_the_private_ones() {
+    let labels_of = |name: &str| {
+        AGENT_DOMAIN_METRIC_INSTRUMENTS
+            .iter()
+            .find(|instrument| instrument.name == name)
+            .unwrap_or_else(|| panic!("`{name}` is not catalogued"))
+            .labels
+    };
+    assert_eq!(
+        labels_of("rakka.agent.communal.retrievals"),
+        ["backend", "outcome"]
+    );
+    assert_eq!(
+        labels_of("rakka.agent.communal.ingress.outcomes"),
+        ["outcome"]
+    );
+    assert_eq!(
+        labels_of("rakka.agent.communal.retrievals"),
+        labels_of("rakka.agent.memory.retrievals")
+    );
+    assert_eq!(
+        labels_of("rakka.agent.communal.ingress.outcomes"),
+        labels_of("rakka.agent.memory.ingress.outcomes")
+    );
+}

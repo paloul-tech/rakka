@@ -1140,6 +1140,40 @@ pub const METRIC_AGENT_MEMORY_RETRIEVALS: &str = "rakka.agent.memory.retrievals"
 /// counter is their bounded visibility.
 pub const METRIC_AGENT_MEMORY_INGRESS_OUTCOMES: &str = "rakka.agent.memory.ingress.outcomes";
 
+/// Counter: communal-claim retrievals run by snapshot assembly, labeled by the
+/// retriever's bounded backend name and outcome (`retrieved` / `degraded` /
+/// `skipped`)
+/// ([specification 17.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// One count per assembled snapshot of a run whose memory carries a communal
+/// bundle. `skipped` is a turn that searched nothing: it had no text to
+/// search for, or the run is granted no knowledge space. `degraded` is a
+/// grant that could not be read, a space whose search failed, or an authority
+/// that failed part-way through.
+///
+/// The memory tier is the metric name, not a label: the private tier keeps
+/// [`METRIC_AGENT_MEMORY_RETRIEVALS`]. Query text, claim text, claim ids and
+/// space ids are never labels.
+pub const METRIC_AGENT_COMMUNAL_RETRIEVALS: &str = "rakka.agent.communal.retrievals";
+
+/// Counter: what happened to ranked communal claims on their way into a
+/// snapshot, labeled by bounded outcome (`blocked` / `transformed` /
+/// `reported` / `checkpoint-refused` / `rejected` / `unverified` /
+/// `resolution-capped` / `index-incomplete` / `spaces-capped`)
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md),
+/// [17.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The first seven mean what they mean on
+/// [`METRIC_AGENT_MEMORY_INGRESS_OUTCOMES`] and count claims; the last three
+/// count assemblies. `index-incomplete` is a searched space that holds claims
+/// its backend's index does not cover, so the selection could not consider
+/// them. `spaces-capped` is a run granted more spaces than its policy
+/// searches.
+///
+/// A blocked or refused claim is not recorded on the snapshot, as for a
+/// private memory, so this counter is its bounded visibility.
+pub const METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES: &str = "rakka.agent.communal.ingress.outcomes";
+
 /// Counter: wake dispositions the continuous controller recorded, labeled by
 /// bounded disposition outcome
 /// ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)'s
@@ -1643,6 +1677,22 @@ pub const AGENT_DOMAIN_METRIC_INSTRUMENTS: &[AgentDomainMetricInstrument] = &[
         &["outcome"],
         &[],
         "Memory-ingress guardrail outcomes on retrieved records.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_COMMUNAL_RETRIEVALS,
+        MetricKind::Counter,
+        "{retrieval}",
+        &["backend", "outcome"],
+        &[],
+        "Communal-claim retrievals run by context-snapshot assembly.",
+    ),
+    AgentDomainMetricInstrument::new(
+        METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES,
+        MetricKind::Counter,
+        "{record}",
+        &["outcome"],
+        &[],
+        "Re-check, guardrail and coverage outcomes on ranked communal claims.",
     ),
     AgentDomainMetricInstrument::new(
         METRIC_AGENT_WAKE_DISPOSITIONS,
