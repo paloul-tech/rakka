@@ -240,11 +240,11 @@ pub use memory::{
     PrivateMemoryExpectation, PrivateMemoryPage, PrivateMemoryScope, PrivateMemoryTombstoneRequest,
     SessionMemoryCursor, SessionMemoryEntry, SessionMemoryPage, SessionMemoryStore,
     SessionPurgeOutcome, SessionRetentionPolicy, SessionWindowPolicy, SnapshotBudget,
-    SnapshotIngressRecord, SnapshotPrivateMemory, SnapshotRetrieval, SnapshotSessionEntry,
-    AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH, AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES,
-    AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES, AGENT_SESSION_MEMORY_ENTRY_MAX_BYTES,
-    AGENT_SESSION_WINDOW_MAX_ENTRIES, AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES,
-    AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_ENTRIES,
+    SnapshotCommunalClaim, SnapshotCommunalRetrieval, SnapshotIngressRecord, SnapshotPrivateMemory,
+    SnapshotRetrieval, SnapshotSessionEntry, AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH,
+    AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES, AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES,
+    AGENT_SESSION_MEMORY_ENTRY_MAX_BYTES, AGENT_SESSION_WINDOW_MAX_ENTRIES,
+    AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES, AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_ENTRIES,
 };
 pub use memory_retention::{
     backfill_run_terminal_stamp, discharge_run_memory_retention, AgentMemoryRetentionReport,
@@ -489,6 +489,7 @@ pub use identity::{
 pub use schema::{
     previous_schema_version, AgentRecordKind, AgentSchemaCompatibility, AgentSchemaError,
     AgentSchemaPolicy, AgentSchemaResult, VersionedAgentRecord,
+    AGENT_MEMORY_CONTEXT_SNAPSHOT_WITHOUT_COMMUNAL_SCHEMA_VERSION,
     CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION, CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION,
     CURRENT_AGENT_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
     CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION, CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,

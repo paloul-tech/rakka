@@ -47,19 +47,25 @@
 //! points at — persisted immutably in a [`ContextSnapshotStore`] — without moving
 //! the reference or changing what the loop persists.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use rakka_agent_workflow::{AgentEffectId, AgentTimestampMillis, StateSchemaVersion};
+use rakka_agent_workflow::{AgentEffectId, AgentTimestampMillis, ArtifactRef, StateSchemaVersion};
+use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::communal::{AgentCommunalClaimTrust, CommunalClaimProvenance, CommunalClaimStatement};
 use crate::definition::{AgentGuardrailStageId, AgentRevisionNumber, AgentToolId};
-use crate::identity::{validated_id, AgentIdentityResult, AgentRunScope, AgentScope};
+use crate::identity::{
+    validated_id, AgentCommunalClaimId, AgentIdentityResult, AgentRunScope, AgentScope,
+    KnowledgeSpaceId,
+};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
+    AGENT_MEMORY_CONTEXT_SNAPSHOT_WITHOUT_COMMUNAL_SCHEMA_VERSION,
     CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
     CURRENT_AGENT_PRIVATE_MEMORY_SCHEMA_VERSION, CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION,
 };
@@ -1080,6 +1086,109 @@ pub struct SnapshotBudget {
     pub private_memory_bytes: usize,
     /// How many communal claims the snapshot selected.
     pub communal_claims: usize,
+    /// The serialized byte size of the selected communal claims' statements.
+    /// Omitted when zero, so a snapshot that selected no claim has the bytes
+    /// it had before the field existed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub communal_claim_bytes: usize,
+}
+
+/// Whether a count is zero: the omit-when-empty rule for a count added to a
+/// record whose earlier bytes must not change.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
+/// One communal claim, exactly as it entered the snapshot
+/// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md): selected
+/// communal claim ids, trust states and content references).
+///
+/// The snapshot embeds the statement, not just the identity, for the reason
+/// [`SnapshotPrivateMemory`] embeds its content: a retried model turn must
+/// reuse the exact input the first assembly selected. Every field but
+/// [`Self::relevance_bps`] comes from the authoritative record the claim was
+/// resolved to, never from the retriever that ranked it.
+///
+/// A snapshot keeps this copy until the run's snapshot purge. A claim that is
+/// tombstoned, deleted, retracted or put out of the run's reach after it was
+/// selected stays in the snapshots that already hold it, and cannot enter a
+/// later one. Rakka keeps no index from a claim to the snapshots holding it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotCommunalClaim {
+    /// Identity of the claim this selection used.
+    pub claim_id: AgentCommunalClaimId,
+    /// The knowledge space that holds the claim.
+    pub space: KnowledgeSpaceId,
+    /// The claim's trust state when it was selected.
+    pub trust: AgentCommunalClaimTrust,
+    /// The statement as included: post-transform, when a memory-ingress stage
+    /// rewrote it.
+    pub statement: CommunalClaimStatement,
+    /// The digest of the statement as included, recomputed after any
+    /// transform.
+    pub statement_digest: AgentContentDigest,
+    /// Who asserted the claim, and in service of what.
+    pub provenance: CommunalClaimProvenance,
+    /// The claim's evidence artifact references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ArtifactRef>,
+    /// When the claim was appended.
+    pub created_at: AgentTimestampMillis,
+    /// The classification of the claim's content.
+    pub classification: MemoryClassification,
+    /// The asserting confidence, in basis points.
+    pub confidence_bps: u16,
+    /// The retriever's relevance score, in basis points, at most 10000.
+    pub relevance_bps: u16,
+    /// Every memory-ingress transform applied to the statement, in stage
+    /// order.
+    #[serde(default)]
+    pub transforms: Vec<SnapshotIngressRecord>,
+    /// Every memory-ingress report-only finding, in stage order.
+    #[serde(default)]
+    pub reports: Vec<SnapshotIngressRecord>,
+}
+
+/// How one snapshot's communal selection was made
+/// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md): retrieval
+/// query and index metadata; trust and classification policy revision).
+///
+/// Present exactly when a communal search ran, including one that selected
+/// nothing. It is what makes a snapshot version 2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCommunalRetrieval {
+    /// The query text the search ran with.
+    pub query: String,
+    /// The retriever's stable backend name.
+    pub retriever: String,
+    /// The retriever's version.
+    pub retriever_version: AgentRevisionNumber,
+    /// The index watermark the backend reported, when it reported one.
+    #[serde(default)]
+    pub index_watermark: Option<String>,
+    /// The knowledge spaces that were searched, in the order searched.
+    pub spaces: Vec<KnowledgeSpaceId>,
+    /// The trust states the policy in force admitted.
+    pub trust: BTreeSet<AgentCommunalClaimTrust>,
+    /// The classifications the policy in force admitted.
+    pub classifications: BTreeSet<MemoryClassification>,
+    /// The confidence floor the policy in force set, in basis points.
+    pub min_confidence_bps: u16,
+    /// Whether a searched space held claims its backend's index did not
+    /// cover, so that the selection could not consider them.
+    #[serde(default)]
+    pub index_incomplete: bool,
+    /// The revision of the memory-ingress guardrail chain the claims were
+    /// evaluated under.
+    #[serde(default)]
+    pub ingress_revision: Option<AgentRevisionNumber>,
+    /// The definition revision the run's read grant was read under.
+    pub definition_revision: AgentRevisionNumber,
+    /// The setup revision the run's read grant was read under, when the run
+    /// has a setup.
+    #[serde(default)]
+    pub setup_revision: Option<AgentRevisionNumber>,
 }
 
 /// The immutable context one model effect was prepared against
@@ -1113,15 +1222,14 @@ pub struct MemoryContextSnapshot {
     pub retrievals: Vec<SnapshotRetrieval>,
     /// The private memory selections, exactly as retrieval selected them.
     pub private_memory: Vec<SnapshotPrivateMemory>,
-    /// The communal claim selections. Always empty today: communal retrieval
-    /// is unwired, and this placeholder deliberately keeps its (wrong)
-    /// private-memory newtype until the retrieval slice replaces it with a
-    /// `SnapshotPrivateMemory`-shaped record carrying claim id, trust state,
-    /// and content references ([specification 13.5](../../../docs/plans/rakka-agent/spec.md))
-    /// — swapping the type now would churn the snapshot schema with no
-    /// producer. Slice 4.6 landed the *append* half (the run-driven claim
-    /// append); retrieval stays owed.
-    pub communal_claims: Vec<MemoryEntryId>,
+    /// The communal claim selections, exactly as the communal read path
+    /// selected them. Empty in a version 1 snapshot.
+    pub communal_claims: Vec<SnapshotCommunalClaim>,
+    /// How the communal selection was made. Present exactly when a communal
+    /// search ran, which is exactly when the snapshot is version 2; absent
+    /// from a version 1 snapshot's encoding entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub communal: Option<SnapshotCommunalRetrieval>,
     /// The trust, classification, and ranking policy revision in force.
     pub policy_revision: AgentRevisionNumber,
     /// The memory-ingress guardrail chain revision the private selections were
@@ -1162,10 +1270,13 @@ impl MemoryContextSnapshot {
     /// Recomputes the content digest over the assembled selections.
     ///
     /// The digest covers the session, retrieval, and selection content but not
-    /// the timestamp, so two assemblies of the same content agree.
+    /// the timestamp, so two assemblies of the same content agree. A version
+    /// 2 snapshot's digest also covers its communal search record; a version
+    /// 1 snapshot has none, and its digest is over exactly the keys it always
+    /// was.
     #[must_use]
     pub fn compute_digest(&self) -> AgentContentDigest {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "reference": self.reference,
             "session": self.session,
             "retrievals": self.retrievals,
@@ -1174,7 +1285,43 @@ impl MemoryContextSnapshot {
             "policy_revision": self.policy_revision,
             "ingress_revision": self.ingress_revision,
         });
+        if let (Some(communal), Some(keys)) = (&self.communal, payload.as_object_mut()) {
+            keys.insert(
+                "communal".to_string(),
+                serde_json::to_value(communal).unwrap_or(serde_json::Value::Null),
+            );
+        }
         AgentContentDigest::of_json(&payload)
+    }
+
+    /// Records a communal search and the claims it selected, and moves the
+    /// snapshot to version 2.
+    ///
+    /// This is the only way a communal selection enters a snapshot, so the
+    /// version rule cannot be skipped: a snapshot carries a communal record
+    /// if and only if it is version 2. `bytes` is the serialized size of the
+    /// selected statements, for the budget. Each claim's relevance is clamped
+    /// to 10000 basis points, and the content digest is recomputed.
+    ///
+    /// Call it for every search that ran, including one that selected
+    /// nothing: the record of the search is part of what the turn was
+    /// computed from.
+    pub fn set_communal(
+        &mut self,
+        retrieval: SnapshotCommunalRetrieval,
+        claims: Vec<SnapshotCommunalClaim>,
+        bytes: usize,
+    ) {
+        let mut claims = claims;
+        for claim in &mut claims {
+            claim.relevance_bps = claim.relevance_bps.min(10_000);
+        }
+        self.schema_version = CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION;
+        self.budget.communal_claims = claims.len();
+        self.budget.communal_claim_bytes = bytes;
+        self.communal_claims = claims;
+        self.communal = Some(retrieval);
+        self.content_digest = self.compute_digest();
     }
 }
 
@@ -1200,7 +1347,9 @@ struct MemoryContextSnapshotRecord {
     #[serde(default)]
     private_memory: Vec<SnapshotPrivateMemory>,
     #[serde(default)]
-    communal_claims: Vec<MemoryEntryId>,
+    communal_claims: Vec<SnapshotCommunalClaim>,
+    #[serde(default)]
+    communal: Option<SnapshotCommunalRetrieval>,
     policy_revision: AgentRevisionNumber,
     #[serde(default)]
     ingress_revision: Option<AgentRevisionNumber>,
@@ -1215,6 +1364,30 @@ impl<'de> Deserialize<'de> for MemoryContextSnapshot {
         D: Deserializer<'de>,
     {
         let record = MemoryContextSnapshotRecord::deserialize(deserializer)?;
+        // The version rule, held on load so that it holds on every store: a
+        // snapshot records a communal search if and only if it is version 2.
+        // A record that breaks the rule was not written by this code, and
+        // reading it leniently would let a claim into a model context under a
+        // version whose readers do not know what a claim is.
+        let without_communal = AGENT_MEMORY_CONTEXT_SNAPSHOT_WITHOUT_COMMUNAL_SCHEMA_VERSION;
+        if record.schema_version == without_communal {
+            if !record.communal_claims.is_empty() {
+                return Err(D::Error::custom(
+                    "a version 1 context snapshot selects no communal claim",
+                ));
+            }
+            if record.communal.is_some() {
+                return Err(D::Error::custom(
+                    "a version 1 context snapshot records no communal search",
+                ));
+            }
+        } else if record.schema_version == CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION
+            && record.communal.is_none()
+        {
+            return Err(D::Error::custom(
+                "a version 2 context snapshot always records its communal search",
+            ));
+        }
         Ok(Self {
             schema_version: record.schema_version,
             reference: record.reference,
@@ -1225,6 +1398,7 @@ impl<'de> Deserialize<'de> for MemoryContextSnapshot {
             retrievals: record.retrievals,
             private_memory: record.private_memory,
             communal_claims: record.communal_claims,
+            communal: record.communal,
             policy_revision: record.policy_revision,
             ingress_revision: record.ingress_revision,
             budget: record.budget,
@@ -1518,10 +1692,13 @@ pub async fn assemble_session_context(
         private_memories: 0,
         private_memory_bytes: 0,
         communal_claims: 0,
+        communal_claim_bytes: 0,
     };
 
+    // A snapshot starts as version 1 and has the bytes it always had. Only
+    // `MemoryContextSnapshot::set_communal` moves it to version 2.
     let mut snapshot = MemoryContextSnapshot {
-        schema_version: CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+        schema_version: AGENT_MEMORY_CONTEXT_SNAPSHOT_WITHOUT_COMMUNAL_SCHEMA_VERSION,
         reference: reference.clone(),
         scope: scope.clone(),
         turn,
@@ -1530,6 +1707,7 @@ pub async fn assemble_session_context(
         retrievals,
         private_memory: Vec::new(),
         communal_claims: Vec::new(),
+        communal: None,
         policy_revision,
         ingress_revision: None,
         budget,
