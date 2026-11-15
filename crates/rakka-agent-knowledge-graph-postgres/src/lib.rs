@@ -94,7 +94,7 @@ use rakka_agent_knowledge_graph::scope::KnowledgeSpaceScope;
 use rakka_agent_knowledge_graph::store::{
     ClaimCursor, ClaimFilter, ClaimPage, ClaimTransitionCursor, ClaimTransitionPage,
     ClaimTraversal, ClaimTraversalDirection, ClaimTraversalReport, KnowledgeGraphCapabilities,
-    KnowledgeGraphStore,
+    KnowledgeGraphCapability, KnowledgeGraphStore,
 };
 use rakka_agent_knowledge_graph::tombstone::{ClaimDeleteRequest, ClaimTombstoneRequest};
 use rakka_agent_knowledge_graph::transition::{
@@ -103,6 +103,7 @@ use rakka_agent_knowledge_graph::transition::{
 };
 use rakka_agent_knowledge_graph::ClaimTrustStatus;
 use rakka_agent_knowledge_graph::CLAIM_TOMBSTONE_MARKER;
+use rakka_agent_knowledge_graph::{ClaimSearch, ClaimSearchReport};
 use rakka_agent_workflow::AgentTimestampMillis;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
@@ -110,6 +111,8 @@ use tokio_postgres::{Client, Row};
 
 mod erasure;
 mod search;
+
+pub use search::CLAIM_SEARCH_SQL;
 
 /// Stable backend name, reported for diagnostics and error detail.
 pub const BACKEND_NAME: &str = "postgres";
@@ -920,7 +923,15 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
     }
 
     fn capabilities(&self) -> KnowledgeGraphCapabilities {
-        KnowledgeGraphCapabilities::core()
+        KnowledgeGraphCapabilities::core().with_capability(KnowledgeGraphCapability::KeywordSearch)
+    }
+
+    fn search<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        search: &'a ClaimSearch,
+    ) -> ClaimFuture<'a, ClaimSearchReport> {
+        Box::pin(self.search_claims(scope, search))
     }
 
     fn append<'a>(

@@ -18,6 +18,9 @@
 
 use std::collections::BTreeSet;
 
+use rakka_agent_knowledge_graph::{ClaimSearch, ClaimSearchReport};
+use rakka_agent_knowledge_graph_postgres::CLAIM_SEARCH_SQL;
+
 use rakka_agent::{AgentCapabilityId, AgentId, AgentTaskContent, MemoryClassification};
 use rakka_agent_knowledge_graph::conformance::{conformance_resolver, ConformanceScopes};
 use rakka_agent_knowledge_graph::{
@@ -1283,4 +1286,358 @@ async fn postgres_delete_leaves_no_row_when_dsn_is_set() {
         .expect("the delete applies");
 
     assert_eq!(index_columns(&raw, &scope, &claim.claim_id).await, None);
+}
+
+// ---------------------------------------------------------------------------
+// Search: the index nominates, the record decides.
+// ---------------------------------------------------------------------------
+
+/// A search admitting every trust state and classification, for a reader
+/// holding `reader`.
+fn admitting_all(text: &str, reader: &[&str]) -> ClaimSearch {
+    ClaimSearch::new(text, 8)
+        .with_trust(ClaimTrustStatus::ALL.into_iter().collect())
+        .with_classifications(BTreeSet::from([
+            MemoryClassification::Unclassified,
+            MemoryClassification::Sensitive,
+            MemoryClassification::Redacted,
+        ]))
+        .with_reader(reader.iter().map(|id| capability(id)).collect())
+}
+
+fn hit_ids(report: &ClaimSearchReport) -> Vec<ClaimId> {
+    report
+        .hits
+        .iter()
+        .map(|hit| hit.claim.claim_id.clone())
+        .collect()
+}
+
+/// Rewrites one index column of one claim row, as corruption would.
+async fn doctor(raw: &Client, scope: &KnowledgeSpaceScope, claim_id: &ClaimId, assignment: &str) {
+    let changed = raw
+        .execute(
+            &format!(
+                "UPDATE rakka_agent_knowledge_claim SET {assignment} \
+                 WHERE tenant = $1 AND space = $2 AND claim_id = $3"
+            ),
+            &[
+                &scope.tenant().as_str(),
+                &scope.space().as_str(),
+                &claim_id.as_str(),
+            ],
+        )
+        .await
+        .expect("the row is doctored");
+    assert_eq!(changed, 1, "exactly the addressed row is doctored");
+}
+
+#[tokio::test]
+async fn postgres_a_claim_is_found_straight_after_its_append_when_dsn_is_set() {
+    let Some((_raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-found").primary;
+    let claim = guarded_claim(&scope, "found");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+
+    let report = store
+        .search(&scope, &admitting_all("customs delay", &["cap-a", "cap-b"]))
+        .await
+        .expect("the search answers");
+    assert_eq!(hit_ids(&report), vec![claim.claim_id.clone()]);
+    assert_eq!(report.hits[0].claim, claim, "a hit is the stored claim");
+    assert_eq!(report.hits[0].relevance_bps, 5_000);
+    assert!(!report.unindexed);
+}
+
+#[tokio::test]
+async fn postgres_an_earlier_binarys_claim_is_reported_unindexed_when_dsn_is_set() {
+    // A node on the earlier binary appends into a migrated table. Its row has
+    // no index, so a search cannot find it, and says so rather than answering
+    // as though the space held nothing more.
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-unindexed").primary;
+    let earlier = text_claim(
+        &scope,
+        "earlier",
+        "order-42",
+        "status",
+        "delayed at customs",
+    );
+    assert!(earlier_append(&raw, &scope, &earlier)
+        .await
+        .get::<_, bool>("applied"));
+    let indexed = text_claim(&scope, "indexed", "order-43", "status", "held at customs");
+    store
+        .append(&scope, &indexed)
+        .await
+        .expect("the claim appends");
+
+    let report = store
+        .search(&scope, &admitting_all("customs", &[]))
+        .await
+        .expect("the search answers");
+    assert_eq!(
+        hit_ids(&report),
+        vec![indexed.claim_id.clone()],
+        "the earlier binary's claim is not a hit"
+    );
+    assert!(
+        report.unindexed,
+        "the space holds a live claim the index does not cover"
+    );
+
+    // A stub is not a claim the index is missing: one that was withdrawn
+    // before it was ever indexed does not keep the space reporting
+    // `unindexed`, and neither does one withdrawn after.
+    let row = earlier_tombstone(
+        &raw,
+        &scope,
+        &earlier,
+        &tombstone_request(&scope, &earlier.claim_id, "withdraw"),
+        &[&earlier.operation_id],
+    )
+    .await;
+    assert!(row.get::<_, bool>("applied"));
+    store
+        .tombstone(
+            &scope,
+            &tombstone_request(&scope, &indexed.claim_id, "withdraw"),
+        )
+        .await
+        .expect("the tombstone applies");
+    let report = store
+        .search(&scope, &admitting_all("customs", &[]))
+        .await
+        .expect("the search answers");
+    assert!(report.hits.is_empty());
+    assert!(!report.unindexed, "a space holding only stubs is covered");
+}
+
+#[tokio::test]
+async fn postgres_a_drifted_capability_column_cannot_leak_a_claim_when_dsn_is_set() {
+    // The index says the claim requires nothing; the record says it requires
+    // two capabilities. A reader holding none must not be handed the claim:
+    // the search is refused as drift.
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-drift-cap").primary;
+    let claim = guarded_claim(&scope, "guarded");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+    let nobody = admitting_all("customs", &[]);
+    assert!(store
+        .search(&scope, &nobody)
+        .await
+        .expect("the search answers")
+        .hits
+        .is_empty());
+
+    doctor(
+        &raw,
+        &scope,
+        &claim.claim_id,
+        "search_read_capabilities = '{}'",
+    )
+    .await;
+
+    let error = store
+        .search(&scope, &nobody)
+        .await
+        .expect_err("a row the record does not admit is refused, never answered");
+    assert_eq!(error.code(), "claim-backend-failed");
+}
+
+#[tokio::test]
+async fn postgres_a_drifted_classification_column_cannot_leak_a_claim_when_dsn_is_set() {
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-drift-class").primary;
+    let claim = guarded_claim(&scope, "sensitive");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+    let unclassified_only = ClaimSearch::new("customs", 8)
+        .with_trust(ClaimTrustStatus::ALL.into_iter().collect())
+        .with_classifications(BTreeSet::from([MemoryClassification::Unclassified]))
+        .with_reader(BTreeSet::from([capability("cap-a"), capability("cap-b")]));
+    assert!(store
+        .search(&scope, &unclassified_only)
+        .await
+        .expect("the search answers")
+        .hits
+        .is_empty());
+
+    doctor(
+        &raw,
+        &scope,
+        &claim.claim_id,
+        "search_classification = 'unclassified'",
+    )
+    .await;
+
+    let error = store
+        .search(&scope, &unclassified_only)
+        .await
+        .expect_err("a sensitive claim is never answered to an unclassified-only search");
+    assert_eq!(error.code(), "claim-backend-failed");
+}
+
+#[tokio::test]
+async fn postgres_drifted_search_words_cannot_surface_a_claim_when_dsn_is_set() {
+    // Words in the index that the record does not hold: the claim would be
+    // found by a query it has nothing to do with. Refused as drift.
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-drift-words").primary;
+    let claim = text_claim(&scope, "words", "order-42", "status", "delayed");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+    doctor(
+        &raw,
+        &scope,
+        &claim.claim_id,
+        "search_tokens = '{unrelatedword}'",
+    )
+    .await;
+
+    let error = store
+        .search(&scope, &admitting_all("unrelatedword", &[]))
+        .await
+        .expect_err("a claim that scores nothing against the query is not a hit");
+    assert_eq!(error.code(), "claim-backend-failed");
+}
+
+#[tokio::test]
+async fn postgres_a_query_without_words_is_a_valid_statement_when_dsn_is_set() {
+    // The statement runs with an empty word array, and with every other set
+    // empty too: no hits, no error.
+    let Some((_raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-wordless").primary;
+    let claim = text_claim(&scope, "present", "order-42", "status", "delayed");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+
+    for search in [
+        admitting_all("...", &[]),
+        admitting_all("", &[]),
+        ClaimSearch::new("...", 8),
+        ClaimSearch::new("delayed", 8),
+    ] {
+        let report = store
+            .search(&scope, &search)
+            .await
+            .expect("a search that can match nothing is not an error");
+        assert!(report.hits.is_empty());
+        assert!(!report.unindexed);
+    }
+}
+
+#[tokio::test]
+async fn postgres_a_row_with_no_words_is_indexed_and_never_a_hit_when_dsn_is_set() {
+    // An empty word array means "indexed, and holds no words", which is not
+    // the `NULL` that means "not indexed".
+    let Some((raw, store)) = shared().await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-search-no-words").primary;
+    let claim = text_claim(&scope, "wordless", "order-42", "status", "delayed");
+    store
+        .append(&scope, &claim)
+        .await
+        .expect("the claim appends");
+    doctor(&raw, &scope, &claim.claim_id, "search_tokens = '{}'").await;
+
+    for text in [
+        "order",
+        "42",
+        "status",
+        "delayed",
+        "order 42 status delayed",
+    ] {
+        let report = store
+            .search(&scope, &admitting_all(text, &[]))
+            .await
+            .expect("the search answers");
+        assert!(
+            report.hits.is_empty(),
+            "a row with no words matches nothing"
+        );
+        assert!(
+            !report.unindexed,
+            "a row with an empty word array is indexed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn postgres_search_uses_the_word_index_when_dsn_is_set() {
+    // The search's word predicate is one the GIN index can answer. In a scope
+    // of five thousand rows where one holds the word, the planner reads the
+    // word index rather than every row of the scope.
+    let Some(dsn) = dsn() else { return };
+    let (schema, raw, _store) = PrivateSchema::migrated(&dsn, "search_plan").await;
+    raw.batch_execute(
+        "INSERT INTO rakka_agent_knowledge_claim \
+            (tenant, space, claim_id, operation_id, subject, predicate, trust, \
+             transition_count, record, search_tokens, search_classification, \
+             search_confidence_bps, search_read_capabilities) \
+         SELECT 'tenant-a', 'space-a', 'claim-' || g, 'op-' || g, 's', 'p', 'proposed', 0, \
+                ''::BYTEA, ARRAY['common', 'word' || g], 'unclassified', 5000, '{}' \
+         FROM generate_series(1, 5000) AS g; \
+         ANALYZE rakka_agent_knowledge_claim; \
+         SET enable_seqscan = off",
+    )
+    .await
+    .expect("the rows are planted");
+
+    let params: [&(dyn ToSql + Sync); 8] = [
+        &"tenant-a",
+        &"space-a",
+        &vec!["word77".to_string()],
+        &vec!["proposed".to_string()],
+        &vec!["unclassified".to_string()],
+        &0_i32,
+        &Vec::<String>::new(),
+        &8_i64,
+    ];
+    let plan: Vec<String> = raw
+        .query(&format!("EXPLAIN {CLAIM_SEARCH_SQL}"), &params)
+        .await
+        .expect("the statement plans")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains(SEARCH_TOKENS_INDEX_NAME)),
+        "the plan reads the word index: {plan:#?}"
+    );
+    // The same statement, run, finds the one row that holds the word.
+    let rows = raw
+        .query(CLAIM_SEARCH_SQL, &params)
+        .await
+        .expect("the statement runs");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>("claim_id"), "claim-77");
+
+    schema.drop().await;
 }
