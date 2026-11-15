@@ -37,7 +37,14 @@ use rakka_agent::{
     InMemorySessionMemoryStore, KnowledgeSpaceId, StaticAgentDelegationCatalog,
     WorkflowAgentRunEffectSink,
 };
-use rakka_agent_knowledge_graph::{InMemoryKnowledgeGraphStore, KnowledgeGraphClaimAppendExecutor};
+use rakka_agent::{
+    AgentCommunalRetrieval, AgentEntityCommunalReadGrants, AgentGuardrailChain, AgentSchemaPolicy,
+    CommunalRetrievalPolicy,
+};
+use rakka_agent_knowledge_graph::{
+    InMemoryKnowledgeGraphStore, KnowledgeGraphClaimAppendExecutor,
+    KnowledgeGraphCommunalAuthority, KnowledgeGraphCommunalRetriever,
+};
 use rakka_agent_workflow::substrate::{ManualWorkflowClock, WorkflowState, WorkflowTimestamp};
 use rakka_agent_workflow::{
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorkerId,
@@ -441,6 +448,27 @@ impl World {
     /// graph, and the workflow child's inbox.
     #[must_use]
     pub fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// The same world with the communal read path wired into every run: the
+    /// knowledge graph's retriever and authority over [`Self::graph`], the
+    /// read grant taken from each run's own agent entity, no memory-ingress
+    /// stages, and the default policy, which admits only `Verified` claims.
+    ///
+    /// The acceptance walk does not use it, so the walk's snapshots stay the
+    /// version 1 records they always were; `tests/communal_read_path.rs`
+    /// does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the in-memory graph store stops reporting keyword search.
+    #[must_use]
+    pub fn with_communal_read_path() -> Self {
+        Self::build(true)
+    }
+
+    fn build(communal_read_path: bool) -> Self {
         let system = ActorSystem::new("MultiAgentGoalAcceptance");
         let sharding = ClusterSharding::get(&system);
         let tasks = InMemoryDurableStateStore::<AgentTaskState>::new();
@@ -463,6 +491,27 @@ impl World {
         let session = Arc::new(InMemorySessionMemoryStore::new());
         let snapshots = Arc::new(InMemoryContextSnapshotStore::new());
         let workflow_starts = Arc::new(RegistryInboxStartExecutor::new(child_inbox_store.clone()));
+
+        // What every run reads from and writes to. The communal bundle is the
+        // whole of the read path's wiring: a retriever to rank, an authority
+        // to answer the record, the source of the run's grant, the
+        // memory-ingress chain and the policy.
+        let mut memory = AgentRunMemory::new(session.clone(), snapshots.clone());
+        if communal_read_path {
+            memory = memory.with_communal_retrieval(AgentCommunalRetrieval::new(
+                Arc::new(
+                    KnowledgeGraphCommunalRetriever::new(graph.clone())
+                        .expect("the in-memory graph store searches by keyword"),
+                ),
+                Arc::new(KnowledgeGraphCommunalAuthority::new(graph.clone())),
+                Arc::new(AgentEntityCommunalReadGrants::new(
+                    Arc::new(agents.clone()),
+                    AgentSchemaPolicy::default(),
+                )),
+                AgentGuardrailChain::new(AgentRevisionNumber::INITIAL),
+                CommunalRetrievalPolicy::verified_only(),
+            ));
+        }
 
         let policies = registry
             .effect_policies()
@@ -503,7 +552,7 @@ impl World {
                 .with_clock(entity_clock)
                 .with_effect_policies(policies)
                 .with_metrics(metrics.clone())
-                .with_memory(AgentRunMemory::new(session.clone(), snapshots.clone()))
+                .with_memory(memory)
                 .with_delegation(delegation_config())
                 .with_workflow_tools(workflow_config()),
         )
