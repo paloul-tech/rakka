@@ -2668,6 +2668,7 @@ pub struct AgentRunMemory {
     snapshots: Arc<dyn ContextSnapshotStore>,
     private: Option<Arc<dyn AgentPrivateMemoryStore>>,
     retrieval: Option<crate::retrieval::AgentMemoryRetrieval>,
+    communal: Option<crate::communal::AgentCommunalRetrieval>,
     window: SessionWindowPolicy,
 }
 
@@ -2683,6 +2684,7 @@ impl AgentRunMemory {
             snapshots,
             private: None,
             retrieval: None,
+            communal: None,
             window: SessionWindowPolicy::recent_window(),
         }
     }
@@ -2728,6 +2730,30 @@ impl AgentRunMemory {
     #[must_use]
     pub fn with_retrieval(mut self, retrieval: crate::retrieval::AgentMemoryRetrieval) -> Self {
         self.retrieval = Some(retrieval);
+        self
+    }
+
+    /// Wires the communal read bundle
+    /// ([specification 13.4 and 16](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// With a bundle wired, [`crate::retrieval::assemble_context`] searches
+    /// the knowledge spaces the run is granted and fills the snapshot's
+    /// communal selection with the claims the run may read, each resolved
+    /// through the bundle's authority and evaluated against the bundle's
+    /// memory-ingress guardrail chain. A run with no communal bundle selects
+    /// no claim and writes the snapshot it wrote before the read path
+    /// existed.
+    ///
+    /// The chain must be the one the deployment's dispatch authority carries,
+    /// for the reason [`Self::with_retrieval`] gives, and
+    /// [`crate::tools::AgentToolAuthority::with_memory_ingress`] attests it
+    /// for both bundles.
+    #[must_use]
+    pub fn with_communal_retrieval(
+        mut self,
+        communal: crate::communal::AgentCommunalRetrieval,
+    ) -> Self {
+        self.communal = Some(communal);
         self
     }
 
@@ -2777,6 +2803,12 @@ impl AgentRunMemory {
     pub fn retrieval(&self) -> Option<&crate::retrieval::AgentMemoryRetrieval> {
         self.retrieval.as_ref()
     }
+
+    /// The communal read bundle, when one is wired.
+    #[must_use]
+    pub fn communal_retrieval(&self) -> Option<&crate::communal::AgentCommunalRetrieval> {
+        self.communal.as_ref()
+    }
 }
 
 impl fmt::Debug for AgentRunMemory {
@@ -2797,6 +2829,13 @@ impl fmt::Debug for AgentRunMemory {
                     .retrieval
                     .as_ref()
                     .map_or("none", |retrieval| retrieval.retriever().backend_name()),
+            )
+            .field(
+                "communal",
+                &self
+                    .communal
+                    .as_ref()
+                    .map_or("none", |communal| communal.retriever().backend_name()),
             )
             .field("window", &self.window)
             .finish()
