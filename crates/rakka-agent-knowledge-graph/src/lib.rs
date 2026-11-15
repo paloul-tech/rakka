@@ -72,6 +72,7 @@ pub mod goal_claim_source;
 pub mod promotion;
 pub mod retention;
 pub mod scope;
+pub mod search;
 pub mod store;
 pub mod tombstone;
 pub mod transition;
@@ -95,6 +96,11 @@ pub use retention::{
     KNOWLEDGE_SPACE_RETENTION_DEFAULT_MAX_BATCH,
 };
 pub use scope::KnowledgeSpaceScope;
+pub use search::{
+    claim_search_query_tokens, claim_search_relevance_bps, claim_search_tokens,
+    rank_claim_search_hits, ClaimSearch, ClaimSearchHit, ClaimSearchReport, CLAIM_SEARCH_MAX_HITS,
+    CLAIM_SEARCH_TEXT_MAX_BYTES,
+};
 pub use store::{
     ClaimCursor, ClaimFilter, ClaimPage, ClaimTransitionCursor, ClaimTransitionPage,
     ClaimTraversal, ClaimTraversalDirection, ClaimTraversalReport, InMemoryKnowledgeGraphStore,

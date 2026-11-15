@@ -331,3 +331,33 @@ async fn a_backend_declaring_tighter_limits_passes_the_contract() {
     let store = ShallowKnowledgeGraphStore::default();
     conformance::check_knowledge_graph_contract(&store).await;
 }
+
+#[tokio::test]
+async fn keyword_search_admits_before_it_ranks() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    assert!(store
+        .capabilities()
+        .supports(rakka_agent_knowledge_graph::KnowledgeGraphCapability::KeywordSearch));
+    conformance::keyword_search(&store, ConformanceScopes::unique("keyword-search")).await;
+}
+
+/// Search is optional. A backend that does not report it answers the
+/// capability error from the trait's own default, so a caller learns that the
+/// store cannot search rather than reading an empty answer as "nothing found".
+#[tokio::test]
+async fn a_store_without_the_capability_refuses_search() {
+    let store = ShallowKnowledgeGraphStore::default();
+    assert!(!store
+        .capabilities()
+        .supports(rakka_agent_knowledge_graph::KnowledgeGraphCapability::KeywordSearch));
+    let scopes = ConformanceScopes::unique("no-search");
+    let error = store
+        .search(
+            &scopes.primary,
+            &rakka_agent_knowledge_graph::ClaimSearch::new("anything", 8),
+        )
+        .await
+        .expect_err("a store that does not report keyword search refuses it");
+    assert_eq!(error.code(), "claim-capability-unsupported");
+    assert!(error.to_string().contains("keyword-search"));
+}

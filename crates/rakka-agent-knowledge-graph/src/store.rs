@@ -31,6 +31,10 @@ use crate::claim::{Claim, ClaimId, ClaimNodeId, ClaimPredicate, ClaimTrustStatus
 use crate::error::{ClaimError, ClaimFuture};
 use crate::promotion::{validate_promotion, ClaimPromotionPolicy};
 use crate::scope::KnowledgeSpaceScope;
+use crate::search::{
+    claim_search_relevance_bps, rank_claim_search_hits, ClaimSearch, ClaimSearchHit,
+    ClaimSearchReport,
+};
 use crate::tombstone::{ClaimDeleteRequest, ClaimTombstoneRequest};
 use crate::transition::{
     ClaimTransitionOutcome, ClaimTrustTransition, ClaimTrustTransitionRequest,
@@ -61,6 +65,9 @@ pub const CLAIM_TRAVERSAL_MAX_EDGES: usize = 1024;
 pub enum KnowledgeGraphCapability {
     /// Semantic (embedding-based) claim search.
     SemanticSearch,
+    /// Keyword claim search ([`KnowledgeGraphStore::search`]): admitted claims
+    /// ranked by the words they share with a query.
+    KeywordSearch,
 }
 
 impl KnowledgeGraphCapability {
@@ -69,6 +76,7 @@ impl KnowledgeGraphCapability {
     pub const fn as_label(&self) -> &'static str {
         match self {
             Self::SemanticSearch => "semantic-search",
+            Self::KeywordSearch => "keyword-search",
         }
     }
 }
@@ -825,6 +833,40 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
         scope: &'a KnowledgeSpaceScope,
         request: &'a ClaimDeleteRequest,
     ) -> ClaimFuture<'a, ()>;
+
+    /// Ranks the claims of one space that a search admits by the words they
+    /// share with its query.
+    ///
+    /// Optional: a backend reports
+    /// [`KnowledgeGraphCapability::KeywordSearch`] when it implements this,
+    /// and the default body answers `claim-capability-unsupported`, so a
+    /// caller learns that the store cannot search instead of reading an empty
+    /// answer as "nothing found".
+    ///
+    /// Admission precedes ranking: [`ClaimSearch::admits`] decides what may
+    /// be found before anything is ordered, so a claim the reader may not see
+    /// never takes a hit slot. A hit shares at least one word with the query;
+    /// hits are ordered by [`claim_search_relevance_bps`] descending, ties by
+    /// ascending claim id, and cut to the search's limit. Nothing bounds how
+    /// far the search looks: every admitted claim of the space is a
+    /// candidate. A wrong scope answers the report an empty space does, and a
+    /// tombstoned stub is never a hit.
+    ///
+    /// [`claim_search_relevance_bps`]: crate::search::claim_search_relevance_bps
+    fn search<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        search: &'a ClaimSearch,
+    ) -> ClaimFuture<'a, ClaimSearchReport> {
+        let _ = (scope, search);
+        Box::pin(async {
+            Err(ClaimError::CapabilityUnsupported {
+                capability: KnowledgeGraphCapability::KeywordSearch
+                    .as_label()
+                    .to_string(),
+            })
+        })
+    }
 }
 
 /// What one spent operation id resolved to.
@@ -923,7 +965,42 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
     }
 
     fn capabilities(&self) -> KnowledgeGraphCapabilities {
-        KnowledgeGraphCapabilities::core()
+        KnowledgeGraphCapabilities::core().with_capability(KnowledgeGraphCapability::KeywordSearch)
+    }
+
+    fn search<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        search: &'a ClaimSearch,
+    ) -> ClaimFuture<'a, ClaimSearchReport> {
+        Box::pin(async move {
+            let inner = self
+                .inner
+                .lock()
+                .expect("the in-memory graph lock is never poisoned");
+            // Admit, then score, then rank: a claim the search does not admit
+            // is dropped before it can be ordered against anything.
+            let mut hits: Vec<ClaimSearchHit> = inner
+                .claims
+                .get(&scope.key())
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .filter(|claim| search.admits(claim))
+                .filter_map(|claim| {
+                    let relevance_bps = claim_search_relevance_bps(search.query_tokens(), claim);
+                    (relevance_bps > 0).then(|| ClaimSearchHit {
+                        claim: claim.clone(),
+                        relevance_bps,
+                    })
+                })
+                .collect();
+            rank_claim_search_hits(&mut hits, search.limit());
+            // Nothing here can fall behind the claims: there is no index.
+            Ok(ClaimSearchReport {
+                hits,
+                unindexed: false,
+            })
+        })
     }
 
     fn append<'a>(

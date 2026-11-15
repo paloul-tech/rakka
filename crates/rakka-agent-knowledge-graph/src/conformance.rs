@@ -79,6 +79,7 @@ use crate::transition::ClaimTrustTransitionRequest;
 
 mod erasure;
 mod retention;
+mod search;
 
 pub use erasure::{
     a_deleted_claim_cannot_be_restored_by_replay, a_stale_delete_changes_nothing, a_stub_is_frozen,
@@ -86,6 +87,8 @@ pub use erasure::{
     erasure_operation_kinds, tombstone_isolation, tombstone_replay_and_erased_operations,
     tombstone_withdraws_content, tombstoned_claims_are_hidden_from_discovery,
 };
+
+pub use search::keyword_search;
 
 pub use retention::{
     retention_ages_claims_by_trust_status, retention_is_bounded_and_resumable,
@@ -1367,6 +1370,15 @@ pub async fn check_knowledge_graph_contract(store: &dyn KnowledgeGraphStore) {
     retention_ages_claims_by_trust_status(store, ConformanceScopes::unique("retention-ages")).await;
     retention_is_bounded_and_resumable(store, ConformanceScopes::unique("retention-bounded")).await;
     retention_leaves_a_claim_that_moved(store, ConformanceScopes::unique("retention-moved")).await;
+    // Keyword search is optional: its clause binds exactly the backends that
+    // report it. One that does not is held to the refusal the trait's default
+    // answers, which the capability report already implies.
+    if store
+        .capabilities()
+        .supports(crate::store::KnowledgeGraphCapability::KeywordSearch)
+    {
+        keyword_search(store, ConformanceScopes::unique("keyword-search")).await;
+    }
 }
 
 #[cfg(test)]

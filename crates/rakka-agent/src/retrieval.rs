@@ -799,7 +799,7 @@ impl AgentPrivateMemoryRetriever for InMemoryPrivateMemoryRetriever {
 
             let mut ranked: Vec<RetrievedPrivateMemory> = match &self.embedder {
                 None => {
-                    let query_tokens = tokenize(query.text());
+                    let query_tokens = tokenize_search_text(query.text());
                     admitted
                         .into_iter()
                         .filter_map(|memory| {
@@ -891,8 +891,15 @@ pub async fn embed_memory_vector(
     Ok(vector)
 }
 
-/// Lowercased alphanumeric tokens of one text, deduplicated.
-fn tokenize(text: &str) -> BTreeSet<String> {
+/// The words of one text for keyword matching: the text split on every
+/// character that is not alphanumeric, lowercased, without duplicates.
+///
+/// One rule for every tier: the private retriever ranks with it, and the
+/// communal knowledge graph both ranks with it and stores its output in a
+/// search index. Its output for a given text is therefore a compatibility
+/// surface and must not change.
+#[must_use]
+pub fn tokenize_search_text(text: &str) -> BTreeSet<String> {
     text.split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(str::to_lowercase)
@@ -905,7 +912,7 @@ fn token_overlap_bps(query_tokens: &BTreeSet<String>, text: &str) -> u16 {
     if query_tokens.is_empty() {
         return 0;
     }
-    let text_tokens = tokenize(text);
+    let text_tokens = tokenize_search_text(text);
     let overlap = query_tokens.intersection(&text_tokens).count();
     let bps = overlap.saturating_mul(10_000) / query_tokens.len();
     u16::try_from(bps.min(10_000)).unwrap_or(10_000)
