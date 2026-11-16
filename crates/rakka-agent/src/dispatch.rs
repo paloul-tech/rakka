@@ -2289,19 +2289,20 @@ where
         self
     }
 
-    /// Rebuilds the fleet handle from the settings and filter this worker
-    /// currently holds.
+    /// Rebuilds the fleet handle from the settings, the filter and the
+    /// metrics recorder this worker currently holds.
     ///
-    /// Both builders route through here so neither discards the other's
-    /// configuration — which the two independent constructions they used to
-    /// perform did, silently, depending on call order.
+    /// Every builder that changes one of the three routes through here so
+    /// none discards another's configuration — which the independent
+    /// constructions they used to perform did, silently, depending on call
+    /// order.
     fn rebuild_fleet(&mut self) {
         self.fleet = AgentDispatcherFleet::with_clock_and_metrics(
             self.fleet_store.clone(),
             rakka_agent_workflow::agent_dispatcher_fleet_persistence_id(),
             self.fleet_settings.clone(),
             self.clock.clone(),
-            Arc::new(rakka_core::NoopMetricsRecorder),
+            self.metrics.clone(),
         )
         .with_claim_filter(self.claim_filter.clone());
     }
@@ -2464,12 +2465,52 @@ where
     }
 
     /// Records the dispatcher's own metrics
-    /// ([`crate::observability::METRIC_AGENT_DISPATCH_WRITE_RETRIES`]) into
-    /// `metrics`. Without it they are recorded nowhere.
+    /// ([`crate::observability::METRIC_AGENT_DISPATCH_WRITE_RETRIES`]) and
+    /// its fleet's into `metrics`. Without it they are recorded nowhere.
+    ///
+    /// The fleet's are the counter
+    /// [`rakka_agent_workflow::METRIC_AGENT_DISPATCHER_FLEET`] and the gauges
+    /// [`rakka_agent_workflow::METRIC_AGENT_DISPATCHER_IN_FLIGHT`],
+    /// [`rakka_agent_workflow::METRIC_AGENT_DISPATCHER_BACKLOG`] and
+    /// [`rakka_agent_workflow::METRIC_AGENT_DISPATCHER_ENTRIES`]. The last is
+    /// the fleet record's entry count by status: the series that shows the
+    /// record growing when nothing calls [`Self::prune_fleet`]. None of them
+    /// carries a run, effect, tenant or worker id.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
         self.metrics = metrics;
+        self.rebuild_fleet();
         self
+    }
+
+    /// Removes the finished entries of this dispatcher's fleet record that
+    /// finished before `before`.
+    ///
+    /// The fleet record is one durable record per database that every
+    /// dispatcher reads and writes whole, and nothing else removes an entry
+    /// from it: without a prune it holds one entry for every effect the
+    /// deployment ever dispatched. An application calls this on its own
+    /// schedule, with its own horizon. It is
+    /// [`AgentDispatcherFleet::prune_terminal`] and nothing more, so an
+    /// operator command that holds only the fleet store can call that
+    /// directly.
+    ///
+    /// It is safe while other dispatchers run and at any horizon: only an
+    /// entry that is `Completed`, `Exhausted` or `Cancelled` is removed, an
+    /// entry is finished only after its outbox row is, and a settle that
+    /// loses its write to the prune reads the record again and re-applies.
+    /// What goes with an entry is its `last_error_code`, the only durable
+    /// copy of a cancelled ticket's settle reason.
+    ///
+    /// # Errors
+    ///
+    /// The fleet store's error, or `revision-conflict` when the prune lost
+    /// its write more times than it re-applies.
+    pub async fn prune_fleet(
+        &mut self,
+        before: AgentTimestampMillis,
+    ) -> AgentDispatchResult<rakka_agent_workflow::AgentDispatcherPrune> {
+        Ok(self.fleet.prune_terminal(before).await?)
     }
 
     /// Closes one segment into the wired sink, attaching the run's identity

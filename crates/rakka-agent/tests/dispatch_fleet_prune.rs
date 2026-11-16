@@ -187,3 +187,112 @@ async fn pumping_a_finished_run_after_a_prune_registers_nothing() {
         .is_empty());
     assert_eq!(fx.tools.invocation_count(TOOL), 1);
 }
+
+// ---------------------------------------------------------------------------
+// The dispatcher's own prune, under another dispatcher's claim.
+// ---------------------------------------------------------------------------
+
+/// A tool during whose call another dispatcher prunes the fleet record.
+struct PrunedMidCall {
+    other: tokio::sync::Mutex<Option<Pipeline>>,
+    pruned: std::sync::Mutex<Option<AgentDispatcherPrune>>,
+}
+
+impl rakka_agent::AgentDispatchToolExecutor for PrunedMidCall {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a rakka_agent::AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a rakka_agent_workflow::AgentEphemeralCredential>,
+    ) -> rakka_agent::AgentDispatchFuture<'a, AgentTaskContent> {
+        Box::pin(async move {
+            let mut other = self
+                .other
+                .lock()
+                .await
+                .take()
+                .expect("the other dispatcher is wired before the call");
+            let prune = other
+                .prune_fleet(FUTURE)
+                .await
+                .expect("the other dispatcher's prune runs");
+            *self.pruned.lock().expect("the slot is not poisoned") = Some(prune);
+            Ok(
+                AgentTaskContent::inline(serde_json::json!({ "paid": true }))
+                    .expect("the result is inline-bounded"),
+            )
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_prune_from_another_dispatcher_does_not_cost_a_claim_its_settle() {
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let tool = Arc::new(PrunedMidCall {
+        other: tokio::sync::Mutex::new(None),
+        pruned: std::sync::Mutex::new(None),
+    });
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(tool_registry_for_spec(TOOL, &spec)),
+        None,
+    )
+    .with_tool_executor(tool.clone());
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let effect = fx.effect_at(1).await.expect("the tool effect is committed");
+    *tool.other.lock().await = Some(fx.worker("worker-pruner", fx.tools.clone(), None));
+
+    // The prune lands while this dispatcher's claim is in flight: between
+    // its claim, which read the fleet record, and its settle.
+    let pass = fx
+        .worker("worker-claimant", fx.tools.clone(), None)
+        .pump_run(&run_scope())
+        .await
+        .expect("a prune from another handle does not fail the pass");
+
+    let prune = tool
+        .pruned
+        .lock()
+        .expect("the slot is not poisoned")
+        .clone()
+        .expect("the prune ran during the call");
+    assert_eq!(
+        prune.pruned, 1,
+        "the first model turn's finished entry was pruned"
+    );
+    assert_eq!(prune.remaining, 1, "the claim in flight was left alone");
+    assert_eq!((pass.claimed, pass.invoked, pass.delivered), (1, 1, 1));
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Completed),
+        "the claim settled as what it was, not as a cancelled ticket a lease later"
+    );
+}
+
+#[tokio::test]
+async fn prune_fleet_reports_what_it_removed() {
+    let (fx, _effect) = ready_tool_ticket().await;
+    fx.pump().await;
+    let held = fleet_state(&fx)
+        .await
+        .expect("the fleet record exists")
+        .entries()
+        .len();
+    assert!(held >= 2);
+
+    let prune = fx
+        .pipeline()
+        .prune_fleet(FUTURE)
+        .await
+        .expect("the prune runs");
+
+    assert_eq!(prune.pruned, held);
+    assert_eq!(prune.remaining, 0);
+    assert!(fleet_state(&fx)
+        .await
+        .expect("the fleet record exists")
+        .entries()
+        .is_empty());
+}
