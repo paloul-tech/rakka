@@ -67,6 +67,10 @@ const FLEET_WRITE_REAPPLICATIONS: u32 = 3;
 /// carries it.
 const REVISION_CONFLICT_CODE: &str = "revision-conflict";
 
+/// The code an entry carries from the moment its run's cancellation was
+/// requested while a worker held its lease.
+const CANCELLATION_REQUESTED: &str = "cancellation-requested";
+
 /// The code a fleet entry carries when its claim was settled to match an
 /// outbox row that was already finished: another worker finished the row, or
 /// a crash fell between the outbox write and the fleet write.
@@ -706,6 +710,14 @@ impl AgentDispatchEntry {
                 .is_some_and(|lease| lease.is_active_at(now))
     }
 
+    /// Returns true when this entry is fenced by a cancellation request,
+    /// not yet finished, and held by no active lease at `now`: its outbox
+    /// row is the next thing to settle, and then the entry can be finished.
+    #[must_use]
+    pub fn awaits_cancellation_settlement(&self, now: AgentTimestampMillis) -> bool {
+        self.cancellation_requested && !self.status.is_terminal() && !self.is_in_flight_at(now)
+    }
+
     /// Returns true when the provided claim is still current and unexpired.
     #[must_use]
     pub fn is_current_claim(&self, claim: &AgentDispatchClaim, now: AgentTimestampMillis) -> bool {
@@ -1076,6 +1088,25 @@ impl AgentDispatcherFleetState {
             .count()
     }
 
+    /// The effects of one run whose entries a cancellation request fenced
+    /// and that are ready to be settled at the outbox and then finished:
+    /// fenced, unfinished, and held by no active lease at `now`.
+    ///
+    /// The list is stable between a settle and the finalize that follows
+    /// it: a fenced entry is never claimable, so it cannot gain a lease.
+    #[must_use]
+    pub fn cancellations_awaiting_settlement(
+        &self,
+        run_id: &AgentRunId,
+        now: AgentTimestampMillis,
+    ) -> Vec<AgentEffectId> {
+        self.entries
+            .values()
+            .filter(|entry| &entry.run_id == run_id && entry.awaits_cancellation_settlement(now))
+            .map(|entry| entry.effect_id.clone())
+            .collect()
+    }
+
     /// Builds a bounded health snapshot.
     #[must_use]
     pub fn snapshot(
@@ -1102,24 +1133,41 @@ pub struct AgentDispatcherRegistration {
     pub registered_effects: usize,
 }
 
-/// Result of marking dispatch entries cancelled or cancellation requested.
+/// Result of [`AgentDispatcherWorker::cancel_run_dispatches`]: what one
+/// cancellation fenced, settled and finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDispatcherCancellation {
     /// Run whose dispatch entries were considered.
     pub run_id: AgentRunId,
     /// Timestamp used for the cancellation pass.
     pub cancelled_at: AgentTimestampMillis,
-    /// Entries moved to `Cancelled`.
+    /// Entries moved to `Cancelled`, each after its outbox row was settled.
     pub cancelled_entries: usize,
     /// Entries already terminal before the cancellation pass.
     pub already_terminal_entries: usize,
     /// Actively leased entries marked cancellation requested. They are left
     /// for the in-flight worker to finish truthfully; if the lease expires
-    /// they are finalized as cancelled on the next worker refresh.
+    /// they are settled and finished as cancelled on the next worker refresh.
     pub in_flight_entries: usize,
-    /// Effect ids of entries moved to `Cancelled` by this pass, to settle at
-    /// the durable outbox layer.
+    /// Effect ids of the entries this pass moved to `Cancelled`.
     pub cancelled_effect_ids: Vec<AgentEffectId>,
+}
+
+/// What one [`AgentDispatcherFleet::request_run_cancellation`] fenced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDispatcherCancellationRequest {
+    /// Run whose entries were considered.
+    pub run_id: AgentRunId,
+    /// Timestamp of the request.
+    pub requested_at: AgentTimestampMillis,
+    /// Effects of fenced entries with no active lease, including ones an
+    /// earlier request fenced: settle these at the outbox, then finalize
+    /// them.
+    pub awaiting_settlement: Vec<AgentEffectId>,
+    /// Entries with an active lease, fenced and left to their worker.
+    pub in_flight_entries: usize,
+    /// Entries already finished before the request.
+    pub already_terminal_entries: usize,
 }
 
 /// What one [`AgentDispatcherFleet::prune_terminal`] did.
@@ -1567,19 +1615,33 @@ where
         })
     }
 
-    /// Marks claimable dispatch entries for a run cancelled in the fleet index.
+    /// Fences every unfinished entry of a run against being claimed.
     ///
-    /// Active leases are not forcibly completed. They are marked cancellation
-    /// requested and left for the worker's in-flight side effect to finish
-    /// truthfully; a cancellation-requested entry is never claimable again,
-    /// and if its lease expires it is finalized by
-    /// [`Self::finalize_run_cancellations`]. This pass updates only the fleet
-    /// index — use [`AgentDispatcherWorker::cancel_run_dispatches`] to also
-    /// settle the cancelled effects at the durable outbox layer.
-    pub async fn cancel_run_dispatches(
+    /// This is the first of a cancellation's three steps, and it finishes
+    /// nothing. Each unfinished entry of the run is marked
+    /// `cancellation_requested`, which makes it never claimable again. The
+    /// caller then settles the rows of the entries that have no active
+    /// lease ([`AgentDispatcherCancellationRequest::awaiting_settlement`])
+    /// at the durable outbox layer, and only then finishes them with
+    /// [`Self::finalize_run_cancellations`]. In that order a fleet entry is
+    /// never finished before its outbox row is, which is what lets
+    /// [`Self::prune_terminal`] remove a finished entry at any time.
+    ///
+    /// An entry with an active lease is left to its worker, which may still
+    /// finish and record a truthful completion; it is also given the code
+    /// `cancellation-requested`. An entry without one keeps the code it had.
+    ///
+    /// A caller that stops after this step leaves fenced, unfinished
+    /// entries: no worker claims them and no prune removes them, and the
+    /// next request or [`AgentDispatcherWorker::refresh_run`] for the run
+    /// lists them again. One write, and none when nothing changed.
+    ///
+    /// Use [`AgentDispatcherWorker::cancel_run_dispatches`] for the three
+    /// steps together.
+    pub async fn request_run_cancellation(
         &mut self,
         run_id: &AgentRunId,
-    ) -> AgentDispatcherResult<AgentDispatcherCancellation> {
+    ) -> AgentDispatcherResult<AgentDispatcherCancellationRequest> {
         if self.record.is_none() {
             self.recover().await?;
         }
@@ -1587,11 +1649,9 @@ where
         let now = current_agent_timestamp(&self.clock);
         let record = self.current_record()?;
         let mut next = record.state;
-        let mut cancelled_entries = 0;
+        let mut fenced_entries = 0;
         let mut already_terminal_entries = 0;
         let mut in_flight_entries = 0;
-        let mut cancelled_effect_ids = Vec::new();
-        let mut changed = false;
 
         for entry in next
             .entries
@@ -1600,47 +1660,54 @@ where
         {
             if entry.status.is_terminal() {
                 already_terminal_entries += 1;
-            } else if entry.is_in_flight_at(now) {
+                continue;
+            }
+            let in_flight = entry.is_in_flight_at(now);
+            if in_flight {
                 in_flight_entries += 1;
+            }
+            if !entry.cancellation_requested {
                 entry.cancellation_requested = true;
-                entry.last_error_code = Some("cancellation-requested".to_string());
+                if in_flight {
+                    entry.last_error_code = Some(CANCELLATION_REQUESTED.to_string());
+                }
                 entry.updated_at = now;
-                changed = true;
-            } else {
-                let updated = entry.clone().mark_cancelled(now);
-                *entry = updated;
-                cancelled_effect_ids.push(entry.effect_id.clone());
-                cancelled_entries += 1;
-                changed = true;
+                fenced_entries += 1;
             }
         }
 
-        if changed {
+        let awaiting_settlement = next.cancellations_awaiting_settlement(run_id, now);
+        if fenced_entries > 0 {
             next.updated_at = now;
             self.persist(record.revision, next).await?;
             self.record_gauges(now);
         }
-        self.record_metric("cancel", "cancelled", "none", cancelled_entries as u64);
-        Ok(AgentDispatcherCancellation {
+        self.record_metric("cancel", "requested", "none", fenced_entries as u64);
+        Ok(AgentDispatcherCancellationRequest {
             run_id: run_id.clone(),
-            cancelled_at: now,
-            cancelled_entries,
-            already_terminal_entries,
+            requested_at: now,
+            awaiting_settlement,
             in_flight_entries,
-            cancelled_effect_ids,
+            already_terminal_entries,
         })
     }
 
-    /// Finalizes cancellation-requested entries for one run whose leases are
-    /// no longer active, returning the effect ids to settle at the durable
-    /// outbox layer.
+    /// Finishes the named entries of a run as cancelled, returning the
+    /// effects it finished.
     ///
-    /// A cancellation-requested entry whose worker completes normally records
-    /// a truthful terminal outcome instead; this pass only converges entries
-    /// whose worker crashed or lost its lease after cancellation.
+    /// The last of a cancellation's three steps: `settled` names the effects
+    /// whose outbox rows the caller has settled. An entry is finished only
+    /// when it is named, belongs to the run, was fenced by
+    /// [`Self::request_run_cancellation`], is not already finished, and has
+    /// no active lease. Anything else named is left as it is, so a caller
+    /// cannot finish an entry whose row it did not settle by naming one
+    /// whose lease lapsed since it asked.
+    ///
+    /// One write, and none when it finishes nothing.
     pub async fn finalize_run_cancellations(
         &mut self,
         run_id: &AgentRunId,
+        settled: &[AgentEffectId],
     ) -> AgentDispatcherResult<Vec<AgentEffectId>> {
         if self.record.is_none() {
             self.recover().await?;
@@ -1653,9 +1720,8 @@ where
 
         for entry in next.entries.values_mut().filter(|entry| {
             &entry.run_id == run_id
-                && entry.cancellation_requested
-                && !entry.status.is_terminal()
-                && !entry.is_in_flight_at(now)
+                && entry.awaits_cancellation_settlement(now)
+                && settled.contains(&entry.effect_id)
         }) {
             let updated = entry.clone().mark_cancelled(now);
             *entry = updated;
@@ -1666,13 +1732,13 @@ where
             next.updated_at = now;
             self.persist(record.revision, next).await?;
             self.record_gauges(now);
-            self.record_metric(
-                "cancel",
-                "finalized",
-                "lease-expired",
-                finalized_effect_ids.len() as u64,
-            );
         }
+        self.record_metric(
+            "cancel",
+            "cancelled",
+            "none",
+            finalized_effect_ids.len() as u64,
+        );
         Ok(finalized_effect_ids)
     }
 
@@ -2385,17 +2451,31 @@ where
 
     /// Refreshes due effects for one run.
     ///
-    /// Cancellation-requested entries whose leases expired are finalized as
-    /// cancelled before registration, and every cancelled fleet entry whose
-    /// outbox message is still unsettled is settled as cancelled — so a
-    /// cancelled run's effects are never redelivered after a worker crash,
-    /// even one that interrupted an earlier cancellation pass between its
-    /// fleet and outbox writes.
+    /// Before it registers anything, it finishes what a cancellation of the
+    /// run left unfinished: every entry a cancellation request fenced that
+    /// no worker holds any more has its outbox row settled as cancelled and
+    /// is then finished, in that order. So a cancelled run's effects are
+    /// never redelivered after a worker crash, wherever in the cancellation
+    /// the crash fell.
+    ///
+    /// The fleet record is read before the run's outbox, on a handle that
+    /// holds no record yet as on any other. A registration is fenced on the
+    /// fleet revision it writes against, and that only protects it if the
+    /// list of due effects is no older than that revision: a list read
+    /// first could name an effect another worker has since run, finished
+    /// and pruned, and registering it would put a finished effect back.
+    ///
+    /// A fleet entry that is already `Cancelled` while its outbox row is
+    /// still unsettled is what a build from before this order could leave
+    /// behind; its row is settled here too.
     pub async fn refresh_run(
         &mut self,
         run_id: AgentRunId,
         workflow_id: Option<AgentWorkflowId>,
     ) -> AgentDispatcherResult<AgentDispatcherRegistration> {
+        if self.fleet.state().is_err() {
+            self.fleet.recover().await?;
+        }
         let mut inbox = AgentRunInbox::with_clock_and_metrics(
             run_id.clone(),
             self.workflow_store.clone(),
@@ -2403,7 +2483,20 @@ where
             self.metrics.clone(),
         );
         inbox.recover().await?;
-        self.fleet.finalize_run_cancellations(&run_id).await?;
+
+        let now = current_agent_timestamp(&self.clock);
+        let awaiting_settlement = self
+            .fleet
+            .state()?
+            .cancellations_awaiting_settlement(&run_id, now);
+        if !awaiting_settlement.is_empty() {
+            self.settle_cancelled_effects(&mut inbox, &awaiting_settlement, "dispatch-cancelled")
+                .await?;
+            self.fleet
+                .finalize_run_cancellations(&run_id, &awaiting_settlement)
+                .await?;
+        }
+
         let cancelled_effect_ids: Vec<AgentEffectId> = self
             .fleet
             .state()?
@@ -2425,17 +2518,25 @@ where
     /// Cancels a run's dispatch entries and settles the cancelled effects at
     /// the durable outbox layer.
     ///
-    /// Unclaimed entries are marked cancelled in both the fleet index and the
-    /// run's durable outbox, so they are never dispatched and their durable
-    /// state converges. Actively leased entries are marked cancellation
-    /// requested and left for the in-flight side effect to finish truthfully
-    /// or be finalized after lease expiry by [`Self::refresh_run`].
+    /// Three steps, in this order: the run's unfinished entries are fenced
+    /// against being claimed
+    /// ([`AgentDispatcherFleet::request_run_cancellation`]); the outbox rows
+    /// of the fenced entries no worker holds are settled as cancelled; and
+    /// those entries are finished
+    /// ([`AgentDispatcherFleet::finalize_run_cancellations`]). A fleet entry
+    /// is therefore never finished before its outbox row is.
+    ///
+    /// Actively leased entries are fenced and left for the in-flight side
+    /// effect to finish truthfully, or to be settled and finished after
+    /// lease expiry by [`Self::refresh_run`]. A crash between any two steps
+    /// leaves fenced, unfinished entries, which that same refresh finishes.
     pub async fn cancel_run_dispatches(
         &mut self,
         run_id: &AgentRunId,
     ) -> AgentDispatcherResult<AgentDispatcherCancellation> {
-        let cancellation = self.fleet.cancel_run_dispatches(run_id).await?;
-        if !cancellation.cancelled_effect_ids.is_empty() {
+        let request = self.fleet.request_run_cancellation(run_id).await?;
+        let mut cancelled_effect_ids = Vec::new();
+        if !request.awaiting_settlement.is_empty() {
             let mut inbox = AgentRunInbox::with_clock_and_metrics(
                 run_id.clone(),
                 self.workflow_store.clone(),
@@ -2445,12 +2546,23 @@ where
             inbox.recover().await?;
             self.settle_cancelled_effects(
                 &mut inbox,
-                &cancellation.cancelled_effect_ids,
+                &request.awaiting_settlement,
                 "run-cancelled",
             )
             .await?;
+            cancelled_effect_ids = self
+                .fleet
+                .finalize_run_cancellations(run_id, &request.awaiting_settlement)
+                .await?;
         }
-        Ok(cancellation)
+        Ok(AgentDispatcherCancellation {
+            run_id: request.run_id,
+            cancelled_at: request.requested_at,
+            cancelled_entries: cancelled_effect_ids.len(),
+            already_terminal_entries: request.already_terminal_entries,
+            in_flight_entries: request.in_flight_entries,
+            cancelled_effect_ids,
+        })
     }
 
     /// Settles cancelled effects at the durable outbox layer.
