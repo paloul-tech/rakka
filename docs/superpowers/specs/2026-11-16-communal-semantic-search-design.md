@@ -17,6 +17,8 @@ After this change a deployment can rank a knowledge space's claims by meaning: e
 - In PostgreSQL the word index is four nullable columns on the claim row (`search_tokens`, `search_classification`, `search_confidence_bps`, `search_read_capabilities`), filled inside the append. A trigger clears a tombstoned row's words. `index_claims` fills rows an earlier build appended.
 - `KnowledgeGraphCommunalRetriever` (`communal_retrieval.rs`) serves `rakka-agent`'s port `AgentCommunalClaimRetriever` from any store with `keyword-search`. It reports retriever version 1.
 - `KnowledgeGraphClaimAppendExecutor` (`append_executor.rs`) appends a run's claim as an idempotent, retried effect.
+- `Claim.embedding: Option<MemoryEmbeddingRef>` is a field of the authoritative record. A caller may set it at append (`with_embedding`); nothing reads it, and a tombstone clears it. No vector is stored anywhere.
+- A claim's classification is one of `Unclassified`, `Sensitive` and `Redacted`. A read policy admits `Unclassified` alone unless a deployment widens it.
 - Context assembly in `rakka-agent` takes whatever ranking the retriever answers, resolves every ranked identity through the authority, re-checks it, evaluates it at memory ingress, and embeds it in the snapshot. It records the retriever's name and version and `index_incomplete`. **Assembly does not change.**
 - The private tier already ranks by meaning: `AgentMemoryEmbedder` (a model identity `MemoryEmbeddingRef { model, dimensions, version }` and `embed(text)`), `embed_memory_vector` (the shared length and finiteness check), and `PgvectorPrivateMemoryRetriever` in `rakka-agent-postgres`, which ships an exact scan and maps cosine distance `d` to relevance `(1 - d/2) * 10000` basis points.
 - The CI database image is `pgvector/pgvector:pg16`. A local database may have no `vector` extension.
@@ -41,6 +43,8 @@ After this change a deployment can rank a knowledge space's claims by meaning: e
 - A metric for embeddings that failed at append.
 - A time bound on the embedder call. The embedder is the deployment's.
 - Embedding artifact-backed object content. This crate never loads artifact bytes.
+- Fixing the same wedge in the private tier's `reindex`, which stops on a model error.
+- Keeping `Claim.embedding` in step with the stored embedding (6.2).
 - Any change to context assembly, to the snapshot's shape, or to the `AgentCommunalClaimRetriever` port.
 
 **Anti-goals**
@@ -94,7 +98,7 @@ After this change a deployment can rank a knowledge space's claims by meaning: e
 - **`ClaimEmbedding { reference: MemoryEmbeddingRef, vector: Vec<f32> }`**, with a `validate` that refuses a vector whose length is not `reference.dimensions`, a non-finite component, zero dimensions, or more than `CLAIM_EMBEDDING_MAX_DIMENSIONS` (16000, pgvector's own ceiling). It reuses the existing `claim-embedding-invalid` code.
 - **`ClaimSemanticSearch`**: a `ClaimSearch` (its trust set, classifications, confidence floor, reader capabilities, limit and `admits`) together with the query's `ClaimEmbedding`.
 - **`claim_semantic_relevance_bps(query, candidate) -> u16`**: cosine similarity mapped as the private tier maps it, `((1 + cos) / 2) * 10000` rounded, and 0 when either vector has zero magnitude. One function, so backends score alike.
-- **The answer is the existing `ClaimSearchReport { hits, unindexed }`.** Hits are ordered by relevance, highest first, then by claim id.
+- **The answer is the existing `ClaimSearchReport { hits, unindexed }`.** Hits are ordered by relevance, highest first, then by claim id. A candidate that scores 0 is not a hit: its vector, or the query's, has no direction, or the two point exactly opposite ways. That keeps the type's rule that a hit's relevance is never zero. *(My call.)*
 
 ### 6.2 The store SPI (`KnowledgeGraphStore`)
 
@@ -104,7 +108,7 @@ Three optional operations. A backend that reports `semantic-search` implements a
 |---|---|
 | `search_semantic(scope, &ClaimSemanticSearch) -> ClaimSearchReport` | Admits, then ranks. A candidate is a live claim of the scope that the search admits and whose stored embedding has the query's reference. `unindexed` is true when the scope holds a live claim the search admits, or cannot judge, that has no embedding under that reference. |
 | `store_claim_embedding(scope, &ClaimId, &ClaimEmbedding) -> bool` | Stores or replaces the claim's one embedding. Answers `false` and stores nothing when the scope holds no such claim or the claim is tombstoned. It refuses an invalid embedding. It is idempotent. |
-| `unembedded_claims(scope, &MemoryEmbeddingRef, after: Option<&ClaimId>, limit) -> ClaimEmbeddingPage` | One bounded page, in claim-id order, of the live claims that have no embedding under the reference: none at all, or one from another model, dimension count or version. `ClaimEmbeddingPage { claims, skipped, next }`. `skipped` counts records this build cannot decode. The page is clamped to `CLAIM_EMBEDDING_PAGE_MAX_CLAIMS` (64). |
+| `unembedded_claims(scope, &MemoryEmbeddingRef, classifications, after: Option<&ClaimId>, limit) -> ClaimEmbeddingPage` | One bounded page, in claim-id order, of the claims that should have an embedding under the reference and have none: none at all, or one from another model, dimension count or version. A claim is listed only when it is live, its trust is not `Retracted` (no search ever admits a retracted claim), and its classification is in the set given. `ClaimEmbeddingPage { claims, undecodable, next }`. `undecodable` counts records this build cannot decode; the cursor moves past them. The page is clamped to `CLAIM_EMBEDDING_PAGE_MAX_CLAIMS` (64). |
 
 Rules every backend keeps:
 
@@ -112,6 +116,7 @@ Rules every backend keeps:
 - **One embedding per claim.** Storing under a new reference replaces the old one. A search under one reference never ranks a vector stored under another.
 - **Erasure reaches the embedding.** A tombstone and a delete remove it in the same operation.
 - **The store calls no model** and never returns a vector.
+- **The record is not rewritten.** Storing an embedding changes no byte of the claim's authoritative record, so `Claim.embedding` is not kept in step: it stays whatever the appender set, which is usually nothing. Keeping it in step would make the embedding a second writer of the record, racing a trust transition, and would break the rule that a replayed append answers the claim as first stored. The field's documentation is reworded to say it is the appender's own note and not the state of any index. *(My call.)*
 
 `InMemoryKnowledgeGraphStore` implements the three and reports the capability.
 
@@ -127,14 +132,14 @@ Rules every backend keeps:
 - A row trigger that sets the four columns to null on any inserted or updated row whose `tombstoned` is true and whose `embedding` is not null. The rule therefore holds for an earlier binary's tombstone statement, which names none of them.
 - **No index.** The claim table's primary key leads with tenant and space, which bounds every statement below to one knowledge space.
 
-**Search.** One statement: the scope, `NOT tombstoned`, the embedding's three reference columns, then trust, classification, confidence and read capabilities from the columns the word index already keeps, and only then `ORDER BY` cosine distance, claim id, with the limit. Every returned row is decoded and checked against its own record (`admits`); a row its record does not admit is refused as drift, as the word search does. Relevance is the shared mapping of the database's distance. The answer is re-ranked by the shared rule.
+**Search.** One statement: the scope, `NOT tombstoned`, the embedding's three reference columns, then trust (a column every row has), then classification, confidence and read capabilities from the three columns the word index keeps, and only then `ORDER BY` cosine distance, claim id, with the limit. Every returned row is decoded and checked against its own record (`admits`); a row its record does not admit is refused as drift, as the word search does. Relevance is the shared mapping of the database's distance. The answer is re-ranked by the shared rule.
 
 - A claim an earlier build appended has no filter columns until `index_claims` reaches it. It is not a candidate, and it makes `unindexed` true.
 - Cost is linear in the claims of one knowledge space that pass the filters. The documents say so, and show the deployment-applied approximate index the private tier's documents show.
 
 **Storing.** One `UPDATE` that sets the four columns `WHERE` the scope and claim id match `AND NOT tombstoned`. It answers whether a row was written. A tombstone that commits first leaves nothing to update; one that commits after clears the embedding through the trigger. An earlier binary cannot write the columns: it does not name them.
 
-**The page.** One `SELECT` in claim-id order of live rows whose embedding is null or whose reference differs.
+**The page.** One `SELECT` in claim-id order of live rows, not retracted, of the classifications given, whose embedding is null or whose reference differs. A row with no filter columns (appended before issue #69 and not yet reached by `index_claims`) is not listed: its classification cannot be judged without them.
 
 ### 6.4 The three callers of the embedder (`rakka-agent-knowledge-graph`)
 
@@ -145,15 +150,24 @@ Rules every backend keeps:
   - A failed embedding fails that `retrieve`. Assembly already treats that as a degraded space and continues the turn. There is no per-search fallback to words.
   - `index_incomplete` is the store's `unindexed`.
 - **The append executor.** `KnowledgeGraphClaimAppendExecutor::with_embedder(self, embedder) -> Self`. After the store answers the append (first time or replay), and when the store reports `semantic-search`, it embeds `claim_embedding_text` and stores the result. **Every failure of that step is swallowed**: the finding is still `Appended`. A claim it could not embed is left for the pass.
-- **The pass.** `embed_claims(store, embedder, scope, after, limit) -> ClaimResult<ClaimEmbeddingPassPage { embedded, skipped, next }>`. It reads one page of `unembedded_claims`, embeds each claim and stores it. A deployment calls it until `next` is `None`. It is idempotent and safe while the store serves. A model failure ends the call with the error; what it already stored stays, and a re-run continues. After a model or version change it re-embeds everything, since every claim is then unembedded under the new reference.
+- **The pass.** `embed_claims(store, embedder, classifications, scope, after, limit) -> ClaimResult<ClaimEmbeddingPassPage { embedded, failed, undecodable, next }>`. It reads one page of `unembedded_claims`, embeds each claim and stores it. A deployment calls it until `next` is `None`. It is idempotent and safe while the store serves.
+  - **A claim the model refuses does not stop the pass.** It is counted in `failed` and the cursor moves past it, so one claim a provider always rejects (a content filter, an input it finds too long) cannot keep every later claim of the space unembedded. The same holds for an answer of the wrong length or with a non-finite component. A non-zero `failed` means: run the pass again later. A claim that fails every time stays unembedded, and searches that admit it keep reporting `index_incomplete`. *(My call. The private tier's `reindex` stops on a model error and can be wedged this way.)*
+  - A store failure ends the call with the store's error. What was already stored stays.
+  - After a model or version change it re-embeds everything, since every claim is then unembedded under the new reference.
 
-### 6.5 Which claims are sent to the embedder
+### 6.5 What is sent to the embedder
 
-Embedding a claim sends its text to a model the deployment chose, which may be outside the deployment. *(Proposed; see the questions for the owner.)*
+Embedding sends text to a model the deployment chose, which may be outside the deployment. Two kinds of text are sent.
 
-- The executor and the pass take the set of classifications they may embed. The default is `Unclassified` alone, which is also the default a read policy admits.
-- A claim outside the set is never sent. It has no embedding, so a meaning-based search does not find it.
-- `unindexed` is judged against the search's own filters (6.2). So a search that does not admit `Restricted` claims is not marked incomplete because `Restricted` claims were left unembedded, and one that does admit them is.
+**Claims.** The executor and the pass take the set of classifications they may embed.
+
+- **OPEN, for the owner:** what that set is when a deployment does not state one. See the question put to the owner with this design.
+- A `Redacted` claim is never sent, whatever the set says. The private tier never embeds redacted content either. *(My call.)*
+- A `Retracted` claim is not sent: no search ever admits one. One that is retracted after it was embedded keeps its vector, which no search can reach. *(My call.)*
+- A claim outside the set has no embedding, so a meaning-based search does not find it. Word-match search would have. A deployment whose read policy admits a classification must also let it be embedded, or lose those claims when it switches the retriever to meaning.
+- `unindexed` is judged against the search's own filters (6.2). So a search that does not admit `Sensitive` claims is not marked incomplete because `Sensitive` claims were left unembedded. One that does admit them is marked incomplete for as long as they are, which is the sign of the mismatch above.
+
+**The query.** Wiring the embedder into the retriever sends the query text to the model on every turn that searches. The query is derived from the run's recent session entries, up to 1024 bytes, with no classification filter: it is conversation text, not a claim. The private tier's meaning-based retrieval already does the same with its own embedder. The documents say this plainly.
 
 ### 6.6 What a deployment sees
 
@@ -190,7 +204,8 @@ Embedding a claim sends its text to a model the deployment chose, which may be o
 5. `unindexed` follows the search's filters: an unembedded claim the search does not admit does not set it.
 6. `store_claim_embedding` is idempotent, replaces an embedding under another reference, answers `false` for an absent or tombstoned claim and for a claim of another scope, and refuses an invalid embedding.
 7. A tombstone removes the embedding: the claim is no longer found, is not listed by `unembedded_claims`, and cannot be given an embedding again. A delete does the same.
-8. `unembedded_claims` pages in claim-id order, keeps its clamp, and resumes from its cursor.
+8. `unembedded_claims` pages in claim-id order, keeps its clamp, resumes from its cursor, and lists no retracted claim and no claim outside the classifications given.
+8a. Storing an embedding changes no byte of the claim's record: `get` answers the claim exactly as before.
 
 **The callers**, against the in-memory store:
 
@@ -200,8 +215,8 @@ Embedding a claim sends its text to a model the deployment chose, which may be o
 12. A failed query embedding fails the `retrieve` and falls back to nothing.
 13. The append executor embeds a fresh claim; a search finds it with no pass.
 14. An embedder that fails, or answers a wrong-length vector, does not fail the append. The claim is left unembedded.
-15. The executor and the pass send no claim outside their classification set.
-16. `embed_claims` embeds what is missing, is idempotent, re-embeds after a reference change, and resumes from its cursor.
+15. The executor and the pass send no claim outside their classification set, never a `Redacted` one, and never a `Retracted` one.
+16. `embed_claims` embeds what is missing, is idempotent, re-embeds after a reference change, and resumes from its cursor. A claim the embedder refuses is counted in `failed` and does not stop the claims after it.
 
 **PostgreSQL**, gated on `RAKKA_POSTGRES_TEST_DSN`, with the pgvector clauses gated the way the private tier's are (`RAKKA_POSTGRES_PGVECTOR_REQUIRED=1` makes a skip a failure):
 
@@ -214,7 +229,7 @@ Embedding a claim sends its text to a model the deployment chose, which may be o
 
 **End to end**, in `examples/multi-agent-goal-acceptance` over real sharded entities:
 
-23. One agent appends a claim; another, granted its space, gets it in its turn's snapshot from a query that shares no word with it, with `retriever_version` 2.
+23. One agent appends a claim, which the append effect embeds. The claim is promoted to `Verified` directly on the store, as the existing `communal_read_path.rs` does, because the example's read policy admits verified claims only. Another agent, granted its space, then gets it in its turn's snapshot from a query that shares no word with it, with `retriever_version` 2.
 
 ## 9. Documents
 
