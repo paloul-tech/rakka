@@ -2635,7 +2635,10 @@ where
     ///
     /// It reads the run's outbox and the run, and reads and writes the fleet
     /// record only when the outbox has a due ticket — and writes it only when
-    /// registration inserts or changes an entry.
+    /// registration inserts or changes an entry. When it does read the fleet
+    /// record, it reads the run's outbox once more afterwards and registers
+    /// what that read finds due, so a ticket finished between the two reads
+    /// is never registered again.
     pub async fn register_run(
         &mut self,
         scope: &AgentRunScope,
@@ -2671,18 +2674,33 @@ where
         // Register the run's due dispatch tickets into the fleet.
         let mut inbox = self.inbox(scope);
         inbox.recover().await?;
-        let due = inbox.due_effects()?;
-        let fleet_current = !due.is_empty();
+        // This first read only decides whether the fleet record is read at
+        // all: a run with nothing due costs no read of the shared record.
+        let fleet_current = !inbox.due_effects()?.is_empty();
         if fleet_current {
             // Read here, not once per worker: the registration's
             // compare-and-set is fenced on the revision it read, and a
             // long-lived worker's copy is whatever its last pass left.
             self.fleet.recover().await?;
-            let registration = self
-                .fleet
-                .register_due_effects(workflow_run_id(scope), None, due)
-                .await?;
-            pass.registered = registration.registered_effects;
+            // The list that is registered is read after the fleet record,
+            // never before it. The fence only protects a registration whose
+            // due list is no older than the revision it writes against: a
+            // list read first can name a ticket that another worker has
+            // since claimed, run and settled, and whose finished entry a
+            // prune has since removed. Registering it would put a finished
+            // effect back in the fleet. Read in this order, either nothing
+            // wrote the fleet after this read, and the list is newer than
+            // every finished entry and every prune it could miss; or
+            // something did, and the write below loses.
+            inbox.recover().await?;
+            let due = inbox.due_effects()?;
+            if !due.is_empty() {
+                let registration = self
+                    .fleet
+                    .register_due_effects(workflow_run_id(scope), None, due)
+                    .await?;
+                pass.registered = registration.registered_effects;
+            }
         }
 
         // Fence a winding-down run at the dispatch layer before anything can

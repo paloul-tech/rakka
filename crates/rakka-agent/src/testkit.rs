@@ -3892,7 +3892,15 @@ where
     /// Whether an armed conflict repeats on every write after the armed one
     /// ([`CrashingStateStore::conflict_from`]) rather than firing once.
     persistent: Arc<std::sync::atomic::AtomicBool>,
+    /// The work to run before the next load answers
+    /// ([`CrashingStateStore::before_next_load`]).
+    before_load: Arc<std::sync::Mutex<Option<StoreLoadHook>>>,
 }
+
+/// A one-shot piece of work a [`CrashingStateStore`] runs before its next
+/// load answers: what another writer does between two of the owner's reads.
+pub type StoreLoadHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
 impl<S> Clone for CrashingStateStore<S>
 where
@@ -3906,6 +3914,7 @@ where
             crash_after: self.crash_after.clone(),
             conflict: self.conflict.clone(),
             persistent: self.persistent.clone(),
+            before_load: self.before_load.clone(),
         }
     }
 }
@@ -3945,7 +3954,25 @@ where
             crash_after: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             conflict: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             persistent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            before_load: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Runs `hook` once, before the next load of this store answers.
+    ///
+    /// A reader that makes two reads, of this store or of this one and
+    /// another, can have a second writer land between them. This is how a
+    /// test puts one there: the hook is whatever that writer does, and the
+    /// load that fires it answers with what the hook left behind.
+    ///
+    /// The hook is taken before it runs, so loads it makes of this same
+    /// store do not fire it again. Loads are otherwise never counted and
+    /// never crash.
+    pub fn before_next_load(&self, hook: StoreLoadHook) {
+        *self
+            .before_load
+            .lock()
+            .expect("the hook slot is not poisoned") = Some(hook);
     }
 
     /// Kills the owner at the `nth` write from now on, and resets the counter.
@@ -4029,7 +4056,17 @@ where
         &'a self,
         persistence_id: &'a rakka_persistence::PersistenceId,
     ) -> rakka_persistence::StoreFuture<'a, Option<rakka_persistence::StateRecord<S>>> {
-        self.inner.load(persistence_id)
+        Box::pin(async move {
+            let hook = self
+                .before_load
+                .lock()
+                .expect("the hook slot is not poisoned")
+                .take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+            self.inner.load(persistence_id).await
+        })
     }
 
     fn compare_and_set<'a>(
