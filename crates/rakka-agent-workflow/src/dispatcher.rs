@@ -48,6 +48,14 @@ pub const METRIC_AGENT_DISPATCHER_IN_FLIGHT: &str = "rakka.agent_workflow.dispat
 /// Gauge for due dispatcher work that could not be claimed in one pass.
 pub const METRIC_AGENT_DISPATCHER_BACKLOG: &str = "rakka.agent_workflow.dispatcher.backlog";
 
+/// Gauge for the entries the fleet record holds, by dispatch status.
+///
+/// One sample per [`AgentDispatchStatus`] under the label `status`, a status
+/// with no entries reported as zero. The finished statuses are what a
+/// deployment that never calls [`AgentDispatcherFleet::prune_terminal`]
+/// watches grow.
+pub const METRIC_AGENT_DISPATCHER_ENTRIES: &str = "rakka.agent_workflow.dispatcher.entries";
+
 /// How many more times a fleet write that lost its compare-and-set is read
 /// again and re-applied before the loss is returned.
 ///
@@ -491,6 +499,16 @@ pub enum AgentDispatchStatus {
 }
 
 impl AgentDispatchStatus {
+    /// Every dispatch status, in declaration order.
+    pub const ALL: [Self; 6] = [
+        Self::Pending,
+        Self::Claimed,
+        Self::Completed,
+        Self::RetryScheduled,
+        Self::Exhausted,
+        Self::Cancelled,
+    ];
+
     /// Stable lowercase label for diagnostics and metrics.
     #[must_use]
     pub const fn as_label(self) -> &'static str {
@@ -1901,6 +1919,18 @@ where
                 state.due_dispatch_count(now) as f64,
                 &[],
             );
+            for status in AgentDispatchStatus::ALL {
+                let held = state
+                    .entries
+                    .values()
+                    .filter(|entry| entry.status == status)
+                    .count();
+                self.metrics.record_gauge(
+                    METRIC_AGENT_DISPATCHER_ENTRIES,
+                    held as f64,
+                    &[("status", status.as_label())],
+                );
+            }
         }
     }
 }

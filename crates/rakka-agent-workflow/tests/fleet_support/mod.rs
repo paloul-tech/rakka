@@ -363,6 +363,11 @@ impl Default for World {
 
 /// A tool-call effect due at the instant [`clock`] starts at.
 pub fn tool_effect(effect_id: &str) -> AgentEffect {
+    tool_effect_due(effect_id, 100)
+}
+
+/// A tool-call effect due at `due_at`.
+pub fn tool_effect_due(effect_id: &str, due_at: u64) -> AgentEffect {
     let durability = AgentDurabilityMetadata::new(
         AgentDeduplicationKey::new(format!("dedupe-{effect_id}")),
         AgentCausationId::new(format!("cause-{effect_id}")),
@@ -375,7 +380,7 @@ pub fn tool_effect(effect_id: &str) -> AgentEffect {
         AgentTimestampMillis::new(100),
     )
     .expect("effect metadata should be valid")
-    .due_at(AgentTimestampMillis::new(100));
+    .due_at(AgentTimestampMillis::new(due_at));
     let target = AgentEffectTarget {
         target_type: "tool".to_string(),
         name: "research-tool".to_string(),
@@ -390,17 +395,27 @@ pub fn tool_effect(effect_id: &str) -> AgentEffect {
         .expect("effect should validate")
 }
 
-/// Schedules one tool-call effect into a run's outbox.
+/// Schedules one tool-call effect, due now, into a run's outbox.
 pub async fn schedule(
     store: &WorkflowStore,
     clock: &ManualWorkflowClock,
     run_id: &AgentRunId,
     effect_id: &str,
 ) {
+    schedule_effect(store, clock, run_id, tool_effect(effect_id)).await;
+}
+
+/// Schedules one effect into a run's outbox.
+pub async fn schedule_effect(
+    store: &WorkflowStore,
+    clock: &ManualWorkflowClock,
+    run_id: &AgentRunId,
+    effect: AgentEffect,
+) {
     let mut inbox = AgentRunInbox::with_clock(run_id.clone(), store.clone(), clock.clone());
     inbox.recover().await.expect("inbox should recover");
     inbox
-        .schedule_effect(tool_effect(effect_id))
+        .schedule_effect(effect)
         .await
         .expect("effect should schedule");
 }

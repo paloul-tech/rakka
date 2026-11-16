@@ -133,6 +133,14 @@ async fn dispatcher_load_claims_bounded_work_and_keeps_metric_series_bounded() {
     assert!(metric_series_count(&snapshot, METRIC_AGENT_DISPATCHER_FLEET) <= 2);
     assert!(metric_series_count(&snapshot, METRIC_AGENT_DISPATCHER_IN_FLIGHT) <= 1);
     assert!(metric_series_count(&snapshot, METRIC_AGENT_DISPATCHER_BACKLOG) <= 1);
+    // One series per dispatch status, whatever the number of entries.
+    assert_eq!(
+        metric_series_count(
+            &snapshot,
+            rakka_agent_workflow::METRIC_AGENT_DISPATCHER_ENTRIES
+        ),
+        6
+    );
 }
 
 #[tokio::test]
