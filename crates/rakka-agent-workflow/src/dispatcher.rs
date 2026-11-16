@@ -171,7 +171,9 @@ pub enum AgentDispatcherError {
         /// Dispatch id.
         dispatch_id: AgentDispatchId,
     },
-    /// Requested dispatch work is not currently claimable.
+    /// The claimed work has nothing to dispatch: its outbox row is already
+    /// finished, or the run's outbox holds no row for it. The claim's fleet
+    /// entry was settled to match, and nothing was dispatched.
     ClaimUnavailable {
         /// Dispatch id.
         dispatch_id: AgentDispatchId,
@@ -245,7 +247,10 @@ impl Display for AgentDispatcherError {
                 write!(f, "agent dispatch entry {dispatch_id} was not found")
             }
             Self::ClaimUnavailable { dispatch_id } => {
-                write!(f, "agent dispatch entry {dispatch_id} is not claimable")
+                write!(
+                    f,
+                    "agent dispatch entry {dispatch_id} has nothing to dispatch: its outbox row is finished or absent"
+                )
             }
             Self::ClaimFenced {
                 dispatch_id,
@@ -2484,6 +2489,15 @@ where
     }
 
     /// Dispatches one current claim.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentDispatcherError::ClaimUnavailable`] (`claim-unavailable`) when
+    /// the claim's outbox row is already finished or absent. Nothing is
+    /// dispatched, and the fleet entry is settled to match the row through
+    /// [`AgentDispatcherFleet::settle_claim_from_row`], so the ticket is not
+    /// claimed again. [`AgentDispatcherError::ClaimFenced`] when the claim is
+    /// no longer current, before or after the dispatch.
     pub async fn dispatch_claim<D>(
         &mut self,
         claim: AgentDispatchClaim,
@@ -2508,6 +2522,41 @@ where
             self.metrics.clone(),
         );
         inbox.recover().await?;
+
+        // The outbox row is the authority on whether this effect is done.
+        // A claim can outlive it: a crash, or a fleet write lost for good,
+        // between the outbox success and the fleet completion leaves the row
+        // finished and the entry claimable again once its lease lapses.
+        // Marking such a row `Dispatching` would run the effect a second
+        // time, so a finished or absent row is never dispatched. The entry
+        // is settled to match it instead, and the claim is over.
+        let row = inbox
+            .inner()
+            .state()
+            .map_err(AgentDispatcherError::from)?
+            .outbox_entry(&message_id)
+            .cloned();
+        let finished = row.as_ref().is_none_or(|row| {
+            matches!(
+                row.status(),
+                OutboxStatus::Dispatched | OutboxStatus::Exhausted | OutboxStatus::Cancelled
+            )
+        });
+        if finished {
+            let detail = if row.is_some() {
+                TICKET_ROW_SETTLED
+            } else {
+                TICKET_ROW_MISSING
+            };
+            self.fleet
+                .settle_claim_from_row(&claim, row.as_ref())
+                .await?;
+            self.fleet.record_metric("dispatch", "skipped", detail, 1);
+            return Err(AgentDispatcherError::ClaimUnavailable {
+                dispatch_id: claim.dispatch_id,
+            });
+        }
+
         let entry = inbox
             .inner_mut()
             .mark_outbox_dispatching(&message_id)
@@ -2571,6 +2620,10 @@ where
     }
 
     /// Runs one bounded worker cycle over a provided run set.
+    ///
+    /// A claim whose outbox row was already finished or absent is settled
+    /// and passed over: it is counted among the cycle's claims and not among
+    /// its completions.
     pub async fn run_once<D>(
         &mut self,
         run_ids: impl IntoIterator<Item = AgentRunId>,
@@ -2587,7 +2640,14 @@ where
         let claims = self.claim_due().await?;
         let mut completions = Vec::new();
         for claim in claims.claims.clone() {
-            completions.push(self.dispatch_claim(claim, dispatcher).await?);
+            match self.dispatch_claim(claim, dispatcher).await {
+                Ok(completion) => completions.push(completion),
+                // The claim's row was already finished or gone: its entry
+                // was settled to match and nothing was dispatched, which is
+                // not a failure of the cycle.
+                Err(AgentDispatcherError::ClaimUnavailable { .. }) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(AgentDispatcherCycle {
             registrations,
