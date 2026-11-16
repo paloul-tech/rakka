@@ -5056,6 +5056,11 @@ fn narrowed_delegation_budget(
 /// carries no goal narrowing and no chain, but still carries its
 /// definition's own ceilings when the definition declares any: without an
 /// envelope the delegation door would enforce nothing for these runs.
+///
+/// A handoff that was not refused then narrows the communal grant to what
+/// the catalog states for the target, for every one of those shapes. A task
+/// that had no envelope gets a root one for that purpose, which carries the
+/// two grants and narrows nothing else.
 fn delegation_envelope_for(
     task: &AgentTask,
 ) -> Option<Box<crate::delegation::AgentRunDelegationEnvelope>> {
@@ -5074,33 +5079,34 @@ fn delegation_envelope_for(
         .as_deref()
         .filter(|handoff| !matches!(handoff.status, AgentTaskHandoffStatus::Refused { .. }))
     {
-        // A task with no base envelope gets none here either, so its handoff
-        // narrows nothing: the target's run is bounded by its own agent's
-        // definition and setup alone, for communal appends as for reads.
-        // That is how knowledge spaces behaved before read capabilities
-        // joined them, it is pinned by
-        // `a_plain_task_with_no_envelope_is_not_narrowed_by_its_handoff`, and
-        // closing it means synthesizing a root envelope for such a task,
-        // which changes what its target may append.
-        if let Some(env) = envelope.as_deref_mut() {
-            // The delegation door's own rule, shared with it: a statement the
-            // task holds is intersected; a chain without one cannot prove
-            // what it may pass on and grants nothing; at the root the
-            // definition envelope still bounds everything, and the catalog's
-            // explicit statement becomes the grant. Read capabilities ride
-            // the same rule as knowledge spaces.
-            let has_lineage = !env.lineage.is_empty();
-            env.knowledge_spaces = Some(crate::delegation::delegated_grant(
-                &handoff.knowledge_spaces,
-                env.knowledge_spaces.as_ref(),
-                has_lineage,
-            ));
-            env.read_capabilities = Some(crate::delegation::delegated_grant(
-                &handoff.read_capabilities,
-                env.read_capabilities.as_ref(),
-                has_lineage,
-            ));
-        }
+        // A task with no base envelope is a plain or epoch task: a root with
+        // no statement of its own. It is given the default envelope here, so
+        // that the catalog's statement becomes the target's grant for it as
+        // for every other task. Without that the step had nothing to narrow,
+        // and the target read and appended under its own agent's whole
+        // grant, whatever the catalog stated (issue #142). The default
+        // envelope narrows nothing else: no skill, tool, workflow or
+        // environment set, no ceiling, no lineage, depth zero, no deadline.
+        // A refused transfer never reaches here, so the restored source
+        // keeps no envelope.
+        let env = envelope.get_or_insert_with(Default::default);
+        // The delegation door's own rule, shared with it: a statement the
+        // task holds is intersected; a chain without one cannot prove what
+        // it may pass on and grants nothing; at the root the definition
+        // envelope still bounds everything, and the catalog's explicit
+        // statement becomes the grant. Read capabilities ride the same rule
+        // as knowledge spaces.
+        let has_lineage = !env.lineage.is_empty();
+        env.knowledge_spaces = Some(crate::delegation::delegated_grant(
+            &handoff.knowledge_spaces,
+            env.knowledge_spaces.as_ref(),
+            has_lineage,
+        ));
+        env.read_capabilities = Some(crate::delegation::delegated_grant(
+            &handoff.read_capabilities,
+            env.read_capabilities.as_ref(),
+            has_lineage,
+        ));
     }
     envelope
 }

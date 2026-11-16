@@ -920,19 +920,39 @@ fn read_capabilities(ids: &[&str]) -> std::collections::BTreeSet<rakka_agent::Ag
         .collect()
 }
 
-/// The handoff fixture's wiring with a catalog that states the read
-/// capabilities the handoff target is delegated.
-fn handoff_config_delegating_reads(ids: &[&str]) -> rakka_agent::AgentRunDelegationConfig {
-    let mut target = common::handoff_target();
-    for capability in read_capabilities(ids) {
+fn knowledge_spaces(ids: &[&str]) -> std::collections::BTreeSet<rakka_agent::KnowledgeSpaceId> {
+    ids.iter()
+        .map(|id| rakka_agent::KnowledgeSpaceId::new(*id).expect("the space id is valid"))
+        .collect()
+}
+
+/// A catalog target with the communal access the catalog states for it.
+fn stating(
+    mut target: rakka_agent::AgentDelegationTarget,
+    spaces: &[&str],
+    reads: &[&str],
+) -> rakka_agent::AgentDelegationTarget {
+    for space in knowledge_spaces(spaces) {
+        target = target.with_knowledge_space(space);
+    }
+    for capability in read_capabilities(reads) {
         target = target.with_read_capability(capability);
     }
+    target
+}
+
+/// The handoff fixture's wiring with a catalog that resolves the delegation
+/// skill and the handoff skill to the two targets given.
+fn handoff_config_with(
+    delegation: rakka_agent::AgentDelegationTarget,
+    handoff: rakka_agent::AgentDelegationTarget,
+) -> rakka_agent::AgentRunDelegationConfig {
     rakka_agent::AgentRunDelegationConfig::new(
         common::delegation_tool_id(),
         Arc::new(
             rakka_agent::StaticAgentDelegationCatalog::new()
-                .with_target(common::skill_id(), common::delegation_target())
-                .with_target(common::handoff_skill_id(), target),
+                .with_target(common::skill_id(), delegation)
+                .with_target(common::handoff_skill_id(), handoff),
         ),
         std::collections::BTreeSet::from([
             rakka_agent::AgentCoordinationCapabilityKind::Delegation,
@@ -947,19 +967,42 @@ fn handoff_config_delegating_reads(ids: &[&str]) -> rakka_agent::AgentRunDelegat
     .expect("the handoff configuration declares the capability")
 }
 
-fn fixture_handing_off_reads(ids: &[&str]) -> Fixture {
+/// A fixture whose source hands the task off in its first turn; the target
+/// then takes `target_turn`.
+fn fixture_handing_off_with(
+    config: rakka_agent::AgentRunDelegationConfig,
+    target_turn: AgentModelTurn,
+) -> Fixture {
     let fixture = Fixture::new(ScriptedDispatcher::with_adapter(
         DeterministicModelAdapter::new()
             .with_turn(handoff_turn(handoff_arguments()))
-            .with_turn(proposing_turn()),
+            .with_turn(target_turn),
     ))
-    .with_delegation(handoff_config_delegating_reads(ids));
+    .with_delegation(config);
     let executor = ApplyingHandoffExecutor::over(&fixture);
     let _ = fixture
         .dispatcher
         .clone()
         .with_a2a_handoff_executor(executor);
     fixture
+}
+
+/// A fixture whose catalog states, for the handoff target, the knowledge
+/// spaces and the read capabilities given.
+fn fixture_handing_off(spaces: &[&str], reads: &[&str]) -> Fixture {
+    fixture_handing_off_with(
+        handoff_config_with(
+            common::delegation_target(),
+            stating(common::handoff_target(), spaces, reads),
+        ),
+        proposing_turn(),
+    )
+}
+
+/// A fixture whose catalog states the read capabilities the handoff target
+/// is delegated, and no knowledge space.
+fn fixture_handing_off_reads(ids: &[&str]) -> Fixture {
+    fixture_handing_off(&[], ids)
 }
 
 /// Drives the transfer to the target's own run and answers the
@@ -1100,31 +1143,65 @@ async fn a_delegated_tasks_handoff_intersects_the_targets_statement_with_its_gra
     );
 }
 
-/// **A known gap, pinned so it cannot change unnoticed.** A plain task (no
-/// goal, no delegation) whose definition declares no delegation ceilings
-/// carries no envelope, and the handoff step narrows an envelope: with none,
-/// there is nothing to narrow. The handoff records the catalog's statement,
-/// and the target's run carries no envelope at all, so its communal reads and
-/// appends are bounded by the target agent's own definition and setup, not by
-/// what the catalog stated. The same holds for knowledge spaces, and did
-/// before read capabilities existed.
-///
-/// The target still reads nothing its own definition does not grant. What is
-/// missing is the catalog's narrowing. A deployment that needs it for plain
-/// tasks declares delegation ceilings on the task definition, or roots the
-/// task in a goal: either gives the task an envelope, and the two tests above
-/// then apply.
-#[tokio::test]
-async fn a_plain_task_with_no_envelope_is_not_narrowed_by_its_handoff() {
-    let fixture = fixture_handing_off_reads(&["claims.read.a", "claims.read.b"]);
+// ---------------------------------------------------------------------------
+// A plain task's handoff is narrowed by the catalog (issue #142).
+// ---------------------------------------------------------------------------
+
+/// A read grant, as an agent's own definition and setup would give it.
+fn read_grant(spaces: &[&str], reads: &[&str]) -> rakka_agent::AgentCommunalReadGrant {
+    rakka_agent::AgentCommunalReadGrant {
+        spaces: knowledge_spaces(spaces),
+        read_capabilities: read_capabilities(reads),
+        definition_revision: rakka_agent::AgentRevisionNumber::INITIAL,
+        setup_revision: None,
+    }
+}
+
+/// Creates the plain task: no goal, no delegation, and a definition that
+/// declares no delegation ceilings, so nothing gives it an envelope.
+async fn create_plain_task(fixture: &Fixture) {
     fixture.instantiate_agent().await;
     assert!(
         handoff_task_definition().delegation.is_none(),
         "the definition declares no delegation ceilings"
     );
     fixture.create_task_with(handoff_task_definition()).await;
+}
+
+/// The envelope the source's own run carries.
+async fn source_envelope(fixture: &Fixture) -> Option<rakka_agent::AgentRunDelegationEnvelope> {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.state()
+        .expect("the source run state reads")
+        .loop_state()
+        .and_then(|loop_state| loop_state.delegation_envelope().cloned())
+}
+
+/// A plain task carries no envelope of its own, and a handoff used to narrow
+/// only an envelope a task already had: the target then read and appended
+/// under its own agent's whole grant, whatever the catalog stated. The
+/// handoff step now gives such a task a root envelope, so the catalog's
+/// statement is the target's grant, as it is at every other door.
+///
+/// The envelope is the default one with the two statements and nothing
+/// else: no skill, tool, workflow or environment narrowing, no ceiling, no
+/// depth, no lineage, no deadline.
+#[tokio::test]
+async fn a_plain_tasks_handoff_grants_only_what_the_catalog_states() {
+    let fixture = fixture_handing_off(
+        &["space-alpha", "space-omega"],
+        &["claims.read.a", "claims.read.b"],
+    );
+    create_plain_task(&fixture).await;
 
     let envelope = target_envelope_after_transfer(&fixture).await;
+
+    assert_eq!(
+        source_envelope(&fixture).await,
+        None,
+        "the plain task's own run carried no envelope: only its handoff's target does"
+    );
 
     let task = fixture.task_snapshot().await;
     let handoff = task.handoff.as_deref().expect("the transfer is recorded");
@@ -1137,24 +1214,240 @@ async fn a_plain_task_with_no_envelope_is_not_narrowed_by_its_handoff() {
         handoff.status
     );
     assert_eq!(
-        handoff.read_capabilities,
-        read_capabilities(&["claims.read.a", "claims.read.b"]),
-        "the catalog's statement is on the record"
-    );
-    assert_eq!(
-        envelope, None,
-        "and the target's run carries no envelope to hold it"
+        envelope,
+        Some(rakka_agent::AgentRunDelegationEnvelope {
+            knowledge_spaces: Some(knowledge_spaces(&["space-alpha", "space-omega"])),
+            read_capabilities: Some(read_capabilities(&["claims.read.a", "claims.read.b"])),
+            ..Default::default()
+        }),
+        "the default envelope, with the catalog's two statements and nothing else"
     );
 
-    // What that means for a read: the target's whole grant, unnarrowed.
-    let grant = rakka_agent::AgentCommunalReadGrant {
-        spaces: std::collections::BTreeSet::from([rakka_agent::KnowledgeSpaceId::new(
-            "space-alpha",
+    // What that means for a read. The target's agent is granted alpha and
+    // beta, and the catalog passed alpha and omega: the target reads alpha.
+    // It does not keep beta, which the catalog did not pass, and it does not
+    // gain omega, which its own agent is not granted: a handoff never widens.
+    let own = read_grant(
+        &["space-alpha", "space-beta"],
+        &["claims.read.a", "claims.read.z"],
+    );
+    assert_eq!(
+        own.narrowed_by(envelope.as_ref()),
+        read_grant(&["space-alpha"], &["claims.read.a"])
+    );
+
+    // A catalog that states spaces and no read capability passes on none:
+    // in those spaces the target reads only claims that require none.
+    let fixture = fixture_handing_off(&["space-alpha"], &[]);
+    create_plain_task(&fixture).await;
+    let envelope = target_envelope_after_transfer(&fixture).await;
+    assert_eq!(
+        own.narrowed_by(envelope.as_ref()),
+        read_grant(&["space-alpha"], &[])
+    );
+}
+
+/// Stating nothing passes on nothing, as it does for a delegation and for
+/// the handoff of a task that carries an envelope. A catalog written before
+/// anyone thought about handoffs and claims is this case: its target loses
+/// the communal access it had on a plain task.
+#[tokio::test]
+async fn a_plain_tasks_handoff_to_a_target_the_catalog_states_nothing_for_grants_nothing() {
+    let fixture = fixture_handing_off(&[], &[]);
+    create_plain_task(&fixture).await;
+
+    let envelope = target_envelope_after_transfer(&fixture)
+        .await
+        .expect("the target run carries an envelope");
+
+    assert_eq!(envelope.knowledge_spaces, Some(knowledge_spaces(&[])));
+    assert_eq!(envelope.read_capabilities, Some(read_capabilities(&[])));
+    let own = read_grant(
+        &["space-alpha", "space-beta"],
+        &["claims.read.a", "claims.read.z"],
+    );
+    assert_eq!(own.narrowed_by(Some(&envelope)), read_grant(&[], &[]));
+}
+
+fn append_request(space_id: &str) -> rakka_agent::AgentClaimAppendRequest {
+    rakka_agent::AgentClaimAppendRequest {
+        space: rakka_agent::KnowledgeSpaceId::new(space_id).expect("the space id is valid"),
+        subject: "finding".to_string(),
+        predicate: "links".to_string(),
+        object: rakka_agent::AgentClaimObjectRequest::Value(
+            AgentTaskContent::inline(json!({ "note": "observed" }))
+                .expect("the object is inline-bounded"),
+        ),
+        confidence_bps: 5_000,
+        classification: rakka_agent::MemoryClassification::Unclassified,
+        evidence: Vec::new(),
+        requested_by: rakka_agent_workflow::PrincipalRef {
+            principal_type: "service".to_string(),
+            principal_id: "researcher".to_string(),
+            display_name: None,
+        },
+    }
+}
+
+/// Applies one `AppendClaim` command to the handoff target's run.
+async fn append_at_the_target(
+    fixture: &Fixture,
+    step: &str,
+    space_id: &str,
+) -> Result<rakka_agent::AgentRunEntityReply, rakka_agent::AgentRunError> {
+    let scope = handoff_target_run_scope();
+    let mut target = fixture.run_at(&scope);
+    target.recover(fixture.now()).await.expect("recover");
+    target
+        .apply(
+            rakka_agent::AgentRunEntityCommand::AppendClaim {
+                operation_id: rakka_agent::claim_append_operation_id(&scope, step)
+                    .expect("the operation id derives"),
+                append: Box::new(append_request(space_id)),
+            },
+            &fixture.router,
+            fixture.now(),
         )
-        .expect("the space id is valid")]),
-        read_capabilities: read_capabilities(&["claims.read.a", "claims.read.b", "claims.read.z"]),
-        definition_revision: rakka_agent::AgentRevisionNumber::INITIAL,
-        setup_revision: None,
-    };
-    assert_eq!(grant.narrowed_by(envelope.as_ref()), grant);
+        .await
+}
+
+/// How many claim appends the handoff target's run has committed.
+async fn appends_committed_at_the_target(fixture: &Fixture) -> usize {
+    let mut target = fixture.run_at(&handoff_target_run_scope());
+    target.recover(fixture.now()).await.expect("recover");
+    target
+        .state()
+        .expect("the target run state reads")
+        .loop_state()
+        .map_or(0, |loop_state| {
+            loop_state
+                .effects()
+                .iter()
+                .filter(|effect| {
+                    matches!(
+                        effect.request,
+                        rakka_agent::AgentRunEffectRequest::ClaimAppend { .. }
+                    )
+                })
+                .count()
+        })
+}
+
+/// Appends close with reads: the same envelope bounds both. The target
+/// appends in a space the catalog passed it, and is refused at its run's
+/// door in one the catalog did not, with the code that door already has.
+#[tokio::test]
+async fn the_target_of_a_plain_tasks_handoff_appends_only_inside_the_catalogs_spaces() {
+    let fixture = fixture_handing_off(&["space-alpha"], &[]);
+    create_plain_task(&fixture).await;
+    target_envelope_after_transfer(&fixture)
+        .await
+        .expect("the target run carries an envelope");
+
+    let refused = append_at_the_target(&fixture, "append-outside", "space-beta")
+        .await
+        .expect_err("a space the catalog did not pass on is refused");
+    assert_eq!(refused.code(), "run-claim-space-not-delegated");
+    assert_eq!(
+        appends_committed_at_the_target(&fixture).await,
+        0,
+        "the refusal commits nothing"
+    );
+
+    append_at_the_target(&fixture, "append-inside", "space-alpha")
+        .await
+        .expect("a space the catalog passed on is accepted");
+    assert_eq!(appends_committed_at_the_target(&fixture).await, 1);
+}
+
+fn delegating_turn() -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Delegating the translation.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("call-1").expect("call id should be valid"),
+                common::delegation_tool_id(),
+                json!({ "skill": common::SKILL, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        )
+}
+
+/// The root envelope narrows nothing but the two grants: the target still
+/// delegates, with no skill narrowing and no depth or fan-out ceiling
+/// applied to it. And the grant it was passed is the ceiling on what it
+/// passes on: the catalog states alpha and gamma for the delegation's
+/// target, the handoff's target holds alpha and beta, and the child is
+/// delegated alpha.
+#[tokio::test]
+async fn the_target_of_a_plain_tasks_handoff_delegates_and_passes_on_no_more_than_it_holds() {
+    let fixture = fixture_handing_off_with(
+        handoff_config_with(
+            stating(
+                common::delegation_target(),
+                &["space-alpha", "space-gamma"],
+                &["claims.read.a", "claims.read.c"],
+            ),
+            stating(
+                common::handoff_target(),
+                &["space-alpha", "space-beta"],
+                &["claims.read.a", "claims.read.b"],
+            ),
+        ),
+        delegating_turn(),
+    );
+    create_plain_task(&fixture).await;
+    target_envelope_after_transfer(&fixture)
+        .await
+        .expect("the target run carries an envelope");
+
+    let mut target = fixture.run_at(&handoff_target_run_scope());
+    target.recover(fixture.now()).await.expect("recover");
+    let state = target.state().expect("the target run state reads");
+    let loop_state = state.loop_state().expect("the target run has a loop");
+    assert_eq!(
+        loop_state.delegation_count(),
+        1,
+        "the delegation committed: nothing but the two grants was narrowed"
+    );
+    let record = &loop_state
+        .delegations()
+        .values()
+        .next()
+        .expect("the cell exists")
+        .record;
+    assert_eq!(record.knowledge_spaces, knowledge_spaces(&["space-alpha"]));
+    assert_eq!(
+        record.read_capabilities,
+        read_capabilities(&["claims.read.a"])
+    );
+}
+
+/// A refused transfer gives no one a root envelope: the source is restored
+/// and resumes as it was, under its own agent's grant. Pinned here because
+/// it must not change with the narrowing.
+#[tokio::test]
+async fn a_refused_handoff_of_a_plain_task_leaves_the_source_with_no_envelope() {
+    let fixture = fixture_handing_off(&["space-alpha"], &["claims.read.a"]);
+    create_plain_task(&fixture).await;
+    // The target agent is never instantiated: its readiness refuses, and the
+    // single-attempt rule resolves the transfer refused.
+
+    fixture.pump().await.expect("the loop should converge");
+
+    let task = fixture.task_snapshot().await;
+    let handoff = task.handoff.as_deref().expect("the provenance survives");
+    assert!(
+        matches!(handoff.status, AgentTaskHandoffStatus::Refused { .. }),
+        "the transfer was refused, got {:?}",
+        handoff.status
+    );
+    assert_eq!(source_envelope(&fixture).await, None);
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    assert_eq!(
+        run.state().expect("state").status(),
+        Some(AgentRunStatus::Completed),
+        "the source resumed and finished the task itself"
+    );
 }
