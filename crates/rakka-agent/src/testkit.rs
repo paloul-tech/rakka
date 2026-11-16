@@ -5288,7 +5288,9 @@ impl CommunalClaimFixture {
     ///
     /// The record's own validation error: a subject, predicate or node that
     /// is not a valid identity segment, or inline text over the bound a
-    /// claim's object has.
+    /// claim's object has (`memory-entry-too-large`). Inline text that is
+    /// too large to be a task content at all is refused before a record
+    /// exists, as [`MemoryError::Encoding`].
     pub fn build(self) -> Result<CommunalClaimRecord, MemoryError> {
         let object = match self.object {
             CommunalClaimFixtureObject::InlineText(text) => CommunalClaimObject::Value(

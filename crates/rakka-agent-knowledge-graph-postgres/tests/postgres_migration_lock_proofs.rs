@@ -39,6 +39,15 @@ async fn connect(dsn: &str) -> Client {
     client
 }
 
+/// Drops the schema one step of the proof made for itself.
+async fn default_cleanup(dsn: &str, schema: &str) {
+    connect(dsn)
+        .await
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .expect("the proof's own schema is dropped");
+}
+
 #[tokio::test]
 async fn postgres_a_migrator_stops_waiting_and_names_the_holder_when_dsn_is_set() {
     let Ok(dsn) = std::env::var("RAKKA_POSTGRES_TEST_DSN") else {
@@ -59,15 +68,18 @@ async fn postgres_a_migrator_stops_waiting_and_names_the_holder_when_dsn_is_set(
         .batch_execute("SET application_name = 'holder-application-name'")
         .await
         .expect("the holder labels itself");
-    holder
-        .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
-        .await
-        .expect("the holder takes the lock");
     let holder_pid: i32 = holder
         .query_one("SELECT pg_backend_pid()", &[])
         .await
         .expect("the holder knows its backend")
         .get(0);
+    // Taking the lock is the holder's last statement, so `pg_advisory_lock`
+    // is the query text the server holds for it, and the refusal can be
+    // shown not to repeat that either.
+    holder
+        .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
+        .await
+        .expect("the holder takes the lock");
 
     // A waiter with a short wait gives up inside the margin and names the
     // holder.
@@ -109,6 +121,41 @@ async fn postgres_a_migrator_stops_waiting_and_names_the_holder_when_dsn_is_set(
         .await
         .expect("one try ends at once")
         .expect_err("the lock is held");
+
+    // A waiter that cannot read the holder still says what happened: the
+    // lock was not acquired. Its session resolves `pg_locks` to a table of
+    // its own that has none of the catalog's columns, so the read fails as
+    // it would for a role the server refuses the view.
+    let blind_schema = format!(
+        "rakka_knowledge_graph_lock_blind_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos()
+    );
+    let blind_client = connect(&dsn).await;
+    blind_client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {blind_schema}; \
+             CREATE TABLE {blind_schema}.pg_locks (unreadable int); \
+             SET search_path TO {blind_schema}, pg_catalog"
+        ))
+        .await
+        .expect("the session shadows the lock view");
+    let blind = PostgresKnowledgeGraphStore::new(blind_client)
+        .with_migration_lock_wait(Duration::from_millis(100));
+    let refused = tokio::time::timeout(MARGIN, blind.migrate())
+        .await
+        .expect("the waiter stops inside the margin")
+        .expect_err("the lock is held");
+    assert_eq!(refused.code(), "claim-backend-failed");
+    assert_eq!(
+        refused.to_string(),
+        "the postgres backend failed: migration lock not acquired within 100ms: the holder \
+         could not be read (SQLSTATE 42703)."
+    );
+    drop(blind);
+    default_cleanup(&dsn, &blind_schema).await;
 
     // The holder's connection closes, which is what the refusal tells an
     // operator to do. A store with the default wait covers the moment the

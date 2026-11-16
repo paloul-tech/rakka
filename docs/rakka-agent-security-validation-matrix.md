@@ -175,10 +175,12 @@ inside the mutator, and is what that arrangement was verified for.
   `AgentGuardrailContext::claim` before the bundle is wired. A deployment can
   see what its own chain does with a claim:
   `rakka_agent::testkit::evaluate_claim_at_memory_ingress` evaluates one
-  through the step assembly runs and answers whether assembly would embed
-  it, embed a transform of it, or drop it, and `CommunalClaimFixture` builds
-  a claim that carries text the chain should catch (issue #144). The clause
-  attests nothing. Rakka does not know whether a deployment ran it, and
+  through the boundary step assembly runs and answers what that step does
+  with it: pass it on as it is, pass on a transform of it, or drop it.
+  `CommunalClaimFixture` builds a claim that carries text the chain should
+  catch (issue #144). The clause covers that step only, not the admission
+  checks before it or the byte budget after it, and shows what a chain does
+  with the claims a test hands it and no others. It attests nothing. Rakka does not know whether a deployment ran it, and
   nothing in Rakka checks that a stage reads a claim's shape.
 
 ## Owed, and why
@@ -213,7 +215,8 @@ inside the mutator, and is what that arrangement was verified for.
   connection and so changes its signature. The wait is no longer unbounded
   (issue #143): another migrator stops after the store's lock wait, five
   minutes unless `with_migration_lock_wait` set another, and its refusal
-  names the holder's backend process id, its connection age and its state. A
+  names the holder's backend process id, its connection age and its state,
+  or says what of that it could not read. A
   waiter cannot tell a leaked lock from a first migration still building its
   indexes, so a node that starts during a longer first migration is refused
   too, and succeeds on a retry.
@@ -406,7 +409,7 @@ live-database proofs,
 | A claim an earlier binary appended is reported `unindexed`, and the indexing pass makes it searchable | `postgres_an_earlier_binarys_claim_is_reported_unindexed_when_dsn_is_set`, `postgres_the_indexing_pass_makes_an_earlier_claim_searchable_when_dsn_is_set` |
 | The indexing pass is idempotent, bounded, scoped, skips a damaged record, and loses to a tombstone | `postgres_the_indexing_pass_is_idempotent_when_dsn_is_set`, `postgres_the_indexing_pass_clamps_its_limit_when_dsn_is_set`, `postgres_the_indexing_pass_stays_in_its_scope_when_dsn_is_set`, `postgres_the_indexing_pass_skips_a_damaged_record_when_dsn_is_set`, `postgres_a_tombstone_beats_the_indexing_pass_when_dsn_is_set`, `postgres_two_indexing_passes_at_once_index_every_claim_once_when_dsn_is_set` |
 | The search reads the word index rather than scanning the scope | `postgres_search_uses_the_word_index_when_dsn_is_set` |
-| A migrator that finds the migration lock held stops after the store's lock wait and names the holder's backend, without its application name, its query or the connection string; a wait of zero is one try; it migrates once the holder's connection closes (issue #143; a test file of its own, `postgres_migration_lock_proofs.rs`, because the lock is one per database) | `postgres_a_migrator_stops_waiting_and_names_the_holder_when_dsn_is_set` |
+| A migrator that finds the migration lock held stops after the store's lock wait and names the holder's backend, without its application name, its query or the connection string; a waiter that cannot read the holder still says the lock was not acquired; a wait of zero is one try; it migrates once the holder's connection closes (issue #143; a test file of its own, `postgres_migration_lock_proofs.rs`, because the lock is one per database) | `postgres_a_migrator_stops_waiting_and_names_the_holder_when_dsn_is_set` |
 
 Verified against PostgreSQL 17.5 on 2026-11-16: the graph crate's five test
 files pass with no skips (8 backend proofs, 28 conformance clauses, 16 erasure

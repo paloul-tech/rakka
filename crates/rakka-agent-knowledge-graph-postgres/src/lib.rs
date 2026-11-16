@@ -477,10 +477,10 @@ const MIGRATION_LOCK_PAUSE_SQL: &str = "SELECT pg_sleep(0.05)";
 /// `pg_locks` shows a 64-bit advisory key as two 32-bit halves, the high
 /// half in `classid` and the low half in `objid`, with `objsubid` 1. An
 /// advisory lock belongs to one database, so the row is matched on this
-/// one. The join is a left join because the server shows a role without
-/// `pg_read_all_stats` nothing but the process id of another role's session.
-/// Nothing else is selected: no query text, no application name, no client
-/// address.
+/// one. The join is a left join, and the state and the connection time may
+/// be null: the server withholds both, of another role's session, from a
+/// role without `pg_read_all_stats`. Nothing else is selected: no query
+/// text, no application name, no client address.
 const MIGRATION_LOCK_HOLDER_SQL: &str = "\
     SELECT l.pid, a.state, EXTRACT(EPOCH FROM (now() - a.backend_start))::bigint \
     FROM pg_locks l \
@@ -817,10 +817,22 @@ impl PostgresKnowledgeGraphStore {
     /// The refusal carries no query text, application name, client address
     /// or connection string. A waiter that gives up holds nothing.
     ///
+    /// The refusal's message begins `migration lock not acquired within`.
+    /// That beginning is stable, and is how a caller tells this refusal from
+    /// another backend failure; the rest is written for a person. Where the
+    /// server withholds the holder's connection age or state, the message
+    /// says they are unknown. Where the holder released the lock just before
+    /// it was read, the message says so, and `migrate` can be run again.
+    /// Where the holder could not be read at all, the message says that and
+    /// gives the SQLSTATE of the failed read.
+    ///
     /// A waiter cannot tell a lock a cancelled call left behind from one a
     /// first migration still holds while it builds its indexes. The holder's
-    /// state is the best signal there is: a session that is migrating is
-    /// `active`, and one that only keeps the lock is usually `idle`. A node
+    /// state is the best signal there is, and it is a weak one. A session
+    /// that is `idle` is not migrating. A session that is `active` may be
+    /// migrating, or may be serving an unrelated query on a connection that
+    /// kept the lock: the store runs on a client the application supplies,
+    /// so a leaked lock usually sits on a connection still in use. A node
     /// that starts during a first migration longer than its wait gets the
     /// refusal and succeeds on a retry; give such a node a longer wait.
     ///
@@ -880,10 +892,19 @@ impl PostgresKnowledgeGraphStore {
                 return Ok(());
             }
             if started.elapsed() >= self.migration_lock_wait {
-                let holder = self.migration_lock_holder().await.map_err(map_error)?;
+                // The refusal is what the caller must hear. A holder that
+                // cannot be read changes what the refusal can say about the
+                // holder, and never replaces it with the read's own error.
+                let message = match self.migration_lock_holder().await {
+                    Ok(holder) => lock_wait_refusal(self.migration_lock_wait, holder.as_ref()),
+                    Err(error) => lock_wait_refusal_unread(
+                        self.migration_lock_wait,
+                        error.code().map(SqlState::code),
+                    ),
+                };
                 return Err(ClaimError::Backend {
                     backend: BACKEND_NAME.to_string(),
-                    message: lock_wait_refusal(self.migration_lock_wait, holder.as_ref()),
+                    message,
                 });
             }
             self.client
@@ -1738,6 +1759,24 @@ fn lock_wait_refusal(wait: Duration, holder: Option<&MigrationLockHolder>) -> St
     )
 }
 
+/// The refusal's message when the read of the holder itself failed, as it
+/// does for a role the server refuses `pg_stat_activity`.
+///
+/// It still says the lock was not acquired, which is what happened. Of the
+/// failed read it carries only the five-character SQLSTATE, when the server
+/// gave one, and never the server's own text.
+fn lock_wait_refusal_unread(wait: Duration, sqlstate: Option<&str>) -> String {
+    match sqlstate {
+        Some(sqlstate) => format!(
+            "migration lock not acquired within {wait:?}: the holder could not be read \
+             (SQLSTATE {sqlstate})."
+        ),
+        None => {
+            format!("migration lock not acquired within {wait:?}: the holder could not be read.")
+        }
+    }
+}
+
 /// Whether a statement failed on a primary-key or unique constraint.
 fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
     error
@@ -1790,6 +1829,19 @@ mod tests {
             lock_wait_refusal(Duration::from_millis(300), Some(&holder)),
             "migration lock not acquired within 300ms: held by backend pid 4242, connection age \
              unknown, state unknown. If no migration is running on that connection, close it."
+        );
+    }
+
+    #[test]
+    fn the_refusal_survives_a_holder_that_could_not_be_read() {
+        assert_eq!(
+            lock_wait_refusal_unread(Duration::from_secs(300), Some("42501")),
+            "migration lock not acquired within 300s: the holder could not be read (SQLSTATE \
+             42501)."
+        );
+        assert_eq!(
+            lock_wait_refusal_unread(Duration::from_secs(300), None),
+            "migration lock not acquired within 300s: the holder could not be read."
         );
     }
 

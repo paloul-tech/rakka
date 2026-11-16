@@ -272,10 +272,14 @@ fn a_chain_with_no_ingress_stage_embeds_the_claim() {
 
 #[test]
 fn an_oversized_transform_is_blocked_by_the_chain() {
+    // Six kibibytes: over what a statement may be at this boundary, and
+    // under the chain's general ceiling of sixteen. So it is this boundary's
+    // own bound that refuses it, with the chain's reason code, and not the
+    // statement's validation afterwards.
     let oversized = json!({
         "subject": "order-42",
         "predicate": "note",
-        "object": { "value": { "inline": "x".repeat(64 * 1024) } }
+        "object": { "value": { "inline": "x".repeat(6 * 1024) } }
     });
 
     let evaluation =

@@ -1060,14 +1060,18 @@ fn applicable_transform(
 
 /// What assembly does with one claim after the memory-ingress boundary.
 ///
-/// The answer of [`evaluate_claim_at_ingress`], which is the step assembly
-/// runs for every claim it resolved and admitted. A deployment reaches the
-/// same step through [`crate::testkit::evaluate_claim_at_memory_ingress`].
+/// The answer of the boundary step assembly runs for every claim it resolved
+/// and admitted. A deployment reaches the same step through
+/// [`crate::testkit::evaluate_claim_at_memory_ingress`].
+///
+/// It is the boundary's answer and no more. The snapshot's byte budget is
+/// applied after the boundary, so a claim this says assembly embeds can
+/// still be left out of a snapshot that has no room for it.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum ClaimIngressOutcome {
     /// The chain allowed the claim and changed nothing: assembly embeds the
-    /// record's own statement.
+    /// record's own statement, if the byte budget has room.
     Embedded,
     /// The chain allowed the claim with a transform assembly can apply:
     /// assembly embeds this statement, under this statement's digest.
