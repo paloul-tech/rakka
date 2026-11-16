@@ -118,11 +118,11 @@ impl OverrunningTool {
     }
 
     fn other_pass(&self) -> AgentDispatchPass {
-        self.other_pass
+        let pass = *self
+            .other_pass
             .lock()
-            .expect("the pass slot is not poisoned")
-            .clone()
-            .expect("the other worker ran")
+            .expect("the pass slot is not poisoned");
+        pass.expect("the other worker ran")
     }
 }
 
