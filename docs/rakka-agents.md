@@ -532,7 +532,12 @@ incorrectly.
     under `object.value.inline`. A stage that inspects a top-level string
     therefore allows every claim, and one that replaces the value with a bare
     string drops every claim. Branch on `context.claim` in each memory-ingress
-    stage before wiring the bundle. The chain must be the one the dispatch
+    stage before wiring the bundle, and run the chain against a claim first:
+    `rakka_agent::testkit::evaluate_claim_at_memory_ingress` evaluates one
+    through the step assembly runs and answers what assembly would do with
+    it, and `CommunalClaimFixture` builds a claim carrying text the chain
+    should catch. That clause attests nothing; Rakka does not know whether it
+    was run. The chain must be the one the dispatch
     authority declares: `AgentToolAuthority::with_memory_ingress` attests the private
     and the communal bundle together, and refuses a memory in which either
     carries a different chain (`guardrail-chain-mismatch`). Rakka selects claims and records
