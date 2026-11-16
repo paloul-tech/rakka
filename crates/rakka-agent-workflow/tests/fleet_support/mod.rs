@@ -14,12 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchEntry,
-    AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorker,
-    AgentDispatcherWorkerId, AgentDurabilityMetadata, AgentEffect, AgentEffectDispatchFuture,
-    AgentEffectDispatcher, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
-    AgentEffectSchedule, AgentEffectTarget, AgentIdempotencyKey, AgentRunId, AgentRunInbox,
-    AgentTimestampMillis,
+    AgentCausationId, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchClaim,
+    AgentDispatchEntry, AgentDispatcherFleetSettings, AgentDispatcherFleetState,
+    AgentDispatcherWorker, AgentDispatcherWorkerId, AgentDurabilityMetadata, AgentEffect,
+    AgentEffectDispatchFuture, AgentEffectDispatcher, AgentEffectId, AgentEffectKind,
+    AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget, AgentIdempotencyKey, AgentRunId,
+    AgentRunInbox, AgentTimestampMillis,
 };
 use rakka_core::InMemoryMetricsRecorder;
 use rakka_persistence::{
@@ -242,6 +242,123 @@ pub fn worker(
         clock.clone(),
         metrics.clone(),
     )
+}
+
+/// A worker over the shared stores that claims under its own lease.
+pub fn worker_with_lease(
+    worker_id: &str,
+    lease_ms: u64,
+    fleet_store: &FleetStore,
+    workflow_store: &WorkflowStore,
+    clock: &ManualWorkflowClock,
+    metrics: &Arc<InMemoryMetricsRecorder>,
+) -> TestWorker {
+    AgentDispatcherWorker::with_clock_and_metrics(
+        AgentDispatcherWorkerId::new(worker_id),
+        fleet_store.clone(),
+        workflow_store.clone(),
+        AgentDispatcherFleetSettings::new(8, lease_ms),
+        clock.clone(),
+        metrics.clone(),
+    )
+}
+
+/// The stores, the clock and the recorder one fleet test shares between its
+/// workers.
+pub struct World {
+    /// The fleet's store.
+    pub fleet_store: FleetStore,
+    /// The store every run's outbox lives in.
+    pub workflow_store: WorkflowStore,
+    /// The one clock.
+    pub clock: ManualWorkflowClock,
+    /// The recorder every worker records into.
+    pub metrics: Arc<InMemoryMetricsRecorder>,
+}
+
+impl World {
+    /// Empty stores and a clock at 100.
+    pub fn new() -> Self {
+        Self {
+            fleet_store: FleetStore::new(),
+            workflow_store: WorkflowStore::new(),
+            clock: clock(),
+            metrics: Arc::new(InMemoryMetricsRecorder::new()),
+        }
+    }
+
+    /// A worker over this world's stores, under [`LEASE_MS`].
+    pub fn worker(&self, worker_id: &str) -> TestWorker {
+        worker(
+            worker_id,
+            &self.fleet_store,
+            &self.workflow_store,
+            &self.clock,
+            &self.metrics,
+        )
+    }
+
+    /// A worker over this world's stores, under its own lease.
+    pub fn worker_with_lease(&self, worker_id: &str, lease_ms: u64) -> TestWorker {
+        worker_with_lease(
+            worker_id,
+            lease_ms,
+            &self.fleet_store,
+            &self.workflow_store,
+            &self.clock,
+            &self.metrics,
+        )
+    }
+
+    /// Schedules one effect into `run` and registers it through `worker`,
+    /// without claiming it.
+    pub async fn register_one(&self, worker: &mut TestWorker, run: &str, effect: &str) {
+        let run_id = AgentRunId::new(run);
+        schedule(&self.workflow_store, &self.clock, &run_id, effect).await;
+        worker.recover().await.expect("the fleet recovers");
+        worker
+            .refresh_run(run_id, None)
+            .await
+            .expect("the run registers");
+    }
+
+    /// Schedules one effect into `run`, registers it through `worker`, and
+    /// claims it. Nothing else may be claimable when this is called.
+    pub async fn claim_one(
+        &self,
+        worker: &mut TestWorker,
+        run: &str,
+        effect: &str,
+    ) -> AgentDispatchClaim {
+        self.register_one(worker, run, effect).await;
+        let mut batch = worker.claim_due().await.expect("the claim pass runs");
+        assert_eq!(batch.claims.len(), 1, "exactly the new effect is claimed");
+        batch.claims.remove(0)
+    }
+
+    /// Claims one new effect and dispatches it to success, so both its
+    /// outbox row and its fleet entry are finished.
+    pub async fn complete_one(&self, worker: &mut TestWorker, run: &str, effect: &str) {
+        let claim = self.claim_one(worker, run, effect).await;
+        let mut dispatcher = RecordingDispatcher::succeeding();
+        worker
+            .dispatch_claim(claim, &mut dispatcher)
+            .await
+            .expect("the effect dispatches");
+    }
+
+    /// The fleet's revision as the store holds it now.
+    pub async fn fleet_revision(&self) -> Option<Revision> {
+        fleet_record(&self.fleet_store)
+            .await
+            .map(|record| record.revision)
+    }
+}
+
+impl Default for World {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A tool-call effect due at the instant [`clock`] starts at.

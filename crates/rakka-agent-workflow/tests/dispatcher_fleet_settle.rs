@@ -8,63 +8,11 @@
 //! fencing token, a lease still active. The fence is in the record, so a
 //! re-read can never settle a claim another worker took over.
 
-use std::sync::Arc;
-
-use rakka_agent_workflow::{AgentDispatchClaim, AgentDispatchStatus, AgentRunId};
-use rakka_core::InMemoryMetricsRecorder;
-use rakka_workflow::ManualWorkflowClock;
+use rakka_agent_workflow::{AgentDispatchStatus, AgentRunId};
 
 mod fleet_support;
 
 use fleet_support::*;
-
-struct World {
-    fleet_store: FleetStore,
-    workflow_store: WorkflowStore,
-    clock: ManualWorkflowClock,
-    metrics: Arc<InMemoryMetricsRecorder>,
-}
-
-impl World {
-    fn new() -> Self {
-        Self {
-            fleet_store: FleetStore::new(),
-            workflow_store: WorkflowStore::new(),
-            clock: clock(),
-            metrics: Arc::new(InMemoryMetricsRecorder::new()),
-        }
-    }
-
-    fn worker(&self, worker_id: &str) -> TestWorker {
-        worker(
-            worker_id,
-            &self.fleet_store,
-            &self.workflow_store,
-            &self.clock,
-            &self.metrics,
-        )
-    }
-
-    /// Schedules one effect into `run`, registers it through `worker`, and
-    /// claims it.
-    async fn claim_one(
-        &self,
-        worker: &mut TestWorker,
-        run: &str,
-        effect: &str,
-    ) -> AgentDispatchClaim {
-        let run_id = AgentRunId::new(run);
-        schedule(&self.workflow_store, &self.clock, &run_id, effect).await;
-        worker.recover().await.expect("the fleet recovers");
-        worker
-            .refresh_run(run_id, None)
-            .await
-            .expect("the run registers");
-        let mut batch = worker.claim_due().await.expect("the claim pass runs");
-        assert_eq!(batch.claims.len(), 1, "exactly the new effect is claimed");
-        batch.claims.remove(0)
-    }
-}
 
 #[tokio::test]
 async fn a_settle_survives_another_workers_claim() {

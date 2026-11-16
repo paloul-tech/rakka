@@ -1090,6 +1090,15 @@ pub struct AgentDispatcherCancellation {
     pub cancelled_effect_ids: Vec<AgentEffectId>,
 }
 
+/// What one [`AgentDispatcherFleet::prune_terminal`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDispatcherPrune {
+    /// Entries this call removed.
+    pub pruned: usize,
+    /// Entries left in the record, live and finished.
+    pub remaining: usize,
+}
+
 /// Result of one claim pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDispatchClaimBatch {
@@ -1633,6 +1642,72 @@ where
             );
         }
         Ok(finalized_effect_ids)
+    }
+
+    /// Removes the finished entries that finished before `before`.
+    ///
+    /// Nothing else removes an entry: without this the record grows by one
+    /// entry for every effect a deployment ever dispatched, and every claim
+    /// and settle writes the whole record back. Pruning is an explicit act
+    /// of the application, called on its own schedule with its own horizon.
+    ///
+    /// An entry is removed when it is `Completed`, `Exhausted` or
+    /// `Cancelled` and its last update, which is the moment it finished, is
+    /// earlier than `before`. Nothing else is touched: a pending, claimed or
+    /// retry-scheduled entry stays, and so does a claimed entry whose lease
+    /// has lapsed and an entry whose cancellation was requested and has not
+    /// finished. Any horizon is safe, including one in the future, which
+    /// removes every finished entry: a finished entry is history, and the
+    /// rule that makes it so is that an entry is finished only after its
+    /// outbox row is.
+    ///
+    /// What goes with an entry is its `last_error_code`, the only durable
+    /// copy of a cancelled ticket's settle reason. The horizon is how long
+    /// that stays readable.
+    ///
+    /// The record is read fresh on every attempt, never from this handle's
+    /// copy. A prune that finds nothing to remove writes nothing. One that
+    /// loses its compare-and-set to another writer reads again and
+    /// re-applies, up to [`FLEET_WRITE_REAPPLICATIONS`] more times.
+    ///
+    /// # Errors
+    ///
+    /// The store's error, or the lost compare-and-set (`revision-conflict`)
+    /// once the bound is spent.
+    pub async fn prune_terminal(
+        &mut self,
+        before: AgentTimestampMillis,
+    ) -> AgentDispatcherResult<AgentDispatcherPrune> {
+        let mut reapplied = 0;
+        loop {
+            self.recover().await?;
+            let now = current_agent_timestamp(&self.clock);
+            let record = self.current_record()?;
+            let mut next = record.state;
+            let held = next.entries.len();
+            next.entries
+                .retain(|_, entry| !(entry.status.is_terminal() && entry.updated_at < before));
+            let remaining = next.entries.len();
+            let pruned = held - remaining;
+            if pruned == 0 {
+                return Ok(AgentDispatcherPrune { pruned, remaining });
+            }
+            next.updated_at = now;
+            match self.persist(record.revision, next).await {
+                Ok(_) => {
+                    self.record_metric("prune", "pruned", "none", pruned as u64);
+                    self.record_gauges(now);
+                    return Ok(AgentDispatcherPrune { pruned, remaining });
+                }
+                Err(error)
+                    if error.code() == REVISION_CONFLICT_CODE
+                        && reapplied < FLEET_WRITE_REAPPLICATIONS =>
+                {
+                    reapplied += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Completes a current claim.
