@@ -48,6 +48,17 @@ pub const METRIC_AGENT_DISPATCHER_IN_FLIGHT: &str = "rakka.agent_workflow.dispat
 /// Gauge for due dispatcher work that could not be claimed in one pass.
 pub const METRIC_AGENT_DISPATCHER_BACKLOG: &str = "rakka.agent_workflow.dispatcher.backlog";
 
+/// How many more times a fleet write that lost its compare-and-set is read
+/// again and re-applied before the loss is returned.
+///
+/// The same bound the agent dispatcher gives its outbox writes: a
+/// convergence aid for a record several handles write, never the fence.
+const FLEET_WRITE_REAPPLICATIONS: u32 = 3;
+
+/// The stable code of a lost compare-and-set, under whichever wrapper
+/// carries it.
+const REVISION_CONFLICT_CODE: &str = "revision-conflict";
+
 /// The most bytes of failure detail one fleet index entry keeps in
 /// [`AgentDispatchEntry::last_error_code`].
 ///
@@ -1683,50 +1694,82 @@ where
     }
 
     /// Returns true when the claim is still current and unexpired.
+    ///
+    /// A claim whose entry is no longer in the record is not current: a
+    /// finished entry can be removed by [`Self::prune_terminal`], and a
+    /// worker still holding a lapsed claim on it gets the answer it would
+    /// have had while the entry was there.
     pub fn is_current_claim(&self, claim: &AgentDispatchClaim) -> AgentDispatcherResult<bool> {
         let now = current_agent_timestamp(&self.clock);
-        let entry = self.state()?.entry(&claim.dispatch_id).ok_or_else(|| {
-            AgentDispatcherError::DispatchNotFound {
-                dispatch_id: claim.dispatch_id.clone(),
-            }
-        })?;
-        Ok(entry.is_current_claim(claim, now))
+        Ok(self
+            .state()?
+            .entry(&claim.dispatch_id)
+            .is_some_and(|entry| entry.is_current_claim(claim, now)))
     }
 
+    /// Applies `update` to the entry a current claim holds, and writes it.
+    ///
+    /// The write is a compare-and-set of the whole record, and every other
+    /// handle writes the same record: another worker's claim, a registration
+    /// and a prune all move its revision. A settle computed from the record
+    /// this handle read at claim time would lose to any of them, after the
+    /// outbox row it follows was already written. So a lost write is read
+    /// again and re-applied, up to [`FLEET_WRITE_REAPPLICATIONS`] more times.
+    ///
+    /// The re-read cannot settle a claim that is no longer this worker's:
+    /// the fence is in the record, and every attempt checks it against the
+    /// record it is about to write. An entry that is absent was finished and
+    /// pruned, so its claim is fenced like any other that is not current.
+    ///
+    /// Only a lost compare-and-set is retried, recognized by its stable code
+    /// (`revision-conflict`). Any other failure is returned as it is.
     async fn update_current_claim(
         &mut self,
         claim: &AgentDispatchClaim,
-        update: impl FnOnce(AgentDispatchEntry, AgentTimestampMillis) -> AgentDispatchEntry,
+        update: impl Fn(AgentDispatchEntry, AgentTimestampMillis) -> AgentDispatchEntry,
     ) -> AgentDispatcherResult<AgentDispatchEntry> {
         if self.record.is_none() {
             self.recover().await?;
         }
-        let now = current_agent_timestamp(&self.clock);
-        let record = self.current_record()?;
-        let entry = record
-            .state
-            .entries
-            .get(&claim.dispatch_id)
-            .cloned()
-            .ok_or_else(|| AgentDispatcherError::DispatchNotFound {
-                dispatch_id: claim.dispatch_id.clone(),
-            })?;
-        if !entry.is_current_claim(claim, now) {
-            return Err(AgentDispatcherError::ClaimFenced {
+        let mut reapplied = 0;
+        loop {
+            let now = current_agent_timestamp(&self.clock);
+            let record = self.current_record()?;
+            let fenced = || AgentDispatcherError::ClaimFenced {
                 dispatch_id: claim.dispatch_id.clone(),
                 worker_id: claim.worker_id.clone(),
                 fencing_token: claim.fencing_token,
-            });
-        }
+            };
+            let entry = record
+                .state
+                .entries
+                .get(&claim.dispatch_id)
+                .cloned()
+                .ok_or_else(fenced)?;
+            if !entry.is_current_claim(claim, now) {
+                return Err(fenced());
+            }
 
-        let updated = update(entry, now);
-        let mut next = record.state;
-        next.updated_at = updated.updated_at;
-        next.entries
-            .insert(claim.dispatch_id.clone(), updated.clone());
-        self.persist(record.revision, next).await?;
-        self.record_gauges(now);
-        Ok(updated)
+            let updated = update(entry, now);
+            let mut next = record.state;
+            next.updated_at = updated.updated_at;
+            next.entries
+                .insert(claim.dispatch_id.clone(), updated.clone());
+            match self.persist(record.revision, next).await {
+                Ok(_) => {
+                    self.record_gauges(now);
+                    return Ok(updated);
+                }
+                Err(error)
+                    if error.code() == REVISION_CONFLICT_CODE
+                        && reapplied < FLEET_WRITE_REAPPLICATIONS =>
+                {
+                    reapplied += 1;
+                    self.recover().await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn persist(
