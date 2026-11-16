@@ -2375,17 +2375,19 @@ pub struct AgentTaskHandoff {
     /// The communal knowledge spaces the catalog explicitly delegates to the
     /// target ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
     /// The envelope derivation intersects the task's own grant with this
-    /// statement, so a handoff can never widen communal access.
+    /// statement, and takes the statement as it stands for a task that has
+    /// no grant of its own, so a handoff can never widen communal access.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
     /// The capabilities for reading communal claims the catalog explicitly
-    /// delegates to the target. The envelope derivation intersects the task's
-    /// own grant with this statement, so a handoff of a task that carries a
-    /// delegation envelope can never widen what the task may read. A task
-    /// that carries none (a plain task whose definition declares no
-    /// delegation ceilings) is not narrowed: the statement is recorded here
-    /// and the target reads under its own agent's definition and setup, as
-    /// it does for [`Self::knowledge_spaces`].
+    /// delegates to the target. This statement is the target's grant for
+    /// every task, as [`Self::knowledge_spaces`] is: intersected with the
+    /// task's own statement where the task has one, and taken as it stands
+    /// where it has none. A task with no delegation envelope of its own (no
+    /// goal it instituted, no delegation, no delegation ceilings on its
+    /// definition) used to be left unnarrowed; since issue #142 its target
+    /// holds this statement too. The target's own agent's definition and
+    /// setup still bound what it reads, so a handoff never widens.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub read_capabilities: BTreeSet<crate::AgentCapabilityId>,
     /// Where the transfer stands.
@@ -15776,5 +15778,147 @@ mod digest_tests {
         let before = AgentContentDigest::sha256_of_json(&json!({"amount": 100}));
         let after = AgentContentDigest::sha256_of_json(&json!({"amount": 101}));
         assert_ne!(before, after);
+    }
+}
+
+#[cfg(test)]
+mod handoff_envelope_tests {
+    //! The envelope a task's next assignment carries, at each state of a
+    //! handoff (issue #142). No flow decides an assignment while a handoff
+    //! is refused, so only a direct call can pin that a refused transfer
+    //! gives no one an envelope.
+
+    use super::*;
+    use crate::delegation::AgentRunDelegationEnvelope;
+    use crate::identity::{AgentHandoffId, KnowledgeSpaceId};
+
+    /// A task with no goal, no delegation and no delegation ceilings on its
+    /// definition: nothing gives it an envelope of its own.
+    fn plain_task() -> (AgentTaskScope, AgentTask) {
+        let scope = AgentTaskScope::new(
+            TenantId::new("acme"),
+            AgentTaskId::new("plain-task").expect("the task id is valid"),
+        )
+        .expect("the scope is valid");
+        let mut state = AgentTaskState::uncreated(scope.clone(), AgentTimestampMillis::new(1));
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("triage").expect("the definition id is valid"),
+            "Triage one ticket.",
+            AgentSchemaRef::new(
+                AgentSchemaId::new("in").expect("the schema id is valid"),
+                AgentRevisionNumber::INITIAL,
+            ),
+            AgentSchemaRef::new(
+                AgentSchemaId::new("out").expect("the schema id is valid"),
+                AgentRevisionNumber::INITIAL,
+            ),
+        )
+        .expect("the definition is valid");
+        assert!(definition.delegation.is_none());
+        create_task(
+            &mut state,
+            &AgentOperationId::new(
+                AgentOperationKind::TaskCreation,
+                ["acme", "plain-task", "1"],
+            )
+            .expect("the operation id derives"),
+            AgentTaskCreation {
+                definition,
+                input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                    .expect("the input is inline-bounded"),
+                assignee: Some(AgentId::new("support").expect("the agent id is valid")),
+                team: None,
+                goal: None,
+                goal_mode: Default::default(),
+                goal_spec: None,
+                parent: None,
+                dependencies: Vec::new(),
+                escrow: None,
+                wake: None,
+                delegation: None,
+                telemetry: Default::default(),
+            },
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the plain task creates");
+        let task = state.task.expect("the task exists");
+        (scope, task)
+    }
+
+    /// A handoff record at `status`, whose catalog statement is one space
+    /// and one read capability.
+    fn handoff(scope: &AgentTaskScope, status: AgentTaskHandoffStatus) -> AgentTaskHandoff {
+        let generation = AgentAssignmentGeneration::new(1);
+        AgentTaskHandoff {
+            handoff: AgentHandoffId::new("handoff-1").expect("the handoff id is valid"),
+            source_assignment: Box::new(AgentTaskAssignment {
+                generation,
+                agent: AgentId::new("support").expect("the agent id is valid"),
+                run: run_id_for_assignment(scope.task(), generation).expect("the run id derives"),
+                status: AgentAssignmentStatus::Accepted,
+                agent_definition_revision: AgentRevisionNumber::INITIAL,
+                agent_settings_revision: AgentRevisionNumber::INITIAL,
+                operation_id: assignment_operation_id(scope, generation)
+                    .expect("the operation id derives"),
+                assigned_at: AgentTimestampMillis::new(2),
+            }),
+            target: AgentId::new("billing").expect("the agent id is valid"),
+            target_generation: None,
+            reason: "needs billing authority".to_string(),
+            policy_revision: AgentRevisionNumber::INITIAL,
+            context: Vec::new(),
+            knowledge_spaces: BTreeSet::from([
+                KnowledgeSpaceId::new("space-alpha").expect("the space id is valid")
+            ]),
+            read_capabilities: BTreeSet::from([
+                crate::AgentCapabilityId::new("claims.read.a").expect("the capability is valid")
+            ]),
+            status,
+            result_settled: false,
+            recorded_at: AgentTimestampMillis::new(3),
+            settled_at: None,
+        }
+    }
+
+    #[test]
+    fn a_plain_task_that_was_never_handed_off_has_no_envelope() {
+        let (_, task) = plain_task();
+        assert_eq!(delegation_envelope_for(&task), None);
+    }
+
+    #[test]
+    fn a_handoff_in_progress_or_accepted_gives_a_plain_task_the_catalogs_statement() {
+        for status in [
+            AgentTaskHandoffStatus::Initiated,
+            AgentTaskHandoffStatus::Accepted,
+        ] {
+            let (scope, mut task) = plain_task();
+            let record = handoff(&scope, status);
+            let expected = AgentRunDelegationEnvelope {
+                knowledge_spaces: Some(record.knowledge_spaces.clone()),
+                read_capabilities: Some(record.read_capabilities.clone()),
+                ..Default::default()
+            };
+            task.handoff = Some(Box::new(record));
+
+            assert_eq!(
+                delegation_envelope_for(&task).as_deref(),
+                Some(&expected),
+                "the default envelope with the catalog's two statements and nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_handoff_gives_a_plain_task_no_envelope() {
+        let (scope, mut task) = plain_task();
+        task.handoff = Some(Box::new(handoff(
+            &scope,
+            AgentTaskHandoffStatus::Refused {
+                code: "agent-not-instantiated".to_string(),
+            },
+        )));
+
+        assert_eq!(delegation_envelope_for(&task), None);
     }
 }

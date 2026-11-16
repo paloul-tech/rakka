@@ -112,3 +112,16 @@ In `delegation_envelope_for` (`crates/rakka-agent/src/task.rs`): when the task h
 
 - Test names, and whether proof 3 and proof 8 extend `handoff_record.rs` or an existing end-to-end file.
 - How proof 8 is shown with the fixtures that exist.
+
+## 9. As built
+
+Where the build and its review moved from this design.
+
+- **The tasks affected are wider than "plain".** What gives a task an envelope of its own is a goal it instituted with a goal specification, not a goal it names. A wake-epoch task and any task that only names a goal carry none, and are narrowed by this change. The product documents say so; sections 1 and 2 above do not. `a_task_that_only_names_a_goal_is_narrowed_like_a_plain_task` holds it.
+- **The reader table in section 4 omits two readers.** The fan-in await deadline and the claim-append provenance stamp (`lineage.last()`) also read the envelope. Both behave with the default envelope as they do with none.
+- **"The source's later assignments carry no envelope" describes an event that does not occur.** A refused handoff restores the source's assignment and mints nothing, and no flow decides an assignment while a handoff is refused. Proof 5 as written shows only that the refusal disturbs nothing. That a refused record yields no envelope is pinned by a direct call, in `task.rs::handoff_envelope_tests`.
+- **"A handoff recorded on the earlier build and assigned on the new one" cannot rest.** Recording a handoff and deciding the target's assignment are one compare-and-set. The carrier across an upgrade is the handoff the source's run planned, which holds the catalog's statement as it stood then. The compatibility entry says to let planned handoffs finish.
+- **"Passes on at most what the target was passed" is the rule, not "what it holds".** A target's envelope can state a space its own agent is not granted, and a child whose catalog entry states that space is delegated it, as at any root.
+- **"Stating them first is safe" needed a caveat.** The same catalog entry serves delegation and the handoff of enveloped tasks, where a statement takes effect at once.
+- **Proof 8's "can still call a tool" has no test.** The delegation half is tested; tool planning reads `allowed_tools`, which the equality with the default envelope shows is empty.
+

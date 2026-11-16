@@ -508,14 +508,19 @@ incorrectly.
        nothing delegates nothing. A handoff follows the same rule for every task: its
        target holds what the catalog states for it, intersected with the
        task's own statement where the task has one (a delegated task, or a
-       goal that names knowledge spaces), and stating nothing passes on
-       nothing. That holds for communal appends as for reads, and the target
-       passes on no more than it holds. A plain task (no goal, no delegation,
-       no delegation ceilings on its definition) used to be the exception:
-       its handoff narrowed nothing, and the target kept its own agent's
-       whole grant (issue #142). A catalog target a plain task can be handed
-       to must therefore state the knowledge spaces and read capabilities it
-       needs (`with_knowledge_space`, `with_read_capability`).
+       goal specification that names knowledge spaces), and stating nothing
+       passes on nothing. That holds for communal appends as for reads. When
+       the target delegates, it passes on no more than it was passed; like a
+       root, it can pass on what its own agent is not granted. When it hands
+       the task off again, the next target holds the catalog's statement for
+       it, not intersected with the earlier handoff's. A task with no
+       envelope of its own used to be the exception: one that institutes no
+       goal, carries no delegation, and whose definition declares no
+       delegation ceilings, which includes a wake-epoch task and a task that
+       only names a goal. Its handoff narrowed nothing, and the target kept
+       its own agent's whole grant (issue #142). A catalog target such a task
+       can be handed to must therefore state the knowledge spaces and read
+       capabilities it needs (`with_knowledge_space`, `with_read_capability`).
     3. *The policy.* `CommunalRetrievalPolicy` names the trust states and
        classifications a deployment admits into a model context at all.
        **The default admits only `Verified`, `Unclassified` claims.** A

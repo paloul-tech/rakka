@@ -377,30 +377,34 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
 - Issue #142 ("narrow a plain task's handoff by the catalog's communal statement") changes what the target of a handoff may read and append. **It can remove access.** No durable field, no schema change, no new error code, no new metric.
 
-  A plain task is one with no goal, no delegation, and no delegation ceilings on its definition. It carries no delegation envelope, and a handoff used to narrow only an envelope a task already had.
+  The tasks affected are those that carry no delegation envelope of their own: a task that institutes no goal (it was created with no goal specification), carries no delegation provenance, and whose definition declares no delegation ceilings. **That includes a wake-epoch task and any task that only names a goal by id.** This entry calls them plain tasks. A handoff used to narrow only an envelope a task already had.
 
   | On the handoff of a plain task | Before | After |
   |---|---|---|
   | The target's knowledge spaces, for reads and appends | Its own agent's whole grant | The spaces the catalog states for the target, inside its own agent's grant |
   | The target's read capabilities | Its own agent's whole grant | The capabilities the catalog states for the target, inside its own agent's grant |
   | A catalog target that states nothing | The target's whole grant | No communal access |
-  | An append outside the catalog's spaces | Accepted | Refused: `run-claim-space-not-delegated` at the run's command door, `claim-space-not-delegated` at dispatch |
-  | A read outside the catalog's statement | Answered | Not an error: the space is not searched, and a claim that requires a capability the run was not passed is not admitted |
-  | What the target passes on when it delegates | The next catalog statement | The next catalog statement intersected with what the target holds |
+  | An append outside the catalog's spaces | Accepted | Refused at the run's command door with `run-claim-space-not-delegated`. The dispatch authority holds the same check behind it (`claim-space-not-delegated`) |
+  | A read outside the catalog's statement | Answered | Not an error: the space is not searched, and a claim that requires a capability the run was not passed is not admitted. A run passed no space runs no communal search at all |
+  | What the target passes on when it delegates | The next catalog statement | The next catalog statement intersected with what the target was passed. The bound is what it was passed, not what its own agent is granted |
+  | The target hands the task off again | The next target keeps its own agent's whole grant | The next target holds the catalog's statement for it. That statement is not intersected with what this target was passed: each handoff of such a task starts from the catalog |
+  | The target's run record | Holds no delegation envelope | Holds one. `AgentLoopState::delegation_envelope()` answering `Some` no longer means a run is goal-scoped or delegated |
   | Skills, tools, workflows, environments, ceilings, depth, deadline | Not narrowed | Not narrowed |
 
-  A handoff of a task that already carried an envelope (a goal-bearing task, a delegated task, a task whose definition declares delegation ceilings) is unchanged. So is a refused handoff: the source resumes under its own agent's grant.
+  A handoff of a task that already carried an envelope (a task that instituted a goal with a goal specification, a delegated task, a task whose definition declares delegation ceilings) is unchanged. So is a refused handoff: the source resumes under its own agent's grant.
 
   **When it takes effect.** The task entity computes the envelope when it makes an assignment, and a run keeps the envelope it accepted.
 
   | Situation | Result |
   |---|---|
   | A run already accepted when its task entity moves to the new build | Unchanged for the life of the run |
-  | A handoff recorded on the earlier build and assigned on the new one | Narrowed by what its record holds. A record written before issue #69 holds no read capabilities, so its target reads only claims that require none |
+  | A handoff the source's run planned before the catalog was updated, and delivered after the upgrade (one held behind an approval gate or awaiting reconciliation) | It carries the catalog's statement as it stood when it was planned. If that stated nothing, its target is passed nothing. One planned on a build from before issue #69 carries no read capabilities |
   | During a roll | Whether a handoff is narrowed depends on which build hosts the task entity when it assigns |
   | A rollback | Clean. The earlier build reads the envelope and enforces it; nothing new is written |
 
-  **Before upgrading**, state on every catalog target a plain task can be handed to the knowledge spaces and read capabilities it needs (`AgentDelegationTarget::with_knowledge_space`, `with_read_capability`). The earlier build ignores them for a plain task, so stating them first is safe. After upgrading, a target that was missed shows as appends refused with the two codes above and as communal reads that find nothing.
+  **Before upgrading**, state on every catalog target such a task can be handed to the knowledge spaces and read capabilities it needs (`AgentDelegationTarget::with_knowledge_space`, `with_read_capability`), and let handoffs already planned finish. The earlier build ignores the statement for a plain task's handoff. It does not ignore it elsewhere: one catalog entry serves a skill for delegation and for handoff alike, so a statement added to it takes effect at once for children delegated to that skill and for the handoff of a task that carries an envelope. State what each target should hold, and no more.
+
+  **After upgrading, a target that was missed** is refused its appends with `run-claim-space-not-delegated`, and runs no communal search: `rakka.agent.communal.retrievals` does not move for it and its snapshots hold no communal record, which is also what a run with no communal bundle looks like. The reliable sign is the target run's own record, whose delegation envelope holds an empty `knowledge_spaces`.
 
 Run the default compatibility matrix:
 

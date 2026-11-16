@@ -1247,6 +1247,55 @@ async fn a_plain_tasks_handoff_grants_only_what_the_catalog_states() {
     );
 }
 
+/// What decides whether a task has an envelope of its own is a goal it
+/// *instituted* (a goal specification), not a goal it names. A task that
+/// only names a goal, as a wake-epoch task does, has none, and its handoff
+/// is narrowed like a plain task's.
+#[tokio::test]
+async fn a_task_that_only_names_a_goal_is_narrowed_like_a_plain_task() {
+    let fixture = fixture_handing_off(&["space-alpha"], &["claims.read.a"]);
+    fixture.instantiate_agent().await;
+    fixture
+        .apply_task_command(AgentTaskEntityCommand::Create {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::TaskCreation,
+                [common::TENANT, common::TASK, "1"],
+            )
+            .expect("the operation id derives"),
+            creation: Box::new(rakka_agent::AgentTaskCreation {
+                definition: handoff_task_definition(),
+                input: AgentTaskContent::inline(json!({ "text": "hello" }))
+                    .expect("the input is inline-bounded"),
+                assignee: Some(common::agent_id()),
+                team: None,
+                goal: Some(
+                    rakka_agent::AgentGoalId::new("goal-named-only").expect("the goal id is valid"),
+                ),
+                goal_mode: Default::default(),
+                goal_spec: None,
+                parent: None,
+                dependencies: Vec::new(),
+                escrow: None,
+                wake: None,
+                delegation: None,
+                telemetry: Default::default(),
+            }),
+        })
+        .await
+        .expect("the task that names a goal creates");
+
+    let envelope = target_envelope_after_transfer(&fixture).await;
+
+    assert_eq!(
+        envelope,
+        Some(rakka_agent::AgentRunDelegationEnvelope {
+            knowledge_spaces: Some(knowledge_spaces(&["space-alpha"])),
+            read_capabilities: Some(read_capabilities(&["claims.read.a"])),
+            ..Default::default()
+        })
+    );
+}
+
 /// Stating nothing passes on nothing, as it does for a delegation and for
 /// the handoff of a task that carries an envelope. A catalog written before
 /// anyone thought about handoffs and claims is this case: its target loses
@@ -1423,9 +1472,13 @@ async fn the_target_of_a_plain_tasks_handoff_delegates_and_passes_on_no_more_tha
     );
 }
 
-/// A refused transfer gives no one a root envelope: the source is restored
-/// and resumes as it was, under its own agent's grant. Pinned here because
-/// it must not change with the narrowing.
+/// A refused transfer leaves the source as it was: restored, resumed, and
+/// with no envelope on its run. The run's envelope was fixed when it was
+/// accepted, before any handoff, so this shows the refusal disturbs nothing.
+/// That a refused record gives no *later* assignment an envelope is pinned
+/// where it can be, by a direct call, in `task.rs`
+/// (`a_refused_handoff_gives_a_plain_task_no_envelope`): no flow decides an
+/// assignment while a handoff is refused.
 #[tokio::test]
 async fn a_refused_handoff_of_a_plain_task_leaves_the_source_with_no_envelope() {
     let fixture = fixture_handing_off(&["space-alpha"], &["claims.read.a"]);
