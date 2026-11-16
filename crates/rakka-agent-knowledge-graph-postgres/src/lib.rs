@@ -129,6 +129,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rakka_agent_knowledge_graph::claim::{
     Claim, ClaimId, ClaimNodeId, ClaimOperationId, ClaimRecord,
@@ -183,6 +184,17 @@ pub const OPERATION_TABLE_NAME: &str = "rakka_agent_knowledge_claim_op";
 /// shared id would needlessly serialize unrelated subsystems' migrations in a
 /// shared database (the lesson `rakka-agent-postgres` records).
 pub const MIGRATION_LOCK_ID: i64 = 982_451_927;
+
+/// How long [`PostgresKnowledgeGraphStore::migrate`] waits for another
+/// migrator's lock before it gives up, unless the store was given its own
+/// wait with [`PostgresKnowledgeGraphStore::with_migration_lock_wait`]: five
+/// minutes.
+///
+/// A waiter cannot tell a lock that a cancelled migration left behind from
+/// one a first migration still holds while it builds its indexes. Five
+/// minutes covers the second on a claim table of moderate size; a deployment
+/// with a larger one sets a longer wait on the nodes that start during it.
+pub const DEFAULT_MIGRATION_LOCK_WAIT: Duration = Duration::from_secs(300);
 
 /// Largest number of compare-and-set attempts one [`transition`] call makes
 /// before failing with `claim-backend-failed`.
@@ -458,6 +470,28 @@ const SEARCH_INDEX_BUILDS: [(&str, &str); 2] = [
 /// own. The statement ends by itself, so nothing can wait on it for long.
 const MIGRATION_LOCK_PAUSE_SQL: &str = "SELECT pg_sleep(0.05)";
 
+/// Reads the session that holds the migration lock: its backend process id,
+/// and what `pg_stat_activity` says of its state and of how long it has been
+/// connected.
+///
+/// `pg_locks` shows a 64-bit advisory key as two 32-bit halves, the high
+/// half in `classid` and the low half in `objid`, with `objsubid` 1. An
+/// advisory lock belongs to one database, so the row is matched on this
+/// one. The join is a left join, and the state and the connection time may
+/// be null: the server withholds both, of another role's session, from a
+/// role without `pg_read_all_stats`. Nothing else is selected: no query
+/// text, no application name, no client address.
+const MIGRATION_LOCK_HOLDER_SQL: &str = "\
+    SELECT l.pid, a.state, EXTRACT(EPOCH FROM (now() - a.backend_start))::bigint \
+    FROM pg_locks l \
+    LEFT JOIN pg_stat_activity a ON a.pid = l.pid \
+    WHERE l.locktype = 'advisory' AND l.granted \
+      AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+      AND l.classid = (($1::bigint >> 32) & 4294967295)::oid \
+      AND l.objid = ($1::bigint & 4294967295)::oid \
+      AND l.objsubid = 1 \
+    LIMIT 1";
+
 /// Whether one index exists and is valid; no row when it does not exist.
 const INDEX_VALID_SQL: &str = "
 SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)
@@ -698,6 +732,7 @@ impl LedgerHit {
 #[derive(Clone)]
 pub struct PostgresKnowledgeGraphStore {
     client: Arc<Client>,
+    migration_lock_wait: Duration,
 }
 
 impl PostgresKnowledgeGraphStore {
@@ -710,7 +745,29 @@ impl PostgresKnowledgeGraphStore {
     /// Creates a store that shares an already-`Arc`-wrapped client.
     #[must_use]
     pub fn from_shared_client(client: Arc<Client>) -> Self {
-        Self { client }
+        Self {
+            client,
+            migration_lock_wait: DEFAULT_MIGRATION_LOCK_WAIT,
+        }
+    }
+
+    /// Sets how long [`Self::migrate`] waits for another migrator's lock
+    /// before it gives up. The default is [`DEFAULT_MIGRATION_LOCK_WAIT`].
+    ///
+    /// The lock is always tried at least once, so a wait of zero means "try
+    /// once". A node that starts while a first migration is still building
+    /// its indexes for longer than the wait fails, and succeeds on a retry;
+    /// give such a node a longer wait.
+    #[must_use]
+    pub fn with_migration_lock_wait(mut self, wait: Duration) -> Self {
+        self.migration_lock_wait = wait;
+        self
+    }
+
+    /// How long [`Self::migrate`] waits for another migrator's lock.
+    #[must_use]
+    pub const fn migration_lock_wait(&self) -> Duration {
+        self.migration_lock_wait
     }
 
     /// Applies the idempotent schema under the crate's advisory lock.
@@ -743,18 +800,49 @@ impl PostgresKnowledgeGraphStore {
     ///
     /// The advisory lock is a session lock, released by the last statement
     /// of this call. A call that is dropped or timed out part-way never
-    /// reaches that statement, and the lock stays held on the connection.
-    /// Every other migrator then waits, with no error, for as long as that
-    /// connection lives; a retry on the same connection succeeds, because a
-    /// session lock is re-entrant, and still leaves one hold behind. After a
-    /// cancelled `migrate`, close the connection. Do not run `migrate` under
-    /// a deadline shorter than the index builds.
+    /// reaches that statement, and the lock stays held on the connection for
+    /// as long as that connection lives. A retry on the same connection
+    /// succeeds, because a session lock is re-entrant, and still leaves one
+    /// hold behind. After a cancelled `migrate`, close the connection. Do
+    /// not run `migrate` under a deadline shorter than the index builds.
+    ///
+    /// # The wait for another migrator
+    ///
+    /// A migrator that finds the lock held waits for it, trying again every
+    /// fifty milliseconds, for no longer than the store's lock wait:
+    /// [`DEFAULT_MIGRATION_LOCK_WAIT`] unless
+    /// [`Self::with_migration_lock_wait`] set another. Then it stops and
+    /// returns a refusal that names the session holding the lock: its
+    /// backend process id, how long it has been connected, and its state.
+    /// The refusal carries no query text, application name, client address
+    /// or connection string. A waiter that gives up holds nothing.
+    ///
+    /// The refusal's message begins `migration lock not acquired within`.
+    /// That beginning is stable, and is how a caller tells this refusal from
+    /// another backend failure; the rest is written for a person. Where the
+    /// server withholds the holder's connection age or state, the message
+    /// says they are unknown. Where the holder released the lock just before
+    /// it was read, the message says so, and `migrate` can be run again.
+    /// Where the holder could not be read at all, the message says that and
+    /// gives the SQLSTATE of the failed read.
+    ///
+    /// A waiter cannot tell a lock a cancelled call left behind from one a
+    /// first migration still holds while it builds its indexes. The holder's
+    /// state is the best signal there is, and it is a weak one. A session
+    /// that is `idle` is not migrating. A session that is `active` may be
+    /// migrating, or may be serving an unrelated query on a connection that
+    /// kept the lock: the store runs on a client the application supplies,
+    /// so a leaked lock usually sits on a connection still in use. A node
+    /// that starts during a first migration longer than its wait gets the
+    /// refusal and succeeds on a retry; give such a node a longer wait.
     ///
     /// # Errors
     ///
-    /// Returns [`ClaimError::Backend`] if the DDL cannot be applied.
+    /// Returns [`ClaimError::Backend`] if the DDL cannot be applied, or if
+    /// another session still holds the migration lock when the lock wait
+    /// ends.
     pub async fn migrate(&self) -> ClaimResult<()> {
-        self.lock_for_migration().await.map_err(map_error)?;
+        self.lock_for_migration().await?;
         // Two batches, two transactions: the validating scan must not run under
         // the exclusive locks the first batch takes (see
         // `MIGRATION_VALIDATE_SQL`).
@@ -775,7 +863,8 @@ impl PostgresKnowledgeGraphStore {
     }
 
     /// Takes the crate's migration lock, waiting for another migrator without
-    /// holding anything while it waits.
+    /// holding anything while it waits, and for no longer than the store's
+    /// lock wait.
     ///
     /// The lock is *tried*, never waited on. A concurrent index build waits
     /// for every transaction whose snapshot is older than its own, and a
@@ -784,19 +873,61 @@ impl PostgresKnowledgeGraphStore {
     /// on each other, the second for the lock and the first for the second's
     /// snapshot, and PostgreSQL would break the cycle by failing one with
     /// `deadlock detected`. Each attempt here is a statement that ends at
-    /// once, and so is each pause between attempts.
-    async fn lock_for_migration(&self) -> Result<(), tokio_postgres::Error> {
+    /// once, and so is each pause between attempts and the read of the
+    /// holder.
+    ///
+    /// The bound is checked after a failed try and before the pause, so the
+    /// lock is always tried at least once and a wait of zero is one try. A
+    /// waiter that gives up holds nothing.
+    async fn lock_for_migration(&self) -> ClaimResult<()> {
+        let started = Instant::now();
         loop {
             let locked: bool = self
                 .client
                 .query_one("SELECT pg_try_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
-                .await?
+                .await
+                .map_err(map_error)?
                 .get(0);
             if locked {
                 return Ok(());
             }
-            self.client.batch_execute(MIGRATION_LOCK_PAUSE_SQL).await?;
+            if started.elapsed() >= self.migration_lock_wait {
+                // The refusal is what the caller must hear. A holder that
+                // cannot be read changes what the refusal can say about the
+                // holder, and never replaces it with the read's own error.
+                let message = match self.migration_lock_holder().await {
+                    Ok(holder) => lock_wait_refusal(self.migration_lock_wait, holder.as_ref()),
+                    Err(error) => lock_wait_refusal_unread(
+                        self.migration_lock_wait,
+                        error.code().map(SqlState::code),
+                    ),
+                };
+                return Err(ClaimError::Backend {
+                    backend: BACKEND_NAME.to_string(),
+                    message,
+                });
+            }
+            self.client
+                .batch_execute(MIGRATION_LOCK_PAUSE_SQL)
+                .await
+                .map_err(map_error)?;
         }
+    }
+
+    /// Reads which session holds the migration lock in this database, or
+    /// `None` when none does any more.
+    async fn migration_lock_holder(
+        &self,
+    ) -> Result<Option<MigrationLockHolder>, tokio_postgres::Error> {
+        let row = self
+            .client
+            .query_opt(MIGRATION_LOCK_HOLDER_SQL, &[&MIGRATION_LOCK_ID])
+            .await?;
+        Ok(row.map(|row| MigrationLockHolder {
+            pid: row.get(0),
+            state: row.get(1),
+            connected_secs: row.get(2),
+        }))
     }
 
     /// Builds the two search indexes without blocking a reader or a writer,
@@ -1588,6 +1719,64 @@ fn decode_outcome(bytes: &[u8]) -> ClaimResult<ClaimTransitionOutcome> {
     })
 }
 
+/// What the database says about the session that holds the migration lock.
+///
+/// Only the backend's process id is always known. The server withholds the
+/// rest of another role's session from a role without `pg_read_all_stats`.
+struct MigrationLockHolder {
+    /// The holding session's backend process id.
+    pid: i32,
+    /// Whole seconds since that session connected.
+    connected_secs: Option<i64>,
+    /// The session's state, as `pg_stat_activity` reports it.
+    state: Option<String>,
+}
+
+/// The message of the refusal a migrator returns when it stops waiting for
+/// the migration lock.
+///
+/// It names what an operator needs to find the connection: the holder's
+/// backend process id, how long it has been connected, and its state. It
+/// carries no query text, application name, client address or connection
+/// string. `None` is a holder that released the lock between the last try
+/// and the read.
+fn lock_wait_refusal(wait: Duration, holder: Option<&MigrationLockHolder>) -> String {
+    let Some(holder) = holder else {
+        return format!(
+            "migration lock not acquired within {wait:?}: the holder released it since. Run \
+             migrate again."
+        );
+    };
+    let connected = holder.connected_secs.map_or_else(
+        || "connection age unknown".to_string(),
+        |seconds| format!("connected for {seconds}s"),
+    );
+    let state = holder.state.as_deref().unwrap_or("unknown");
+    format!(
+        "migration lock not acquired within {wait:?}: held by backend pid {}, {connected}, state \
+         {state}. If no migration is running on that connection, close it.",
+        holder.pid
+    )
+}
+
+/// The refusal's message when the read of the holder itself failed, as it
+/// does for a role the server refuses `pg_stat_activity`.
+///
+/// It still says the lock was not acquired, which is what happened. Of the
+/// failed read it carries only the five-character SQLSTATE, when the server
+/// gave one, and never the server's own text.
+fn lock_wait_refusal_unread(wait: Duration, sqlstate: Option<&str>) -> String {
+    match sqlstate {
+        Some(sqlstate) => format!(
+            "migration lock not acquired within {wait:?}: the holder could not be read \
+             (SQLSTATE {sqlstate})."
+        ),
+        None => {
+            format!("migration lock not acquired within {wait:?}: the holder could not be read.")
+        }
+    }
+}
+
 /// Whether a statement failed on a primary-key or unique constraint.
 fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
     error
@@ -1608,5 +1797,60 @@ fn map_error(error: tokio_postgres::Error) -> ClaimError {
     ClaimError::Backend {
         backend: BACKEND_NAME.to_string(),
         message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_refusal_names_the_holder() {
+        let holder = MigrationLockHolder {
+            pid: 4242,
+            connected_secs: Some(1830),
+            state: Some("idle".to_string()),
+        };
+        assert_eq!(
+            lock_wait_refusal(Duration::from_secs(300), Some(&holder)),
+            "migration lock not acquired within 300s: held by backend pid 4242, connected for \
+             1830s, state idle. If no migration is running on that connection, close it."
+        );
+    }
+
+    #[test]
+    fn the_refusal_says_what_the_server_withheld() {
+        let holder = MigrationLockHolder {
+            pid: 4242,
+            connected_secs: None,
+            state: None,
+        };
+        assert_eq!(
+            lock_wait_refusal(Duration::from_millis(300), Some(&holder)),
+            "migration lock not acquired within 300ms: held by backend pid 4242, connection age \
+             unknown, state unknown. If no migration is running on that connection, close it."
+        );
+    }
+
+    #[test]
+    fn the_refusal_survives_a_holder_that_could_not_be_read() {
+        assert_eq!(
+            lock_wait_refusal_unread(Duration::from_secs(300), Some("42501")),
+            "migration lock not acquired within 300s: the holder could not be read (SQLSTATE \
+             42501)."
+        );
+        assert_eq!(
+            lock_wait_refusal_unread(Duration::from_secs(300), None),
+            "migration lock not acquired within 300s: the holder could not be read."
+        );
+    }
+
+    #[test]
+    fn the_refusal_says_when_the_holder_is_gone() {
+        assert_eq!(
+            lock_wait_refusal(Duration::from_secs(300), None),
+            "migration lock not acquired within 300s: the holder released it since. Run migrate \
+             again."
+        );
     }
 }

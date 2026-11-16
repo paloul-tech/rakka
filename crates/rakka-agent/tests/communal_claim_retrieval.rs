@@ -1050,6 +1050,48 @@ async fn the_guardrail_sees_the_statement_json_and_the_claim() {
     );
 }
 
+/// The testkit clause a deployment runs against its own chain (issue #144)
+/// is the step assembly runs, so the two answer alike for one chain and one
+/// claim: the statement the clause says assembly embeds is the statement in
+/// the snapshot, and a claim the clause says assembly drops is not there.
+#[tokio::test]
+async fn assembly_and_the_testkit_clause_agree_on_a_claim() {
+    use rakka_agent::testkit::{evaluate_claim_at_memory_ingress, ClaimIngressOutcome};
+
+    let held = text_record("s1", "claim-1", "call the customer on 555 0100");
+
+    let redacted = text_statement("[redacted]");
+    let replacement = serde_json::to_value(&redacted).expect("the statement encodes");
+    let rewriting = chain_with(move |_, _| AgentGuardrailOutcome::Transform {
+        content: replacement.clone(),
+        reason_code: "pii-redacted".to_string(),
+    });
+    let clause = evaluate_claim_at_memory_ingress(&rewriting, &scope(), &held)
+        .expect("the record is one assembly evaluates");
+    let assembled = one_claim_under(rewriting, held.clone())
+        .await
+        .assemble()
+        .await;
+    assert_eq!(
+        clause.outcome,
+        ClaimIngressOutcome::EmbeddedTransformed(
+            assembled.snapshot.communal_claims[0].statement.clone()
+        )
+    );
+    assert_eq!(assembled.snapshot.communal_claims[0].statement, redacted);
+
+    let blocking = chain_with(|_, _| AgentGuardrailOutcome::Block {
+        reason_code: "not-for-this-agent".to_string(),
+        evidence: None,
+    });
+    let clause = evaluate_claim_at_memory_ingress(&blocking, &scope(), &held)
+        .expect("the record is one assembly evaluates");
+    let assembled = one_claim_under(blocking, held).await.assemble().await;
+    assert_eq!(clause.outcome, ClaimIngressOutcome::Blocked);
+    assert!(selected_ids(&assembled).is_empty());
+    assert_eq!(assembled.communal.blocked, 1);
+}
+
 // ---------------------------------------------------------------------------
 // The selection is a prefix of the merged ranking.
 // ---------------------------------------------------------------------------

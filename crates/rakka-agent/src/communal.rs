@@ -51,7 +51,8 @@ use crate::definition::{AgentCapabilityId, AgentRevisionNumber};
 use crate::delegation::{delegated_grant, AgentRunDelegationEnvelope};
 use crate::dispatch::AgentRunSetupResolver;
 use crate::guardrails::{
-    AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailDisposition,
+    AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailDecision,
+    AgentGuardrailDisposition,
 };
 use crate::identity::{
     validate_identity_segment, AgentCommunalClaimId, AgentDelegationId, AgentGoalId, AgentId,
@@ -1057,6 +1058,89 @@ fn applicable_transform(
     applicable.then_some(transformed)
 }
 
+/// What assembly does with one claim after the memory-ingress boundary.
+///
+/// The answer of the boundary step assembly runs for every claim it resolved
+/// and admitted. A deployment reaches the same step through
+/// [`crate::testkit::evaluate_claim_at_memory_ingress`].
+///
+/// It is the boundary's answer and no more. The snapshot's byte budget is
+/// applied after the boundary, so a claim this says assembly embeds can
+/// still be left out of a snapshot that has no room for it.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ClaimIngressOutcome {
+    /// The chain allowed the claim and changed nothing: assembly embeds the
+    /// record's own statement, if the byte budget has room.
+    Embedded,
+    /// The chain allowed the claim with a transform assembly can apply:
+    /// assembly embeds this statement, under this statement's digest.
+    EmbeddedTransformed(CommunalClaimStatement),
+    /// A stage blocked the claim, or the chain blocked an oversized
+    /// transform: assembly drops the claim.
+    Blocked,
+    /// A stage required a checkpoint: assembly drops the claim, because
+    /// snapshot assembly has no checkpoint to park on.
+    CheckpointRefused,
+    /// The chain allowed the claim with a transform assembly cannot apply:
+    /// one that does not decode to a valid statement, or that changes a node
+    /// object, an artifact reference or the object's kind. Assembly drops
+    /// the claim and counts it as blocked.
+    TransformRejected,
+}
+
+/// One claim's evaluation at the memory-ingress boundary: the chain's own
+/// decision, and what assembly does with the claim because of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimIngressEvaluation {
+    /// The chain's decision, with its disposition, its transforms and its
+    /// reports.
+    pub decision: AgentGuardrailDecision,
+    /// What assembly does with the claim.
+    pub outcome: ClaimIngressOutcome,
+}
+
+/// Evaluates one claim at the memory-ingress boundary, as assembly does.
+///
+/// One evaluation per claim, on the statement object, with the claim's
+/// identity and space in the context and a transform bounded to the size a
+/// statement may have. This is the only place that step is written: the walk
+/// in [`select_communal_claims`] and the testkit clause both call it, so
+/// what a deployment tests is what assembly runs.
+///
+/// The caller has already resolved the record and checked that it validates
+/// and that the query admits it.
+pub(crate) fn evaluate_claim_at_ingress(
+    chain: &AgentGuardrailChain,
+    scope: &AgentRunScope,
+    record: &CommunalClaimRecord,
+) -> ClaimIngressEvaluation {
+    let context = AgentGuardrailContext::new(AgentGuardrailBoundary::MemoryIngress, scope)
+        .with_claim(&record.claim_id, &record.space);
+    let decision = chain.evaluate_bounded(
+        &context,
+        &record.statement.to_json(),
+        COMMUNAL_STATEMENT_TRANSFORM_MAX_BYTES,
+    );
+    let outcome = match &decision.disposition {
+        AgentGuardrailDisposition::Blocked { .. } => ClaimIngressOutcome::Blocked,
+        // Fail-closed drop: there is no checkpoint plumbing at snapshot
+        // assembly, and parking a model turn on a per-claim grant would make
+        // memory a liveness gate.
+        AgentGuardrailDisposition::CheckpointRequired { .. } => {
+            ClaimIngressOutcome::CheckpointRefused
+        }
+        AgentGuardrailDisposition::Allowed if decision.transformed => {
+            match applicable_transform(&record.statement, &decision.content) {
+                Some(transformed) => ClaimIngressOutcome::EmbeddedTransformed(transformed),
+                None => ClaimIngressOutcome::TransformRejected,
+            }
+        }
+        AgentGuardrailDisposition::Allowed => ClaimIngressOutcome::Embedded,
+    };
+    ClaimIngressEvaluation { decision, outcome }
+}
+
 /// One entry of the merged ranking: a claim, the space whose ranking named
 /// it, and its clamped score.
 struct MergedRanking {
@@ -1216,38 +1300,24 @@ pub(crate) async fn select_communal_claims(
 
         // The memory-ingress boundary: one evaluation per claim, on the
         // statement, with the claim's identity in the context.
-        let context = AgentGuardrailContext::new(AgentGuardrailBoundary::MemoryIngress, scope)
-            .with_claim(&record.claim_id, &record.space);
-        let decision = chain.evaluate_bounded(
-            &context,
-            &record.statement.to_json(),
-            COMMUNAL_STATEMENT_TRANSFORM_MAX_BYTES,
-        );
-        match &decision.disposition {
-            AgentGuardrailDisposition::Blocked { .. } => {
+        let ClaimIngressEvaluation { decision, outcome } =
+            evaluate_claim_at_ingress(chain, scope, &record);
+        let (statement, statement_digest) = match outcome {
+            // A transform the boundary cannot apply drops the claim, and is
+            // counted with the claims a stage blocked.
+            ClaimIngressOutcome::Blocked | ClaimIngressOutcome::TransformRejected => {
                 report.blocked += 1;
                 continue;
             }
-            AgentGuardrailDisposition::CheckpointRequired { .. } => {
-                // Fail-closed drop: there is no checkpoint plumbing at
-                // snapshot assembly, and parking a model turn on a per-claim
-                // grant would make memory a liveness gate.
+            ClaimIngressOutcome::CheckpointRefused => {
                 report.checkpoint_refused += 1;
                 continue;
             }
-            AgentGuardrailDisposition::Allowed => {}
-        }
-
-        let (statement, statement_digest) = if decision.transformed {
-            let Some(transformed) = applicable_transform(&record.statement, &decision.content)
-            else {
-                report.blocked += 1;
-                continue;
-            };
-            let digest = transformed.digest();
-            (transformed, digest)
-        } else {
-            (record.statement, record.statement_digest)
+            ClaimIngressOutcome::EmbeddedTransformed(transformed) => {
+                let digest = transformed.digest();
+                (transformed, digest)
+            }
+            ClaimIngressOutcome::Embedded => (record.statement, record.statement_digest),
         };
 
         // Stop at the first claim that does not fit, rather than skipping it
