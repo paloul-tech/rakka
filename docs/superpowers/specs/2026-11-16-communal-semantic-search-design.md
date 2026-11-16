@@ -30,6 +30,7 @@ After this change a deployment can rank a knowledge space's claims by meaning: e
 - One stored embedding per claim, scoped by tenant and knowledge space, with the model, dimension count and pipeline version beside it.
 - A search operation behind `semantic-search`, on the portable store SPI, implemented by the in-memory store and by PostgreSQL with pgvector.
 - A fresh claim is embedded at append, best effort. A pass a deployment calls embeds what is left. No loop in Rakka calls the pass. *(Owner's decision, 2026-11-16.)*
+- A deployment states which classifications of claim may be sent to the embedder. There is no default. *(Owner's decision, 2026-11-16.)*
 - The communal retriever ranks by meaning when it is given an embedder and its store reports the capability, and by words otherwise.
 - Conformance clauses any backend runs.
 - A deployment that does not opt in keeps its schema, its bytes and its behaviour. The base graph schema keeps working on a database with no `vector` extension.
@@ -149,7 +150,7 @@ Rules every backend keeps:
   - It embeds the query with `embed_memory_vector`, and keeps the last query text with its vector, because assembly calls `retrieve` once per granted space with the same query.
   - A failed embedding fails that `retrieve`. Assembly already treats that as a degraded space and continues the turn. There is no per-search fallback to words.
   - `index_incomplete` is the store's `unindexed`.
-- **The append executor.** `KnowledgeGraphClaimAppendExecutor::with_embedder(self, embedder) -> Self`. After the store answers the append (first time or replay), and when the store reports `semantic-search`, it embeds `claim_embedding_text` and stores the result. **Every failure of that step is swallowed**: the finding is still `Appended`. A claim it could not embed is left for the pass.
+- **The append executor.** `KnowledgeGraphClaimAppendExecutor::with_embedder(self, embedder, classifications: BTreeSet<MemoryClassification>) -> Self`. After the store answers the append (first time or replay), when the store reports `semantic-search` and the claim's classification is in the set (6.5), it embeds `claim_embedding_text` and stores the result. **Every failure of that step is swallowed**: the finding is still `Appended`. A claim it could not embed is left for the pass.
 - **The pass.** `embed_claims(store, embedder, classifications, scope, after, limit) -> ClaimResult<ClaimEmbeddingPassPage { embedded, failed, undecodable, next }>`. It reads one page of `unembedded_claims`, embeds each claim and stores it. A deployment calls it until `next` is `None`. It is idempotent and safe while the store serves.
   - **A claim the model refuses does not stop the pass.** It is counted in `failed` and the cursor moves past it, so one claim a provider always rejects (a content filter, an input it finds too long) cannot keep every later claim of the space unembedded. The same holds for an answer of the wrong length or with a non-finite component. A non-zero `failed` means: run the pass again later. A claim that fails every time stays unembedded, and searches that admit it keep reporting `index_incomplete`. *(My call. The private tier's `reindex` stops on a model error and can be wedged this way.)*
   - A store failure ends the call with the store's error. What was already stored stays.
@@ -161,7 +162,8 @@ Embedding sends text to a model the deployment chose, which may be outside the d
 
 **Claims.** The executor and the pass take the set of classifications they may embed.
 
-- **OPEN, for the owner:** what that set is when a deployment does not state one. See the question put to the owner with this design.
+- **There is no default. A deployment states the set.** It is a required argument of the executor's `with_embedder` and of `embed_claims`, so sending a class of claims to a model is always something the deployment wrote down. *(Owner's decision, 2026-11-16.)*
+- An empty set is allowed and embeds nothing.
 - A `Redacted` claim is never sent, whatever the set says. The private tier never embeds redacted content either. *(My call.)*
 - A `Retracted` claim is not sent: no search ever admits one. One that is retracted after it was embedded keeps its vector, which no search can reach. *(My call.)*
 - A claim outside the set has no embedding, so a meaning-based search does not find it. Word-match search would have. A deployment whose read policy admits a classification must also let it be embedded, or lose those claims when it switches the retriever to meaning.
@@ -187,8 +189,8 @@ Embedding sends text to a model the deployment chose, which may be outside the d
   1. Have the `vector` extension available on the graph's database.
   2. Run `migrate` from a store built `with_semantic_search`, to its end.
   3. Run `index_claims` for any space with claims from before issue #69, as that issue's step 3 says.
-  4. Wire the embedder into the append executor on every node.
-  5. Run `embed_claims` for each space until it answers no `next`.
+  4. Wire the embedder into the append executor on every node, with the classifications it may embed. They should cover every classification the read policy admits.
+  5. Run `embed_claims` for each space, with the same classifications, until it answers no `next`.
   6. Wire the embedder into the retriever. Before step 5 finishes this is safe: searches report `index_incomplete`.
 - **New stable strings:** the three operation names in refusals are not new codes; `semantic-search` already exists. The PostgreSQL column and trigger names are fixed once shipped, because `migrate` finds them by name.
 - No new error code and no new metric.
