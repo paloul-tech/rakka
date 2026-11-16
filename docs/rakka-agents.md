@@ -505,13 +505,22 @@ incorrectly.
        own definition, so the catalog is what bounds a root's delegation, and
        a root can pass on a read capability it does not itself hold. A
        delegated run holds what its delegation states and no more: stating
-       nothing delegates nothing. A handoff follows the same rule **when the task carries a
-       delegation envelope**: a goal-bearing task, a delegated task, or a task
-       whose definition declares delegation ceilings. A plain task with none
-       of those carries no envelope, and its handoff is recorded but narrows
-       nothing: the target run reads, and appends, under its own agent's
-       definition and setup. Declare delegation ceilings on the task
-       definition, or root the task in a goal, where a handoff must narrow.
+       nothing delegates nothing. A handoff follows the same rule for every task: its
+       target holds what the catalog states for it, intersected with the
+       task's own statement where the task has one (a delegated task, or a
+       goal specification that names knowledge spaces), and stating nothing
+       passes on nothing. That holds for communal appends as for reads. When
+       the target delegates, it passes on no more than it was passed; like a
+       root, it can pass on what its own agent is not granted. When it hands
+       the task off again, the next target holds the catalog's statement for
+       it, not intersected with the earlier handoff's. A task with no
+       envelope of its own used to be the exception: one that institutes no
+       goal, carries no delegation, and whose definition declares no
+       delegation ceilings, which includes a wake-epoch task and a task that
+       only names a goal. Its handoff narrowed nothing, and the target kept
+       its own agent's whole grant (issue #142). A catalog target such a task
+       can be handed to must therefore state the knowledge spaces and read
+       capabilities it needs (`with_knowledge_space`, `with_read_capability`).
     3. *The policy.* `CommunalRetrievalPolicy` names the trust states and
        classifications a deployment admits into a model context at all.
        **The default admits only `Verified`, `Unclassified` claims.** A
