@@ -66,6 +66,10 @@ use crate::choreography::{
     AgentExchangePayload, AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter,
     AgentExchangeState, AgentExchangeTransition, AgentExchangeTransport,
 };
+use crate::communal::{
+    AgentCommunalClaimTrust, CommunalClaimObject, CommunalClaimProvenance, CommunalClaimRecord,
+    CommunalClaimStatement,
+};
 use crate::definition::{AgentCredentialBindingRef, AgentModelProfileId, AgentRevisionNumber};
 use crate::dispatch::{
     AgentDispatchError, AgentDispatchFuture, AgentDispatchProbe, AgentDispatchToolExecutor,
@@ -78,9 +82,13 @@ use crate::effect::{
     AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
     AgentRunEffectStatus,
 };
-use crate::identity::{AgentOperationId, AgentRunScope, AgentTaskScope};
+use crate::guardrails::AgentGuardrailChain;
+use crate::identity::{
+    AgentCommunalClaimId, AgentId, AgentOperationId, AgentRunScope, AgentTaskScope,
+    KnowledgeSpaceId,
+};
 use crate::loop_runtime::{AgentLoopState, CURRENT_AGENT_LOOP_ADAPTER_VERSION};
-use crate::memory::{AgentContextSnapshotRef, AgentRunMemory, MemoryError};
+use crate::memory::{AgentContextSnapshotRef, AgentRunMemory, MemoryClassification, MemoryError};
 use crate::model::{
     AgentModelAdapter, AgentModelFuture, AgentModelRequest, AgentModelResult,
     AgentModelRetryPolicy, AgentModelTurn, AgentToolCallRequest,
@@ -5126,6 +5134,199 @@ pub async fn assert_conversation_history_store_contract<Store>(
         "resuming past the hole delivers the tail"
     );
     assert!(tail.next.is_none(), "the tail is the end of the log");
+}
+
+// ---------------------------------------------------------------------------
+// A communal claim at the memory-ingress boundary (issue #144).
+// ---------------------------------------------------------------------------
+
+pub use crate::communal::{ClaimIngressEvaluation, ClaimIngressOutcome};
+
+/// Evaluates one communal claim at the memory-ingress boundary with `chain`,
+/// through the code context assembly runs, and answers what assembly would
+/// do with the claim.
+///
+/// # Why a deployment runs this
+///
+/// The communal bundle must carry the dispatch authority's own guardrail
+/// chain, so the stages a deployment wrote for private memory also see every
+/// communal claim. They see it in another shape. A private memory is handed
+/// to a stage as its bare content. A claim is handed over as its statement
+/// object, `{"subject", "predicate", "object"}`, with any text under
+/// `object.value.inline`, and with [`AgentGuardrailContext::claim`] and
+/// `claim_space` set. A stage that inspects a top-level string finds an
+/// object, matches nothing, and allows every claim; one that answers a bare
+/// string as its transform drops every claim.
+///
+/// Run a deployment's own chain here against a claim that carries text its
+/// stages should catch ([`CommunalClaimFixture`] builds one), and assert the
+/// outcome it expects: [`ClaimIngressOutcome::Blocked`], or
+/// [`ClaimIngressOutcome::EmbeddedTransformed`] with the rewritten
+/// statement. [`ClaimIngressOutcome::TransformRejected`] means the chain
+/// allowed the claim with a transform assembly does not apply: a transform
+/// must decode to a valid statement, may rewrite the subject, the predicate
+/// and an inline value, and may not change a node object, an artifact
+/// reference or the object's kind.
+///
+/// # What it covers, and what it does not
+///
+/// It is the boundary step and nothing else. Before that step assembly
+/// resolves the claim through the authority and re-checks its space, trust,
+/// classification, confidence and required read capabilities; after it,
+/// assembly applies the snapshot's byte budget. None of that runs here.
+///
+/// **It attests nothing.** Rakka does not know whether a deployment ran it,
+/// and wiring the communal bundle does not require it. A chain is shown to
+/// handle the claims a test hands it, and no others.
+///
+/// # Errors
+///
+/// A record that does not validate is refused with the record's own
+/// [`CommunalClaimRecord::validate`] error and is not evaluated: assembly
+/// drops such a record before the boundary, so no stage ever sees it.
+///
+/// [`AgentGuardrailContext::claim`]: crate::guardrails::AgentGuardrailContext::claim
+pub fn evaluate_claim_at_memory_ingress(
+    chain: &AgentGuardrailChain,
+    scope: &AgentRunScope,
+    claim: &CommunalClaimRecord,
+) -> Result<ClaimIngressEvaluation, MemoryError> {
+    claim.validate()?;
+    Ok(crate::communal::evaluate_claim_at_ingress(
+        chain, scope, claim,
+    ))
+}
+
+/// Builds a communal claim record to hand to
+/// [`evaluate_claim_at_memory_ingress`].
+///
+/// The statement is the part a memory-ingress stage sees, so it is what the
+/// caller chooses: a subject, a predicate, and either inline text or a node.
+/// The claim's id and space can be set, because a stage may branch on them.
+/// The rest is fixed and never reaches a stage: the claim is `Verified` and
+/// `Unclassified`, at full confidence, created at instant zero by the agent
+/// `testkit`, with no evidence and no required read capability. The
+/// statement's digest is derived from the statement.
+#[derive(Debug, Clone)]
+pub struct CommunalClaimFixture {
+    claim_id: AgentCommunalClaimId,
+    space: KnowledgeSpaceId,
+    subject: String,
+    predicate: String,
+    object: CommunalClaimFixtureObject,
+}
+
+/// The object of a fixture's statement, before it is checked.
+#[derive(Debug, Clone)]
+enum CommunalClaimFixtureObject {
+    InlineText(String),
+    Node(String),
+}
+
+impl CommunalClaimFixture {
+    /// The claim id a fixture carries unless [`Self::with_claim_id`] sets
+    /// another.
+    pub const DEFAULT_CLAIM_ID: &'static str = "claim-under-test";
+    /// The knowledge space a fixture carries unless [`Self::with_space`]
+    /// sets another.
+    pub const DEFAULT_SPACE: &'static str = "space-under-test";
+
+    /// A claim whose object is inline text, which a stage finds under
+    /// `object.value.inline`. This is where a hostile claim carries its
+    /// payload.
+    #[must_use]
+    pub fn inline_text(subject: &str, predicate: &str, text: &str) -> Self {
+        Self::with_object(
+            subject,
+            predicate,
+            CommunalClaimFixtureObject::InlineText(text.to_string()),
+        )
+    }
+
+    /// A claim whose object is a node of the graph, which a stage finds
+    /// under `object.node`. A transform may not change it.
+    #[must_use]
+    pub fn node(subject: &str, predicate: &str, node: &str) -> Self {
+        Self::with_object(
+            subject,
+            predicate,
+            CommunalClaimFixtureObject::Node(node.to_string()),
+        )
+    }
+
+    fn with_object(subject: &str, predicate: &str, object: CommunalClaimFixtureObject) -> Self {
+        Self {
+            claim_id: AgentCommunalClaimId::new(Self::DEFAULT_CLAIM_ID)
+                .expect("the default claim id is a valid identity"),
+            space: KnowledgeSpaceId::new(Self::DEFAULT_SPACE)
+                .expect("the default space is a valid identity"),
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object,
+        }
+    }
+
+    /// Sets the claim's id, which a stage reads from
+    /// `AgentGuardrailContext::claim`.
+    #[must_use]
+    pub fn with_claim_id(mut self, claim_id: AgentCommunalClaimId) -> Self {
+        self.claim_id = claim_id;
+        self
+    }
+
+    /// Sets the claim's knowledge space, which a stage reads from
+    /// `AgentGuardrailContext::claim_space`.
+    #[must_use]
+    pub fn with_space(mut self, space: KnowledgeSpaceId) -> Self {
+        self.space = space;
+        self
+    }
+
+    /// Builds the record.
+    ///
+    /// # Errors
+    ///
+    /// The record's own validation error: a subject, predicate or node that
+    /// is not a valid identity segment, or inline text over the bound a
+    /// claim's object has.
+    pub fn build(self) -> Result<CommunalClaimRecord, MemoryError> {
+        let object = match self.object {
+            CommunalClaimFixtureObject::InlineText(text) => CommunalClaimObject::Value(
+                AgentTaskContent::inline(serde_json::Value::String(text)).map_err(|error| {
+                    MemoryError::Encoding {
+                        message: format!("the fixture's inline text is not a claim value: {error}"),
+                    }
+                })?,
+            ),
+            CommunalClaimFixtureObject::Node(node) => CommunalClaimObject::Node(node),
+        };
+        let statement = CommunalClaimStatement {
+            subject: self.subject,
+            predicate: self.predicate,
+            object,
+        };
+        let record = CommunalClaimRecord {
+            claim_id: self.claim_id,
+            space: self.space,
+            statement_digest: statement.digest(),
+            statement,
+            trust: AgentCommunalClaimTrust::Verified,
+            provenance: CommunalClaimProvenance {
+                agent: AgentId::new("testkit").expect("the fixture's agent id is valid"),
+                goal: None,
+                task: None,
+                run: None,
+                delegation: None,
+            },
+            evidence: Vec::new(),
+            created_at: AgentTimestampMillis::new(0),
+            confidence_bps: 10_000,
+            classification: MemoryClassification::Unclassified,
+            required_read_capabilities: std::collections::BTreeSet::new(),
+        };
+        record.validate()?;
+        Ok(record)
+    }
 }
 
 #[cfg(test)]
