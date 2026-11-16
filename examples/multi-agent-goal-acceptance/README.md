@@ -41,6 +41,19 @@ and its snapshots are unchanged.
 cargo test -p rakka-example-multi-agent-goal-acceptance --test communal_read_path
 ```
 
+`tests/fleet_prune.rs` prunes the dispatcher fleet record in the same world.
+Two runs complete, and their finished entries are what the record would
+otherwise hold for good. A third run's dispatcher is then lost after it
+claimed a ticket, so one claim is in flight under a live lease. A second
+dispatcher over the same stores calls `prune_fleet` at a horizon in the
+future: every finished entry is removed, and the claim in flight is left
+exactly as it was. Once its lease lapses the claim is taken over, the run
+completes, and its model is invoked once.
+
+```sh
+cargo test -p rakka-example-multi-agent-goal-acceptance --test fleet_prune
+```
+
 ## Expected stdout
 
 ```text
