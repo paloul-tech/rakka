@@ -102,8 +102,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rakka_agent_workflow::substrate::{
-    OutboxCommand, OutboxMessageId, OutboxStatus, RetryPolicy, WorkflowClock, WorkflowState,
-    WorkflowTelemetryEvent,
+    OutboxCommand, OutboxEntry, OutboxMessageId, OutboxStatus, RetryPolicy, WorkflowClock,
+    WorkflowState, WorkflowTelemetryEvent,
 };
 use rakka_agent_workflow::{
     agent_effect_to_outbox_command, AgentDispatchClaim, AgentDispatcherError, AgentDispatcherFleet,
@@ -421,6 +421,26 @@ const WORKER_LOST: Ambiguity<'static> = Ambiguity {
     code: "dispatcher-lost-after-started",
     line: "dispatcher lost after started",
 };
+
+/// What a worker would have told the run had its own failure spent the
+/// ticket's row: owed to the run when the row was exhausted under a claim
+/// the worker still holds
+/// ([`AgentRunEffectDispatcher::conclude_on_finished_row`]).
+struct OwedOutcome<'a> {
+    scope: &'a AgentRunScope,
+    intent: &'a AgentRunEffect,
+    attempt: u32,
+    outcome: AgentRunEffectOutcome,
+}
+
+/// What [`AgentRunEffectDispatcher::apply_outbox`] did.
+enum OutboxWritten {
+    /// The write was applied; the substrate's event, where it produces one.
+    Applied(Option<WorkflowTelemetryEvent>),
+    /// A settle write found its row already finished and wrote nothing: the
+    /// row as it stands.
+    RowFinished(Box<OutboxEntry>),
+}
 
 /// One of the dispatcher's own writes to a run's inbox store.
 ///
@@ -2280,19 +2300,20 @@ where
         self
     }
 
-    /// Rebuilds the fleet handle from the settings and filter this worker
-    /// currently holds.
+    /// Rebuilds the fleet handle from the settings, the filter and the
+    /// metrics recorder this worker currently holds.
     ///
-    /// Both builders route through here so neither discards the other's
-    /// configuration — which the two independent constructions they used to
-    /// perform did, silently, depending on call order.
+    /// Every builder that changes one of the three routes through here so
+    /// none discards another's configuration — which the independent
+    /// constructions they used to perform did, silently, depending on call
+    /// order.
     fn rebuild_fleet(&mut self) {
         self.fleet = AgentDispatcherFleet::with_clock_and_metrics(
             self.fleet_store.clone(),
             rakka_agent_workflow::agent_dispatcher_fleet_persistence_id(),
             self.fleet_settings.clone(),
             self.clock.clone(),
-            Arc::new(rakka_core::NoopMetricsRecorder),
+            self.metrics.clone(),
         )
         .with_claim_filter(self.claim_filter.clone());
     }
@@ -2455,12 +2476,52 @@ where
     }
 
     /// Records the dispatcher's own metrics
-    /// ([`crate::observability::METRIC_AGENT_DISPATCH_WRITE_RETRIES`]) into
-    /// `metrics`. Without it they are recorded nowhere.
+    /// ([`crate::observability::METRIC_AGENT_DISPATCH_WRITE_RETRIES`]) and
+    /// its fleet's into `metrics`. Without it they are recorded nowhere.
+    ///
+    /// The fleet's are the counter
+    /// [`rakka_agent_workflow::METRIC_AGENT_DISPATCHER_FLEET`] and the gauges
+    /// [`rakka_agent_workflow::METRIC_AGENT_DISPATCHER_IN_FLIGHT`],
+    /// [`rakka_agent_workflow::METRIC_AGENT_DISPATCHER_BACKLOG`] and
+    /// [`rakka_agent_workflow::METRIC_AGENT_DISPATCHER_ENTRIES`]. The last is
+    /// the fleet record's entry count by status: the series that shows the
+    /// record growing when nothing calls [`Self::prune_fleet`]. None of them
+    /// carries a run, effect, tenant or worker id.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
         self.metrics = metrics;
+        self.rebuild_fleet();
         self
+    }
+
+    /// Removes the finished entries of this dispatcher's fleet record that
+    /// finished before `before`.
+    ///
+    /// The fleet record is one durable record per database that every
+    /// dispatcher reads and writes whole, and nothing else removes an entry
+    /// from it: without a prune it holds one entry for every effect the
+    /// deployment ever dispatched. An application calls this on its own
+    /// schedule, with its own horizon. It is
+    /// [`AgentDispatcherFleet::prune_terminal`] and nothing more, so an
+    /// operator command that holds only the fleet store can call that
+    /// directly.
+    ///
+    /// It is safe while other dispatchers run and at any horizon: only an
+    /// entry that is `Completed`, `Exhausted` or `Cancelled` is removed, an
+    /// entry is finished only after its outbox row is, and a settle that
+    /// loses its write to the prune reads the record again and re-applies.
+    /// What goes with an entry is its `last_error_code`, the only durable
+    /// copy of a cancelled ticket's settle reason.
+    ///
+    /// # Errors
+    ///
+    /// The fleet store's error, or `revision-conflict` when the prune lost
+    /// its write more times than it re-applies.
+    pub async fn prune_fleet(
+        &mut self,
+        before: AgentTimestampMillis,
+    ) -> AgentDispatchResult<rakka_agent_workflow::AgentDispatcherPrune> {
+        Ok(self.fleet.prune_terminal(before).await?)
     }
 
     /// Closes one segment into the wired sink, attaching the run's identity
@@ -2524,10 +2585,88 @@ where
         message_id: &OutboxMessageId,
         write: InboxWrite<'_>,
     ) -> AgentDispatchResult<Option<WorkflowTelemetryEvent>> {
+        match self.apply_outbox(scope, message_id, write, false).await? {
+            OutboxWritten::Applied(event) => Ok(event),
+            OutboxWritten::RowFinished(_) => {
+                unreachable!("only a settle write looks at the row before it writes")
+            }
+        }
+    }
+
+    /// Records how a claim's attempt ended at the run's outbox: one of
+    /// [`InboxWrite::Succeeded`], [`InboxWrite::Failed`] and
+    /// [`InboxWrite::Exhausted`]. It is [`Self::write_outbox`] with one
+    /// difference: **it never rewrites a finished row.**
+    ///
+    /// The substrate sets the row's status whatever it held. A call that
+    /// outlives its lease is still running when another worker takes the
+    /// ticket over and finishes it, and when that call finally answers, its
+    /// worker comes here with a failure for a row that already says
+    /// `Dispatched`. Written, that failure would make a finished row due
+    /// again. So the row is looked at in the same read the write is computed
+    /// from, and a row that is `Dispatched`, `Exhausted` or `Cancelled` is
+    /// left exactly as it is. The check and the write share the inbox
+    /// record's revision, so nothing can finish the row between them.
+    ///
+    /// Answers the substrate's event when the write was applied, and the row
+    /// as it stands when it was already finished. The caller of the second
+    /// goes to [`Self::conclude_on_finished_row`].
+    ///
+    /// A row that is not finished is written as before, whoever holds the
+    /// claim: fencing every outbox write on the claim is a larger change.
+    async fn settle_outbox(
+        &self,
+        scope: &AgentRunScope,
+        message_id: &OutboxMessageId,
+        write: InboxWrite<'_>,
+    ) -> AgentDispatchResult<Result<WorkflowTelemetryEvent, Box<OutboxEntry>>> {
+        debug_assert!(
+            matches!(
+                write,
+                InboxWrite::Succeeded | InboxWrite::Failed { .. } | InboxWrite::Exhausted { .. }
+            ),
+            "a settle write is a success, a failure or an exhaustion"
+        );
+        match self.apply_outbox(scope, message_id, write, true).await? {
+            OutboxWritten::Applied(event) => {
+                Ok(Ok(event.expect("a settle write answers its event")))
+            }
+            OutboxWritten::RowFinished(row) => Ok(Err(row)),
+        }
+    }
+
+    /// The one loop behind [`Self::write_outbox`] and
+    /// [`Self::settle_outbox`]. `keep_finished_row` is the settle's check.
+    async fn apply_outbox(
+        &self,
+        scope: &AgentRunScope,
+        message_id: &OutboxMessageId,
+        write: InboxWrite<'_>,
+        keep_finished_row: bool,
+    ) -> AgentDispatchResult<OutboxWritten> {
         let mut reapplied = 0;
         loop {
             let mut inbox = self.inbox(scope);
             inbox.recover().await?;
+            if keep_finished_row {
+                let finished = inbox
+                    .inner()
+                    .state()
+                    .map_err(AgentInboxError::from)?
+                    .outbox_entry(message_id)
+                    .filter(|row| {
+                        matches!(
+                            row.status(),
+                            OutboxStatus::Dispatched
+                                | OutboxStatus::Exhausted
+                                | OutboxStatus::Cancelled
+                        )
+                    })
+                    .cloned();
+                if let Some(row) = finished {
+                    return Ok(OutboxWritten::RowFinished(Box::new(row)));
+                }
+            }
             let written = match &write {
                 InboxWrite::Scheduled(command) => inbox
                     .inner_mut()
@@ -2575,9 +2714,65 @@ where
                     )
                     .ok();
                 }
-                written => return Ok(written?),
+                written => return Ok(OutboxWritten::Applied(written?)),
             }
         }
+    }
+
+    /// Ends a claim whose outbox row was already finished when this worker
+    /// came to settle it ([`Self::settle_outbox`]).
+    ///
+    /// The claim is over, and this worker writes nothing more to the outbox.
+    /// What is left is the fleet entry, which is brought in line with the
+    /// row if this worker's claim is still current, and, in one case, the
+    /// run.
+    ///
+    /// **A worker whose lease lapsed** is how a row usually comes to be
+    /// finished under it: another worker took the ticket over and finished
+    /// it. The fleet answers that worker `claim-fenced`, which is the
+    /// expected answer here and not a failure of the pass. It delivers
+    /// nothing: the worker that holds the claim owns the outcome.
+    ///
+    /// **A worker that still holds the claim** can find its row exhausted
+    /// too, and then it is the one the run must hear from. A late worker's
+    /// failure is written to a row that is not finished yet, and that worker
+    /// is fenced at the fleet before it delivers anything. So the row is
+    /// `Exhausted`, nobody has told the run, and once the fleet entry
+    /// follows the row nothing will ever claim the ticket again. `owed` is
+    /// what this worker would have told the run had its own failure spent
+    /// the row; it is delivered when, and only when, the claim was still
+    /// current and the row is `Exhausted`. The run's own guard refuses it if
+    /// the effect is already resolved.
+    ///
+    /// The fleet entry is settled first and the run is told second, the
+    /// order every exhausting site keeps: only a worker that still holds the
+    /// claim may deliver a failure, and settling the entry is what
+    /// establishes that.
+    async fn conclude_on_finished_row(
+        &mut self,
+        claim: &AgentDispatchClaim,
+        row: &OutboxEntry,
+        owed: Option<OwedOutcome<'_>>,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        match self.fleet.settle_claim_from_row(claim, Some(row)).await {
+            Ok(_) => {
+                if let Some(owed) = owed.filter(|_| row.status() == OutboxStatus::Exhausted) {
+                    self.deliver_outcome(
+                        owed.scope,
+                        owed.intent,
+                        owed.attempt,
+                        claim.fencing_token,
+                        owed.outcome,
+                        pass,
+                    )
+                    .await?;
+                }
+            }
+            Err(rakka_agent_workflow::AgentDispatcherError::ClaimFenced { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(ClaimConclusion::Settled)
     }
 
     /// The dispatcher's own clock, as an agent-domain timestamp.
@@ -2635,7 +2830,10 @@ where
     ///
     /// It reads the run's outbox and the run, and reads and writes the fleet
     /// record only when the outbox has a due ticket — and writes it only when
-    /// registration inserts or changes an entry.
+    /// registration inserts or changes an entry. When it does read the fleet
+    /// record, it reads the run's outbox once more afterwards and registers
+    /// what that read finds due, so a ticket finished between the two reads
+    /// is never registered again.
     pub async fn register_run(
         &mut self,
         scope: &AgentRunScope,
@@ -2671,18 +2869,33 @@ where
         // Register the run's due dispatch tickets into the fleet.
         let mut inbox = self.inbox(scope);
         inbox.recover().await?;
-        let due = inbox.due_effects()?;
-        let fleet_current = !due.is_empty();
+        // This first read only decides whether the fleet record is read at
+        // all: a run with nothing due costs no read of the shared record.
+        let fleet_current = !inbox.due_effects()?.is_empty();
         if fleet_current {
             // Read here, not once per worker: the registration's
             // compare-and-set is fenced on the revision it read, and a
             // long-lived worker's copy is whatever its last pass left.
             self.fleet.recover().await?;
-            let registration = self
-                .fleet
-                .register_due_effects(workflow_run_id(scope), None, due)
-                .await?;
-            pass.registered = registration.registered_effects;
+            // The list that is registered is read after the fleet record,
+            // never before it. The fence only protects a registration whose
+            // due list is no older than the revision it writes against: a
+            // list read first can name a ticket that another worker has
+            // since claimed, run and settled, and whose finished entry a
+            // prune has since removed. Registering it would put a finished
+            // effect back in the fleet. Read in this order, either nothing
+            // wrote the fleet after this read, and the list is newer than
+            // every finished entry and every prune it could miss; or
+            // something did, and the write below loses.
+            inbox.recover().await?;
+            let due = inbox.due_effects()?;
+            if !due.is_empty() {
+                let registration = self
+                    .fleet
+                    .register_due_effects(workflow_run_id(scope), None, due)
+                    .await?;
+                pass.registered = registration.registered_effects;
+            }
         }
 
         // Fence a winding-down run at the dispatch layer before anything can
@@ -3274,8 +3487,15 @@ where
             return Ok(ClaimConclusion::Died);
         }
 
-        self.write_outbox(scope, &message_id, InboxWrite::Succeeded)
-            .await?;
+        if let Err(row) = self
+            .settle_outbox(scope, &message_id, InboxWrite::Succeeded)
+            .await?
+        {
+            // The outcome was delivered before this write.
+            return self
+                .conclude_on_finished_row(&claim, &row, None, pass)
+                .await;
+        }
         self.fleet.complete_claim(&claim).await?;
         Ok(ClaimConclusion::Settled)
     }
@@ -3464,8 +3684,8 @@ where
     ) -> AgentDispatchResult<ClaimConclusion> {
         let timer = AgentSegmentTimer::start(self.now());
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
-        let event = self
-            .write_outbox(
+        let event = match self
+            .settle_outbox(
                 scope,
                 &message_id,
                 InboxWrite::Failed {
@@ -3474,7 +3694,23 @@ where
                 },
             )
             .await?
-            .expect("a failure record answers its event");
+        {
+            Ok(event) => event,
+            Err(row) => {
+                let owed = OwedOutcome {
+                    scope,
+                    intent,
+                    attempt: row.attempts().attempts(),
+                    outcome: AgentRunEffectOutcome::exhausted(
+                        ambiguity.code.to_string(),
+                        "the retry budget was spent recovering ambiguous attempts".to_string(),
+                    ),
+                };
+                return self
+                    .conclude_on_finished_row(&claim, &row, Some(owed), pass)
+                    .await;
+            }
+        };
         pass.failed_attempts += 1;
 
         if let WorkflowTelemetryEvent::OutboxDispatchExhausted { attempts, .. } = &event {
@@ -3604,8 +3840,15 @@ where
                 self.deliver_outcome(scope, intent, attempt, claim.fencing_token, *outcome, pass)
                     .await?;
                 let message_id = OutboxMessageId::new(claim.effect_id.as_str());
-                self.write_outbox(scope, &message_id, InboxWrite::Succeeded)
-                    .await?;
+                if let Err(row) = self
+                    .settle_outbox(scope, &message_id, InboxWrite::Succeeded)
+                    .await?
+                {
+                    // The reconciled outcome was delivered before this write.
+                    return self
+                        .conclude_on_finished_row(&claim, &row, None, pass)
+                        .await;
+                }
                 self.fleet.complete_claim(&claim).await?;
                 Ok(ClaimConclusion::Settled)
             }
@@ -3693,8 +3936,8 @@ where
         // protocol again rather than invoking; a spent budget parks the
         // generation.
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
-        let event = self
-            .write_outbox(
+        let event = match self
+            .settle_outbox(
                 scope,
                 &message_id,
                 InboxWrite::Failed {
@@ -3703,7 +3946,26 @@ where
                 },
             )
             .await?
-            .expect("a failure record answers its event");
+        {
+            Ok(event) => event,
+            Err(row) => {
+                // The finding established nothing, and the row's budget is
+                // spent: the run is told the outcome is unknown, as a park
+                // tells it.
+                let owed = OwedOutcome {
+                    scope,
+                    intent,
+                    attempt,
+                    outcome: AgentRunEffectOutcome::indeterminate(
+                        bounded_failure_code(exhausted_code),
+                        bounded_failure_detail(INDETERMINATE_OUTCOME_MESSAGE),
+                    ),
+                };
+                return self
+                    .conclude_on_finished_row(&claim, &row, Some(owed), pass)
+                    .await;
+            }
+        };
         pass.failed_attempts += 1;
         if matches!(
             event,
@@ -3968,10 +4230,21 @@ where
                 timed_out: false,
             }
         };
-        let event = self
-            .write_outbox(scope, &message_id, write)
-            .await?
-            .expect("a failure record answers its event");
+        let event = match self.settle_outbox(scope, &message_id, write).await? {
+            Ok(event) => event,
+            Err(row) => {
+                let owed = OwedOutcome {
+                    scope,
+                    intent,
+                    attempt,
+                    outcome: AgentRunEffectOutcome::exhausted(code.to_string(), detail)
+                        .with_reason(reason),
+                };
+                return self
+                    .conclude_on_finished_row(claim, &row, Some(owed), pass)
+                    .await;
+            }
+        };
         pass.failed_attempts += 1;
         self.fleet.record_claim_failure(claim, &event).await?;
 

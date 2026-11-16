@@ -17,8 +17,8 @@ use crate::{
     },
     checkpoints::{METRIC_AGENT_HUMAN_CHECKPOINTS, METRIC_AGENT_HUMAN_WAIT_LATENCY_MS},
     dispatcher::{
-        METRIC_AGENT_DISPATCHER_BACKLOG, METRIC_AGENT_DISPATCHER_FLEET,
-        METRIC_AGENT_DISPATCHER_IN_FLIGHT,
+        METRIC_AGENT_DISPATCHER_BACKLOG, METRIC_AGENT_DISPATCHER_ENTRIES,
+        METRIC_AGENT_DISPATCHER_FLEET, METRIC_AGENT_DISPATCHER_IN_FLIGHT,
     },
     inbox::METRIC_AGENT_INBOX_COMMANDS,
     outbox::METRIC_AGENT_OUTBOX_EFFECTS,
@@ -598,6 +598,12 @@ pub const AGENT_WORKFLOW_METRIC_INSTRUMENTS: &[AgentMetricInstrument] = &[
         MetricKind::Gauge,
         "{effect}",
         "Dispatcher in-flight work by target class.",
+    ),
+    AgentMetricInstrument::new(
+        METRIC_AGENT_DISPATCHER_ENTRIES,
+        MetricKind::Gauge,
+        "{entry}",
+        "Entries the dispatcher fleet record holds, by dispatch status.",
     ),
     AgentMetricInstrument::new(
         METRIC_AGENT_DISPATCH_LATENCY_MS,

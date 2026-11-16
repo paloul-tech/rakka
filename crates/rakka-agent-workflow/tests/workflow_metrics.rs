@@ -68,6 +68,17 @@ fn metric_registry_uses_stable_names_kinds_units_and_bounded_attributes() {
 }
 
 #[test]
+fn the_entries_gauge_is_in_the_metric_catalogue() {
+    let entries = agent_metric_instrument(rakka_agent_workflow::METRIC_AGENT_DISPATCHER_ENTRIES)
+        .expect("the entries gauge is registered");
+
+    assert_eq!(entries.name, "rakka.agent_workflow.dispatcher.entries");
+    assert_eq!(entries.kind, MetricKind::Gauge);
+    // Its one label is a bounded field.
+    assert!(is_bounded_agent_metric_attribute("status"));
+}
+
+#[test]
 fn metric_attribute_validation_rejects_high_cardinality_labels() {
     let error = validate_agent_metric_attributes(&[("run_id", "run-123")])
         .expect_err("raw run ids must not be hot metric labels");

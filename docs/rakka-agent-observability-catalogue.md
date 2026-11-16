@@ -116,6 +116,35 @@ correct.
 | Mailbox and stream pressure | `rakka.agent_workflow.runtime.mailbox_depth`, `rakka.agent_workflow.stream.pressure`, `rakka.actor.mailbox.depth`, `rakka.stream.pressure` |
 | Human checkpoint wait latency and waiting runs | `rakka.agent_workflow.human.wait.latency_ms`, `rakka.agent_workflow.human.waiting_runs` |
 
+### The fleet's own series, from the dispatcher
+
+`AgentRunEffectDispatcher::with_metrics` hands its recorder to its fleet
+(issue #145), so an application that wires it receives the dispatcher fleet's
+series beside the agent domain's. They are declared in
+`rakka-agent-workflow`, with the rest of the substrate's instruments.
+
+| Metric | Kind | Unit | Labels | What it counts |
+| --- | --- | --- | --- | --- |
+| `rakka.agent_workflow.dispatcher.fleet` | Counter | `{dispatch}` | `operation`, `outcome`, `detail` | Fleet operations. `AgentRunEffectDispatcher` records `register`, `claim` and `prune`. |
+| `rakka.agent_workflow.dispatcher.in_flight` | Gauge | `{effect}` | — | Entries under an active lease. |
+| `rakka.agent_workflow.dispatcher.backlog` | Gauge | `{effect}` | — | Entries claimable now. |
+| `rakka.agent_workflow.dispatcher.entries` | Gauge | `{entry}` | `status` | Entries the fleet record holds, one sample per dispatch status, a zero included. |
+
+`entries` is the series that shows the record growing: its `completed`,
+`exhausted` and `cancelled` samples fall only when something calls
+`prune_fleet` or `prune_terminal`. A prune records `operation=prune`,
+`outcome=pruned` with the number of entries it removed. No label carries a
+run, effect, tenant or worker id.
+
+The workflow-tier worker, `AgentDispatcherWorker`, records two more
+operations on the same counter, which a recorder wired through
+`AgentRunEffectDispatcher` never sees: `cancel`, and `dispatch`, whose
+samples also carry `effect_kind` and `target_class`. A dispatch that worker
+did not make, because the ticket's outbox row was already finished or absent,
+records `operation=dispatch`, `outcome=skipped` with
+`detail=ticket-row-settled` or `ticket-row-missing`, under the three labels
+of the table.
+
 ### The `signal` label, and where its values are declared
 
 The four instruments carrying `signal` take their values from two closed

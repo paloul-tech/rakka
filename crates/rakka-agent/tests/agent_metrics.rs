@@ -1524,3 +1524,112 @@ async fn a_run_without_a_communal_bundle_counts_no_communal_retrieval() {
         .observations_named(METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES)
         .is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The dispatcher's recorder reaches its fleet (issue #145).
+// ---------------------------------------------------------------------------
+
+const FLEET_SERIES: [&str; 4] = [
+    rakka_agent_workflow::METRIC_AGENT_DISPATCHER_FLEET,
+    rakka_agent_workflow::METRIC_AGENT_DISPATCHER_IN_FLIGHT,
+    rakka_agent_workflow::METRIC_AGENT_DISPATCHER_BACKLOG,
+    rakka_agent_workflow::METRIC_AGENT_DISPATCHER_ENTRIES,
+];
+
+/// A run whose first model ticket is in the outbox, over a fixture that
+/// wires no recorder of its own.
+async fn run_with_a_due_ticket() -> AuthorityFixture {
+    let fx = AuthorityFixture::new(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn("done")),
+        rakka_agent::AgentToolAuthority::new(rakka_agent::AgentToolRegistry::new()),
+        None,
+    );
+    fx.start().await;
+    fx.settle().await;
+    fx
+}
+
+fn series_recorded(metrics: &InMemoryMetricsRecorder) -> Vec<&'static str> {
+    let snapshot = metrics.snapshot();
+    FLEET_SERIES
+        .into_iter()
+        .filter(|name| !snapshot.observations_named(name).is_empty())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_dispatcher_with_metrics_records_its_fleets_series() {
+    let fx = run_with_a_due_ticket().await;
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+
+    fx.pipeline()
+        .with_metrics(metrics.clone())
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(series_recorded(&metrics), FLEET_SERIES.to_vec());
+    // Bounded labels only: no series of the fleet carries an identifier.
+    let snapshot = metrics.snapshot();
+    for name in FLEET_SERIES {
+        for observation in snapshot.observations_named(name) {
+            for attribute in observation.attributes() {
+                assert!(
+                    matches!(
+                        attribute.key(),
+                        "operation" | "outcome" | "detail" | "status"
+                    ),
+                    "{name} carries the label {}",
+                    attribute.key()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_fleets_recorder_survives_every_builder_order() {
+    let settings = rakka_agent_workflow::AgentDispatcherFleetSettings::new(16, LEASE_MS);
+    let classes =
+        || [rakka_agent::AgentExecutionPolicyRef::new("default").expect("the class ref is valid")];
+
+    let fx = run_with_a_due_ticket().await;
+    let metrics_first = Arc::new(InMemoryMetricsRecorder::new());
+    fx.pipeline()
+        .with_metrics(metrics_first.clone())
+        .with_fleet_settings(settings.clone())
+        .with_execution_classes(classes())
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    let fx = run_with_a_due_ticket().await;
+    let metrics_last = Arc::new(InMemoryMetricsRecorder::new());
+    fx.pipeline()
+        .with_execution_classes(classes())
+        .with_fleet_settings(settings)
+        .with_metrics(metrics_last.clone())
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(series_recorded(&metrics_first), FLEET_SERIES.to_vec());
+    assert_eq!(series_recorded(&metrics_last), FLEET_SERIES.to_vec());
+}
+
+#[tokio::test]
+async fn the_last_recorder_wired_is_the_one_the_fleet_records_into() {
+    let fx = run_with_a_due_ticket().await;
+    let replaced = Arc::new(InMemoryMetricsRecorder::new());
+    let kept = Arc::new(InMemoryMetricsRecorder::new());
+
+    fx.pipeline()
+        .with_metrics(replaced.clone())
+        .with_metrics(kept.clone())
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert!(series_recorded(&replaced).is_empty());
+    assert_eq!(series_recorded(&kept), FLEET_SERIES.to_vec());
+}
