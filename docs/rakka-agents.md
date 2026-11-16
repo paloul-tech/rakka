@@ -206,6 +206,67 @@ suites kill the owner at; the [fault-injection
 matrix](rakka-agent-fault-injection-matrix.md) records, per boundary, which
 sweeps are demonstrated and which are still inferred.
 
+### The dispatcher fleet record
+
+The fleet keeps its index in one durable record per database. Every
+registration, claim and settle is a compare-and-set of the whole record, and
+every worker reads it. Three rules hold at every site that writes it or a
+run's outbox (issue #145):
+
+1. **A fleet entry is finished only after its outbox row is finished or
+   absent.** The dispatcher settles a ticket at the run's outbox first and at
+   the fleet second. The workflow-tier worker's cancellation fences a run's
+   unfinished entries, settles their rows, and only then finishes them.
+2. **A registration's list of due tickets is never older than the fleet
+   record it writes against.** The fleet record is read first and the run's
+   outbox after it.
+3. **A finished outbox row stays finished.** A settle that finds its row
+   already `Dispatched`, `Exhausted` or `Cancelled` writes nothing, and the
+   worker's fleet entry follows the row. The workflow-tier worker never
+   dispatches a row that is finished or gone.
+
+A settle that loses its compare-and-set to another writer reads the record
+again and re-applies, up to three more times, under the claim's own fence:
+this worker, this fencing token, a lease still active.
+
+**Pruning.** Nothing else removes an entry, so without a prune the record
+holds one entry for every effect a deployment ever dispatched. An application
+calls it on its own schedule:
+
+| Call | From |
+| --- | --- |
+| `AgentRunEffectDispatcher::prune_fleet(before)` | A dispatch worker |
+| `AgentDispatcherFleet::prune_terminal(before)` | An operator command that holds only the fleet store |
+
+- It removes the entries that are `Completed`, `Exhausted` or `Cancelled`
+  and finished before `before`. A pending, claimed or retry-scheduled entry
+  is never touched, nor is a claimed entry whose lease has lapsed.
+- Any horizon is safe while workers run, including one in the future. The
+  three rules above are why: once an entry is finished, nothing can register
+  its effect again.
+- A prune that finds nothing writes nothing. One that loses its write reads
+  again and re-applies.
+- **What goes with an entry is its `last_error_code`**, the only durable copy
+  of a cancelled ticket's settle reason. The horizon is how long that stays
+  readable.
+
+**Before the first prune** on an existing deployment: every node runs a build
+with this change; a deployment that cancels through `AgentDispatcherWorker`
+refreshes each run that holds a `Cancelled` fleet entry once on that build;
+and a deployment that must prune during a roll keeps the horizon at an hour
+or more. [`rakka-compatibility.md`](rakka-compatibility.md) says why.
+
+**Watching it.** A dispatcher built `with_metrics` records its fleet's
+series too. `rakka.agent_workflow.dispatcher.entries` is the record's entry
+count by status; the finished statuses are what grows when nothing prunes.
+
+**What is not bounded.** The record is still one record, written whole. A
+prune bounds it to the live entries plus the finished ones inside the
+horizon, which on a busy fleet can be megabytes. A worker whose lease lapsed
+can still burn an attempt on a ticket another worker is running: only a
+finished row is protected. And a claim on an `Exhausted` row whose intent is
+unresolved still starts an attempt (issue #134).
+
 ## Goals: finite and continuous
 
 A goal has no entity of its own. The root task carries the goal contract —
