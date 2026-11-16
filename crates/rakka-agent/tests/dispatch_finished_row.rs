@@ -518,3 +518,137 @@ impl AgentDispatchToolExecutor for CountingRefusal {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// The worker that holds the claim tells the run, when the row was exhausted
+// under it.
+// ---------------------------------------------------------------------------
+
+/// How a gated call answers once it is released.
+#[derive(Clone, Copy, Debug)]
+enum Answer {
+    DefinitiveFailure,
+    RetryableFailure,
+}
+
+/// A tool whose calls each wait to be released, so a test can order what two
+/// workers' calls answer and when.
+struct GatedTool {
+    calls: AtomicUsize,
+    entered: [tokio::sync::Notify; 2],
+    answers: [tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Answer>>>; 2],
+}
+
+impl GatedTool {
+    fn new() -> (Arc<Self>, [tokio::sync::oneshot::Sender<Answer>; 2]) {
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        let tool = Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            entered: [tokio::sync::Notify::new(), tokio::sync::Notify::new()],
+            answers: [
+                tokio::sync::Mutex::new(Some(first_rx)),
+                tokio::sync::Mutex::new(Some(second_rx)),
+            ],
+        });
+        (tool, [first_tx, second_tx])
+    }
+}
+
+impl AgentDispatchToolExecutor for GatedTool {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        Box::pin(async move {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(call < 2, "the tool is called by two workers, once each");
+            self.entered[call].notify_one();
+            let released = self.answers[call]
+                .lock()
+                .await
+                .take()
+                .expect("each call is released once");
+            match released.await.expect("the test releases every call") {
+                Answer::DefinitiveFailure => Err(AgentDispatchError::Definitive {
+                    code: "tool-refused".to_string(),
+                    message: "the tool refused the call".to_string(),
+                }),
+                Answer::RetryableFailure => Err(AgentDispatchError::Invocation {
+                    code: "tool-timeout",
+                    message: "the tool timed out".to_string(),
+                }),
+            }
+        })
+    }
+}
+
+/// A row can be exhausted under the worker that holds the claim. A call
+/// outlives its lease; a second worker takes the ticket over and calls the
+/// tool itself; the first call then fails for good and its worker, whose
+/// claim has lapsed, exhausts the row and is fenced before it can tell the
+/// run. When the second worker's own call fails, it finds the row already
+/// exhausted. It holds the claim, so it is the one the run hears from: with
+/// nothing delivered, the row would be exhausted, the fleet entry finished,
+/// and the run would wait on the effect for good.
+#[tokio::test]
+async fn the_worker_holding_the_claim_delivers_the_exhaustion_of_a_row_exhausted_under_it() {
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let (tool, [release_first, release_second]) = GatedTool::new();
+    let (fx, effect) = ready_tool_ticket(&spec, Some(tool.clone())).await;
+    let mut late = fx.worker("worker-late", fx.tools.clone(), None);
+    let mut current = fx.worker("worker-current", fx.tools.clone(), None);
+    let late_done = tokio::sync::Notify::new();
+
+    let late_pass = async {
+        let pass = late.pump_run(&run_scope()).await;
+        late_done.notify_one();
+        pass
+    };
+    let current_pass = async {
+        // Once the first call is in flight its lease lapses, and the second
+        // worker takes the ticket over and calls the tool itself.
+        tool.entered[0].notified().await;
+        fx.wf_clock.advance(LEASE_MS + 1);
+        current.claim_and_execute().await
+    };
+    let order = async {
+        // With both calls in flight, the late one fails for good first...
+        tool.entered[1].notified().await;
+        release_first
+            .send(Answer::DefinitiveFailure)
+            .expect("the first call is waiting");
+        late_done.notified().await;
+        // ...and then the call of the worker that holds the claim fails.
+        release_second
+            .send(Answer::RetryableFailure)
+            .expect("the second call is waiting");
+    };
+    let (late_pass, current_pass, ()) = tokio::join!(late_pass, current_pass, order);
+
+    // The late worker exhausted the row and was fenced before it delivered.
+    let late_error = late_pass.expect_err("the late worker's fleet write is fenced");
+    assert_eq!(late_error.code(), "claim-fenced");
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Exhausted)
+    );
+    // The worker that holds the claim found the row finished: its pass goes
+    // on, the fleet entry follows the row, and the run is told.
+    let current_pass = current_pass.expect("a claim whose row is already finished is over");
+    assert_eq!(current_pass.claimed, 1);
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Exhausted)
+    );
+    assert!(
+        !fx.effect_at(1)
+            .await
+            .is_some_and(|effect| !effect.status.is_resolved()),
+        "the run is not left waiting on an effect nothing will ever claim again"
+    );
+    assert_eq!(current_pass.delivered, 1, "the exhaustion was delivered");
+}

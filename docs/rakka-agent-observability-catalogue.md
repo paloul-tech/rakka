@@ -125,7 +125,7 @@ series beside the agent domain's. They are declared in
 
 | Metric | Kind | Unit | Labels | What it counts |
 | --- | --- | --- | --- | --- |
-| `rakka.agent_workflow.dispatcher.fleet` | Counter | `{dispatch}` | `operation`, `outcome`, `detail` | Fleet operations: `register`, `claim`, `cancel`, `prune`, and a `dispatch` the workflow-tier worker skipped. |
+| `rakka.agent_workflow.dispatcher.fleet` | Counter | `{dispatch}` | `operation`, `outcome`, `detail` | Fleet operations. `AgentRunEffectDispatcher` records `register`, `claim` and `prune`. |
 | `rakka.agent_workflow.dispatcher.in_flight` | Gauge | `{effect}` | — | Entries under an active lease. |
 | `rakka.agent_workflow.dispatcher.backlog` | Gauge | `{effect}` | — | Entries claimable now. |
 | `rakka.agent_workflow.dispatcher.entries` | Gauge | `{entry}` | `status` | Entries the fleet record holds, one sample per dispatch status, a zero included. |
@@ -133,11 +133,17 @@ series beside the agent domain's. They are declared in
 `entries` is the series that shows the record growing: its `completed`,
 `exhausted` and `cancelled` samples fall only when something calls
 `prune_fleet` or `prune_terminal`. A prune records `operation=prune`,
-`outcome=pruned` with the number of entries it removed. A dispatch the
-workflow-tier worker did not make, because the ticket's outbox row was
-already finished or absent, records `operation=dispatch`, `outcome=skipped`
-with `detail=ticket-row-settled` or `ticket-row-missing`. No label carries a
+`outcome=pruned` with the number of entries it removed. No label carries a
 run, effect, tenant or worker id.
+
+The workflow-tier worker, `AgentDispatcherWorker`, records two more
+operations on the same counter, which a recorder wired through
+`AgentRunEffectDispatcher` never sees: `cancel`, and `dispatch`, whose
+samples also carry `effect_kind` and `target_class`. A dispatch that worker
+did not make, because the ticket's outbox row was already finished or absent,
+records `operation=dispatch`, `outcome=skipped` with
+`detail=ticket-row-settled` or `ticket-row-missing`, under the three labels
+of the table.
 
 ### The `signal` label, and where its values are declared
 

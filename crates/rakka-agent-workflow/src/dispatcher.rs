@@ -1699,9 +1699,18 @@ where
     /// whose outbox rows the caller has settled. An entry is finished only
     /// when it is named, belongs to the run, was fenced by
     /// [`Self::request_run_cancellation`], is not already finished, and has
-    /// no active lease. Anything else named is left as it is, so a caller
-    /// cannot finish an entry whose row it did not settle by naming one
-    /// whose lease lapsed since it asked.
+    /// no active lease at the time of this call. Anything else named is left
+    /// as it is.
+    ///
+    /// **That the named rows are settled is the caller's word.** This method
+    /// cannot see an outbox: it finishes any fenced, unfinished entry with
+    /// no active lease that is named, whether or not its row was settled.
+    /// The rule that a fleet entry is finished only after its outbox row
+    /// rests, at this method, on naming only what was settled, as
+    /// [`AgentDispatcherWorker::cancel_run_dispatches`] and
+    /// [`AgentDispatcherWorker::refresh_run`] do. An entry that was in
+    /// flight at the request is not in that request's list, so a caller that
+    /// passes the list back never finishes one whose lease lapsed since.
     ///
     /// One write, and none when it finishes nothing.
     pub async fn finalize_run_cancellations(

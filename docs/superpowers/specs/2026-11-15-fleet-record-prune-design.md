@@ -476,3 +476,17 @@ The report also states:
 - The report on #145, with section 10's answers and the items the brief's section 7 lists.
 - A note on #134: settle writes no longer rewrite a finished row, the `Dispatching` write is still unguarded in `AgentRunEffectDispatcher`, and proof 25 pins that.
 - Memory: the decisions and any trap met while building.
+- A note on #134 that its unconfirmed step is confirmed: the fleet does offer an entry whose row is already `Exhausted`, and the tool is invoked again.
+
+## 13. As built
+
+Where the build moved from this design. The whole-branch review found the first two.
+
+- **Section 6.6, "whoever finished the row owns its outcome", was wrong for one case.** A late worker's failure is written to a row that is not finished yet, and that worker is fenced at the fleet before it delivers. The worker that still holds the claim then finds the row `Exhausted` under it. As designed it delivered nothing, and the run waited on the effect for good, where `ff9a495` resolved it. As built, a worker that still holds the claim and finds its row `Exhausted` tells the run: `Exhausted` from a failed attempt, `Indeterminate` from a reconciliation that established nothing. A worker whose lease lapsed still delivers nothing. `the_worker_holding_the_claim_delivers_the_exhaustion_of_a_row_exhausted_under_it` holds it.
+- **Section 6.1's argument for rule 3 does not hold in `AgentRunEffectDispatcher`.** It says the `Dispatching` mark "needs a claim, which needs an entry". That dispatcher does not check its claim again before the mark, so a worker that stalls past its lease before its durable `Started` can mark a finished row `Dispatching` and invoke, as it could at `ff9a495`. If that attempt fails the row is due again, and after a prune the ticket is registered again and settled `Cancelled` without being invoked. So in that tier the promise is "never run again because of a prune", not "never registered again". The documents say so. The workflow tier keeps the stronger promise: its row check and its mark share one inbox revision.
+- **Proof 11 covers four of the five finishing sites.** The reconciler's `Executed` finding has no order pin.
+- **Proof 16 does not assert `registered == 0`.** The other dispatcher's pass delivers the tool's result, the run schedules its next ticket, and the second outbox read rightly registers that one. The test asserts the finished ticket has no entry.
+- **Proof 30 holds the claim in flight with the kill-switch probe,** not a held call. A prune between a live claim and its settle is proven in `rakka-agent`'s own fixture (`a_prune_from_another_dispatcher_does_not_cost_a_claim_its_settle`).
+- **The fleet counter's `cancel` operation** records `outcome=requested` and `outcome=cancelled`; `outcome=finalized, detail=lease-expired` is gone.
+- **Two public items the design did not name:** `AgentDispatchStatus::ALL` and `AgentDispatchEntry::awaits_cancellation_settlement`.
+- **Test support:** `fleet_support::ContendedStore` stands in for the `HookedStore` of the plan.

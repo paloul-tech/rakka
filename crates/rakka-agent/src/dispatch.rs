@@ -422,6 +422,17 @@ const WORKER_LOST: Ambiguity<'static> = Ambiguity {
     line: "dispatcher lost after started",
 };
 
+/// What a worker would have told the run had its own failure spent the
+/// ticket's row: owed to the run when the row was exhausted under a claim
+/// the worker still holds
+/// ([`AgentRunEffectDispatcher::conclude_on_finished_row`]).
+struct OwedOutcome<'a> {
+    scope: &'a AgentRunScope,
+    intent: &'a AgentRunEffect,
+    attempt: u32,
+    outcome: AgentRunEffectOutcome,
+}
+
 /// What [`AgentRunEffectDispatcher::apply_outbox`] did.
 enum OutboxWritten {
     /// The write was applied; the substrate's event, where it produces one.
@@ -2711,21 +2722,53 @@ where
     /// Ends a claim whose outbox row was already finished when this worker
     /// came to settle it ([`Self::settle_outbox`]).
     ///
-    /// The claim is over: another worker finished the ticket, and owns its
-    /// outcome. This worker writes nothing more to the outbox and delivers
-    /// nothing more to the run. What is left is the fleet entry, which is
-    /// brought in line with the row if this worker's claim is still current.
-    /// For a worker whose lease lapsed, which is how a row comes to be
-    /// finished under it, the fleet answers `claim-fenced`; that is the
-    /// expected answer here and not a failure of the pass, which goes on to
-    /// its next claim.
+    /// The claim is over, and this worker writes nothing more to the outbox.
+    /// What is left is the fleet entry, which is brought in line with the
+    /// row if this worker's claim is still current, and, in one case, the
+    /// run.
+    ///
+    /// **A worker whose lease lapsed** is how a row usually comes to be
+    /// finished under it: another worker took the ticket over and finished
+    /// it. The fleet answers that worker `claim-fenced`, which is the
+    /// expected answer here and not a failure of the pass. It delivers
+    /// nothing: the worker that holds the claim owns the outcome.
+    ///
+    /// **A worker that still holds the claim** can find its row exhausted
+    /// too, and then it is the one the run must hear from. A late worker's
+    /// failure is written to a row that is not finished yet, and that worker
+    /// is fenced at the fleet before it delivers anything. So the row is
+    /// `Exhausted`, nobody has told the run, and once the fleet entry
+    /// follows the row nothing will ever claim the ticket again. `owed` is
+    /// what this worker would have told the run had its own failure spent
+    /// the row; it is delivered when, and only when, the claim was still
+    /// current and the row is `Exhausted`. The run's own guard refuses it if
+    /// the effect is already resolved.
+    ///
+    /// The fleet entry is settled first and the run is told second, the
+    /// order every exhausting site keeps: only a worker that still holds the
+    /// claim may deliver a failure, and settling the entry is what
+    /// establishes that.
     async fn conclude_on_finished_row(
         &mut self,
         claim: &AgentDispatchClaim,
         row: &OutboxEntry,
+        owed: Option<OwedOutcome<'_>>,
+        pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         match self.fleet.settle_claim_from_row(claim, Some(row)).await {
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(owed) = owed.filter(|_| row.status() == OutboxStatus::Exhausted) {
+                    self.deliver_outcome(
+                        owed.scope,
+                        owed.intent,
+                        owed.attempt,
+                        claim.fencing_token,
+                        owed.outcome,
+                        pass,
+                    )
+                    .await?;
+                }
+            }
             Err(rakka_agent_workflow::AgentDispatcherError::ClaimFenced { .. }) => {}
             Err(error) => return Err(error.into()),
         }
@@ -3448,7 +3491,10 @@ where
             .settle_outbox(scope, &message_id, InboxWrite::Succeeded)
             .await?
         {
-            return self.conclude_on_finished_row(&claim, &row).await;
+            // The outcome was delivered before this write.
+            return self
+                .conclude_on_finished_row(&claim, &row, None, pass)
+                .await;
         }
         self.fleet.complete_claim(&claim).await?;
         Ok(ClaimConclusion::Settled)
@@ -3650,7 +3696,20 @@ where
             .await?
         {
             Ok(event) => event,
-            Err(row) => return self.conclude_on_finished_row(&claim, &row).await,
+            Err(row) => {
+                let owed = OwedOutcome {
+                    scope,
+                    intent,
+                    attempt: row.attempts().attempts(),
+                    outcome: AgentRunEffectOutcome::exhausted(
+                        ambiguity.code.to_string(),
+                        "the retry budget was spent recovering ambiguous attempts".to_string(),
+                    ),
+                };
+                return self
+                    .conclude_on_finished_row(&claim, &row, Some(owed), pass)
+                    .await;
+            }
         };
         pass.failed_attempts += 1;
 
@@ -3785,7 +3844,10 @@ where
                     .settle_outbox(scope, &message_id, InboxWrite::Succeeded)
                     .await?
                 {
-                    return self.conclude_on_finished_row(&claim, &row).await;
+                    // The reconciled outcome was delivered before this write.
+                    return self
+                        .conclude_on_finished_row(&claim, &row, None, pass)
+                        .await;
                 }
                 self.fleet.complete_claim(&claim).await?;
                 Ok(ClaimConclusion::Settled)
@@ -3886,7 +3948,23 @@ where
             .await?
         {
             Ok(event) => event,
-            Err(row) => return self.conclude_on_finished_row(&claim, &row).await,
+            Err(row) => {
+                // The finding established nothing, and the row's budget is
+                // spent: the run is told the outcome is unknown, as a park
+                // tells it.
+                let owed = OwedOutcome {
+                    scope,
+                    intent,
+                    attempt,
+                    outcome: AgentRunEffectOutcome::indeterminate(
+                        bounded_failure_code(exhausted_code),
+                        bounded_failure_detail(INDETERMINATE_OUTCOME_MESSAGE),
+                    ),
+                };
+                return self
+                    .conclude_on_finished_row(&claim, &row, Some(owed), pass)
+                    .await;
+            }
         };
         pass.failed_attempts += 1;
         if matches!(
@@ -4154,7 +4232,18 @@ where
         };
         let event = match self.settle_outbox(scope, &message_id, write).await? {
             Ok(event) => event,
-            Err(row) => return self.conclude_on_finished_row(claim, &row).await,
+            Err(row) => {
+                let owed = OwedOutcome {
+                    scope,
+                    intent,
+                    attempt,
+                    outcome: AgentRunEffectOutcome::exhausted(code.to_string(), detail)
+                        .with_reason(reason),
+                };
+                return self
+                    .conclude_on_finished_row(claim, &row, Some(owed), pass)
+                    .await;
+            }
         };
         pass.failed_attempts += 1;
         self.fleet.record_claim_failure(claim, &event).await?;

@@ -220,10 +220,12 @@ run's outbox (issue #145):
 2. **A registration's list of due tickets is never older than the fleet
    record it writes against.** The fleet record is read first and the run's
    outbox after it.
-3. **A finished outbox row stays finished.** A settle that finds its row
+3. **No settle rewrites a finished outbox row.** A settle that finds its row
    already `Dispatched`, `Exhausted` or `Cancelled` writes nothing, and the
-   worker's fleet entry follows the row. The workflow-tier worker never
-   dispatches a row that is finished or gone.
+   worker's fleet entry follows the row. A worker that still holds the claim
+   and finds its row `Exhausted` tells the run so; a worker whose lease
+   lapsed tells it nothing. The workflow-tier worker never dispatches a row
+   that is finished or gone.
 
 A settle that loses its compare-and-set to another writer reads the record
 again and re-applies, up to three more times, under the claim's own fence:
@@ -241,9 +243,12 @@ calls it on its own schedule:
 - It removes the entries that are `Completed`, `Exhausted` or `Cancelled`
   and finished before `before`. A pending, claimed or retry-scheduled entry
   is never touched, nor is a claimed entry whose lease has lapsed.
-- Any horizon is safe while workers run, including one in the future. The
-  three rules above are why: once an entry is finished, nothing can register
-  its effect again.
+- Any horizon is safe while workers run, including one in the future: no
+  effect is run again because its entry was pruned. In the workflow tier
+  the three rules above mean a finished effect is never registered again.
+  In `AgentRunEffectDispatcher` one path can still put a finished effect's
+  ticket back in the record after a prune, and it is then settled
+  `Cancelled` without being invoked ("What is not bounded", below).
 - A prune that finds nothing writes nothing. One that loses its write reads
   again and re-applies.
 - **What goes with an entry is its `last_error_code`**, the only durable copy
@@ -262,10 +267,24 @@ count by status; the finished statuses are what grows when nothing prunes.
 
 **What is not bounded.** The record is still one record, written whole. A
 prune bounds it to the live entries plus the finished ones inside the
-horizon, which on a busy fleet can be megabytes. A worker whose lease lapsed
-can still burn an attempt on a ticket another worker is running: only a
-finished row is protected. And a claim on an `Exhausted` row whose intent is
-unresolved still starts an attempt (issue #134).
+horizon, which on a busy fleet can be megabytes.
+
+`AgentRunEffectDispatcher` does not check its claim again before it marks a
+ticket's row `Dispatching`, and that mark is not guarded against a finished
+row. Three things follow, none of them new with the prune:
+
+- A worker whose lease lapsed can still burn an attempt on a ticket another
+  worker is running. Only a finished row is protected, and only against a
+  settle.
+- A worker that stalls past its lease before its durable `Started` can mark
+  a row `Dispatching` after another worker finished it, and invoke. If that
+  attempt then fails, the row is due again. While the finished entry is in
+  the record it absorbs the registration. After a prune the ticket is
+  registered again, claimed, and settled `Cancelled` (`intent-already-resolved`
+  or `ticket-stale`) without being invoked: an operator sees a finished
+  effect's entry reappear and end `Cancelled`.
+- A claim on an `Exhausted` row whose intent is unresolved still starts an
+  attempt (issue #134).
 
 ## Goals: finite and continuous
 
