@@ -14,8 +14,8 @@ use std::sync::Arc;
 use rakka_core::{MetricsRecorder, NoopMetricsRecorder};
 use rakka_persistence::{DurableError, DurableStateStore, PersistenceId, Revision, StateRecord};
 use rakka_workflow::{
-    OutboxDispatchResult, OutboxEntry, OutboxMessageId, SystemWorkflowClock, WorkflowClock,
-    WorkflowError, WorkflowState, WorkflowTelemetryEvent, WorkflowTimestamp,
+    OutboxDispatchResult, OutboxEntry, OutboxMessageId, OutboxStatus, SystemWorkflowClock,
+    WorkflowClock, WorkflowError, WorkflowState, WorkflowTelemetryEvent, WorkflowTimestamp,
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +66,15 @@ const FLEET_WRITE_REAPPLICATIONS: u32 = 3;
 /// The stable code of a lost compare-and-set, under whichever wrapper
 /// carries it.
 const REVISION_CONFLICT_CODE: &str = "revision-conflict";
+
+/// The code a fleet entry carries when its claim was settled to match an
+/// outbox row that was already finished: another worker finished the row, or
+/// a crash fell between the outbox write and the fleet write.
+const TICKET_ROW_SETTLED: &str = "ticket-row-settled";
+
+/// The code a fleet entry carries when its claim was settled because the
+/// run's outbox holds no row for it.
+const TICKET_ROW_MISSING: &str = "ticket-row-missing";
 
 /// The most bytes of failure detail one fleet index entry keeps in
 /// [`AgentDispatchEntry::last_error_code`].
@@ -1774,6 +1783,68 @@ where
             WorkflowTelemetryEvent::OutboxDispatchCancelled { message, .. } => {
                 entry.mark_settled_cancelled(message, now)
             }
+        })
+        .await
+    }
+
+    /// Settles a current claim to match an outbox row that is already
+    /// finished, or absent.
+    ///
+    /// The outbox row is the authority on whether an effect is done, and the
+    /// fleet entry follows it. A worker that finds its claim's row already
+    /// finished has nothing to dispatch and nothing to record at the outbox;
+    /// what is left is to bring the entry in line, so the ticket is not
+    /// claimed again on every lease.
+    ///
+    /// | Row | The entry becomes | `last_error_code` |
+    /// |---|---|---|
+    /// | `Dispatched` | `Completed` | unchanged |
+    /// | `Exhausted` | `Exhausted`, with the row's attempt count | `ticket-row-settled` |
+    /// | `Cancelled` | `Cancelled` | `ticket-row-settled` |
+    /// | absent | `Cancelled` | `ticket-row-missing` |
+    ///
+    /// It is a settle like any other: fenced on the claim, and read again
+    /// when it loses its write.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentDispatcherError::InvalidEntry`] (`invalid-dispatch-entry`) for
+    /// a row that is not finished, which is not this method's to settle.
+    /// [`AgentDispatcherError::ClaimFenced`] (`claim-fenced`) when the claim
+    /// is no longer current.
+    pub async fn settle_claim_from_row(
+        &mut self,
+        claim: &AgentDispatchClaim,
+        row: Option<&OutboxEntry>,
+    ) -> AgentDispatcherResult<AgentDispatchEntry> {
+        enum Settlement {
+            Completed,
+            Exhausted { attempts: u32 },
+            Cancelled { code: &'static str },
+        }
+        let settlement = match row.map(|row| (row.status(), row.attempts().attempts())) {
+            None => Settlement::Cancelled {
+                code: TICKET_ROW_MISSING,
+            },
+            Some((OutboxStatus::Dispatched, _)) => Settlement::Completed,
+            Some((OutboxStatus::Exhausted, attempts)) => Settlement::Exhausted { attempts },
+            Some((OutboxStatus::Cancelled, _)) => Settlement::Cancelled {
+                code: TICKET_ROW_SETTLED,
+            },
+            Some((OutboxStatus::Pending | OutboxStatus::Dispatching | OutboxStatus::Failed, _)) => {
+                return Err(AgentDispatcherError::InvalidEntry {
+                    dispatch_id: claim.dispatch_id.clone(),
+                    field: "row",
+                    reason: "not-finished",
+                });
+            }
+        };
+        self.update_current_claim(claim, |entry, now| match settlement {
+            Settlement::Completed => entry.mark_completed(now),
+            Settlement::Exhausted { attempts } => {
+                entry.mark_exhausted(attempts, TICKET_ROW_SETTLED.to_string(), now)
+            }
+            Settlement::Cancelled { code } => entry.mark_settled_cancelled(code, now),
         })
         .await
     }

@@ -27,8 +27,8 @@ use rakka_persistence::{
     Revision, StateRecord, StoreFuture,
 };
 use rakka_workflow::{
-    ManualWorkflowClock, OutboxDispatchResult, OutboxMessageId, OutboxStatus, WorkflowState,
-    WorkflowTimestamp,
+    ManualWorkflowClock, OutboxDispatchResult, OutboxEntry, OutboxMessageId, OutboxStatus,
+    WorkflowState, WorkflowTimestamp,
 };
 
 /// A one-shot piece of work a store runs between two of its calls.
@@ -435,6 +435,76 @@ pub async fn outbox_status(
         .expect("workflow state should be recovered")
         .outbox_entry(&OutboxMessageId::new(effect_id))
         .map(|entry| entry.status())
+}
+
+/// One effect's outbox row as the store holds it now.
+pub async fn outbox_row(
+    store: &WorkflowStore,
+    clock: &ManualWorkflowClock,
+    run_id: &AgentRunId,
+    effect_id: &str,
+) -> Option<OutboxEntry> {
+    let mut inbox = AgentRunInbox::with_clock(run_id.clone(), store.clone(), clock.clone());
+    inbox.recover().await.expect("inbox should recover");
+    inbox
+        .inner()
+        .state()
+        .expect("workflow state should be recovered")
+        .outbox_entry(&OutboxMessageId::new(effect_id))
+        .cloned()
+}
+
+/// Moves one effect's outbox row to `status` through the substrate's own
+/// transitions, and answers the row. `Pending` leaves the row as scheduled.
+pub async fn move_row_to(
+    store: &WorkflowStore,
+    clock: &ManualWorkflowClock,
+    run_id: &AgentRunId,
+    effect_id: &str,
+    status: OutboxStatus,
+) -> OutboxEntry {
+    let mut inbox = AgentRunInbox::with_clock(run_id.clone(), store.clone(), clock.clone());
+    inbox.recover().await.expect("inbox should recover");
+    let message_id = OutboxMessageId::new(effect_id);
+    let substrate = inbox.inner_mut();
+    match status {
+        OutboxStatus::Pending => {}
+        OutboxStatus::Dispatching => {
+            substrate
+                .mark_outbox_dispatching(&message_id)
+                .await
+                .expect("the row is marked dispatching");
+        }
+        OutboxStatus::Failed => {
+            substrate
+                .record_outbox_failure(&message_id, "failed", false)
+                .await
+                .expect("the row records a failure");
+        }
+        OutboxStatus::Dispatched => {
+            substrate
+                .record_outbox_success(&message_id)
+                .await
+                .expect("the row records its success");
+        }
+        OutboxStatus::Exhausted => {
+            substrate
+                .record_outbox_exhausted(&message_id, "exhausted")
+                .await
+                .expect("the row is exhausted");
+        }
+        OutboxStatus::Cancelled => {
+            substrate
+                .record_outbox_cancelled(&message_id, "cancelled")
+                .await
+                .expect("the row is cancelled");
+        }
+    }
+    let row = outbox_row(store, clock, run_id, effect_id)
+        .await
+        .expect("the row exists");
+    assert_eq!(row.status(), status, "the row reached the status asked for");
+    row
 }
 
 /// The fleet's durable record as the store holds it now, read without
