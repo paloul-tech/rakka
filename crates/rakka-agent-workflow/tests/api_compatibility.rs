@@ -745,6 +745,7 @@ fn dispatch_entry(dispatch_id: &str, run_id: &AgentRunId) -> AgentDispatchEntry 
         graph_node_kind: None,
         graph_loop_instance_id: None,
         due_at: ts(1_100),
+        row_scheduled_at: None,
         status: AgentDispatchStatus::Claimed,
         lease: Some(AgentDispatchLease {
             worker_id: AgentDispatcherWorkerId::new("worker-api-compat"),

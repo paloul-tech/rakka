@@ -275,14 +275,25 @@ usual reconciliation checkpoint, whatever the effect's safety class. The row
 was the only record of whether an attempt started, so that effect is not
 invoked again until someone decides.
 
-The park reaches an effect only if the claim finds the row still missing,
-and a run puts a missing row back whenever it settles: every command it
-handles and every settle pass sends its ready effects to the outbox again,
-as new rows with no attempt history. A ticket whose row came back that way
-runs as a first attempt. The park is itself a command the run handles, so
-when one run lost several rows together, the ticket claimed first is parked
-and the others run again. A winding-down run that is pumped is fenced before
-anything is claimed, and the fence cancels a ready effect that has no row.
+A lost row gets that answer however it is reached. A run puts a missing row
+back whenever it settles: every command it handles and every settle pass
+sends its ready effects to the outbox again, as new rows with no attempt
+history, and the park is itself such a command. The fleet entry records
+which row it was registered from (`AgentDispatchEntry::row_scheduled_at`),
+so a claim that finds another row in its place parks the effect in the same
+way and finishes the row the run put back; when one run lost several rows
+together, every one of them is parked. A winding-down run that is pumped is
+fenced before anything is claimed, and the fence reads the fleet record for
+a ready effect that has no row: a ticket with a fleet entry once had a row,
+so it is left to the claim, or parked by the fence when no claim will come,
+and only a ticket the fleet never indexed is cancelled as a flush that never
+landed.
+
+Two things are not told apart. A ticket with no fleet entry, never
+registered or finished and pruned, has no witness: the row the run puts back
+runs as a first attempt. And an entry registered by a build that recorded no
+row stamp behaves as it did before, until it finishes.
+[`rakka-compatibility.md`](rakka-compatibility.md) has the cases.
 
 **What is not bounded.** The record is still one record, written whole. A
 prune bounds it to the live entries plus the finished ones inside the
