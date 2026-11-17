@@ -143,6 +143,10 @@ use crate::observability::{
     LINK_KIND_RECONCILIATION_DECISION, SEGMENT_ATTR_EFFECT_ATTEMPT, SEGMENT_ATTR_EFFECT_STATUS,
     SEGMENT_ATTR_SETTINGS_REVISION,
 };
+use crate::owed_outcome::{
+    UnknownFinding, AMBIGUOUS_BUDGET_SPENT_MESSAGE, INDETERMINATE_OUTCOME_MESSAGE,
+    OUTCOME_MISMATCH, RECONCILIATION_UNKNOWN, WORKER_LOST_CODE, WORKER_LOST_LINE,
+};
 use crate::run::{
     load_agent_run_state, AgentRun, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError,
     AgentRunState, AgentRunStatus,
@@ -162,11 +166,6 @@ pub type AgentDispatchResult<T> = Result<T, AgentDispatchError>;
 /// it too, to tell a handoff send that never left from one that may have
 /// (issue #107).
 pub(crate) const CREDENTIAL_RESOLUTION_FAILED: &str = "credential-resolution-failed";
-
-/// The detail carried by an `Indeterminate` outcome parked for an ambiguity
-/// the pipeline could not resolve.
-const INDETERMINATE_OUTCOME_MESSAGE: &str =
-    "the attempt's outcome could not be established; an explicit reconciliation decision is owed";
 
 /// The code a ticket whose outbox row is gone settles under: the fleet
 /// entry's `last_error_code`, and the indeterminate code of the effect a run
@@ -429,8 +428,8 @@ struct Ambiguity<'a> {
 
 /// The ambiguity of an attempt whose worker was lost after `Started`.
 const WORKER_LOST: Ambiguity<'static> = Ambiguity {
-    code: "dispatcher-lost-after-started",
-    line: "dispatcher lost after started",
+    code: WORKER_LOST_CODE,
+    line: WORKER_LOST_LINE,
 };
 
 /// What a worker would have told the run had its own failure spent the
@@ -3925,7 +3924,7 @@ where
                     attempt: row.attempts().attempts(),
                     outcome: AgentRunEffectOutcome::exhausted(
                         ambiguity.code.to_string(),
-                        "the retry budget was spent recovering ambiguous attempts".to_string(),
+                        AMBIGUOUS_BUDGET_SPENT_MESSAGE.to_string(),
                     ),
                 };
                 return self
@@ -3940,7 +3939,7 @@ where
             self.fleet.record_claim_failure(&claim, &event).await?;
             let outcome = AgentRunEffectOutcome::exhausted(
                 ambiguity.code.to_string(),
-                "the retry budget was spent recovering ambiguous attempts".to_string(),
+                AMBIGUOUS_BUDGET_SPENT_MESSAGE.to_string(),
             );
             let status = outcome.resolved_status();
             self.deliver_outcome(scope, intent, attempts, claim.fencing_token, outcome, pass)
@@ -4051,9 +4050,7 @@ where
                             intent,
                             attempt,
                             winding_down,
-                            "effect-outcome-mismatch: the reconciled outcome does not fit the effect",
-                            "effect-outcome-mismatch",
-                            "effect-outcome-mismatch",
+                            &OUTCOME_MISMATCH,
                             pass,
                         )
                         .await;
@@ -4103,9 +4100,7 @@ where
                     intent,
                     attempt,
                     winding_down,
-                    "reconciliation outcome unknown",
-                    "reconciliation-unknown",
-                    "reconciliation-exhausted",
+                    &RECONCILIATION_UNKNOWN,
                     pass,
                 )
                 .await
@@ -4115,9 +4110,10 @@ where
 
     /// Settles a reconciliation finding that establishes nothing about the
     /// intent: the reconciler's `Unknown`, or an `Executed` whose outcome does
-    /// not belong to it. `line` is the burned attempt's failure line;
-    /// `winding_down_code` and `exhausted_code` are the codes the two parks
-    /// carry.
+    /// not belong to it. `finding` holds the burned attempt's failure line
+    /// and the codes the two parks carry; the line is what a later reader of
+    /// the exhausted row recognizes the finding by
+    /// ([`crate::owed_outcome`]).
     ///
     /// Either park settles the ticket, once: [`Self::park_indeterminate`]
     /// records the claim's end as cancelled `indeterminate`, as every park
@@ -4132,11 +4128,14 @@ where
         intent: &AgentRunEffect,
         attempt: u32,
         winding_down: bool,
-        line: &str,
-        winding_down_code: &str,
-        exhausted_code: &str,
+        finding: &UnknownFinding,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
+        let UnknownFinding {
+            line,
+            winding_down_code,
+            exhausted_code,
+        } = *finding;
         if winding_down {
             // A cancelled run cannot wait for a better answer forever; the
             // outcome is unknown and consequential, so it parks for the
