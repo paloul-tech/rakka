@@ -1,9 +1,9 @@
 # A finished ticket whose run was never told (issue #134)
 
-Status: written 2026-11-16, awaiting the owner's approval. The owner chose
-option 1 of decision 1 the same day ("Option 1. By safety class, code from
-the row."). Nothing is built beyond the reproductions. Size: a project (two
-code paths, one of them new).
+Status: approved by the owner on 2026-11-16 ("1b. approved"), with decision
+1 settled as 1b: the row's last failure line is followed for every safety
+class (section 8 has how that came about). Size: a project (two code paths,
+one of them new).
 
 ## 1. Intent
 
@@ -77,25 +77,22 @@ invocation.**
 **Decision 1, the owner's: what a run is told for an `Exhausted` row nobody
 delivered.**
 
-1. **By safety class, with the row's own code (chosen by the owner).**
-   Read-only, idempotent and non-idempotent effects are told `Exhausted`
-   with the code and detail read from the row's last failure line; a
-   reconcileable effect is told `Indeterminate`, as the issue suggests. For
-   the first three classes this is what the lost worker would have said,
-   less its reason, so the run's own readers of the reason err to the
-   cautious side (a handoff send parks). **For a reconcileable effect it is
-   not always what the lost worker would have said**: only
-   `settle_unknown_finding` parks. `record_attempt_failure` and
-   `retry_ambiguous` tell a reconcileable effect `Exhausted` like any other.
-   So under this option the same exhaustion ends `Exhausted` when nothing
-   crashed and `Indeterminate` when the worker was lost. The option was put
-   to the owner as "closest to what the lost worker would have said" without
-   that exception; section 8 holds the question it leaves.
-2. **Always `Indeterminate`.** One rule, the lost-row rule. Costs an
-   operator decision for every crash in this window, including a read-only
-   failure the row records in full.
-3. **Always `Exhausted`.** One rule, and it calls a reconcileable effect
-   failed where its own doctrine says unknown.
+1. **Follow the row (chosen, as 1b).** The row's last failure line is the
+   line of the write that exhausted it, and it says which path that was. The
+   run is told what that path's worker tells it: `Exhausted` with the row's
+   code, or `Indeterminate` under the finding's code, for every safety
+   class. A crash changes who speaks and not what is said, less the
+   collaborator's reason, which no durable record keeps; the run's own
+   readers of the reason err to the cautious side (a handoff send parks).
+2. **Reconcileable always `Indeterminate`, the rest from the row** (1a, the
+   issue's suggestion, and the owner's first pick). An uncrashed worker
+   tells a reconcileable effect `Exhausted` at two of its three exhausting
+   sites, so the same exhaustion would end differently crashed and not.
+3. **Always `Indeterminate`.** The lost-row rule. An operator decision for
+   every crash in this window, including a read-only failure the row
+   records in full.
+4. **Always `Exhausted`.** Calls a reconciliation that established nothing
+   a failure.
 
 **Decision 2, mine: who tells a run when no claim will come.**
 
@@ -123,8 +120,7 @@ succeeded.
 
 | Row | The run is told | The ticket |
 |---|---|---|
-| `Exhausted`, read-only, idempotent or non-idempotent effect | `Exhausted`, code and detail from the row (below), attempts from the row | the entry follows the row (`settle_claim_from_row`) |
-| `Exhausted`, reconcileable effect | `Indeterminate` | the entry follows the row |
+| `Exhausted` | what the row's line rebuilds (below), attempts from the row | the entry follows the row (`settle_claim_from_row`) |
 | `Cancelled`, and the wind-down fence applies (run winding down, kind not exempt) | `Cancelled`, as today | as today |
 | `Cancelled` otherwise | `Indeterminate` | the entry follows the row |
 | `Dispatched` | `Indeterminate`: the row says the call succeeded, and its result reached nobody | the entry follows the row |
@@ -136,18 +132,20 @@ the write that exhausted it, and each exhausting site writes a known shape:
 |---|---|---|---|
 | `record_attempt_failure` | `code: detail` | `Exhausted(code, detail)` with the collaborator's reason | `Exhausted(code, detail)`, no reason |
 | `retry_ambiguous`, worker lost | `dispatcher lost after started` | `Exhausted(dispatcher-lost-after-started, "the retry budget was spent recovering ambiguous attempts")` | the same |
-| `retry_ambiguous`, after a reconciler's "not executed" | `code: message` | `Exhausted(code, …)` | reconcileable only: `Indeterminate` |
-| `settle_unknown_finding` | the finding's line (`reconciliation outcome unknown`, or the mismatch line) | `Indeterminate` under `reconciliation-exhausted`, or `effect-outcome-mismatch` | reconcileable only: `Indeterminate` under the same code |
+| `retry_ambiguous`, after an executor's unknown outcome was found not executed | `code: message` | `Exhausted(code, "the retry budget was spent…")` | `Exhausted(code, message)`: the code is the same, the detail is the row's |
+| `settle_unknown_finding` | `reconciliation outcome unknown`, or the mismatch line | `Indeterminate` under `reconciliation-exhausted`, or `effect-outcome-mismatch` | the same |
 
-So: the worker-lost line maps to its code and message; any other line is
-split at its first `": "` into code and detail when the part before it is
-non-empty and has no whitespace; a line of neither shape, or no line, is
-told under `ticket-row-settled` with the line as detail. The two finding
-lines become named constants paired with their codes, shared by the site
-that writes them and the reader, as `WORKER_LOST` already is. A
-reconcileable effect whose row carries neither finding line parks under
-`reconciliation-exhausted`. For a reconcileable effect the rebuilt answer
-differs from the lost worker's in the first three rows (section 8).
+So, in this order: a finding line rebuilds its `Indeterminate`; the
+worker-lost line rebuilds its `Exhausted`; any other line is split at its
+first `": "` into code and detail when the part before it is non-empty and
+has no whitespace, and rebuilds `Exhausted`. A line of no known shape, or
+no line, says the budget is spent and not how: a reconcileable effect parks
+under `reconciliation-exhausted`, and any other is told `Exhausted` under
+`ticket-row-settled` with the line as detail. The finding lines and the
+worker-lost line are named constants paired with their codes, shared by the
+site that writes each and the reader, as `WORKER_LOST` already is. The
+mismatch line itself has the `code: detail` shape, so it is matched before
+the split.
 
 **Fleet first, run second**, the order `conclude_on_finished_row` keeps,
 and for its reason. The settle is fenced on the claim, so it is what
@@ -214,12 +212,11 @@ the row's own finishing time stands in for it.
 - **The wait for an absent entry is measured from the row.** A prune with a
   horizon shorter than a lease can still let the sweep speak a moment
   before a worker that is about to.
-- **The code of an indeterminate park from a finished row.** The
-  reconcileable `Exhausted` row parks under `reconciliation-exhausted`, the
-  code a spent reconciliation budget already parks under. `Dispatched` and
-  live `Cancelled` rows park under `ticket-row-settled`, the fleet's
+- **The code of an indeterminate park from a finished row.** `Dispatched`
+  and live `Cancelled` rows park under `ticket-row-settled`, the fleet's
   existing word for "the entry follows a finished row", new as an effect's
-  indeterminate code.
+  indeterminate code. A reconcileable `Exhausted` row whose line has no
+  known shape parks under `reconciliation-exhausted`.
 - **How the exhausted code is read from the row's line** (the table in
   section 5), and the fallback code `ticket-row-settled` for a line of no
   known shape.
@@ -232,15 +229,19 @@ the row's own finishing time stands in for it.
 become the first two) and the pinned #134 test in
 `dispatch_finished_row.rs`:
 
-- an `Exhausted` row under a re-claim is not invoked; the run is told, per
-  class; the entry follows the row;
+- an `Exhausted` row under a re-claim is not invoked; the run is told what
+  the row's line rebuilds; the entry follows the row;
 - the same through the reconciler's `Unknown` arm with a reconcileable
   effect, which the issue has only by reading, and through its mismatch
   arm, under that arm's code;
 - `record_attempt_failure` and `retry_ambiguous`, each crashed after its
   outbox write and after its fleet write, and `settle_unknown_finding`
   crashed after its outbox write (it has no later window): the run is told
-  what section 5's table rebuilds;
+  what an uncrashed worker tells it, less the reason and, in one row of
+  section 5's table, the detail, for a reconcileable effect as for any
+  other;
+- a row whose line has no known shape, for a reconcileable effect and for
+  another;
 - a worker whose claim lapsed before it reached a finished row tells the
   run nothing and its pass does not fail;
 - a finished entry is not swept before a lease has passed, and a live
@@ -259,23 +260,13 @@ Each guard is falsified once before the work is called done.
 `docs/rakka-compatibility.md` (a dated entry), `docs/rakka-agents.md` (the
 dispatcher section), `CHANGELOG.md`.
 
-## 8. Open with the owner
+## 8. How decision 1 was settled
 
-Decision 1 was chosen on a description that left out one thing: an
-uncrashed worker tells a reconcileable effect `Exhausted` at two of the
-three sites that spend its budget. Under the rule as chosen, a reconcileable
-exhaustion ends `Indeterminate` only when the worker was lost.
-
-- **1a, as chosen.** Reconcileable: always `Indeterminate` from a finished
-  row. The issue's suggestion, and the cautious side. Crashed and uncrashed
-  differ.
-- **1b, follow the row for every class.** A `code: detail` line or the
-  worker-lost line rebuilds `Exhausted`; a finding line rebuilds
-  `Indeterminate` under its code. Crashed and uncrashed agree at every
-  site, less the reason. A reconcileable row whose line has no known shape
-  still parks.
-- **1c, make the uncrashed sites park a reconcileable effect too.** A
-  behaviour change where nothing crashed, and outside this issue.
-
-Sections 5 and 6 are written for 1a and change in the two tables'
-reconcileable rows under 1b.
+The owner first chose "Option 1. By safety class, code from the row.", put
+to them as the option closest to what the lost worker would have said, with
+reconcileable effects always `Indeterminate`. The review of this document
+showed that description was wrong for reconcileable effects: an uncrashed
+worker tells them `Exhausted` at two of the three sites that spend their
+budget. Put back to the owner as 1a (keep the pick), 1b (follow the row for
+every class) and 1c (make the uncrashed sites park too, outside this
+issue), the owner chose 1b.
