@@ -19,9 +19,9 @@ use std::sync::Arc;
 use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, SharedAtomicWorkflowClock};
 use rakka_agent::{
     AgentDispatchError, AgentDispatchFuture, AgentDispatchPass, AgentDispatchToolExecutor,
-    AgentDispatchWindow, AgentEffectSpec, AgentModelTurn, AgentRunEffect, AgentRunScope,
-    AgentRunStatus, AgentTaskContent, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest,
-    AgentToolId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentDispatchWindow, AgentEffectSpec, AgentModelTurn, AgentRunEffect, AgentRunEffectStatus,
+    AgentRunScope, AgentRunStatus, AgentTaskContent, AgentToolAuthority, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::OutboxStatus;
 use rakka_agent_workflow::{
@@ -447,18 +447,16 @@ async fn a_ticket_whose_intent_is_resolved_finishes_the_row_before_the_fleet_ent
 }
 
 // ---------------------------------------------------------------------------
-// The write this change does not guard.
+// A finished row under an effect the run still waits on (issue #134).
 // ---------------------------------------------------------------------------
 
-/// Issue #134, pinned as it stands: a claim on an `Exhausted` row whose
-/// intent is still unresolved starts an attempt.
-///
-/// The settle writes are guarded against a finished row; the `Dispatching`
-/// mark is not. Refusing it here would leave the intent unresolved with
-/// nothing left to claim it, which issue #134 has to decide together with
-/// the park. When #134 lands, this test changes with it.
+/// A claim on an `Exhausted` row whose intent is still unresolved starts no
+/// attempt. The worker that spent the budget was lost before it finished
+/// the fleet entry and told the run; the next lease settles the entry to
+/// follow the row and tells the run what the row says.
+/// `dispatch_owed_outcome.rs` has the cases.
 #[tokio::test]
-async fn a_claim_on_an_exhausted_row_with_an_unresolved_intent_still_starts_an_attempt() {
+async fn a_claim_on_an_exhausted_row_with_an_unresolved_intent_tells_the_run_and_invokes_nothing() {
     let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
     let tool = Arc::new(CountingRefusal::default());
     let (fx, effect) = ready_tool_ticket(&spec, Some(tool.clone())).await;
@@ -477,15 +475,24 @@ async fn a_claim_on_an_exhausted_row_with_an_unresolved_intent_still_starts_an_a
     );
 
     fx.expire_lease();
-    fx.pipeline()
+    let pass = fx
+        .pipeline()
         .claim_and_execute()
         .await
         .expect("the pass runs");
 
+    assert_eq!(tool.calls(), 1, "the exhausted row was not run again");
+    assert_eq!((pass.invoked, pass.delivered), (0, 1));
     assert_eq!(
-        tool.calls(),
-        2,
-        "issue #134: the exhausted row was run again"
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Exhausted)
+    );
+    let entry = fleet_entry(&fx, &effect).await.expect("the entry is kept");
+    assert_eq!(entry.status, AgentDispatchStatus::Exhausted);
+    assert_eq!(entry.last_error_code.as_deref(), Some("ticket-row-settled"));
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Exhausted)
     );
 }
 

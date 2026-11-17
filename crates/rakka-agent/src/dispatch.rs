@@ -144,8 +144,9 @@ use crate::observability::{
     SEGMENT_ATTR_SETTINGS_REVISION,
 };
 use crate::owed_outcome::{
-    UnknownFinding, AMBIGUOUS_BUDGET_SPENT_MESSAGE, INDETERMINATE_OUTCOME_MESSAGE,
-    OUTCOME_MISMATCH, RECONCILIATION_UNKNOWN, WORKER_LOST_CODE, WORKER_LOST_LINE,
+    owed_by_exhausted_row, OwedByExhaustedRow, UnknownFinding, AMBIGUOUS_BUDGET_SPENT_MESSAGE,
+    INDETERMINATE_OUTCOME_MESSAGE, OUTCOME_MISMATCH, RECONCILIATION_UNKNOWN, TICKET_ROW_SETTLED,
+    WORKER_LOST_CODE, WORKER_LOST_LINE,
 };
 use crate::run::{
     load_agent_run_state, AgentRun, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError,
@@ -441,6 +442,74 @@ struct OwedOutcome<'a> {
     intent: &'a AgentRunEffect,
     attempt: u32,
     outcome: AgentRunEffectOutcome,
+}
+
+/// What a finished outbox row says of an effect its run still waits on
+/// ([`owed_by_finished_row`]).
+enum RowVerdict {
+    /// The ticket was cancelled before any attempt could start, under a
+    /// wind-down that fences it: the run is told `Cancelled`.
+    NeverStarted,
+    /// The budget was spent on failures: the run is told `Exhausted`.
+    Exhausted {
+        /// The stable code of the failure that spent the budget.
+        code: String,
+        /// The failure's detail.
+        detail: String,
+    },
+    /// The row does not establish an outcome: the run is parked
+    /// `Indeterminate` under this code.
+    Unknown {
+        /// The stable code of the park.
+        code: &'static str,
+    },
+}
+
+/// Reads a finished outbox row as what it owes a run that still waits on
+/// its effect, with the attempt number the run is told (issue #134).
+///
+/// A worker finishes a ticket's row before it tells the run, on every path
+/// that spends the ticket's budget, so a worker lost in between leaves a
+/// finished row and a run that was never told. A settle write never
+/// rewrites a finished row, so what the row says stays true, whoever reads
+/// it and whenever.
+///
+/// | The row | The run is owed |
+/// |---|---|
+/// | `Exhausted` | what the row's last failure line says the lost worker was about to deliver ([`owed_by_exhausted_row`]), with the row's attempt count |
+/// | `Cancelled`, and `fence_applies` | `Cancelled`: the wind-down fence's own answer for a ticket that never started |
+/// | `Cancelled` otherwise | `Indeterminate`: the ticket was ended, and nothing says with what |
+/// | `Dispatched` | `Indeterminate`: the call succeeded, and its result reached nobody |
+///
+/// The outcome carries no failure reason. The collaborator's reason was in
+/// the lost worker's memory and on no durable record.
+fn owed_by_finished_row(
+    row: &OutboxEntry,
+    intent: &AgentRunEffect,
+    fence_applies: bool,
+) -> (RowVerdict, u32) {
+    let counted = row.attempts().attempts();
+    match row.status() {
+        OutboxStatus::Exhausted => {
+            let reconcileable = intent.safety.class() == AgentEffectSafetyClass::Reconcileable;
+            let verdict = match owed_by_exhausted_row(row.attempts().last_error(), reconcileable) {
+                OwedByExhaustedRow::Exhausted { code, detail } => {
+                    RowVerdict::Exhausted { code, detail }
+                }
+                OwedByExhaustedRow::Indeterminate { code } => RowVerdict::Unknown { code },
+            };
+            (verdict, counted)
+        }
+        OutboxStatus::Cancelled if fence_applies => {
+            (RowVerdict::NeverStarted, counted.saturating_add(1))
+        }
+        _ => (
+            RowVerdict::Unknown {
+                code: TICKET_ROW_SETTLED,
+            },
+            counted.max(intent.attempts),
+        ),
+    }
 }
 
 /// What [`AgentRunEffectDispatcher::apply_outbox`] did.
@@ -2950,6 +3019,98 @@ where
             .is_none_or(|entry| entry.indexes_row(row))
     }
 
+    /// Ends a claim that found its outbox row finished while the run still
+    /// waits on the effect (issue #134), and starts no attempt.
+    ///
+    /// The worker that finished the row was lost before it told the run, or
+    /// before it finished the fleet entry too. The entry is settled to
+    /// follow the row, and then the run is told what the row says
+    /// ([`owed_by_finished_row`]).
+    ///
+    /// **Fleet first, run second**, the order
+    /// [`Self::conclude_on_finished_row`] keeps, and for its reason. The
+    /// settle is fenced on the claim, so it is what establishes that this
+    /// worker still holds the ticket. A worker whose lease lapsed while it
+    /// worked through its batch is answered `claim-fenced` and tells the
+    /// run nothing: the worker that took the ticket over may be between its
+    /// own fleet write and its own delivery, and would be beaten to the run
+    /// by an outcome that carries no reason. A crash between this settle
+    /// and the delivery leaves the entry finished and the run untold, which
+    /// the per-run half of a pass repairs.
+    ///
+    /// A row cancelled under a wind-down that fences the ticket keeps the
+    /// two steps it always had: the ticket is settled as cancelled at both
+    /// layers, and the run is told `Cancelled`.
+    async fn conclude_on_untold_row(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: &AgentDispatchClaim,
+        row: &OutboxEntry,
+        intent: &AgentRunEffect,
+        fence_applies: bool,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        let (verdict, attempt) = owed_by_finished_row(row, intent, fence_applies);
+        if matches!(verdict, RowVerdict::NeverStarted) {
+            self.settle_ticket_cancelled(scope, claim, "run-cancelled", pass)
+                .await?;
+            self.tell_owed(scope, intent, attempt, claim.fencing_token, verdict, pass)
+                .await?;
+            return Ok(ClaimConclusion::Settled);
+        }
+        match self.fleet.settle_claim_from_row(claim, Some(row)).await {
+            Ok(_) => {
+                if row.status() == OutboxStatus::Cancelled {
+                    pass.cancelled += 1;
+                }
+                self.tell_owed(scope, intent, attempt, claim.fencing_token, verdict, pass)
+                    .await?;
+            }
+            Err(rakka_agent_workflow::AgentDispatcherError::ClaimFenced { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(ClaimConclusion::Settled)
+    }
+
+    /// Tells the run what a finished row owes it. An unknown outcome is a
+    /// park like any other and goes through [`Self::tell_indeterminate`].
+    async fn tell_owed(
+        &mut self,
+        scope: &AgentRunScope,
+        intent: &AgentRunEffect,
+        attempt: u32,
+        fence: u64,
+        verdict: RowVerdict,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<()> {
+        let outcome = match verdict {
+            RowVerdict::Unknown { code } => {
+                return self
+                    .tell_indeterminate(
+                        scope,
+                        intent,
+                        attempt,
+                        fence,
+                        code,
+                        INDETERMINATE_OUTCOME_MESSAGE,
+                        None,
+                        None,
+                        pass,
+                    )
+                    .await;
+            }
+            RowVerdict::Exhausted { code, detail } => AgentRunEffectOutcome::exhausted(
+                bounded_failure_code(&code),
+                bounded_failure_detail(&detail),
+            ),
+            RowVerdict::NeverStarted => AgentRunEffectOutcome::Cancelled {
+                reason: "run-cancelled".to_string(),
+            },
+        };
+        self.deliver_outcome(scope, intent, attempt, fence, outcome, pass)
+            .await
+    }
+
     /// Finishes the fleet entry of a claim whose outbox row is gone, and
     /// writes nothing to the outbox.
     ///
@@ -3226,6 +3387,19 @@ where
             .as_ref()
             .and_then(AgentRunState::run)
             .is_some_and(|run| run.terminal_reason.is_some() || run.status.is_terminal());
+
+        // A finished row under an effect the run still waits on is never
+        // started. The worker that finished it was lost before the run
+        // heard, and the row holds what there is to say.
+        if matches!(
+            row.status(),
+            OutboxStatus::Dispatched | OutboxStatus::Exhausted | OutboxStatus::Cancelled
+        ) {
+            let fence_applies = winding_down && !intent.kind().exempt_from_wind_down_fence();
+            return self
+                .conclude_on_untold_row(scope, &claim, &row, &intent, fence_applies, pass)
+                .await;
+        }
 
         // `Dispatching` is the durable ambiguity marker: a previous attempt
         // wrote its `Started` and disappeared, so the invocation may have

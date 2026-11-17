@@ -1,17 +1,33 @@
 //! A ticket that is finished while its run was never told (issue #134).
 //!
-//! Reproductions, as the code stands before the fix. Each test here changes
-//! with the fix.
+//! A dispatch worker spends a ticket's budget by writing the outbox row
+//! `Exhausted`, then the fleet entry, then telling the run, and it can be
+//! lost between any two. The row is then finished, the run still waits, and
+//! what the worker knew is on the row: its attempt count and the last
+//! failure line.
+//!
+//! A claim that finds a finished row under an effect the run still waits on
+//! starts no attempt. It settles the fleet entry to follow the row, and then
+//! tells the run what the row says: for an `Exhausted` row, the outcome the
+//! lost worker was about to deliver, less the collaborator's reason, which
+//! no durable record keeps. Each crashed case below is held against a twin
+//! run where nothing crashed.
+//!
+//! The two tests named `pinned_` are reproductions of the other side of the
+//! window, where no claim will come. They state the behaviour as it stands.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, SharedAtomicWorkflowClock};
+use rakka_agent::testkit::{
+    CrashPoint, DeterministicModelAdapter, ScriptedReconciler, SharedAtomicWorkflowClock,
+};
 use rakka_agent::{
-    AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor, AgentEffectSpec,
-    AgentModelTurn, AgentRunEffect, AgentRunEffectStatus, AgentRunScope, AgentTaskContent,
-    AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor, AgentDispatchWindow,
+    AgentEffectSpec, AgentModelTurn, AgentReconciliationFinding, AgentReconciliationProtocolRef,
+    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand,
+    AgentRunScope, AgentRunStatus, AgentTaskContent, AgentToolAuthority, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::{OutboxMessageId, OutboxStatus, WorkflowTelemetryEvent};
 use rakka_agent_workflow::{
@@ -53,6 +69,15 @@ async fn ready_tool_ticket(
     spec: &AgentEffectSpec,
     tools: Option<Arc<dyn AgentDispatchToolExecutor>>,
 ) -> (AuthorityFixture, AgentRunEffect) {
+    ticket(spec, tools, None).await
+}
+
+/// The same, with the reconciler a reconcileable effect's recovery asks.
+async fn ticket(
+    spec: &AgentEffectSpec,
+    tools: Option<Arc<dyn AgentDispatchToolExecutor>>,
+    reconciler: Option<&ScriptedReconciler>,
+) -> (AuthorityFixture, AgentRunEffect) {
     let mut fx = AuthorityFixture::new(
         tool_then_proposal(),
         AgentToolAuthority::new(tool_registry_for_spec(TOOL, spec)),
@@ -61,10 +86,142 @@ async fn ready_tool_ticket(
     if let Some(tools) = tools {
         fx = fx.with_tool_executor(tools);
     }
+    if let Some(reconciler) = reconciler {
+        fx = fx.with_reconciler(Arc::new(reconciler.clone()));
+    }
     fx.start().await;
     fx.pump_until_tool_ticket().await;
     let effect = fx.effect_at(1).await.expect("the tool effect is committed");
     (fx, effect)
+}
+
+fn reconcileable(max_attempts: u32) -> AgentEffectSpec {
+    AgentEffectSpec::reconcileable(
+        AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid"),
+        max_attempts,
+    )
+    .expect("the spec is valid")
+}
+
+fn idempotent(max_attempts: u32) -> AgentEffectSpec {
+    AgentEffectSpec::idempotent(max_attempts).expect("the spec is valid")
+}
+
+/// What the run records for the effect once it is resolved: the part a
+/// rebuilt outcome must share with the one an uncrashed worker delivers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Recorded {
+    status: AgentRunEffectStatus,
+    code: Option<String>,
+    attempts: u32,
+}
+
+/// The effect's record, and whether it carries a failure reason.
+async fn recorded(fx: &AuthorityFixture) -> (Recorded, bool) {
+    let effect = fx.effect_at(1).await.expect("the effect is held");
+    (
+        Recorded {
+            status: effect.status,
+            code: effect.last_error_code.clone(),
+            attempts: effect.attempts,
+        },
+        effect.last_error_reason.is_some(),
+    )
+}
+
+async fn row_status(fx: &AuthorityFixture, effect: &AgentRunEffect) -> Option<OutboxStatus> {
+    fx.outbox_row(effect).await.map(|row| row.status())
+}
+
+/// Finishes the effect's outbox row through the substrate, as a worker that
+/// was then lost would have: `Exhausted` with `line`, `Dispatched`, or
+/// `Cancelled`.
+async fn finish_row(
+    fx: &AuthorityFixture,
+    effect: &AgentRunEffect,
+    status: OutboxStatus,
+    line: &str,
+) {
+    let mut inbox = rakka_agent_workflow::AgentRunInbox::with_clock(
+        rakka_agent::workflow_run_id(&run_scope()),
+        fx.workflow_store.clone(),
+        fx.wf_clock.clone(),
+    );
+    inbox.recover().await.expect("the inbox recovers");
+    let id = OutboxMessageId::new(effect.dispatch_ticket_id().as_str());
+    let substrate = inbox.inner_mut();
+    match status {
+        OutboxStatus::Exhausted => {
+            substrate
+                .record_outbox_exhausted(&id, line)
+                .await
+                .expect("the row is exhausted");
+        }
+        OutboxStatus::Dispatched => {
+            substrate
+                .record_outbox_success(&id)
+                .await
+                .expect("the row records its success");
+        }
+        OutboxStatus::Cancelled => {
+            substrate
+                .record_outbox_cancelled(&id, line)
+                .await
+                .expect("the row is cancelled");
+        }
+        other => panic!("{other:?} is not a finished status"),
+    }
+    assert_eq!(row_status(fx, effect).await, Some(status));
+}
+
+/// Registers the run and runs one worker pass whose second fleet write, the
+/// one that would finish the entry, is refused: the worker is lost after
+/// the outbox write that spent the budget and before the fleet write.
+async fn lose_the_worker_before_its_fleet_write(fx: &AuthorityFixture, effect: &AgentRunEffect) {
+    let mut pipeline = fx.pipeline();
+    pipeline
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    fx.fleet_store.crash_at(2, CrashPoint::BeforeWrite);
+    pipeline
+        .claim_and_execute()
+        .await
+        .expect_err("the settle's fleet write is refused");
+    fx.fleet_store
+        .assert_crash_fired(2, CrashPoint::BeforeWrite);
+    fx.fleet_store.survive();
+    assert_eq!(row_status(fx, effect).await, Some(OutboxStatus::Exhausted));
+    assert_eq!(
+        fleet_entry(fx, effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Claimed)
+    );
+    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+}
+
+/// A first attempt whose worker dies after the durable `Started` write,
+/// before the target is invoked. The row is left `Dispatching`.
+async fn lose_the_first_attempt_after_started(fx: &AuthorityFixture, effect: &AgentRunEffect) {
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    let died = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert!(died.died);
+    assert_eq!(
+        row_status(fx, effect).await,
+        Some(OutboxStatus::Dispatching)
+    );
+    fx.expire_lease();
+}
+
+fn assert_entry_follows_the_row(entry: Option<AgentDispatchEntry>, status: AgentDispatchStatus) {
+    let entry = entry.expect("the entry is kept");
+    assert_eq!(entry.status, status);
+    if status != AgentDispatchStatus::Completed {
+        assert_eq!(entry.last_error_code.as_deref(), Some("ticket-row-settled"));
+    }
 }
 
 /// The fleet index entry for one effect's ticket, if it is registered.
@@ -89,6 +246,16 @@ struct CountingRefusal {
     calls: AtomicUsize,
 }
 
+impl CountingRefusal {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+fn refusing() -> Arc<CountingRefusal> {
+    Arc::new(CountingRefusal::default())
+}
+
 impl AgentDispatchToolExecutor for CountingRefusal {
     fn execute<'a>(
         &'a self,
@@ -107,6 +274,472 @@ impl AgentDispatchToolExecutor for CountingRefusal {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A claim on a finished row starts nothing and tells the run.
+// ---------------------------------------------------------------------------
+
+/// A failed attempt spent the budget and its worker was lost before the
+/// fleet write. The next lease finds the row `Exhausted` and the run still
+/// waiting. It does not call the tool again: it tells the run what the row
+/// says, which is what the twin's worker told its run, less the reason.
+#[tokio::test]
+async fn a_failed_attempts_exhaustion_lost_before_the_fleet_write_is_told() {
+    let spec = idempotent(3);
+    let (twin, twin_has_reason) = {
+        let (fx, _effect) = ticket(&spec, Some(refusing()), None).await;
+        fx.pipeline()
+            .pump_run(&run_scope())
+            .await
+            .expect("the pass runs");
+        recorded(&fx).await
+    };
+    assert_eq!(twin.status, AgentRunEffectStatus::Exhausted);
+    assert!(twin_has_reason, "an uncrashed worker delivers the reason");
+
+    let tool = refusing();
+    let (fx, effect) = ticket(&spec, Some(tool.clone()), None).await;
+    lose_the_worker_before_its_fleet_write(&fx, &effect).await;
+    fx.expire_lease();
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(tool.calls(), 1, "the exhausted row was not run again");
+    assert_eq!((pass.claimed, pass.invoked, pass.delivered), (1, 0, 1));
+    let (told, has_reason) = recorded(&fx).await;
+    assert_eq!(told, twin);
+    assert!(!has_reason, "no durable record keeps the reason");
+    assert_entry_follows_the_row(
+        fleet_entry(&fx, &effect).await,
+        AgentDispatchStatus::Exhausted,
+    );
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Exhausted)
+    );
+}
+
+/// The same for a reconcileable effect. A failed attempt exhausts it like
+/// any other, and its worker tells the run `Exhausted`; so does the repair.
+/// The reconciler is not asked: nothing here was ambiguous.
+#[tokio::test]
+async fn the_same_for_a_reconcileable_effect_is_told_exhausted() {
+    let spec = reconcileable(3);
+    let twin = {
+        let (fx, _effect) = ticket(&spec, Some(refusing()), Some(&ScriptedReconciler::new())).await;
+        fx.pipeline()
+            .pump_run(&run_scope())
+            .await
+            .expect("the pass runs");
+        recorded(&fx).await.0
+    };
+    assert_eq!(twin.status, AgentRunEffectStatus::Exhausted);
+
+    let tool = refusing();
+    let reconciler = ScriptedReconciler::new();
+    let (fx, effect) = ticket(&spec, Some(tool.clone()), Some(&reconciler)).await;
+    lose_the_worker_before_its_fleet_write(&fx, &effect).await;
+    fx.expire_lease();
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    assert_eq!((tool.calls(), reconciler.queries()), (1, 0));
+    assert_eq!(recorded(&fx).await.0, twin);
+}
+
+/// The budget was spent recovering an attempt whose worker was lost after
+/// `Started`, and the recovering worker was lost before its fleet write.
+#[tokio::test]
+async fn an_ambiguous_budget_lost_before_the_fleet_write_is_told() {
+    let spec = idempotent(1);
+    let twin = {
+        let (fx, effect) = ticket(&spec, None, None).await;
+        lose_the_first_attempt_after_started(&fx, &effect).await;
+        fx.pipeline()
+            .claim_and_execute()
+            .await
+            .expect("the pass runs");
+        recorded(&fx).await.0
+    };
+    assert_eq!(
+        (twin.status, twin.code.as_deref()),
+        (
+            AgentRunEffectStatus::Exhausted,
+            Some("dispatcher-lost-after-started")
+        )
+    );
+
+    let (fx, effect) = ticket(&spec, None, None).await;
+    lose_the_first_attempt_after_started(&fx, &effect).await;
+    // The recovery's claim is its first fleet write, the settle its second.
+    fx.fleet_store.crash_at(2, CrashPoint::BeforeWrite);
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect_err("the settle's fleet write is refused");
+    fx.fleet_store
+        .assert_crash_fired(2, CrashPoint::BeforeWrite);
+    fx.fleet_store.survive();
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Exhausted)
+    );
+    fx.expire_lease();
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    assert_eq!((pass.invoked, pass.delivered), (0, 1));
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    assert_eq!(recorded(&fx).await.0, twin);
+}
+
+/// A reconcileable effect whose first attempt was lost after `Started`,
+/// with one attempt in its budget, behind `reconciler`. The recovery asks
+/// the reconciler, burns the attempt, and parks.
+async fn a_reconciliation_that_spends_the_budget(
+    reconciler: &ScriptedReconciler,
+) -> (AuthorityFixture, AgentRunEffect) {
+    let (fx, effect) = ticket(&reconcileable(1), None, Some(reconciler)).await;
+    lose_the_first_attempt_after_started(&fx, &effect).await;
+    (fx, effect)
+}
+
+/// The same, with the recovering worker lost after the write that spent the
+/// budget and before it told the run.
+async fn lost_before_the_park(
+    reconciler: &ScriptedReconciler,
+) -> (AuthorityFixture, AgentRunEffect) {
+    let (fx, effect) = a_reconciliation_that_spends_the_budget(reconciler).await;
+    fx.fx.runs.crash_at(1, CrashPoint::BeforeWrite);
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect_err("the run's store refuses the park");
+    fx.fx.runs.assert_crash_fired(1, CrashPoint::BeforeWrite);
+    fx.fx.runs.survive();
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Exhausted)
+    );
+    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+    fx.expire_lease();
+    (fx, effect)
+}
+
+/// A reconciliation established nothing and spent the budget, and the
+/// worker was lost before it parked the run. The row's line names the
+/// finding, so the run is parked as that worker would have parked it, and
+/// the reconciler is not asked again: the budget to ask it is gone.
+#[tokio::test]
+async fn a_reconciliation_that_established_nothing_lost_before_the_park_is_parked() {
+    let twin = {
+        let reconciler = ScriptedReconciler::new();
+        let (fx, _effect) = a_reconciliation_that_spends_the_budget(&reconciler).await;
+        fx.pipeline()
+            .claim_and_execute()
+            .await
+            .expect("the pass runs");
+        recorded(&fx).await.0
+    };
+    assert_eq!(
+        (twin.status, twin.code.as_deref()),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("reconciliation-exhausted")
+        )
+    );
+
+    let reconciler = ScriptedReconciler::new();
+    let (fx, effect) = lost_before_the_park(&reconciler).await;
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    assert_eq!((pass.invoked, pass.parked_indeterminate), (0, 1));
+    assert_eq!(reconciler.queries(), 1, "the reconciler is not asked again");
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    assert_eq!(recorded(&fx).await.0, twin);
+    assert_entry_follows_the_row(
+        fleet_entry(&fx, &effect).await,
+        AgentDispatchStatus::Exhausted,
+    );
+}
+
+/// The reconciler answers with an outcome that belongs to another call,
+/// which establishes nothing either, under its own code.
+#[tokio::test]
+async fn the_same_through_the_mismatch_arm_parks_under_its_code() {
+    let foreign = || {
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::Executed {
+            outcome: Box::new(AgentRunEffectOutcome::Tool {
+                call_id: AgentToolCallId::new("another-call").expect("the call id is valid"),
+                content: AgentTaskContent::inline(serde_json::json!({ "receipt": "r-1" }))
+                    .expect("the content is inline-bounded"),
+            }),
+        })
+    };
+    let twin = {
+        let (fx, _effect) = a_reconciliation_that_spends_the_budget(&foreign()).await;
+        fx.pipeline()
+            .claim_and_execute()
+            .await
+            .expect("the pass runs");
+        recorded(&fx).await.0
+    };
+    assert_eq!(
+        (twin.status, twin.code.as_deref()),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("effect-outcome-mismatch")
+        )
+    );
+
+    let (fx, _effect) = lost_before_the_park(&foreign()).await;
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(recorded(&fx).await.0, twin);
+}
+
+/// A registered ticket whose row was then finished by a worker that was
+/// lost, with nothing told to the run.
+async fn a_registered_ticket_with_a_finished_row(
+    spec: &AgentEffectSpec,
+    reconciler: Option<&ScriptedReconciler>,
+    status: OutboxStatus,
+    line: &str,
+) -> (AuthorityFixture, AgentRunEffect) {
+    let (fx, effect) = ticket(spec, None, reconciler).await;
+    fx.pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    finish_row(&fx, &effect, status, line).await;
+    (fx, effect)
+}
+
+/// A line no exhausting site of this build writes says the budget is spent
+/// and not how. Any effect but a reconcileable one is exhausted under the
+/// row's own code; a reconcileable one parks.
+#[tokio::test]
+async fn a_row_whose_line_has_no_known_shape() {
+    let (fx, _effect) = a_registered_ticket_with_a_finished_row(
+        &idempotent(3),
+        None,
+        OutboxStatus::Exhausted,
+        "something else happened",
+    )
+    .await;
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (AgentRunEffectStatus::Exhausted, Some("ticket-row-settled"))
+    );
+
+    let reconciler = ScriptedReconciler::new();
+    let (fx, _effect) = a_registered_ticket_with_a_finished_row(
+        &reconcileable(3),
+        Some(&reconciler),
+        OutboxStatus::Exhausted,
+        "something else happened",
+    )
+    .await;
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("reconciliation-exhausted")
+        )
+    );
+    assert_eq!(reconciler.queries(), 0);
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+}
+
+/// The row says the call succeeded, and its result reached nobody. Nothing
+/// can produce that result now, so the run is parked, and the target is not
+/// called a second time.
+#[tokio::test]
+async fn a_dispatched_row_nobody_delivered_is_parked() {
+    let (fx, effect) =
+        a_registered_ticket_with_a_finished_row(&idempotent(3), None, OutboxStatus::Dispatched, "")
+            .await;
+
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    assert_eq!((pass.invoked, pass.parked_indeterminate), (0, 1));
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("ticket-row-settled")
+        )
+    );
+    assert_entry_follows_the_row(
+        fleet_entry(&fx, &effect).await,
+        AgentDispatchStatus::Completed,
+    );
+}
+
+/// A cancelled row under a live run's waiting effect: the ticket was ended
+/// and nothing says with what. Parked, not invoked.
+#[tokio::test]
+async fn a_cancelled_row_on_a_live_run_is_parked() {
+    let (fx, effect) = a_registered_ticket_with_a_finished_row(
+        &idempotent(3),
+        None,
+        OutboxStatus::Cancelled,
+        "cancelled",
+    )
+    .await;
+
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    assert_eq!((pass.invoked, pass.parked_indeterminate), (0, 1));
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("ticket-row-settled")
+        )
+    );
+    assert_entry_follows_the_row(
+        fleet_entry(&fx, &effect).await,
+        AgentDispatchStatus::Cancelled,
+    );
+}
+
+/// An operator cancels the run, which stays `Cancelling` on its ready effect.
+async fn cancel_the_run(fx: &AuthorityFixture) {
+    let mut run = fx.fx.run();
+    run.recover(fx.fx.now()).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::Cancel {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Cancellation,
+                [TENANT, AGENT, "1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+        &fx.fx.router,
+        fx.fx.now(),
+    )
+    .await
+    .expect("cancellation applies");
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::Cancelling
+    );
+}
+
+/// The wind-down branch cancels a ticket that provably never started. An
+/// `Exhausted` row is a ticket that was attempted until its budget was
+/// spent, so a winding-down run is told that, and not `Cancelled`.
+#[tokio::test]
+async fn a_cancelling_run_is_told_what_its_exhausted_row_says() {
+    let (fx, _effect) = a_registered_ticket_with_a_finished_row(
+        &idempotent(3),
+        None,
+        OutboxStatus::Exhausted,
+        "tool-refused: the tool refused the call",
+    )
+    .await;
+    cancel_the_run(&fx).await;
+
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (AgentRunEffectStatus::Exhausted, Some("tool-refused"))
+    );
+}
+
+/// The worker's lease lapses between its claim and its look at the row. It
+/// no longer holds the ticket, and the worker that takes it over may be
+/// about to tell the run itself. The fleet answers its settle
+/// `claim-fenced`: it tells the run nothing, and its pass does not fail.
+/// The next lease tells the run.
+#[tokio::test]
+async fn a_worker_whose_claim_lapsed_tells_the_run_nothing() {
+    let (fx, effect) = a_registered_ticket_with_a_finished_row(
+        &idempotent(3),
+        None,
+        OutboxStatus::Exhausted,
+        "tool-refused: the tool refused the call",
+    )
+    .await;
+    // The claim's first read of the run's workflow record is its look at
+    // the row. By then the lease has run out.
+    let clock = fx.wf_clock.clone();
+    fx.workflow_store.before_next_load(Box::new(move || {
+        Box::pin(async move { clock.advance(LEASE_MS + 1) })
+    }));
+
+    let late = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("a fenced settle does not fail the pass");
+
+    assert_eq!((late.claimed, late.delivered, late.invoked), (1, 0, 0));
+    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Claimed)
+    );
+
+    let next = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+    assert_eq!((next.claimed, next.delivered), (1, 1));
+    assert_eq!(
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Exhausted)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The other side of the window: no claim will come. Reproductions.
+// ---------------------------------------------------------------------------
+
 /// The worker is lost after the fleet write that finishes the entry and
 /// before it tells the run. The row is `Exhausted`, the entry is
 /// `Exhausted`, and nothing claims a finished entry: the run waits for good.
@@ -123,7 +756,7 @@ async fn pinned_a_worker_lost_after_the_fleet_write_leaves_the_run_waiting() {
         .expect_err("the delivery is refused");
     fx.fx.runs.assert_crash_fired(1, CrashPoint::BeforeWrite);
     fx.fx.runs.survive();
-    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tool.calls(), 1);
     assert_eq!(
         fx.outbox_row(&effect).await.map(|row| row.status()),
         Some(OutboxStatus::Exhausted)
