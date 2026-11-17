@@ -87,6 +87,7 @@ pub mod promotion;
 pub mod retention;
 pub mod scope;
 pub mod search;
+pub mod semantic;
 pub mod store;
 pub mod tombstone;
 pub mod transition;
@@ -115,6 +116,11 @@ pub use search::{
     claim_search_query_tokens, claim_search_relevance_bps, claim_search_tokens,
     rank_claim_search_hits, ClaimSearch, ClaimSearchHit, ClaimSearchReport, CLAIM_SEARCH_MAX_HITS,
     CLAIM_SEARCH_TEXT_MAX_BYTES,
+};
+pub use semantic::{
+    claim_embedding_text, claim_semantic_distance_relevance_bps, claim_semantic_relevance_bps,
+    ClaimEmbedding, ClaimEmbeddingPage, ClaimSemanticSearch, CLAIM_EMBEDDING_MAX_DIMENSIONS,
+    CLAIM_EMBEDDING_PAGE_MAX_CLAIMS,
 };
 pub use store::{
     ClaimCursor, ClaimFilter, ClaimPage, ClaimTransitionCursor, ClaimTransitionPage,
