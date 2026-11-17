@@ -541,6 +541,28 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   | Mixed builds | An earlier build's own claim still starts an attempt on a finished row, and its per-run half tells a live run nothing. One thing an earlier build writes this build misreads: its unguarded `Dispatching` mark, written by a late worker over a row whose entry is already finished, leaves a live row under a finished entry. This build's sweep takes that for a row the run put back, cancels it and parks the effect under `ticket-row-missing`, while the earlier build's call is in flight. The effect is parked, not invoked twice by this build, and the window closes when no node runs the earlier build |
   | A rollback | Clean. No record changed shape; a told run and a settled entry are states the earlier build already reads |
 
+- Issue #157 ("a dispatcher settle that survives another worker's write, and a failed pass that releases the claims it did not finish") changes how a dispatch pass holds the batch it claimed. **No durable field, status, schema version or error code is added**, and a rollback is clean. The brief's first ask, a settle that reads the record again when it loses its write, is issue #145's change above; nothing is added to it here.
+
+  | Before | Now |
+  |---|---|
+  | Every claim of a batch was leased at one instant and nothing renewed a lease. A pass runs its claims one after another, so a later claim had what the earlier ones left of the lease: one that started late was claimed by another worker while it ran, and its own settle was answered `claim-fenced` | Every settle a pass writes also renews the claims that pass has not started, in the same write: each is leased for a full lease from that settle. No write is added. The lease has to cover the longest single call, not the sum of a batch |
+  | A claim whose lease had lapsed before the pass reached it was started anyway | It is not started. It is counted in `AgentDispatchPass::lapsed`, nothing is written for it, and any worker can claim it |
+  | A pass that met an error returned it and left the claims it had not started `Claimed` until the batch's lease lapsed. They counted against their class's concurrency limit meanwhile | The pass first gives those claims back: one fenced write sets each to `Pending` with no lease, claimable at once under the next fencing token. The claim that failed keeps its lease. The error returned is the one the pass had |
+  | `AgentDispatchPass` did not carry the tickets a claim left at a concurrency limit | `AgentDispatchPass::concurrency_limited` carries the count the fleet's claim already made |
+  | `AgentDispatcherWorker::run_once` had the first and the third gap | It renews and releases in the same way. `dispatch_claim` is unchanged, and a claim that is no longer current still ends the cycle with `claim-fenced` |
+
+  **The fence.** A renewal and a release each apply only to a claim that is still current in the record the write is applied to: the same worker, the same fencing token, a lease still active. A claim that lapsed, was taken over, finished or was pruned is left as it is. A release keeps the entry's last fencing token, so a late write under the released claim is answered `claim-fenced`. A renewal never shortens a lease. Both read the record again when they lose their compare-and-set, as a settle does, and a release reads it before its first write too.
+
+  **What is not renewed.** The claim being run. A call that outlives the lease loses its claim as before, its settle is answered `claim-fenced`, and the claims the pass held behind it lapse with it. Nothing renews during a call.
+
+  **What is not released.** The claim that failed, whose lease is its backoff; the claims of a worker that was killed, or of a pass whose future was dropped; and anything at all when the release's own write fails, which is logged and does not replace the pass's error.
+
+  **What an earlier binary reads.** A renewed entry is a claimed entry with a later `lease_expires_at`. A released entry is `Pending` with `lease: null` and a `last_fencing_token` above zero, which is what a registration has always written for a claim whose lease lapsed; `a_released_entry_is_written_in_a_shape_the_record_already_had` holds its bytes. A worker at `ff9a495` or `c4be3d9` beside a newer one leaves a renewed lease alone and claims a released entry. Its own batches are neither renewed nor released, and at `ff9a495` its settle does not read again.
+
+  **Public names.** `AgentDispatcherFleet::hold_claims` and `AgentDispatcherFleet::release_claims` in `rakka-agent-workflow`; `AgentDispatchPass::lapsed` and `AgentDispatchPass::concurrency_limited` in `rakka-agent`. The two fields are source-breaking only for a struct literal or a pattern that names every field of `AgentDispatchPass`. **New stable strings**, on the counter `rakka.agent_workflow.dispatcher.fleet`: `operation=renew, outcome=renewed` and `operation=release, outcome=released`, each with `detail=none` and each counting entries.
+
+  **The concurrency limit.** An entry counts against its class and its target from its claim until it is settled or its lease lapses. The settle is what tells the record a call has ended, so a call that ended and whose settle was lost for good holds its slot for the rest of one lease; that takes four lost writes running, or a worker lost between the delivery and the settle. A batch's claimed and unstarted tickets hold slots too, and a failed pass now gives those back.
+
 Run the default compatibility matrix:
 
 ```sh

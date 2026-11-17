@@ -216,3 +216,43 @@ it passes.
 - A delivered ticket whose settle was lost for good is still ended
   `Cancelled` under `ticket-stale` or `intent-already-resolved` at its
   re-claim, not `Completed`.
+
+## 10. As built
+
+Where the build moved from the text above.
+
+1. **Nothing clears what a handle holds** (4.2 said "when the batch ends,
+   however it ends, nothing is held any more"). The held list is replaced
+   before every claim, so the last claim of a batch holds nothing behind it,
+   and no settle is written between one batch and the first claim of the
+   next. A clear at the end of a batch had nothing that could observe it, so
+   it was not written. After a failed pass the handle still names claims,
+   all of them released. After a kill it names claims that are still
+   leased, until the next batch replaces them.
+2. **The settled claim needs no exception** (4.1 said "each held claim other
+   than the one being settled"). A settled entry holds no lease, so it is
+   not current and the renewal passes it over like any other.
+3. **A renewal that would change nothing is not one.** A held lease already
+   running to the new expiry or past it is left untouched, `updated_at`
+   included, and is not counted.
+4. **`release_claims` does not edit what is held.** A released claim is not
+   current, which is all the renewal asks.
+5. **A lapsed claim is a third conclusion**, `ClaimConclusion::Lapsed`,
+   beside `Settled` and `Died`.
+6. **A doc correction that is not this issue's.** The product doc's "What is
+   not bounded" still said the `Dispatching` mark was unguarded against a
+   finished row, that a stalled worker could invoke a finished ticket and
+   make it reappear after a prune, and that a claim on an `Exhausted` row
+   still started an attempt. Issue #134 closed all three and left the
+   paragraph. It is rewritten here, because this change alters its first
+   sentence, and the "Pruning" bullet and the known-limitations line that
+   leaned on it are corrected with it.
+
+**Tests.** `crates/rakka-agent-workflow/tests/dispatcher_fleet_leases.rs`
+(22) and `crates/rakka-agent/tests/dispatch_batch_leases.rs` (7). Before the
+change the agent tier's lease tests failed `claim-fenced` and the failed
+pass left both tickets `Claimed`; the inverted host proof for Ask 1 already
+passed. 24 single mutations were run against the two source files, and each
+is caught by a named test: 15 in the fleet, 9 in the pass, the last of which
+undoes issue #145's re-read and turns the host proof red.
+
