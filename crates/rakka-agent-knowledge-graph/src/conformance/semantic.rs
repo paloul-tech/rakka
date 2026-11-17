@@ -14,10 +14,12 @@
 //! store never calls one.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use rakka_agent::{
-    AgentCapabilityId, AgentId, AgentRevisionNumber, AgentTaskContent, KnowledgeSpaceId,
-    MemoryClassification, MemoryEmbeddingRef,
+    tokenize_search_text, AgentCapabilityId, AgentId, AgentMemoryEmbedder, AgentRevisionNumber,
+    AgentTaskContent, KnowledgeSpaceId, MemoryClassification, MemoryEmbeddingRef, MemoryError,
+    MemoryFuture,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -749,4 +751,129 @@ pub async fn semantic_search(store: &dyn KnowledgeGraphStore, scopes: Conformanc
     assert_eq!(rest.next, None);
     let narrowest = page(store, scope, 1, UNCLASSIFIED, None, 0).await;
     assert_eq!(narrowest.claims.len(), 1, "a limit of zero reads one claim");
+}
+
+/// A deterministic embedder that needs no model, for tests of everything
+/// that holds an embedder: the retriever, the append executor and the
+/// embedding pass.
+///
+/// It knows a vocabulary of *concepts*, each a set of words that mean the
+/// same thing. A text's vector has one component per concept, counting the
+/// text's words that belong to it, and a last component that is 1 when the
+/// text names no concept at all. Two texts that name the same concept in
+/// different words therefore point the same way, which is what lets a test
+/// find a claim by a query that shares no word with it; texts that name
+/// different concepts are unrelated.
+///
+/// Clones share one record of the texts they were asked to embed.
+#[derive(Debug, Clone)]
+pub struct ConceptEmbedder {
+    concepts: Arc<Vec<BTreeSet<String>>>,
+    version: u64,
+    failing: BTreeSet<String>,
+    short: BTreeSet<String>,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl ConceptEmbedder {
+    /// The model name every concept embedder reports.
+    pub const MODEL: &'static str = "concept-embedder";
+
+    /// An embedder over `concepts`, at pipeline version 1. Each concept is
+    /// the words that mean it; a word is matched as
+    /// [`tokenize_search_text`] splits a text.
+    #[must_use]
+    pub fn new(concepts: &[&[&str]]) -> Self {
+        Self {
+            concepts: Arc::new(
+                concepts
+                    .iter()
+                    .map(|words| words.iter().map(|word| word.to_lowercase()).collect())
+                    .collect(),
+            ),
+            version: 1,
+            failing: BTreeSet::new(),
+            short: BTreeSet::new(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// The same embedder at another pipeline version: another reference, as
+    /// a deployment that changed its model or its pipeline has.
+    #[must_use]
+    pub const fn with_version(mut self, version: u64) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Makes `embed` fail for any text that holds `word`, as a provider that
+    /// rejects one input does.
+    #[must_use]
+    pub fn failing_on(mut self, word: &str) -> Self {
+        self.failing.insert(word.to_lowercase());
+        self
+    }
+
+    /// Makes `embed` answer one component too few for any text that holds
+    /// `word`, as a provider that answers the wrong dimension count does.
+    #[must_use]
+    pub fn answering_short_on(mut self, word: &str) -> Self {
+        self.short.insert(word.to_lowercase());
+        self
+    }
+
+    /// Every text this embedder, or a clone of it, was asked to embed, in
+    /// order, whether or not the call succeeded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a thread panicked while recording a call.
+    #[must_use]
+    pub fn calls(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .expect("the call record lock is never poisoned")
+            .clone()
+    }
+}
+
+impl AgentMemoryEmbedder for ConceptEmbedder {
+    fn embedding_ref(&self) -> MemoryEmbeddingRef {
+        MemoryEmbeddingRef {
+            model: Self::MODEL.to_string(),
+            dimensions: u32::try_from(self.concepts.len() + 1).unwrap_or(u32::MAX),
+            version: AgentRevisionNumber::new(self.version),
+        }
+    }
+
+    fn embed<'a>(&'a self, text: &'a str) -> MemoryFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .expect("the call record lock is never poisoned")
+                .push(text.to_string());
+            let words = tokenize_search_text(text);
+            if words.iter().any(|word| self.failing.contains(word)) {
+                return Err(MemoryError::Backend {
+                    backend: Self::MODEL.to_string(),
+                    message: "the model refused this input".to_string(),
+                });
+            }
+            let mut vector: Vec<f32> = self
+                .concepts
+                .iter()
+                .map(|concept| {
+                    let named = words.iter().filter(|word| concept.contains(*word)).count();
+                    // A text names a concept a handful of times at most.
+                    f32::from(u16::try_from(named).unwrap_or(u16::MAX))
+                })
+                .collect();
+            let names_none = vector.iter().all(|component| *component == 0.0);
+            vector.push(if names_none { 1.0 } else { 0.0 });
+            if words.iter().any(|word| self.short.contains(word)) {
+                vector.pop();
+            }
+            Ok(vector)
+        })
+    }
 }

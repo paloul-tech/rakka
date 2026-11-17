@@ -81,6 +81,7 @@ pub mod append_executor;
 pub mod claim;
 pub mod communal_retrieval;
 pub mod conformance;
+pub mod embedding_pass;
 pub mod error;
 pub mod goal_claim_source;
 pub mod promotion;
@@ -100,6 +101,7 @@ pub use claim::{
     CLAIM_OBJECT_INLINE_MAX_BYTES, CURRENT_CLAIM_SCHEMA_VERSION,
 };
 pub use communal_retrieval::{KnowledgeGraphCommunalAuthority, KnowledgeGraphCommunalRetriever};
+pub use embedding_pass::{embed_claims, ClaimEmbeddingPassPage};
 pub use error::{check_schema_window, ClaimError, ClaimFuture, ClaimRecordKind, ClaimResult};
 pub use goal_claim_source::KnowledgeGraphGoalClaimSource;
 pub use promotion::{

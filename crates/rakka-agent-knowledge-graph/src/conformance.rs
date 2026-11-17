@@ -90,7 +90,7 @@ pub use erasure::{
 };
 
 pub use search::keyword_search;
-pub use semantic::{semantic_search, semantic_search_refused};
+pub use semantic::{semantic_search, semantic_search_refused, ConceptEmbedder};
 
 pub use retention::{
     retention_ages_claims_by_trust_status, retention_is_bounded_and_resumable,
