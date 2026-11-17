@@ -368,6 +368,16 @@ pub fn tool_effect(effect_id: &str) -> AgentEffect {
 
 /// A tool-call effect due at `due_at`.
 pub fn tool_effect_due(effect_id: &str, due_at: u64) -> AgentEffect {
+    tool_effect_with(effect_id, Some(due_at))
+}
+
+/// A tool-call effect that names no due time: its outbox row is due, and
+/// stamped, at the instant it is scheduled.
+pub fn tool_effect_due_when_scheduled(effect_id: &str) -> AgentEffect {
+    tool_effect_with(effect_id, None)
+}
+
+fn tool_effect_with(effect_id: &str, due_at: Option<u64>) -> AgentEffect {
     let durability = AgentDurabilityMetadata::new(
         AgentDeduplicationKey::new(format!("dedupe-{effect_id}")),
         AgentCausationId::new(format!("cause-{effect_id}")),
@@ -379,8 +389,11 @@ pub fn tool_effect_due(effect_id: &str, due_at: u64) -> AgentEffect {
         AgentIdempotencyKey::new(format!("idempotency-{effect_id}")),
         AgentTimestampMillis::new(100),
     )
-    .expect("effect metadata should be valid")
-    .due_at(AgentTimestampMillis::new(due_at));
+    .expect("effect metadata should be valid");
+    let metadata = match due_at {
+        Some(due_at) => metadata.due_at(AgentTimestampMillis::new(due_at)),
+        None => metadata,
+    };
     let target = AgentEffectTarget {
         target_type: "tool".to_string(),
         name: "research-tool".to_string(),

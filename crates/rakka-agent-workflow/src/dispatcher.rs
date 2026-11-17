@@ -599,6 +599,23 @@ pub struct AgentDispatchEntry {
     pub graph_loop_instance_id: Option<String>,
     /// Due timestamp for first dispatch or retry.
     pub due_at: AgentTimestampMillis,
+    /// When the outbox row this entry was first registered from was
+    /// scheduled.
+    ///
+    /// A row's scheduling stamp is written once, when the row is created,
+    /// and no retry changes it, so it tells the row the entry indexes from
+    /// a row scheduled later under the same message id: what an outbox
+    /// owner writes when the first row was lost. Set by the registration
+    /// that creates the entry and by nothing after it. `None` on an entry
+    /// written before the field existed, which indexes whatever row it is
+    /// shown ([`Self::indexes_row`]).
+    ///
+    /// The stamp is the instant the row was written only for an effect that
+    /// names no due time of its own; one that does is stamped with that
+    /// time, whenever its row is written, and a second row for it carries
+    /// the same stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_scheduled_at: Option<AgentTimestampMillis>,
     /// Dispatcher lifecycle status.
     pub status: AgentDispatchStatus,
     /// Current active or expired lease.
@@ -663,6 +680,9 @@ impl AgentDispatchEntry {
             graph_node_kind: graph_context.node_kind,
             graph_loop_instance_id: graph_context.loop_instance_id,
             due_at,
+            row_scheduled_at: Some(agent_dispatch_timestamp_from_workflow_timestamp(
+                due.entry.scheduled_at(),
+            )),
             status: AgentDispatchStatus::Pending,
             lease: None,
             last_fencing_token: 0,
@@ -729,6 +749,23 @@ impl AgentDispatchEntry {
         })
     }
 
+    /// Returns true when `row` is the outbox row this entry was registered
+    /// from, as far as the entry can tell.
+    ///
+    /// False only when the entry recorded its row's scheduling stamp
+    /// ([`Self::row_scheduled_at`]) and `row` carries another: the row the
+    /// entry indexed is gone, and `row` was scheduled in its place, with
+    /// none of its attempt history. An entry with no stamp answers true for
+    /// every row. So does a row that carries the stamp the first one did: a
+    /// row written in the same millisecond, or any row of an effect that
+    /// names its own due time.
+    #[must_use]
+    pub fn indexes_row(&self, row: &OutboxEntry) -> bool {
+        self.row_scheduled_at.is_none_or(|scheduled_at| {
+            scheduled_at == agent_dispatch_timestamp_from_workflow_timestamp(row.scheduled_at())
+        })
+    }
+
     /// Whether this entry differs from `other` in anything but `updated_at`,
     /// which nothing reads to decide anything.
     fn differs_beyond_updated_at(&self, other: &Self) -> bool {
@@ -744,6 +781,15 @@ impl AgentDispatchEntry {
         now: AgentTimestampMillis,
     ) -> Self {
         if self.status.is_terminal() || self.cancellation_requested {
+            return self;
+        }
+        if !self.indexes_row(&due.entry) {
+            // Another row under this entry's message id: the row the entry
+            // was registered from is gone, and its owner scheduled the
+            // ticket again. What the entry holds is the last the fleet
+            // learned from the row that was lost, the attempts it counted
+            // included, and a row that never saw them must not overwrite
+            // it. Whoever claims the entry decides what the ticket is now.
             return self;
         }
 

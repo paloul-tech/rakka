@@ -40,8 +40,25 @@ async fn a_one_entry_record_keeps_the_bytes_it_had() {
     assert_eq!(bytes, PINNED_ONE_ENTRY_RECORD);
 }
 
-/// The bytes `ff9a495` writes for the record the test above builds.
-const PINNED_ONE_ENTRY_RECORD: &str = r#"{"entries":{"run-a:effect-a":{"dispatch_id":"run-a:effect-a","workflow_id":null,"run_id":"run-a","effect_id":"effect-a","effect_kind":"tool-call","target":{"target_type":"tool","name":"research-tool","address":"tool://research-tool","attributes":{}},"target_class":"tool","due_at":100,"status":"completed","lease":null,"last_fencing_token":1,"attempts":0,"cancellation_requested":false,"last_error_code":null,"created_at":100,"updated_at":100,"completed_at":100,"exhausted_at":null,"attributes":{}}},"updated_at":100}"#;
+/// The bytes this build writes for the record the test above builds: what
+/// `ff9a495` wrote, and `row_scheduled_at` (issues #153 and #154).
+const PINNED_ONE_ENTRY_RECORD: &str = r#"{"entries":{"run-a:effect-a":{"dispatch_id":"run-a:effect-a","workflow_id":null,"run_id":"run-a","effect_id":"effect-a","effect_kind":"tool-call","target":{"target_type":"tool","name":"research-tool","address":"tool://research-tool","attributes":{}},"target_class":"tool","due_at":100,"row_scheduled_at":100,"status":"completed","lease":null,"last_fencing_token":1,"attempts":0,"cancellation_requested":false,"last_error_code":null,"created_at":100,"updated_at":100,"completed_at":100,"exhausted_at":null,"attributes":{}}},"updated_at":100}"#;
+
+/// A record written before `row_scheduled_at` existed is read, and written
+/// back byte for byte: an entry with no stamp is not given one, and the
+/// field is absent rather than null.
+#[test]
+fn a_record_written_before_the_row_stamp_keeps_the_bytes_it_had() {
+    let state: AgentDispatcherFleetState =
+        serde_json::from_str(PINNED_RECORD_BEFORE_THE_ROW_STAMP).expect("the record decodes");
+
+    let bytes = serde_json::to_string(&state).expect("the state encodes");
+
+    assert_eq!(bytes, PINNED_RECORD_BEFORE_THE_ROW_STAMP);
+}
+
+/// The bytes `ff9a495` wrote for the same record.
+const PINNED_RECORD_BEFORE_THE_ROW_STAMP: &str = r#"{"entries":{"run-a:effect-a":{"dispatch_id":"run-a:effect-a","workflow_id":null,"run_id":"run-a","effect_id":"effect-a","effect_kind":"tool-call","target":{"target_type":"tool","name":"research-tool","address":"tool://research-tool","attributes":{}},"target_class":"tool","due_at":100,"status":"completed","lease":null,"last_fencing_token":1,"attempts":0,"cancellation_requested":false,"last_error_code":null,"created_at":100,"updated_at":100,"completed_at":100,"exhausted_at":null,"attributes":{}}},"updated_at":100}"#;
 
 /// Settles a claim as exhausted, with an event built by hand: the fleet
 /// follows whatever outbox transition it is told about.
