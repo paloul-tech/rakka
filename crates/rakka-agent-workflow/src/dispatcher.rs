@@ -2071,11 +2071,11 @@ where
     ///
     /// This replaces what was held, and an empty list holds nothing. It
     /// reads and writes nothing. A worker names the claims it has not
-    /// started before each one it runs and holds nothing once its batch has
-    /// ended: a claim left held is renewed by every later settle of this
-    /// handle for as long as it stays current. The claim being run is not
-    /// renewed by anything, so a dispatch that outlives a lease lapses as it
-    /// always did, and the claims held behind it lapse with it.
+    /// started before each one it runs, so the last claim of a batch holds
+    /// nothing behind it. A claim left held is renewed by every later settle
+    /// of this handle for as long as it stays current. The claim being run
+    /// is not renewed by anything, so a dispatch that outlives a lease
+    /// lapses as it always did, and the claims held behind it lapse with it.
     pub fn hold_claims(&mut self, claims: Vec<AgentDispatchClaim>) {
         self.held = claims;
     }
@@ -2997,7 +2997,6 @@ where
                 // not a failure of the cycle.
                 Err(AgentDispatcherError::ClaimUnavailable { .. }) => {}
                 Err(error) => {
-                    self.fleet.hold_claims(Vec::new());
                     // The cycle ends here, and what it never started is
                     // given back instead of left leased. The error the
                     // cycle had is the one returned: a release that fails
@@ -3008,7 +3007,6 @@ where
                 }
             }
         }
-        self.fleet.hold_claims(Vec::new());
         Ok(AgentDispatcherCycle {
             registrations,
             claims,

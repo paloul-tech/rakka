@@ -94,6 +94,7 @@
 //! backed by the run's own effect fence. Running a pass twice — or from two
 //! workers racing across a partition — converges on the same durable state.
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
@@ -2198,6 +2199,24 @@ pub struct AgentDispatchPass {
     /// — which matters because a busy fleet is when an unservable class is
     /// most likely to be sitting behind work that keeps getting claimed.
     pub class_filtered: usize,
+    /// Due tickets the claim left where they were because their target
+    /// class, or their target, already had as many calls in flight as its
+    /// limit allows ([`rakka_agent_workflow::AgentDispatchConcurrencyLimits`]).
+    ///
+    /// Never a failure: the ticket stays claimable. A value that stays
+    /// non-zero while work is due says the limit, not the workers, is what
+    /// bounds the fleet. A claimed ticket counts against its limit from the
+    /// claim until it is settled or its lease lapses, so a batch's claimed
+    /// and unstarted tickets count too.
+    pub concurrency_limited: usize,
+    /// Claims this pass took and did not start, because their lease had
+    /// lapsed by the time the pass reached them.
+    ///
+    /// Nothing is written for such a claim: its lease is over, so any worker
+    /// can take the ticket. A pass renews the claims it holds every time it
+    /// settles one, so this counts only when a single claim outlasted the
+    /// lease and the pass went on.
+    pub lapsed: usize,
     /// True when the probe killed the worker mid-pass.
     pub died: bool,
     /// The status of the run the pass was given, as the pass read it: `None`
@@ -2221,6 +2240,9 @@ enum ClaimConclusion {
     /// The probe killed the worker; durable state is exactly as a crash
     /// leaves it.
     Died,
+    /// The claim's lease had lapsed before the pass reached it. Nothing was
+    /// started and nothing was written.
+    Lapsed,
 }
 
 /// How a park ends its claim's ticket.
@@ -3200,6 +3222,13 @@ where
     /// The pass reads only durable state, so calling it after a crash, after a
     /// clock advance past a lease, or twice in a row are all the same
     /// operation.
+    ///
+    /// # Errors
+    ///
+    /// The first error a claim meets ends the pass. The claims of the batch
+    /// that were not started are given back before the error is returned
+    /// ([`Self::claim_and_execute`] has the rule); the claim that failed
+    /// keeps its lease.
     pub async fn pump_run(
         &mut self,
         scope: &AgentRunScope,
@@ -3267,6 +3296,29 @@ where
     /// [`Self::register_run`] or [`Self::pump_run`] has registered, for any
     /// run. It reads no run of its own, so its
     /// [`AgentDispatchPass::run_status`] is `None`.
+    ///
+    /// **The batch and its leases** (issue #157). The fleet leases every
+    /// claim of a batch at one instant, and the claims run one after
+    /// another. Every settle the pass writes also renews the claims it has
+    /// not started yet, in the same write, so each claim starts with a full
+    /// lease and the lease has to cover the longest single call, not their
+    /// sum. The claim being run is renewed by nothing: a call that outlives
+    /// the lease loses its claim as before, and the unstarted claims behind
+    /// it lapse with it. A claim whose lease has lapsed by the time the pass
+    /// reaches it is not started and is counted in
+    /// [`AgentDispatchPass::lapsed`]; any worker can then take it.
+    ///
+    /// # Errors
+    ///
+    /// The first error a claim meets ends the pass, and no report is
+    /// returned. **The claims the pass had not started are given back
+    /// first**: one fenced write puts each of them back to pending, with no
+    /// lease, so the next pass of any worker can claim them at once. The
+    /// claim that failed keeps its lease, and is recovered when it lapses
+    /// like any attempt that disappeared. When that release fails too, it is
+    /// logged, the pass still returns the error it had, and the unstarted
+    /// claims wait out their lease. A worker killed mid-pass, or a pass
+    /// whose future is dropped, gives nothing back.
     pub async fn claim_and_execute(&mut self) -> AgentDispatchResult<AgentDispatchPass> {
         let mut pass = AgentDispatchPass::default();
         self.claim_into(false, &mut pass).await?;
@@ -3343,17 +3395,79 @@ where
         let batch = self.fleet.claim_due(self.worker_id.clone()).await?;
         pass.claimed = batch.claims.len();
         pass.class_filtered = batch.class_filtered;
-        for claim in batch.claims {
-            let claim_scope = AgentRunScope::parse(claim.run_id.as_str())?;
-            match self.execute_claim(&claim_scope, claim, pass).await? {
-                ClaimConclusion::Settled => {}
-                ClaimConclusion::Died => {
+        pass.concurrency_limited = batch.concurrency_limited;
+        let mut unstarted: VecDeque<AgentDispatchClaim> = batch.claims.into();
+        while let Some(claim) = unstarted.pop_front() {
+            match self.execute_batch_claim(claim, &unstarted, pass).await {
+                Ok(ClaimConclusion::Settled) => {}
+                Ok(ClaimConclusion::Lapsed) => pass.lapsed += 1,
+                Ok(ClaimConclusion::Died) => {
+                    // A killed worker gives nothing back: the claims behind
+                    // this one wait out their lease, as after a crash.
                     pass.died = true;
                     break;
+                }
+                Err(error) => {
+                    self.release_unstarted(unstarted.into()).await;
+                    return Err(error);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Runs one claim of a batch, with the claims behind it still unstarted.
+    ///
+    /// A batch is leased at one instant and run one claim at a time, so two
+    /// things are done for every claim before it starts.
+    ///
+    /// **A claim whose lease has lapsed is not started.** The fleet handle
+    /// is asked, from the copy of the record it holds and with no read.
+    /// While a lease is active only its own worker's writes move it, and the
+    /// handle's copy holds every write the handle made, so the copy's
+    /// expiry for a claim this worker holds is the record's. Past it the
+    /// ticket is any worker's to take, and starting it here could run it
+    /// beside that worker. Nothing is written for it.
+    ///
+    /// **The claims behind it are held**
+    /// ([`AgentDispatcherFleet::hold_claims`]), so the settle that ends this
+    /// claim renews them and the next one starts with a full lease. The
+    /// list is replaced before every claim, and the last claim of a batch
+    /// holds nothing behind it.
+    async fn execute_batch_claim(
+        &mut self,
+        claim: AgentDispatchClaim,
+        unstarted: &VecDeque<AgentDispatchClaim>,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        if !self.fleet.is_current_claim(&claim)? {
+            return Ok(ClaimConclusion::Lapsed);
+        }
+        self.fleet.hold_claims(unstarted.iter().cloned().collect());
+        let claim_scope = AgentRunScope::parse(claim.run_id.as_str())?;
+        self.execute_claim(&claim_scope, claim, pass).await
+    }
+
+    /// Gives back the claims a failed pass never started
+    /// ([`AgentDispatcherFleet::release_claims`]), so they are claimable at
+    /// once instead of leased until the batch's lease lapses.
+    ///
+    /// The claim that failed is not among them. Its lease is its backoff: a
+    /// ticket that fails every pass would otherwise be first in every
+    /// pass's batch and fail the claims behind it each time.
+    ///
+    /// The pass returns the error it had. A release that fails too is
+    /// logged, and those claims wait out their lease as they did before.
+    async fn release_unstarted(&mut self, unstarted: Vec<AgentDispatchClaim>) {
+        if let Err(error) = self.fleet.release_claims(&unstarted).await {
+            tracing::warn!(
+                worker_id = self.worker_id.as_str(),
+                claims = unstarted.len(),
+                code = error.code(),
+                "a failed dispatch pass could not give back the claims it did not start; \
+                 they stay leased until their lease lapses"
+            );
+        }
     }
 
     /// Executes one claimed dispatch ticket to a settled conclusion.
