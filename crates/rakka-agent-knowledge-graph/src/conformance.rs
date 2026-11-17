@@ -80,6 +80,7 @@ use crate::transition::ClaimTrustTransitionRequest;
 mod erasure;
 mod retention;
 mod search;
+mod semantic;
 
 pub use erasure::{
     a_deleted_claim_cannot_be_restored_by_replay, a_stale_delete_changes_nothing, a_stub_is_frozen,
@@ -89,6 +90,7 @@ pub use erasure::{
 };
 
 pub use search::keyword_search;
+pub use semantic::{semantic_search, semantic_search_refused};
 
 pub use retention::{
     retention_ages_claims_by_trust_status, retention_is_bounded_and_resumable,
@@ -1378,6 +1380,16 @@ pub async fn check_knowledge_graph_contract(store: &dyn KnowledgeGraphStore) {
         .supports(crate::store::KnowledgeGraphCapability::KeywordSearch)
     {
         keyword_search(store, ConformanceScopes::unique("keyword-search")).await;
+    }
+    // So is meaning-based search. A backend that reports it is held to its
+    // clause, and one that does not is held to the refusal.
+    if store
+        .capabilities()
+        .supports(crate::store::KnowledgeGraphCapability::SemanticSearch)
+    {
+        semantic_search(store, ConformanceScopes::unique("semantic-search")).await;
+    } else {
+        semantic_search_refused(store, ConformanceScopes::unique("semantic-refused")).await;
     }
 }
 

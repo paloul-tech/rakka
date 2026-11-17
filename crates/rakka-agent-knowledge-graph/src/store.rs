@@ -12,17 +12,19 @@
 //! The core operations — append, get, query, traverse, transition, and the
 //! erasure pair tombstone and delete — are mandatory: a backend that cannot
 //! serve them is not a conformant backend, so they are not "capabilities". Only genuinely optional features are
-//! reported through [`KnowledgeGraphCapabilities`]; `SemanticSearch` is
-//! declared now because the specification names it, but no search method
-//! ships in this slice — the refusal contract
-//! (`claim-capability-unsupported`) exists from day one, and the method
-//! belongs to the communal-retrieval slice.
+//! reported through [`KnowledgeGraphCapabilities`]: keyword search
+//! ([`KnowledgeGraphStore::search`]) and meaning-based search
+//! ([`KnowledgeGraphStore::search_semantic`] and the two operations that
+//! keep its embeddings). An optional operation's default body answers
+//! `claim-capability-unsupported`, so a caller of a backend that does not
+//! serve it learns so instead of reading an empty answer as "nothing found".
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use rakka_agent::{
     AgentDelegationId, AgentGoalId, AgentId, AgentRunId, AgentTaskId, MemoryClassification,
+    MemoryEmbeddingRef,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,10 @@ use crate::scope::KnowledgeSpaceScope;
 use crate::search::{
     claim_search_relevance_bps, rank_claim_search_hits, ClaimSearch, ClaimSearchHit,
     ClaimSearchReport,
+};
+use crate::semantic::{
+    claim_semantic_relevance_bps, ClaimEmbedding, ClaimEmbeddingPage, ClaimSemanticSearch,
+    CLAIM_EMBEDDING_PAGE_MAX_CLAIMS,
 };
 use crate::tombstone::{ClaimDeleteRequest, ClaimTombstoneRequest};
 use crate::transition::{
@@ -63,7 +69,11 @@ pub const CLAIM_TRAVERSAL_MAX_EDGES: usize = 1024;
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum KnowledgeGraphCapability {
-    /// Semantic (embedding-based) claim search.
+    /// Meaning-based claim search
+    /// ([`KnowledgeGraphStore::search_semantic`]): admitted claims ranked by
+    /// how near their stored embedding is to a query's. A backend that
+    /// reports it also serves [`KnowledgeGraphStore::store_claim_embedding`]
+    /// and [`KnowledgeGraphStore::unembedded_claims`].
     SemanticSearch,
     /// Keyword claim search ([`KnowledgeGraphStore::search`]): admitted claims
     /// ranked by the words they share with a query.
@@ -867,6 +877,105 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
             })
         })
     }
+
+    /// Ranks the claims of one space that a search admits by how near their
+    /// stored embedding is to the query's.
+    ///
+    /// Optional: a backend reports
+    /// [`KnowledgeGraphCapability::SemanticSearch`] when it implements this
+    /// and the two operations below, and the default body answers
+    /// `claim-capability-unsupported`.
+    ///
+    /// The query's embedding is validated first
+    /// (`claim-embedding-invalid`). Admission precedes ranking: a candidate
+    /// is a live claim of the scope that [`ClaimSemanticSearch::admits`] and
+    /// whose stored embedding has exactly the query's reference, so a claim
+    /// the reader may not see never takes a hit slot, and a vector produced
+    /// by another model, dimension count or pipeline version is never
+    /// compared with the query. A candidate is scored with
+    /// [`claim_semantic_relevance_bps`]; one that scores zero is not a hit.
+    /// Hits are ordered by relevance descending, ties by ascending claim id,
+    /// and cut to the search's limit. Nothing else bounds how far the search
+    /// looks, and there is no relevance floor: the nearest admitted claims
+    /// are answered however far they are.
+    ///
+    /// [`ClaimSearchReport::unindexed`] is `true` when the scope holds a live
+    /// claim the search admits (or whose admission the backend cannot judge)
+    /// that has no embedding under the query's reference. A wrong scope
+    /// answers the report an empty space does.
+    ///
+    /// The store calls no model and returns no vector.
+    ///
+    /// [`claim_semantic_relevance_bps`]: crate::semantic::claim_semantic_relevance_bps
+    fn search_semantic<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        search: &'a ClaimSemanticSearch,
+    ) -> ClaimFuture<'a, ClaimSearchReport> {
+        let _ = (scope, search);
+        Box::pin(async { Err(semantic_search_unsupported()) })
+    }
+
+    /// Stores, or replaces, the one embedding of a claim.
+    ///
+    /// Optional, with [`Self::search_semantic`]. The embedding is validated
+    /// first (`claim-embedding-invalid`). Answers `true` when it was stored.
+    /// Answers `false`, and stores nothing, when the scope holds no such
+    /// claim or the claim is tombstoned: an embedding is derived from a
+    /// claim's content, and withdrawn content is given none. Absent and
+    /// out-of-scope are the same answer.
+    ///
+    /// A claim has one embedding: storing under a new reference replaces the
+    /// old one. The operation is idempotent, and it changes no byte of the
+    /// claim's authoritative record ([`Claim::embedding`] is not written). A
+    /// tombstone and a delete remove the embedding in the same operation
+    /// that withdraws the content.
+    fn store_claim_embedding<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        claim_id: &'a ClaimId,
+        embedding: &'a ClaimEmbedding,
+    ) -> ClaimFuture<'a, bool> {
+        let _ = (scope, claim_id, embedding);
+        Box::pin(async { Err(semantic_search_unsupported()) })
+    }
+
+    /// One bounded page of the claims of a space that should have an
+    /// embedding under `reference` and have none.
+    ///
+    /// Optional, with [`Self::search_semantic`]. A claim is listed when it is
+    /// live, its trust is not `Retracted` (no search ever admits a retracted
+    /// claim), its classification is one of `classifications`, and it has no
+    /// embedding under `reference`: none at all, or one from another model,
+    /// dimension count or pipeline version. The empty set lists nothing.
+    ///
+    /// The page reads at most `limit` claims (clamped to
+    /// `1..=`[`CLAIM_EMBEDDING_PAGE_MAX_CLAIMS`]) in ascending claim-id order
+    /// after the cursor. [`ClaimEmbeddingPage::next`] is the last claim read
+    /// when the page was full, and `None` at the end of the walk.
+    ///
+    /// The classifications are how a caller keeps a class of claims from
+    /// ever reaching its embedder: a claim outside the set is not answered.
+    fn unembedded_claims<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        reference: &'a MemoryEmbeddingRef,
+        classifications: &'a BTreeSet<MemoryClassification>,
+        after: Option<&'a ClaimId>,
+        limit: usize,
+    ) -> ClaimFuture<'a, ClaimEmbeddingPage> {
+        let _ = (scope, reference, classifications, after, limit);
+        Box::pin(async { Err(semantic_search_unsupported()) })
+    }
+}
+
+/// The refusal of a backend that does not serve meaning-based search.
+fn semantic_search_unsupported() -> ClaimError {
+    ClaimError::CapabilityUnsupported {
+        capability: KnowledgeGraphCapability::SemanticSearch
+            .as_label()
+            .to_string(),
+    }
 }
 
 /// What one spent operation id resolved to.
@@ -920,6 +1029,10 @@ struct Inner {
     transitions: BTreeMap<String, BTreeMap<String, Vec<ClaimTrustTransition>>>,
     /// `scope key -> operation id -> original result` — the replay ledger.
     operations: BTreeMap<String, BTreeMap<String, ClaimLedgerEntry>>,
+    /// `scope key -> claim id -> the claim's one embedding`. Kept beside the
+    /// claims, never in them, and removed by the operation that withdraws a
+    /// claim's content.
+    embeddings: BTreeMap<String, BTreeMap<String, ClaimEmbedding>>,
 }
 
 /// The in-memory reference implementation of [`KnowledgeGraphStore`].
@@ -957,6 +1070,22 @@ impl InMemoryKnowledgeGraphStore {
     pub fn is_empty(&self, scope: &KnowledgeSpaceScope) -> bool {
         self.len(scope) == 0
     }
+
+    /// Whether the store holds an embedding for one claim, under any
+    /// reference; for tests and diagnostics.
+    ///
+    /// The SPI cannot show that a withdrawn claim's vector is gone, only
+    /// that no search reaches it. This can: an embedding is derived from a
+    /// claim's content, so it must not be kept once the content is erased.
+    #[must_use]
+    pub fn has_embedding(&self, scope: &KnowledgeSpaceScope, claim_id: &ClaimId) -> bool {
+        self.inner
+            .lock()
+            .expect("the in-memory graph lock is never poisoned")
+            .embeddings
+            .get(&scope.key())
+            .is_some_and(|embeddings| embeddings.contains_key(claim_id.as_str()))
+    }
 }
 
 impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
@@ -965,7 +1094,135 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
     }
 
     fn capabilities(&self) -> KnowledgeGraphCapabilities {
-        KnowledgeGraphCapabilities::core().with_capability(KnowledgeGraphCapability::KeywordSearch)
+        KnowledgeGraphCapabilities::core()
+            .with_capability(KnowledgeGraphCapability::KeywordSearch)
+            .with_capability(KnowledgeGraphCapability::SemanticSearch)
+    }
+
+    fn search_semantic<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        search: &'a ClaimSemanticSearch,
+    ) -> ClaimFuture<'a, ClaimSearchReport> {
+        Box::pin(async move {
+            let query = search.query();
+            query.validate()?;
+            let inner = self
+                .inner
+                .lock()
+                .expect("the in-memory graph lock is never poisoned");
+            let key = scope.key();
+            let embeddings = inner.embeddings.get(&key);
+            let mut hits = Vec::new();
+            let mut unindexed = false;
+            // Admit, then score, then rank: a claim the search does not admit
+            // is dropped before its embedding is even looked up.
+            for claim in inner
+                .claims
+                .get(&key)
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .filter(|claim| search.admits(claim))
+            {
+                // Only a vector under the query's own reference is compared
+                // with it. Any other is, for this search, no embedding.
+                let Some(stored) = embeddings
+                    .and_then(|embeddings| embeddings.get(claim.claim_id.as_str()))
+                    .filter(|stored| stored.reference == query.reference)
+                else {
+                    unindexed = true;
+                    continue;
+                };
+                let relevance_bps = claim_semantic_relevance_bps(&query.vector, &stored.vector);
+                if relevance_bps > 0 {
+                    hits.push(ClaimSearchHit {
+                        claim: claim.clone(),
+                        relevance_bps,
+                    });
+                }
+            }
+            rank_claim_search_hits(&mut hits, search.limit());
+            Ok(ClaimSearchReport { hits, unindexed })
+        })
+    }
+
+    fn store_claim_embedding<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        claim_id: &'a ClaimId,
+        embedding: &'a ClaimEmbedding,
+    ) -> ClaimFuture<'a, bool> {
+        Box::pin(async move {
+            embedding.validate()?;
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("the in-memory graph lock is never poisoned");
+            let key = scope.key();
+            // Withdrawn content is given no embedding, and neither is a claim
+            // this scope does not hold.
+            let live = inner
+                .claims
+                .get(&key)
+                .and_then(|claims| claims.get(claim_id.as_str()))
+                .is_some_and(|claim| !claim.is_tombstoned());
+            if !live {
+                return Ok(false);
+            }
+            inner
+                .embeddings
+                .entry(key)
+                .or_default()
+                .insert(claim_id.as_str().to_string(), embedding.clone());
+            Ok(true)
+        })
+    }
+
+    fn unembedded_claims<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        reference: &'a MemoryEmbeddingRef,
+        classifications: &'a BTreeSet<MemoryClassification>,
+        after: Option<&'a ClaimId>,
+        limit: usize,
+    ) -> ClaimFuture<'a, ClaimEmbeddingPage> {
+        Box::pin(async move {
+            let limit = limit.clamp(1, CLAIM_EMBEDDING_PAGE_MAX_CLAIMS);
+            let inner = self
+                .inner
+                .lock()
+                .expect("the in-memory graph lock is never poisoned");
+            let key = scope.key();
+            let embeddings = inner.embeddings.get(&key);
+            let claims: Vec<Claim> = inner
+                .claims
+                .get(&key)
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .filter(|claim| after.is_none_or(|after| claim.claim_id.as_str() > after.as_str()))
+                .filter(|claim| {
+                    !claim.is_tombstoned()
+                        && claim.trust() != ClaimTrustStatus::Retracted
+                        && classifications.contains(&claim.classification)
+                })
+                .filter(|claim| {
+                    embeddings
+                        .and_then(|embeddings| embeddings.get(claim.claim_id.as_str()))
+                        .is_none_or(|stored| stored.reference != *reference)
+                })
+                .take(limit)
+                .cloned()
+                .collect();
+            let next = (claims.len() == limit)
+                .then(|| claims.last().map(|claim| claim.claim_id.clone()))
+                .flatten();
+            Ok(ClaimEmbeddingPage {
+                claims,
+                // Every record here is a decoded claim already.
+                undecodable: 0,
+                next,
+            })
+        })
     }
 
     fn search<'a>(
@@ -1461,6 +1718,10 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
             // The claim's earlier operations stop answering with its content
             // in the same step the content is withdrawn.
             inner.erase_operations(&key, &claim);
+            // So does its embedding, which was derived from that content.
+            if let Some(embeddings) = inner.embeddings.get_mut(&key) {
+                embeddings.remove(claim.claim_id.as_str());
+            }
             inner
                 .claims
                 .entry(key.clone())
@@ -1546,6 +1807,9 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
             }
             if let Some(transitions) = inner.transitions.get_mut(&key) {
                 transitions.remove(claim.claim_id.as_str());
+            }
+            if let Some(embeddings) = inner.embeddings.get_mut(&key) {
+                embeddings.remove(claim.claim_id.as_str());
             }
             inner.operations.entry(key).or_default().insert(
                 request.operation_id.as_str().to_string(),
