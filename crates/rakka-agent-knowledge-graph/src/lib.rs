@@ -100,7 +100,9 @@ pub use claim::{
     CLAIM_MAX_ACL_CAPABILITIES, CLAIM_MAX_EVIDENCE_ARTIFACTS, CLAIM_MAX_TRUST_TRANSITIONS,
     CLAIM_OBJECT_INLINE_MAX_BYTES, CURRENT_CLAIM_SCHEMA_VERSION,
 };
-pub use communal_retrieval::{KnowledgeGraphCommunalAuthority, KnowledgeGraphCommunalRetriever};
+pub use communal_retrieval::{
+    KnowledgeGraphCommunalAuthority, KnowledgeGraphCommunalRanking, KnowledgeGraphCommunalRetriever,
+};
 pub use embedding_pass::{embed_claims, ClaimEmbeddingPassPage};
 pub use error::{check_schema_window, ClaimError, ClaimFuture, ClaimRecordKind, ClaimResult};
 pub use goal_claim_source::KnowledgeGraphGoalClaimSource;
