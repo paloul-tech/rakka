@@ -272,10 +272,17 @@ entry is finished as `Cancelled` with `last_error_code` `ticket-row-missing`,
 and the pass goes on with its batch. A run that still holds the effect
 unresolved is parked on it as `Indeterminate` under the same code, behind the
 usual reconciliation checkpoint, whatever the effect's safety class. The row
-was the only record of whether an attempt started, so nothing is invoked
-again until someone decides. A run that handles a command before the claim
-arrives flushes its ready effects again, which recreates the row with no
-attempt history, and the ticket then runs as a first attempt.
+was the only record of whether an attempt started, so that effect is not
+invoked again until someone decides.
+
+The park reaches an effect only if the claim finds the row still missing,
+and a run puts a missing row back whenever it settles: every command it
+handles and every settle pass sends its ready effects to the outbox again,
+as new rows with no attempt history. A ticket whose row came back that way
+runs as a first attempt. The park is itself a command the run handles, so
+when one run lost several rows together, the ticket claimed first is parked
+and the others run again. A winding-down run that is pumped is fenced before
+anything is claimed, and the fence cancels a ready effect that has no row.
 
 **What is not bounded.** The record is still one record, written whole. A
 prune bounds it to the live entries plus the finished ones inside the

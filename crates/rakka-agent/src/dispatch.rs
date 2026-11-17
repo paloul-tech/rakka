@@ -2816,6 +2816,14 @@ where
     /// effect at this generation, or when it is no longer waiting on it:
     /// the entry is settled and that is all.
     ///
+    /// **Telling the run makes it flush.** The park is a command the run
+    /// handles, and a run that handles one sends its other ready effects to
+    /// the outbox again. Where their rows were lost with this one, they come
+    /// back as new rows with no attempt history, and the claims on them find
+    /// a row and run it as a first attempt. Of a run's several lost rows
+    /// this path parks the one claimed first; nothing durable tells a row
+    /// the run recreated from the one that was lost.
+    ///
     /// **The run is told first and the entry is settled second**, the
     /// park's own order and the reverse of
     /// [`Self::conclude_on_finished_row`]'s. A crash between the two leaves
@@ -2877,9 +2885,11 @@ where
     /// Finishes the fleet entry of a claim whose outbox row is gone, and
     /// writes nothing to the outbox.
     ///
-    /// `claim-fenced` is an expected answer and not a failure of the pass:
-    /// the claim lapsed and another worker took the ticket over, and that
-    /// worker settles the entry. Nothing is counted for it.
+    /// `claim-fenced` is an expected answer and not a failure of the pass.
+    /// The claim is no longer current: its lease lapsed, with or without
+    /// another worker taking the ticket over, or the entry was already
+    /// finished and pruned. Whoever claims the entry next settles it.
+    /// Nothing is counted for it.
     async fn settle_orphan_claim(
         &mut self,
         claim: &AgentDispatchClaim,

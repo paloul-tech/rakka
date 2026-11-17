@@ -229,18 +229,8 @@ async fn with_the_run_gone_too_the_entry_is_settled_and_nobody_is_told() {
     assert_settled_as_missing(fleet_entry(&fx, &effect).await);
 }
 
-/// A run that is winding down gets the answer a live one gets. The claim
-/// path cannot tell a ticket that never started from one whose row took the
-/// record of its attempt with it, so it does not say `Cancelled` here either.
-#[tokio::test]
-async fn a_cancelling_run_is_parked_like_a_live_one() {
-    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
-    let (fx, effect) = ready_tool_ticket(&spec, None).await;
-    let mut pipeline = fx.pipeline();
-    pipeline
-        .register_run(&run_scope())
-        .await
-        .expect("the registration runs");
+/// An operator cancels the run, which stays `Cancelling` on its ready effect.
+async fn cancel_the_run(fx: &AuthorityFixture) {
     let mut run = fx.fx.run();
     run.recover(fx.fx.now()).await.expect("the run recovers");
     run.apply(
@@ -261,6 +251,25 @@ async fn a_cancelling_run_is_parked_like_a_live_one() {
         fx.fx.run_snapshot().await.expect("the run exists").status,
         AgentRunStatus::Cancelling
     );
+}
+
+/// A run that is winding down gets the answer a live one gets, when the
+/// claim is what reaches it first. The claim path cannot tell a ticket that
+/// never started from one whose row took the record of its attempt with it,
+/// so it does not say `Cancelled` here either.
+///
+/// The claim reaches it first only on the per-worker half of a pass, as
+/// here. The next test is the other half.
+#[tokio::test]
+async fn a_cancelling_run_is_parked_like_a_live_one() {
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let (fx, effect) = ready_tool_ticket(&spec, None).await;
+    let mut pipeline = fx.pipeline();
+    pipeline
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    cancel_the_run(&fx).await;
     delete_workflow_record(&fx).await;
 
     let pass = pipeline
@@ -279,6 +288,103 @@ async fn a_cancelling_run_is_parked_like_a_live_one() {
         fx.fx.run_snapshot().await.expect("the run exists").status,
         AgentRunStatus::WaitingForReconciliation,
         "the unknown outcome keeps the run from ending until it is decided"
+    );
+}
+
+/// The same run, pumped: the per-run half of a pass fences a winding-down
+/// run before anything is claimed, and the fence answers first.
+///
+/// Pinned as it stands. The wind-down fence reads a ready effect with no
+/// outbox row as one whose flush never landed: it plants a cancelled
+/// tombstone and tells the run `Cancelled`. It does that for a row that was
+/// lost as well, whatever the row knew, and the run ends. The claim then
+/// finds the tombstone and an intent already resolved. This change does not
+/// touch the fence; when the fence learns to tell a lost row from a flush
+/// that never landed, this test changes with it.
+#[tokio::test]
+async fn a_cancelling_run_that_is_pumped_is_fenced_before_the_claim() {
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let (fx, effect) = ready_tool_ticket(&spec, None).await;
+    let mut pipeline = fx.pipeline();
+    pipeline
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    cancel_the_run(&fx).await;
+    delete_workflow_record(&fx).await;
+
+    let pass = pipeline
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(pass.parked_indeterminate, 0);
+    assert_eq!(pass.invoked, 0);
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::Cancelled,
+        "the fence told the run the effect was cancelled, and the run ended"
+    );
+    let entry = fleet_entry(&fx, &effect).await.expect("the entry is kept");
+    assert_eq!(entry.status, AgentDispatchStatus::Cancelled);
+    assert_eq!(
+        entry.last_error_code.as_deref(),
+        Some("intent-already-resolved"),
+        "the claim found the fence's tombstone, not a missing row"
+    );
+}
+
+/// A run that has ended, with the orphan still registered: what a retention
+/// that purges an ended run's workflow record leaves when a worker died
+/// between telling the run and settling its ticket. The run waits on
+/// nothing, so nobody is told and the entry is finished.
+#[tokio::test]
+async fn a_run_that_already_ended_is_told_nothing() {
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let (fx, effect) = ready_tool_ticket(&spec, None).await;
+    let mut pipeline = fx.pipeline();
+    pipeline
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    let mut run = fx.fx.run();
+    run.recover(fx.fx.now()).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect
+                .result_operation_id(&run_scope())
+                .expect("the operation id derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: 1,
+            fence: 1,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::failed(
+                "tool-refused",
+                "the tool refused the call",
+            )),
+        },
+        &fx.fx.router,
+        fx.fx.now(),
+    )
+    .await
+    .expect("the result applies");
+    let ended = fx.fx.run_snapshot().await.expect("the run exists").status;
+    assert!(ended.is_terminal(), "the run ended: {ended:?}");
+    delete_workflow_record(&fx).await;
+
+    let pass = pipeline
+        .claim_and_execute()
+        .await
+        .expect("an orphan does not fail the pass");
+
+    assert_eq!(counts(&pass), (1, 1, 0, 0));
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    assert_settled_as_missing(fleet_entry(&fx, &effect).await);
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        ended,
+        "the ended run was not moved"
     );
 }
 
@@ -540,6 +646,45 @@ async fn a_healthy_ticket_behind_the_orphan_runs_in_the_same_pass() {
     assert_settled_as_missing(fleet_entry(&fx, &orphan).await);
     assert_eq!(
         fleet_entry(&fx, &healthy).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Completed)
+    );
+}
+
+/// Two orphans of one run, pinned as it stands: one is parked, and its park
+/// puts the other's row back.
+///
+/// The park is a command the run handles, and a run that handles a command
+/// flushes its ready effects to the outbox again. The second ticket's row
+/// comes back as a new row with no attempt history, the claim this pass
+/// already holds on it finds a row, and the tool is invoked as a first
+/// attempt. So of a run's several lost rows, the one claimed first waits for
+/// a decision and the others run again. Nothing durable tells a row the run
+/// recreated from the one that was lost; when something does, this test
+/// changes with it.
+#[tokio::test]
+async fn of_two_orphans_of_one_run_the_park_of_the_first_flushes_the_second_back() {
+    let (fx, first, second) = two_registered_tool_tickets(|_fx| None).await;
+    delete_workflow_record(&fx).await;
+
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("an orphan does not fail the pass");
+
+    assert_eq!(counts(&pass), (2, 1, 1, 2));
+    assert_settled_as_missing(fleet_entry(&fx, &first).await);
+    assert_eq!(
+        fx.effect_status(first.slot).await,
+        Some(AgentRunEffectStatus::Indeterminate)
+    );
+    assert_eq!(
+        (pass.invoked, fx.tools.invocation_count(TOOL)),
+        (1, 1),
+        "the second ticket ran as a first attempt on the row the run put back"
+    );
+    assert_eq!(
+        fleet_entry(&fx, &second).await.map(|entry| entry.status),
         Some(AgentDispatchStatus::Completed)
     );
 }

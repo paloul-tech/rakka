@@ -197,16 +197,33 @@ left a choice.
 - **The attempt count** is read from the fleet entry through
   `AgentDispatcherFleet::state()`, which was already public: no new method.
   The park reports the larger of it and the run's own. This call had no
-  guard in section 6, so an eighth test holds it.
+  guard in section 6, so a test was added for it.
 - **The two-claim batch** is one run whose model turn asks for two tool
   calls. One ticket's row is removed by round-tripping the stored
   `WorkflowState` through JSON, which leaves the other row in place.
-- **"A run that has already ended"** (the plan's third review-focus line) is
-  not a state a test can build. A run does not reach a terminal status with
-  a ticket still claimable unless the wind-down fence settles that ticket
-  first. What is held instead is a run that is cancelling: it is parked like
-  a live one and rests at `WaitingForReconciliation`, which is what a
-  cancelling run does on any indeterminate effect.
+- **A run that has already ended** is told nothing and its entry is
+  settled. The test builds it by handing the run a failed outcome directly
+  and then deleting the record: what a worker that died between telling the
+  run and settling its ticket leaves. The first build wrongly held that this
+  state could not be built; the review built it.
+- **A winding-down run does not always get the same answer** (section 5,
+  call 3, said "whichever reaches the run first"). Through `claim_and_execute`
+  alone the claim is first: a cancelling run is parked like a live one and
+  rests at `WaitingForReconciliation`. Through `pump_run` or `register_run`
+  the wind-down fence always runs first, reads the row-less effect as one
+  whose flush never landed, and tells the run `Cancelled`; the run ends. Both
+  are pinned by tests. The fence is unchanged by this work, and its answer
+  for a lost row is the one anti-goal 1 names. It is left for the owner.
+- **The park re-arms the run's other lost rows.** The park is a command the
+  run handles, so the run flushes its other ready effects again and their
+  rows come back with no attempt history. Of several effects of one run
+  whose rows were lost together, the one claimed first is parked and the
+  others run as first attempts, in the same pass when the same batch holds
+  their claims. Before this work all of them ran, on the run's next settle,
+  so the change parks one where none was parked; it does not hold anti-goal
+  2 for the rest. Closing it needs a durable way to tell a recreated row
+  from the lost one, which is design work of its own. It is pinned by a test
+  and left for the owner.
 - **The non-goal in section 2 is real and close by.** A result that a live
   run accepts makes it flush its ready effects again in the same pass, which
   recreates a missing row before the next claim of the batch reaches it. The
@@ -222,9 +239,9 @@ left a choice.
 
 | Mutation | Fails |
 |---|---|
-| The arm calls `settle_ticket_cancelled` again | all eight, the first with the issue's `outbox-entry-not-found` |
+| The arm calls `settle_ticket_cancelled` again | every test that claims a missing row, the first with the issue's `outbox-entry-not-found` |
 | `claim-fenced` returned instead of taken as the claim's end | the late-worker test |
 | The entry settled before the run is told | the unwritable-run test and the refused-fleet-write test |
-| The outstanding check removed | the refused-fleet-write test and the late-worker test |
-| The park skipped | five, the first test at the effect's status |
+| The outstanding check removed | the refused-fleet-write test, the late-worker test and the ended-run test |
+| The park skipped | seven of the eleven, the first test at the effect's status |
 | The fleet entry's attempt count ignored | the attempt-count test |
