@@ -18,7 +18,10 @@ use rakka_agent_knowledge_graph::{
     KnowledgeGraphStore, KnowledgeSpaceScope,
 };
 
-use support::{append_stated, embedder, meaning_of, retract, unclassified, CoreOnlyStore};
+use support::{
+    append_stated, embedder, meaning_of, retract, unclassified, CoreOnlyStore,
+    MisbehavingSemanticStore,
+};
 
 /// Walks the pass to its end, `limit` claims at a time, summing its pages.
 async fn walk(
@@ -294,4 +297,90 @@ async fn a_store_without_the_capability_ends_the_pass_with_its_refusal() {
         embedder.calls().is_empty(),
         "no claim was sent to the model"
     );
+}
+
+/// What a store lists is a nomination. A backend whose listing has drifted
+/// from its records, or one written elsewhere that ignores the set it was
+/// given, must not get a claim's text sent to a model: the pass checks each
+/// record itself, last, before the text leaves.
+#[tokio::test]
+async fn the_pass_checks_the_record_whatever_the_store_listed() {
+    use rakka_agent_knowledge_graph::conformance::conformance_resolver;
+    use rakka_agent_knowledge_graph::{
+        ClaimOperationId, ClaimTombstoneReason, ClaimTombstoneRequest,
+    };
+    use rakka_agent_workflow::AgentTimestampMillis;
+
+    let store = MisbehavingSemanticStore::default();
+    let scopes = ConformanceScopes::unique("pass-drifted-listing");
+    let scope = &scopes.primary;
+    let embedder = embedder();
+    let plain = append_stated(
+        &store,
+        scope,
+        "plain",
+        "the car is here",
+        MemoryClassification::Unclassified,
+    )
+    .await;
+    for (discriminator, classification) in [
+        ("sensitive", MemoryClassification::Sensitive),
+        ("redacted", MemoryClassification::Redacted),
+    ] {
+        append_stated(
+            &store,
+            scope,
+            discriminator,
+            "a withheld car",
+            classification,
+        )
+        .await;
+    }
+    let retracted = append_stated(
+        &store,
+        scope,
+        "retracted",
+        "a retracted car",
+        MemoryClassification::Unclassified,
+    )
+    .await;
+    retract(&store, scope, &retracted).await;
+    let withdrawn = append_stated(
+        &store,
+        scope,
+        "withdrawn",
+        "a withdrawn car",
+        MemoryClassification::Unclassified,
+    )
+    .await;
+    store
+        .tombstone(
+            scope,
+            &ClaimTombstoneRequest {
+                claim_id: withdrawn.claim_id.clone(),
+                operation_id: ClaimOperationId::derive_tombstone(scope, &withdrawn.claim_id, "t")
+                    .expect("the operation id derives"),
+                reason: ClaimTombstoneReason::Withdrawn,
+                actor: conformance_resolver(),
+                tombstoned_at: AgentTimestampMillis::new(20),
+            },
+        )
+        .await
+        .expect("the tombstone applies");
+
+    // The store lists all five. The caller even names `Redacted`.
+    let allowed = BTreeSet::from([
+        MemoryClassification::Unclassified,
+        MemoryClassification::Redacted,
+    ]);
+    let page = embed_claims(&store, &embedder, &allowed, scope, None, 64)
+        .await
+        .expect("the pass answers");
+    assert_eq!((page.embedded, page.failed), (1, 0));
+    assert_eq!(
+        embedder.calls(),
+        vec!["fleetnote reports the car is here".to_string()],
+        "only the claim its record allows reached the model"
+    );
+    assert!(store.inner.has_embedding(scope, &plain.claim_id));
 }

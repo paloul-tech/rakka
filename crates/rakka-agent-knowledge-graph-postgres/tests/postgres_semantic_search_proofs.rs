@@ -927,6 +927,60 @@ async fn postgres_an_unindexed_claim_is_not_ranked_and_flags_the_search_when_dsn
             .len(),
         1
     );
+
+    // A row with no filter columns can still be judged on its trust, which
+    // is a column every row has. A retracted one does not make a search that
+    // admits no retracted claim incomplete; it would hold the flag up for
+    // good, since a retracted claim is never embedded.
+    let scope = &scopes.foreign;
+    let retracted = append(&store, scope, "unindexed-retracted", "the car is here").await;
+    store
+        .transition(
+            scope,
+            &ClaimTrustTransitionRequest::new(
+                retracted.claim_id.clone(),
+                ClaimOperationId::derive_transition(scope, &retracted.claim_id, "retract")
+                    .expect("the operation id derives"),
+                ClaimTrustStatus::Retracted,
+                conformance_resolver(),
+                NOW,
+            ),
+            &ClaimPromotionPolicy::ungated(),
+            NOW,
+        )
+        .await
+        .expect("the retraction applies");
+    doctor(
+        &raw,
+        scope,
+        &retracted.claim_id,
+        "search_tokens = NULL, search_classification = NULL, search_confidence_bps = NULL, \
+         search_read_capabilities = NULL",
+    )
+    .await
+    .expect("the raw update applies");
+    assert!(
+        !store
+            .search_semantic(scope, &search)
+            .await
+            .expect("the search answers")
+            .unindexed,
+        "a retracted row with no filter columns is not a claim this search could have found"
+    );
+    let admitting_retracted = ClaimSemanticSearch::new(
+        ClaimSearch::new("", 64)
+            .with_trust(BTreeSet::from([ClaimTrustStatus::Retracted]))
+            .with_classifications(unclassified()),
+        embedding([1.0, 0.0, 0.0]),
+    );
+    assert!(
+        store
+            .search_semantic(scope, &admitting_retracted)
+            .await
+            .expect("the search answers")
+            .unindexed,
+        "a search that names the row's trust state cannot judge the rest of it"
+    );
     schema.drop().await;
 }
 

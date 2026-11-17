@@ -977,3 +977,46 @@ async fn the_semantic_retriever_maps_the_query_onto_a_search() {
     assert_eq!(search.query().reference, embedder.embedding_ref());
     assert_eq!(search.query().vector, vec![1.0, 0.0, 0.0]);
 }
+
+/// The retriever is shared by every run on a node, so the turns of two runs
+/// interleave: each searches its granted spaces in turn, with its own query.
+/// Each query is still embedded once.
+#[tokio::test]
+async fn interleaved_turns_each_embed_their_query_once() {
+    let store = Arc::new(InMemoryKnowledgeGraphStore::new());
+    let embedder = embedder();
+    let retriever = by_meaning(store, &embedder);
+    for space_id in ["s1", "s2", "s3"] {
+        for text in ["automobile", "ship"] {
+            retriever
+                .retrieve(&tenant(), &space(space_id), &query(text), NOW)
+                .await
+                .expect("the search answers");
+        }
+    }
+    assert_eq!(
+        embedder.calls(),
+        vec!["automobile".to_string(), "ship".to_string()],
+        "two turns over three spaces send two texts to the model, not six"
+    );
+
+    // The memo is bounded: a query pushed out by enough later ones is
+    // embedded again, and nothing else is.
+    for index in 0..rakka_agent_knowledge_graph::COMMUNAL_QUERY_MEMO_MAX_ENTRIES {
+        retriever
+            .retrieve(
+                &tenant(),
+                &space("s1"),
+                &query(&format!("filler {index}")),
+                NOW,
+            )
+            .await
+            .expect("the search answers");
+    }
+    let before = embedder.calls().len();
+    retriever
+        .retrieve(&tenant(), &space("s1"), &query("automobile"), NOW)
+        .await
+        .expect("the search answers");
+    assert_eq!(embedder.calls().len(), before + 1);
+}

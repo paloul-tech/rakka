@@ -516,6 +516,126 @@ pub async fn semantic_search(store: &dyn KnowledgeGraphStore, scopes: Conformanc
         "an unembedded claim the search admits does"
     );
 
+    // The same for each of the other three filters, and for a retracted
+    // claim. An unembedded claim one filter excludes must not make the answer
+    // incomplete: for a claim the reader may not read, the flag would say
+    // that the claim exists, and a retracted claim is never embedded, so it
+    // would hold the flag up for good. A search that does admit the claim is
+    // incomplete until the claim is embedded.
+    let scope = &space(&scopes, "sem-unindexed-trust");
+    append_embedded(store, scope, "trust-embedded", QUERY).await;
+    let disputed = append(store, scope, Stated::new("trust-unembedded")).await;
+    store
+        .transition(
+            scope,
+            &transition_request(
+                scope,
+                &disputed.claim_id,
+                "dispute",
+                ClaimTrustStatus::Disputed,
+            ),
+            &ClaimPromotionPolicy::ungated(),
+            AgentTimestampMillis::new(10),
+        )
+        .await
+        .expect("the dispute applies");
+    assert!(
+        !run(store, scope, &toward_query(filters(64)))
+            .await
+            .unindexed,
+        "an unembedded claim of a trust state the search does not admit"
+    );
+    assert!(
+        run(
+            store,
+            scope,
+            &toward_query(filters(64).with_trust(BTreeSet::from([
+                ClaimTrustStatus::Proposed,
+                ClaimTrustStatus::Disputed,
+            ])))
+        )
+        .await
+        .unindexed
+    );
+
+    let scope = &space(&scopes, "sem-unindexed-retracted");
+    append_embedded(store, scope, "retracted-embedded", QUERY).await;
+    let retracted = append(store, scope, Stated::new("retracted-unembedded")).await;
+    store
+        .transition(
+            scope,
+            &transition_request(
+                scope,
+                &retracted.claim_id,
+                "retract",
+                ClaimTrustStatus::Retracted,
+            ),
+            &ClaimPromotionPolicy::ungated(),
+            AgentTimestampMillis::new(10),
+        )
+        .await
+        .expect("the retraction applies");
+    assert!(
+        !run(store, scope, &toward_query(filters(64)))
+            .await
+            .unindexed,
+        "a retracted claim is never embedded and never makes a search incomplete"
+    );
+
+    let scope = &space(&scopes, "sem-unindexed-confidence");
+    append_embedded(store, scope, "confidence-embedded", QUERY).await;
+    append(
+        store,
+        scope,
+        Stated {
+            confidence_bps: 1_000,
+            ..Stated::new("confidence-unembedded")
+        },
+    )
+    .await;
+    assert!(
+        !run(
+            store,
+            scope,
+            &toward_query(filters(64).with_min_confidence_bps(4_000))
+        )
+        .await
+        .unindexed,
+        "an unembedded claim below the search's confidence floor"
+    );
+    assert!(
+        run(store, scope, &toward_query(filters(64)))
+            .await
+            .unindexed
+    );
+
+    let scope = &space(&scopes, "sem-unindexed-capability");
+    append_embedded(store, scope, "capability-embedded", QUERY).await;
+    append(
+        store,
+        scope,
+        Stated {
+            required: &["cap-guarded"],
+            ..Stated::new("capability-unembedded")
+        },
+    )
+    .await;
+    assert!(
+        !run(store, scope, &toward_query(filters(64)))
+            .await
+            .unindexed,
+        "an unembedded claim the reader may not read must not show through the flag"
+    );
+    assert!(
+        run(
+            store,
+            scope,
+            &toward_query(filters(64).with_reader(BTreeSet::from([capability("cap-guarded")])))
+        )
+        .await
+        .unindexed
+    );
+
     // --- Storing an embedding. ---------------------------------------------
     let scope = &space(&scopes, "sem-storing");
     let stored = append(store, scope, Stated::new("stored")).await;

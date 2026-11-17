@@ -34,11 +34,14 @@
 //! No index is shipped. The statement reads every claim of one tenant and
 //! space that passes the filters, so its cost is linear in those, and every
 //! restriction is applied before the ordering
-//! ([specification 16](../../../docs/plans/rakka-agent/spec.md)). An
-//! approximate index picks its candidates before a filter runs, so a
-//! selective filter would silently lose results behind one; a deployment
-//! that needs one adds it as its own DDL, for one model's dimension count,
-//! and accepts that trade.
+//! ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+//!
+//! **Nor can the statement use an approximate index a deployment adds.** The
+//! vector column has no fixed dimension, pgvector indexes only a
+//! fixed-dimension expression, and the statement orders by the bare column,
+//! so the planner would not choose such an index. An approximate index also
+//! picks its candidates before a filter runs, so a selective filter would
+//! silently lose results behind one. Ranking through one is not available.
 //!
 //! # The record still decides
 //!

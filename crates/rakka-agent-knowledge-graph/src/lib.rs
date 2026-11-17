@@ -111,7 +111,8 @@ pub use claim::{
     CLAIM_OBJECT_INLINE_MAX_BYTES, CURRENT_CLAIM_SCHEMA_VERSION,
 };
 pub use communal_retrieval::{
-    KnowledgeGraphCommunalAuthority, KnowledgeGraphCommunalRanking, KnowledgeGraphCommunalRetriever,
+    KnowledgeGraphCommunalAuthority, KnowledgeGraphCommunalRanking,
+    KnowledgeGraphCommunalRetriever, COMMUNAL_QUERY_MEMO_MAX_ENTRIES,
 };
 pub use embedding_pass::{embed_claims, ClaimEmbeddingPassPage};
 pub use error::{check_schema_window, ClaimError, ClaimFuture, ClaimRecordKind, ClaimResult};

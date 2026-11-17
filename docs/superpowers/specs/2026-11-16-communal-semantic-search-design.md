@@ -266,3 +266,13 @@ Where the build moved from the sections above. Each is a decision made while bui
 - **Proof 17 to 22 use a store built without the flag as the earlier binary.** That is exact because no existing statement of the crate changed.
 - **Proof 23 grants the writer its space.** The dispatcher refuses an append into a space its agent was never given (`widened-knowledge-access`). Being granted, the writer's own turn searches the space, so the embedder also receives the writer's query; the test asserts both texts. The reader asks "automobile whereabouts", which shares no word with the claim, so the word-ranked control selects nothing.
 - **The PostgreSQL found-by-meaning proof embeds through the pass**, not the append executor, whose only store call is `store_claim_embedding`.
+
+### After the whole-branch review
+
+A fresh reviewer read the branch and attacked each anti-goal on a live pgvector database. It found no Critical issue and three Important ones; all were fixed, each with a test that fails without the fix.
+
+- **A replayed append no longer embeds a claim retracted since (6.4, 6.5).** The executor decided what to embed on the claim the store's `append` answered, and a replay answers the claim as first stored, which is `Proposed` whatever happened since. A retry that straddled a retraction sent the retracted claim's text to the embedder. The executor now reads the claim again after the append and decides on that record. A read that fails embeds nothing. The cost is one `get` per append when an embedder is wired.
+- **The query memo holds the last 16 query texts, not one (6.4, 10).** The retriever is shared by every run on a node, so with one slot two interleaved turns over three spaces made six model calls. `COMMUNAL_QUERY_MEMO_MAX_ENTRIES` is the bound. A vector is only ever answered for the exact text it was embedded from.
+- **Every filter of the `unindexed` probe is now held by a test (6.2).** The conformance clause varied classification only; with the trust, confidence or read-capability term removed from the PostgreSQL probe the whole suite passed. An unembedded claim excluded by each filter, and a retracted one, must not flag a search incomplete: for a claim the reader may not read the flag would reveal that it exists.
+- **Two anti-goals gained their only direct pin.** A store whose embedding write errors does not fail the append, and the pass checks each record itself whatever a store listed (a store double that lists every claim).
+- **The PostgreSQL module's documentation said a deployment could add an approximate index.** It now says what the product document says: the statement cannot use one.

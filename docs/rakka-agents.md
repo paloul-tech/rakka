@@ -598,7 +598,8 @@ incorrectly.
     - **How a claim gets its embedding.** An append executor given an
       embedder (`KnowledgeGraphClaimAppendExecutor::with_embedder`) embeds
       each claim it appends, best effort: a failed embedding never fails the
-      append. `embed_claims` is the pass that embeds whatever is left: claims
+      append. It embeds the claim as the store holds it after the append, so
+      a retry of an append whose claim was retracted meanwhile sends nothing. `embed_claims` is the pass that embeds whatever is left: claims
       from before the deployment opted in, claims whose embedding failed at
       append, and, after a change of model or pipeline version, every claim.
       **No loop in Rakka calls the pass.** A deployment calls it for each
@@ -621,7 +622,9 @@ incorrectly.
       scale: 10000 for the same direction, 5000 for unrelated, and a claim
       that scores 0 is not ranked. There is no relevance floor: the nearest
       admitted claims are answered however far they are. A query with no
-      text ranks nothing and calls no model. A query that cannot be embedded
+      text ranks nothing and calls no model. A retriever remembers the
+      vectors of its last 16 query texts, so a turn that searches several
+      spaces embeds its query once. A query that cannot be embedded
       fails that space's search, which is counted `degraded`; the retriever
       never falls back to words. The embedding model is not recorded in the
       snapshot, only the retriever's version. No metric counts embeddings

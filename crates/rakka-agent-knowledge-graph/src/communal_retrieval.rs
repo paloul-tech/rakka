@@ -38,6 +38,7 @@
 //! live here and are exhaustive, so a trust status added to
 //! [`ClaimTrustStatus`] fails to compile until it is mapped.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use rakka_agent::{
@@ -123,41 +124,59 @@ pub enum KnowledgeGraphCommunalRanking {
     Semantic,
 }
 
-/// One remembered query: its text and the vector it embedded to.
-type RememberedQuery = Option<(String, Vec<f32>)>;
+/// The most query texts a meaning-based retriever remembers the vectors of.
+///
+/// A retriever is shared by every run on a node, and context assembly calls
+/// it once per granted space with one turn's query. Remembering the last few
+/// queries is what lets each turn embed its query once while the turns of
+/// several runs interleave. A turn whose query was pushed out by this many
+/// later ones embeds it again, which costs a model call and nothing else.
+pub const COMMUNAL_QUERY_MEMO_MAX_ENTRIES: usize = 16;
+
+/// The remembered queries, oldest first: each text with the vector it
+/// embedded to.
+type RememberedQueries = VecDeque<(String, Vec<f32>)>;
 
 /// The embedder a meaning-based retriever embeds its queries with, and the
 /// last query it embedded.
 #[derive(Clone)]
 struct QueryEmbedding {
     embedder: Arc<dyn AgentMemoryEmbedder>,
-    /// The last query text embedded, with its vector. Context assembly calls
-    /// `retrieve` once per granted space with the same query, so one turn
-    /// embeds its query once. Shared across clones of the retriever.
-    last: Arc<Mutex<RememberedQuery>>,
+    /// The last [`COMMUNAL_QUERY_MEMO_MAX_ENTRIES`] query texts embedded,
+    /// each with its vector, keyed by the exact text. Shared across clones
+    /// of the retriever. A vector is only ever answered for the text it was
+    /// embedded from, so sharing it across runs and tenants reveals nothing:
+    /// the caller already holds the text.
+    last: Arc<Mutex<RememberedQueries>>,
 }
 
 impl QueryEmbedding {
-    /// The vector of `text`, embedded now unless it was the last text asked.
+    /// The vector of `text`, embedded now unless it is one of the texts
+    /// remembered.
     async fn vector_of(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
         let remembered = self
             .last
             .lock()
             .expect("the query memo lock is never poisoned")
-            .as_ref()
-            .filter(|(remembered, _)| remembered == text)
+            .iter()
+            .find(|(remembered, _)| remembered == text)
             .map(|(_, vector)| vector.clone());
         if let Some(vector) = remembered {
             return Ok(vector);
         }
-        // The lock is not held across the model call. Two turns embedding at
-        // once each call the model, and the later one is remembered.
+        // The lock is not held across the model call. Two turns embedding
+        // the same text at once each call the model, and one is remembered.
         let vector = embed_memory_vector(self.embedder.as_ref(), text).await?;
-        *self
+        let mut last = self
             .last
             .lock()
-            .expect("the query memo lock is never poisoned") =
-            Some((text.to_string(), vector.clone()));
+            .expect("the query memo lock is never poisoned");
+        if !last.iter().any(|(remembered, _)| remembered == text) {
+            if last.len() >= COMMUNAL_QUERY_MEMO_MAX_ENTRIES {
+                last.pop_front();
+            }
+            last.push_back((text.to_string(), vector.clone()));
+        }
         Ok(vector)
     }
 }
@@ -232,7 +251,7 @@ impl KnowledgeGraphCommunalRetriever {
             .supports(KnowledgeGraphCapability::SemanticSearch)
             .then(|| QueryEmbedding {
                 embedder,
-                last: Arc::new(Mutex::new(None)),
+                last: Arc::new(Mutex::new(VecDeque::new())),
             });
         self
     }

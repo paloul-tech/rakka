@@ -6,17 +6,18 @@
 
 use std::collections::BTreeSet;
 
-use rakka_agent::{AgentId, AgentTaskContent, MemoryClassification};
+use rakka_agent::{AgentId, AgentTaskContent, MemoryClassification, MemoryEmbeddingRef};
 use rakka_agent_knowledge_graph::conformance::{conformance_resolver, ConceptEmbedder};
 use rakka_agent_knowledge_graph::store::{
     ClaimCursor, ClaimFilter, ClaimPage, ClaimTransitionCursor, ClaimTransitionPage,
     ClaimTraversal, ClaimTraversalReport, KnowledgeGraphCapabilities,
 };
 use rakka_agent_knowledge_graph::{
-    Claim, ClaimDeleteRequest, ClaimEmbedding, ClaimFuture, ClaimId, ClaimNodeId, ClaimObject,
-    ClaimOperationId, ClaimPredicate, ClaimPromotionPolicy, ClaimProvenance, ClaimSearch,
-    ClaimSemanticSearch, ClaimTombstoneRequest, ClaimTransitionOutcome, ClaimTrustStatus,
-    ClaimTrustTransitionRequest, InMemoryKnowledgeGraphStore, KnowledgeGraphStore,
+    Claim, ClaimDeleteRequest, ClaimEmbedding, ClaimEmbeddingPage, ClaimError, ClaimFuture,
+    ClaimId, ClaimNodeId, ClaimObject, ClaimOperationId, ClaimPredicate, ClaimPromotionPolicy,
+    ClaimProvenance, ClaimSearch, ClaimSearchReport, ClaimSemanticSearch, ClaimTombstoneRequest,
+    ClaimTransitionOutcome, ClaimTrustStatus, ClaimTrustTransitionRequest,
+    InMemoryKnowledgeGraphStore, KnowledgeGraphCapability, KnowledgeGraphStore,
     KnowledgeSpaceScope,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
@@ -104,6 +105,148 @@ impl KnowledgeGraphStore for CoreOnlyStore {
         request: &'a ClaimDeleteRequest,
     ) -> ClaimFuture<'a, ()> {
         self.inner.delete(scope, request)
+    }
+}
+
+/// A store that serves meaning-based search badly, the way a backend with a
+/// drifted index or a failing database would: its page of claims owed an
+/// embedding lists **every** claim of the space, whatever its classification
+/// or trust, and it can be told to fail every embedding write.
+///
+/// It exists to hold the callers to their own checks. What a store lists is
+/// a nomination; the record decides what may be sent to a model.
+#[derive(Default)]
+pub struct MisbehavingSemanticStore {
+    pub inner: InMemoryKnowledgeGraphStore,
+    pub fail_embedding_writes: bool,
+}
+
+impl KnowledgeGraphStore for MisbehavingSemanticStore {
+    fn backend_name(&self) -> &'static str {
+        "in-memory-misbehaving"
+    }
+
+    fn capabilities(&self) -> KnowledgeGraphCapabilities {
+        KnowledgeGraphCapabilities::core().with_capability(KnowledgeGraphCapability::SemanticSearch)
+    }
+
+    fn append<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        claim: &'a Claim,
+    ) -> ClaimFuture<'a, Claim> {
+        self.inner.append(scope, claim)
+    }
+
+    fn get<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        claim_id: &'a ClaimId,
+    ) -> ClaimFuture<'a, Option<Claim>> {
+        self.inner.get(scope, claim_id)
+    }
+
+    fn query<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        filter: &'a ClaimFilter,
+        cursor: ClaimCursor,
+    ) -> ClaimFuture<'a, ClaimPage> {
+        self.inner.query(scope, filter, cursor)
+    }
+
+    fn traverse<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        traversal: &'a ClaimTraversal,
+    ) -> ClaimFuture<'a, ClaimTraversalReport> {
+        self.inner.traverse(scope, traversal)
+    }
+
+    fn transition<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimTrustTransitionRequest,
+        policy: &'a ClaimPromotionPolicy,
+        now: AgentTimestampMillis,
+    ) -> ClaimFuture<'a, ClaimTransitionOutcome> {
+        self.inner.transition(scope, request, policy, now)
+    }
+
+    fn transitions<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        claim_id: &'a ClaimId,
+        cursor: ClaimTransitionCursor,
+    ) -> ClaimFuture<'a, ClaimTransitionPage> {
+        self.inner.transitions(scope, claim_id, cursor)
+    }
+
+    fn tombstone<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimTombstoneRequest,
+    ) -> ClaimFuture<'a, Claim> {
+        self.inner.tombstone(scope, request)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimDeleteRequest,
+    ) -> ClaimFuture<'a, ()> {
+        self.inner.delete(scope, request)
+    }
+
+    fn search_semantic<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        search: &'a ClaimSemanticSearch,
+    ) -> ClaimFuture<'a, ClaimSearchReport> {
+        self.inner.search_semantic(scope, search)
+    }
+
+    fn store_claim_embedding<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        claim_id: &'a ClaimId,
+        embedding: &'a ClaimEmbedding,
+    ) -> ClaimFuture<'a, bool> {
+        if self.fail_embedding_writes {
+            return Box::pin(async {
+                Err(ClaimError::Backend {
+                    backend: "in-memory-misbehaving".to_string(),
+                    message: "the embedding columns do not exist".to_string(),
+                })
+            });
+        }
+        self.inner.store_claim_embedding(scope, claim_id, embedding)
+    }
+
+    fn unembedded_claims<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        _reference: &'a MemoryEmbeddingRef,
+        _classifications: &'a BTreeSet<MemoryClassification>,
+        _after: Option<&'a ClaimId>,
+        _limit: usize,
+    ) -> ClaimFuture<'a, ClaimEmbeddingPage> {
+        Box::pin(async move {
+            // Every claim the space holds, tombstoned stubs included.
+            let page = self
+                .inner
+                .query(
+                    scope,
+                    &ClaimFilter::matching_all().including_tombstoned(),
+                    ClaimCursor::start().with_limit(64),
+                )
+                .await?;
+            Ok(ClaimEmbeddingPage {
+                claims: page.claims,
+                undecodable: 0,
+                next: None,
+            })
+        })
     }
 }
 

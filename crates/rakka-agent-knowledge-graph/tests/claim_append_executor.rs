@@ -342,7 +342,9 @@ async fn a_replayed_append_of_an_erased_claim_is_a_definitive_refusal() {
 // ---------------------------------------------------------------------------
 
 use rakka_agent::AgentMemoryEmbedder;
-use support::{embedder, meaning_of, unclassified, CoreOnlyStore};
+use support::{
+    embedder, meaning_of, retract, unclassified, CoreOnlyStore, MisbehavingSemanticStore,
+};
 
 /// An append of an inline text value, at one classification.
 fn text_request(
@@ -544,4 +546,75 @@ async fn an_executor_over_a_store_without_the_capability_calls_no_model() {
         embedder.calls().is_empty(),
         "a store that cannot keep an embedding is not worth a model call"
     );
+}
+
+/// A replayed append answers the claim as it was first stored, which is
+/// `Proposed` whatever has happened to it since. The executor decides what to
+/// embed on the claim as the store holds it now, so a claim retracted between
+/// two attempts of its append is not sent to the model by the second.
+#[tokio::test]
+async fn a_replayed_append_does_not_embed_a_claim_retracted_since() {
+    let store = Arc::new(InMemoryKnowledgeGraphStore::new());
+    let scopes = ConformanceScopes::unique("append-replay-retracted");
+    let scope = &scopes.primary;
+    let request = text_request(
+        scope.space().clone(),
+        "the car is at the depot",
+        MemoryClassification::Unclassified,
+    );
+
+    // The first attempt appends; its embedding fails, so the claim is left
+    // unembedded.
+    let refusing = embedder().failing_on("car");
+    let first = KnowledgeGraphClaimAppendExecutor::new(store.clone())
+        .with_embedder(Arc::new(refusing), unclassified());
+    let claim_id = appended(&first, scope, 0, &request).await;
+    let claim = store
+        .get(scope, &claim_id)
+        .await
+        .expect("the claim reads")
+        .expect("the claim is there");
+    retract(store.as_ref(), scope, &claim).await;
+
+    // The same effect is attempted again, on a node whose embedder works.
+    let working = embedder();
+    let second = KnowledgeGraphClaimAppendExecutor::new(store.clone())
+        .with_embedder(Arc::new(working.clone()), unclassified());
+    assert_eq!(appended(&second, scope, 0, &request).await, claim_id);
+    assert!(
+        working.calls().is_empty(),
+        "a retracted claim's text is not sent to the model: {:?}",
+        working.calls()
+    );
+    assert!(!store.has_embedding(scope, &claim_id));
+}
+
+/// The executor wired before the store's migration ran, or a database that
+/// fails the write: the store refuses the embedding with an error. The append
+/// already happened, and its finding does not change.
+#[tokio::test]
+async fn a_store_that_cannot_keep_the_embedding_does_not_fail_the_append() {
+    let store = Arc::new(MisbehavingSemanticStore {
+        fail_embedding_writes: true,
+        ..MisbehavingSemanticStore::default()
+    });
+    let embedder = embedder();
+    let executor = KnowledgeGraphClaimAppendExecutor::new(store.clone())
+        .with_embedder(Arc::new(embedder.clone()), unclassified());
+    let scopes = ConformanceScopes::unique("append-embedding-write-fails");
+    let scope = &scopes.primary;
+    let request = text_request(
+        scope.space().clone(),
+        "the car is at the depot",
+        MemoryClassification::Unclassified,
+    );
+
+    let claim_id = appended(&executor, scope, 0, &request).await;
+    assert_eq!(embedder.calls().len(), 1, "the claim was embedded");
+    assert!(store
+        .get(scope, &claim_id)
+        .await
+        .expect("the claim reads")
+        .is_some());
+    assert!(!store.inner.has_embedding(scope, &claim_id));
 }

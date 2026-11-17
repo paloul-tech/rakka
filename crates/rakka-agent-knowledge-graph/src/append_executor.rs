@@ -76,7 +76,10 @@ impl KnowledgeGraphClaimAppendExecutor {
     ///
     /// The step runs after the store answers the append, on the first
     /// attempt and on a replay alike, and only when the store reports
-    /// [`KnowledgeGraphCapability::SemanticSearch`]. Every failure of it is
+    /// [`KnowledgeGraphCapability::SemanticSearch`]. What it embeds is the
+    /// claim as the store holds it at that moment, read again after the
+    /// append: a replay answers the claim as first stored, and a claim
+    /// retracted or withdrawn since must not be sent. Every failure of it is
     /// dropped: the model failing, an answer that does not match the
     /// embedder's own reference, the store refusing the embedding. The
     /// finding is `Appended` exactly as it is without an embedder, and the
@@ -107,7 +110,17 @@ impl KnowledgeGraphClaimAppendExecutor {
         {
             return;
         }
-        let Some(vector) = embed_claim(embedding.embedder.as_ref(), appended).await else {
+        // The append answered the claim as it was first stored, which on a
+        // replay is not what it is now: its trust may have moved to
+        // `Retracted`, or its content may be gone. The claim the store holds
+        // now decides, and a read that fails embeds nothing.
+        let Ok(Some(current)) = self.store.get(scope, &appended.claim_id).await else {
+            return;
+        };
+        if !may_embed(&current, &embedding.classifications) {
+            return;
+        }
+        let Some(vector) = embed_claim(embedding.embedder.as_ref(), &current).await else {
             return;
         };
         // A claim withdrawn meanwhile answers `false`, and a store failure
