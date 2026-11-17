@@ -89,7 +89,7 @@ renewal is computed again from the fresh record.
 - A claim that is not current is skipped.
 - One write for all of them, and none when nothing is current.
 - A lost write is read again and re-applied, up to three more times.
-- It answers how many entries it released, and drops them from what is held.
+- It answers how many entries it released.
 
 A released entry has no lease, so a late write under the released token is
 answered `claim-fenced`. The next claim of the entry takes the next token.
