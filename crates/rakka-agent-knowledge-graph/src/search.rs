@@ -224,20 +224,30 @@ pub fn claim_search_relevance_bps(query_tokens: &BTreeSet<String>, claim: &Claim
 pub struct ClaimSearchHit {
     /// The claim, whole, as the store holds it.
     pub claim: Claim,
-    /// [`claim_search_relevance_bps`] of the query against the claim. Never
-    /// zero: a claim that shares no word with the query is not a hit.
+    /// How well the claim matched, in basis points. For a keyword search,
+    /// [`claim_search_relevance_bps`] of the query against the claim; for a
+    /// meaning-based search,
+    /// [`claim_semantic_relevance_bps`](crate::semantic::claim_semantic_relevance_bps)
+    /// of the query's embedding against the claim's. Never zero in either: a
+    /// claim that shares no word with the query, or whose embedding scores
+    /// nothing against the query's, is not a hit.
     pub relevance_bps: u16,
 }
 
-/// What one keyword search answered.
+/// What one search answered: a keyword search, or a meaning-based one.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ClaimSearchReport {
-    /// The admitted claims that share a word with the query, best first, ties
-    /// by ascending claim id, at most the search's limit.
+    /// The admitted claims the search found, best first, ties by ascending
+    /// claim id, at most the search's limit. A keyword search finds the
+    /// claims that share a word with the query; a meaning-based search finds
+    /// the claims embedded under the query's reference.
     pub hits: Vec<ClaimSearchHit>,
-    /// Whether the space holds live claims the backend's index does not
-    /// cover, so that this search could not see them. A backend with no index
-    /// to fall behind always answers `false`.
+    /// Whether the space holds live claims this search could not see because
+    /// the backend's index does not cover them. For a keyword search, a claim
+    /// with no word index; a backend with no index to fall behind always
+    /// answers `false`. For a meaning-based search, a claim the search admits
+    /// (or whose admission the backend cannot judge) that has no embedding
+    /// under the query's reference.
     pub unindexed: bool,
 }
 

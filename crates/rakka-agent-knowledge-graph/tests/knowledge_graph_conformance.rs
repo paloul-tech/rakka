@@ -361,3 +361,99 @@ async fn a_store_without_the_capability_refuses_search() {
     assert_eq!(error.code(), "claim-capability-unsupported");
     assert!(error.to_string().contains("keyword-search"));
 }
+
+#[tokio::test]
+async fn semantic_search_admits_before_it_ranks() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    assert!(store
+        .capabilities()
+        .supports(rakka_agent_knowledge_graph::KnowledgeGraphCapability::SemanticSearch));
+    conformance::semantic_search(&store, ConformanceScopes::unique("semantic-search")).await;
+}
+
+/// Meaning-based search is optional too. A backend that does not report it
+/// answers the capability error from the trait's own defaults for all three
+/// of its operations.
+#[tokio::test]
+async fn a_store_without_the_capability_refuses_semantic_search() {
+    let store = ShallowKnowledgeGraphStore::default();
+    assert!(!store
+        .capabilities()
+        .supports(rakka_agent_knowledge_graph::KnowledgeGraphCapability::SemanticSearch));
+    conformance::semantic_search_refused(&store, ConformanceScopes::unique("semantic-refused"))
+        .await;
+}
+
+/// The conformance clause shows that no search reaches an erased claim. This
+/// shows the vector itself is gone: it was derived from the claim's content,
+/// so the store must not keep it once the content is withdrawn.
+#[tokio::test]
+async fn erasure_drops_the_embedding_itself() {
+    use rakka_agent::{AgentRevisionNumber, MemoryEmbeddingRef};
+    use rakka_agent_knowledge_graph::conformance::{conformance_claim, conformance_resolver};
+    use rakka_agent_knowledge_graph::{ClaimEmbedding, ClaimOperationId, ClaimTombstoneReason};
+
+    let store = InMemoryKnowledgeGraphStore::new();
+    let scopes = ConformanceScopes::unique("embedding-erasure");
+    let scope = &scopes.primary;
+    let embedding = ClaimEmbedding {
+        reference: MemoryEmbeddingRef {
+            model: "conformance-embedder".to_string(),
+            dimensions: 2,
+            version: AgentRevisionNumber::new(1),
+        },
+        vector: vec![1.0, 0.0],
+    };
+    let mut claims = Vec::new();
+    for discriminator in ["tombstoned", "deleted"] {
+        let claim = store
+            .append(
+                scope,
+                &conformance_claim(scope, discriminator, "subject", "object"),
+            )
+            .await
+            .expect("the claim appends");
+        assert!(store
+            .store_claim_embedding(scope, &claim.claim_id, &embedding)
+            .await
+            .expect("the embedding stores"));
+        assert!(store.has_embedding(scope, &claim.claim_id));
+        claims.push(claim);
+    }
+
+    store
+        .tombstone(
+            scope,
+            &ClaimTombstoneRequest {
+                claim_id: claims[0].claim_id.clone(),
+                operation_id: ClaimOperationId::derive_tombstone(scope, &claims[0].claim_id, "t")
+                    .expect("the operation id derives"),
+                reason: ClaimTombstoneReason::Withdrawn,
+                actor: conformance_resolver(),
+                tombstoned_at: AgentTimestampMillis::new(5),
+            },
+        )
+        .await
+        .expect("the tombstone applies");
+    assert!(
+        !store.has_embedding(scope, &claims[0].claim_id),
+        "a tombstone drops the embedding with the content"
+    );
+
+    store
+        .delete(
+            scope,
+            &ClaimDeleteRequest {
+                claim_id: claims[1].claim_id.clone(),
+                operation_id: ClaimOperationId::derive_delete(scope, &claims[1].claim_id, "d")
+                    .expect("the operation id derives"),
+                expected: None,
+            },
+        )
+        .await
+        .expect("the delete applies");
+    assert!(
+        !store.has_embedding(scope, &claims[1].claim_id),
+        "a delete drops the embedding with the claim"
+    );
+}

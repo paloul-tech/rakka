@@ -558,6 +558,8 @@ incorrectly.
     `KnowledgeGraphCommunalAuthority` (in `rakka-agent-knowledge-graph`)
     implement two of them over any `KnowledgeGraphStore`; the retriever
     refuses a store that does not report the `keyword-search` capability.
+    The retriever ranks by shared words, or, given an embedder and a store
+    that reports `semantic-search`, by meaning (below).
     `AgentEntityCommunalReadGrants` implements the third from the run's own
     agent entity, and from its setup when given a setup resolver.
   - **Search is by shared words.** `KnowledgeGraphStore::search` is an
@@ -571,8 +573,78 @@ incorrectly.
     Such text is not found, and the search does not say so. A claim is a hit
     when it shares at least one word with the query, and its score is the
     share of the query's words it holds. Restrictions apply before ranking, so a claim the reader
-    may not read takes no place in the ranking. There is no meaning-based
-    search yet (issue #140).
+    may not read takes no place in the ranking.
+  - **Search by meaning is opt-in (issue #140).** A deployment that wants a
+    claim found when the turn asks about it in other words gives the
+    retriever an embedder: `KnowledgeGraphCommunalRetriever::with_embedder`,
+    over a store that reports the `semantic-search` capability. The
+    retriever then embeds each turn's query and the store ranks the space's
+    claims by how near their stored embedding is to it. The same
+    restrictions apply before ranking, every ranked identity is still
+    resolved through the authority and re-checked, and context assembly and
+    the snapshot's shape do not change. The retriever reports version 2
+    instead of 1, which the snapshot records; `ranking()` says which of the
+    two a retriever is, and the choice is made when it is built. Given a
+    store that cannot rank by meaning, the embedder is dropped and the
+    retriever ranks by words.
+    - **What a store keeps.** One embedding per claim, beside the model,
+      dimension count and pipeline version that produced it. Only vectors
+      under the query's own reference are compared with it. A store never
+      calls a model and never returns a vector. Storing an embedding changes
+      no byte of the claim's record; `Claim.embedding` is the appender's own
+      note and is not written. A tombstone and a delete remove the embedding
+      in the operation that withdraws the content, and nothing can store one
+      for a tombstoned claim afterwards.
+    - **How a claim gets its embedding.** An append executor given an
+      embedder (`KnowledgeGraphClaimAppendExecutor::with_embedder`) embeds
+      each claim it appends, best effort: a failed embedding never fails the
+      append. It embeds the claim as the store holds it after the append, so
+      a retry of an append whose claim was retracted meanwhile sends nothing. `embed_claims` is the pass that embeds whatever is left: claims
+      from before the deployment opted in, claims whose embedding failed at
+      append, and, after a change of model or pipeline version, every claim.
+      **No loop in Rakka calls the pass.** A deployment calls it for each
+      space until it answers no cursor. A claim the model refuses is counted
+      `failed` and does not stop the claims after it.
+    - **What is sent to the embedder.** The embedder is the deployment's and
+      may be a service outside it. Two kinds of text reach it. *Claims:* the
+      subject, predicate and object text of each claim the executor or the
+      pass embeds. Both take the set of classifications they may send, and
+      **the set has no default**: a deployment states it. It should cover
+      every classification the read policy admits, because a claim that is
+      never embedded is never found by meaning, and a search that admits it
+      reports `index_incomplete` for as long as it is not. A `Redacted` claim
+      is never sent whatever the set says, and a `Retracted` or tombstoned
+      claim is not embedded. *Queries:* the retriever sends each searching
+      turn's query, up to 1,024 bytes derived from the run's recent session
+      entries, with no classification of its own. The private tier's
+      meaning-based retrieval already sends its query to its own embedder.
+    - **Limits.** The score is cosine similarity on the private tier's
+      scale: 10000 for the same direction, 5000 for unrelated, and a claim
+      that scores 0 is not ranked. There is no relevance floor: the nearest
+      admitted claims are answered however far they are. A query with no
+      text ranks nothing and calls no model. A retriever remembers the
+      vectors of its last 16 query texts, so a turn that searches several
+      spaces embeds its query once. A query that cannot be embedded
+      fails that space's search, which is counted `degraded`; the retriever
+      never falls back to words. The embedding model is not recorded in the
+      snapshot, only the retriever's version. No metric counts embeddings
+      that failed at append, and nothing bounds the embedder call in time.
+      An artifact-backed object is embedded from its subject and predicate
+      alone.
+    - **PostgreSQL.** `PostgresKnowledgeGraphStore::with_semantic_search`
+      opts a store in: it then reports the capability, and its `migrate`
+      adds four nullable columns to the claim table, a check and a tombstone
+      trigger, and needs the `vector` extension (pgvector). A store that does
+      not opt in never names the extension. The search is an exact scan of
+      the claims of one tenant and space that pass the filters, so its cost
+      is linear in those. **No approximate index is shipped, and the search
+      statement cannot use one a deployment adds.** The vector column has no
+      fixed dimension, so that a model change needs no schema change; pgvector
+      indexes only a fixed-dimension expression, and the statement orders by
+      the bare column. An approximate index also picks its candidates before
+      a filter runs, so a selective filter loses results behind one. Ranking
+      through one is not available in this release. The roll order is in
+      [`rakka-compatibility.md`](rakka-compatibility.md).
   - **A fault never fails the turn.** A grant that cannot be read selects
     nothing; a space whose search fails costs that space's ranking and the
     others continue; an authority fault part-way keeps the claims already
@@ -586,7 +658,10 @@ incorrectly.
     says so. The snapshot's communal record carries `index_incomplete`, and
     the outcome counter counts `index-incomplete`. The remedy is the
     deployment's: call `PostgresKnowledgeGraphStore::index_claims` for the
-    space until it answers no cursor. No loop in Rakka calls it.
+    space until it answers no cursor. No loop in Rakka calls it. A search by
+    meaning reports the same thing for a claim it admits that has no
+    embedding under the retriever's embedder, on every backend, and the
+    remedy is `embed_claims`.
   - **What a snapshot keeps.** A snapshot is immutable and is reused on every
     retry of its turn. A claim that is tombstoned, deleted, retracted, or put
     out of the run's reach after it was selected stays in the snapshots that

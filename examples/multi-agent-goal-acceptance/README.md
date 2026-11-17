@@ -41,6 +41,21 @@ and its snapshots are unchanged.
 cargo test -p rakka-example-multi-agent-goal-acceptance --test communal_read_path
 ```
 
+`tests/communal_semantic_read_path.rs` builds the world that ranks communal
+claims by meaning (`World::with_semantic_read_path`): one deterministic
+embedder, which needs no model, is wired into the communal retriever and
+into every dispatcher's claim-append executor. A writer agent states a claim
+through its own run, as a committed effect the dispatcher executes, and the
+executor embeds it. A reviewer verifies it. A reader agent granted the
+claim's space then asks about the same thing in words the claim does not use
+("automobile" for "car"), and its context snapshot holds the claim and
+records retriever version 2. The same walk in the world that ranks by shared
+words selects nothing.
+
+```sh
+cargo test -p rakka-example-multi-agent-goal-acceptance --test communal_semantic_read_path
+```
+
 `tests/fleet_prune.rs` prunes the dispatcher fleet record in the same world.
 Two runs complete, and their finished entries are what the record would
 otherwise hold for good. A third run's dispatcher is then lost after it

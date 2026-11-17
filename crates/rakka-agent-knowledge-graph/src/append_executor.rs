@@ -12,33 +12,123 @@
 //! logical claim. The provenance written is the transition-stamped record
 //! riding on the intent — goal, task, source agent and run, delegation, and
 //! the carrying effect — never anything invented here.
+//!
+//! # Embedding at append
+//!
+//! An executor given an embedder
+//! ([`KnowledgeGraphClaimAppendExecutor::with_embedder`]) also embeds the
+//! claim it appended and stores the embedding, so that a meaning-based
+//! search finds a fresh claim without waiting for a pass. That step is best
+//! effort: **a failed embedding never fails the append.** A claim it could
+//! not embed is left for [`embed_claims`](crate::embedding_pass::embed_claims).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rakka_agent::{
     AgentClaimAppendExecutor, AgentClaimAppendFinding, AgentClaimAppendProvenance,
     AgentClaimAppendRequest, AgentClaimObjectRequest, AgentCommunalClaimId, AgentDispatchError,
-    AgentDispatchFuture, AgentRunEffect, AgentRunScope,
+    AgentDispatchFuture, AgentMemoryEmbedder, AgentRunEffect, AgentRunScope, MemoryClassification,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
 use crate::claim::{
     Claim, ClaimNodeId, ClaimObject, ClaimOperationId, ClaimPredicate, ClaimProvenance,
 };
+use crate::embedding_pass::{embed_claim, may_embed};
 use crate::error::ClaimError;
 use crate::scope::KnowledgeSpaceScope;
-use crate::store::KnowledgeGraphStore;
+use crate::store::{KnowledgeGraphCapability, KnowledgeGraphStore};
+
+/// What an executor embeds with, and which claims it may send there.
+struct AppendEmbedding {
+    embedder: Arc<dyn AgentMemoryEmbedder>,
+    classifications: BTreeSet<MemoryClassification>,
+}
 
 /// Executes one claim append against a wired [`KnowledgeGraphStore`].
 pub struct KnowledgeGraphClaimAppendExecutor {
     store: Arc<dyn KnowledgeGraphStore>,
+    embedding: Option<AppendEmbedding>,
 }
 
 impl KnowledgeGraphClaimAppendExecutor {
     /// Wires the executor over the store it appends into.
     #[must_use]
     pub fn new(store: Arc<dyn KnowledgeGraphStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            embedding: None,
+        }
+    }
+
+    /// Makes the executor embed each claim it appends and store the
+    /// embedding, best effort, so a meaning-based search finds a fresh claim
+    /// at once.
+    ///
+    /// **Embedding sends a claim's text to `embedder`**, which may be a
+    /// service outside the deployment. `classifications` is the set of
+    /// classifications the deployment allows to be sent, and it has no
+    /// default: the deployment states it. It should cover every
+    /// classification the deployment's read policy admits, because a claim
+    /// that is never embedded is never found by meaning. Whatever the set
+    /// says, a `Redacted` claim is never sent. The empty set embeds nothing.
+    ///
+    /// The step runs after the store answers the append, on the first
+    /// attempt and on a replay alike, and only when the store reports
+    /// [`KnowledgeGraphCapability::SemanticSearch`]. What it embeds is the
+    /// claim as the store holds it at that moment, read again after the
+    /// append: a replay answers the claim as first stored, and a claim
+    /// retracted or withdrawn since must not be sent. Every failure of it is
+    /// dropped: the model failing, an answer that does not match the
+    /// embedder's own reference, the store refusing the embedding. The
+    /// finding is `Appended` exactly as it is without an embedder, and the
+    /// claim is left for [`embed_claims`](crate::embedding_pass::embed_claims).
+    #[must_use]
+    pub fn with_embedder(
+        mut self,
+        embedder: Arc<dyn AgentMemoryEmbedder>,
+        classifications: BTreeSet<MemoryClassification>,
+    ) -> Self {
+        self.embedding = Some(AppendEmbedding {
+            embedder,
+            classifications,
+        });
+        self
+    }
+
+    /// Embeds an appended claim and stores the embedding, best effort.
+    async fn embed_appended(&self, scope: &KnowledgeSpaceScope, appended: &Claim) {
+        let Some(embedding) = &self.embedding else {
+            return;
+        };
+        if !self
+            .store
+            .capabilities()
+            .supports(KnowledgeGraphCapability::SemanticSearch)
+            || !may_embed(appended, &embedding.classifications)
+        {
+            return;
+        }
+        // The append answered the claim as it was first stored, which on a
+        // replay is not what it is now: its trust may have moved to
+        // `Retracted`, or its content may be gone. The claim the store holds
+        // now decides, and a read that fails embeds nothing.
+        let Ok(Some(current)) = self.store.get(scope, &appended.claim_id).await else {
+            return;
+        };
+        if !may_embed(&current, &embedding.classifications) {
+            return;
+        }
+        let Some(vector) = embed_claim(embedding.embedder.as_ref(), &current).await else {
+            return;
+        };
+        // A claim withdrawn meanwhile answers `false`, and a store failure
+        // answers an error. Neither changes what the append found.
+        let _ = self
+            .store
+            .store_claim_embedding(scope, &appended.claim_id, &vector)
+            .await;
     }
 }
 
@@ -141,6 +231,7 @@ impl AgentClaimAppendExecutor for KnowledgeGraphClaimAppendExecutor {
             };
             match self.store.append(&space_scope, &claim).await {
                 Ok(appended) => {
+                    self.embed_appended(&space_scope, &appended).await;
                     let claim =
                         AgentCommunalClaimId::new(appended.claim_id.as_str()).map_err(|error| {
                             AgentDispatchError::Invocation {

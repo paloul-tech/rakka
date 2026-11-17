@@ -36,6 +36,11 @@
 //!   discharges it over any backend.
 //! - [`search`] — the keyword search a store may offer: the query, the
 //!   shared word rule, the score and the ranking order.
+//! - [`semantic`] — the meaning-based search a store may offer: the text a
+//!   claim is embedded from, the validated embedding, the query, and the one
+//!   mapping from cosine similarity to a score.
+//! - [`embedding_pass`] — the pass a deployment calls to embed the claims of
+//!   a space that have no embedding yet.
 //! - [`communal_retrieval`] — the communal read ports of `rakka-agent`,
 //!   served from a store.
 //! - [`store`] — the portable [`KnowledgeGraphStore`] SPI, bounded
@@ -59,7 +64,9 @@
 //!
 //! [`communal_retrieval`] implements the two communal read ports
 //! `rakka-agent` declares. [`KnowledgeGraphCommunalRetriever`] ranks a
-//! space's claims by keyword [`search`](KnowledgeGraphStore::search), and
+//! space's claims by keyword [`search`](KnowledgeGraphStore::search), or,
+//! given an embedder and a store that can, by meaning
+//! ([`search_semantic`](KnowledgeGraphStore::search_semantic)), and
 //! [`KnowledgeGraphCommunalAuthority`] answers the claim a ranking named.
 //! Context assembly in `rakka-agent` decides on the record the authority
 //! answers, which is where a claim's trust status, classification and
@@ -73,20 +80,25 @@
 //! No metrics counters, no sharded knowledge-space entity, no agent-facing
 //! erasure path (tombstone, delete and the retention sweep are operations an
 //! application calls on the store; no run effect, command or tool reaches
-//! them), no bulk or whole-space erasure, no meaning-based (embedding)
-//! search, and no cross-tenant federation. The run-entity claim-append effect
+//! them), no bulk or whole-space erasure, no approximate index and no
+//! relevance floor for the meaning-based search, no loop that calls the
+//! embedding pass, and no cross-tenant federation. A store never calls an
+//! embedding model: the retriever, the append executor and the pass do, with
+//! the embedder a deployment wires. The run-entity claim-append effect
 //! this crate once deferred landed with scenario 33 ([`append_executor`]).
 
 pub mod append_executor;
 pub mod claim;
 pub mod communal_retrieval;
 pub mod conformance;
+pub mod embedding_pass;
 pub mod error;
 pub mod goal_claim_source;
 pub mod promotion;
 pub mod retention;
 pub mod scope;
 pub mod search;
+pub mod semantic;
 pub mod store;
 pub mod tombstone;
 pub mod transition;
@@ -98,7 +110,11 @@ pub use claim::{
     CLAIM_MAX_ACL_CAPABILITIES, CLAIM_MAX_EVIDENCE_ARTIFACTS, CLAIM_MAX_TRUST_TRANSITIONS,
     CLAIM_OBJECT_INLINE_MAX_BYTES, CURRENT_CLAIM_SCHEMA_VERSION,
 };
-pub use communal_retrieval::{KnowledgeGraphCommunalAuthority, KnowledgeGraphCommunalRetriever};
+pub use communal_retrieval::{
+    KnowledgeGraphCommunalAuthority, KnowledgeGraphCommunalRanking,
+    KnowledgeGraphCommunalRetriever, COMMUNAL_QUERY_MEMO_MAX_ENTRIES,
+};
+pub use embedding_pass::{embed_claims, ClaimEmbeddingPassPage};
 pub use error::{check_schema_window, ClaimError, ClaimFuture, ClaimRecordKind, ClaimResult};
 pub use goal_claim_source::KnowledgeGraphGoalClaimSource;
 pub use promotion::{
@@ -115,6 +131,11 @@ pub use search::{
     claim_search_query_tokens, claim_search_relevance_bps, claim_search_tokens,
     rank_claim_search_hits, ClaimSearch, ClaimSearchHit, ClaimSearchReport, CLAIM_SEARCH_MAX_HITS,
     CLAIM_SEARCH_TEXT_MAX_BYTES,
+};
+pub use semantic::{
+    claim_embedding_text, claim_semantic_distance_relevance_bps, claim_semantic_relevance_bps,
+    ClaimEmbedding, ClaimEmbeddingPage, ClaimSemanticSearch, CLAIM_EMBEDDING_MAX_DIMENSIONS,
+    CLAIM_EMBEDDING_PAGE_MAX_CLAIMS,
 };
 pub use store::{
     ClaimCursor, ClaimFilter, ClaimPage, ClaimTransitionCursor, ClaimTransitionPage,

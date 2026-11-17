@@ -148,6 +148,9 @@ jobs:
       - name: Test PostgreSQL store
         env:
           RAKKA_POSTGRES_TEST_DSN: postgres://postgres:postgres@localhost:5432/postgres
+          # The service image provides pgvector, so a pgvector clause that
+          # skips here is a clause that stopped running: make it a failure.
+          RAKKA_POSTGRES_PGVECTOR_REQUIRED: "1"
         run: |
           cargo test -p rakka-persistence-postgres
           cargo test -p rakka-sharding-postgres

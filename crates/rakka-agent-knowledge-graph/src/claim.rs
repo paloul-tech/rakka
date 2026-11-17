@@ -574,7 +574,14 @@ pub struct Claim {
     pub access: ClaimAccess,
     trust: ClaimTrustStatus,
     transition_count: u32,
-    /// Embedding metadata, when the claim's content was embedded.
+    /// The appender's own note of the embedding model its content was
+    /// embedded with, when it chose to record one.
+    ///
+    /// It is not the state of any index. Nothing in Rakka writes it after the
+    /// append and nothing reads it: a store that serves meaning-based search
+    /// keeps a claim's embedding, and the reference it was produced under,
+    /// beside the record and never in it (see [`crate::semantic`]), so this
+    /// field is usually `None` for a claim that is embedded.
     #[serde(default)]
     pub embedding: Option<MemoryEmbeddingRef>,
     /// The policy in force when the claim was appended, when any.
@@ -655,7 +662,9 @@ impl Claim {
         Ok(self)
     }
 
-    /// Attaches embedding metadata, re-validating its bounds.
+    /// Attaches the appender's note of an embedding model (see
+    /// [`Self::embedding`]), re-validating its bounds. It stores no vector
+    /// and does not make the claim findable by meaning.
     pub fn with_embedding(mut self, embedding: MemoryEmbeddingRef) -> ClaimResult<Self> {
         self.embedding = Some(embedding);
         self.validate()?;

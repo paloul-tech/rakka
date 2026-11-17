@@ -123,6 +123,10 @@ inside the mutator, and is what that arrangement was verified for.
 | Communal memory treated as an injection source; provenance and trust available to the context builder | Every claim on its way into a snapshot is resolved through the authoritative store, re-checked, and evaluated at the memory-ingress boundary on its statement, with its id and space in the context. A blocked claim, a claim a stage would checkpoint, and a transform that changes what a claim points at are dropped. The snapshot carries each claim's trust state and provenance beside its statement. The communal bundle's chain is attested with the private one | `communal_claim_retrieval.rs` (29 tests), `memory_guardrail_chain_consistency.rs`, `communal_snapshot_record.rs` | Met for the boundary; **what a stage decides is the deployment's**. A claim is evaluated as its statement object, not as bare content, so a stage written for private memory allows every claim until it branches on `context.claim` (see "Delegated to the deployment"). Rendering the claims as untrusted data in a prompt is the application's model adapter's |
 | A communal claim is read only by a run granted its space and holding its required read capabilities, checked before ranking and again on the record | `CommunalRetrievalQuery::admits` on the authoritative record; the retriever is never called for a space outside the effective grant; the grant is the definition's, narrowed by setup and by the run's delegation envelope, which the run entity hands to assembly. A read capability authorizes no tool dispatch | `communal_claim_retrieval.rs`, `communal_read_grant.rs`, `communal_run_grant.rs` (the run entity's own envelope reaches assembly), `handoff_record.rs` (a handoff's target holds only what the catalog states, for a task with no envelope of its own as for an enveloped one: `a_plain_tasks_handoff_grants_only_what_the_catalog_states`, `a_task_that_only_names_a_goal_is_narrowed_like_a_plain_task`, `the_target_of_a_plain_tasks_handoff_appends_only_inside_the_catalogs_spaces`; a refused handoff gives no envelope: `task.rs::handoff_envelope_tests`), `tool_authority.rs` (`a_read_capability_authorizes_no_tool_dispatch`), the graph's `keyword_search` conformance clause, and `communal_read_path.rs` in `examples/multi-agent-goal-acceptance` with real entities | Met. Until issue #142 a handoff of a task that carried no delegation envelope was not narrowed by the catalog. *Purpose* restrictions remain unmodelled |
 | Only reviewed claims reach a model context by default | `CommunalRetrievalPolicy::verified_only` is the default; `Retracted` is refused whatever a policy says | `communal_claim_retrieval.rs` (`a_record_the_query_no_longer_admits_is_rejected`), `communal.rs` unit tests | Met; admitting `Proposed` is a deployment's explicit choice |
+| A communal search by meaning applies every restriction before ranking, and never compares vectors of two embedding models (issue #140) | The store admits, then ranks: a candidate is a live claim the search admits whose stored embedding has exactly the query's model, dimension count and pipeline version. On PostgreSQL every filter is a predicate of the one statement, before its ordering, and every row it returns is decoded and re-checked against its own record; a row the record does not admit is refused as drift. Context assembly still resolves and re-checks every ranked identity | The graph's `semantic_search` conformance clause (in memory, and on PostgreSQL with pgvector), `postgres_semantic_search_proofs.rs` (`postgres_a_drifted_filter_column_cannot_leak_a_claim_when_dsn_is_set`), the graph's `communal_retrieval.rs`, and `communal_semantic_read_path.rs` in `examples/multi-agent-goal-acceptance` with real entities | Met. The scan is exact; no approximate index is involved |
+| A claim's embedding never outlives the claim's content (issue #140) | A tombstone and a delete remove the embedding in the operation that withdraws the content, and no embedding is stored for a tombstoned claim. On PostgreSQL the embedding write changes only a row that is not tombstoned, and a table trigger clears the embedding of any tombstoned row, whichever binary wrote the tombstone | The conformance clause; the graph's `erasure_drops_the_embedding_itself`; `postgres_an_earlier_tombstone_clears_the_embedding_when_dsn_is_set`, `postgres_a_tombstone_beats_a_late_embedding_when_dsn_is_set` | Met for the store. **A copy the embedder kept is outside it** (see "Erasing a claim does not reach the copies outside the graph") |
+| A claim's text reaches an embedder only when the deployment stated its classification (issue #140) | The append executor and the embedding pass take the set of classifications they may send, with no default. `Redacted` is refused whatever the set says, and a `Retracted` or tombstoned claim is not sent. The pass lists by the claim's record, not by an index column | The graph's `claim_append_executor.rs` (`the_executor_sends_only_the_classifications_it_was_given`), `claim_embedding_pass.rs` (`the_pass_sends_only_what_its_set_allows`), and the drifted-column proof above | Met for claims. **The query is not classified**: see "Delegated to the deployment" |
+| A failed embedding never fails a claim append (issue #140) | The executor embeds after the store answered the append and drops every failure of that step | `claim_append_executor.rs` (`a_failed_embedding_does_not_fail_the_append`) | Met. Nothing counts such a failure; it shows as a claim owed an embedding |
 | Tool arguments, prompts, raw memory, credentials, high-cardinality ids never metric labels | `validate_agent_domain_metric_attributes` per observation | `agent_metrics.rs`, and `secret_exclusion.rs` over the whole emitted *series set* | Met |
 
 ## MCP client, specification 16 (Phase 7 slice 7.7)
@@ -183,12 +187,26 @@ inside the mutator, and is what that arrangement was verified for.
   with the claims a test hands it and no others. It attests nothing. Rakka does not know whether a deployment ran it, and
   nothing in Rakka checks that a stage reads a claim's shape.
 
+- **What an embedder receives, and what it keeps.** A deployment that ranks
+  communal claims by meaning (issue #140) wires an embedder, and the embedder
+  may be a service outside the deployment. It is sent the text of each claim
+  whose classification the deployment stated, and the query of every turn
+  that searches: up to 1,024 bytes derived from the run's recent session
+  entries. **The query carries no classification and is not filtered.** A
+  deployment whose session text must not leave it must not wire an external
+  embedder into the retriever. Rakka resolves no credential for an embedder
+  and persists none; the embedder's transport, its credential and its own
+  retention are the deployment's. Rakka bounds what an embedder's failure can
+  do (it is dropped at append and in the pass, and degrades one space's
+  search), and cannot know what is in its error text.
+
 ## Owed, and why
 
-- **Meaning-based communal search.** The communal read path (issue #69)
-  ranks by shared words only. A claim that answers the turn in other words is
-  not found, and a deployment cannot yet rank claims by embedding. Tracked as
-  [#140](https://github.com/paloul-tech/rakka/issues/140).
+- **Communal search by meaning has limits a deployment will meet.** It is an
+  exact scan with no approximate index, it has no relevance floor, the
+  snapshot does not record the embedding model, no metric counts embeddings
+  that failed at append, and nothing bounds an embedder call in time (issue
+  #140). They are listed in `rakka-agents.md`, "Search by meaning is opt-in".
 - **The communal search index spans tenants.** On PostgreSQL the word index is
   one index over the claim table. Every statement carries its tenant and space
   and returns only that scope's rows, so nothing is disclosed, but the work a
@@ -252,6 +270,10 @@ inside the mutator, and is what that arrangement was verified for.
     enter a later snapshot. The rule below for private memory applies
     unchanged, and Rakka keeps no index from a claim to the snapshots that
     hold it.
+  - **An embedder.** A deployment that ranks claims by meaning (issue #140)
+    sent the claim's text to its embedder when the claim was appended or
+    when the pass reached it. The stored embedding is erased with the claim;
+    whatever the embedder's own service kept is the deployment's.
   - **The database's own physical copies.** The no-bytes proofs are logical:
     they read every row a query can reach. PostgreSQL keeps the superseded row
     versions, in the table, its out-of-line storage, and its indexes, until
@@ -430,10 +452,19 @@ cargo test -p rakka-example-multi-agent-goal-acceptance --test communal_read_pat
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test -p rakka-agent-knowledge-graph-postgres
 
-# The whole contract, against a pgvector-enabled image, with no silent skips:
+# Search by meaning, its embedding pass and its executor:
+cargo test -p rakka-agent-knowledge-graph --test claim_embedding_pass
+cargo test -p rakka-agent-knowledge-graph --test claim_append_executor
+cargo test -p rakka-example-multi-agent-goal-acceptance --test communal_semantic_read_path
+
+# The whole contract, against a pgvector-enabled image, with no silent skips.
+# CI runs both crates this way:
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5433/postgres \
 RAKKA_POSTGRES_PGVECTOR_REQUIRED=1 \
   cargo test -p rakka-agent-postgres --test memory_conformance
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5433/postgres \
+RAKKA_POSTGRES_PGVECTOR_REQUIRED=1 \
+  cargo test -p rakka-agent-knowledge-graph-postgres
 ```
 
 ## Production interpretation

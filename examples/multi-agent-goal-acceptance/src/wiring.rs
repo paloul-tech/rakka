@@ -41,6 +41,7 @@ use rakka_agent::{
     AgentCommunalRetrieval, AgentEntityCommunalReadGrants, AgentGuardrailChain, AgentSchemaPolicy,
     CommunalRetrievalPolicy,
 };
+use rakka_agent_knowledge_graph::conformance::ConceptEmbedder;
 use rakka_agent_knowledge_graph::{
     InMemoryKnowledgeGraphStore, KnowledgeGraphClaimAppendExecutor,
     KnowledgeGraphCommunalAuthority, KnowledgeGraphCommunalRetriever,
@@ -383,6 +384,17 @@ impl AgentGoalEvaluationExecutor for AcceptanceEvaluator {
     }
 }
 
+/// How a world's runs read communal claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommunalReadPath {
+    /// No communal bundle: the acceptance walk's world.
+    Unwired,
+    /// The knowledge graph's retriever, ranking by shared words.
+    ByWords,
+    /// The same, given an embedder: ranking by meaning.
+    ByMeaning,
+}
+
 /// The whole in-process world the acceptance walk drives.
 pub struct World {
     /// The actor system hosting the sharded entities.
@@ -406,6 +418,10 @@ pub struct World {
     pub child_inbox_store: InMemoryDurableStateStore<WorkflowState>,
     /// The communal knowledge graph.
     pub graph: Arc<InMemoryKnowledgeGraphStore>,
+    /// The embedder of [`Self::with_semantic_read_path`], wired into the
+    /// communal retriever and the claim-append executor. `None` in every
+    /// other world, which calls no model for a claim or a query.
+    pub embedder: Option<ConceptEmbedder>,
     /// The workflow clock, advanced deliberately to expire leases.
     pub wf_clock: SharedAtomicWorkflowClock,
     /// The shared tick counter behind every timestamp.
@@ -448,7 +464,7 @@ impl World {
     /// graph, and the workflow child's inbox.
     #[must_use]
     pub fn new() -> Self {
-        Self::build(false)
+        Self::build(CommunalReadPath::Unwired)
     }
 
     /// The same world with the communal read path wired into every run: the
@@ -465,10 +481,27 @@ impl World {
     /// Panics if the in-memory graph store stops reporting keyword search.
     #[must_use]
     pub fn with_communal_read_path() -> Self {
-        Self::build(true)
+        Self::build(CommunalReadPath::ByWords)
     }
 
-    fn build(communal_read_path: bool) -> Self {
+    /// The world of [`Self::with_communal_read_path`], ranking by meaning:
+    /// one [`ConceptEmbedder`] is wired into the communal retriever, which
+    /// then embeds each turn's query and reports retriever version 2, and
+    /// into every dispatcher's claim-append executor, which then embeds each
+    /// `Unclassified` claim it appends. To that embedder "car" and
+    /// "automobile" are one concept, which is how
+    /// `tests/communal_semantic_read_path.rs` asks about a claim in words
+    /// the claim does not use.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the in-memory graph store stops reporting keyword search.
+    #[must_use]
+    pub fn with_semantic_read_path() -> Self {
+        Self::build(CommunalReadPath::ByMeaning)
+    }
+
+    fn build(read_path: CommunalReadPath) -> Self {
         let system = ActorSystem::new("MultiAgentGoalAcceptance");
         let sharding = ClusterSharding::get(&system);
         let tasks = InMemoryDurableStateStore::<AgentTaskState>::new();
@@ -496,13 +529,17 @@ impl World {
         // whole of the read path's wiring: a retriever to rank, an authority
         // to answer the record, the source of the run's grant, the
         // memory-ingress chain and the policy.
+        let embedder = (read_path == CommunalReadPath::ByMeaning)
+            .then(|| ConceptEmbedder::new(&[&["car", "automobile"]]));
         let mut memory = AgentRunMemory::new(session.clone(), snapshots.clone());
-        if communal_read_path {
+        if read_path != CommunalReadPath::Unwired {
+            let mut retriever = KnowledgeGraphCommunalRetriever::new(graph.clone())
+                .expect("the in-memory graph store searches by keyword");
+            if let Some(embedder) = &embedder {
+                retriever = retriever.with_embedder(Arc::new(embedder.clone()));
+            }
             memory = memory.with_communal_retrieval(AgentCommunalRetrieval::new(
-                Arc::new(
-                    KnowledgeGraphCommunalRetriever::new(graph.clone())
-                        .expect("the in-memory graph store searches by keyword"),
-                ),
+                Arc::new(retriever),
                 Arc::new(KnowledgeGraphCommunalAuthority::new(graph.clone())),
                 Arc::new(AgentEntityCommunalReadGrants::new(
                     Arc::new(agents.clone()),
@@ -626,6 +663,7 @@ impl World {
             fleet_store,
             child_inbox_store,
             graph,
+            embedder,
             wf_clock,
             clock,
             tools,
@@ -691,9 +729,23 @@ impl World {
         )))
         .with_workflow_start_executor(self.workflow_starts.clone())
         .with_goal_evaluation_executor(Arc::new(AcceptanceEvaluator))
-        .with_claim_append_executor(Arc::new(KnowledgeGraphClaimAppendExecutor::new(
-            self.graph.clone(),
-        )))
+        .with_claim_append_executor(Arc::new(self.claim_append_executor()))
+    }
+
+    /// The claim-append executor every dispatcher of this world runs: over
+    /// the graph, and, in the world that ranks by meaning, embedding each
+    /// `Unclassified` claim it appends. The classifications are stated here
+    /// because they have no default: a deployment says which claims may be
+    /// sent to its embedder.
+    fn claim_append_executor(&self) -> KnowledgeGraphClaimAppendExecutor {
+        let executor = KnowledgeGraphClaimAppendExecutor::new(self.graph.clone());
+        match &self.embedder {
+            Some(embedder) => executor.with_embedder(
+                Arc::new(embedder.clone()),
+                std::collections::BTreeSet::from([rakka_agent::MemoryClassification::Unclassified]),
+            ),
+            None => executor,
+        }
     }
 
     /// Runs the compiled refund step for one accepted `StartRun`, exactly

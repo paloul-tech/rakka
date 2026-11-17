@@ -15,6 +15,13 @@
 //! answers the identities and scores of what the search found: no statement,
 //! no provenance, nothing a caller could mistake for the claim.
 //!
+//! It ranks by shared words, or by meaning. A retriever given an embedder
+//! ([`KnowledgeGraphCommunalRetriever::with_embedder`]) over a store that
+//! reports [`KnowledgeGraphCapability::SemanticSearch`] embeds the query and
+//! ranks the claims by how near their stored embedding is to it. The choice
+//! is made when the retriever is built and never changes afterwards, so
+//! every snapshot it contributes to records one retriever version.
+//!
 //! The **authority** answers the claim. Context assembly resolves every
 //! ranked identity through it, in the space whose ranking named it, and
 //! decides on the record it answers. That is where a claim's trust state,
@@ -31,20 +38,23 @@
 //! live here and are exhaustive, so a trust status added to
 //! [`ClaimTrustStatus`] fails to compile until it is mapped.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use rakka_agent::{
-    AgentCommunalClaimAuthority, AgentCommunalClaimId, AgentCommunalClaimRetriever,
-    AgentCommunalClaimTrust, AgentRevisionNumber, CommunalClaimObject, CommunalClaimProvenance,
-    CommunalClaimRecord, CommunalClaimStatement, CommunalRetrievalOutcome, CommunalRetrievalQuery,
-    KnowledgeSpaceId, MemoryError, MemoryFuture, RankedCommunalClaim, TenantId,
+    embed_memory_vector, AgentCommunalClaimAuthority, AgentCommunalClaimId,
+    AgentCommunalClaimRetriever, AgentCommunalClaimTrust, AgentMemoryEmbedder, AgentRevisionNumber,
+    CommunalClaimObject, CommunalClaimProvenance, CommunalClaimRecord, CommunalClaimStatement,
+    CommunalRetrievalOutcome, CommunalRetrievalQuery, KnowledgeSpaceId, MemoryError, MemoryFuture,
+    RankedCommunalClaim, TenantId,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
 use crate::claim::{Claim, ClaimId, ClaimObject, ClaimTrustStatus};
 use crate::error::{ClaimError, ClaimResult};
 use crate::scope::KnowledgeSpaceScope;
-use crate::search::ClaimSearch;
+use crate::search::{ClaimSearch, ClaimSearchReport};
+use crate::semantic::{ClaimEmbedding, ClaimSemanticSearch};
 use crate::store::{KnowledgeGraphCapability, KnowledgeGraphStore};
 
 impl From<ClaimTrustStatus> for AgentCommunalClaimTrust {
@@ -103,8 +113,77 @@ fn space_scope(
     })
 }
 
-/// Ranks the claims of a knowledge space by keyword search over a wired
-/// [`KnowledgeGraphStore`].
+/// How a [`KnowledgeGraphCommunalRetriever`] ranks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnowledgeGraphCommunalRanking {
+    /// By the words a claim shares with the query
+    /// ([`KnowledgeGraphStore::search`]). Retriever version 1.
+    Keyword,
+    /// By how near a claim's stored embedding is to the query's
+    /// ([`KnowledgeGraphStore::search_semantic`]). Retriever version 2.
+    Semantic,
+}
+
+/// The most query texts a meaning-based retriever remembers the vectors of.
+///
+/// A retriever is shared by every run on a node, and context assembly calls
+/// it once per granted space with one turn's query. Remembering the last few
+/// queries is what lets each turn embed its query once while the turns of
+/// several runs interleave. A turn whose query was pushed out by this many
+/// later ones embeds it again, which costs a model call and nothing else.
+pub const COMMUNAL_QUERY_MEMO_MAX_ENTRIES: usize = 16;
+
+/// The remembered queries, oldest first: each text with the vector it
+/// embedded to.
+type RememberedQueries = VecDeque<(String, Vec<f32>)>;
+
+/// The embedder a meaning-based retriever embeds its queries with, and the
+/// last query it embedded.
+#[derive(Clone)]
+struct QueryEmbedding {
+    embedder: Arc<dyn AgentMemoryEmbedder>,
+    /// The last [`COMMUNAL_QUERY_MEMO_MAX_ENTRIES`] query texts embedded,
+    /// each with its vector, keyed by the exact text. Shared across clones
+    /// of the retriever. A vector is only ever answered for the text it was
+    /// embedded from, so sharing it across runs and tenants reveals nothing:
+    /// the caller already holds the text.
+    last: Arc<Mutex<RememberedQueries>>,
+}
+
+impl QueryEmbedding {
+    /// The vector of `text`, embedded now unless it is one of the texts
+    /// remembered.
+    async fn vector_of(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
+        let remembered = self
+            .last
+            .lock()
+            .expect("the query memo lock is never poisoned")
+            .iter()
+            .find(|(remembered, _)| remembered == text)
+            .map(|(_, vector)| vector.clone());
+        if let Some(vector) = remembered {
+            return Ok(vector);
+        }
+        // The lock is not held across the model call. Two turns embedding
+        // the same text at once each call the model, and one is remembered.
+        let vector = embed_memory_vector(self.embedder.as_ref(), text).await?;
+        let mut last = self
+            .last
+            .lock()
+            .expect("the query memo lock is never poisoned");
+        if !last.iter().any(|(remembered, _)| remembered == text) {
+            if last.len() >= COMMUNAL_QUERY_MEMO_MAX_ENTRIES {
+                last.pop_front();
+            }
+            last.push_back((text.to_string(), vector.clone()));
+        }
+        Ok(vector)
+    }
+}
+
+/// Ranks the claims of a knowledge space over a wired
+/// [`KnowledgeGraphStore`]: by keyword search, or, given an embedder and a
+/// store that can, by meaning.
 ///
 /// The ranking carries identities and scores only. Every restriction the
 /// query names is applied by the store before it ranks, so a claim the reader
@@ -113,10 +192,12 @@ fn space_scope(
 #[derive(Clone)]
 pub struct KnowledgeGraphCommunalRetriever {
     store: Arc<dyn KnowledgeGraphStore>,
+    /// Present exactly when the retriever ranks by meaning.
+    embedding: Option<QueryEmbedding>,
 }
 
 impl KnowledgeGraphCommunalRetriever {
-    /// Wires the retriever over the store it searches.
+    /// Wires the retriever over the store it searches. It ranks by keyword.
     ///
     /// # Errors
     ///
@@ -135,7 +216,54 @@ impl KnowledgeGraphCommunalRetriever {
                     .to_string(),
             });
         }
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            embedding: None,
+        })
+    }
+
+    /// Makes the retriever rank by meaning, when its store can.
+    ///
+    /// Given a store that reports
+    /// [`KnowledgeGraphCapability::SemanticSearch`], the retriever embeds
+    /// each query with `embedder` and ranks the space's claims by how near
+    /// their stored embedding is to it; it then reports retriever version 2.
+    /// Given any other store, the embedder is dropped and the retriever
+    /// keeps ranking by keyword: the choice is made here, once, and
+    /// [`Self::ranking`] says which it was, so a deployment can assert it
+    /// got what it wired.
+    ///
+    /// **Ranking by meaning sends the query text to `embedder`** on every
+    /// turn that searches, and the embedder may be a service outside the
+    /// deployment. The query is text derived from the run's recent session
+    /// entries, up to 1024 bytes, with no classification of its own.
+    ///
+    /// A query that cannot be embedded fails that retrieval, which context
+    /// assembly records as a degraded space; there is no fall back to a
+    /// keyword search. A claim with no embedding under this embedder's
+    /// reference is not found, and makes the outcome's `index_incomplete`
+    /// true (see [`embed_claims`](crate::embedding_pass::embed_claims)).
+    #[must_use]
+    pub fn with_embedder(mut self, embedder: Arc<dyn AgentMemoryEmbedder>) -> Self {
+        self.embedding = self
+            .store
+            .capabilities()
+            .supports(KnowledgeGraphCapability::SemanticSearch)
+            .then(|| QueryEmbedding {
+                embedder,
+                last: Arc::new(Mutex::new(VecDeque::new())),
+            });
+        self
+    }
+
+    /// How this retriever ranks. Fixed when it was built.
+    #[must_use]
+    pub const fn ranking(&self) -> KnowledgeGraphCommunalRanking {
+        if self.embedding.is_some() {
+            KnowledgeGraphCommunalRanking::Semantic
+        } else {
+            KnowledgeGraphCommunalRanking::Keyword
+        }
     }
 }
 
@@ -143,6 +271,7 @@ impl std::fmt::Debug for KnowledgeGraphCommunalRetriever {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KnowledgeGraphCommunalRetriever")
             .field("store", &self.store.backend_name())
+            .field("ranking", &self.ranking())
             .finish()
     }
 }
@@ -154,9 +283,14 @@ impl AgentCommunalClaimRetriever for KnowledgeGraphCommunalRetriever {
 
     /// Version 1: keyword search scored by
     /// [`claim_search_relevance_bps`](crate::search::claim_search_relevance_bps).
+    /// Version 2: meaning-based search scored by
+    /// [`claim_semantic_relevance_bps`](crate::semantic::claim_semantic_relevance_bps).
     /// It moves when the meaning of a score does.
     fn retriever_version(&self) -> AgentRevisionNumber {
-        AgentRevisionNumber::new(1)
+        match self.ranking() {
+            KnowledgeGraphCommunalRanking::Keyword => AgentRevisionNumber::new(1),
+            KnowledgeGraphCommunalRanking::Semantic => AgentRevisionNumber::new(2),
+        }
     }
 
     fn retrieve<'a>(
@@ -182,11 +316,25 @@ impl AgentCommunalClaimRetriever for KnowledgeGraphCommunalRetriever {
                 .with_classifications(query.classifications.clone())
                 .with_min_confidence_bps(query.min_confidence_bps)
                 .with_reader(query.reader.clone());
-            let report = self
-                .store
-                .search(&scope, &search)
-                .await
-                .map_err(|error| backend_error(backend, &error))?;
+            let report = match &self.embedding {
+                None => self.store.search(&scope, &search).await,
+                // A query that says nothing has no direction to rank by. A
+                // word search of no words finds nothing either, and no model
+                // is asked to embed an empty text.
+                Some(_) if query.text.trim().is_empty() => Ok(ClaimSearchReport::default()),
+                Some(embedding) => {
+                    let vector = embedding.vector_of(&query.text).await?;
+                    let search = ClaimSemanticSearch::new(
+                        search,
+                        ClaimEmbedding {
+                            reference: embedding.embedder.embedding_ref(),
+                            vector,
+                        },
+                    );
+                    self.store.search_semantic(&scope, &search).await
+                }
+            }
+            .map_err(|error| backend_error(backend, &error))?;
 
             let mut ranked = Vec::with_capacity(report.hits.len());
             for hit in report.hits {
