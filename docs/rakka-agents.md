@@ -305,10 +305,12 @@ the row says: for an `Exhausted` row, the outcome and code its worker was
 about to deliver, without the collaborator's failure reason, which no
 durable record keeps. When the entry is finished too, no claim will come, and
 the per-run half of a pass (`register_run`, `pump_run`) tells the run instead,
-once the entry has been finished for a lease, so it never speaks ahead of a
-worker that is about to. It also parks a live run whose finished ticket lost
-its row, which nothing else reaches. An ordinary pass reads nothing more for
-this. [`rakka-compatibility.md`](rakka-compatibility.md) has the tables.
+once the entry has been finished for a lease, so that it does not speak ahead
+of a worker that is about to. It also parks a live run whose finished ticket
+lost its row, which nothing else reaches. An ordinary pass reads nothing more
+for this. The repair runs only in a pass: a deployment that pumps a run only
+when something happens to it should also pump the runs that are waiting on an
+effect. [`rakka-compatibility.md`](rakka-compatibility.md) has the tables.
 
 **What is not bounded.** The record is still one record, written whole. A
 prune bounds it to the live entries plus the finished ones inside the

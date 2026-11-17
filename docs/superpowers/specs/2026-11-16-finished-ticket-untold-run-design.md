@@ -348,3 +348,39 @@ Three of the first eighteen survived and each got a test.
 | A live row is parked under a cancellation-fenced entry | survived in each look alone: the two looks hold the same test, and one ticket cannot show either without the other. Mutated together, `a_live_row_under_a_cancellation_in_progress_is_left_alone` fails |
 | A live row is parked and not cancelled | `a_live_run_whose_finished_ticket_lost_its_row_is_parked`, `the_same_for_an_entry_with_no_stamp` |
 | A live row's cancellation is not counted | survived; `a_live_run_whose_finished_ticket_lost_its_row_is_parked` now asserts the count |
+
+**After the whole-branch review** (one fix pass):
+
+- **The fence asks the fleet entry before it reads a cancelled row as its
+  own.** The sweep's cancel-first order made a second source of cancelled
+  rows under a waited effect. If the sweep was lost after the cancel and the
+  run was then cancelled by an operator, the fence's arm for "a row an
+  earlier fence cancelled" told the run `Cancelled` for a ticket whose entry
+  records a spent budget. That arm now fires only when the entry is absent,
+  unfinished, or finished as cancelled under a code other than
+  `ticket-row-missing`, `ticket-row-settled` and `indeterminate`.
+  `a_row_the_sweep_cancelled_is_not_read_as_the_fences_own` failed first.
+- **A line of no known shape parks a non-idempotent effect**, under
+  `ticket-row-settled`, where section 5 exhausted it. The substrate
+  documents that a dispatcher may exhaust a row because an outcome is
+  unknown, and for this class an unknown outcome always parks. Read-only
+  and idempotent effects are exhausted as section 5 says. The reader takes
+  the safety class.
+- **A lapsed claim still fails its pass on one row**: a `Cancelled` row
+  under a fencing wind-down keeps its two steps from before this change,
+  and the second is not tolerant of `claim-fenced`. The plan's constraint
+  holds for every row the entry is settled to follow.
+- **Tests added** for table rows nothing held: the sweep on a winding-down
+  run, on a finished row under a cancellation-fenced entry, and on
+  `Dispatched` and `Cancelled` rows.
+- **The public doc comments of `pump_run` and `register_run`** still
+  described the per-run half as registration and the fence; they now say
+  what it tells a run and when it reads. The compatibility entry had six
+  sentences the code did not keep; each is corrected there.
+- **Falsified again**, seven mutations over the fix pass, each caught: the
+  fence reading any cancelled row as its own; an entry that spent a budget,
+  or was settled under an unknown-history code, read as one that may never
+  have started; the sweep telling a winding-down run nothing from a
+  finished row; a cancellation-fenced entry not counted as past claiming;
+  the sweep telling only from an `Exhausted` row; an unknown line
+  exhausting a non-idempotent effect.

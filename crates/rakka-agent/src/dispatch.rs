@@ -173,6 +173,10 @@ pub(crate) const CREDENTIAL_RESOLUTION_FAILED: &str = "credential-resolution-fai
 /// was still waiting on (issue #150).
 const TICKET_ROW_MISSING: &str = "ticket-row-missing";
 
+/// The reason a parked generation's ticket is settled as cancelled under:
+/// the fleet entry's `last_error_code` once its effect is `Indeterminate`.
+const PARKED_INDETERMINATE: &str = "indeterminate";
+
 /// The detail carried by the `Indeterminate` outcome of an effect whose
 /// ticket lost its outbox row.
 const TICKET_ROW_MISSING_MESSAGE: &str =
@@ -491,13 +495,13 @@ fn owed_by_finished_row(
     let counted = row.attempts().attempts();
     match row.status() {
         OutboxStatus::Exhausted => {
-            let reconcileable = intent.safety.class() == AgentEffectSafetyClass::Reconcileable;
-            let verdict = match owed_by_exhausted_row(row.attempts().last_error(), reconcileable) {
-                OwedByExhaustedRow::Exhausted { code, detail } => {
-                    RowVerdict::Exhausted { code, detail }
-                }
-                OwedByExhaustedRow::Indeterminate { code } => RowVerdict::Unknown { code },
-            };
+            let verdict =
+                match owed_by_exhausted_row(row.attempts().last_error(), intent.safety.class()) {
+                    OwedByExhaustedRow::Exhausted { code, detail } => {
+                        RowVerdict::Exhausted { code, detail }
+                    }
+                    OwedByExhaustedRow::Indeterminate { code } => RowVerdict::Unknown { code },
+                };
             (verdict, counted)
         }
         OutboxStatus::Cancelled if fence_applies => {
@@ -2199,13 +2203,14 @@ pub struct AgentDispatchPass {
     /// The status of the run the pass was given, as the pass read it: `None`
     /// when that run has no record, and on a pass that reads no run.
     ///
-    /// Read once, before the wind-down fence, by
-    /// [`AgentRunEffectDispatcher::register_run`] and
+    /// Read once, before the per-run half's look at the effects the run
+    /// waits on, by [`AgentRunEffectDispatcher::register_run`] and
     /// [`AgentRunEffectDispatcher::pump_run`];
     /// [`AgentRunEffectDispatcher::claim_and_execute`] serves the fleet rather
     /// than one run and leaves it `None`. A terminal status is final. A
-    /// non-terminal one can be a pass behind, because the fence, and the
-    /// claims a pump executes, may move the run after the read.
+    /// non-terminal one can be a pass behind, because that look, the
+    /// wind-down fence in it, and the claims a pump executes may each move
+    /// the run after the read.
     pub run_status: Option<AgentRunStatus>,
 }
 
@@ -3177,11 +3182,11 @@ where
         Ok(load_agent_run_state(&self.runs, scope, &self.schema_policy).await?)
     }
 
-    /// One bounded dispatch pass: register the given run's due tickets and
-    /// fence it if it is winding down, then claim and execute what the fleet
-    /// has due.
+    /// One bounded dispatch pass: register the given run's due tickets, tell
+    /// the run what it is owed for a ticket no claim will come for, fence it
+    /// if it is winding down, then claim and execute what the fleet has due.
     ///
-    /// Only the registration and the wind-down fence are scoped to the given
+    /// Only the per-run half ([`Self::register_run`]) is scoped to the given
     /// run. The claim batch is *fleet-wide* — a worker serves every run whose
     /// tickets are due, so a pass may execute tickets other runs registered;
     /// each claim re-derives its own run scope and is recovered under that
@@ -3206,11 +3211,28 @@ where
     }
 
     /// The per-run half of a pass: registers the given run's due tickets into
-    /// the fleet and fences the run if it is winding down. Claims nothing.
+    /// the fleet, then looks at the effects the run waits on. Claims nothing.
+    ///
+    /// **The look** does two things, for a live run and a winding-down one
+    /// alike. It tells the run what it is owed for a ticket no claim will
+    /// come for (issue #134): one whose outbox row is finished and whose
+    /// fleet entry has been finished for a lease, after a worker was lost
+    /// between finishing the ticket and telling the run; and one whose
+    /// fleet entry is finished and whose row was lost, which it parks as
+    /// `Indeterminate`, cancelling a row the run put back. And it fences a
+    /// winding-down run: a ready effect whose flush never landed, or whose
+    /// row an earlier fence cancelled, is told `Cancelled`. A ticket a
+    /// worker holds or can still claim is left to the claim.
+    ///
+    /// That repair runs only when the run is registered or pumped. A run
+    /// left waiting by a lost worker is told on the first such call at
+    /// least a lease after its ticket finished, so a deployment that pumps
+    /// a run only when something happens to it should also pump the runs
+    /// that are waiting on an effect.
     ///
     /// The report carries what registration added or changed
-    /// ([`AgentDispatchPass::registered`]), what the fence cancelled and
-    /// delivered, and the status it read
+    /// ([`AgentDispatchPass::registered`]), what the look delivered, parked
+    /// and cancelled, and the status it read
     /// ([`AgentDispatchPass::run_status`]). Registration happens only here
     /// and in [`Self::pump_run`], so a ticket the run's outbox holds is
     /// claimable only once one of them has run for that run.
@@ -3220,11 +3242,13 @@ where
     /// registration inserts or changes an entry. When it does read the fleet
     /// record, it reads the run's outbox once more afterwards and registers
     /// what that read finds due, so a ticket finished between the two reads
-    /// is never registered again. The wind-down fence reads the fleet record
-    /// too, once, when a winding-down run holds a ready effect that has no
-    /// outbox row and the registration did not just read it: a ticket the
-    /// fleet indexed once had a row, and the fence does not cancel it as a
-    /// flush that never landed.
+    /// is never registered again. The look reads nothing more unless an
+    /// effect the run waits on has a finished row or none, or a live row
+    /// under a finished entry. Then it reads the run's outbox again, once
+    /// for each effect the run waits on, and the fleet record once if the
+    /// registration did not just read it. What the look writes is the run,
+    /// and the run's outbox when it cancels a row or plants the fence's
+    /// cancelled one; the look never writes the fleet record.
     pub async fn register_run(
         &mut self,
         scope: &AgentRunScope,
@@ -4485,7 +4509,7 @@ where
         .await?;
         match ticket {
             ParkedTicket::BothLayers => {
-                self.settle_ticket_cancelled(scope, &claim, "indeterminate", pass)
+                self.settle_ticket_cancelled(scope, &claim, PARKED_INDETERMINATE, pass)
                     .await?;
             }
             ParkedTicket::FleetOnly => self.settle_orphan_claim(&claim, pass).await?,
@@ -5450,7 +5474,7 @@ where
     /// |---|---|---|
     /// | live | finished | the row is cancelled and the effect parked `ticket-row-missing` |
     /// | live | anything else | nothing |
-    /// | `Cancelled`, and the wind-down fences the effect | any | the run is told `Cancelled` |
+    /// | `Cancelled`, and the wind-down fences the effect | none, or one that does not rule out a ticket that never started | the run is told `Cancelled` |
     /// | finished | a worker holds or can claim it | nothing |
     /// | finished | finished, or fenced by a cancellation request, for a lease | the run is told what the row says |
     /// | finished | none, and the row finished a lease ago | the same |
@@ -5494,7 +5518,14 @@ where
     ///   lands on a terminal row instead of creating dispatchable work
     ///   post-fence, and the cancelled word is delivered to the run;
     /// - a `Ready` effect whose row is already cancelled — an earlier fence
-    ///   died between settling the row and delivering the word.
+    ///   died between settling the row and delivering the word. The row
+    ///   alone does not say that: this sweep cancels a row the run put
+    ///   back, and the claim path settles a ticket's entry to follow a row
+    ///   cancelled by another hand. So the fleet entry is asked. One that
+    ///   finished `Exhausted` or `Completed`, or was finished as cancelled
+    ///   under `ticket-row-missing`, `ticket-row-settled` or
+    ///   `indeterminate`, is a ticket whose history is not "never started",
+    ///   and its cancelled row is read as any other finished row is.
     ///
     /// The compensation and workflow-cancel the wind-down itself authorized,
     /// and the promotion or claim append that copies work already recorded,
@@ -5570,20 +5601,19 @@ where
                 .map_err(AgentInboxError::from)?
                 .outbox_entry(&message_id)
                 .cloned();
-            // (finished, past claiming, last fencing token, last written)
-            let entry = self.fleet.state()?.entry(&dispatch_id).map(|entry| {
-                (
-                    entry.status.is_terminal(),
-                    entry.status.is_terminal() || entry.cancellation_requested,
-                    entry.last_fencing_token,
-                    entry.updated_at.as_millis(),
-                )
-            });
+            let entry = self
+                .fleet
+                .state()?
+                .entry(&dispatch_id)
+                .map(WaitedTicket::of);
             let now = self.now().as_millis();
 
             match (row, entry) {
                 (Some(row), entry) if !row_is_finished(row.status()) => {
-                    let Some((true, _, last_fence, _)) = entry else {
+                    let Some(last_fence) = entry
+                        .filter(|entry| entry.finished)
+                        .map(|entry| entry.last_fence)
+                    else {
                         // A worker holds the ticket, can claim it, or will
                         // once it is registered.
                         continue;
@@ -5614,7 +5644,11 @@ where
                     )
                     .await?;
                 }
-                (Some(row), _) if fenced && row.status() == OutboxStatus::Cancelled => {
+                (Some(row), entry)
+                    if fenced
+                        && row.status() == OutboxStatus::Cancelled
+                        && entry.is_none_or(|entry| entry.may_never_have_started) =>
+                {
                     self.deliver_outcome(
                         scope,
                         &intent,
@@ -5631,8 +5665,8 @@ where
                     let (settled_at, fence) = match entry {
                         // A worker holds the ticket or can claim it: the
                         // claim path owns the row.
-                        Some((_, false, _, _)) => continue,
-                        Some((_, true, last_fence, since)) => (since, last_fence),
+                        Some(entry) if !entry.past_claiming => continue,
+                        Some(entry) => (entry.since, entry.last_fence),
                         None => (row.updated_at().as_millis(), 0),
                     };
                     if now < settled_at.saturating_add(lease_ms) {
@@ -5642,13 +5676,13 @@ where
                     self.tell_owed(scope, &intent, attempt, fence, verdict, pass)
                         .await?;
                 }
-                (None, Some((_, true, last_fence, _))) => {
+                (None, Some(entry)) if entry.past_claiming => {
                     let attempt = self.attempts_counted(&dispatch_id, &intent);
                     self.tell_indeterminate(
                         scope,
                         &intent,
                         attempt,
-                        last_fence,
+                        entry.last_fence,
                         TICKET_ROW_MISSING,
                         TICKET_ROW_MISSING_MESSAGE,
                         None,
@@ -5696,6 +5730,52 @@ where
             }
         }
         Ok(())
+    }
+}
+
+/// What the per-run sweep reads of the fleet entry of a ticket a run waits
+/// on ([`AgentRunEffectDispatcher::settle_waited_effects`]).
+#[derive(Clone, Copy)]
+struct WaitedTicket {
+    /// The entry is finished: nothing will claim it.
+    finished: bool,
+    /// No claim will come: the entry is finished, or a cancellation request
+    /// fenced it.
+    past_claiming: bool,
+    /// Nothing the entry records rules out that the ticket was cancelled
+    /// before any attempt could start.
+    may_never_have_started: bool,
+    /// The last fencing token the entry issued.
+    last_fence: u64,
+    /// When the entry was last written, in milliseconds: when it finished,
+    /// or was fenced.
+    since: u64,
+}
+
+impl WaitedTicket {
+    fn of(entry: &rakka_agent_workflow::AgentDispatchEntry) -> Self {
+        use rakka_agent_workflow::AgentDispatchStatus;
+        // An entry that finished `Exhausted` or `Completed` records
+        // attempts. One this dispatcher finished as cancelled because the
+        // ticket's row was lost, was settled by another's hand, or was
+        // parked, records that the ticket's history is not known. For any
+        // of those, "fenced before any attempt could start" is not
+        // something a cancelled row can be read as saying.
+        let may_never_have_started = match entry.status {
+            AgentDispatchStatus::Exhausted | AgentDispatchStatus::Completed => false,
+            AgentDispatchStatus::Cancelled => !matches!(
+                entry.last_error_code.as_deref(),
+                Some(TICKET_ROW_MISSING | TICKET_ROW_SETTLED | PARKED_INDETERMINATE)
+            ),
+            _ => true,
+        };
+        Self {
+            finished: entry.status.is_terminal(),
+            past_claiming: entry.status.is_terminal() || entry.cancellation_requested,
+            may_never_have_started,
+            last_fence: entry.last_fencing_token,
+            since: entry.updated_at.as_millis(),
+        }
     }
 }
 
@@ -6001,6 +6081,8 @@ impl From<AgentEffectError> for AgentDispatchError {
 /// The lines live here, beside the function that reads them back, so the
 /// sites that write a line and the reader cannot drift apart.
 mod owed_outcome {
+    use crate::definition::AgentEffectSafetyClass;
+
     /// The code of a generation whose budget was spent on attempts whose worker
     /// was lost after `Started`.
     pub(crate) const WORKER_LOST_CODE: &str = "dispatcher-lost-after-started";
@@ -6084,13 +6166,22 @@ mod owed_outcome {
     /// precedes it is a code: not empty, and without whitespace.
     ///
     /// A line of no known shape, or no line, says the budget is spent and not
-    /// how. A reconcileable effect then parks, since for that class only its
-    /// protocol establishes an outcome and the budget to ask it is gone. Any
-    /// other effect is exhausted under [`TICKET_ROW_SETTLED`], with the line as
-    /// its detail.
+    /// how. This dispatcher writes no such line, but another writer of the
+    /// same outbox can: the substrate lets a dispatcher exhaust a row
+    /// because an outcome is unknown, under words of its own. So the effect
+    /// gets what its class gets when nothing is known:
+    ///
+    /// - a reconcileable effect parks under `reconciliation-exhausted`,
+    ///   since only its protocol establishes an outcome and the budget to
+    ///   ask it is gone;
+    /// - a non-idempotent effect parks under [`TICKET_ROW_SETTLED`], as its
+    ///   unknown outcome always does;
+    /// - a read-only or idempotent effect is exhausted under
+    ///   [`TICKET_ROW_SETTLED`], with the line as its detail, as its
+    ///   unknown outcome is once the budget is spent.
     pub(crate) fn owed_by_exhausted_row(
         line: Option<&str>,
-        reconcileable: bool,
+        class: AgentEffectSafetyClass,
     ) -> OwedByExhaustedRow {
         let line = line.unwrap_or_default();
         for finding in [RECONCILIATION_UNKNOWN, OUTCOME_MISMATCH] {
@@ -6114,14 +6205,18 @@ mod owed_outcome {
                 };
             }
         }
-        if reconcileable {
-            OwedByExhaustedRow::Indeterminate {
+        match class {
+            AgentEffectSafetyClass::Reconcileable => OwedByExhaustedRow::Indeterminate {
                 code: RECONCILIATION_UNKNOWN.exhausted_code,
-            }
-        } else {
-            OwedByExhaustedRow::Exhausted {
-                code: TICKET_ROW_SETTLED.to_string(),
-                detail: line.to_string(),
+            },
+            AgentEffectSafetyClass::NonIdempotent => OwedByExhaustedRow::Indeterminate {
+                code: TICKET_ROW_SETTLED,
+            },
+            AgentEffectSafetyClass::ReadOnly | AgentEffectSafetyClass::Idempotent => {
+                OwedByExhaustedRow::Exhausted {
+                    code: TICKET_ROW_SETTLED.to_string(),
+                    detail: line.to_string(),
+                }
             }
         }
     }
@@ -6129,6 +6224,13 @@ mod owed_outcome {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        const CLASSES: [AgentEffectSafetyClass; 4] = [
+            AgentEffectSafetyClass::ReadOnly,
+            AgentEffectSafetyClass::Idempotent,
+            AgentEffectSafetyClass::Reconcileable,
+            AgentEffectSafetyClass::NonIdempotent,
+        ];
 
         fn exhausted(code: &str, detail: &str) -> OwedByExhaustedRow {
             OwedByExhaustedRow::Exhausted {
@@ -6139,62 +6241,64 @@ mod owed_outcome {
 
         #[test]
         fn a_failed_attempts_line_gives_back_its_code_and_detail() {
-            for reconcileable in [false, true] {
+            for class in CLASSES {
                 assert_eq!(
-                    owed_by_exhausted_row(
-                        Some("tool-refused: the tool refused the call"),
-                        reconcileable
-                    ),
-                    exhausted("tool-refused", "the tool refused the call")
+                    owed_by_exhausted_row(Some("tool-refused: the tool refused the call"), class),
+                    exhausted("tool-refused", "the tool refused the call"),
+                    "{class:?}"
                 );
             }
         }
 
         #[test]
         fn a_line_is_split_at_its_first_separator() {
-            for reconcileable in [false, true] {
+            for class in CLASSES {
                 assert_eq!(
-                    owed_by_exhausted_row(Some("a: b: c"), reconcileable),
-                    exhausted("a", "b: c")
+                    owed_by_exhausted_row(Some("a: b: c"), class),
+                    exhausted("a", "b: c"),
+                    "{class:?}"
                 );
             }
         }
 
         #[test]
         fn the_worker_lost_line_gives_back_its_code() {
-            for reconcileable in [false, true] {
+            for class in CLASSES {
                 assert_eq!(
-                    owed_by_exhausted_row(Some(WORKER_LOST_LINE), reconcileable),
-                    exhausted(WORKER_LOST_CODE, AMBIGUOUS_BUDGET_SPENT_MESSAGE)
+                    owed_by_exhausted_row(Some(WORKER_LOST_LINE), class),
+                    exhausted(WORKER_LOST_CODE, AMBIGUOUS_BUDGET_SPENT_MESSAGE),
+                    "{class:?}"
                 );
             }
         }
 
         #[test]
         fn a_finding_that_established_nothing_parks_under_its_code() {
-            for reconcileable in [false, true] {
+            for class in CLASSES {
                 assert_eq!(
-                    owed_by_exhausted_row(Some(RECONCILIATION_UNKNOWN.line), reconcileable),
+                    owed_by_exhausted_row(Some(RECONCILIATION_UNKNOWN.line), class),
                     OwedByExhaustedRow::Indeterminate {
                         code: "reconciliation-exhausted"
-                    }
+                    },
+                    "{class:?}"
                 );
             }
         }
 
         #[test]
         fn the_mismatch_line_is_a_finding_and_not_a_failed_attempt() {
-            for reconcileable in [false, true] {
+            for class in CLASSES {
                 assert_eq!(
-                    owed_by_exhausted_row(Some(OUTCOME_MISMATCH.line), reconcileable),
+                    owed_by_exhausted_row(Some(OUTCOME_MISMATCH.line), class),
                     OwedByExhaustedRow::Indeterminate {
                         code: "effect-outcome-mismatch"
-                    }
+                    },
+                    "{class:?}"
                 );
             }
         }
 
-        /// Lines no exhausting site writes.
+        /// Lines no exhausting site of this dispatcher writes.
         const UNKNOWN_SHAPES: [Option<&str>; 5] = [
             Some("no colon here"),
             Some("two words: detail"),
@@ -6207,7 +6311,7 @@ mod owed_outcome {
         fn a_line_of_no_known_shape_parks_a_reconcileable_effect() {
             for line in UNKNOWN_SHAPES {
                 assert_eq!(
-                    owed_by_exhausted_row(line, true),
+                    owed_by_exhausted_row(line, AgentEffectSafetyClass::Reconcileable),
                     OwedByExhaustedRow::Indeterminate {
                         code: "reconciliation-exhausted"
                     },
@@ -6216,14 +6320,36 @@ mod owed_outcome {
             }
         }
 
+        /// Another writer can exhaust a row because an outcome is unknown,
+        /// under a line of its own. For a non-idempotent effect an unknown
+        /// outcome always parks, so a line that does not say otherwise
+        /// parks it.
         #[test]
-        fn a_line_of_no_known_shape_exhausts_any_other_effect_under_the_rows_code() {
+        fn a_line_of_no_known_shape_parks_a_non_idempotent_effect() {
             for line in UNKNOWN_SHAPES {
                 assert_eq!(
-                    owed_by_exhausted_row(line, false),
-                    exhausted("ticket-row-settled", line.unwrap_or_default()),
+                    owed_by_exhausted_row(line, AgentEffectSafetyClass::NonIdempotent),
+                    OwedByExhaustedRow::Indeterminate {
+                        code: "ticket-row-settled"
+                    },
                     "{line:?}"
                 );
+            }
+        }
+
+        #[test]
+        fn a_line_of_no_known_shape_exhausts_an_effect_that_is_safe_to_have_run() {
+            for class in [
+                AgentEffectSafetyClass::ReadOnly,
+                AgentEffectSafetyClass::Idempotent,
+            ] {
+                for line in UNKNOWN_SHAPES {
+                    assert_eq!(
+                        owed_by_exhausted_row(line, class),
+                        exhausted("ticket-row-settled", line.unwrap_or_default()),
+                        "{class:?} {line:?}"
+                    );
+                }
             }
         }
     }

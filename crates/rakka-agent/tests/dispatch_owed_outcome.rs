@@ -534,10 +534,35 @@ async fn a_registered_ticket_with_a_finished_row(
 }
 
 /// A line no exhausting site of this build writes says the budget is spent
-/// and not how. Any effect but a reconcileable one is exhausted under the
-/// row's own code; a reconcileable one parks.
+/// and not how. An effect that is safe to have run is exhausted under the
+/// row's own code. A reconcileable one parks, and so does a non-idempotent
+/// one: another writer may have exhausted the row because the outcome was
+/// unknown.
 #[tokio::test]
 async fn a_row_whose_line_has_no_known_shape() {
+    let (fx, _effect) = a_registered_ticket_with_a_finished_row(
+        &AgentEffectSpec::non_idempotent(),
+        None,
+        OutboxStatus::Exhausted,
+        "something else happened",
+    )
+    .await;
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref(), pass.parked_indeterminate),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("ticket-row-settled"),
+            1
+        )
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+
     let (fx, _effect) = a_registered_ticket_with_a_finished_row(
         &idempotent(3),
         None,
@@ -1220,6 +1245,271 @@ async fn a_live_run_whose_finished_ticket_lost_its_row_is_parked_before_it_settl
     );
     assert_parked_as_missing(&fx).await;
     assert!(fx.outbox_row(&effect).await.is_none());
+}
+
+/// The sweep cancels the row the run put back, and is lost before it parks
+/// the run. Then an operator cancels the run. The wind-down fence tells a
+/// run `Cancelled` for a ready effect whose row is already cancelled: an
+/// earlier fence died between the row and the word. This row is not the
+/// fence's. Its ticket's entry records attempts that spent a budget, so
+/// nobody can say the effect never started, and the run is parked.
+#[tokio::test]
+async fn a_row_the_sweep_cancelled_is_not_read_as_the_fences_own() {
+    let (fx, effect) = a_finished_ticket_that_lost_its_row().await;
+    fx.expire_lease();
+    fx.settle().await;
+    fx.fx.runs.crash_at(1, CrashPoint::BeforeWrite);
+    fx.pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect_err("the park's delivery is refused");
+    fx.fx.runs.assert_crash_fired(1, CrashPoint::BeforeWrite);
+    fx.fx.runs.survive();
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Cancelled)
+    );
+    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+    cancel_the_run(&fx).await;
+
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(pass.parked_indeterminate, 1);
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("ticket-row-settled")
+        )
+    );
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::WaitingForReconciliation
+    );
+}
+
+/// The claim path settled a cancelled row's entry to follow the row, and was
+/// lost before it parked the run. The entry is finished as cancelled under
+/// `ticket-row-settled`: this dispatcher's own word for a ticket ended by
+/// another hand, with nothing known of what it did. When the run is then
+/// cancelled, the fence does not read that row as its own either.
+#[tokio::test]
+async fn a_cancelled_row_whose_entry_was_settled_to_follow_it_is_not_the_fences_own() {
+    let (fx, effect) = a_registered_ticket_with_a_finished_row(
+        &idempotent(3),
+        None,
+        OutboxStatus::Cancelled,
+        "ended",
+    )
+    .await;
+    fx.fx.runs.crash_at(1, CrashPoint::BeforeWrite);
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect_err("the park's delivery is refused");
+    fx.fx.runs.assert_crash_fired(1, CrashPoint::BeforeWrite);
+    fx.fx.runs.survive();
+    let entry = fleet_entry(&fx, &effect).await.expect("the entry is kept");
+    assert_eq!(
+        (entry.status, entry.last_error_code.as_deref()),
+        (AgentDispatchStatus::Cancelled, Some("ticket-row-settled"))
+    );
+    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+    cancel_the_run(&fx).await;
+    fx.expire_lease();
+
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(pass.parked_indeterminate, 1);
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("ticket-row-settled")
+        )
+    );
+}
+
+/// The sweep serves a winding-down run as it serves a live one. A cancelled
+/// run whose worker was lost after the fleet write is told what the row
+/// says, and not `Cancelled`: the ticket was attempted until its budget was
+/// spent.
+#[tokio::test]
+async fn a_cancelling_run_whose_worker_was_lost_after_the_fleet_write_is_told_by_the_sweep() {
+    let (fx, _effect, tool) = lose_the_worker_after_its_fleet_write(&idempotent(3)).await;
+    cancel_the_run(&fx).await;
+    fx.expire_lease();
+
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!((pass.claimed, pass.delivered), (0, 1));
+    assert_eq!(tool.calls(), 1);
+    assert_eq!(
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Exhausted)
+    );
+}
+
+/// A registered ticket claimed by a worker that is not the pipeline, which
+/// then finishes the row and is heard from no more.
+async fn a_ticket_another_worker_claimed_and_finished(
+    status: OutboxStatus,
+    line: &str,
+) -> (
+    AuthorityFixture,
+    AgentRunEffect,
+    AgentDispatcherFleet<FleetStore, SharedAtomicWorkflowClock>,
+    rakka_agent_workflow::AgentDispatchClaim,
+) {
+    let (fx, effect) = ticket(&idempotent(3), None, None).await;
+    fx.pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    fx.wf_clock.advance(10 * LEASE_MS);
+    let mut fleet = another_fleet_handle(&fx);
+    let claim = fleet
+        .claim_due(AgentDispatcherWorkerId::new("worker-lost"))
+        .await
+        .expect("the claim pass runs")
+        .claims
+        .remove(0);
+    finish_row(&fx, &effect, status, line).await;
+    (fx, effect, fleet, claim)
+}
+
+/// The worker exhausted its row and was lost, and a cancellation request
+/// then fenced its entry. A fenced entry is never claimed again, so no
+/// claim will tell the run. The sweep does, a lease after the request.
+#[tokio::test]
+async fn a_finished_row_under_a_cancellation_fenced_entry_is_told_after_a_lease() {
+    let (fx, _effect, mut fleet, _claim) = a_ticket_another_worker_claimed_and_finished(
+        OutboxStatus::Exhausted,
+        "tool-refused: the tool refused the call",
+    )
+    .await;
+    fleet
+        .request_run_cancellation(&rakka_agent::workflow_run_id(&run_scope()))
+        .await
+        .expect("the fleet fences the run's entries");
+
+    let early = fx
+        .pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the per-run half runs");
+    assert_eq!(
+        early.delivered, 0,
+        "a lease has not passed since the request"
+    );
+
+    fx.expire_lease();
+    let late = fx
+        .pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the per-run half runs");
+    assert_eq!(late.delivered, 1);
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (AgentRunEffectStatus::Exhausted, Some("tool-refused"))
+    );
+}
+
+/// The row says the call succeeded, the entry was completed, and the worker
+/// was lost before the result reached the run. No claim will come. The
+/// sweep parks the run: nothing can produce that result now.
+#[tokio::test]
+async fn the_sweep_parks_a_dispatched_row_under_a_completed_entry() {
+    let (fx, effect, mut fleet, claim) =
+        a_ticket_another_worker_claimed_and_finished(OutboxStatus::Dispatched, "").await;
+    fleet
+        .complete_claim(&claim)
+        .await
+        .expect("the entry is completed");
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Completed)
+    );
+    fx.expire_lease();
+
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(
+        (pass.claimed, pass.invoked, pass.parked_indeterminate),
+        (0, 0, 1)
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("ticket-row-settled")
+        )
+    );
+}
+
+/// The same for a cancelled row and a cancelled entry on a live run: the
+/// ticket was ended, and nothing says with what.
+#[tokio::test]
+async fn the_sweep_parks_a_cancelled_row_under_a_cancelled_entry_on_a_live_run() {
+    let (fx, effect, mut fleet, claim) =
+        a_ticket_another_worker_claimed_and_finished(OutboxStatus::Cancelled, "ended").await;
+    fleet
+        .record_claim_failure(
+            &claim,
+            &WorkflowTelemetryEvent::OutboxDispatchCancelled {
+                message_id: OutboxMessageId::new(claim.effect_id.as_str()),
+                at: rakka_agent_workflow::substrate::WorkflowTimestamp::from_millis(0),
+                message: "ended".to_string(),
+            },
+        )
+        .await
+        .expect("the entry is cancelled");
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Cancelled)
+    );
+    fx.expire_lease();
+
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(
+        (pass.claimed, pass.invoked, pass.parked_indeterminate),
+        (0, 0, 1)
+    );
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("ticket-row-settled")
+        )
+    );
 }
 
 // ---------------------------------------------------------------------------
