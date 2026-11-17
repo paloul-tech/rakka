@@ -4,7 +4,7 @@
 //! module adds a fleet-level index for cross-run discovery, leases, fencing,
 //! target concurrency limits, and bounded health snapshots.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
@@ -900,6 +900,21 @@ impl AgentDispatchEntry {
         self
     }
 
+    /// Gives a claimed entry back: `Pending`, with no lease. Everything
+    /// else but `updated_at` stays as it was, the last fencing token
+    /// included, so the next claim takes the next token and a write under
+    /// this one is fenced.
+    ///
+    /// `Pending`, whatever the entry was before it was claimed: the claim
+    /// did not keep what it replaced, and this is what a registration
+    /// already makes of a claim whose lease lapsed.
+    fn release(mut self, now: AgentTimestampMillis) -> Self {
+        self.status = AgentDispatchStatus::Pending;
+        self.lease = None;
+        self.updated_at = now;
+        self
+    }
+
     /// Settles a claimed ticket as cancelled and keeps why, bounded where
     /// it is written like every other writer of the field.
     fn mark_settled_cancelled(self, reason: &str, now: AgentTimestampMillis) -> Self {
@@ -940,7 +955,12 @@ pub struct AgentDispatchClaim {
     pub fencing_token: u64,
     /// Claim timestamp.
     pub claimed_at: AgentTimestampMillis,
-    /// Lease expiration timestamp.
+    /// Lease expiration timestamp, as the claim pass set it.
+    ///
+    /// A worker that renews the claims it holds
+    /// ([`AgentDispatcherFleet::hold_claims`]) moves the entry's lease and
+    /// not this value, which can then be earlier than the lease the entry
+    /// holds, never later. Read the entry for the lease as it stands.
     pub lease_expires_at: AgentTimestampMillis,
     /// Target class.
     pub target_class: AgentDispatchTargetClass,
@@ -1162,6 +1182,46 @@ impl AgentDispatcherFleetState {
     ) -> AgentDispatcherSnapshot {
         AgentDispatcherSnapshot::from_state(self, now, sample_limit)
     }
+
+    /// Extends the lease of every claim in `held` that is still current at
+    /// `now` to `lease_expires_at`, and answers how many it extended.
+    ///
+    /// A claim is current when the entry is leased to its worker under its
+    /// fencing token and the lease is active: one that lapsed, was taken
+    /// over, finished or is gone is left as it is, which covers the claim
+    /// the same write settles: a settled entry holds no lease. A lease
+    /// already running to `lease_expires_at` or past it is left too, so a
+    /// renewal never shortens one.
+    ///
+    /// An entry a cancellation request fenced is left as well. The record
+    /// wants that lease to end: once it lapses, the cancellation can settle
+    /// the entry, and extending it would keep a cancelled run's effect in a
+    /// worker's hands for as long as the worker went on settling.
+    fn renew_held(
+        &mut self,
+        held: &[AgentDispatchClaim],
+        now: AgentTimestampMillis,
+        lease_expires_at: AgentTimestampMillis,
+    ) -> u64 {
+        let mut renewed = 0;
+        for claim in held {
+            let Some(entry) = self.entries.get_mut(&claim.dispatch_id) else {
+                continue;
+            };
+            if entry.cancellation_requested || !entry.is_current_claim(claim, now) {
+                continue;
+            }
+            let Some(lease) = entry.lease.as_mut() else {
+                continue;
+            };
+            if lease.lease_expires_at < lease_expires_at {
+                lease.lease_expires_at = lease_expires_at;
+                entry.updated_at = now;
+                renewed += 1;
+            }
+        }
+        renewed
+    }
 }
 
 /// Result of registering due effects into the fleet index.
@@ -1361,6 +1421,9 @@ where
     claim_filter: AgentDispatchClaimFilter,
     metrics: Arc<dyn MetricsRecorder>,
     record: Option<StateRecord<AgentDispatcherFleetState>>,
+    /// The claims this handle's worker has taken and not started
+    /// ([`Self::hold_claims`]).
+    held: Vec<AgentDispatchClaim>,
 }
 
 impl<Store> AgentDispatcherFleet<Store, SystemWorkflowClock>
@@ -1442,6 +1505,7 @@ where
             },
             metrics,
             record: None,
+            held: Vec::new(),
         }
     }
 
@@ -1997,6 +2061,125 @@ where
             .is_some_and(|entry| entry.is_current_claim(claim, now)))
     }
 
+    /// Names the claims this handle's worker has taken and not yet started,
+    /// for the next settle the handle writes.
+    ///
+    /// A claim pass leases every claim of its batch at one instant, and a
+    /// worker that runs them one after another reaches the last one with
+    /// whatever the ones before it left of that lease. So before each claim
+    /// it runs, a worker tells its handle which claims it still holds, and
+    /// **the settle that ends that claim renews them**: in the same write,
+    /// each held claim that is still current is leased for a full lease
+    /// from that settle
+    /// ([`AgentDispatcherFleetSettings::lease_duration_ms`]). A batch then
+    /// needs a lease that covers its longest single dispatch, not their sum,
+    /// and renewing it costs no write of its own.
+    ///
+    /// The fence is the one a settle keeps. A held claim is renewed only
+    /// while the entry is leased to its worker under its fencing token and
+    /// the lease is active, checked against the record the write is applied
+    /// to. One whose lease lapsed, that another worker took over, that is
+    /// finished or gone is left as it is. So is one whose run's cancellation
+    /// was requested: that lease is meant to end. A renewal never shortens a
+    /// lease.
+    ///
+    /// **A hold is spent by the settle that lands.** It replaces what was
+    /// held, an empty list holds nothing, and a settle that is written
+    /// leaves nothing held, so a claim is renewed once for each time it is
+    /// named. A worker that stops naming a claim stops renewing it: a claim
+    /// nobody will start is leased for at most one more lease, never for as
+    /// long as its worker goes on settling other work. A worker whose batch
+    /// ends short should hold nothing, so that not even that one settle
+    /// renews what it abandoned. It reads and writes nothing.
+    ///
+    /// The claim being run is not renewed by anything, so a dispatch that
+    /// outlives a lease lapses as it always did, and the claims held behind
+    /// it lapse with it.
+    ///
+    /// The [`AgentDispatchClaim`] a worker holds keeps the expiry its claim
+    /// pass gave it. A renewal moves the entry's lease, not that value.
+    pub fn hold_claims(&mut self, claims: Vec<AgentDispatchClaim>) {
+        self.held = claims;
+    }
+
+    /// Gives claims back: each one that is still current goes back to
+    /// `Pending` with no lease, claimable at once.
+    ///
+    /// For a worker that stops before it has started every claim of its
+    /// batch. Left alone, those claims stay leased until the batch's lease
+    /// lapses, and count against their target's concurrency limit
+    /// meanwhile.
+    ///
+    /// A claim is released only while the entry is leased to its worker
+    /// under its fencing token and the lease is active. One that is not
+    /// current is passed over: its lease lapsed, another worker holds it, or
+    /// it is finished or gone. A released entry changes its status, its
+    /// lease and its `updated_at`, and nothing else. It keeps its due time,
+    /// its attempt count, its last error code and its last fencing token,
+    /// so the next claim takes the next token and a late write under the
+    /// released one is answered `claim-fenced`. It keeps a cancellation
+    /// request too: such an entry is not claimable, and is finished by the
+    /// cancellation, which no longer has a lease to wait for.
+    ///
+    /// Release only a claim whose dispatch never started. The entry says
+    /// nothing about what was done under the claim: the outbox row does, and
+    /// a claim released after its row was marked is taken again at once and
+    /// recovered as any attempt that disappeared.
+    ///
+    /// The record is read fresh on every attempt, never from this handle's
+    /// copy. Every current claim is released in one write, and a release
+    /// that finds none writes nothing. One that loses its compare-and-set
+    /// reads again and re-applies, up to [`FLEET_WRITE_REAPPLICATIONS`] more
+    /// times. Answers how many entries it released.
+    ///
+    /// # Errors
+    ///
+    /// The store's error, or the lost compare-and-set (`revision-conflict`)
+    /// once the bound is spent. The claims are then as they were.
+    pub async fn release_claims(
+        &mut self,
+        claims: &[AgentDispatchClaim],
+    ) -> AgentDispatcherResult<usize> {
+        if claims.is_empty() {
+            return Ok(0);
+        }
+        let mut reapplied = 0;
+        loop {
+            self.recover().await?;
+            let now = current_agent_timestamp(&self.clock);
+            let record = self.current_record()?;
+            let mut next = record.state;
+            let mut released = 0;
+            for claim in claims {
+                let Some(entry) = next.entries.get_mut(&claim.dispatch_id) else {
+                    continue;
+                };
+                if entry.is_current_claim(claim, now) {
+                    *entry = entry.clone().release(now);
+                    released += 1;
+                }
+            }
+            if released == 0 {
+                return Ok(0);
+            }
+            next.updated_at = now;
+            match self.persist(record.revision, next).await {
+                Ok(_) => {
+                    self.record_metric("release", "released", "none", released as u64);
+                    self.record_gauges(now);
+                    return Ok(released);
+                }
+                Err(error)
+                    if error.code() == REVISION_CONFLICT_CODE
+                        && reapplied < FLEET_WRITE_REAPPLICATIONS =>
+                {
+                    reapplied += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Applies `update` to the entry a current claim holds, and writes it.
     ///
     /// The write is a compare-and-set of the whole record, and every other
@@ -2013,6 +2196,10 @@ where
     ///
     /// Only a lost compare-and-set is retried, recognized by its stable code
     /// (`revision-conflict`). Any other failure is returned as it is.
+    ///
+    /// The same write renews the claims this handle holds
+    /// ([`Self::hold_claims`]), each under its own fence and from the record
+    /// the write is applied to, so a re-read renews from what it read.
     async fn update_current_claim(
         &mut self,
         claim: &AgentDispatchClaim,
@@ -2045,8 +2232,21 @@ where
             next.updated_at = updated.updated_at;
             next.entries
                 .insert(claim.dispatch_id.clone(), updated.clone());
+            let renewed = next.renew_held(
+                &self.held,
+                now,
+                AgentTimestampMillis::new(
+                    now.as_millis()
+                        .saturating_add(self.settings.lease_duration_ms),
+                ),
+            );
             match self.persist(record.revision, next).await {
                 Ok(_) => {
+                    // A hold is good for the one settle that lands.
+                    self.held.clear();
+                    if renewed > 0 {
+                        self.record_metric("renew", "renewed", "none", renewed);
+                    }
                     self.record_gauges(now);
                     return Ok(updated);
                 }
@@ -2791,6 +2991,15 @@ where
     /// A claim whose outbox row was already finished or absent is settled
     /// and passed over: it is counted among the cycle's claims and not among
     /// its completions.
+    ///
+    /// The cycle dispatches its claims one after another, and each settle
+    /// renews the claims behind it ([`AgentDispatcherFleet::hold_claims`]),
+    /// so the lease has to cover one dispatch and not the batch. A cycle
+    /// that ends on an error gives back the claims it did not start
+    /// ([`AgentDispatcherFleet::release_claims`]) before it returns the
+    /// error, and holds none of them any more. The claim that failed keeps
+    /// its lease. A release that fails too is logged, and the cycle still
+    /// returns the error it had.
     pub async fn run_once<D>(
         &mut self,
         run_ids: impl IntoIterator<Item = AgentRunId>,
@@ -2806,14 +3015,37 @@ where
         }
         let claims = self.claim_due().await?;
         let mut completions = Vec::new();
-        for claim in claims.claims.clone() {
+        let mut unstarted: VecDeque<AgentDispatchClaim> = claims.claims.iter().cloned().collect();
+        while let Some(claim) = unstarted.pop_front() {
+            // The claims behind this one are renewed by its settle.
+            self.fleet.hold_claims(unstarted.iter().cloned().collect());
             match self.dispatch_claim(claim, dispatcher).await {
                 Ok(completion) => completions.push(completion),
                 // The claim's row was already finished or gone: its entry
                 // was settled to match and nothing was dispatched, which is
                 // not a failure of the cycle.
                 Err(AgentDispatcherError::ClaimUnavailable { .. }) => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // The cycle ends here. Nothing will start the claims
+                    // behind this one, so nothing may renew them either:
+                    // the handle holds nothing, whatever the release does.
+                    self.fleet.hold_claims(Vec::new());
+                    // What the cycle never started is given back instead of
+                    // left leased. The error the cycle had is the one
+                    // returned: a release that fails too is logged, and
+                    // leaves those claims to their lease, as before.
+                    let unstarted: Vec<AgentDispatchClaim> = unstarted.into();
+                    if let Err(release_error) = self.fleet.release_claims(&unstarted).await {
+                        tracing::warn!(
+                            worker_id = self.worker_id.as_str(),
+                            claims = unstarted.len(),
+                            code = release_error.code(),
+                            "a failed dispatcher cycle could not give back the claims it did \
+                             not start; they stay leased until their lease lapses"
+                        );
+                    }
+                    return Err(error);
+                }
             }
         }
         Ok(AgentDispatcherCycle {

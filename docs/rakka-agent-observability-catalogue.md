@@ -125,7 +125,7 @@ series beside the agent domain's. They are declared in
 
 | Metric | Kind | Unit | Labels | What it counts |
 | --- | --- | --- | --- | --- |
-| `rakka.agent_workflow.dispatcher.fleet` | Counter | `{dispatch}` | `operation`, `outcome`, `detail` | Fleet operations. `AgentRunEffectDispatcher` records `register`, `claim` and `prune`. |
+| `rakka.agent_workflow.dispatcher.fleet` | Counter | `{dispatch}` | `operation`, `outcome`, `detail` | Fleet operations. `AgentRunEffectDispatcher` records `register`, `claim`, `renew`, `release` and `prune`. |
 | `rakka.agent_workflow.dispatcher.in_flight` | Gauge | `{effect}` | — | Entries under an active lease. |
 | `rakka.agent_workflow.dispatcher.backlog` | Gauge | `{effect}` | — | Entries claimable now. |
 | `rakka.agent_workflow.dispatcher.entries` | Gauge | `{entry}` | `status` | Entries the fleet record holds, one sample per dispatch status, a zero included. |
@@ -133,8 +133,12 @@ series beside the agent domain's. They are declared in
 `entries` is the series that shows the record growing: its `completed`,
 `exhausted` and `cancelled` samples fall only when something calls
 `prune_fleet` or `prune_terminal`. A prune records `operation=prune`,
-`outcome=pruned` with the number of entries it removed. No label carries a
-run, effect, tenant or worker id.
+`outcome=pruned` with the number of entries it removed. A settle that renews
+the claims its pass still holds records `operation=renew`, `outcome=renewed`
+with the number of entries it renewed, and a failed pass that gives back the
+claims it did not start records `operation=release`, `outcome=released` with
+the number it released (issue #157). No label carries a run, effect, tenant
+or worker id.
 
 The workflow-tier worker, `AgentDispatcherWorker`, records two more
 operations on the same counter, which a recorder wired through

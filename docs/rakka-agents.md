@@ -231,6 +231,54 @@ A settle that loses its compare-and-set to another writer reads the record
 again and re-applies, up to three more times, under the claim's own fence:
 this worker, this fencing token, a lease still active.
 
+**A batch and its leases** (issue #157). A claim pass leases every claim of
+its batch at one instant, and a worker runs the claims one after another.
+Two rules keep a later claim from being taken by another worker while its
+pass is still working, and from being run by two:
+
+- **Every settle renews what the pass still holds.** In the same write, each
+  claim the pass has taken and not started is leased for a full lease from
+  that settle. A renewal costs no write of its own, and the lease has to
+  cover the longest single call, not the sum of a batch. The claim being run
+  is renewed by nothing: a call that outlives the lease loses its claim, and
+  the claims held behind it lapse with it. An entry whose run's cancellation
+  was requested is not renewed either.
+- **A claim whose lease lapsed is not started.** The pass passes it over,
+  counts it in `AgentDispatchPass::lapsed` and writes nothing. Any worker
+  can claim it.
+
+A renewed batch stays with its worker. A ticket claimed behind long calls
+waits for every one of them, and no other worker can take it meanwhile,
+where one lease used to bound that wait. The batch size bounds it now.
+
+**A pass that fails gives back what it did not start.** The first error a
+claim meets ends the pass. Before the pass returns that error, one write
+puts the claims it had not started back to `Pending` with no lease. Another
+pass can claim them at once, and they stop counting against their class's
+concurrency limit. The claim that failed keeps its lease, which is its
+backoff: a ticket that fails every pass would otherwise be first in every
+batch. That lease can be a full one, counted from the settle before the
+failure. A killed worker gives nothing back, and neither does a pass whose
+release fails, which is logged. Those claims wait out their lease.
+
+A renewal and a release keep the settle's fence, and each reads the record
+again when it loses its compare-and-set. A deployment that drives a fleet
+handle itself has the two calls, `AgentDispatcherFleet::hold_claims` and
+`AgentDispatcherFleet::release_claims`; `AgentDispatcherWorker::run_once`
+uses both. A hold is spent by the settle that lands, so a worker names the
+claims it still holds before each one it runs, and a claim nobody names
+again is leased for at most one more lease. The `AgentDispatchClaim` a
+worker was handed keeps the expiry of its claim pass; the entry holds the
+lease as it stands.
+
+**The concurrency limit counts leases.** An entry counts against its class
+and its target from its claim until it is settled or its lease lapses,
+because the settle is what tells the record a call has ended. A batch's
+claimed and unstarted tickets count too, and the batch size is the lever.
+`AgentDispatchPass::concurrency_limited` is how many due tickets a claim
+left at a limit before its batch filled. The claim stops counting once the
+batch is full, so zero is not evidence that no limit binds.
+
 **Pruning.** Nothing else removes an entry, so without a prune the record
 holds one entry for every effect a deployment ever dispatched. An application
 calls it on its own schedule:
@@ -246,9 +294,6 @@ calls it on its own schedule:
 - Any horizon is safe while workers run, including one in the future: no
   effect is run again because its entry was pruned. In the workflow tier
   the three rules above mean a finished effect is never registered again.
-  In `AgentRunEffectDispatcher` one path can still put a finished effect's
-  ticket back in the record after a prune, and it is then settled
-  `Cancelled` without being invoked ("What is not bounded", below).
 - A prune that finds nothing writes nothing. One that loses its write reads
   again and re-applies.
 - **What goes with an entry is its `last_error_code`**, the only durable copy
@@ -316,22 +361,24 @@ effect. [`rakka-compatibility.md`](rakka-compatibility.md) has the tables.
 prune bounds it to the live entries plus the finished ones inside the
 horizon, which on a busy fleet can be megabytes.
 
-`AgentRunEffectDispatcher` does not check its claim again before it marks a
-ticket's row `Dispatching`, and that mark is not guarded against a finished
-row. Three things follow, none of them new with the prune:
+`AgentRunEffectDispatcher` checks a claim's lease when its pass reaches the
+claim, and not again before it marks the ticket's row `Dispatching`. A
+finished row is protected at both ends: the mark and a settle each leave a
+row that is `Dispatched`, `Exhausted` or `Cancelled` as it is. What is left
+concerns a row that is not finished:
 
-- A worker whose lease lapsed can still burn an attempt on a ticket another
-  worker is running. Only a finished row is protected, and only against a
-  settle.
-- A worker that stalls past its lease before its durable `Started` can mark
-  a row `Dispatching` after another worker finished it, and invoke. If that
-  attempt then fails, the row is due again. While the finished entry is in
-  the record it absorbs the registration. After a prune the ticket is
-  registered again, claimed, and settled `Cancelled` (`intent-already-resolved`
-  or `ticket-stale`) without being invoked: an operator sees a finished
-  effect's entry reappear and end `Cancelled`.
-- A claim on an `Exhausted` row whose intent is unresolved still starts an
-  attempt (issue #134).
+- A worker that stalls past its lease between that check and its durable
+  `Started` can still start an attempt on a ticket another worker has since
+  claimed and is running.
+- Nothing renews a lease during a call. A call that outlives its lease loses
+  its claim, and the next claim recovers the ticket as an attempt that
+  disappeared, by its safety class, while that call may still be out. The
+  lease has to be longer than the longest call.
+- A worker whose lease lapsed during its call still writes that call's
+  result to a row that is not finished. Its failure burns an attempt, and
+  can exhaust the row, under a ticket another worker is running; its success
+  finishes the row under that worker. Only then is it answered
+  `claim-fenced`.
 
 ## Goals: finite and continuous
 
