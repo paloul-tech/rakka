@@ -81,7 +81,6 @@ pub mod model_profile;
 pub mod observability;
 #[cfg(feature = "otel")]
 pub mod otel;
-mod owed_outcome;
 pub mod query;
 pub mod retrieval;
 #[cfg(feature = "rig")]

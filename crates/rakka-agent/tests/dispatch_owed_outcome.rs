@@ -906,6 +906,38 @@ async fn a_finished_entry_is_not_swept_before_a_lease_has_passed() {
     );
 }
 
+/// A finished row under an entry a worker holds, or can still claim, is the
+/// claim path's. The holder's call may still be in flight under a row a
+/// late worker exhausted, and it delivers its own outcome; a claimable
+/// entry is told by the worker that claims it. The sweep tells neither,
+/// however long the row has been finished.
+#[tokio::test]
+async fn a_finished_row_under_a_claim_is_left_to_the_claim_path() {
+    let (fx, effect) = ticket(&idempotent(3), Some(refusing()), None).await;
+    lose_the_worker_before_its_fleet_write(&fx, &effect).await;
+
+    let held = fx
+        .pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the per-run half runs");
+    assert_eq!(held.delivered, 0, "the lease is still running");
+
+    fx.expire_lease();
+    fx.expire_lease();
+    let claimable = fx
+        .pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the per-run half runs");
+    assert_eq!(claimable.delivered, 0, "a worker can claim the ticket");
+    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Claimed)
+    );
+}
+
 /// The budget was spent recovering an attempt lost after `Started`, and the
 /// recovering worker was lost after its fleet write.
 #[tokio::test]
