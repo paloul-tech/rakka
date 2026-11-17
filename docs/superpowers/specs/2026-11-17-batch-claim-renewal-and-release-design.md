@@ -219,16 +219,22 @@ it passes.
 
 ## 10. As built
 
-Where the build moved from the text above.
+Where the build moved from the text above. Items 1, 7, 8 and 9 come from the
+whole-branch review (section 11).
 
-1. **Nothing clears what a handle holds** (4.2 said "when the batch ends,
-   however it ends, nothing is held any more"). The held list is replaced
-   before every claim, so the last claim of a batch holds nothing behind it,
-   and no settle is written between one batch and the first claim of the
-   next. A clear at the end of a batch had nothing that could observe it, so
-   it was not written. After a failed pass the handle still names claims,
-   all of them released. After a kill it names claims that are still
-   leased, until the next batch replaces them.
+1. **A hold is spent by the settle that lands, and both loops hold nothing
+   once a batch ends short** (4.1 said a hold stays until it is replaced;
+   4.2 said "when the batch ends, however it ends, nothing is held any
+   more"). The first build kept a hold until the next `hold_claims` and
+   cleared nothing, on my reading that no settle is written between one
+   batch and the first claim of the next. That reading was wrong for the
+   workflow tier: `AgentDispatcherWorker::dispatch_claim` is public, and a
+   worker that used it after a cycle whose release had failed renewed the
+   claims that cycle abandoned, at every settle, without bound. Now a settle
+   that is written leaves nothing held, so an unnamed claim is renewed at
+   most once more, and each loop holds nothing on the way out so that it is
+   not renewed at all. In `AgentRunEffectDispatcher` no settle is written
+   outside the loop, so its clear is a rule kept and no test can see it.
 2. **The settled claim needs no exception** (4.1 said "each held claim other
    than the one being settled"). A settled entry holds no lease, so it is
    not current and the renewal passes it over like any other.
@@ -246,13 +252,49 @@ Where the build moved from the text above.
    still started an attempt. Issue #134 closed all three and left the
    paragraph. It is rewritten here, because this change alters its first
    sentence, and the "Pruning" bullet and the known-limitations line that
-   leaned on it are corrected with it.
+   leaned on it are corrected with it. My first rewrite also dropped a
+   fourth statement that nothing closed, that a worker whose lease lapsed
+   during its call still writes its result to an unfinished row; the review
+   caught it and it is back.
+7. **An entry whose run's cancellation was requested is not renewed.** The
+   record wants that lease to end, so that the cancellation can settle the
+   entry. Without this a renewal kept a cancelled run's unstarted effect in
+   a worker's hands until the batch reached it. Workflow tier only:
+   `AgentRunEffectDispatcher` never sets the flag.
+8. **`run_once` logs a failed release** as the pass does, and still returns
+   the cycle's error.
+9. **What the docs now say that the design did not:** a renewed batch stays
+   with its worker, so the batch size and not the lease bounds how long a
+   claimed, unstarted ticket waits; the claim that failed can wait a full
+   lease from the settle before it; `concurrency_limited` stops counting
+   once a batch is full; and `AgentDispatchClaim::lease_expires_at` is the
+   expiry at claim time.
 
 **Tests.** `crates/rakka-agent-workflow/tests/dispatcher_fleet_leases.rs`
-(22) and `crates/rakka-agent/tests/dispatch_batch_leases.rs` (7). Before the
+(27) and `crates/rakka-agent/tests/dispatch_batch_leases.rs` (8). Before the
 change the agent tier's lease tests failed `claim-fenced` and the failed
 pass left both tickets `Claimed`; the inverted host proof for Ask 1 already
-passed. 24 single mutations were run against the two source files, and each
-is caught by a named test: 15 in the fleet, 9 in the pass, the last of which
-undoes issue #145's re-read and turns the host proof red.
+passed. 24 single mutations were run against the first build, and 14 more
+after the review: six new ones in the fleet, and the pass's again against
+its reworked loop. Each is caught by a named test but one. Removing the
+pass's own clear of its hold changes nothing a test can see, for the reason
+in item 1. The last of the pass's mutations undoes issue #145's re-read and
+turns the host proof red.
 
+## 11. The whole-branch review
+
+One fresh reviewer read `c4be3d9..82b4e98`. No Critical finding. Two
+Important, both fixed: the limitation dropped from "What is not bounded"
+(10.6), and the unbounded renewal of abandoned claims through
+`dispatch_claim` (10.1). Eight Minor:
+
+| Finding | What was done |
+|---|---|
+| `AgentDispatchClaim::lease_expires_at` is stale after a renewal | Documented on the field |
+| `run_once` dropped a failed release silently | It logs (10.8) |
+| A renewal extended a claim whose run was cancelled | Fixed (10.7) |
+| The failed claim now waits a full lease wherever it sat in its batch | Kept (call 2), and documented. Releasing a claim that provably started nothing, with a backoff, is a possible follow-up |
+| The lease no longer bounds an unstarted ticket's wait | Documented |
+| Four doc sentences wider than the code | Corrected |
+| The API inventory line, and `lapsed` lost with a failed pass's report | The line is extended. The second is documented, not built |
+| Tests weaker than their names, and gaps | The byte pin is renamed for what it holds, a test builds a released entry beside one a registration made of a lapsed claim, the no-op renewal is held by entry equality, and tests were added for a cycle whose release fails, a failure at a claim that is not the first, and renewal through the other two settles |

@@ -14,6 +14,7 @@
 //! - **A pass that failed left the claims it never started leased.** It now
 //!   gives them back before it returns its error.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,23 +39,22 @@ use common::*;
 const TOOL: &str = "charge-card";
 const FUTURE: AgentTimestampMillis = AgentTimestampMillis::new(u64::MAX);
 
-/// Two tool calls in one turn, so one pass claims two tickets in one batch.
-fn two_tools_then_proposal() -> DeterministicModelAdapter {
-    let call = |id: &str| {
-        AgentToolCallRequest::new(
-            AgentToolCallId::new(id).expect("the call id is valid"),
-            AgentToolId::new(TOOL).expect("the tool id is valid"),
-            serde_json::json!({ "amount": 42 }),
-        )
-        .expect("the tool call is bounded")
-    };
+/// Several tool calls in one turn, so one pass claims that many tickets in
+/// one batch.
+fn tools_then_proposal(calls: usize) -> DeterministicModelAdapter {
+    let mut turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION);
+    for nth in 1..=calls {
+        turn = turn.with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new(format!("call-{nth}")).expect("the call id is valid"),
+                AgentToolId::new(TOOL).expect("the tool id is valid"),
+                serde_json::json!({ "amount": 42 }),
+            )
+            .expect("the tool call is bounded"),
+        );
+    }
     DeterministicModelAdapter::new()
-        .with_turn_for(
-            1,
-            AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
-                .with_tool_call(call("call-1"))
-                .with_tool_call(call("call-2")),
-        )
+        .with_turn_for(1, turn)
         .with_turn_for(
             2,
             AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_proposal(
@@ -64,17 +64,19 @@ fn two_tools_then_proposal() -> DeterministicModelAdapter {
         )
 }
 
-/// What a [`TimedTool`] does during its first call, given the call's effect.
-type DuringFirstCall =
+/// What a [`TimedTool`] does during one of its calls, given the call's
+/// effect.
+type DuringCall =
     Box<dyn FnOnce(AgentRunEffect) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 /// A tool that takes time: every call moves the shared clock on by `millis`.
-/// Its first call can also run a piece of work, which is how a test puts
-/// another worker between a pass's claim and its settle.
+/// A call can also run a piece of work first, which is how a test puts
+/// another worker, or a failing store, between a pass's claim and its
+/// settle.
 struct TimedTool {
     clock: std::sync::Mutex<Option<SharedAtomicWorkflowClock>>,
     millis: u64,
-    during_first: tokio::sync::Mutex<Option<DuringFirstCall>>,
+    during: tokio::sync::Mutex<BTreeMap<usize, DuringCall>>,
     calls: std::sync::Mutex<Vec<String>>,
 }
 
@@ -83,9 +85,14 @@ impl TimedTool {
         Arc::new(Self {
             clock: std::sync::Mutex::new(None),
             millis,
-            during_first: tokio::sync::Mutex::new(None),
+            during: tokio::sync::Mutex::new(BTreeMap::new()),
             calls: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Runs `work` during the `nth` call, the first being 1.
+    async fn during_call(&self, nth: usize, work: DuringCall) {
+        self.during.lock().await.insert(nth, work);
     }
 
     /// The call ids it was handed, in order.
@@ -103,12 +110,13 @@ impl rakka_agent::AgentDispatchToolExecutor for TimedTool {
         _credential: Option<&'a rakka_agent_workflow::AgentEphemeralCredential>,
     ) -> rakka_agent::AgentDispatchFuture<'a, AgentTaskContent> {
         Box::pin(async move {
-            self.calls
-                .lock()
-                .expect("the log is not poisoned")
-                .push(call.call_id.as_str().to_string());
-            let during_first = self.during_first.lock().await.take();
-            if let Some(work) = during_first {
+            let nth = {
+                let mut calls = self.calls.lock().expect("the log is not poisoned");
+                calls.push(call.call_id.as_str().to_string());
+                calls.len()
+            };
+            let work = self.during.lock().await.remove(&nth);
+            if let Some(work) = work {
                 work(intent.clone()).await;
             }
             let clock = self
@@ -128,10 +136,19 @@ impl rakka_agent::AgentDispatchToolExecutor for TimedTool {
 
 /// A run with two tool tickets in its outbox, not yet registered, and the
 /// two effects behind them. `tool` replaces the recording executor.
-async fn two_tool_tickets(tool: Option<Arc<TimedTool>>) -> (AuthorityFixture, [AgentRunEffect; 2]) {
+async fn two_tool_tickets(tool: Option<Arc<TimedTool>>) -> (AuthorityFixture, Vec<AgentRunEffect>) {
+    tool_tickets(2, tool).await
+}
+
+/// A run with `calls` tool tickets in its outbox, not yet registered, and
+/// the effects behind them. `tool` replaces the recording executor.
+async fn tool_tickets(
+    calls: usize,
+    tool: Option<Arc<TimedTool>>,
+) -> (AuthorityFixture, Vec<AgentRunEffect>) {
     let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
     let mut fx = AuthorityFixture::new(
-        two_tools_then_proposal(),
+        tools_then_proposal(calls),
         AgentToolAuthority::new(tool_registry_for_spec(TOOL, &spec)),
         None,
     );
@@ -141,9 +158,15 @@ async fn two_tool_tickets(tool: Option<Arc<TimedTool>>) -> (AuthorityFixture, [A
     }
     fx.start().await;
     fx.pump_until_tool_ticket().await;
-    let first = fx.effect_at(1).await.expect("the first call is committed");
-    let second = fx.effect_at(2).await.expect("the second call is committed");
-    (fx, [first, second])
+    let mut effects = Vec::new();
+    for slot in 1..=calls {
+        effects.push(
+            fx.effect_at(slot)
+                .await
+                .expect("each call's effect is committed"),
+        );
+    }
+    (fx, effects)
 }
 
 /// The fleet record as the store holds it.
@@ -159,7 +182,7 @@ async fn fleet_state(fx: &AuthorityFixture) -> rakka_agent_workflow::AgentDispat
 /// The fleet entries of the two tool tickets.
 async fn tool_entries(
     fx: &AuthorityFixture,
-    effects: &[AgentRunEffect; 2],
+    effects: &[AgentRunEffect],
 ) -> Vec<AgentDispatchEntry> {
     let state = fleet_state(fx).await;
     effects
@@ -206,15 +229,19 @@ async fn a_settle_after_another_handles_write_completes_and_the_batch_goes_on() 
     let (fx, effects) = two_tool_tickets(Some(tool.clone())).await;
     let mut other = another_handle(&fx, 16);
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    *tool.during_first.lock().await = Some(Box::new(move |_intent| {
-        Box::pin(async move {
-            let prune = other
-                .prune_terminal(FUTURE)
-                .await
-                .expect("the other handle's prune runs");
-            sender.send(prune.pruned).expect("the test is waiting");
-        })
-    }));
+    tool.during_call(
+        1,
+        Box::new(move |_intent| {
+            Box::pin(async move {
+                let prune = other
+                    .prune_terminal(FUTURE)
+                    .await
+                    .expect("the other handle's prune runs");
+                sender.send(prune.pruned).expect("the test is waiting");
+            })
+        }),
+    )
+    .await;
 
     let pass = fx
         .pipeline()
@@ -274,36 +301,40 @@ async fn a_claim_whose_lease_lapsed_before_the_pass_reached_it_is_not_started() 
     let mut other = another_handle(&fx, 1);
     let workflow_store = fx.workflow_store.clone();
     let clock = fx.wf_clock.clone();
-    *tool.during_first.lock().await = Some(Box::new(move |intent| {
-        Box::pin(async move {
-            clock.advance(LEASE_MS + 1);
-            let mut batch = other
-                .claim_due(AgentDispatcherWorkerId::new("worker-other"))
-                .await
-                .expect("the other worker claims");
-            let claim = batch.claims.remove(0);
-            assert_eq!(
-                claim.effect_id.as_str(),
-                intent.dispatch_ticket_id().as_str(),
-                "the other worker took the ticket whose call is running"
-            );
-            let mut inbox = AgentRunInbox::with_clock(
-                rakka_agent::workflow_run_id(&run_scope()),
-                workflow_store,
-                clock,
-            );
-            inbox.recover().await.expect("the inbox recovers");
-            inbox
-                .inner_mut()
-                .record_outbox_success(&OutboxMessageId::new(claim.effect_id.as_str()))
-                .await
-                .expect("the other worker finishes the row");
-            other
-                .complete_claim(&claim)
-                .await
-                .expect("the other worker finishes the entry");
-        })
-    }));
+    tool.during_call(
+        1,
+        Box::new(move |intent| {
+            Box::pin(async move {
+                clock.advance(LEASE_MS + 1);
+                let mut batch = other
+                    .claim_due(AgentDispatcherWorkerId::new("worker-other"))
+                    .await
+                    .expect("the other worker claims");
+                let claim = batch.claims.remove(0);
+                assert_eq!(
+                    claim.effect_id.as_str(),
+                    intent.dispatch_ticket_id().as_str(),
+                    "the other worker took the ticket whose call is running"
+                );
+                let mut inbox = AgentRunInbox::with_clock(
+                    rakka_agent::workflow_run_id(&run_scope()),
+                    workflow_store,
+                    clock,
+                );
+                inbox.recover().await.expect("the inbox recovers");
+                inbox
+                    .inner_mut()
+                    .record_outbox_success(&OutboxMessageId::new(claim.effect_id.as_str()))
+                    .await
+                    .expect("the other worker finishes the row");
+                other
+                    .complete_claim(&claim)
+                    .await
+                    .expect("the other worker finishes the entry");
+            })
+        }),
+    )
+    .await;
 
     let pass = fx
         .pipeline()
@@ -392,6 +423,64 @@ async fn a_failed_pass_gives_back_the_claims_it_did_not_start() {
         .expect("the next pass runs");
     assert_eq!((next.claimed, next.invoked, next.delivered), (1, 1, 1));
     assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
+
+#[tokio::test]
+async fn a_pass_that_fails_part_way_gives_back_what_is_behind_the_failure() {
+    // Three calls of 10 s. The first settles. During the second, the run's
+    // outbox starts losing every write, so that claim's own records fail
+    // the pass after its call was made.
+    let tool = TimedTool::taking(10_000);
+    let (fx, effects) = tool_tickets(3, Some(tool.clone())).await;
+    let workflow_store = fx.workflow_store.clone();
+    tool.during_call(
+        2,
+        Box::new(move |_intent| {
+            Box::pin(async move {
+                workflow_store.conflict_from(1);
+            })
+        }),
+    )
+    .await;
+
+    let error = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect_err("the second claim fails the pass");
+    fx.workflow_store.survive();
+
+    assert_eq!(
+        tool.calls().len(),
+        2,
+        "the third call was never made: {error:?}"
+    );
+    let entries = tool_entries(&fx, &effects).await;
+    let with_status = |status: AgentDispatchStatus| {
+        let found: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.status == status)
+            .collect();
+        assert_eq!(found.len(), 1, "one ticket is {status:?}: {entries:?}");
+        found[0]
+    };
+    let settled = with_status(AgentDispatchStatus::Completed);
+    let failed = with_status(AgentDispatchStatus::Claimed);
+    let given_back = with_status(AgentDispatchStatus::Pending);
+    // The claim that failed keeps its lease, and the lease it keeps is the
+    // one the first claim's settle gave it: a full lease from that settle.
+    let settled_at = settled.completed_at.expect("a completed entry says when");
+    let lease = failed.lease.as_ref().expect("the failed claim is leased");
+    assert_eq!(
+        lease.lease_expires_at.as_millis(),
+        settled_at.as_millis() + LEASE_MS
+    );
+    assert!(
+        settled_at.as_millis() >= lease.claimed_at.as_millis() + 10_000,
+        "the first call took its time before that settle"
+    );
+    assert_eq!(given_back.lease, None);
+    assert_eq!(given_back.last_fencing_token, 1);
 }
 
 #[tokio::test]

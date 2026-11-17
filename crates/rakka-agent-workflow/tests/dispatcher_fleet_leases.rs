@@ -253,6 +253,7 @@ async fn a_renewal_never_shortens_a_lease() {
     let mut short = world.worker("worker-a");
     let claim_a = world.claim_one(&mut short, "run-a", EFFECT).await;
     short.fleet_mut().hold_claims(vec![claim_b]);
+    let held = entry(&world, "run-b").await;
 
     // A full lease of the short handle's from 200 would be 1200.
     world.clock.advance_millis(100);
@@ -263,6 +264,12 @@ async fn a_renewal_never_shortens_a_lease() {
         .expect("the claim settles");
 
     assert_eq!(expiry(&world, "run-b").await, Some(5_100));
+    assert_eq!(
+        entry(&world, "run-b").await,
+        held,
+        "an entry whose lease is not extended is not touched at all"
+    );
+    assert_eq!(counted(&world, "renew", "renewed"), 0.0);
 }
 
 #[tokio::test]
@@ -362,22 +369,121 @@ async fn renewed_entries_are_counted() {
 }
 
 #[tokio::test]
-async fn a_settle_at_the_instant_of_the_claim_renews_nothing_and_counts_nothing() {
+async fn a_settle_at_the_instant_of_the_claim_counts_no_renewal() {
     let world = World::new();
     let mut worker_a = world.worker("worker-a");
     let claims = claim_batch(&world, &mut worker_a, &["run-a", "run-b"]).await;
     worker_a.fleet_mut().hold_claims(vec![claims[1].clone()]);
-    let claimed = entry(&world, "run-b").await;
 
-    // No time has passed: a full lease from here is the lease it has.
+    // No time has passed: a full lease from here is the lease it has, and a
+    // lease that does not move is not a renewal. The entry would read the
+    // same either way, so the count is what this holds.
     worker_a
         .fleet_mut()
         .complete_claim(&claims[0])
         .await
         .expect("the first claim settles");
 
-    assert_eq!(entry(&world, "run-b").await, claimed);
     assert_eq!(counted(&world, "renew", "renewed"), 0.0);
+}
+
+#[tokio::test]
+async fn a_hold_is_spent_by_the_settle_that_lands() {
+    let world = World::new();
+    let mut worker_a = world.worker("worker-a");
+    let claims = claim_batch(&world, &mut worker_a, &["run-a", "run-b", "run-c"]).await;
+    worker_a
+        .fleet_mut()
+        .hold_claims(vec![claims[1].clone(), claims[2].clone()]);
+    world.clock.advance_millis(600);
+    worker_a
+        .fleet_mut()
+        .complete_claim(&claims[0])
+        .await
+        .expect("the first claim settles");
+    assert_eq!(expiry(&world, "run-c").await, Some(1_700));
+
+    // The worker names nothing again before its next settle, at 1000.
+    world.clock.advance_millis(300);
+    worker_a
+        .fleet_mut()
+        .complete_claim(&claims[1])
+        .await
+        .expect("the second claim settles");
+
+    assert_eq!(
+        expiry(&world, "run-c").await,
+        Some(1_700),
+        "a claim is renewed by the one settle after it was named"
+    );
+}
+
+#[tokio::test]
+async fn every_kind_of_settle_renews_what_is_held() {
+    let world = World::new();
+    let mut worker_a = world.worker("worker-a");
+    let claims = claim_batch(&world, &mut worker_a, &["run-a", "run-b", "run-c"]).await;
+
+    // A failed attempt that is rescheduled, at 400.
+    worker_a.fleet_mut().hold_claims(vec![claims[2].clone()]);
+    world.clock.advance_millis(300);
+    worker_a
+        .fleet_mut()
+        .record_claim_failure(
+            &claims[0],
+            &WorkflowTelemetryEvent::OutboxDispatchRetried {
+                message_id: OutboxMessageId::new(EFFECT),
+                attempt: 1,
+                next_retry_at: WorkflowTimestamp::from_millis(9_000),
+                message: "tool-timeout".to_string(),
+            },
+        )
+        .await
+        .expect("the first claim reschedules");
+    assert_eq!(expiry(&world, "run-c").await, Some(1_400));
+
+    // A claim settled to follow a row that is gone, at 700.
+    worker_a.fleet_mut().hold_claims(vec![claims[2].clone()]);
+    world.clock.advance_millis(300);
+    worker_a
+        .fleet_mut()
+        .settle_claim_from_row(&claims[1], None)
+        .await
+        .expect("the second claim settles");
+    assert_eq!(expiry(&world, "run-c").await, Some(1_700));
+}
+
+#[tokio::test]
+async fn a_held_claim_whose_run_was_cancelled_is_not_renewed() {
+    let world = World::new();
+    let mut worker_a = world.worker("worker-a");
+    let claims = claim_batch(&world, &mut worker_a, &["run-a", "run-b"]).await;
+    worker_a.fleet_mut().hold_claims(vec![claims[1].clone()]);
+    // Another handle asks for run-b's cancellation while its claim is held
+    // and not started. The entry is fenced, and left to its lease.
+    let mut worker_b = world.worker("worker-b");
+    worker_b.recover().await.expect("the fleet recovers");
+    let request = worker_b
+        .fleet_mut()
+        .request_run_cancellation(&AgentRunId::new("run-b"))
+        .await
+        .expect("the cancellation is requested");
+    assert_eq!(request.in_flight_entries, 1);
+
+    world.clock.advance_millis(600);
+    worker_a
+        .fleet_mut()
+        .complete_claim(&claims[0])
+        .await
+        .expect("the first claim settles");
+
+    let fenced = entry(&world, "run-b").await;
+    assert!(fenced.cancellation_requested);
+    assert_eq!(
+        expiry(&world, "run-b").await,
+        Some(1_100),
+        "a lease the record wants ended is not extended"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -630,11 +736,49 @@ async fn released_entries_are_counted() {
     assert_eq!(counted(&world, "release", "released"), 2.0);
 }
 
-/// What an older binary reads from a record a release wrote: an entry shape
-/// it already knows. Nothing here is a field, a status or a value that a
-/// registration of a lapsed claim did not already write.
+/// What an older binary reads from a record a release wrote: the entry a
+/// registration has always made of a claim whose lease lapsed. The two are
+/// built here side by side, and differ in nothing but when they were
+/// written.
 #[tokio::test]
-async fn a_released_entry_is_written_in_a_shape_the_record_already_had() {
+async fn a_released_entry_is_the_entry_a_registration_makes_of_a_lapsed_claim() {
+    // A claim whose lease lapses, and whose run is then registered again.
+    let lapsing = World::new();
+    let mut worker = lapsing.worker("worker-a");
+    lapsing.claim_one(&mut worker, "run-a", EFFECT).await;
+    lapsing.clock.advance_millis(LEASE_MS + 1);
+    worker.recover().await.expect("the fleet recovers");
+    let registration = worker
+        .refresh_run(AgentRunId::new("run-a"), None)
+        .await
+        .expect("the run registers");
+    assert_eq!(registration.registered_effects, 1);
+    let put_back = entry(&lapsing, "run-a").await;
+    assert_eq!(put_back.status, AgentDispatchStatus::Pending);
+
+    // The same claim, released.
+    let releasing = World::new();
+    let mut worker = releasing.worker("worker-a");
+    let claim = releasing.claim_one(&mut worker, "run-a", EFFECT).await;
+    worker
+        .fleet_mut()
+        .release_claims(&[claim])
+        .await
+        .expect("the release runs");
+    let released = entry(&releasing, "run-a").await;
+
+    assert_eq!(
+        released,
+        AgentDispatchEntry {
+            updated_at: released.updated_at,
+            ..put_back
+        }
+    );
+}
+
+/// The bytes a release writes, held so that a change to them is seen.
+#[tokio::test]
+async fn a_record_whose_one_claim_was_released_keeps_these_bytes() {
     let world = World::new();
     let mut worker_a = world.worker("worker-a");
     let claim = world.claim_one(&mut worker_a, "run-a", "effect-a").await;
@@ -714,6 +858,73 @@ async fn a_cycle_that_fails_releases_the_claims_it_did_not_start() {
         let given_back = entry(&world, run).await;
         assert_eq!(given_back.status, AgentDispatchStatus::Pending, "{run}");
         assert_eq!(given_back.lease, None, "{run}");
+    }
+}
+
+/// A dispatcher that succeeds, and during its first dispatch arms the fleet
+/// store to refuse the next write and then to lose the four after it: the
+/// settle of the claim it is running, and every try of the release.
+struct FailsItsFirstSettleAndTheRelease {
+    fleet_store: FleetStore,
+    armed: bool,
+}
+
+impl AgentEffectDispatcher for FailsItsFirstSettleAndTheRelease {
+    fn dispatch<'a>(&'a mut self, _job: &'a AgentDispatchJob) -> AgentEffectDispatchFuture<'a> {
+        if !self.armed {
+            self.armed = true;
+            self.fleet_store.refuse_next_write();
+            self.fleet_store.contend(4);
+        }
+        Box::pin(async move { OutboxDispatchResult::Success })
+    }
+}
+
+#[tokio::test]
+async fn a_cycle_whose_release_fails_too_returns_its_own_error_and_holds_nothing() {
+    let world = World::new();
+    let mut worker_a = world.worker("worker-a");
+    let run_ids = schedule_runs(&world, &["run-a", "run-b", "run-c"]).await;
+    let mut dispatcher = FailsItsFirstSettleAndTheRelease {
+        fleet_store: world.fleet_store.clone(),
+        armed: false,
+    };
+
+    let error = worker_a
+        .run_once(run_ids, &mut dispatcher)
+        .await
+        .expect_err("the first claim's settle is refused by the store");
+
+    assert_eq!(
+        error.code(),
+        "store-error",
+        "the error the cycle had, not the release's lost write"
+    );
+    for run in ["run-a", "run-b", "run-c"] {
+        assert_eq!(
+            (entry(&world, run).await.status, expiry(&world, run).await),
+            (AgentDispatchStatus::Claimed, Some(1_100)),
+            "{run} is left to its lease"
+        );
+    }
+
+    // The cycle is over, and nothing will start run-b or run-c under these
+    // claims. The worker goes on with other work, at 600: its settle must
+    // not keep the abandoned claims leased.
+    world.clock.advance_millis(500);
+    let claim = world.claim_one(&mut worker_a, "run-d", EFFECT).await;
+    let mut succeeding = RecordingDispatcher::succeeding();
+    worker_a
+        .dispatch_claim(claim, &mut succeeding)
+        .await
+        .expect("the later claim dispatches");
+
+    for run in ["run-b", "run-c"] {
+        assert_eq!(
+            expiry(&world, run).await,
+            Some(1_100),
+            "{run} keeps the lease it was abandoned with"
+        );
     }
 }
 

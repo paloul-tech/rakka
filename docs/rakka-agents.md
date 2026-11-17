@@ -241,10 +241,15 @@ pass is still working, and from being run by two:
   that settle. A renewal costs no write of its own, and the lease has to
   cover the longest single call, not the sum of a batch. The claim being run
   is renewed by nothing: a call that outlives the lease loses its claim, and
-  the claims held behind it lapse with it.
+  the claims held behind it lapse with it. An entry whose run's cancellation
+  was requested is not renewed either.
 - **A claim whose lease lapsed is not started.** The pass passes it over,
   counts it in `AgentDispatchPass::lapsed` and writes nothing. Any worker
   can claim it.
+
+A renewed batch stays with its worker. A ticket claimed behind long calls
+waits for every one of them, and no other worker can take it meanwhile,
+where one lease used to bound that wait. The batch size bounds it now.
 
 **A pass that fails gives back what it did not start.** The first error a
 claim meets ends the pass. Before the pass returns that error, one write
@@ -252,21 +257,27 @@ puts the claims it had not started back to `Pending` with no lease. Another
 pass can claim them at once, and they stop counting against their class's
 concurrency limit. The claim that failed keeps its lease, which is its
 backoff: a ticket that fails every pass would otherwise be first in every
-batch. A killed worker gives nothing back, and neither does a pass whose
+batch. That lease can be a full one, counted from the settle before the
+failure. A killed worker gives nothing back, and neither does a pass whose
 release fails, which is logged. Those claims wait out their lease.
 
 A renewal and a release keep the settle's fence, and each reads the record
 again when it loses its compare-and-set. A deployment that drives a fleet
 handle itself has the two calls, `AgentDispatcherFleet::hold_claims` and
 `AgentDispatcherFleet::release_claims`; `AgentDispatcherWorker::run_once`
-uses both.
+uses both. A hold is spent by the settle that lands, so a worker names the
+claims it still holds before each one it runs, and a claim nobody names
+again is leased for at most one more lease. The `AgentDispatchClaim` a
+worker was handed keeps the expiry of its claim pass; the entry holds the
+lease as it stands.
 
 **The concurrency limit counts leases.** An entry counts against its class
 and its target from its claim until it is settled or its lease lapses,
 because the settle is what tells the record a call has ended. A batch's
-claimed and unstarted tickets count too. `AgentDispatchPass::concurrency_limited`
-is how many due tickets a claim left at a limit, and the batch size is the
-lever.
+claimed and unstarted tickets count too, and the batch size is the lever.
+`AgentDispatchPass::concurrency_limited` is how many due tickets a claim
+left at a limit before its batch filled. The claim stops counting once the
+batch is full, so zero is not evidence that no limit binds.
 
 **Pruning.** Nothing else removes an entry, so without a prune the record
 holds one entry for every effect a deployment ever dispatched. An application
@@ -363,6 +374,11 @@ concerns a row that is not finished:
   its claim, and the next claim recovers the ticket as an attempt that
   disappeared, by its safety class, while that call may still be out. The
   lease has to be longer than the longest call.
+- A worker whose lease lapsed during its call still writes that call's
+  result to a row that is not finished. Its failure burns an attempt, and
+  can exhaust the row, under a ticket another worker is running; its success
+  finishes the row under that worker. Only then is it answered
+  `claim-fenced`.
 
 ## Goals: finite and continuous
 

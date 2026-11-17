@@ -2208,6 +2208,11 @@ pub struct AgentDispatchPass {
     /// bounds the fleet. A claimed ticket counts against its limit from the
     /// claim until it is settled or its lease lapses, so a batch's claimed
     /// and unstarted tickets count too.
+    ///
+    /// Not complete, unlike [`Self::class_filtered`]: the claim stops
+    /// counting once its batch is full, so a pass that filled its batch can
+    /// report zero with a class at its limit. Zero says the limit did not
+    /// turn a ticket away before the batch filled, and nothing more.
     pub concurrency_limited: usize,
     /// Claims this pass took and did not start, because their lease had
     /// lapsed by the time the pass reached them.
@@ -2215,7 +2220,8 @@ pub struct AgentDispatchPass {
     /// Nothing is written for such a claim: its lease is over, so any worker
     /// can take the ticket. A pass renews the claims it holds every time it
     /// settles one, so this counts only when a single claim outlasted the
-    /// lease and the pass went on.
+    /// lease and the pass went on. A pass that ends in an error returns no
+    /// report, and the claims it passed over are then counted nowhere.
     pub lapsed: usize,
     /// True when the probe killed the worker mid-pass.
     pub died: bool,
@@ -3300,13 +3306,21 @@ where
     /// **The batch and its leases** (issue #157). The fleet leases every
     /// claim of a batch at one instant, and the claims run one after
     /// another. Every settle the pass writes also renews the claims it has
-    /// not started yet, in the same write, so each claim starts with a full
-    /// lease and the lease has to cover the longest single call, not their
-    /// sum. The claim being run is renewed by nothing: a call that outlives
-    /// the lease loses its claim as before, and the unstarted claims behind
-    /// it lapse with it. A claim whose lease has lapsed by the time the pass
-    /// reaches it is not started and is counted in
-    /// [`AgentDispatchPass::lapsed`]; any worker can then take it.
+    /// not started yet, in the same write: each is leased for a full lease
+    /// from that settle. So the lease has to cover the longest single call,
+    /// not their sum, and whatever the pass still does for one claim after
+    /// its settle, such as telling the run of an exhausted attempt, is
+    /// spent from the next claim's lease. The claim being run is renewed by
+    /// nothing: a call that outlives the lease loses its claim as before,
+    /// and the unstarted claims behind it lapse with it. A claim whose lease
+    /// has lapsed by the time the pass reaches it is not started and is
+    /// counted in [`AgentDispatchPass::lapsed`]; any worker can then take
+    /// it.
+    ///
+    /// A renewed batch stays with its worker. A ticket claimed behind long
+    /// calls waits for every one of them, and no other worker can take it
+    /// meanwhile, where one lease used to bound that wait. The batch size
+    /// bounds it now.
     ///
     /// # Errors
     ///
@@ -3314,8 +3328,9 @@ where
     /// returned. **The claims the pass had not started are given back
     /// first**: one fenced write puts each of them back to pending, with no
     /// lease, so the next pass of any worker can claim them at once. The
-    /// claim that failed keeps its lease, and is recovered when it lapses
-    /// like any attempt that disappeared. When that release fails too, it is
+    /// claim that failed keeps its lease, which can be a full lease from the
+    /// settle before it, and is recovered when it lapses like any attempt
+    /// that disappeared. When that release fails too, it is
     /// logged, the pass still returns the error it had, and the unstarted
     /// claims wait out their lease. A worker killed mid-pass, or a pass
     /// whose future is dropped, gives nothing back.
@@ -3397,6 +3412,7 @@ where
         pass.class_filtered = batch.class_filtered;
         pass.concurrency_limited = batch.concurrency_limited;
         let mut unstarted: VecDeque<AgentDispatchClaim> = batch.claims.into();
+        let mut failure = None;
         while let Some(claim) = unstarted.pop_front() {
             match self.execute_batch_claim(claim, &unstarted, pass).await {
                 Ok(ClaimConclusion::Settled) => {}
@@ -3408,12 +3424,23 @@ where
                     break;
                 }
                 Err(error) => {
-                    self.release_unstarted(unstarted.into()).await;
-                    return Err(error);
+                    failure = Some(error);
+                    break;
                 }
             }
         }
-        Ok(())
+        // The batch is over, however it ended. Nothing will start a claim
+        // it left behind, so the handle holds none of them for a later
+        // settle to renew. No settle of this dispatcher's is written
+        // outside this loop, so this is a rule kept, not a defect closed.
+        self.fleet.hold_claims(Vec::new());
+        match failure {
+            Some(error) => {
+                self.release_unstarted(unstarted.into()).await;
+                Err(error)
+            }
+            None => Ok(()),
+        }
     }
 
     /// Runs one claim of a batch, with the claims behind it still unstarted.
@@ -3431,9 +3458,10 @@ where
     ///
     /// **The claims behind it are held**
     /// ([`AgentDispatcherFleet::hold_claims`]), so the settle that ends this
-    /// claim renews them and the next one starts with a full lease. The
-    /// list is replaced before every claim, and the last claim of a batch
-    /// holds nothing behind it.
+    /// claim renews them: each is then leased for a full lease from that
+    /// settle. A hold is spent by the settle that lands, and the list is
+    /// named again before every claim; the last claim of a batch holds
+    /// nothing behind it.
     async fn execute_batch_claim(
         &mut self,
         claim: AgentDispatchClaim,
