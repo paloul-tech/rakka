@@ -436,6 +436,28 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   Wiring the retriever before step 5 finishes is safe: claims not yet embedded are not found, and each snapshot's communal record says `index_incomplete`. **Wiring the embedder sends text to it**: each claim of the stated classifications, and each searching turn's query (up to 1,024 bytes of recent session text). A deployment whose read policy admits a classification its embedding set leaves out stops finding those claims when it moves the retriever to meaning, and its snapshots report `index_incomplete` for as long as that holds.
 
+- Issue #150 ("a dispatch ticket whose outbox row is gone is settled, and its run is told") changes what `AgentRunEffectDispatcher` does with a claim on a fleet entry whose outbox row no longer exists. No signature changes, no record changes, no schema version moves, no refusal code is added, no metric is added. A ticket whose row exists is handled exactly as before.
+
+  **Before**, the claim wrote its cancellation to the row first, the substrate answered `outbox-entry-not-found`, and the fleet entry was never touched: the pass failed, the claims behind it in the batch were left unexecuted until their own leases lapsed, and the entry was claimed again on every lease, for good. The `ticket-row-missing` value the issue #81 entry lists for `AgentDispatchEntry::last_error_code` was never written by this dispatcher.
+
+  **Now** nothing is written to the outbox. The fleet entry is finished as `Cancelled` with `last_error_code` `ticket-row-missing`, the pass answers `Ok` and goes on with its batch, and `AgentDispatchPass::cancelled` counts the entry. The entry is finished, so `prune_terminal` removes it like any other.
+
+  **A run that is still waiting on the effect is parked on it.** If the run holds the effect unresolved at the ticket's generation, the effect becomes `Indeterminate` with `last_error_code` `ticket-row-missing`, behind the reconciliation checkpoint every indeterminate effect opens, and `AgentDispatchPass::parked_indeterminate` counts it. It is `Indeterminate` and not `Cancelled` for every safety class, a read-only effect included: the row was the only record of whether an attempt started, so that effect is not invoked again without a decision. Nobody is told when the run's record is gone as well, or when the run no longer waits on the effect, an ended run included.
+
+  **What the park does not cover.** It reaches an effect only when the claim finds the row still missing, and a run puts a missing row back whenever it settles: each command it handles, and each settle pass over it, sends every `Ready` effect to the outbox again. Two cases follow, both in the table below. The park is itself a command the run handles, so of several effects of one run whose rows were lost together, the one claimed first is parked and the park recreates the others' rows, which then run as first attempts. And `pump_run` and `register_run` fence a winding-down run before anything is claimed, so on those paths the fence answers first.
+
+  **New stable string.** `ticket-row-missing` as an effect's indeterminate code: on `AgentRunEffect::last_error_code`, on the `error_code` of the dispatcher's indeterminate `effect-dispatch` segment, as the reason code of the `request-reconciliation` decision event the run records when it opens the checkpoint, and wherever else a deployment reads an indeterminate effect's code. A consumer that maps indeterminate codes should add it. The attempt count the run records for the parked effect is the larger of its own and the fleet entry's; it can miss an attempt that was in flight when the row was lost.
+
+  | | |
+  |---|---|
+  | A row the run flushed again before the claim arrived | Unchanged. A run that settles flushes its `Ready` effects again, which recreates a missing row as `Pending` with no attempt history; the claim then finds a row and runs it as a first attempt, a non-idempotent effect included |
+  | Several effects of one run whose rows were lost together | The first claimed is parked. Its park makes the run flush the others' rows back, and they run as first attempts, in the same pass when the same batch holds their claims. Before this change the same rows came back on the run's next settle and all of them ran, the first included |
+  | A winding-down run, through `pump_run` or `register_run` | Unchanged. The wind-down fence runs before any claim and reads a `Ready` effect with no row as one whose flush never landed: it plants a cancelled row and tells the run `Cancelled`, and the claim then settles the ticket `intent-already-resolved`. Through `claim_and_execute` alone the claim is first, and the effect is parked like a live run's |
+  | A crash after the run was told and before the fleet entry was settled | The entry stays `Claimed`. The next lease finds the effect no longer waited on and settles the entry; the run is not told twice |
+  | A worker whose lease lapsed | The fleet answers its settle `claim-fenced`, which ends its claim and does not fail its pass. If the run flushed the row again in between and another worker is running the effect, the late worker's park can reach the run first; the run then waits for a decision on an effect that ran |
+  | Mixed builds | An earlier build beside this one keeps failing its own passes on such an entry until a node on this build claims and settles it. Nothing either build writes confuses the other |
+  | A rollback | Clean. A settled entry and a parked effect are states the earlier build already reads |
+
 Run the default compatibility matrix:
 
 ```sh

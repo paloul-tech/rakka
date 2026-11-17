@@ -167,6 +167,16 @@ pub(crate) const CREDENTIAL_RESOLUTION_FAILED: &str = "credential-resolution-fai
 const INDETERMINATE_OUTCOME_MESSAGE: &str =
     "the attempt's outcome could not be established; an explicit reconciliation decision is owed";
 
+/// The code a ticket whose outbox row is gone settles under: the fleet
+/// entry's `last_error_code`, and the indeterminate code of the effect a run
+/// was still waiting on (issue #150).
+const TICKET_ROW_MISSING: &str = "ticket-row-missing";
+
+/// The detail carried by the `Indeterminate` outcome of an effect whose
+/// ticket lost its outbox row.
+const TICKET_ROW_MISSING_MESSAGE: &str =
+    "the dispatch ticket's outbox row is gone; whether an attempt invoked the target cannot be established";
+
 /// The most bytes of failure detail one dispatch attempt persists.
 ///
 /// A failed attempt's detail is written to the run's durable outbox row, to
@@ -2139,6 +2149,15 @@ enum ClaimConclusion {
     Died,
 }
 
+/// How a park ends its claim's ticket.
+enum ParkedTicket {
+    /// The outbox row and the fleet entry, as every park but one does.
+    BothLayers,
+    /// The fleet entry alone: the outbox row is gone, and nothing is written
+    /// to it.
+    FleetOnly,
+}
+
 /// The durable effect dispatcher for agent runs.
 ///
 /// It composes the run's agent-workflow outbox (the dispatch tickets), the
@@ -2775,6 +2794,117 @@ where
         Ok(ClaimConclusion::Settled)
     }
 
+    /// Ends a claim whose outbox row is gone (issue #150).
+    ///
+    /// A fleet entry can outlive its row: a run's workflow record is purged,
+    /// or one store is restored without the other. Nothing can be executed
+    /// from such a claim, and nothing is written to the row that is not
+    /// there. The fleet entry is finished as `Cancelled` under
+    /// `ticket-row-missing`, so it is never claimed again, and the run is
+    /// told if it is still waiting.
+    ///
+    /// **The run is told `Indeterminate`, not `Cancelled`.** `Cancelled`
+    /// says the generation was fenced before any invocation could have
+    /// happened. The row was the only record of whether an attempt started,
+    /// so with the row gone nobody can say that. The effect is parked for
+    /// an explicit reconciliation decision, whatever its safety class, and
+    /// nothing is invoked. The ticket is matched to the run's effect by its
+    /// ticket id, which carries the generation; the row's payload, which the
+    /// ordinary path matches on, went with the row.
+    ///
+    /// **Nobody is told** when the run is gone, when it holds no such
+    /// effect at this generation, or when it is no longer waiting on it:
+    /// the entry is settled and that is all.
+    ///
+    /// **Telling the run makes it flush.** The park is a command the run
+    /// handles, and a run that handles one sends its other ready effects to
+    /// the outbox again. Where their rows were lost with this one, they come
+    /// back as new rows with no attempt history, and the claims on them find
+    /// a row and run it as a first attempt. Of a run's several lost rows
+    /// this path parks the one claimed first; nothing durable tells a row
+    /// the run recreated from the one that was lost.
+    ///
+    /// **The run is told first and the entry is settled second**, the
+    /// park's own order and the reverse of
+    /// [`Self::conclude_on_finished_row`]'s. A crash between the two leaves
+    /// the entry `Claimed`: the next lease finds the row still missing and
+    /// the effect no longer outstanding, and settles the entry. Settled
+    /// first, a crash would leave the entry finished and the run waiting on
+    /// an effect nothing will ever claim again, which is the wait this path
+    /// exists to prevent. The cost is that a worker whose lease lapsed can
+    /// park an effect another worker is running, if the run flushed the row
+    /// again in between. The run then holds "unknown, an operator decides"
+    /// for an effect that ran, which a decision recovers.
+    ///
+    /// The attempt reported is the larger of the run's own count and the
+    /// fleet entry's, the last the fleet learned from the row. It can miss
+    /// an attempt that was in flight when the row was lost.
+    async fn conclude_on_missing_row(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: AgentDispatchClaim,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        let run_state = self.run_state(scope).await?;
+        let intent = run_state
+            .as_ref()
+            .and_then(AgentRunState::loop_state)
+            .and_then(|loop_state| {
+                loop_state.effects().iter().find(|effect| {
+                    effect.is_outstanding()
+                        && effect.dispatch_ticket_id().as_str() == claim.effect_id.as_str()
+                })
+            })
+            .cloned();
+        let Some(intent) = intent else {
+            self.settle_orphan_claim(&claim, pass).await?;
+            return Ok(ClaimConclusion::Settled);
+        };
+        let counted_by_fleet = self
+            .fleet
+            .state()
+            .ok()
+            .and_then(|state| state.entry(&claim.dispatch_id))
+            .map_or(0, |entry| entry.attempts);
+        let attempt = intent.attempts.max(counted_by_fleet);
+        self.park_indeterminate_with(
+            scope,
+            claim,
+            &intent,
+            attempt,
+            TICKET_ROW_MISSING,
+            TICKET_ROW_MISSING_MESSAGE,
+            None,
+            None,
+            ParkedTicket::FleetOnly,
+            pass,
+        )
+        .await
+    }
+
+    /// Finishes the fleet entry of a claim whose outbox row is gone, and
+    /// writes nothing to the outbox.
+    ///
+    /// `claim-fenced` is an expected answer and not a failure of the pass.
+    /// The claim is no longer current: its lease lapsed, with or without
+    /// another worker taking the ticket over, or the entry was already
+    /// finished and pruned. Whoever claims the entry next settles it.
+    /// Nothing is counted for it.
+    async fn settle_orphan_claim(
+        &mut self,
+        claim: &AgentDispatchClaim,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<()> {
+        match self.fleet.settle_claim_from_row(claim, None).await {
+            Ok(_) => {
+                pass.cancelled += 1;
+                Ok(())
+            }
+            Err(rakka_agent_workflow::AgentDispatcherError::ClaimFenced { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// The dispatcher's own clock, as an agent-domain timestamp.
     fn now(&self) -> AgentTimestampMillis {
         AgentTimestampMillis::new(self.clock.now().as_millis())
@@ -2959,11 +3089,11 @@ where
             .outbox_entry(&message_id)
             .cloned()
         else {
-            // A fleet entry without its outbox row cannot be executed; settle
-            // it so it is never claimed again.
-            self.settle_ticket_cancelled(scope, &claim, "ticket-row-missing", pass)
-                .await?;
-            return Ok(ClaimConclusion::Settled);
+            // A fleet entry without its outbox row cannot be executed, and
+            // there is no row to write a cancellation to. The entry is
+            // settled at the fleet alone, so it is never claimed again, and
+            // a run still waiting on the effect is told.
+            return self.conclude_on_missing_row(scope, claim, pass).await;
         };
         let attempt = row.attempts().attempts().saturating_add(1);
 
@@ -3663,7 +3793,16 @@ where
                     None => (None, None),
                 };
                 self.park_indeterminate_with(
-                    scope, claim, intent, attempt, code, message, reason, evidence, pass,
+                    scope,
+                    claim,
+                    intent,
+                    attempt,
+                    code,
+                    message,
+                    reason,
+                    evidence,
+                    ParkedTicket::BothLayers,
+                    pass,
                 )
                 .await
             }
@@ -4003,13 +4142,26 @@ where
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         self.park_indeterminate_with(
-            scope, claim, intent, attempt, code, message, None, None, pass,
+            scope,
+            claim,
+            intent,
+            attempt,
+            code,
+            message,
+            None,
+            None,
+            ParkedTicket::BothLayers,
+            pass,
         )
         .await
     }
 
     /// Parks one generation as indeterminate with what is known about it, and
     /// revokes its dispatch eligibility.
+    ///
+    /// `ticket` says how the claim's ticket is ended once the run has been
+    /// told: at the outbox row and the fleet entry, or at the fleet entry
+    /// alone when the row is gone ([`Self::conclude_on_missing_row`]).
     #[allow(clippy::too_many_arguments)]
     async fn park_indeterminate_with(
         &mut self,
@@ -4021,6 +4173,7 @@ where
         message: &str,
         reason: Option<crate::failure::AgentFailureReason>,
         evidence: Option<AgentUnknownOutcomeEvidence>,
+        ticket: ParkedTicket,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let timer = AgentSegmentTimer::start(self.now());
@@ -4083,8 +4236,13 @@ where
                 .failed("rakka.agent.effect", bounded_failure_code(code)),
         );
         pass.parked_indeterminate += 1;
-        self.settle_ticket_cancelled(scope, &claim, "indeterminate", pass)
-            .await?;
+        match ticket {
+            ParkedTicket::BothLayers => {
+                self.settle_ticket_cancelled(scope, &claim, "indeterminate", pass)
+                    .await?;
+            }
+            ParkedTicket::FleetOnly => self.settle_orphan_claim(&claim, pass).await?,
+        }
         Ok(ClaimConclusion::Settled)
     }
 

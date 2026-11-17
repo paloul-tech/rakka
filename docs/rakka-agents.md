@@ -265,6 +265,25 @@ or more. [`rakka-compatibility.md`](rakka-compatibility.md) says why.
 series too. `rakka.agent_workflow.dispatcher.entries` is the record's entry
 count by status; the finished statuses are what grows when nothing prunes.
 
+**A ticket whose outbox row is gone.** A fleet entry outlives its row when a
+run's workflow record is purged, or when one store is restored without the
+other. `AgentRunEffectDispatcher` writes nothing to the missing row: the
+entry is finished as `Cancelled` with `last_error_code` `ticket-row-missing`,
+and the pass goes on with its batch. A run that still holds the effect
+unresolved is parked on it as `Indeterminate` under the same code, behind the
+usual reconciliation checkpoint, whatever the effect's safety class. The row
+was the only record of whether an attempt started, so that effect is not
+invoked again until someone decides.
+
+The park reaches an effect only if the claim finds the row still missing,
+and a run puts a missing row back whenever it settles: every command it
+handles and every settle pass sends its ready effects to the outbox again,
+as new rows with no attempt history. A ticket whose row came back that way
+runs as a first attempt. The park is itself a command the run handles, so
+when one run lost several rows together, the ticket claimed first is parked
+and the others run again. A winding-down run that is pumped is fenced before
+anything is claimed, and the fence cancels a ready effect that has no row.
+
 **What is not bounded.** The record is still one record, written whole. A
 prune bounds it to the live entries plus the finished ones inside the
 horizon, which on a busy fleet can be megabytes.
