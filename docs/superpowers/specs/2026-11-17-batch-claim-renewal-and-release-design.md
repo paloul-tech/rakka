@@ -270,6 +270,16 @@ whole-branch review (section 11).
    once a batch is full; and `AgentDispatchClaim::lease_expires_at` is the
    expiry at claim time.
 
+10. **The claim's future is boxed inside the pass.** The first full
+    validation failed: `coordination-capability-acceptance`'s walk overflowed
+    its test thread's stack. Measured with `RUST_MIN_STACK` in 64 KiB steps,
+    that test needs between 1984 and 2048 KiB on main, so it already ran
+    within 64 KiB of the 2 MiB limit. The async function this change put
+    around `execute_claim` took it to between 2048 and 2112 KiB. With that
+    one await boxed it needs between 1920 and 1984 KiB, less than on main.
+    That the example runs this close to the limit is older than this change
+    and is not addressed here.
+
 **Tests.** `crates/rakka-agent-workflow/tests/dispatcher_fleet_leases.rs`
 (27) and `crates/rakka-agent/tests/dispatch_batch_leases.rs` (8). Before the
 change the agent tier's lease tests failed `claim-fenced` and the failed

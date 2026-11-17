@@ -3473,7 +3473,14 @@ where
         }
         self.fleet.hold_claims(unstarted.iter().cloned().collect());
         let claim_scope = AgentRunScope::parse(claim.run_id.as_str())?;
-        self.execute_claim(&claim_scope, claim, pass).await
+        // Boxed: the claim's future is the largest in a pass, and awaited
+        // in place it sits in this future and in the pass's, one level
+        // deeper than it did before this function existed. In a debug build
+        // that level cost enough stack to overflow a test thread in
+        // `coordination-capability-acceptance`, whose walk already ran
+        // within 64 KiB of the 2 MiB a test thread has. On the heap the
+        // same walk needs less than it did without the level.
+        Box::pin(self.execute_claim(&claim_scope, claim, pass)).await
     }
 
     /// Gives back the claims a failed pass never started
