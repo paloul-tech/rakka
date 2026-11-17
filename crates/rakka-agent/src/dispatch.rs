@@ -3290,16 +3290,16 @@ where
         }
 
         // Fence a winding-down run at the dispatch layer before anything can
-        // be claimed on its behalf.
+        // be claimed on its behalf, and tell any run what it is owed for a
+        // ticket no claim will come for.
         let run_state = self.run_state(scope).await?;
         pass.run_status = run_state.as_ref().and_then(AgentRunState::status);
         if let Some(state) = &run_state {
             let winding_down = state
                 .run()
                 .is_some_and(|run| run.terminal_reason.is_some() || run.status.is_terminal());
-            if winding_down {
-                self.fence_run(scope, state, fleet_current, pass).await?;
-            }
+            self.settle_waited_effects(scope, state, winding_down, fleet_current, &inbox, pass)
+                .await?;
         }
         Ok(fleet_current)
     }
@@ -4504,7 +4504,7 @@ where
     /// run, the same segment and the same count. A park under a claim ends
     /// the claim's ticket afterwards ([`Self::park_indeterminate_with`]).
     /// The wind-down fence parks without a claim, for a ticket no claim
-    /// will come for ([`Self::fence_run`]), and has no ticket to end.
+    /// will come for ([`Self::settle_waited_effects`]), and has no ticket to end.
     #[allow(clippy::too_many_arguments)]
     async fn tell_indeterminate(
         &mut self,
@@ -5435,103 +5435,233 @@ where
         Ok(())
     }
 
-    /// Fences a winding-down run at the dispatch layer
+    /// The per-run half's look at the effects a run waits on: it settles
+    /// what the run is owed where no claim will, and fences a winding-down
+    /// run at the dispatch layer
     /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
     ///
-    /// The ordinary claim path already applies the fence to every registered
-    /// ticket — it re-reads the run's wind-down state under its claim, cancels
-    /// what provably never started, and recovers an ambiguous attempt per its
-    /// safety class, which is what keeps a cancelled run's ambiguous
-    /// non-idempotent effect in reconciliation rather than terminally
-    /// cancelled (scenario 57). This pass repairs only what the claim path
-    /// can never see:
+    /// The claim path owns every ticket a worker holds or can still claim.
+    /// It applies the wind-down fence under its claim, recovers an ambiguous
+    /// attempt per its safety class, parks a ticket whose row is gone or was
+    /// put back, and tells a run what a finished row says. This sweep acts
+    /// only where the claim path cannot: on a ticket no claim will come for.
     ///
-    /// - a `Ready` effect with **no outbox row and no fleet entry** — the
-    ///   flush never landed. A tombstone is planted (schedule the ticket
+    /// | The effect's outbox row | The ticket's fleet entry | What happens |
+    /// |---|---|---|
+    /// | live | finished | the row is cancelled and the effect parked `ticket-row-missing` |
+    /// | live | anything else | nothing |
+    /// | `Cancelled`, and the wind-down fences the effect | any | the run is told `Cancelled` |
+    /// | finished | a worker holds or can claim it | nothing |
+    /// | finished | finished, or fenced by a cancellation request, for a lease | the run is told what the row says |
+    /// | finished | none, and the row finished a lease ago | the same |
+    /// | none | finished, or fenced by a cancellation request | the effect is parked `ticket-row-missing` |
+    /// | none | a worker can claim it | nothing: the claim parks it |
+    /// | none | none, and the wind-down fences the effect | a cancelled row is planted and the run told `Cancelled` |
+    /// | none | none, otherwise | nothing: the run's own flush lands, or is sent again |
+    ///
+    /// **A finished row whose run was never told** (issue #134). A worker
+    /// finishes a ticket's row, then its fleet entry, then tells the run. A
+    /// worker lost after the second leaves a finished entry nothing will
+    /// ever claim, and a run that waits for good. The run is told from the
+    /// row ([`owed_by_finished_row`]), but only once the entry has been
+    /// finished for a lease: a worker that has just finished it is about to
+    /// tell the run itself, with the collaborator's reason the row does not
+    /// keep, and a lease is how long a claim's worker may still be acting.
+    /// An entry that is absent was finished and pruned, and the row's own
+    /// finishing time stands in for it.
+    ///
+    /// **A lost row** (issues #154 and #134). A ticket with a fleet entry
+    /// once had a row a worker could have claimed, so an effect with an
+    /// entry and without its row is never told `Cancelled`. An entry a
+    /// worker can still claim is left to that claim
+    /// ([`Self::conclude_on_missing_row`]). An entry no claim will come for
+    /// is parked here. A live row under a finished entry is the same case
+    /// after the run settled: an entry is finished only once its row is
+    /// finished or gone, and nothing makes a finished row live again, so
+    /// the row is one the run put back, whatever the entry's stamp says.
+    /// It is cancelled first, so it does not sit due under an entry that
+    /// will never be claimed, and then the effect is parked. An entry that
+    /// finished and was pruned is absent, and a row-less effect with no
+    /// entry reads as a ticket that was never registered: nothing durable
+    /// is left to say otherwise.
+    ///
+    /// **The fence**, for a winding-down run, for every effect kind the
+    /// wind-down does not exempt:
+    ///
+    /// - a `Ready` effect with no outbox row and no fleet entry — the flush
+    ///   never landed. A tombstone is planted (schedule the ticket
     ///   idempotently, then cancel it) so a laggard flush racing this fence
     ///   lands on a terminal row instead of creating dispatchable work
     ///   post-fence, and the cancelled word is delivered to the run;
-    /// - a `Ready` effect whose row is **already cancelled** — an earlier
-    ///   fence died between settling the row and delivering the word.
+    /// - a `Ready` effect whose row is already cancelled — an earlier fence
+    ///   died between settling the row and delivering the word.
     ///
-    /// **A row-less effect whose ticket has a fleet entry is a lost row**
-    /// (issue #154), and is never told `Cancelled` here. The entry exists
-    /// only because a registration once read a due row for the ticket, so
-    /// the flush did land, a worker could have held the ticket, and the row
-    /// that would say whether one invoked anything is gone. The fleet record
-    /// is read to learn this, once per fence, only when an effect has no
-    /// row, and not at all when the registration just before left it
-    /// current (`fleet_current`). An entry a worker can still claim is left to that claim, which
-    /// parks the effect ([`Self::conclude_on_missing_row`]). An entry no
-    /// claim will come for, finished or fenced by a cancellation request, is
-    /// parked here under the same code. An entry that finished and was
-    /// pruned is absent, and reads as a ticket that was never registered:
-    /// nothing durable is left to say otherwise.
-    async fn fence_run(
+    /// The compensation and workflow-cancel the wind-down itself authorized,
+    /// and the promotion or claim append that copies work already recorded,
+    /// stay dispatchable: the fence plants nothing for them and cancels
+    /// nothing of theirs.
+    ///
+    /// **What it reads.** Nothing, on an ordinary pass. It looks first at
+    /// the outbox rows the registration just read (`registered_from`) and,
+    /// when the registration read the fleet record too (`fleet_current`),
+    /// at the entries. Only an effect whose row is finished or absent
+    /// there, or live under a finished entry, makes it read: the run's
+    /// outbox again for each effect, since telling a live run makes it
+    /// flush, and the fleet record once unless it is already current.
+    #[allow(clippy::too_many_lines)]
+    async fn settle_waited_effects(
         &mut self,
         scope: &AgentRunScope,
         state: &AgentRunState,
+        winding_down: bool,
         fleet_current: bool,
+        registered_from: &AgentRunInbox<Flow, Clock>,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<()> {
         let Some(loop_state) = state.loop_state() else {
             return Ok(());
         };
-        let mut fleet_read = fleet_current;
+        let waited = loop_state.ready_effects();
+        if waited.is_empty() {
+            return Ok(());
+        }
+        let run_id = workflow_run_id(scope);
 
-        for intent in loop_state.ready_effects() {
-            if intent.kind().exempt_from_wind_down_fence() {
-                // The compensation and workflow-cancel the wind-down itself
-                // authorized, and the promotion or claim append that copies
-                // work already recorded — including one accepted after the
-                // run ended — stay dispatchable; the ordinary flush and claim
-                // paths own them, and this sweep neither reads nor re-fences
-                // them on any later pass.
-                continue;
+        // The look that costs nothing.
+        {
+            let rows = registered_from
+                .inner()
+                .state()
+                .map_err(AgentInboxError::from)?;
+            let entries = if fleet_current {
+                self.fleet.state().ok()
+            } else {
+                None
+            };
+            let nothing_owed = waited.iter().all(|intent| {
+                let ticket_id = intent.dispatch_ticket_id();
+                let live = rows
+                    .outbox_entry(&OutboxMessageId::new(ticket_id.as_str()))
+                    .is_some_and(|row| !row_is_finished(row.status()));
+                let entry_finished = entries
+                    .and_then(|entries| entries.entry(&agent_dispatch_id(&run_id, &ticket_id)))
+                    .is_some_and(|entry| entry.status.is_terminal());
+                live && !entry_finished
+            });
+            if nothing_owed {
+                return Ok(());
             }
+        }
+        if !fleet_current {
+            self.fleet.recover().await?;
+        }
+        let lease_ms = self.fleet.settings().lease_duration_ms();
+
+        for intent in waited {
+            let fenced = winding_down && !intent.kind().exempt_from_wind_down_fence();
             let ticket_id = intent.dispatch_ticket_id();
             let message_id = OutboxMessageId::new(ticket_id.as_str());
+            let dispatch_id = agent_dispatch_id(&run_id, &ticket_id);
             let mut inbox = self.inbox(scope);
             inbox.recover().await?;
-            let status = inbox
+            let row = inbox
                 .inner()
                 .state()
                 .map_err(AgentInboxError::from)?
                 .outbox_entry(&message_id)
-                .map(|row| row.status());
+                .cloned();
+            // (finished, past claiming, last fencing token, last written)
+            let entry = self.fleet.state()?.entry(&dispatch_id).map(|entry| {
+                (
+                    entry.status.is_terminal(),
+                    entry.status.is_terminal() || entry.cancellation_requested,
+                    entry.last_fencing_token,
+                    entry.updated_at.as_millis(),
+                )
+            });
+            let now = self.now().as_millis();
 
-            match status {
-                None => {
-                    if !fleet_read {
-                        self.fleet.recover().await?;
-                        fleet_read = true;
+            match (row, entry) {
+                (Some(row), entry) if !row_is_finished(row.status()) => {
+                    let Some((true, _, last_fence, _)) = entry else {
+                        // A worker holds the ticket, can claim it, or will
+                        // once it is registered.
+                        continue;
+                    };
+                    let attempt = self.attempts_counted(&dispatch_id, &intent);
+                    let cancelled = self
+                        .write_outbox(
+                            scope,
+                            &message_id,
+                            InboxWrite::Cancelled {
+                                reason: TICKET_ROW_MISSING,
+                            },
+                        )
+                        .await?;
+                    if cancelled.is_some() {
+                        pass.cancelled += 1;
                     }
-                    let dispatch_id = agent_dispatch_id(&workflow_run_id(scope), &ticket_id);
-                    let lost_row = self.fleet.state()?.entry(&dispatch_id).map(|entry| {
-                        let claim_will_come =
-                            !(entry.status.is_terminal() || entry.cancellation_requested);
-                        (claim_will_come, entry.last_fencing_token)
-                    });
-                    if let Some((claim_will_come, last_fence)) = lost_row {
-                        if !claim_will_come {
-                            let attempt = self.attempts_counted(&dispatch_id, &intent);
-                            self.tell_indeterminate(
-                                scope,
-                                &intent,
-                                attempt,
-                                last_fence,
-                                TICKET_ROW_MISSING,
-                                TICKET_ROW_MISSING_MESSAGE,
-                                None,
-                                None,
-                                pass,
-                            )
-                            .await?;
-                        }
-                        // Otherwise a worker can still claim the ticket, and
-                        // the claim parks it.
+                    self.tell_indeterminate(
+                        scope,
+                        &intent,
+                        attempt,
+                        last_fence,
+                        TICKET_ROW_MISSING,
+                        TICKET_ROW_MISSING_MESSAGE,
+                        None,
+                        None,
+                        pass,
+                    )
+                    .await?;
+                }
+                (Some(row), _) if fenced && row.status() == OutboxStatus::Cancelled => {
+                    self.deliver_outcome(
+                        scope,
+                        &intent,
+                        intent.attempts,
+                        0,
+                        AgentRunEffectOutcome::Cancelled {
+                            reason: "run-cancelled".to_string(),
+                        },
+                        pass,
+                    )
+                    .await?;
+                }
+                (Some(row), entry) => {
+                    let (settled_at, fence) = match entry {
+                        // A worker holds the ticket or can claim it: the
+                        // claim path owns the row.
+                        Some((_, false, _, _)) => continue,
+                        Some((_, true, last_fence, since)) => (since, last_fence),
+                        None => (row.updated_at().as_millis(), 0),
+                    };
+                    if now < settled_at.saturating_add(lease_ms) {
                         continue;
                     }
+                    let (verdict, attempt) = owed_by_finished_row(&row, &intent, false);
+                    self.tell_owed(scope, &intent, attempt, fence, verdict, pass)
+                        .await?;
+                }
+                (None, Some((_, true, last_fence, _))) => {
+                    let attempt = self.attempts_counted(&dispatch_id, &intent);
+                    self.tell_indeterminate(
+                        scope,
+                        &intent,
+                        attempt,
+                        last_fence,
+                        TICKET_ROW_MISSING,
+                        TICKET_ROW_MISSING_MESSAGE,
+                        None,
+                        None,
+                        pass,
+                    )
+                    .await?;
+                }
+                (None, Some(_)) => {
+                    // A worker can still claim the ticket, and the claim
+                    // parks it.
+                }
+                (None, None) if fenced => {
                     let ticket = intent.to_workflow_effect(scope);
                     let command = ticket_outbox_command(&ticket, self.retry_backoff_ms)
                         .map_err(|error| AgentDispatchError::Effect(Box::new(error)))?;
@@ -5559,27 +5689,22 @@ where
                     )
                     .await?;
                 }
-                Some(OutboxStatus::Cancelled) => {
-                    self.deliver_outcome(
-                        scope,
-                        &intent,
-                        intent.attempts,
-                        0,
-                        AgentRunEffectOutcome::Cancelled {
-                            reason: "run-cancelled".to_string(),
-                        },
-                        pass,
-                    )
-                    .await?;
-                }
-                Some(_) => {
-                    // Registered, claimable, or settling: the claim path owns
-                    // it, fence included.
+                (None, None) => {
+                    // The run's own flush has not landed yet, or will be
+                    // sent again when the run next settles.
                 }
             }
         }
         Ok(())
     }
+}
+
+/// Whether an outbox row is finished: nothing will dispatch it again.
+const fn row_is_finished(status: OutboxStatus) -> bool {
+    matches!(
+        status,
+        OutboxStatus::Dispatched | OutboxStatus::Exhausted | OutboxStatus::Cancelled
+    )
 }
 
 /// What an executor knows about an attempt whose outcome is unknown,

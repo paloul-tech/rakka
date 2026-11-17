@@ -64,15 +64,8 @@ fn tool_then_proposal() -> DeterministicModelAdapter {
         )
 }
 
-/// A run whose tool ticket is in the outbox, under `spec`, with `tools`.
-async fn ready_tool_ticket(
-    spec: &AgentEffectSpec,
-    tools: Option<Arc<dyn AgentDispatchToolExecutor>>,
-) -> (AuthorityFixture, AgentRunEffect) {
-    ticket(spec, tools, None).await
-}
-
-/// The same, with the reconciler a reconcileable effect's recovery asks.
+/// A run whose tool ticket is in the outbox, under `spec`, with `tools`, and
+/// with the reconciler a reconcileable effect's recovery asks.
 async fn ticket(
     spec: &AgentEffectSpec,
     tools: Option<Arc<dyn AgentDispatchToolExecutor>>,
@@ -810,18 +803,18 @@ async fn a_row_finished_between_the_claims_read_and_the_mark_is_not_invoked() {
 }
 
 // ---------------------------------------------------------------------------
-// The other side of the window: no claim will come. Reproductions.
+// The other side of the window: no claim will come.
 // ---------------------------------------------------------------------------
 
-/// The worker is lost after the fleet write that finishes the entry and
-/// before it tells the run. The row is `Exhausted`, the entry is
-/// `Exhausted`, and nothing claims a finished entry: the run waits for good.
-#[tokio::test]
-async fn pinned_a_worker_lost_after_the_fleet_write_leaves_the_run_waiting() {
-    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
-    let tool = Arc::new(CountingRefusal::default());
-    let (fx, effect) = ready_tool_ticket(&spec, Some(tool.clone())).await;
-
+/// A failed attempt spent the budget, the worker finished the fleet entry,
+/// and it was lost before it told the run: the run's store refuses the
+/// delivery. The row and the entry are `Exhausted` and the effect is
+/// `Ready`. Nothing claims a finished entry.
+async fn lose_the_worker_after_its_fleet_write(
+    spec: &AgentEffectSpec,
+) -> (AuthorityFixture, AgentRunEffect, Arc<CountingRefusal>) {
+    let tool = refusing();
+    let (fx, effect) = ticket(spec, Some(tool.clone()), None).await;
     fx.fx.runs.crash_at(1, CrashPoint::BeforeWrite);
     fx.pipeline()
         .pump_run(&run_scope())
@@ -831,29 +824,152 @@ async fn pinned_a_worker_lost_after_the_fleet_write_leaves_the_run_waiting() {
     fx.fx.runs.survive();
     assert_eq!(tool.calls(), 1);
     assert_eq!(
-        fx.outbox_row(&effect).await.map(|row| row.status()),
+        row_status(&fx, &effect).await,
         Some(OutboxStatus::Exhausted)
     );
     assert_eq!(
         fleet_entry(&fx, &effect).await.map(|entry| entry.status),
         Some(AgentDispatchStatus::Exhausted)
     );
+    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+    (fx, effect, tool)
+}
 
-    for _round in 0..3 {
-        fx.expire_lease();
-        fx.settle().await;
-        let pass = fx
-            .pipeline()
+/// The per-run half of a pass is what tells this run: no claim will come
+/// for a finished entry. It waits until the entry has been finished for a
+/// lease, and then tells the run what the row says, once.
+#[tokio::test]
+async fn a_worker_lost_after_the_fleet_write_is_repaired_after_a_lease() {
+    let spec = idempotent(3);
+    let twin = {
+        let (fx, _effect) = ticket(&spec, Some(refusing()), None).await;
+        fx.pipeline()
             .pump_run(&run_scope())
             .await
             .expect("the pass runs");
-        assert_eq!((pass.claimed, pass.delivered), (0, 0));
-    }
-    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
-    eprintln!(
-        "run status: {:?}",
-        fx.fx.run_snapshot().await.expect("the run exists").status
+        recorded(&fx).await.0
+    };
+    let (fx, effect, tool) = lose_the_worker_after_its_fleet_write(&spec).await;
+
+    fx.expire_lease();
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!((pass.claimed, pass.invoked, pass.delivered), (0, 0, 1));
+    assert_eq!(tool.calls(), 1);
+    let (told, has_reason) = recorded(&fx).await;
+    assert_eq!(told, twin);
+    assert!(!has_reason);
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Exhausted)
     );
+
+    let again = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert_eq!(again.delivered, 0, "the run is told once");
+}
+
+/// A worker that has just finished the entry is about to tell the run
+/// itself, with the collaborator's reason the row does not keep. Until the
+/// entry has been finished for a lease, the sweep leaves the run to it.
+#[tokio::test]
+async fn a_finished_entry_is_not_swept_before_a_lease_has_passed() {
+    let (fx, _effect, _tool) = lose_the_worker_after_its_fleet_write(&idempotent(3)).await;
+    fx.wf_clock.advance(LEASE_MS / 2);
+
+    let early = fx
+        .pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the per-run half runs");
+
+    assert_eq!(early.delivered, 0);
+    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+
+    fx.wf_clock.advance(LEASE_MS);
+    let late = fx
+        .pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the per-run half runs");
+    assert_eq!(late.delivered, 1);
+    assert_eq!(
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Exhausted)
+    );
+}
+
+/// The budget was spent recovering an attempt lost after `Started`, and the
+/// recovering worker was lost after its fleet write.
+#[tokio::test]
+async fn an_ambiguous_budget_lost_after_the_fleet_write_is_repaired() {
+    let (fx, effect) = ticket(&idempotent(1), None, None).await;
+    lose_the_first_attempt_after_started(&fx, &effect).await;
+    fx.fx.runs.crash_at(1, CrashPoint::BeforeWrite);
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect_err("the delivery is refused");
+    fx.fx.runs.assert_crash_fired(1, CrashPoint::BeforeWrite);
+    fx.fx.runs.survive();
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Exhausted)
+    );
+    fx.expire_lease();
+
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!((pass.invoked, pass.delivered), (0, 1));
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref(), told.attempts),
+        (
+            AgentRunEffectStatus::Exhausted,
+            Some("dispatcher-lost-after-started"),
+            1
+        )
+    );
+}
+
+/// The finished entry was pruned before the run was told. The row is what
+/// is left, and its own finishing time stands in for the entry's.
+#[tokio::test]
+async fn a_finished_row_whose_entry_was_pruned_is_repaired_from_the_row() {
+    let (fx, effect, _tool) = lose_the_worker_after_its_fleet_write(&idempotent(3)).await;
+    fx.pipeline()
+        .prune_fleet(rakka_agent_workflow::AgentTimestampMillis::new(u64::MAX))
+        .await
+        .expect("the prune runs");
+    assert!(fleet_entry(&fx, &effect).await.is_none());
+
+    let early = fx
+        .pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the per-run half runs");
+    assert_eq!(early.delivered, 0, "a lease has not passed since the row");
+
+    fx.expire_lease();
+    let late = fx
+        .pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the per-run half runs");
+    assert_eq!(late.delivered, 1);
+    let told = recorded(&fx).await.0;
+    assert_eq!(told.status, AgentRunEffectStatus::Exhausted);
 }
 
 /// A fleet handle of its own over the fixture's fleet record.
@@ -869,13 +985,10 @@ fn another_fleet_handle(
     )
 }
 
-/// A live run whose ticket is finished at the fleet and whose row was lost.
-/// The run puts a row back, registration leaves a finished entry alone, and
-/// nothing ever claims it: the run waits for good.
-#[tokio::test]
-async fn pinned_a_live_run_whose_finished_ticket_lost_its_row_waits_for_good() {
-    let spec = AgentEffectSpec::non_idempotent();
-    let (fx, effect) = ready_tool_ticket(&spec, None).await;
+/// A live run whose ticket is finished at the fleet, and whose outbox row
+/// is then lost with the run's workflow record.
+async fn a_finished_ticket_that_lost_its_row() -> (AuthorityFixture, AgentRunEffect) {
+    let (fx, effect) = ticket(&AgentEffectSpec::non_idempotent(), None, None).await;
     fx.pipeline()
         .register_run(&run_scope())
         .await
@@ -909,22 +1022,184 @@ async fn pinned_a_live_run_whose_finished_ticket_lost_its_row_waits_for_good() {
         .delete(&id, record.revision)
         .await
         .expect("the workflow record is deleted");
+    (fx, effect)
+}
 
-    for _round in 0..3 {
-        fx.expire_lease();
-        fx.settle().await;
-        let pass = fx
-            .pipeline()
-            .pump_run(&run_scope())
-            .await
-            .expect("the pass runs");
-        assert_eq!((pass.claimed, pass.delivered, pass.invoked), (0, 0, 0));
-    }
-    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+async fn assert_parked_as_missing(fx: &AuthorityFixture) {
+    let told = recorded(fx).await.0;
     assert_eq!(
-        fx.outbox_row(&effect).await.map(|row| row.status()),
-        Some(OutboxStatus::Pending),
-        "the run put a row back, and nothing will claim it"
+        (told.status, told.code.as_deref()),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("ticket-row-missing")
+        )
     );
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
+}
+
+/// The run settles and puts a row back, as a run does. Registration leaves
+/// a finished entry alone, so nothing will ever claim that row, and a live
+/// row under a finished entry is always a row put back: an entry is
+/// finished only after its row is finished or gone. The effect is parked as
+/// a lost row's is, and the row is finished so it does not sit due for good.
+#[tokio::test]
+async fn a_live_run_whose_finished_ticket_lost_its_row_is_parked() {
+    let (fx, effect) = a_finished_ticket_that_lost_its_row().await;
+    fx.expire_lease();
+    fx.settle().await;
+    assert_eq!(row_status(&fx, &effect).await, Some(OutboxStatus::Pending));
+
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(
+        (pass.claimed, pass.invoked, pass.parked_indeterminate),
+        (0, 0, 1)
+    );
+    assert_parked_as_missing(&fx).await;
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Cancelled)
+    );
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Exhausted),
+        "the finished entry is left as it finished"
+    );
+
+    let again = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert_eq!((again.delivered, again.registered), (0, 0));
+}
+
+/// Rewrites the fleet record without any entry's row stamp: the record a
+/// build before issue #153 wrote.
+async fn strip_the_row_stamps(fx: &AuthorityFixture) {
+    let id = rakka_agent_workflow::agent_dispatcher_fleet_persistence_id();
+    let record = fx
+        .fleet_store
+        .load(&id)
+        .await
+        .expect("the fleet store loads")
+        .expect("the fleet has a record");
+    let mut state = serde_json::to_value(&record.state).expect("the state encodes");
+    for entry in state["entries"]
+        .as_object_mut()
+        .expect("the entries are a map")
+        .values_mut()
+    {
+        assert!(
+            entry
+                .as_object_mut()
+                .expect("an entry is an object")
+                .remove("row_scheduled_at")
+                .is_some(),
+            "the stamp was there to remove"
+        );
+    }
+    fx.fleet_store
+        .compare_and_set(
+            &id,
+            record.revision,
+            serde_json::from_value(state).expect("a record with no stamps decodes"),
+        )
+        .await
+        .expect("the earlier record is written");
+}
+
+/// The entry's row stamp is not what says the row was put back, so an entry
+/// registered by a build that recorded none is reached too.
+#[tokio::test]
+async fn the_same_for_an_entry_with_no_stamp() {
+    let (fx, effect) = a_finished_ticket_that_lost_its_row().await;
+    strip_the_row_stamps(&fx).await;
+    fx.expire_lease();
+    fx.settle().await;
+
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(pass.parked_indeterminate, 1);
+    assert_parked_as_missing(&fx).await;
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Cancelled)
+    );
+}
+
+/// The run has not settled since the loss, so there is no row at all.
+#[tokio::test]
+async fn a_live_run_whose_finished_ticket_lost_its_row_is_parked_before_it_settles() {
+    let (fx, effect) = a_finished_ticket_that_lost_its_row().await;
+
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(
+        (pass.claimed, pass.invoked, pass.parked_indeterminate),
+        (0, 0, 1)
+    );
+    assert_parked_as_missing(&fx).await;
+    assert!(fx.outbox_row(&effect).await.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// What the sweep costs a pass that has nothing to repair.
+// ---------------------------------------------------------------------------
+
+/// Counts every load of `store` from now on.
+fn count_loads<S>(store: &rakka_agent::testkit::CrashingStateStore<S>, loads: &Arc<AtomicUsize>)
+where
+    S: rakka_persistence::DurableState,
+{
+    let (rearm, counted) = (store.clone(), loads.clone());
+    store.before_next_load(Box::new(move || {
+        Box::pin(async move {
+            counted.fetch_add(1, Ordering::SeqCst);
+            count_loads(&rearm, &counted);
+        })
+    }));
+}
+
+/// A healthy ticket, registered and due again on every pass until it is
+/// claimed. The per-run half reads the run's workflow record twice, once to
+/// see that something is due and once after the fleet record, and the fleet
+/// record once. The sweep looks at the rows and the entries those reads
+/// already hold, and reads nothing more.
+#[tokio::test]
+async fn a_healthy_due_ticket_costs_the_per_run_half_no_more_reads() {
+    let (fx, _effect) = ticket(&idempotent(3), None, None).await;
+    fx.pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    let (outbox_loads, fleet_loads) =
+        (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    count_loads(&fx.workflow_store, &outbox_loads);
+    count_loads(&fx.fleet_store, &fleet_loads);
+
+    fx.pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the per-run half runs");
+
+    assert_eq!(
+        (
+            outbox_loads.load(Ordering::SeqCst),
+            fleet_loads.load(Ordering::SeqCst)
+        ),
+        (2, 1)
+    );
 }
