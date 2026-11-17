@@ -484,6 +484,58 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   | Mixed builds | An earlier build ignores the field, and drops it from every entry each time it writes the fleet record; an entry that lost its stamp behaves as before from then on. An earlier build's own claim runs a row that was put back, and its fence cancels a lost row. The change is complete for entries registered after every node that writes the record runs this build |
   | A rollback | Clean. The field is ignored and then dropped; a parked effect, a cancelled row and a cancelled entry are states the earlier build already reads |
 
+- Issue #134 ("a finished ticket whose run was never told") changes what `AgentRunEffectDispatcher` does with a dispatch ticket whose outbox row is finished while the run still waits on the effect. No signature changes, no record changes, no schema version moves, no metric is added, and no string is new: `ticket-row-settled` is written in new places. A ticket whose worker is not lost is handled exactly as before.
+
+  **Before.** Three paths spend a ticket's budget by writing the outbox row `Exhausted`, then the fleet entry, then telling the run (a failed attempt, a budget spent recovering ambiguous attempts, and the worker that finds its row exhausted under it); a reconciliation that established nothing writes the row, then parks the run. A worker lost after the row write and before the fleet write left the entry claimable: the next lease read an `Exhausted` row as startable, marked it `Dispatching` and **invoked the target again**, past its attempt bound, a reconcileable effect included. A worker lost after the fleet write left a finished entry nothing claims: the run **waited for good**. So did a live run whose finished ticket's row was then lost, which issues #153 and #154 did not reach.
+
+  **A claim never starts a finished row.** A claim that finds its row `Dispatched`, `Exhausted` or `Cancelled`, with the effect still unresolved at the ticket's generation, invokes nothing. It settles the fleet entry to follow the row (`AgentDispatcherFleet::settle_claim_from_row`: `Completed`, or `Exhausted` or `Cancelled` with `last_error_code` `ticket-row-settled`), and then tells the run what the row says. The settle is fenced on the claim and comes first: a worker whose lease lapsed is answered `claim-fenced`, tells the run nothing, and its pass answers `Ok`. The `Dispatching` mark itself no longer rewrites a finished row either, so a row finished between a claim's first look and its mark is concluded the same way and not invoked.
+
+  | The row | The run is told |
+  |---|---|
+  | `Exhausted` | what the row's last failure line says its worker was about to deliver (the next table), with the row's attempt count |
+  | `Cancelled`, the run winding down and the effect's kind not exempt | `Cancelled`, as before |
+  | `Cancelled` otherwise | `Indeterminate` under `ticket-row-settled` |
+  | `Dispatched` | `Indeterminate` under `ticket-row-settled`: the row says the call succeeded, and its result reached nobody |
+
+  | The `Exhausted` row's last failure line | The run is told |
+  |---|---|
+  | `code: detail` (a failed attempt, or an unknown outcome a reconciler found not executed) | `Exhausted` under `code`, with the line's detail |
+  | `dispatcher lost after started` | `Exhausted` under `dispatcher-lost-after-started` |
+  | `reconciliation outcome unknown` | `Indeterminate` under `reconciliation-exhausted` |
+  | `effect-outcome-mismatch: the reconciled outcome does not fit the effect` | `Indeterminate` under `effect-outcome-mismatch` |
+  | any other line, or none | a reconcileable effect: `Indeterminate` under `reconciliation-exhausted`. Any other effect: `Exhausted` under `ticket-row-settled`, with the line as its detail |
+
+  This is the outcome and the code the lost worker delivers when it is not lost, for every safety class. **It carries no failure reason**: the collaborator's reason was in the worker's memory and is on no durable record. A reader of `AgentRunEffect::last_error_reason` sees none, and the run's own reader errs to the cautious side: a handoff send whose first attempt was refused definitively is parked for a decision, where the same refusal delivered by its own worker lets the run go on. A send that failed under `credential-resolution-failed` keeps that code and is unaffected.
+
+  **A ticket no claim will come for.** The per-run half of a pass (`register_run`, and `pump_run` before it claims) now looks at each effect a run waits on, for a live run as well as a winding-down one, and tells the run where the claim path cannot:
+
+  | The effect's outbox row | The ticket's fleet entry | What happens |
+  |---|---|---|
+  | finished | finished, or fenced by a cancellation request, for at least one lease | the run is told by the tables above |
+  | finished | none, and the row finished at least one lease ago | the same |
+  | finished | a worker holds it or can claim it | nothing: the claim tells the run |
+  | live | finished | the row is cancelled and the effect parked `Indeterminate` under `ticket-row-missing` |
+  | none | finished, or fenced by a cancellation request | the effect is parked under `ticket-row-missing` (issue #154's rule, now for a live run too) |
+
+  The wait of one lease (`AgentDispatcherFleetSettings`' lease duration, measured from the entry's `updated_at`) is what keeps the sweep from speaking a moment before a worker that has just finished the entry and is about to deliver, with the reason the row does not keep. A live row under a finished entry is always a row the run put back: an entry is finished only once its row is finished or gone, and nothing makes a finished row live again. The entry's `row_scheduled_at` is not consulted, so an entry registered before issue #153 is reached. The wind-down fence's own two cases are unchanged.
+
+  **What the per-run half reads.** Nothing more on an ordinary pass: it looks first at the outbox rows, and the fleet entries when it has them, that registration already read (`a_healthy_due_ticket_costs_the_per_run_half_no_more_reads`). Only an effect whose row is finished or absent, or live under a finished entry, makes it read the run's outbox again and, unless registration just read it, the fleet record once. A winding-down run's pass reads less than before, when the fence read the outbox once for each ready effect.
+
+  **What a deployment can see.**
+
+  | | |
+  |---|---|
+  | `register_run` for a live run | Its report can now carry `delivered`, `parked_indeterminate` and `cancelled`. Before, only a winding-down run's could |
+  | A winding-down run whose ticket's row is `Exhausted` | Told what the row says, `Exhausted` or `Indeterminate`. Before, the claim's wind-down branch cancelled the ticket as never started and told the run `Cancelled` |
+  | A `Dispatched` row, or a `Cancelled` row on a live run, under an unresolved effect | Parked. Before, the claim marked the row `Dispatching` and invoked the target |
+  | `ticket-row-settled` | New as an effect's code: `Indeterminate` for a `Dispatched` or `Cancelled` row, and `Exhausted` for an `Exhausted` row whose line names no code. A consumer that maps effect codes should add it |
+  | A run already waiting in this state when the build is deployed | Told on its first `register_run` or `pump_run`, since its entry has been finished for longer than a lease |
+  | A crash after the claim path settled the entry and before it told the run | The entry is finished and the run untold: the per-run half tells it after a lease |
+  | A finished entry pruned before the run was told | The row's own finishing time stands in for the entry's. A prune whose horizon is shorter than a lease can let the sweep speak a moment before a worker that is about to |
+  | A row a late worker exhausted under a claim holder whose call is still in flight | The holder is unaffected while it holds its lease: it delivers a success before it touches the row and a failure itself. If its lease also lapses mid-call, the worker that takes the ticket over tells the run `Exhausted`; before, that worker invoked the target again |
+  | Mixed builds | An earlier build's own claim still starts an attempt on a finished row, and its per-run half tells a live run nothing. Nothing either build writes confuses the other |
+  | A rollback | Clean. No record changed shape; a told run and a settled entry are states the earlier build already reads |
+
 Run the default compatibility matrix:
 
 ```sh

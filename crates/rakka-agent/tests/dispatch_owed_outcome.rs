@@ -815,6 +815,9 @@ async fn lose_the_worker_after_its_fleet_write(
 ) -> (AuthorityFixture, AgentRunEffect, Arc<CountingRefusal>) {
     let tool = refusing();
     let (fx, effect) = ticket(spec, Some(tool.clone()), None).await;
+    // Well past the clock's origin, so "a lease after the row finished" and
+    // "a lease after the clock started" are different instants.
+    fx.wf_clock.advance(10 * LEASE_MS);
     fx.fx.runs.crash_at(1, CrashPoint::BeforeWrite);
     fx.pipeline()
         .pump_run(&run_scope())
@@ -1091,6 +1094,7 @@ async fn a_live_run_whose_finished_ticket_lost_its_row_is_parked() {
         (pass.claimed, pass.invoked, pass.parked_indeterminate),
         (0, 0, 1)
     );
+    assert_eq!(pass.cancelled, 1, "the row the run put back");
     assert_parked_as_missing(&fx).await;
     assert_eq!(
         row_status(&fx, &effect).await,
@@ -1108,6 +1112,37 @@ async fn a_live_run_whose_finished_ticket_lost_its_row_is_parked() {
         .await
         .expect("the pass runs");
     assert_eq!((again.delivered, again.registered), (0, 0));
+}
+
+/// A live row under an entry that a cancellation request fenced is not a
+/// lost row. The request is the first step of a cancellation another worker
+/// is carrying out, and that worker settles the row itself. The sweep
+/// leaves both alone.
+#[tokio::test]
+async fn a_live_row_under_a_cancellation_in_progress_is_left_alone() {
+    let (fx, effect) = ticket(&idempotent(3), None, None).await;
+    fx.pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    let request = another_fleet_handle(&fx)
+        .request_run_cancellation(&rakka_agent::workflow_run_id(&run_scope()))
+        .await
+        .expect("the fleet fences the run's entries");
+    assert_eq!(request.awaiting_settlement.len(), 1);
+
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(
+        (pass.claimed, pass.delivered, pass.parked_indeterminate),
+        (0, 0, 0)
+    );
+    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+    assert_eq!(row_status(&fx, &effect).await, Some(OutboxStatus::Pending));
 }
 
 /// Rewrites the fleet record without any entry's row stamp: the record a

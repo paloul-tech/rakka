@@ -2,8 +2,8 @@
 
 Status: approved by the owner on 2026-11-16 ("1b. approved"), with decision
 1 settled as 1b: the row's last failure line is followed for every safety
-class (section 8 has how that came about). Size: a project (two code paths,
-one of them new).
+class (section 8 has how that came about). Built (section 9). Size: a
+project (two code paths, one of them new).
 
 ## 1. Intent
 
@@ -270,3 +270,81 @@ worker tells them `Exhausted` at two of the three sites that spend their
 budget. Put back to the owner as 1a (keep the pick), 1b (follow the row for
 every class) and 1c (make the uncrashed sites park too, outside this
 issue), the owner chose 1b.
+
+## 9. As built
+
+Where the build moved from the sections above, and what it chose where they
+left a choice. Plan: `docs/superpowers/plans/2026-11-16-finished-ticket-untold-run.md`.
+
+- **Names.** The reader is `owed_by_exhausted_row`, in the private inline
+  module `dispatch::owed_outcome`, with the lines the exhausting sites write
+  (`WORKER_LOST_LINE`, `RECONCILIATION_UNKNOWN`, `OUTCOME_MISMATCH`) beside
+  it. It was a file of its own first; the crate's shape test holds every
+  source file to a public module, and its items are the dispatcher's own.
+  `owed_by_finished_row` reads any finished row into a `RowVerdict`
+  (`NeverStarted`, `Exhausted`, `Unknown`); `tell_owed` delivers it;
+  `conclude_on_untold_row` is the claim-path arm; `mark_dispatching` is the
+  guarded mark; `settle_waited_effects` is the per-run sweep, and `fence_run`
+  is gone into it.
+- **A rebuilt `Exhausted` closes no segment.** The lost worker's attempt
+  segments were closed, or never opened, when it was lost. An `Indeterminate`
+  goes through `tell_indeterminate`, which closes the park's segment and
+  counts it, as every park does.
+- **The sweep looks twice.** First at the outbox rows registration already
+  read, and at the fleet entries when registration read those too; that look
+  reads nothing. Only an effect whose row is finished or absent there, or
+  live under a finished entry, starts the second look, which reads the run's
+  outbox again for each effect (telling a live run makes it flush, which
+  changes the next effect's row) and the fleet record once unless it is
+  current. A winding-down run's pass reads less than it did: the fence read
+  the outbox once for each ready effect.
+- **A live row is parked only under a finished entry**, not under one a
+  cancellation request fenced (section 5's table had both). The request is
+  the first step of a cancellation another worker is carrying out, and that
+  worker settles the row itself. A row that is absent or finished under a
+  fenced entry is handled as the table says.
+- **A live row under a finished entry is cancelled first and the run told
+  second.** Told first, a crash would leave a `Pending` row due for good
+  under an entry nothing claims, and every pass of that run would read the
+  fleet record for it. Cancelled first, a crash leaves a finished row, which
+  the sweep tells the run from after a lease, under `ticket-row-settled`
+  where an uncrashed sweep says `ticket-row-missing`.
+- **The wait is measured from the entry's `updated_at`**, which every finish
+  and every cancellation request sets.
+- **A winding-down run with an `Exhausted` row is told what the row says.**
+  The claim's wind-down branch used to cancel that ticket as never started.
+- **The lapsed-claim test** uses one ticket and a store hook that moves the
+  clock past the lease at the claim's first look at the row. Section 6's
+  mid-batch shape cannot be built without a second worker: a first claim
+  that outlives its lease fails the pass at its own fleet write, which is
+  the behaviour before this change and is not touched.
+- **No read-count test for a run with nothing due.** A `Dispatching` row is
+  due, so registration reads the fleet record for an in-flight ticket; the
+  cost test counts both stores on a healthy due ticket instead, and measured
+  two outbox reads and one fleet read before the sweep existed and after.
+- **No stack change was needed.** The whole `rakka-agent` suite ran with all
+  features without an overflow.
+
+**Falsified**, one mutation at a time against the reader's unit tests,
+`dispatch_owed_outcome`, `dispatch_finished_row` and `dispatch_missing_row`.
+Three of the first eighteen survived and each got a test.
+
+| Mutation | Fails |
+|---|---|
+| The claim path starts a finished row | four, among them `an_ambiguous_budget_lost_before_the_fleet_write_is_told` |
+| The run is told without the fleet settle | seven, among them `a_worker_whose_claim_lapsed_tells_the_run_nothing` |
+| `claim-fenced` fails the pass | `a_worker_whose_claim_lapsed_tells_the_run_nothing` |
+| The mark is unguarded | `a_row_finished_between_the_claims_read_and_the_mark_is_not_invoked` |
+| The reader does not know a finding line | two unit tests and `the_same_through_the_mismatch_arm_parks_under_its_code` |
+| The reader does not know the worker-lost line | a unit test and both ambiguous-budget tests |
+| The reader takes a code with whitespace, or an empty one | the two unit tests of lines with no known shape |
+| The sweep does not wait a lease | `a_finished_entry_is_not_swept_before_a_lease_has_passed`, `a_finished_row_whose_entry_was_pruned_is_repaired_from_the_row` |
+| The sweep does not wait for a pruned entry | survived: the fixture's clock sat below one lease. `a_finished_row_whose_entry_was_pruned_is_repaired_from_the_row` now starts ten leases in |
+| The sweep leaves a live row under a finished entry, in either look | `a_live_run_whose_finished_ticket_lost_its_row_is_parked`, `the_same_for_an_entry_with_no_stamp` |
+| The sweep always takes its second look | `a_healthy_due_ticket_costs_the_per_run_half_no_more_reads` |
+| A `Dispatched` row is read as exhausted | `a_dispatched_row_nobody_delivered_is_parked` |
+| A `Cancelled` row is never-started without the fence | `a_cancelled_row_on_a_live_run_is_parked` |
+| The sweep speaks under a claim | `a_finished_row_under_a_claim_is_left_to_the_claim_path`, written for this mutation before it was run |
+| A live row is parked under a cancellation-fenced entry | survived in each look alone: the two looks hold the same test, and one ticket cannot show either without the other. Mutated together, `a_live_row_under_a_cancellation_in_progress_is_left_alone` fails |
+| A live row is parked and not cancelled | `a_live_run_whose_finished_ticket_lost_its_row_is_parked`, `the_same_for_an_entry_with_no_stamp` |
+| A live row's cancellation is not counted | survived; `a_live_run_whose_finished_ticket_lost_its_row_is_parked` now asserts the count |

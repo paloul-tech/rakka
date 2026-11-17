@@ -295,6 +295,21 @@ runs as a first attempt. And an entry registered by a build that recorded no
 row stamp behaves as it did before, until it finishes.
 [`rakka-compatibility.md`](rakka-compatibility.md) has the cases.
 
+**A ticket that is finished while its run still waits.** A worker that spends
+a ticket's budget writes the outbox row `Exhausted`, then finishes the fleet
+entry, then tells the run, and it can be lost between any two. The row then
+holds what it knew: the attempt count and the last failure line. A claim that
+finds a finished row under an effect the run still waits on starts no
+attempt. It settles the fleet entry to follow the row and tells the run what
+the row says: for an `Exhausted` row, the outcome and code its worker was
+about to deliver, without the collaborator's failure reason, which no
+durable record keeps. When the entry is finished too, no claim will come, and
+the per-run half of a pass (`register_run`, `pump_run`) tells the run instead,
+once the entry has been finished for a lease, so it never speaks ahead of a
+worker that is about to. It also parks a live run whose finished ticket lost
+its row, which nothing else reaches. An ordinary pass reads nothing more for
+this. [`rakka-compatibility.md`](rakka-compatibility.md) has the tables.
+
 **What is not bounded.** The record is still one record, written whole. A
 prune bounds it to the live entries plus the finished ones inside the
 horizon, which on a busy fleet can be megabytes.
