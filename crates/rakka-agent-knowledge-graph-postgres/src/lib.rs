@@ -58,6 +58,15 @@
 //!   its one statement, a delete removes the row, and a trigger on the table
 //!   clears the words of any tombstoned row, so a withdrawn statement's words
 //!   never outlive it whichever binary withdraws it (see [`MIGRATION_SQL`]).
+//! - **Meaning-based search is opt-in, and needs pgvector.** A store built
+//!   [`with_semantic_search`](PostgresKnowledgeGraphStore::with_semantic_search)
+//!   keeps a claim's embedding in four more columns on its row, added by a
+//!   migration of their own ([`SEMANTIC_MIGRATION_SQL`]). A search filters
+//!   on the word index's columns and ranks by cosine distance in one exact
+//!   scan of one tenant and space; the record still decides, a tombstone
+//!   trigger clears the embedding of any tombstoned row, and an embedding
+//!   write changes no tombstoned row. A store that does not opt in never
+//!   names the `vector` extension, so the base schema needs none.
 //! - **Traversal is the reference breadth-first expansion over bounded
 //!   per-node queries.** A recursive CTE cannot express the global spent-edge
 //!   set, the deterministic frontier-order/claim-id-order edge sequence, or
@@ -131,6 +140,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rakka_agent::{MemoryClassification, MemoryEmbeddingRef};
 use rakka_agent_knowledge_graph::claim::{
     Claim, ClaimId, ClaimNodeId, ClaimOperationId, ClaimRecord,
 };
@@ -149,7 +159,9 @@ use rakka_agent_knowledge_graph::transition::{
 };
 use rakka_agent_knowledge_graph::ClaimTrustStatus;
 use rakka_agent_knowledge_graph::CLAIM_TOMBSTONE_MARKER;
-use rakka_agent_knowledge_graph::{ClaimSearch, ClaimSearchReport};
+use rakka_agent_knowledge_graph::{
+    ClaimEmbedding, ClaimEmbeddingPage, ClaimSearch, ClaimSearchReport, ClaimSemanticSearch,
+};
 use rakka_agent_workflow::AgentTimestampMillis;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
@@ -157,10 +169,15 @@ use tokio_postgres::{Client, Row};
 
 mod erasure;
 mod search;
+mod semantic;
 
 pub use search::{
     ClaimSearchIndexPage, CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS, CLAIM_SEARCH_INDEX_WRITE_SQL,
     CLAIM_SEARCH_SQL,
+};
+pub use semantic::{
+    CLAIM_EMBEDDING_WRITE_SQL, CLAIM_SEMANTIC_SEARCH_SQL, EMBEDDING_CHECK_NAME,
+    EMBEDDING_TRIGGER_NAME, SEMANTIC_MIGRATION_SQL, SEMANTIC_MIGRATION_VALIDATE_SQL,
 };
 
 /// Stable backend name, reported for diagnostics and error detail.
@@ -733,6 +750,8 @@ impl LedgerHit {
 pub struct PostgresKnowledgeGraphStore {
     client: Arc<Client>,
     migration_lock_wait: Duration,
+    /// Whether this store opted in to meaning-based search.
+    semantic_search: bool,
 }
 
 impl PostgresKnowledgeGraphStore {
@@ -748,7 +767,34 @@ impl PostgresKnowledgeGraphStore {
         Self {
             client,
             migration_lock_wait: DEFAULT_MIGRATION_LOCK_WAIT,
+            semantic_search: false,
         }
+    }
+
+    /// Opts this store in to meaning-based search.
+    ///
+    /// A store built this way reports
+    /// [`KnowledgeGraphCapability::SemanticSearch`], serves its three
+    /// operations, and its [`Self::migrate`] also applies
+    /// [`SEMANTIC_MIGRATION_SQL`], which needs the `vector` extension
+    /// (pgvector) and fails where the database cannot provide it. A store
+    /// built without it never names the extension and refuses the three
+    /// operations with `claim-capability-unsupported`, whatever another node
+    /// did to the table: this flag is the only source of the capability,
+    /// because the capability report reads no database.
+    ///
+    /// Every session of a store that opted in must have the schema that
+    /// holds the extension on its search path.
+    #[must_use]
+    pub const fn with_semantic_search(mut self) -> Self {
+        self.semantic_search = true;
+        self
+    }
+
+    /// Whether this store opted in to meaning-based search.
+    #[must_use]
+    pub const fn serves_semantic_search(&self) -> bool {
+        self.semantic_search
     }
 
     /// Sets how long [`Self::migrate`] waits for another migrator's lock
@@ -852,6 +898,13 @@ impl PostgresKnowledgeGraphStore {
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
+        };
+        // The opt-in migration comes last and builds no index, so it adds no
+        // concurrent build for a waiting migrator to deadlock with. A store
+        // that did not opt in ends here, exactly as it always did.
+        let applied = match applied {
+            Ok(()) if self.semantic_search => self.apply_semantic_migration().await,
+            other => other,
         };
         let unlocked = self
             .client
@@ -1113,7 +1166,41 @@ impl KnowledgeGraphStore for PostgresKnowledgeGraphStore {
     }
 
     fn capabilities(&self) -> KnowledgeGraphCapabilities {
-        KnowledgeGraphCapabilities::core().with_capability(KnowledgeGraphCapability::KeywordSearch)
+        let capabilities = KnowledgeGraphCapabilities::core()
+            .with_capability(KnowledgeGraphCapability::KeywordSearch);
+        if self.semantic_search {
+            capabilities.with_capability(KnowledgeGraphCapability::SemanticSearch)
+        } else {
+            capabilities
+        }
+    }
+
+    fn search_semantic<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        search: &'a ClaimSemanticSearch,
+    ) -> ClaimFuture<'a, ClaimSearchReport> {
+        Box::pin(self.search_semantic_claims(scope, search))
+    }
+
+    fn store_claim_embedding<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        claim_id: &'a ClaimId,
+        embedding: &'a ClaimEmbedding,
+    ) -> ClaimFuture<'a, bool> {
+        Box::pin(self.store_embedding(scope, claim_id, embedding))
+    }
+
+    fn unembedded_claims<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        reference: &'a MemoryEmbeddingRef,
+        classifications: &'a BTreeSet<MemoryClassification>,
+        after: Option<&'a ClaimId>,
+        limit: usize,
+    ) -> ClaimFuture<'a, ClaimEmbeddingPage> {
+        Box::pin(self.unembedded(scope, reference, classifications, after, limit))
     }
 
     fn search<'a>(

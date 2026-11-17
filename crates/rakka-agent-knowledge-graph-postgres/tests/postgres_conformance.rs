@@ -252,3 +252,96 @@ async fn scenario_20_the_whole_contract_passes_unchanged_when_dsn_is_set() {
     let Some(store) = store().await else { return };
     conformance::check_knowledge_graph_contract(&store).await;
 }
+
+// ---------------------------------------------------------------------------
+// Meaning-based search (issue #140).
+// ---------------------------------------------------------------------------
+
+/// Set to `1` to make a missing `vector` extension a failure rather than a
+/// skip.
+const PGVECTOR_REQUIRED_ENV: &str = "RAKKA_POSTGRES_PGVECTOR_REQUIRED";
+
+/// A migrated store that opted in to meaning-based search, when the database
+/// can provide the `vector` extension.
+///
+/// Without the extension the clause named by `test` is announced as skipped,
+/// or refused when [`PGVECTOR_REQUIRED_ENV`] is `1`: a skip that reported
+/// `ok` and printed nothing would be indistinguishable from a clause that
+/// ran.
+async fn semantic_store(test: &str) -> Option<PostgresKnowledgeGraphStore> {
+    let dsn = std::env::var("RAKKA_POSTGRES_TEST_DSN").ok()?;
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .expect("the PostgreSQL test database should connect");
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("postgres test connection error: {error}");
+        }
+    });
+    let available: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector') \
+             AS available",
+            &[],
+        )
+        .await
+        .expect("the catalog reads")
+        .get("available");
+    if !available {
+        let message = format!(
+            "{test} did not run: the `vector` extension is unavailable on this database. Use a \
+             pgvector-enabled image, or set {PGVECTOR_REQUIRED_ENV}=1 to make this a failure."
+        );
+        assert!(
+            std::env::var(PGVECTOR_REQUIRED_ENV).as_deref() != Ok("1"),
+            "{message}"
+        );
+        eprintln!("SKIPPED: {message}");
+        return None;
+    }
+    let store = PostgresKnowledgeGraphStore::new(client).with_semantic_search();
+    store.migrate().await.expect("the semantic schema applies");
+    Some(store)
+}
+
+#[tokio::test]
+async fn semantic_search_ranks_admitted_claims_when_dsn_is_set() {
+    // The same clause the in-memory reference passes: this backend filters
+    // and ranks in SQL, and must answer the same hits, in the same order,
+    // with the same scores.
+    let Some(store) = semantic_store("semantic_search_ranks_admitted_claims").await else {
+        return;
+    };
+    assert!(
+        rakka_agent_knowledge_graph::KnowledgeGraphStore::capabilities(&store)
+            .supports(rakka_agent_knowledge_graph::KnowledgeGraphCapability::SemanticSearch),
+        "a store that opted in reports semantic search"
+    );
+    conformance::semantic_search(&store, ConformanceScopes::unique("pg-semantic-search")).await;
+}
+
+#[tokio::test]
+async fn a_store_without_the_flag_refuses_semantic_search_when_dsn_is_set() {
+    // Opting in is the only source of the capability. A store that did not
+    // refuses all three operations, even against a table another node
+    // migrated for them.
+    let Some(store) = store().await else { return };
+    assert!(
+        !rakka_agent_knowledge_graph::KnowledgeGraphStore::capabilities(&store)
+            .supports(rakka_agent_knowledge_graph::KnowledgeGraphCapability::SemanticSearch),
+        "a store that did not opt in does not report semantic search"
+    );
+    conformance::semantic_search_refused(&store, ConformanceScopes::unique("pg-semantic-refused"))
+        .await;
+}
+
+#[tokio::test]
+async fn scenario_20_the_whole_contract_passes_with_semantic_search_when_dsn_is_set() {
+    // The whole contract again, on a store that opted in: the umbrella then
+    // runs the meaning-based clause instead of the refusal.
+    let Some(store) = semantic_store("scenario_20_the_whole_contract_with_semantic_search").await
+    else {
+        return;
+    };
+    conformance::check_knowledge_graph_contract(&store).await;
+}

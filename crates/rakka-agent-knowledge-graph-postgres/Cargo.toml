@@ -25,14 +25,17 @@ rakka-agent-knowledge-graph = { path = "../rakka-agent-knowledge-graph", version
 # the SPI signatures and schema-window tests carry (already in the tree
 # through rakka-agent-knowledge-graph).
 rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
+# The classification and embedding-reference types the meaning-based search
+# operations of the SPI carry, and the provenance identity types the
+# backend-proof tests stamp onto racing specialist claims (already in the
+# tree through the graph crate). Default features are off, as there: a claim
+# store never touches the model adapter.
+rakka-agent = { path = "../rakka-agent", version = "0.1.0", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 tokio-postgres.workspace = true
 
 [dev-dependencies]
-# The provenance identity types the backend-proof tests stamp onto racing
-# specialist claims (already in the tree through the graph crate).
-rakka-agent = { path = "../rakka-agent", version = "0.1.0", default-features = false }
 tokio.workspace = true
 
 [lints]
