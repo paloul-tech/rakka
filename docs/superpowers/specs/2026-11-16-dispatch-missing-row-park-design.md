@@ -1,6 +1,6 @@
 # A dispatch ticket whose outbox row is gone is settled, and its run is told (issue #150)
 
-Status: awaiting approval. Size: a small change (one arm of one function, one
+Status: approved 2026-11-16, built (section 9). Size: a small change (one arm of one function, one
 helper's settle step, one test file, three doc entries).
 
 ## 1. Intent
@@ -183,3 +183,48 @@ reverted the first test must fail with the issue's own error.
   without a new public method; if it is not, use the run's own count and say
   so in the "as built" note.
 - The exact message text of the indeterminate outcome.
+
+## 9. As built
+
+Where the build moved from the sections above, and what it chose where they
+left a choice.
+
+- **Names.** `conclude_on_missing_row` is the arm; `settle_orphan_claim` is
+  the fleet-only settle; `park_indeterminate_with` takes a `ParkedTicket`
+  (`BothLayers` or `FleetOnly`) that says how the claim's ticket is ended
+  once the run has been told. The code and message are the constants
+  `TICKET_ROW_MISSING` and `TICKET_ROW_MISSING_MESSAGE`.
+- **The attempt count** is read from the fleet entry through
+  `AgentDispatcherFleet::state()`, which was already public: no new method.
+  The park reports the larger of it and the run's own. This call had no
+  guard in section 6, so an eighth test holds it.
+- **The two-claim batch** is one run whose model turn asks for two tool
+  calls. One ticket's row is removed by round-tripping the stored
+  `WorkflowState` through JSON, which leaves the other row in place.
+- **"A run that has already ended"** (the plan's third review-focus line) is
+  not a state a test can build. A run does not reach a terminal status with
+  a ticket still claimable unless the wind-down fence settles that ticket
+  first. What is held instead is a run that is cancelling: it is parked like
+  a live one and rests at `WaitingForReconciliation`, which is what a
+  cancelling run does on any indeterminate effect.
+- **The non-goal in section 2 is real and close by.** A result that a live
+  run accepts makes it flush its ready effects again in the same pass, which
+  recreates a missing row before the next claim of the batch reaches it. The
+  late-worker test first met this: its tool has to refuse for good, so the
+  run is winding down and flushes nothing, or the orphan stops being one.
+- **Documents.** The observability catalogue lists no indeterminate codes
+  and names `ticket-row-missing` only for the workflow tier's `skipped`
+  counter, which this change does not touch, so it is unchanged.
+  `docs/rakka-agents.md` gained a paragraph in its dispatcher section, which
+  section 7 did not list.
+
+**Falsified**, one mutation at a time, each caught by the test named:
+
+| Mutation | Fails |
+|---|---|
+| The arm calls `settle_ticket_cancelled` again | all eight, the first with the issue's `outbox-entry-not-found` |
+| `claim-fenced` returned instead of taken as the claim's end | the late-worker test |
+| The entry settled before the run is told | the unwritable-run test and the refused-fleet-write test |
+| The outstanding check removed | the refused-fleet-write test and the late-worker test |
+| The park skipped | five, the first test at the effect's status |
+| The fleet entry's attempt count ignored | the attempt-count test |
