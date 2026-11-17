@@ -516,8 +516,8 @@ fn owed_by_finished_row(
 enum OutboxWritten {
     /// The write was applied; the substrate's event, where it produces one.
     Applied(Option<WorkflowTelemetryEvent>),
-    /// A settle write found its row already finished and wrote nothing: the
-    /// row as it stands.
+    /// A settle write, or the `Dispatching` mark, found its row already
+    /// finished and wrote nothing: the row as it stands.
     RowFinished(Box<OutboxEntry>),
 }
 
@@ -2680,7 +2680,7 @@ where
         match self.apply_outbox(scope, message_id, write, false).await? {
             OutboxWritten::Applied(event) => Ok(event),
             OutboxWritten::RowFinished(_) => {
-                unreachable!("only a settle write looks at the row before it writes")
+                unreachable!("only a settle write and the mark look at the row before they write")
             }
         }
     }
@@ -2727,8 +2727,36 @@ where
         }
     }
 
-    /// The one loop behind [`Self::write_outbox`] and
-    /// [`Self::settle_outbox`]. `keep_finished_row` is the settle's check.
+    /// The durable `Started` mark: the row turns `Dispatching` before any
+    /// external call. Like a settle write, **it never rewrites a finished
+    /// row** (issue #134).
+    ///
+    /// The substrate sets the row's status whatever it held, so a mark
+    /// written over a row that is `Dispatched`, `Exhausted` or `Cancelled`
+    /// makes finished work startable again, and the invocation that follows
+    /// the mark is one more than the ticket allows. The row is looked at in
+    /// the same read the mark is computed from, so nothing can finish it
+    /// between the look and the write.
+    ///
+    /// Answers the row as it stands when it was already finished. The
+    /// caller goes to [`Self::conclude_on_untold_row`].
+    async fn mark_dispatching(
+        &self,
+        scope: &AgentRunScope,
+        message_id: &OutboxMessageId,
+    ) -> AgentDispatchResult<Result<(), Box<OutboxEntry>>> {
+        match self
+            .apply_outbox(scope, message_id, InboxWrite::Dispatching, true)
+            .await?
+        {
+            OutboxWritten::Applied(_) => Ok(Ok(())),
+            OutboxWritten::RowFinished(row) => Ok(Err(row)),
+        }
+    }
+
+    /// The one loop behind [`Self::write_outbox`], [`Self::settle_outbox`]
+    /// and [`Self::mark_dispatching`]. `keep_finished_row` is the check the
+    /// last two make.
     async fn apply_outbox(
         &self,
         scope: &AgentRunScope,
@@ -3651,8 +3679,19 @@ where
         // Durable `Started`: the outbox row turns `Dispatching` under the
         // claim's lease and fence, before any external call
         // ([specification 11.4]).
-        self.write_outbox(scope, &message_id, InboxWrite::Dispatching)
-            .await?;
+        if let Err(row) = self.mark_dispatching(scope, &message_id).await? {
+            // The row was finished after this claim looked at it: a late
+            // worker's failure spent the budget, or its success landed. It
+            // is not marked and nothing is invoked; the claim ends as it
+            // does when it finds the row finished at once.
+            let winding_down = state
+                .run()
+                .is_some_and(|run| run.terminal_reason.is_some() || run.status.is_terminal());
+            let fence_applies = winding_down && !intent.kind().exempt_from_wind_down_fence();
+            return self
+                .conclude_on_untold_row(scope, &claim, &row, intent, fence_applies, pass)
+                .await;
+        }
 
         if !self.survives(AgentDispatchWindow::AfterStarted) {
             return Ok(ClaimConclusion::Died);

@@ -142,10 +142,22 @@ async fn finish_row(
     status: OutboxStatus,
     line: &str,
 ) {
+    finish_row_in(&fx.workflow_store, &fx.wf_clock, effect, status, line).await;
+    assert_eq!(row_status(fx, effect).await, Some(status));
+}
+
+/// [`finish_row`] over the stores alone, for a store hook to call.
+async fn finish_row_in(
+    store: &WorkflowStore,
+    clock: &SharedAtomicWorkflowClock,
+    effect: &AgentRunEffect,
+    status: OutboxStatus,
+    line: &str,
+) {
     let mut inbox = rakka_agent_workflow::AgentRunInbox::with_clock(
         rakka_agent::workflow_run_id(&run_scope()),
-        fx.workflow_store.clone(),
-        fx.wf_clock.clone(),
+        store.clone(),
+        clock.clone(),
     );
     inbox.recover().await.expect("the inbox recovers");
     let id = OutboxMessageId::new(effect.dispatch_ticket_id().as_str());
@@ -171,7 +183,6 @@ async fn finish_row(
         }
         other => panic!("{other:?} is not a finished status"),
     }
-    assert_eq!(row_status(fx, effect).await, Some(status));
 }
 
 /// Registers the run and runs one worker pass whose second fleet write, the
@@ -733,6 +744,68 @@ async fn a_worker_whose_claim_lapsed_tells_the_run_nothing() {
     assert_eq!(
         fx.effect_status(1).await,
         Some(AgentRunEffectStatus::Exhausted)
+    );
+}
+
+/// The row is finished after the claim looked at it and before the claim's
+/// `Dispatching` mark: a late worker's failure spent the budget in between.
+/// The mark is the write that precedes every invocation, and it sets a
+/// row's status whatever the row held, so it looks at the row in the same
+/// read it is computed from. A finished row is not marked and not invoked;
+/// the claim ends as it does when it finds the row finished at once.
+#[tokio::test]
+async fn a_row_finished_between_the_claims_read_and_the_mark_is_not_invoked() {
+    let (fx, effect) = ticket(&idempotent(3), None, None).await;
+    fx.pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    // The claim's first load of the run's workflow record is its look at
+    // the row, and its second is the mark's. The late worker's write lands
+    // before the second.
+    let rearm = fx.workflow_store.clone();
+    let (store, clock, late) = (
+        fx.workflow_store.clone(),
+        fx.wf_clock.clone(),
+        effect.clone(),
+    );
+    fx.workflow_store.before_next_load(Box::new(move || {
+        Box::pin(async move {
+            rearm.before_next_load(Box::new(move || {
+                Box::pin(async move {
+                    finish_row_in(
+                        &store,
+                        &clock,
+                        &late,
+                        OutboxStatus::Exhausted,
+                        "tool-refused: the tool refused the call",
+                    )
+                    .await;
+                })
+            }));
+        })
+    }));
+
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    assert_eq!((pass.invoked, pass.delivered), (0, 1));
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Exhausted)
+    );
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.code.as_deref()),
+        (AgentRunEffectStatus::Exhausted, Some("tool-refused"))
+    );
+    assert_entry_follows_the_row(
+        fleet_entry(&fx, &effect).await,
+        AgentDispatchStatus::Exhausted,
     );
 }
 
