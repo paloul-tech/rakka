@@ -406,6 +406,36 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **After upgrading, a target that was missed** is refused its appends with `run-claim-space-not-delegated`, and runs no communal search: `rakka.agent.communal.retrievals` does not move for it and its snapshots hold no communal record, which is also what a run with no communal bundle looks like. The reliable sign is the target run's own record, whose delegation envelope holds an empty `knowledge_spaces`.
 
+- Issue #140 ("rank communal claims by meaning") adds three optional operations to `KnowledgeGraphStore`, a module of types, an embedding pass, two builders, and an opt-in PostgreSQL migration. No existing signature changes, no existing record changes, no new error code, no new metric. **Nothing changes for a deployment that does not opt in**: its retriever ranks by words and reports version 1, its append executor calls no model, and a `PostgresKnowledgeGraphStore` built without `with_semantic_search` runs the migration it always ran, which never names the `vector` extension.
+
+  **What is added.** `KnowledgeGraphStore::search_semantic`, `store_claim_embedding` and `unembedded_claims`, each with a default body that answers `claim-capability-unsupported` naming `semantic-search`, so a store implemented outside this repository still compiles and refuses. The capability label `semantic-search` already existed; the in-memory store now reports it, and a PostgreSQL store reports it only when built `with_semantic_search`. `rakka_agent_knowledge_graph::semantic` (`ClaimEmbedding`, `ClaimSemanticSearch`, `ClaimEmbeddingPage`, `claim_embedding_text`, `claim_semantic_relevance_bps`), `embed_claims` with `ClaimEmbeddingPassPage`, `KnowledgeGraphCommunalRetriever::with_embedder` and `ranking`, `KnowledgeGraphClaimAppendExecutor::with_embedder`, and `conformance::ConceptEmbedder`, a deterministic test embedder. A refused embedding answers the existing `claim-embedding-invalid`.
+
+  **What a snapshot records.** No field is added. A snapshot for whose turn a meaning-based retriever ran records `retriever_version: 2` in its communal record; the retriever's name is the store's, as before. The embedding model is not recorded.
+
+  **The embedding text is a compatibility surface.** A claim is embedded from its subject, its predicate and its object text, joined by single spaces (`claim_embedding_text`). A change to that rule would leave stored vectors that describe other text, with no way to tell them from current ones; such a change must come with a new pipeline version on the deployment's embedder.
+
+  **The PostgreSQL schema, for a store that opted in.** `migrate` runs `CREATE EXTENSION IF NOT EXISTS vector` and adds to `rakka_agent_knowledge_claim` four nullable columns (`embedding vector`, `embedding_model TEXT`, `embedding_dimensions INTEGER`, `embedding_version BIGINT`), the check `rakka_agent_knowledge_claim_embedding_check` (the four are all null or all set, and the vector has the dimension count beside it), and the trigger `rakka_agent_knowledge_claim_clear_embedding` with a function of the same name. `migrate` finds each by name, so the names are fixed. No index is added, so the run adds no concurrent build. It holds an `ACCESS EXCLUSIVE` lock for catalog changes only; the check is added unvalidated and validated in a statement of its own. A repeat run alters nothing. Where the database cannot provide the extension, `migrate` fails with the server's message after the base migration and applies nothing of this one. **Every session of a store that opted in must have the schema that holds the `vector` extension on its search path**: the type and the `<=>` operator are found there.
+
+  | | |
+  |---|---|
+  | An earlier build against an opted-in table | Its inserts, trust transitions, tombstones and deletes name none of the four columns and keep working. A claim it appends has no embedding and is owed one. Its tombstone clears the embedding through the trigger |
+  | A node that did not opt in, beside nodes that did | It refuses the three operations and ranks by words. Wire the embedder on every node |
+  | A rollback | Clean. The earlier build ignores the columns. The embeddings stay, are never read, and are still cleared by the trigger |
+  | A change of embedding model, dimension count or pipeline version | Every claim is unembedded under the new reference. Searches find nothing from the old vectors and report `index_incomplete` until `embed_claims` has run under the new embedder. The old vector of a claim is replaced when the new one is stored |
+
+  **Roll order**, each step safe to stop after:
+
+  | Step | What |
+  |---|---|
+  | 1 | Make the `vector` extension available on the graph's database |
+  | 2 | Run `migrate` from a store built `with_semantic_search`, to its end. The cautions on a cancelled `migrate` in the issue #69 entry apply |
+  | 3 | Run `index_claims` for any space that holds claims from before issue #69, as that entry's step 3 says. A claim with no word-index columns is not ranked by meaning and is not listed for embedding |
+  | 4 | Wire the embedder into the claim-append executor on every node, with the classifications it may send. They should cover every classification the read policy admits |
+  | 5 | Call `embed_claims` for each space, with the same classifications, until it answers no cursor |
+  | 6 | Wire the embedder into the communal retriever on every node |
+
+  Wiring the retriever before step 5 finishes is safe: claims not yet embedded are not found, and each snapshot's communal record says `index_incomplete`. **Wiring the embedder sends text to it**: each claim of the stated classifications, and each searching turn's query (up to 1,024 bytes of recent session text). A deployment whose read policy admits a classification its embedding set leaves out stops finding those claims when it moves the retriever to meaning, and its snapshots report `index_incomplete` for as long as that holds.
+
 Run the default compatibility matrix:
 
 ```sh

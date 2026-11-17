@@ -36,6 +36,11 @@
 //!   discharges it over any backend.
 //! - [`search`] — the keyword search a store may offer: the query, the
 //!   shared word rule, the score and the ranking order.
+//! - [`semantic`] — the meaning-based search a store may offer: the text a
+//!   claim is embedded from, the validated embedding, the query, and the one
+//!   mapping from cosine similarity to a score.
+//! - [`embedding_pass`] — the pass a deployment calls to embed the claims of
+//!   a space that have no embedding yet.
 //! - [`communal_retrieval`] — the communal read ports of `rakka-agent`,
 //!   served from a store.
 //! - [`store`] — the portable [`KnowledgeGraphStore`] SPI, bounded
@@ -59,7 +64,9 @@
 //!
 //! [`communal_retrieval`] implements the two communal read ports
 //! `rakka-agent` declares. [`KnowledgeGraphCommunalRetriever`] ranks a
-//! space's claims by keyword [`search`](KnowledgeGraphStore::search), and
+//! space's claims by keyword [`search`](KnowledgeGraphStore::search), or,
+//! given an embedder and a store that can, by meaning
+//! ([`search_semantic`](KnowledgeGraphStore::search_semantic)), and
 //! [`KnowledgeGraphCommunalAuthority`] answers the claim a ranking named.
 //! Context assembly in `rakka-agent` decides on the record the authority
 //! answers, which is where a claim's trust status, classification and
@@ -73,8 +80,11 @@
 //! No metrics counters, no sharded knowledge-space entity, no agent-facing
 //! erasure path (tombstone, delete and the retention sweep are operations an
 //! application calls on the store; no run effect, command or tool reaches
-//! them), no bulk or whole-space erasure, no meaning-based (embedding)
-//! search, and no cross-tenant federation. The run-entity claim-append effect
+//! them), no bulk or whole-space erasure, no approximate index and no
+//! relevance floor for the meaning-based search, no loop that calls the
+//! embedding pass, and no cross-tenant federation. A store never calls an
+//! embedding model: the retriever, the append executor and the pass do, with
+//! the embedder a deployment wires. The run-entity claim-append effect
 //! this crate once deferred landed with scenario 33 ([`append_executor`]).
 
 pub mod append_executor;

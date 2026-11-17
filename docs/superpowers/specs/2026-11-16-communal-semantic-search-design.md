@@ -247,3 +247,22 @@ Embedding sends text to a model the deployment chose, which may be outside the d
 - How the deterministic test embedder maps text to a vector, as long as two texts with the same meaning in the proofs are near and unrelated ones are far.
 - Whether the in-memory store keeps vectors beside its claims or in a map of their own.
 - The size of the retriever's query memo, as long as one assembly embeds one query once.
+
+## 11. As built
+
+Where the build moved from the sections above. Each is a decision made while building and recorded in the build's ledger.
+
+- **An approximate index is not usable, not merely not shipped (sections 3, 6.3).** The design said a deployment may add one as its own DDL. pgvector indexes only a fixed-dimension expression, and the shipped statement orders by the bare column, so the planner would not use such an index. The documents say that ranking through an approximate index is not available in this release, and do not show index DDL. The private tier's documents have the same gap.
+- **The relevance mapping is two functions (6.1).** `claim_semantic_distance_relevance_bps(distance)` is the one mapping; `claim_semantic_relevance_bps(query, candidate)` computes the cosine distance and calls it. PostgreSQL maps the database's distance with the first, so both backends score alike.
+- **The in-memory store has a diagnostic `has_embedding` (6.2).** The SPI cannot show that an erased claim's vector is gone, only that no search reaches it: a stub is never admitted and a deleted claim is absent. The conformance clause therefore passed with the removal deleted. The accessor and `erasure_drops_the_embedding_itself` close that; PostgreSQL proves the same on its columns.
+- **The `Redacted` rule is held twice (6.5).** The set handed to the store has `Redacted` removed, and the record is checked again just before its text leaves. Either layer alone keeps the tests green; both are kept, because a backend's listing is a nomination by an index.
+- **A blank query ranks nothing and calls no model (6.4).** The design did not say. `index_incomplete` is false for such a turn.
+- **The PostgreSQL check is stricter (6.3).** The four columns are all null or all set, and the vector has the dimension count beside it. A reference with no vector, or a vector with no reference, cannot exist, so the tombstone trigger keys on `embedding` alone.
+- **A row with no filter columns flags a search incomplete only when its trust is one the search admits (6.2, 6.3).** Trust is a base column, so that much of "cannot judge" can be judged.
+- **`undecodable` also counts a row whose record contradicts its columns (6.2, 6.3).** The page is what a caller sends to a model, so it lists by the record: a row whose record's classification is outside the set, or is retracted, is not listed and is counted there.
+- **A reference whose pipeline version exceeds a `BIGINT` is refused** with `claim-embedding-invalid` on PostgreSQL.
+- **`rakka-agent` is a dependency of the PostgreSQL graph crate**, default features off, where it was a dev-dependency: the new SPI operations carry its classification and embedding-reference types.
+- **CI requires pgvector.** The PostgreSQL job sets `RAKKA_POSTGRES_PGVECTOR_REQUIRED=1`. One proof runs only where the extension is absent (the opt-in migration failing whole and releasing its lock) and announces a skip in CI.
+- **Proof 17 to 22 use a store built without the flag as the earlier binary.** That is exact because no existing statement of the crate changed.
+- **Proof 23 grants the writer its space.** The dispatcher refuses an append into a space its agent was never given (`widened-knowledge-access`). Being granted, the writer's own turn searches the space, so the embedder also receives the writer's query; the test asserts both texts. The reader asks "automobile whereabouts", which shares no word with the claim, so the word-ranked control selects nothing.
+- **The PostgreSQL found-by-meaning proof embeds through the pass**, not the append executor, whose only store call is `store_claim_embedding`.

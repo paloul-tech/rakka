@@ -54,6 +54,9 @@ RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres car
 # it they announce the clauses they skipped. Set this to make that a failure instead:
 RAKKA_POSTGRES_TEST_DSN=... RAKKA_POSTGRES_PGVECTOR_REQUIRED=1 cargo test -p rakka-agent-postgres
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-knowledge-graph-postgres
+# Its meaning-based search proofs need the `vector` extension too, and announce
+# what they skipped without it; the same variable makes that a failure:
+RAKKA_POSTGRES_TEST_DSN=... RAKKA_POSTGRES_PGVECTOR_REQUIRED=1 cargo test -p rakka-agent-knowledge-graph-postgres
 RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture   # both multi-process gates
 RAKKA_K8S_SCENARIO_DRY_RUN=1 examples/kubernetes/local-cluster-scenario.sh         # preview, no cluster touched
 RAKKA_K8S_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s optional_kubectl_manifest_validation_is_gated -- --nocapture
