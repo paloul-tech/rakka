@@ -2287,6 +2287,7 @@ where
     fleet: AgentDispatcherFleet<Fleet, Clock>,
     fleet_settings: AgentDispatcherFleetSettings,
     claim_filter: rakka_agent_workflow::AgentDispatchClaimFilter,
+    fleet_write_pause: rakka_agent_workflow::AgentFleetWritePause,
     runs: Runs,
     clock: Clock,
     schema_policy: AgentSchemaPolicy,
@@ -2355,6 +2356,7 @@ where
             fleet,
             fleet_settings,
             claim_filter,
+            fleet_write_pause: rakka_agent_workflow::AgentFleetWritePause::default(),
             runs,
             clock,
             schema_policy: AgentSchemaPolicy::default(),
@@ -2440,7 +2442,29 @@ where
             self.clock.clone(),
             self.metrics.clone(),
         )
-        .with_claim_filter(self.claim_filter.clone());
+        .with_claim_filter(self.claim_filter.clone())
+        .with_write_pause(self.fleet_write_pause.clone());
+    }
+
+    /// Replaces how this dispatcher's fleet waits before it makes a lost
+    /// write to the fleet record again
+    /// ([`rakka_agent_workflow::AgentFleetWritePause`]).
+    ///
+    /// A registration, a claim or a settle that loses its compare-and-set
+    /// is made again, and most re-applications wait a short random time
+    /// first: under 70 ms in all for one write. The default wait is a
+    /// thread that sleeps, which needs no runtime and no timer. An
+    /// application replaces it to wait on its runtime's timer or in a
+    /// simulated time of its own; a wait that ends at once turns the
+    /// waiting off. The fleet never waits on its own clock.
+    #[must_use]
+    pub fn with_fleet_write_pause(
+        mut self,
+        pause: rakka_agent_workflow::AgentFleetWritePause,
+    ) -> Self {
+        self.fleet_write_pause = pause;
+        self.rebuild_fleet();
+        self
     }
 
     /// Uses an explicit schema-compatibility policy for the run states it
@@ -3221,7 +3245,8 @@ where
     /// run's intent.
     ///
     /// It is [`Self::register_run`] then [`Self::claim_and_execute`] under one
-    /// report, reading the fleet record once between them. A deployment that
+    /// report, which share one read of the fleet record where the halves
+    /// would each make their own. A deployment that
     /// pumps every run from several workers can call the halves instead: the
     /// per-run half once per run, and the per-worker half once per worker.
     ///
@@ -3230,6 +3255,12 @@ where
     /// operation.
     ///
     /// # Errors
+    ///
+    /// A registration or a claim that loses its compare-and-set on the fleet
+    /// record is made again, each at most three more times; the loss after
+    /// that ends the pass as `revision-conflict`, with nothing claimed
+    /// ([`Self::register_run`] and [`Self::claim_and_execute`] have the
+    /// rules).
     ///
     /// The first error a claim meets ends the pass. The claims of the batch
     /// that were not started are given back before the error is returned
@@ -3284,6 +3315,24 @@ where
     /// registration did not just read it. What the look writes is the run,
     /// and the run's outbox when it cancels a row or plants the fence's
     /// cancelled one; the look never writes the fleet record.
+    ///
+    /// **A registration that loses its compare-and-set is made again**
+    /// (issue #159), at most three more times: the fleet record is read
+    /// again, then the run's outbox again, and what that read finds due is
+    /// registered. Both reads are repeated because the list is only safe to
+    /// register against a record no newer than it. Each try after the first
+    /// waits a short random time before it reads
+    /// ([`AgentDispatcherFleet::registration_lost`]), under 70 ms asked for
+    /// in all ([`Self::with_fleet_write_pause`] replaces the wait).
+    /// [`AgentDispatchPass::registered`] is what the write that landed
+    /// changed: a ticket another worker registered in between counts for
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// The lost compare-and-set (`revision-conflict`) once a registration
+    /// has lost four writes. Nothing is registered then, and the next call
+    /// starts over.
     pub async fn register_run(
         &mut self,
         scope: &AgentRunScope,
@@ -3293,7 +3342,7 @@ where
         Ok(pass)
     }
 
-    /// The per-worker half of a pass: reads the fleet record once, claims what
+    /// The per-worker half of a pass: reads the fleet record, claims what
     /// the fleet has due under this worker's class filter — including
     /// expired-lease entries, whose re-claim under a fresh fencing token *is*
     /// the recovery path — and executes each claim to a settled conclusion.
@@ -3322,7 +3371,16 @@ where
     /// meanwhile, where one lease used to bound that wait. The batch size
     /// bounds it now.
     ///
+    /// **A claim that loses its compare-and-set is made again** by the fleet
+    /// (issue #159), at most three more times, each time whole from the
+    /// record it read again
+    /// ([`AgentDispatcherFleet::claim_due`]). The batch the pass runs is the
+    /// one whose write landed.
+    ///
     /// # Errors
+    ///
+    /// The lost compare-and-set (`revision-conflict`) once the claim has
+    /// lost four writes, with nothing claimed.
     ///
     /// The first error a claim meets ends the pass, and no report is
     /// returned. **The claims the pass had not started are given back
@@ -3355,28 +3413,52 @@ where
         // all: a run with nothing due costs no read of the shared record.
         let fleet_current = !inbox.due_effects()?.is_empty();
         if fleet_current {
-            // Read here, not once per worker: the registration's
-            // compare-and-set is fenced on the revision it read, and a
-            // long-lived worker's copy is whatever its last pass left.
-            self.fleet.recover().await?;
-            // The list that is registered is read after the fleet record,
-            // never before it. The fence only protects a registration whose
-            // due list is no older than the revision it writes against: a
-            // list read first can name a ticket that another worker has
-            // since claimed, run and settled, and whose finished entry a
-            // prune has since removed. Registering it would put a finished
-            // effect back in the fleet. Read in this order, either nothing
-            // wrote the fleet after this read, and the list is newer than
-            // every finished entry and every prune it could miss; or
-            // something did, and the write below loses.
-            inbox.recover().await?;
-            let due = inbox.due_effects()?;
-            if !due.is_empty() {
-                let registration = self
+            let mut reapplied = 0;
+            loop {
+                // Read here, not once per worker: the registration's
+                // compare-and-set is fenced on the revision it read, and a
+                // long-lived worker's copy is whatever its last pass left.
+                self.fleet.recover().await?;
+                // The list that is registered is read after the fleet
+                // record, never before it. The fence only protects a
+                // registration whose due list is no older than the revision
+                // it writes against: a list read first can name a ticket
+                // that another worker has since claimed, run and settled,
+                // and whose finished entry a prune has since removed.
+                // Registering it would put a finished effect back in the
+                // fleet. Read in this order, either nothing wrote the fleet
+                // after this read, and the list is newer than every
+                // finished entry and every prune it could miss; or
+                // something did, and the write below loses.
+                inbox.recover().await?;
+                let due = inbox.due_effects()?;
+                if due.is_empty() {
+                    break;
+                }
+                match self
                     .fleet
                     .register_due_effects(workflow_run_id(scope), None, due)
-                    .await?;
-                pass.registered = registration.registered_effects;
+                    .await
+                {
+                    Ok(registration) => {
+                        // What the write that landed changed, and nothing
+                        // from a try that lost: a ticket another worker
+                        // registered in between counts for nothing here.
+                        pass.registered = registration.registered_effects;
+                        break;
+                    }
+                    Err(error) => {
+                        // A registration that lost its write is made again
+                        // from the top of this loop, so both reads are made
+                        // again and in the same order: the fleet cannot
+                        // re-apply a list it was handed. The fleet says
+                        // whether to, counts the loss, and makes the later
+                        // tries wait. Boxed: a path taken only after a lost
+                        // write should not widen every pass's future.
+                        Box::pin(self.fleet.registration_lost(reapplied, error)).await?;
+                        reapplied += 1;
+                    }
+                }
             }
         }
 
