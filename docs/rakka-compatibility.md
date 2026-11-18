@@ -610,9 +610,26 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **A record an earlier binary left parked** with nothing to reconcile is repaired by the first settle pass that touches it, in one write. `Settle` runs one, and so does any command or exchange the run applies. A read, a refused command and a timer with nothing due do not, so a run with nothing in flight stays as it is until a settle reaches it. A park that still has its ambiguous outcome is not written. A record a re-send left on `WaitingForEffect` is not repaired: that status permits progress, and the next status write corrects it.
 
-  **Two differences on the re-send.** With the gate of a goal evaluation open, re-sending a call that moves the run used to put the run on that gate's wait, `WaitingForApproval` or `WaitingForAuthorization`. It now puts it on `WaitingForEffect`, because a denial or an expiry of that gate writes no status to take the run off it. And re-sending a goal evaluation or a workflow cancel used to put the run on the dispatch wait; it now leaves the run on what it rests on, as it does for a memory promotion and a claim append.
+  **Two differences on the re-send.** With the gate of a goal evaluation open, re-sending a call that moves the run used to put the run on that gate's wait, `WaitingForApproval` or `WaitingForAuthorization`. It now puts it on `WaitingForEffect`: the run takes the status of what it rests on, and that is not read from an evaluation's gate. And re-sending a goal evaluation or a workflow cancel used to put the run on the dispatch wait; it now leaves the run on what it rests on, as it does for a memory promotion and a claim append.
 
-  **Not changed.** A turn that commits while a goal evaluation or a workflow cancel is outstanding is still rested on a wait that counts it, and on the approval wait of an evaluation's gate; and a granted evaluation gate still writes the dispatch wait. Those are the turn's own rules and this entry does not touch them; only the status an answered park leaves is read without them. A workflow cancel that fails still winds its run down. The park itself, the checkpoint and its decisions, and what each answer does to the effect are as they were.
+  **Not changed.** A turn that commits while a goal evaluation or a workflow cancel is outstanding is still rested on a wait that counts it, and on the approval wait of an evaluation's gate; and a granted evaluation gate still writes the dispatch wait (issue #166, below, has since narrowed that grant to a run that is on a dispatch wait). Those are the turn's own rules and this entry does not touch them; only the status an answered park leaves is read without them. A workflow cancel that fails still winds its run down. The park itself, the checkpoint and its decisions, and what each answer does to the effect are as they were.
+
+- Issue #166 ("a run can be left on an approval wait nothing clears") changes what status a live run holds once a gate it waited on closes without a grant, and what a grant of a goal evaluation's gate writes. No type, field, status, code, event or schema version is added, and an ended run is not affected.
+
+  | State | Before | Now |
+  |---|---|---|
+  | A review of the goal was open when a turn committed, so the run reported its approval wait. The review is denied or expires after the turn's last result has landed | `AwaitingTools`, `WaitingForApproval`, with no gate, nothing outstanding and no wake, for good | The run goes on to its next turn |
+  | The same review, denied or expired while a call of the turn is still out | `WaitingForApproval` until that call's result landed | `WaitingForEffect`, or the wait of a gate on that call |
+  | The gated send or start of a fan-out member is denied or expires while a goal evaluation is out | `AwaitingTools`, `WaitingForApproval`, and for good once the evaluation settled | A status that permits progress, and the run goes on once the evaluation settles |
+  | A review of the goal is granted while the run rests on its proposal or its children | `WaitingForEffect`, until another transition wrote the status | The status the run had |
+  | A review of the goal is granted while the run is on a dispatch wait | The dispatch wait | Unchanged |
+  | Any gate, while it is open | Its wait | Unchanged |
+
+  **The rule.** A live run that is not parked and not winding down, and that is on `WaitingForApproval` or `WaitingForAuthorization` with no waiting gate of the turn to hold it there, takes the status of what it rests on (the entry for issues #131 and #130 defines it). That happens in the transition that closes the gate: a decision, the checkpoint timers, or an effect's result. Neither wait permits progress, so before this a turn whose last effect had resolved could not be rested from one.
+
+  **A record an earlier binary left on such a wait** is repaired by the first settle pass that touches it: one write releases the wait, and the next rests the turn. `Settle` runs one, and so does any command or exchange the run applies. A read, a refused command and a timer with nothing due do not. A wait whose gate still stands is not written.
+
+  **Not changed.** What a turn waits for: a turn that commits with a goal evaluation or a workflow cancel outstanding is still held for it, and is rested by the settle pass once it ends. A review of the goal that is open when a turn commits is still the turn's approval wait, and the run reports it. A gate on a tool call that is denied or expires still fails the call and winds the run down.
 
 Run the default compatibility matrix:
 

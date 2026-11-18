@@ -202,7 +202,12 @@ leaves behind is the same either way.
    the run down, as that failure always does, `Compensate` winds it down
    behind the compensation, and `Escalate` keeps the park. A record an
    earlier binary left parked with nothing to reconcile is repaired by the
-   first settle pass that reaches it.
+   first settle pass that reaches it. A run leaves `WaitingForApproval` or
+   `WaitingForAuthorization` the same way when the gate that held it there
+   closes without a grant and the run survives it: a review of the goal
+   that is denied or expires, or the gated send or start of a fan-out
+   member. A gate on a tool call that is denied or expires fails the call
+   and winds the run down.
 6. **Budgets.** Every run holds an escrow ledger: allocations flow down from a
    parent scope in the parent's own transition, settlements and returns flow
    back up through the exchange path, and a `Started` attempt that becomes

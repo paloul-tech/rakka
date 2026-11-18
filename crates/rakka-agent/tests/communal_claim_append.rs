@@ -1995,3 +1995,83 @@ async fn an_answered_park_at_an_advancing_phase_with_a_human_review_open_goes_on
         "and that is on to turn two, not a place both are stuck"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A review of the goal granted off the dispatch wait (issue #166).
+// ---------------------------------------------------------------------------
+
+/// A grant of `gate`.
+fn grant_command(gate: &AgentCheckpoint) -> AgentRunEntityCommand {
+    AgentRunEntityCommand::ResolveCheckpoint {
+        operation_id: AgentOperationId::for_agent(
+            AgentOperationKind::CheckpointResolution,
+            &common::agent_scope(),
+            "review-granted",
+        )
+        .expect("the decision key derives"),
+        checkpoint_id: gate.checkpoint_id.clone(),
+        resolver: PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "goal-approver".to_string(),
+            display_name: None,
+        },
+        decision: Box::new(rakka_agent::AgentCheckpointDecision::Approval(
+            rakka_agent::AgentApprovalDecision::Approve {
+                credential_binding: None,
+                expires_at: rakka_agent_workflow::AgentTimestampMillis::new(1_000_000),
+                allowed_use_count: 1,
+            },
+        )),
+        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+    }
+}
+
+/// Issue #166: a review of the goal granted while the run rests on its
+/// proposal puts the run on no dispatch wait. The grant used to write
+/// `WaitingForEffect`, and nothing an evaluation does afterwards writes a
+/// status, so the run reported a dispatch wait while it waited for the task.
+#[tokio::test]
+async fn a_review_granted_while_the_run_rests_on_its_proposal_leaves_its_status() {
+    use rakka_agent::testkit::ExchangeFault;
+
+    let fx = scripted_goal_fixture(RecordingClaimAppendExecutor::new()).await;
+    settle(&fx).await;
+    drive(&fx).await;
+    settle(&fx).await;
+    // Turn two proposes, and the proposal's deliveries are lost for the rest
+    // of the test, so the run rests on its proposal.
+    for _ in 0..64 {
+        fx.task_transport.inject(ExchangeFault::LoseEnvelope);
+    }
+    drive(&fx).await;
+    settle(&fx).await;
+    let resting = fx.run_snapshot().await.expect("the run exists");
+    assert!(resting.proposal.is_some(), "the run rests on its proposal");
+    assert_eq!(resting.status, AgentRunStatus::Running);
+
+    apply_to_run(&fx, human_review_command()).await;
+    let gate = the_review_gate(&fx).await;
+    assert_eq!(
+        run_picture(&fx).await.1,
+        AgentRunStatus::Running,
+        "an open review moves no status"
+    );
+
+    apply_to_run(&fx, grant_command(&gate)).await;
+    let granted = run_picture(&fx).await;
+    assert_eq!(
+        (granted.1, granted.4),
+        (AgentRunStatus::Running, 0),
+        "the grant closes the gate and puts the run on no dispatch wait"
+    );
+    settle(&fx).await;
+    assert_eq!(run_picture(&fx).await.1, AgentRunStatus::Running);
+    assert!(
+        fx.run_snapshot()
+            .await
+            .expect("the run exists")
+            .proposal
+            .is_some(),
+        "the run still rests on its proposal"
+    );
+}

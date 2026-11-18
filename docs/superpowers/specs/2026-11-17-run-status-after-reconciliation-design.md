@@ -229,6 +229,8 @@ ways in.
   - a review granted while the run rests on its proposal leaves the run
     on `WaitingForEffect` after the evaluation settles, which is #130's
     symptom through a door #130 does not name.
+  **Since fixed.** Issue #166 releases a wait whose gate closed without a
+  grant. Its record is `2026-11-17-approval-wait-release-design.md`.
 - **A re-sent tool call can leave the run a turn ahead of it.** In a
   two-call turn, one call parks and the other lands. The tool arm rests
   the turn, because it counts only outstanding effects and the parked one
