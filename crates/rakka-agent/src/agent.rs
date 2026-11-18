@@ -757,6 +757,21 @@ where
         &mut self,
         command: AgentEntityCommand,
     ) -> AgentEntityResult<AgentEntityReply> {
+        // Boxed. A caller holds a future it awaits inline, and a debug
+        // build keeps stack for it at each await, about twice its size.
+        // This store has no choreography host, so the futures below hold
+        // the agent's record themselves and a command's future is 7 KiB:
+        // a function that sends many commands would carry every one of
+        // them (issue #162; `AgentExchangeHost::accept` has the
+        // measurements).
+        Box::pin(self.apply_unboxed(command)).await
+    }
+
+    /// The work of [`Self::apply`], as the one future it boxes.
+    async fn apply_unboxed(
+        &mut self,
+        command: AgentEntityCommand,
+    ) -> AgentEntityResult<AgentEntityReply> {
         self.ensure_recovered()?;
 
         if let Some(operation_id) = command.operation_id() {

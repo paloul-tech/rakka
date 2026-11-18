@@ -2155,6 +2155,19 @@ where
     where
         F: FnOnce(&mut P::State) -> AgentChoreographyResult<Vec<AgentExchangeEnvelope>>,
     {
+        // Boxed: see `Self::accept`.
+        Box::pin(self.initiate_unboxed(now, transition)).await
+    }
+
+    /// [`Self::initiate`], as one future that holds the state it works on.
+    async fn initiate_unboxed<F>(
+        &mut self,
+        now: AgentTimestampMillis,
+        transition: F,
+    ) -> AgentChoreographyResult<Vec<AgentExchangeInitiation>>
+    where
+        F: FnOnce(&mut P::State) -> AgentChoreographyResult<Vec<AgentExchangeEnvelope>>,
+    {
         let record = self.recovered_record()?;
         let mut state = record.state.clone();
         let envelopes = transition(&mut state)?;
@@ -2179,6 +2192,27 @@ where
     /// transition, and the exchange could never converge however often the
     /// courier delivered it.
     pub async fn accept(
+        &mut self,
+        envelope: &AgentExchangeEnvelope,
+        now: AgentTimestampMillis,
+    ) -> AgentChoreographyResult<AgentExchangeReply> {
+        // Boxed, and the same in every operation of this host that writes.
+        // Each holds the participant's whole state three times across its
+        // write: the record it read, the copy it changed and the copy it
+        // hands to the store. For a task that is 6.8 KiB. Every entity
+        // operation awaits one of these, most of them many, and a caller
+        // holds a future it awaits inline: without the box those kilobytes
+        // are in every future above this one, and in a debug build every
+        // function above it keeps stack for them at each of its awaits,
+        // about twice over. That put one frame of the task entity at
+        // 308 KiB, and the coordination acceptance walk within 100 KiB of
+        // a 2 MiB stack (issue #162). The box costs one heap allocation a
+        // call, and every call that reads the record already clones it.
+        Box::pin(self.accept_unboxed(envelope, now)).await
+    }
+
+    /// [`Self::accept`], as one future that holds the state it works on.
+    async fn accept_unboxed(
         &mut self,
         envelope: &AgentExchangeEnvelope,
         now: AgentTimestampMillis,
@@ -2276,6 +2310,16 @@ where
         reply: &AgentExchangeReply,
         now: AgentTimestampMillis,
     ) -> AgentChoreographyResult<AgentExchangeSettlement> {
+        // Boxed: see `Self::accept`.
+        Box::pin(self.settle_unboxed(reply, now)).await
+    }
+
+    /// [`Self::settle`], as one future that holds the state it works on.
+    async fn settle_unboxed(
+        &mut self,
+        reply: &AgentExchangeReply,
+        now: AgentTimestampMillis,
+    ) -> AgentChoreographyResult<AgentExchangeSettlement> {
         self.policy.check_record(reply)?;
         reply.validate()?;
 
@@ -2342,6 +2386,18 @@ where
         code: &str,
         now: AgentTimestampMillis,
     ) -> AgentChoreographyResult<()> {
+        // Boxed: see `Self::accept`.
+        Box::pin(self.record_unsettleable_refusal_unboxed(operation_id, code, now)).await
+    }
+
+    /// [`Self::record_unsettleable_refusal`], as one future that holds the state it
+    /// works on.
+    async fn record_unsettleable_refusal_unboxed(
+        &mut self,
+        operation_id: &AgentOperationId,
+        code: &str,
+        now: AgentTimestampMillis,
+    ) -> AgentChoreographyResult<()> {
         let record = self.recovered_record()?;
         let mut state = record.state.clone();
         if !state
@@ -2361,6 +2417,18 @@ where
     /// persists nothing, so a standing undeliverable envelope costs one
     /// revision rather than one per sweep.
     pub async fn record_delivery_failure(
+        &mut self,
+        operation_id: &AgentOperationId,
+        code: &str,
+        now: AgentTimestampMillis,
+    ) -> AgentChoreographyResult<()> {
+        // Boxed: see `Self::accept`.
+        Box::pin(self.record_delivery_failure_unboxed(operation_id, code, now)).await
+    }
+
+    /// [`Self::record_delivery_failure`], as one future that holds the state it
+    /// works on.
+    async fn record_delivery_failure_unboxed(
         &mut self,
         operation_id: &AgentOperationId,
         code: &str,

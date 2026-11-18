@@ -73,21 +73,24 @@ fn the_service_builds_every_entity_store_through_its_wired_accessor() {
     );
 }
 
-/// The send leaves' futures stay small enough for a test thread's stack.
+/// The request entries box what they send.
 ///
-/// `send` awaits `send_message_normalized`, `team_command_normalized`, or
-/// `conversation_command_normalized`, and each of those awaits the entity
-/// stores; the whole nest is one flattened state machine, so anything a leaf
-/// binds across an await is reserved in `send`'s own future — in every
-/// branch, whether or not that branch runs. Slice 7.2's first ingress commit
-/// bound an owned `(SendMessageRequest, NormalizedAgentCommand)` at five such
-/// sites and pushed the debug-build future past the 2 MiB a Rust test thread
-/// gets, aborting an acceptance example with `fatal runtime error: stack
-/// overflow` and no other symptom. Boxing the admitted pair is what keeps it
-/// down; this is what keeps the next large binding from undoing that
-/// silently.
+/// `send` and `send_message` are the doors a request comes through, and
+/// each boxes the future that does the work. From here their futures are
+/// a few machine words: the arguments and the box. That is the point: a
+/// caller holds a future it awaits inline, and in a debug build keeps
+/// stack for it at each call, so an unboxed request future of 9 KiB cost
+/// every handler, and every dispatch pass whose handoff calls this service
+/// in-process, that much for each send (issue #162).
+///
+/// This test fails if a door stops boxing. What the box holds is private,
+/// and its size is held inside the crate, by
+/// `the_send_futures_stay_near_their_measured_size` in
+/// `src/agents/service.rs`. Before the doors boxed, the test in this place
+/// measured `send`'s own future against a 20 KiB ceiling; left as it was,
+/// it would have measured the box and passed whatever the box held.
 #[test]
-fn the_send_future_stays_within_a_test_threads_stack() {
+fn the_send_entries_box_what_they_send() {
     use std::sync::Arc;
 
     use rakka_a2a::agents::{A2AStaticAgentCatalog, RakkaAgentA2AService};
@@ -125,26 +128,24 @@ fn the_send_future_stays_within_a_test_threads_stack() {
     };
 
     // Constructed, never polled: the size is the state machine's, not a run's.
-    let future = service.send(&params, &request);
-    let bytes = std::mem::size_of_val(&future);
-    drop(future);
+    let send = service.send(&params, &request);
+    let send_bytes = std::mem::size_of_val(&send);
+    drop(send);
+    let send_message = service.send_message(&params, &request);
+    let send_message_bytes = std::mem::size_of_val(&send_message);
+    drop(send_message);
+    println!("send: {send_bytes} bytes, send_message: {send_message_bytes} bytes");
 
-    // The bound has to sit near the real measurement to mean anything: the
-    // regression it exists for was 22_008 bytes, against 17_408 before it and
-    // 18_240 after the fix. 20 KiB leaves about a tenth of headroom over the
-    // current size and still fails at the size that aborted the acceptance
-    // example. A deliberate, measured increase may raise it — but only after
-    // checking that
-    // `cargo test -p rakka-example-coordination-capability-acceptance` still
-    // runs, because that is the symptom this number stands in for.
-    const CEILING: usize = 20 * 1024;
-    assert!(
-        bytes <= CEILING,
-        "`send`'s future is {bytes} bytes, over the {CEILING}-byte ceiling. \
-         Something large is now held across an await in one of the send \
-         leaves — box it (as the admitted ingress pair is boxed) rather than \
-         raising this bound; at 22_008 bytes this overflowed a test thread's \
-         stack with no symptom but a SIGABRT."
-    );
-    println!("send future: {bytes} bytes");
+    // Both measure 40 bytes. An entry that awaits its work in place measures
+    // what the work holds, which is over 9,000.
+    const A_DOOR: usize = 256;
+    for (entry, bytes) in [("send", send_bytes), ("send_message", send_message_bytes)] {
+        assert!(
+            bytes <= A_DOOR,
+            "`{entry}`'s future is {bytes} bytes: the entry no longer boxes \
+             the future that does its work, so every caller holds that \
+             future inline. Box it at the entry \
+             (`Box::pin(self.{entry}_unboxed(..)).await`)."
+        );
+    }
 }

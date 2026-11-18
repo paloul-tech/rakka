@@ -1020,8 +1020,16 @@ async fn queried_surfaces(world: &World) -> Vec<String> {
 /// # Panics
 ///
 /// Panics if any bullet's fact does not hold — the walk is the check.
-#[allow(clippy::too_many_lines)]
 pub async fn run_acceptance() -> AcceptanceReport {
+    // Boxed: the walk keeps every store and fixture it builds alive to its
+    // end, so its future is tens of kilobytes, and whatever awaits it would
+    // hold that inline (issue #162).
+    Box::pin(walk()).await
+}
+
+/// The walk itself ([`run_acceptance`]).
+#[allow(clippy::too_many_lines)]
+async fn walk() -> AcceptanceReport {
     let world = World::new();
     let mut lines = vec![String::new(); 16];
 
