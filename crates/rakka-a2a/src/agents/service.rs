@@ -2009,3 +2009,100 @@ pub fn conversation_response_message(
     message.message_id = format!("{request_message_id}::conversation-response");
     message
 }
+
+#[cfg(test)]
+mod tests {
+    //! What the boxed request entries hold.
+    //!
+    //! `send` and `send_message` box the future that does the work, so from
+    //! outside the crate their futures are a few machine words whatever the
+    //! work holds (`tests/service_shape.rs` holds that). The futures they
+    //! box are private, and this is where their size is held.
+
+    use std::sync::Arc;
+
+    use rakka_agent::{
+        AgentConversationState, AgentEntityState, AgentExchangeRouter, AgentRunState,
+        AgentTaskState, AgentTeamState, InMemoryAgentConversationHistoryStore,
+        InMemoryAgentTaskHistoryStore, InMemoryAgentTeamHistoryStore,
+    };
+    use rakka_persistence::InMemoryDurableStateStore;
+
+    use super::RakkaAgentA2AService;
+    use crate::agents::A2AStaticAgentCatalog;
+    use crate::auth::AllowAllAuthorizer;
+    use crate::mapping::A2AHeaderTenantResolver;
+    use crate::projection::InMemoryA2ATaskProjectionStore;
+
+    /// The futures behind `send` and `send_message` stay near the size they
+    /// were measured at.
+    ///
+    /// A request's future is one flattened state machine: what any branch
+    /// binds across an await is reserved in it, whether or not that branch
+    /// runs. Slice 7.2's first ingress commit bound an owned
+    /// `(SendMessageRequest, NormalizedAgentCommand)` at five such sites,
+    /// which added 4,600 bytes and, in a debug build, pushed an acceptance
+    /// example past the 2 MiB a test thread gets: `fatal runtime error:
+    /// stack overflow`, and no other symptom. Boxing the admitted pair is
+    /// what keeps it down, and this is what keeps the next large binding
+    /// from undoing that silently.
+    ///
+    /// The futures are measured here, inside the crate, because the public
+    /// entries box them (issue #162). Until they did, this test measured
+    /// `send` itself from `tests/service_shape.rs`, at 17,904 bytes: that
+    /// figure included every entity command a request sends, which the
+    /// entity stores now box themselves.
+    #[test]
+    fn the_send_futures_stay_near_their_measured_size() {
+        let service = RakkaAgentA2AService::new(
+            InMemoryDurableStateStore::<AgentTaskState>::default(),
+            InMemoryDurableStateStore::<AgentEntityState>::default(),
+            InMemoryAgentTaskHistoryStore::new(),
+            InMemoryDurableStateStore::<AgentRunState>::default(),
+            InMemoryDurableStateStore::<AgentTeamState>::default(),
+            InMemoryAgentTeamHistoryStore::new(),
+            InMemoryDurableStateStore::<AgentConversationState>::default(),
+            InMemoryAgentConversationHistoryStore::new(),
+            AgentExchangeRouter::new(),
+            Arc::new(A2AStaticAgentCatalog::new()),
+            Arc::new(InMemoryA2ATaskProjectionStore::local()),
+            Arc::new(A2AHeaderTenantResolver),
+            Arc::new(AllowAllAuthorizer),
+        );
+        let params = a2a_server::ServiceParams::new();
+        let request = a2a::SendMessageRequest {
+            message: a2a::Message::new(a2a::Role::User, Vec::new()),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+
+        // Constructed, never polled: the size is the state machine's, not a
+        // run's.
+        let send = service.send_unboxed(&params, &request);
+        let send_bytes = std::mem::size_of_val(&send);
+        drop(send);
+        let send_message = service.send_message_unboxed(&params, &request);
+        let send_message_bytes = std::mem::size_of_val(&send_message);
+        drop(send_message);
+        println!("send: {send_bytes} bytes, send_message: {send_message_bytes} bytes");
+
+        // The bound has to sit near the measurement to mean anything. Both
+        // futures measure 9,136 bytes; the ceiling leaves about a tenth
+        // over that, and the binding this test exists for would add 4,600.
+        // A deliberate, measured increase may raise it, after checking that
+        // `cargo test -p rakka-example-coordination-capability-acceptance`
+        // still passes: its `stack_margin` test is the symptom this number
+        // stands in for.
+        const CEILING: usize = 10 * 1024;
+        for (entry, bytes) in [("send", send_bytes), ("send_message", send_message_bytes)] {
+            assert!(
+                bytes <= CEILING,
+                "the future `{entry}` boxes is {bytes} bytes, over the \
+                 {CEILING}-byte ceiling. Something large is now held across \
+                 an await in one of the send leaves: box it (as the admitted \
+                 ingress pair is boxed) rather than raising this bound."
+            );
+        }
+    }
+}
