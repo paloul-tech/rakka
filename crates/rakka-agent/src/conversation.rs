@@ -2030,6 +2030,23 @@ where
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentConversationResult<AgentConversationEntityReply> {
+        // Boxed. A caller holds a future it awaits inline, and a debug
+        // build keeps stack for it at each await, about twice its size. A
+        // command's future is a few kilobytes of what the command holds
+        // across its awaits, so a function that sends many commands would
+        // carry every one of them (issue #162; `AgentExchangeHost::accept`
+        // has the measurements). The entity's state is not in this future:
+        // the choreography host's operations hold it, and box it themselves.
+        Box::pin(self.apply_unboxed(command, router, now)).await
+    }
+
+    /// The work of [`Self::apply`], as the one future it boxes.
+    async fn apply_unboxed(
+        &mut self,
+        command: AgentConversationEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentConversationResult<AgentConversationEntityReply> {
         let operation = command.operation_label();
         let reply = self.apply_reverified(command, router, now).await;
         // Counted once, on the verdict that actually left the entity: the

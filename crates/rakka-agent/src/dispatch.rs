@@ -3271,7 +3271,10 @@ where
         scope: &AgentRunScope,
     ) -> AgentDispatchResult<AgentDispatchPass> {
         let mut pass = AgentDispatchPass::default();
-        let fleet_current = self.register_run_into(scope, &mut pass).await?;
+        // Boxed: the per-run half holds a copy of the run's state, 6.5 KiB
+        // in all, and a caller that pumps many runs would carry that for
+        // each call (issue #162).
+        let fleet_current = Box::pin(self.register_run_into(scope, &mut pass)).await?;
         self.claim_into(fleet_current, &mut pass).await?;
         Ok(pass)
     }
@@ -3338,7 +3341,8 @@ where
         scope: &AgentRunScope,
     ) -> AgentDispatchResult<AgentDispatchPass> {
         let mut pass = AgentDispatchPass::default();
-        self.register_run_into(scope, &mut pass).await?;
+        // Boxed, as in `Self::pump_run`.
+        Box::pin(self.register_run_into(scope, &mut pass)).await?;
         Ok(pass)
     }
 
@@ -3559,9 +3563,10 @@ where
         // in place it sits in this future and in the pass's, one level
         // deeper than it did before this function existed. In a debug build
         // that level cost enough stack to overflow a test thread in
-        // `coordination-capability-acceptance`, whose walk already ran
+        // `coordination-capability-acceptance`, whose walk at the time ran
         // within 64 KiB of the 2 MiB a test thread has. On the heap the
-        // same walk needs less than it did without the level.
+        // same walk needs less than it did without the level. Issue #162
+        // has since brought the walk under half a default stack.
         Box::pin(self.execute_claim(&claim_scope, claim, pass)).await
     }
 
