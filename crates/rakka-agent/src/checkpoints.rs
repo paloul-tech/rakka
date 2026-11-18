@@ -569,8 +569,11 @@ pub enum AgentReconciliationDecision {
     /// Escalate to the checkpoint's escalation target; the checkpoint stays
     /// nonterminal and a later decision resolves it.
     Escalate,
-    /// Abandon the ambiguous effect; the run fails terminally. A handoff
-    /// send's cell settles failed with it, under `reconciliation-abandoned`.
+    /// Abandon the ambiguous effect: its generation fails. The model call's
+    /// or a tool call's failure winds the run down. A memory promotion's, a
+    /// claim append's or a goal evaluation's fails the generation only, and
+    /// a live run goes on. A handoff send's cell settles failed with it,
+    /// under `reconciliation-abandoned`.
     AbandonAndFail,
 }
 
@@ -635,7 +638,9 @@ pub enum AgentCheckpointOutcome {
     },
     /// The checkpoint escalated and stays nonterminal.
     Escalated,
-    /// The reconciliation abandoned the effect; the run fails terminally.
+    /// The reconciliation abandoned the effect, and its generation failed.
+    /// Whether the run fails with it is the effect kind's: see
+    /// [`AgentReconciliationDecision::AbandonAndFail`].
     Abandoned,
     /// The checkpoint expired without a decision. It never auto-approves.
     Expired,

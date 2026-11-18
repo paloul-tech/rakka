@@ -1111,6 +1111,39 @@ impl AgentRunEffectKind {
     pub const fn outside_the_turn(self) -> bool {
         matches!(self, Self::MemoryPromotionCall | Self::ClaimAppendCall)
     }
+
+    /// Whether a live run's status may be read from an effect of this kind:
+    /// whether its success moves the run's phase or status.
+    ///
+    /// A model call's outcome hands the run its turn. A tool call's, an A2A
+    /// send's and a workflow start's resolve through arms that rest the
+    /// turn. A compensation resolves through the tool arm too, but exists
+    /// only on a run that is winding down, where no status is read from it.
+    ///
+    /// The other four are not what a run rests on. A memory promotion, a
+    /// claim append and a goal evaluation change their own effect and what
+    /// belongs to it, and write nothing of the run's, whether they succeed
+    /// or fail. A workflow cancel that succeeds writes nothing either; one
+    /// that fails winds the run down, which is not a status to rest on.
+    ///
+    /// This is narrower than the complement of [`Self::outside_the_turn`]. A
+    /// goal evaluation and a workflow cancel are counted among the effects a
+    /// turn awaits, yet neither's success rests a turn. So when a
+    /// reconciliation park ends, the run's status is read from this and not
+    /// from that: a run put on the dispatch wait for an effect whose
+    /// success writes no status has nothing to take it off again, and the
+    /// approval wait of a goal evaluation's gate does not permit progress
+    /// (issues #131 and #130).
+    #[must_use]
+    pub(crate) const fn moves_the_run(self) -> bool {
+        !matches!(
+            self,
+            Self::MemoryPromotionCall
+                | Self::ClaimAppendCall
+                | Self::GoalEvaluationCall
+                | Self::WorkflowCancelCall
+        )
+    }
 }
 
 impl Display for AgentRunEffectKind {

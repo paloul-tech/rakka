@@ -1182,16 +1182,49 @@ impl AgentLoopState {
     /// no status (issue #126).
     #[must_use]
     pub fn approval_family_wait(&self) -> Option<crate::checkpoints::AgentCheckpointKind> {
+        self.approval_family_wait_among(|kind| !kind.outside_the_turn())
+    }
+
+    /// [`Self::approval_family_wait`], over the gates of the effects whose
+    /// outcome moves the run and no others
+    /// ([`crate::AgentRunEffectKind::moves_the_run`]).
+    ///
+    /// A goal evaluation's gate is an approval-family wait of the turn, but a
+    /// run rested on it is not taken off it when the gate is denied or
+    /// expires: the evaluation fails, and a failed evaluation writes no
+    /// status. (A grant does write one.) A status read from that gate when a
+    /// reconciliation park ends could be one nothing clears.
+    #[must_use]
+    pub(crate) fn approval_family_wait_of_the_run(
+        &self,
+    ) -> Option<crate::checkpoints::AgentCheckpointKind> {
+        self.approval_family_wait_among(crate::AgentRunEffectKind::moves_the_run)
+    }
+
+    /// Whether an effect whose outcome moves the run is outstanding
+    /// ([`crate::AgentRunEffectKind::moves_the_run`]).
+    #[must_use]
+    pub(crate) fn awaits_effect_that_moves_the_run(&self) -> bool {
+        self.outstanding_effects()
+            .any(|effect| effect.kind().moves_the_run())
+    }
+
+    /// The approval-family wait among the waiting checkpoints whose bound
+    /// effect is of a kind `counts` admits. A checkpoint whose effect the
+    /// loop state no longer holds is counted.
+    fn approval_family_wait_among(
+        &self,
+        counts: impl Fn(crate::AgentRunEffectKind) -> bool,
+    ) -> Option<crate::checkpoints::AgentCheckpointKind> {
         let mut wait = None;
         for checkpoint in &self.open_checkpoints {
             if !checkpoint.status.is_waiting() {
                 continue;
             }
-            let outside_the_turn = self.effects.iter().any(|effect| {
-                effect.effect_id == checkpoint.bound_effect.effect_id
-                    && effect.kind().outside_the_turn()
+            let left_out = self.effects.iter().any(|effect| {
+                effect.effect_id == checkpoint.bound_effect.effect_id && !counts(effect.kind())
             });
-            if outside_the_turn {
+            if left_out {
                 continue;
             }
             match checkpoint.kind {

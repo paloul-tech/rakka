@@ -1709,3 +1709,82 @@ async fn a_gated_tool_call_still_opens_its_gate() {
         );
     }
 }
+
+/// A live run parked on a goal evaluation leaves the park when it is
+/// answered (issue #131).
+///
+/// An evaluation's outcome writes no status, and a failed one is kept out of
+/// the wind-down so the goal stays decidable. So an evaluation that parked
+/// and was then found to have failed left the run parked in reconciliation
+/// with nothing to reconcile.
+#[tokio::test]
+async fn an_answered_goal_evaluation_park_puts_a_live_run_back_where_it_rests() {
+    let fx = satisfying_fixture();
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+    let resting = run_status(&fx).await;
+    assert_eq!(
+        resting,
+        AgentRunStatus::WaitingForEffect,
+        "the model call is out"
+    );
+
+    apply_run(
+        &fx,
+        evaluate_command("1", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the evaluation is commanded");
+    settle_run(&fx).await;
+    let evaluation = evaluation_effect(&fx).await;
+    apply_run(
+        &fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: evaluation
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: evaluation.effect_id.clone(),
+            generation: evaluation.generation,
+            attempt: evaluation.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the recovery retry was refused",
+            )),
+        },
+    )
+    .await
+    .expect("the park applies");
+    assert_eq!(
+        run_status(&fx).await,
+        AgentRunStatus::WaitingForReconciliation,
+        "the park"
+    );
+
+    apply_run(
+        &fx,
+        AgentRunEntityCommand::ResolveIndeterminateEffect {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "found-failed",
+            )
+            .expect("the decision key derives"),
+            effect_id: evaluation.effect_id.clone(),
+            generation: evaluation.generation,
+            resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                outcome: Box::new(rakka_agent::AgentRunEffectOutcome::failed(
+                    "evaluation-unavailable".to_string(),
+                    "a person found the attempt had failed".to_string(),
+                )),
+            }),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await
+    .expect("the park is answered");
+    assert_eq!(
+        run_status(&fx).await,
+        resting,
+        "the run is back on its model wait"
+    );
+}

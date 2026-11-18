@@ -5775,3 +5775,901 @@ async fn an_ended_runs_next_wake_reads_only_what_its_sweep_acts_on() {
     assert_eq!(open_checkpoints(&fx).await, vec![approval]);
     assert_terminal_unmoved(&fx, &before, "after the timers").await;
 }
+
+// ---------------------------------------------------------------------------
+// A live run's reconciliation park, answered (issues #131 and #130).
+// ---------------------------------------------------------------------------
+
+/// How a person answers a parked promotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkAnswer {
+    /// The attempt ran, and succeeded.
+    Completed,
+    /// The attempt ran and failed (by command), or its generation is
+    /// abandoned (at the checkpoint).
+    Failed,
+    /// The attempt never ran: send it again.
+    NotExecuted,
+}
+
+impl ParkAnswer {
+    const ALL: [Self; 3] = [Self::Completed, Self::Failed, Self::NotExecuted];
+}
+
+/// The door an answer comes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// `ResolveIndeterminateEffect`.
+    Command,
+    /// The reconciliation checkpoint the park opened.
+    Checkpoint,
+}
+
+impl Route {
+    const ALL: [Self; 2] = [Self::Command, Self::Checkpoint];
+}
+
+/// Answers the park of `parked` through `route`, under `key`.
+async fn answer_park(
+    fx: &Fixture,
+    parked: &AgentRunEffect,
+    answer: ParkAnswer,
+    route: Route,
+    key: &str,
+) {
+    let command = match route {
+        Route::Command => {
+            let resolution = match answer {
+                ParkAnswer::Completed => rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                    outcome: Box::new(AgentRunEffectOutcome::MemoryPromotion {
+                        promoted: Vec::new(),
+                    }),
+                },
+                ParkAnswer::Failed => rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                    outcome: Box::new(AgentRunEffectOutcome::failed(
+                        "promotion-refused".to_string(),
+                        "a person found the attempt had failed".to_string(),
+                    )),
+                },
+                ParkAnswer::NotExecuted => rakka_agent::AgentEffectResolution::ConfirmedNotExecuted,
+            };
+            resolve_indeterminate(key, parked, parked.generation, resolution)
+        }
+        Route::Checkpoint => {
+            let checkpoint = the_open_checkpoint(fx).await;
+            let decision = match answer {
+                ParkAnswer::Completed => confirmed_completed(),
+                ParkAnswer::Failed => rakka_agent::AgentReconciliationDecision::AbandonAndFail,
+                ParkAnswer::NotExecuted => {
+                    rakka_agent::AgentReconciliationDecision::ConfirmedNotExecuted
+                }
+            };
+            resolve_checkpoint_command(&checkpoint.checkpoint_id, key, reconciliation(decision))
+        }
+    };
+    let reply = apply_ok(fx, command).await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{answer:?} by {route:?}: {reply:?}"
+    );
+}
+
+/// A live run parked on a promotion goes back, when the park is answered, to
+/// the status of what it rests on: at every rest, for every answer, through
+/// both doors.
+///
+/// The park writes `WaitingForReconciliation` over the run's status, and a
+/// promotion is outside the turn, so no arm of its outcome rests the turn
+/// and writes one back. Two answers left the run parked with nothing to
+/// reconcile, which does not permit progress (issue #131). The third, the
+/// re-send, wrote the dispatch wait whatever the run was resting on, and
+/// nothing corrected it when the re-sent generation settled (issue #130).
+#[tokio::test]
+async fn an_answered_promotion_park_puts_a_live_run_back_where_it_rests() {
+    for rest in Rest::ALL {
+        for answer in ParkAnswer::ALL {
+            for route in Route::ALL {
+                let at = format!("{rest:?}, {answer:?}, {route:?}");
+                let (fx, _stores) = live_world(rest, rakka_agent::AgentEffectPolicies::new()).await;
+                let resting = status_and_phase(&fx).await;
+
+                let parked = park_promotion(&fx, "ambiguous").await;
+                assert_eq!(
+                    status_and_phase(&fx).await,
+                    (AgentRunStatus::WaitingForReconciliation, resting.1),
+                    "{at}: the park"
+                );
+
+                answer_park(&fx, &parked, answer, route, "answer").await;
+                assert_eq!(status_and_phase(&fx).await, resting, "{at}: the answer");
+                assert!(open_checkpoints(&fx).await.is_empty(), "{at}");
+
+                if answer == ParkAnswer::NotExecuted {
+                    crank(&fx).await;
+                    let resent = promotion_record(&fx, &parked).await;
+                    assert_eq!(resent.generation, parked.generation.next(), "{at}");
+                    assert_eq!(
+                        status_and_phase(&fx).await,
+                        resting,
+                        "{at}: the re-sent generation is out"
+                    );
+                    let reply = answer_promotion(&fx, &resent).await;
+                    assert!(
+                        matches!(reply, AgentRunEntityReply::Applied { .. }),
+                        "{at}: {reply:?}"
+                    );
+                    let done = promotion_record(&fx, &parked).await;
+                    assert_eq!(done.status, AgentRunEffectStatus::Succeeded, "{at}");
+                    assert_eq!(
+                        status_and_phase(&fx).await,
+                        resting,
+                        "{at}: the re-sent generation settled"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A turn that rests while a promotion is parked goes on once the park is
+/// answered.
+///
+/// The tool result lands during the park and rests the turn; the park holds
+/// the run where it is. This is the run #131 left for good: parked with
+/// nothing to reconcile, between phases, with no effect in flight whose
+/// outcome would ever write its status again.
+#[tokio::test]
+async fn a_turn_that_rests_during_the_park_goes_on_once_the_park_is_answered() {
+    for route in Route::ALL {
+        for answer in [ParkAnswer::Completed, ParkAnswer::Failed] {
+            let at = format!("{answer:?}, {route:?}");
+            let (fx, _stores) =
+                live_world(Rest::AwaitingTools, rakka_agent::AgentEffectPolicies::new()).await;
+            let parked = park_promotion(&fx, "ambiguous").await;
+
+            let tools = dispatched_effects_of(&fx, AgentRunEffectKind::ToolCall).await;
+            assert_eq!(tools.len(), 1, "{at}: the turn's one tool call is out");
+            let reply = answer_effect(&fx, &tools[0]).await;
+            assert!(
+                matches!(reply, AgentRunEntityReply::Applied { .. }),
+                "{at}: {reply:?}"
+            );
+            assert_eq!(
+                status_and_phase(&fx).await,
+                (
+                    AgentRunStatus::WaitingForReconciliation,
+                    AgentLoopPhase::RecordingTurn
+                ),
+                "{at}: the turn rested, and the park holds the run"
+            );
+
+            answer_park(&fx, &parked, answer, route, "answer").await;
+            crank(&fx).await;
+            let (phase, status, turn, _) = resting_at(&fx).await;
+            assert_eq!(
+                (phase, status, turn),
+                (
+                    AgentLoopPhase::AwaitingModel,
+                    AgentRunStatus::WaitingForEffect,
+                    2
+                ),
+                "{at}: the run went on to turn two"
+            );
+        }
+    }
+}
+
+/// One of two parked promotions answered leaves the run parked on the other.
+#[tokio::test]
+async fn a_second_parked_promotion_keeps_the_run_parked() {
+    for answer in ParkAnswer::ALL {
+        let (fx, _stores) =
+            live_world(Rest::OnProposal, rakka_agent::AgentEffectPolicies::new()).await;
+        let resting = status_and_phase(&fx).await;
+        let first = park_promotion(&fx, "first").await;
+        let second = park_promotion(&fx, "second").await;
+        assert_ne!(first.effect_id, second.effect_id);
+
+        answer_park(&fx, &first, answer, Route::Command, "first").await;
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (AgentRunStatus::WaitingForReconciliation, resting.1),
+            "{answer:?}: the other park stands"
+        );
+
+        answer_park(
+            &fx,
+            &second,
+            ParkAnswer::Completed,
+            Route::Command,
+            "second",
+        )
+        .await;
+        assert_eq!(
+            status_and_phase(&fx).await,
+            resting,
+            "{answer:?}: nothing is left to reconcile"
+        );
+    }
+}
+
+/// Rewrites the stored record's status to the reconciliation park, as a
+/// binary before issue #131 left a run whose park had been answered.
+async fn leave_parked(fx: &Fixture) {
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    value["run"]["status"] = serde_json::to_value(AgentRunStatus::WaitingForReconciliation)
+        .expect("the status serializes");
+    let parked = serde_json::from_value(value).expect("the parked record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, parked)
+        .await
+        .expect("the parked record persists");
+}
+
+/// A record left parked with nothing to reconcile heals on the first settle
+/// pass that touches it, at every rest, and stays as healed.
+#[tokio::test]
+async fn a_run_left_parked_with_nothing_to_reconcile_heals_on_its_next_settle_pass() {
+    for rest in Rest::ALL {
+        let (fx, _stores) = live_world(rest, rakka_agent::AgentEffectPolicies::new()).await;
+        let resting = status_and_phase(&fx).await;
+
+        leave_parked(&fx).await;
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (AgentRunStatus::WaitingForReconciliation, resting.1),
+            "{rest:?}: the stuck record"
+        );
+
+        let stuck = run_revision(&fx).await;
+        settle_pass(&fx).await;
+        assert_eq!(status_and_phase(&fx).await, resting, "{rest:?}: healed");
+        let healed = run_revision(&fx).await;
+        assert_eq!(healed, stuck.next(), "{rest:?}: in one write");
+        settle_pass(&fx).await;
+        settle_pass(&fx).await;
+        assert_eq!(status_and_phase(&fx).await, resting, "{rest:?}: and stays");
+        assert_eq!(
+            run_revision(&fx).await,
+            healed,
+            "{rest:?}: a healed record is not written again"
+        );
+    }
+}
+
+/// The stored run record's revision.
+async fn run_revision(fx: &Fixture) -> rakka_persistence::Revision {
+    fx.runs
+        .load(&run_scope().persistence_id())
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists")
+        .revision
+}
+
+/// A park that stands is left alone by the settle pass: the repair is for a
+/// park with nothing left to reconcile, and this one has its promotion.
+#[tokio::test]
+async fn a_standing_park_is_not_rewritten_by_a_settle_pass() {
+    for rest in Rest::ALL {
+        let (fx, _stores) = live_world(rest, rakka_agent::AgentEffectPolicies::new()).await;
+        let phase = status_and_phase(&fx).await.1;
+        park_promotion(&fx, "ambiguous").await;
+        settle_pass(&fx).await;
+        let parked = run_revision(&fx).await;
+
+        settle_pass(&fx).await;
+        settle_pass(&fx).await;
+        assert_eq!(
+            run_revision(&fx).await,
+            parked,
+            "{rest:?}: the standing park is not written"
+        );
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (AgentRunStatus::WaitingForReconciliation, phase),
+            "{rest:?}: and it stands"
+        );
+    }
+}
+
+/// A tool call's park, confirmed while the turn's other tool call is still
+/// out, puts the run back on its tool wait.
+///
+/// This is the same park on an effect of the turn. The confirmed call's
+/// outcome rests the turn only when it is the turn's last, so with another
+/// call out it wrote no status, and the run stayed parked until that call's
+/// result arrived.
+#[tokio::test]
+async fn a_confirmed_tool_park_with_the_turns_other_call_out_puts_the_run_back_on_its_wait() {
+    let stores = stores();
+    let found = || {
+        AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded")
+    };
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, two_tool_turn())
+            .with_turn_for(2, proposing_turn("resolved")),
+    )
+    .with_tool_result("flaky-tool", found())
+    .with_tool_result("lookup", found());
+    let fx = Fixture::new(dispatcher).with_memory(
+        AgentRunMemory::new(stores.session.clone(), stores.snapshots.clone())
+            .with_private_store(stores.private.clone()),
+    );
+    Box::pin(fx.instantiate_agent()).await;
+    Box::pin(fx.create_task()).await;
+    crank(&fx).await;
+    let models = dispatched_effects_of(&fx, AgentRunEffectKind::ModelCall).await;
+    assert_eq!(models.len(), 1, "turn one's model call is out");
+    answer_effect(&fx, &models[0]).await;
+    crank(&fx).await;
+    let resting = status_and_phase(&fx).await;
+    assert_eq!(
+        resting,
+        (
+            AgentRunStatus::WaitingForEffect,
+            AgentLoopPhase::AwaitingTools
+        ),
+        "both tool calls are out"
+    );
+    let tools = dispatched_effects_of(&fx, AgentRunEffectKind::ToolCall).await;
+    assert_eq!(tools.len(), 2, "both tool calls are out");
+    let parked = &tools[0];
+
+    apply_ok(
+        &fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: parked
+                .result_operation_id(&run_scope())
+                .expect("result operation id"),
+            effect_id: parked.effect_id.clone(),
+            generation: parked.generation,
+            attempt: parked.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the worker was lost after the call started",
+            )),
+        },
+    )
+    .await;
+    assert_eq!(
+        status_and_phase(&fx).await,
+        (AgentRunStatus::WaitingForReconciliation, resting.1),
+        "the park"
+    );
+
+    let outcome = fx.dispatcher.answer(parked).await;
+    let reply = apply_ok(
+        &fx,
+        resolve_indeterminate(
+            "confirmed",
+            parked,
+            parked.generation,
+            rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                outcome: Box::new(outcome),
+            },
+        ),
+    )
+    .await;
+    assert!(
+        matches!(reply, AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    assert_eq!(
+        status_and_phase(&fx).await,
+        resting,
+        "the other call is still out, and the run waits on it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The same park at its edges: winding down, escalated, gated, and the model
+// call's own (issues #131 and #130).
+// ---------------------------------------------------------------------------
+
+/// The reconciliation checkpoint bound to `effect`'s current generation.
+async fn the_reconciliation_checkpoint_of(
+    fx: &Fixture,
+    effect: &AgentRunEffect,
+) -> AgentCheckpoint {
+    let bound: Vec<AgentCheckpoint> = open_checkpoints(fx)
+        .await
+        .into_iter()
+        .filter(|checkpoint| {
+            checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
+                && checkpoint.bound_effect.effect_id == effect.effect_id
+        })
+        .collect();
+    assert_eq!(bound.len(), 1, "one reconciliation checkpoint: {bound:?}");
+    bound.into_iter().next().expect("one")
+}
+
+/// An `Indeterminate` result for `effect`.
+fn indeterminate_result_command(effect: &AgentRunEffect) -> AgentRunEntityCommand {
+    AgentRunEntityCommand::RecordEffectResult {
+        operation_id: effect
+            .result_operation_id(&run_scope())
+            .expect("result operation id"),
+        effect_id: effect.effect_id.clone(),
+        generation: effect.generation,
+        attempt: effect.attempts.saturating_add(1),
+        fence: 0,
+        outcome: Box::new(AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the worker was lost after the call started",
+        )),
+    }
+}
+
+/// A winding-down run's parked promotion, answered every way through both
+/// doors, never takes a live status: the park ends in the wind-down.
+#[tokio::test]
+async fn a_winding_down_runs_answered_park_never_goes_live() {
+    for winding in Winding::ALL {
+        for answer in ParkAnswer::ALL {
+            for route in Route::ALL {
+                let at = format!("{winding:?}, {answer:?}, {route:?}");
+                let (fx, _stores, reason) = Box::pin(winding_world(
+                    winding,
+                    rakka_agent::AgentEffectPolicies::new(),
+                ))
+                .await;
+                let parked = park_promotion(&fx, "ambiguous").await;
+                assert_eq!(
+                    status_and_phase(&fx).await.0,
+                    AgentRunStatus::WaitingForReconciliation,
+                    "{at}: the park"
+                );
+                answer_park(&fx, &parked, answer, route, "answer").await;
+                let after = fx.run_snapshot().await.expect("the run exists");
+                assert_eq!(
+                    after.status,
+                    AgentRunStatus::Cancelling,
+                    "{at}: still winding down"
+                );
+                assert_eq!(after.terminal_reason, reason, "{at}: the reason stands");
+                settle_pass(&fx).await;
+                let settled = fx.run_snapshot().await.expect("the run exists");
+                assert_eq!(
+                    settled.status,
+                    AgentRunStatus::Cancelling,
+                    "{at}: after a settle"
+                );
+            }
+        }
+    }
+}
+
+/// A granted gated promotion that parks and is re-sent re-parks its gate,
+/// and at every rest, by both doors, the run is back where it rested.
+#[tokio::test]
+async fn a_re_sent_gated_promotion_re_parks_its_gate_and_the_run_rests_where_it_was() {
+    for rest in Rest::ALL {
+        for route in Route::ALL {
+            let at = format!("{rest:?}, {route:?}");
+            let (fx, _stores) = Box::pin(live_world(
+                rest,
+                policies_gating(Gate::Checkpoint, rakka_agent::AgentCheckpointSla::default()),
+            ))
+            .await;
+            let resting = status_and_phase(&fx).await;
+            let promotion = promote_gated(&fx, "gated").await;
+            let first = the_gate_of(&fx, &promotion).await;
+            answer_gate(&fx, &first, Answer::Grant).await;
+            let parked = resolve_promotion(
+                &fx,
+                AgentRunEffectOutcome::indeterminate(
+                    "dispatcher-lost-after-started",
+                    "the recovery retry was refused",
+                ),
+            )
+            .await;
+            assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate, "{at}");
+            assert_eq!(
+                status_and_phase(&fx).await,
+                (AgentRunStatus::WaitingForReconciliation, resting.1),
+                "{at}: the park"
+            );
+            let command = match route {
+                Route::Command => resolve_indeterminate(
+                    "answer",
+                    &parked,
+                    parked.generation,
+                    rakka_agent::AgentEffectResolution::ConfirmedNotExecuted,
+                ),
+                Route::Checkpoint => {
+                    let checkpoint = the_reconciliation_checkpoint_of(&fx, &parked).await;
+                    resolve_checkpoint_command(
+                        &checkpoint.checkpoint_id,
+                        "answer",
+                        reconciliation(
+                            rakka_agent::AgentReconciliationDecision::ConfirmedNotExecuted,
+                        ),
+                    )
+                }
+            };
+            let reply = apply_ok(&fx, command).await;
+            assert!(
+                matches!(reply, AgentRunEntityReply::Applied { .. }),
+                "{at}: {reply:?}"
+            );
+            let resent = promotion_record(&fx, &parked).await;
+            assert_eq!(resent.generation, parked.generation.next(), "{at}");
+            assert_eq!(resent.status, AgentRunEffectStatus::Pending, "{at}");
+            let second = the_gate_of(&fx, &resent).await;
+            assert_eq!(second.bound_effect.generation, resent.generation, "{at}");
+            assert_eq!(status_and_phase(&fx).await, resting, "{at}: the re-send");
+            settle_pass(&fx).await;
+            assert_eq!(status_and_phase(&fx).await, resting, "{at}: after a settle");
+        }
+    }
+}
+
+/// Two parks answered at their checkpoints: the first answer, whichever it
+/// is, leaves the run parked on the other, and the second ends the park.
+#[tokio::test]
+async fn two_parks_answered_at_their_checkpoints_end_at_the_second() {
+    for answer in ParkAnswer::ALL {
+        let at = format!("{answer:?}");
+        let (fx, _stores) = Box::pin(live_world(
+            Rest::OnProposal,
+            rakka_agent::AgentEffectPolicies::new(),
+        ))
+        .await;
+        let resting = status_and_phase(&fx).await;
+        let first = park_promotion(&fx, "first").await;
+        let second = park_promotion(&fx, "second").await;
+        let decision = match answer {
+            ParkAnswer::Completed => confirmed_completed(),
+            ParkAnswer::Failed => rakka_agent::AgentReconciliationDecision::AbandonAndFail,
+            ParkAnswer::NotExecuted => {
+                rakka_agent::AgentReconciliationDecision::ConfirmedNotExecuted
+            }
+        };
+        let checkpoint = the_reconciliation_checkpoint_of(&fx, &first).await;
+        let reply = apply_ok(
+            &fx,
+            resolve_checkpoint_command(
+                &checkpoint.checkpoint_id,
+                "first",
+                reconciliation(decision),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{at}: {reply:?}"
+        );
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (AgentRunStatus::WaitingForReconciliation, resting.1),
+            "{at}: the other park stands"
+        );
+        settle_pass(&fx).await;
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (AgentRunStatus::WaitingForReconciliation, resting.1),
+            "{at}: and a settle pass leaves it"
+        );
+        let checkpoint = the_reconciliation_checkpoint_of(&fx, &second).await;
+        let reply = apply_ok(
+            &fx,
+            resolve_checkpoint_command(
+                &checkpoint.checkpoint_id,
+                "second",
+                reconciliation(confirmed_completed()),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{at}: {reply:?}"
+        );
+        assert_eq!(
+            status_and_phase(&fx).await,
+            resting,
+            "{at}: nothing left to reconcile"
+        );
+    }
+}
+
+/// `Escalate` keeps the park, a settle pass writes nothing to it, and a
+/// later answer ends it.
+#[tokio::test]
+async fn escalating_a_park_keeps_it() {
+    for rest in Rest::ALL {
+        let (fx, _stores) =
+            Box::pin(live_world(rest, rakka_agent::AgentEffectPolicies::new())).await;
+        let resting = status_and_phase(&fx).await;
+        let parked = park_promotion(&fx, "ambiguous").await;
+        let checkpoint = the_reconciliation_checkpoint_of(&fx, &parked).await;
+        let reply = apply_ok(
+            &fx,
+            resolve_checkpoint_command(
+                &checkpoint.checkpoint_id,
+                "escalate",
+                reconciliation(rakka_agent::AgentReconciliationDecision::Escalate),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{rest:?}: {reply:?}"
+        );
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (AgentRunStatus::WaitingForReconciliation, resting.1),
+            "{rest:?}: escalated"
+        );
+        settle_pass(&fx).await;
+        let revision = run_revision(&fx).await;
+        settle_pass(&fx).await;
+        settle_pass(&fx).await;
+        assert_eq!(run_revision(&fx).await, revision, "{rest:?}: not written");
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (AgentRunStatus::WaitingForReconciliation, resting.1),
+            "{rest:?}: still parked"
+        );
+        answer_park(
+            &fx,
+            &parked,
+            ParkAnswer::Completed,
+            Route::Checkpoint,
+            "answer",
+        )
+        .await;
+        assert_eq!(status_and_phase(&fx).await, resting, "{rest:?}: answered");
+    }
+}
+
+/// The park of the model call itself. A re-send returns the run to its
+/// model wait, a confirmed turn leaves the park, an abandoned or failed
+/// call ends the run `Failed`, and an escalation keeps the park. The model
+/// call's own outcome moves the run, so only the re-send is new here.
+#[tokio::test]
+async fn the_model_calls_own_park_answered_each_way() {
+    for case in [
+        "not-executed",
+        "confirmed",
+        "confirmed-failed",
+        "abandon",
+        "escalate",
+    ] {
+        let (fx, _stores) = Box::pin(live_world(
+            Rest::AwaitingModel,
+            rakka_agent::AgentEffectPolicies::new(),
+        ))
+        .await;
+        let resting = status_and_phase(&fx).await;
+        let model = dispatched_effect(&fx, AgentRunEffectKind::ModelCall).await;
+        let reply = apply_ok(&fx, indeterminate_result_command(&model)).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{case}: {reply:?}"
+        );
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (AgentRunStatus::WaitingForReconciliation, resting.1),
+            "{case}: the park"
+        );
+        let command = match case {
+            "not-executed" => resolve_indeterminate(
+                "answer",
+                &model,
+                model.generation,
+                rakka_agent::AgentEffectResolution::ConfirmedNotExecuted,
+            ),
+            "confirmed" => {
+                let outcome = fx.dispatcher.answer(&model).await;
+                resolve_indeterminate(
+                    "answer",
+                    &model,
+                    model.generation,
+                    rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                        outcome: Box::new(outcome),
+                    },
+                )
+            }
+            "confirmed-failed" => resolve_indeterminate(
+                "answer",
+                &model,
+                model.generation,
+                rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                    outcome: Box::new(AgentRunEffectOutcome::failed(
+                        "model-refused".to_string(),
+                        "a person found the attempt had failed".to_string(),
+                    )),
+                },
+            ),
+            "abandon" => {
+                let checkpoint = the_reconciliation_checkpoint_of(&fx, &model).await;
+                resolve_checkpoint_command(
+                    &checkpoint.checkpoint_id,
+                    "answer",
+                    reconciliation(rakka_agent::AgentReconciliationDecision::AbandonAndFail),
+                )
+            }
+            _ => {
+                let checkpoint = the_reconciliation_checkpoint_of(&fx, &model).await;
+                resolve_checkpoint_command(
+                    &checkpoint.checkpoint_id,
+                    "answer",
+                    reconciliation(rakka_agent::AgentReconciliationDecision::Escalate),
+                )
+            }
+        };
+        let reply = apply(&fx, command).await;
+        assert!(
+            matches!(reply, Ok(AgentRunEntityReply::Applied { .. })),
+            "{case}: {reply:?}"
+        );
+        let (phase, status, _, _) = resting_at(&fx).await;
+        match case {
+            "not-executed" => assert_eq!((status, phase), resting, "{case}"),
+            "confirmed" => assert_ne!(status, AgentRunStatus::WaitingForReconciliation, "{case}"),
+            "confirmed-failed" | "abandon" => assert_eq!(status, AgentRunStatus::Failed, "{case}"),
+            _ => assert_eq!(status, AgentRunStatus::WaitingForReconciliation, "{case}"),
+        }
+    }
+}
+
+/// Rewrites the stored record as a binary before issue #131 left it after a
+/// parked promotion was confirmed: the promotion succeeded, its checkpoint
+/// gone, and the status still the park.
+async fn answer_as_an_older_binary_did(fx: &Fixture) {
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    value["run"]["status"] = serde_json::to_value(AgentRunStatus::WaitingForReconciliation)
+        .expect("the status serializes");
+    let loop_state = value["run"]["loop_state"]
+        .as_object_mut()
+        .expect("the loop state is an object");
+    loop_state.insert("open_checkpoints".to_string(), serde_json::json!([]));
+    loop_state.insert("pending_checkpoint".to_string(), serde_json::Value::Null);
+    for effect in loop_state["effects"]
+        .as_array_mut()
+        .expect("the effects are an array")
+    {
+        let status = effect["status"].as_str().unwrap_or_default().to_string();
+        if status == "indeterminate" {
+            effect["status"] = serde_json::json!("succeeded");
+        }
+    }
+    let rewritten = serde_json::from_value(value).expect("the rewritten record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, rewritten)
+        .await
+        .expect("the rewritten record persists");
+}
+
+/// The record issue #131 left for good heals and goes on: a tool result
+/// landed during the park and rested the turn, and an older binary then
+/// confirmed the promotion. It goes on to turn two in one settle pass, and
+/// is not written again.
+#[tokio::test]
+async fn a_record_stuck_between_phases_heals_and_goes_on() {
+    // Parked between phases with nothing in flight.
+    let (fx, _stores) = Box::pin(live_world(
+        Rest::AwaitingTools,
+        rakka_agent::AgentEffectPolicies::new(),
+    ))
+    .await;
+    let _parked = park_promotion(&fx, "ambiguous").await;
+    let tools = dispatched_effects_of(&fx, AgentRunEffectKind::ToolCall).await;
+    answer_effect(&fx, &tools[0]).await;
+    answer_as_an_older_binary_did(&fx).await;
+    assert_eq!(
+        status_and_phase(&fx).await,
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            AgentLoopPhase::RecordingTurn
+        )
+    );
+    settle_pass(&fx).await;
+    let healed = resting_at(&fx).await;
+    assert_eq!(
+        (healed.0, healed.1, healed.2),
+        (
+            AgentLoopPhase::AwaitingModel,
+            AgentRunStatus::WaitingForEffect,
+            2
+        ),
+        "the run went on to turn two"
+    );
+    let revision = run_revision(&fx).await;
+    settle_pass(&fx).await;
+    settle_pass(&fx).await;
+    assert_eq!(run_revision(&fx).await, revision, "not written again");
+}
+
+/// A turn recorded after a heal is measured once, as one recorded after an
+/// answer is.
+///
+/// The repair step commits at `RecordingTurn` without folding the turn, and
+/// the loop measured a turn at every committed step in that phase, so a
+/// healed record counted its turn's duration and tokens twice.
+#[tokio::test]
+async fn a_healed_record_measures_its_turn_once() {
+    use rakka_core::InMemoryMetricsRecorder;
+
+    let mut samples = Vec::new();
+    for healed in [false, true] {
+        let metrics = Arc::new(InMemoryMetricsRecorder::new());
+        let (fx, _stores) = tool_promoting_world();
+        let fx = fx.with_metrics(metrics.clone());
+        Box::pin(fx.instantiate_agent()).await;
+        Box::pin(fx.create_task()).await;
+        crank(&fx).await;
+        drive_turn(&fx).await;
+        crank(&fx).await;
+        let parked = park_promotion(&fx, "ambiguous").await;
+        let tools = dispatched_effects_of(&fx, AgentRunEffectKind::ToolCall).await;
+        answer_effect(&fx, &tools[0]).await;
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (
+                AgentRunStatus::WaitingForReconciliation,
+                AgentLoopPhase::RecordingTurn
+            )
+        );
+        let count = |name: &str| metrics.snapshot().observations_named(name).len();
+        let before = (
+            count(rakka_agent::METRIC_AGENT_TURN_DURATION),
+            count(rakka_agent::METRIC_AGENT_MODEL_TOKENS),
+        );
+        if healed {
+            answer_as_an_older_binary_did(&fx).await;
+            settle_pass(&fx).await;
+        } else {
+            answer_park(
+                &fx,
+                &parked,
+                ParkAnswer::Completed,
+                Route::Command,
+                "answer",
+            )
+            .await;
+        }
+        let (phase, status, turn, _) = resting_at(&fx).await;
+        assert_eq!(
+            (phase, status, turn),
+            (
+                AgentLoopPhase::AwaitingModel,
+                AgentRunStatus::WaitingForEffect,
+                2
+            ),
+            "healed={healed}: the run went on to turn two"
+        );
+        let after = (
+            count(rakka_agent::METRIC_AGENT_TURN_DURATION),
+            count(rakka_agent::METRIC_AGENT_MODEL_TOKENS),
+        );
+        samples.push((after.0 - before.0, after.1 - before.1));
+    }
+    assert_eq!(
+        samples[0],
+        (1, 2),
+        "an answered turn is one duration sample and two token samples"
+    );
+    assert_eq!(
+        samples[0], samples[1],
+        "one recorded turn is measured once, healed or answered"
+    );
+}
