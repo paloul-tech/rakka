@@ -1836,7 +1836,7 @@ where
     ///
     /// The first attempt is made from this handle's copy of the record. A
     /// claim that loses its compare-and-set reads the record again and
-    /// claims again, up to [`FLEET_WRITE_REAPPLICATIONS`] more times, each
+    /// claims again, up to three more times, each
     /// after a short random wait ([`AgentFleetWritePause`]). Each
     /// attempt is made whole from the record it read: what is due, the
     /// class and target limits, the batch and the fencing tokens, at the
@@ -2136,7 +2136,7 @@ where
     /// The record is read fresh on every attempt, never from this handle's
     /// copy. A prune that finds nothing to remove writes nothing. One that
     /// loses its compare-and-set to another writer reads again and
-    /// re-applies, up to [`FLEET_WRITE_REAPPLICATIONS`] more times, each
+    /// re-applies, up to three more times, each
     /// after a short random wait ([`AgentFleetWritePause`]). Each loss is
     /// counted.
     ///
@@ -2379,7 +2379,7 @@ where
     /// The record is read fresh on every attempt, never from this handle's
     /// copy. Every current claim is released in one write, and a release
     /// that finds none writes nothing. One that loses its compare-and-set
-    /// reads again and re-applies, up to [`FLEET_WRITE_REAPPLICATIONS`] more
+    /// reads again and re-applies, up to three more
     /// times, each after a short random wait ([`AgentFleetWritePause`]).
     /// Each loss is counted. Answers how many entries it released.
     ///
@@ -2448,7 +2448,7 @@ where
     ///
     /// This follows the rule a claim, a release and a prune follow. Only a
     /// lost compare-and-set (`revision-conflict`) is re-applied, at most
-    /// [`FLEET_WRITE_REAPPLICATIONS`] times. Each call with a lost
+    /// three times. Each call with a lost
     /// compare-and-set is counted on [`METRIC_AGENT_DISPATCHER_FLEET`]
     /// under `operation=register`, on the caller's word that a write was
     /// lost. Before it answers `Ok` it waits a short random time, longer
@@ -3088,7 +3088,7 @@ where
     /// behind; its row is settled here too.
     ///
     /// A registration that loses its compare-and-set is made again, at most
-    /// [`FLEET_WRITE_REAPPLICATIONS`] more times, from a fresh read of the
+    /// three more times, from a fresh read of the
     /// fleet record and then of the run's outbox
     /// ([`AgentDispatcherFleet::registration_lost`]). The registration
     /// answered is the one that landed. The cancellation step before it is
