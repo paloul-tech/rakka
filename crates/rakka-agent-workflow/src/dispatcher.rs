@@ -4,12 +4,15 @@
 //! module adds a fleet-level index for cross-run discovery, leases, fencing,
 //! target concurrency limits, and bounded health snapshots.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
+use std::hash::{BuildHasher, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rakka_core::{MetricsRecorder, NoopMetricsRecorder};
 use rakka_persistence::{DurableError, DurableStateStore, PersistenceId, Revision, StateRecord};
@@ -62,6 +65,45 @@ pub const METRIC_AGENT_DISPATCHER_ENTRIES: &str = "rakka.agent_workflow.dispatch
 /// The same bound the agent dispatcher gives its outbox writes: a
 /// convergence aid for a record several handles write, never the fence.
 const FLEET_WRITE_REAPPLICATIONS: u32 = 3;
+
+/// The `detail` a counted re-application carries: which re-application of
+/// its write it is. One label for each the bound allows, so the bound cannot
+/// move without them.
+const FLEET_REAPPLICATION_LABELS: [&str; FLEET_WRITE_REAPPLICATIONS as usize] = ["1", "2", "3"];
+
+/// The least the second re-application of a fleet write waits, in
+/// milliseconds. Each later one waits at least twice what the one before it
+/// did, and each waits less than twice its own least.
+const FLEET_REAPPLICATION_PAUSE_MS: u64 = 10;
+
+/// How long the `nth` re-application of a fleet write waits before it reads
+/// the record again, from 64 random bits.
+///
+/// The first does not wait. A handle writes from the copy its last read
+/// left, and any other worker's write makes that copy old, so a first loss
+/// says the copy was old and nothing about contention. A second loss in a
+/// row is a write that landed between a fresh read and the write that
+/// followed it. Writers that lose to the same write would otherwise read
+/// again together and lose to each other, so each waits a different time:
+/// the second re-application between 10 and 20 ms, the third between 20 and
+/// 40 ms.
+///
+/// A wait separates writers. It does not shorten the time between a read
+/// and its write, which is where a write is lost and which grows with the
+/// record.
+fn reapplication_pause(nth: u32, entropy: u64) -> Option<Duration> {
+    let doublings = nth.checked_sub(2)?;
+    let least_ms = FLEET_REAPPLICATION_PAUSE_MS << doublings;
+    // Whole milliseconds: the runtime's timer is no finer, and rounds up.
+    Some(Duration::from_millis(least_ms + entropy % least_ms))
+}
+
+/// 64 bits that differ from one call to the next and from one process to
+/// the next: the standard library's hash seed, which is all a spread of
+/// waits needs.
+fn reapplication_entropy() -> u64 {
+    RandomState::new().build_hasher().finish()
+}
 
 /// The stable code of a lost compare-and-set, under whichever wrapper
 /// carries it.
@@ -1556,6 +1598,22 @@ where
     ///
     /// Writes only when an entry is inserted or changed; see
     /// [`AgentDispatcherRegistration::registered_effects`].
+    ///
+    /// **One try, against this handle's copy of the record.** A registration
+    /// that loses its compare-and-set is not read again here, unlike every
+    /// other write of the fleet, because its lost write is a fence. The
+    /// list it is given must be no older than the record it is written
+    /// against: a list read before the record can name an effect another
+    /// worker has since run, finished and pruned, and registering it would
+    /// put a finished effect back. So a caller reads the record first and
+    /// the list second, and a write that loses means the record moved after
+    /// both. Re-applying this list to a newer record would undo that. The
+    /// caller re-applies instead: [`Self::registration_lost`] says how.
+    ///
+    /// # Errors
+    ///
+    /// The store's error, including the lost compare-and-set
+    /// (`revision-conflict`) on its first loss.
     pub async fn register_due_effects(
         &mut self,
         run_id: AgentRunId,
@@ -1617,6 +1675,22 @@ where
     }
 
     /// Claims due dispatch entries for one worker.
+    ///
+    /// The first attempt is made from this handle's copy of the record. A
+    /// claim that loses its compare-and-set reads the record again and
+    /// claims again, up to [`FLEET_WRITE_REAPPLICATIONS`] more times. Each
+    /// attempt is made whole from the record it read: what is due, the
+    /// class and target limits, the batch and the fencing tokens, at the
+    /// instant of that attempt. The claims of an attempt that lost are
+    /// dropped. Its write did not land, so it leased nothing, and nothing of
+    /// it is answered. The batch answered, and what is counted, is the
+    /// attempt that ended the call. An attempt that finds nothing to claim
+    /// writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The store's error, or the lost compare-and-set (`revision-conflict`)
+    /// once the bound is spent. Nothing is claimed then.
     pub async fn claim_due(
         &mut self,
         worker_id: AgentDispatcherWorkerId,
@@ -1624,7 +1698,24 @@ where
         if self.record.is_none() {
             self.recover().await?;
         }
+        let mut reapplied = 0;
+        loop {
+            match self.claim_due_once(&worker_id).await {
+                Ok(batch) => return Ok(batch),
+                Err(error) => {
+                    self.reapply("claim", &mut reapplied, error).await?;
+                    self.recover().await?;
+                }
+            }
+        }
+    }
 
+    /// One attempt of [`Self::claim_due`], from the record this handle
+    /// holds.
+    async fn claim_due_once(
+        &mut self,
+        worker_id: &AgentDispatcherWorkerId,
+    ) -> AgentDispatcherResult<AgentDispatchClaimBatch> {
         let now = current_agent_timestamp(&self.clock);
         let record = self.current_record()?;
         let mut next = record.state;
@@ -1715,7 +1806,7 @@ where
         }
         self.record_gauges(now);
         Ok(AgentDispatchClaimBatch {
-            worker_id,
+            worker_id: worker_id.clone(),
             claimed_at: now,
             due_dispatch_count,
             backpressure_limited,
@@ -1885,7 +1976,8 @@ where
     /// The record is read fresh on every attempt, never from this handle's
     /// copy. A prune that finds nothing to remove writes nothing. One that
     /// loses its compare-and-set to another writer reads again and
-    /// re-applies, up to [`FLEET_WRITE_REAPPLICATIONS`] more times.
+    /// re-applies, up to [`FLEET_WRITE_REAPPLICATIONS`] more times, the
+    /// second and third after a short random wait. Each loss is counted.
     ///
     /// # Errors
     ///
@@ -1916,13 +2008,7 @@ where
                     self.record_gauges(now);
                     return Ok(AgentDispatcherPrune { pruned, remaining });
                 }
-                Err(error)
-                    if error.code() == REVISION_CONFLICT_CODE
-                        && reapplied < FLEET_WRITE_REAPPLICATIONS =>
-                {
-                    reapplied += 1;
-                }
-                Err(error) => return Err(error),
+                Err(error) => self.reapply("prune", &mut reapplied, error).await?,
             }
         }
     }
@@ -2130,7 +2216,8 @@ where
     /// copy. Every current claim is released in one write, and a release
     /// that finds none writes nothing. One that loses its compare-and-set
     /// reads again and re-applies, up to [`FLEET_WRITE_REAPPLICATIONS`] more
-    /// times. Answers how many entries it released.
+    /// times, the second and third after a short random wait. Each loss is
+    /// counted. Answers how many entries it released.
     ///
     /// # Errors
     ///
@@ -2169,15 +2256,47 @@ where
                     self.record_gauges(now);
                     return Ok(released);
                 }
-                Err(error)
-                    if error.code() == REVISION_CONFLICT_CODE
-                        && reapplied < FLEET_WRITE_REAPPLICATIONS =>
-                {
-                    reapplied += 1;
-                }
-                Err(error) => return Err(error),
+                Err(error) => self.reapply("release", &mut reapplied, error).await?,
             }
         }
+    }
+
+    /// Decides what follows a registration that failed, for the caller
+    /// that made it.
+    ///
+    /// [`Self::register_due_effects`] tries once, because the list it is
+    /// given has to be read again before it is registered again. A caller
+    /// that can read it again re-applies the registration itself:
+    ///
+    /// 1. read the fleet record ([`Self::recover`]);
+    /// 2. read the run's due effects, after the record and never before;
+    /// 3. register them;
+    /// 4. on an error, call this with how many times this registration has
+    ///    been re-applied so far. `Ok` means go back to step 1. An error is
+    ///    the one to return.
+    ///
+    /// This follows the rule of every other fleet write. Only a lost
+    /// compare-and-set (`revision-conflict`) is re-applied, at most
+    /// [`FLEET_WRITE_REAPPLICATIONS`] times. Each loss is counted on
+    /// [`METRIC_AGENT_DISPATCHER_FLEET`] under `operation=register`. The
+    /// second and third re-applications wait a short random time first,
+    /// under 60 ms in all, on the runtime's timer and never on this
+    /// fleet's clock, so `Ok` may take that long to come.
+    ///
+    /// The registration that lands answers what it changed. An effect
+    /// another worker registered in between counts for nothing in it.
+    ///
+    /// # Errors
+    ///
+    /// `error` itself: when it is not a lost compare-and-set, or when
+    /// `reapplied` has reached the bound.
+    pub async fn registration_lost(
+        &mut self,
+        reapplied: u32,
+        error: AgentDispatcherError,
+    ) -> AgentDispatcherResult<()> {
+        let mut reapplied = reapplied;
+        self.reapply("register", &mut reapplied, error).await
     }
 
     /// Applies `update` to the entry a current claim holds, and writes it.
@@ -2195,7 +2314,9 @@ where
     /// pruned, so its claim is fenced like any other that is not current.
     ///
     /// Only a lost compare-and-set is retried, recognized by its stable code
-    /// (`revision-conflict`). Any other failure is returned as it is.
+    /// (`revision-conflict`). Any other failure is returned as it is. Each
+    /// loss is counted, and the second and third re-applications wait a
+    /// short random time first ([`Self::after_failed_write`]).
     ///
     /// The same write renews the claims this handle holds
     /// ([`Self::hold_claims`]), each under its own fence and from the record
@@ -2250,16 +2371,71 @@ where
                     self.record_gauges(now);
                     return Ok(updated);
                 }
-                Err(error)
-                    if error.code() == REVISION_CONFLICT_CODE
-                        && reapplied < FLEET_WRITE_REAPPLICATIONS =>
-                {
-                    reapplied += 1;
+                Err(error) => {
+                    self.reapply("settle", &mut reapplied, error).await?;
                     self.recover().await?;
                 }
-                Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Decides what follows a fleet write that failed, and counts it.
+    ///
+    /// The one rule every re-applied write follows: a registration, a
+    /// claim, a settle, a release and a prune.
+    ///
+    /// - Only a lost compare-and-set is re-applied, recognized by its stable
+    ///   code (`revision-conflict`). Any other failure is returned as it is
+    ///   and is not counted.
+    /// - A write is re-applied at most [`FLEET_WRITE_REAPPLICATIONS`] times.
+    ///   The loss after that is returned.
+    /// - Each loss is counted once on
+    ///   [`METRIC_AGENT_DISPATCHER_FLEET`] under the write's `operation`:
+    ///   `outcome=reapplied` with the number of the re-application it led
+    ///   to as `detail`, or `outcome=exhausted` when it is returned.
+    ///
+    /// Answers how long the re-application waits before it reads again
+    /// ([`reapplication_pause`]), and `None` when it does not wait.
+    fn after_failed_write(
+        &self,
+        operation: &'static str,
+        reapplied: u32,
+        error: AgentDispatcherError,
+    ) -> AgentDispatcherResult<Option<Duration>> {
+        if error.code() != REVISION_CONFLICT_CODE {
+            return Err(error);
+        }
+        let Some(nth) = FLEET_REAPPLICATION_LABELS.get(reapplied as usize) else {
+            self.record_metric(operation, "exhausted", "none", 1);
+            return Err(error);
+        };
+        self.record_metric(operation, "reapplied", nth, 1);
+        Ok(reapplication_pause(reapplied + 1, reapplication_entropy()))
+    }
+
+    /// Takes a failed fleet write to its next attempt, or returns its error
+    /// ([`Self::after_failed_write`]).
+    ///
+    /// On `Ok` the write has been counted, `reapplied` is one more, and any
+    /// wait is over: the caller reads the record again and re-applies.
+    ///
+    /// The wait is on the runtime's timer, never on this fleet's clock. A
+    /// deployment may hand the fleet a logical clock that moves only when
+    /// it is told to, and a wait that watched that clock would not end.
+    async fn reapply(
+        &mut self,
+        operation: &'static str,
+        reapplied: &mut u32,
+        error: AgentDispatcherError,
+    ) -> AgentDispatcherResult<()> {
+        let pause = self.after_failed_write(operation, *reapplied, error)?;
+        *reapplied += 1;
+        if let Some(pause) = pause {
+            // Boxed, so the timer is not laid out inside every fleet future
+            // for the sake of a write that lost twice.
+            Box::pin(tokio::time::sleep(pause)).await;
+        }
+        Ok(())
     }
 
     async fn persist(
@@ -2723,6 +2899,19 @@ where
     /// A fleet entry that is already `Cancelled` while its outbox row is
     /// still unsettled is what a build from before this order could leave
     /// behind; its row is settled here too.
+    ///
+    /// A registration that loses its compare-and-set is made again, at most
+    /// [`FLEET_WRITE_REAPPLICATIONS`] more times, from a fresh read of the
+    /// fleet record and then of the run's outbox
+    /// ([`AgentDispatcherFleet::registration_lost`]). The registration
+    /// answered is the one that landed. The cancellation step before it is
+    /// not repeated: what a re-read shows newly fenced is finished by the
+    /// next refresh.
+    ///
+    /// # Errors
+    ///
+    /// A store's error, or the lost compare-and-set (`revision-conflict`)
+    /// once the bound is spent or when a cancellation's write loses.
     pub async fn refresh_run(
         &mut self,
         run_id: AgentRunId,
@@ -2764,10 +2953,26 @@ where
             .collect();
         self.settle_cancelled_effects(&mut inbox, &cancelled_effect_ids, "dispatch-cancelled")
             .await?;
-        let effects = inbox.due_effects()?;
-        self.fleet
-            .register_due_effects(run_id, workflow_id, effects)
-            .await
+        // A registration that loses its write is made again from a fresh
+        // read of the record and then of the list, in that order
+        // ([`AgentDispatcherFleet::registration_lost`]).
+        let mut reapplied = 0;
+        loop {
+            let effects = inbox.due_effects()?;
+            match self
+                .fleet
+                .register_due_effects(run_id.clone(), workflow_id.clone(), effects)
+                .await
+            {
+                Ok(registration) => return Ok(registration),
+                Err(error) => {
+                    self.fleet.registration_lost(reapplied, error).await?;
+                    reapplied += 1;
+                    self.fleet.recover().await?;
+                    inbox.recover().await?;
+                }
+            }
+        }
     }
 
     /// Cancels a run's dispatch entries and settles the cancelled effects at

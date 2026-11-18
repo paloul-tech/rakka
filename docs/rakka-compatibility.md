@@ -565,6 +565,30 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **The concurrency limit.** An entry counts against its class and its target from its claim until it is settled or its lease lapses. The settle is what tells the record a call has ended, so a call that ended and whose settle was lost for good holds its slot for the rest of one lease; that takes four lost writes running, or a worker lost between the delivery and the settle. A batch's claimed and unstarted tickets hold slots too, and a failed pass now gives those back.
 
+- Issues #159 and #160 ("a registration or a claim that loses its compare-and-set on the fleet record still fails the dispatch pass", "nothing counts a fleet settle's re-applications, and its tries run back to back") change what follows a lost write to the dispatcher fleet record. **No durable field, status, schema version or error code is added**, and a rollback is clean.
+
+  | Before | Now |
+  |---|---|
+  | A claim that lost its compare-and-set returned `revision-conflict`, and the pass failed | The fleet reads the record again and claims again, up to three more times. Each attempt is made whole from the record it read: what is due, the limits, the batch and the fencing tokens. A lost attempt's claims are dropped; its write did not land, so it leased nothing |
+  | A registration that lost its compare-and-set returned `revision-conflict`, and the pass failed | Its caller reads the fleet record again, then the run's due list again, and registers again, up to three more times. `AgentRunEffectDispatcher` and `AgentDispatcherWorker::refresh_run` do this. `AgentDispatcherFleet::register_due_effects` itself is still one try |
+  | `AgentDispatchPass::registered` and `AgentDispatcherRegistration::registered_effects` were the one try's count | They are the count of the try that landed: what that write changed. An effect another worker registered in between counts for nothing |
+  | Nothing counted a lost write | Each lost compare-and-set is counted once on `rakka.agent_workflow.dispatcher.fleet`, for a registration, a claim, a settle, a release and a prune |
+  | Re-applications ran back to back | The first still follows at once. The second waits between 10 and 20 ms and the third between 20 and 40 ms, each a random time. The whole wait is under 60 ms |
+
+  **Why the registration is not re-applied inside the fleet.** A registration is handed a list of a run's due effects, and its lost write is a fence (issue #145): the list must be no older than the record it is written against, or it can name an effect another worker has since run, finished and had pruned. Re-applying the same list to a newer record would put that effect back. So the list is read again too, after the record, and only the caller can do that.
+
+  **The wait.** It is on the runtime's timer (`tokio::time`), never on the fleet's clock, so a fleet handed a logical clock that moves only when it is told to still waits and goes on. `rakka-agent-workflow` now depends on `tokio` directly, and a fleet write that is re-applied a second time needs a Tokio runtime with its timer enabled. A wait separates writers that lost to the same write. It does not shorten the time between a read and its write, which is where a write is lost.
+
+  **What an earlier binary does in the same fleet.** It reads nothing new: the record's bytes are what they were. Its own registrations and claims fail their pass on a lost write as before, and it counts and waits for nothing.
+
+  **What gets busier.** A registration or a claim that lost used to leave the record alone until its next pass. It now reads and writes the whole record again at once, so there are more writes for a settle to lose to. `operation=settle, outcome=exhausted` is the count to watch across the change.
+
+  **Public names.** `AgentDispatcherFleet::registration_lost(reapplied, error)` in `rakka-agent-workflow`. Nothing else is added, and no signature changes.
+
+  **New stable strings**, all on the counter `rakka.agent_workflow.dispatcher.fleet`: `operation=settle`, which the fleet did not record before; `outcome=reapplied` with `detail` `1`, `2` or `3`, the number of the re-application the loss led to; and `outcome=exhausted` with `detail=none`, a loss returned as `revision-conflict`. Both outcomes are recorded under `operation` `register`, `claim`, `settle`, `release` and `prune`. No label carries a run, effect, tenant or worker id.
+
+  **Not changed.** The bound of three re-applications. The two writes of a cancellation through `AgentDispatcherWorker` (`request_run_cancellation`, `finalize_run_cancellations`): one try each, not counted. A delivered ticket whose settle ran out is still ended `Cancelled` at its re-claim.
+
 Run the default compatibility matrix:
 
 ```sh
