@@ -125,7 +125,7 @@ series beside the agent domain's. They are declared in
 
 | Metric | Kind | Unit | Labels | What it counts |
 | --- | --- | --- | --- | --- |
-| `rakka.agent_workflow.dispatcher.fleet` | Counter | `{dispatch}` | `operation`, `outcome`, `detail` | Fleet operations. `AgentRunEffectDispatcher` records `register`, `claim`, `renew`, `release` and `prune`, and each lost compare-and-set of a `register`, `claim`, `settle`, `release` or `prune` (issue #160): `outcome=reapplied` with `detail` `1`, `2` or `3`, the re-application it led to, or `outcome=exhausted` with `detail=none` when it was returned as `revision-conflict`. |
+| `rakka.agent_workflow.dispatcher.fleet` | Counter | `{dispatch}` | `operation`, `outcome`, `detail` | Fleet operations. `AgentRunEffectDispatcher` records `register`, `claim`, `renew`, `release` and `prune`, and each lost compare-and-set of a `register`, `claim`, `settle`, `release` or `prune` (issue #160): `outcome=reapplied` with `detail` `1`, `2` or `3`, the re-application it led to, or `outcome=revision-conflict` with `detail=none` when it was returned under that code. |
 | `rakka.agent_workflow.dispatcher.in_flight` | Gauge | `{effect}` | — | Entries under an active lease. |
 | `rakka.agent_workflow.dispatcher.backlog` | Gauge | `{effect}` | — | Entries claimable now. |
 | `rakka.agent_workflow.dispatcher.entries` | Gauge | `{entry}` | `status` | Entries the fleet record holds, one sample per dispatch status, a zero included. |

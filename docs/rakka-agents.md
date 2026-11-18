@@ -251,18 +251,26 @@ settle, a release and a prune. The loss after that is returned as
   `AgentDispatcherFleet::registration_lost` tells it whether to go again.
 - **`AgentDispatchPass::registered` is what the write that landed changed.**
   A ticket another worker registered in between counts for nothing.
-- **The first re-application follows at once; the second and third wait.** A
-  handle writes from the copy its last read left, which any other write
-  makes old, so a first loss says the copy was old. The second waits between
-  10 and 20 ms and the third between 20 and 40 ms, each a random time, so
-  writers that lost to the same write do not read again together. The whole
-  wait is under 60 ms.
-- **The wait is on the runtime's timer, never on the fleet's clock.** A
-  fleet handed a logical clock that moves only when told to still waits and
-  goes on. It needs a Tokio runtime with its timer enabled.
-- **A wait does not make a write less likely to be lost.** A write is lost
-  when another lands between its read and its compare-and-set, and that
-  time grows with the record. Pruning is what shortens it.
+- **A re-application waits a short random time first,** so that writers
+  that lost to the same write do not read again together: between 5 and
+  10 ms before the first, 10 and 20 ms before the second, 20 and 40 ms
+  before the third. One write asks for under 70 ms in all.
+- **Only a settle's first re-application follows at once.** A settle is
+  written from the copy its claim left, which is as old as the call it
+  settles, so its first loss says the copy was old. Every other write
+  follows a read, so its first loss is already a write that got in between.
+  A settle asks for under 60 ms in all, while its claim's lease runs.
+- **The wait is never on the fleet's clock.** A fleet handed a logical clock
+  that moves only when it is told to still waits and goes on. By default a
+  thread sleeps and wakes the task, which needs no async runtime and no
+  timer. `AgentRunEffectDispatcher::with_fleet_write_pause` and
+  `AgentDispatcherFleet::set_write_pause` replace it
+  (`AgentFleetWritePause::with`): with a runtime's `sleep`, with a wait in a
+  simulated time, or with one that ends at once, which turns the waiting
+  off.
+- **A wait does not shorten the time a write can be lost in.** A write is
+  lost when another lands between its read and its compare-and-set, and
+  that time grows with the record. Pruning is what shortens it.
 
 **A batch and its leases** (issue #157). A claim pass leases every claim of
 its batch at one instant, and a worker runs the claims one after another.
@@ -343,20 +351,32 @@ or more. [`rakka-compatibility.md`](rakka-compatibility.md) says why.
 series too. `rakka.agent_workflow.dispatcher.entries` is the record's entry
 count by status; the finished statuses are what grows when nothing prunes.
 
-Every lost compare-and-set is counted once on
+Each lost compare-and-set of those five writes is counted once on
 `rakka.agent_workflow.dispatcher.fleet`, under the `operation` that lost it
 (`register`, `claim`, `settle`, `release` or `prune`):
 
 | `outcome` | `detail` | The lost write |
 |---|---|---|
 | `reapplied` | `1`, `2` or `3` | was read again; `detail` is which re-application of that write it led to |
-| `exhausted` | `none` | was returned as `revision-conflict`, the three re-applications spent |
+| `revision-conflict` | `none` | was returned under that code, the three re-applications spent |
 
 `reapplied` with `detail=1` is how many writes were read again at all, and
-`detail=3` how many came within one loss of running out. `exhausted` under
-`settle` is the one that costs something: the ticket's result is delivered,
-its entry stays `Claimed` for the rest of its lease, and its re-claim ends
-it `Cancelled`.
+`detail=3` how many came within one loss of running out. A registration
+made through `register_due_effects` alone is counted only if its caller
+asks `registration_lost`.
+
+`revision-conflict` under `settle` is the one that costs something. The
+ticket's outbox row is finished and its fleet entry is not: the entry stays
+`Claimed`, holding its slot, until its lease lapses and it is claimed again.
+What that re-claim finds depends on how the call ended:
+
+- **A result that was delivered.** The run already has it. The re-claim
+  invokes nothing and ends the entry `Cancelled`.
+- **A call that spent its attempts.** The row is `Exhausted` and the run has
+  not been told: on that path the fleet is settled before the run. The
+  re-claim ends the entry `Exhausted` and tells the run then, a lease late.
+- **A failure with attempts left.** The row is scheduled to be tried again,
+  and the re-claim is that next attempt.
 
 **A ticket whose outbox row is gone.** A fleet entry outlives its row when a
 run's workflow record is purged, or when one store is restored without the
@@ -408,9 +428,10 @@ effect. [`rakka-compatibility.md`](rakka-compatibility.md) has the tables.
 **What is not bounded.** The record is still one record, written whole. A
 prune bounds it to the live entries plus the finished ones inside the
 horizon, which on a busy fleet can be megabytes. A write that is made again
-is another read and another write of all of it, and a registration or a
-claim that would once have failed its pass and left the record alone now
-competes with the settles for it. The two writes of a cancellation through
+is another read and another attempt to write all of it. A registration or a
+claim that lost used to leave the record alone until its next pass; it now
+reads and tries again within tens of milliseconds, so the same writes land
+sooner and closer together. The two writes of a cancellation through
 `AgentDispatcherWorker` are still one try each and are not counted.
 
 `AgentRunEffectDispatcher` checks a claim's lease when its pass reaches the

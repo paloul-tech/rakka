@@ -11,7 +11,8 @@ use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use rakka_core::{MetricsRecorder, NoopMetricsRecorder};
@@ -71,38 +72,172 @@ const FLEET_WRITE_REAPPLICATIONS: u32 = 3;
 /// move without them.
 const FLEET_REAPPLICATION_LABELS: [&str; FLEET_WRITE_REAPPLICATIONS as usize] = ["1", "2", "3"];
 
-/// The least the second re-application of a fleet write waits, in
+/// The least the first re-application of a fleet write waits, in
 /// milliseconds. Each later one waits at least twice what the one before it
 /// did, and each waits less than twice its own least.
-const FLEET_REAPPLICATION_PAUSE_MS: u64 = 10;
+const FLEET_REAPPLICATION_PAUSE_MS: u64 = 5;
 
-/// How long the `nth` re-application of a fleet write waits before it reads
-/// the record again, from 64 random bits.
-///
-/// The first does not wait. A handle writes from the copy its last read
-/// left, and any other worker's write makes that copy old, so a first loss
-/// says the copy was old and nothing about contention. A second loss in a
-/// row is a write that landed between a fresh read and the write that
-/// followed it. Writers that lose to the same write would otherwise read
-/// again together and lose to each other, so each waits a different time:
-/// the second re-application between 10 and 20 ms, the third between 20 and
-/// 40 ms.
-///
-/// A wait separates writers. It does not shorten the time between a read
-/// and its write, which is where a write is lost and which grows with the
-/// record.
-fn reapplication_pause(nth: u32, entropy: u64) -> Option<Duration> {
-    let doublings = nth.checked_sub(2)?;
-    let least_ms = FLEET_REAPPLICATION_PAUSE_MS << doublings;
-    // Whole milliseconds: the runtime's timer is no finer, and rounds up.
-    Some(Duration::from_millis(least_ms + entropy % least_ms))
+/// What a write's first attempt is made from, which decides what its first
+/// loss means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstAttempt {
+    /// The copy an earlier call of this handle left. A settle's: its copy
+    /// dates from its claim, so it is as old as the call it settles, and
+    /// any other worker's write in that time makes it lose. A first loss
+    /// says the copy was old, and the settle is made again at once.
+    FromAnOlderCopy,
+    /// A read made for this write or, for a claim and a registration,
+    /// usually just before it. A first loss is already a write that landed
+    /// between a read and the write that followed it, so every
+    /// re-application waits. Where the copy was in fact old, the cost is
+    /// that first wait: under 10 ms.
+    FromARead,
 }
 
-/// 64 bits that differ from one call to the next and from one process to
-/// the next: the standard library's hash seed, which is all a spread of
-/// waits needs.
+/// How long the `nth` re-application of a fleet write waits before it reads
+/// the record again, from 64 random bits: between 5 and 10 ms for the
+/// first, 10 and 20 ms for the second, 20 and 40 ms for the third.
+///
+/// Writers that lose to the same write would otherwise read again together
+/// and lose to each other, so each waits a different time. A wait separates
+/// writers. It does not shorten the time between a read and its write,
+/// which is where a write is lost and which grows with the record.
+fn reapplication_pause(nth: u32, entropy: u64) -> Duration {
+    let least_ms = FLEET_REAPPLICATION_PAUSE_MS << nth.saturating_sub(1);
+    // Whole milliseconds: timers are seldom finer, and round up.
+    Duration::from_millis(least_ms + entropy % least_ms)
+}
+
+/// 64 bits that differ from one call to the next, from one thread to the
+/// next and from one process to the next: the standard library's hash
+/// keys, which are seeded for each thread and moved on for each new
+/// `RandomState`. That is all a spread of waits needs.
 fn reapplication_entropy() -> u64 {
     RandomState::new().build_hasher().finish()
+}
+
+/// The future a fleet's wait answers: it ends after about the time it was
+/// asked for.
+pub type AgentFleetPauseFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// How a fleet handle waits before it makes a lost write again
+/// ([`AgentDispatcherFleet::set_write_pause`]).
+///
+/// A fleet write that loses its compare-and-set is read again and made
+/// again, and most re-applications wait a short random time first. The
+/// fleet asks for the time; this is what does the waiting.
+///
+/// The fleet never waits on its own clock. A deployment may hand it a
+/// logical clock that moves only when it is told to, and a wait that
+/// watched that clock would not end.
+#[derive(Clone, Default)]
+pub enum AgentFleetWritePause {
+    /// A thread sleeps for the time asked and wakes the task. The default.
+    ///
+    /// It needs no async runtime and no timer, so a fleet handle waits the
+    /// same way inside any executor and cannot panic for want of one. Each
+    /// wait starts one short-lived thread; a handle makes one write at a
+    /// time, so a process has at most one such thread for each handle. If
+    /// the thread cannot be started, the re-application follows at once.
+    #[default]
+    Thread,
+    /// The application's own wait: given how long, it answers a future that
+    /// ends after about that long. `AgentFleetWritePause::with` builds it.
+    ///
+    /// For an application that would wait on its runtime's timer, or that
+    /// runs under a simulated time of its own. A future that ends at once
+    /// turns the waits off.
+    With(Arc<dyn Fn(Duration) -> AgentFleetPauseFuture + Send + Sync>),
+}
+
+impl AgentFleetWritePause {
+    /// The application's own wait, from a function such as a runtime's
+    /// `sleep`.
+    #[must_use]
+    pub fn with<Wait, Waiting>(wait: Wait) -> Self
+    where
+        Wait: Fn(Duration) -> Waiting + Send + Sync + 'static,
+        Waiting: Future<Output = ()> + Send + 'static,
+    {
+        Self::With(Arc::new(move |pause| Box::pin(wait(pause))))
+    }
+
+    /// The wait itself, for the time asked.
+    fn wait(&self, pause: Duration) -> AgentFleetPauseFuture {
+        match self {
+            Self::Thread => Box::pin(ThreadPause::new(pause)),
+            Self::With(wait) => wait(pause),
+        }
+    }
+}
+
+impl fmt::Debug for AgentFleetWritePause {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Thread => "AgentFleetWritePause::Thread",
+            Self::With(_) => "AgentFleetWritePause::With(..)",
+        })
+    }
+}
+
+/// A wait that needs no async runtime: on its first poll it starts a thread
+/// that sleeps for the time asked and then wakes the task.
+struct ThreadPause {
+    /// The time asked, until the thread is started.
+    pause: Option<Duration>,
+    shared: Arc<Mutex<ThreadPauseState>>,
+}
+
+/// What a [`ThreadPause`] and its thread share.
+#[derive(Default)]
+struct ThreadPauseState {
+    over: bool,
+    waker: Option<Waker>,
+}
+
+impl ThreadPause {
+    fn new(pause: Duration) -> Self {
+        Self {
+            pause: Some(pause),
+            shared: Arc::default(),
+        }
+    }
+}
+
+impl Future for ThreadPause {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        {
+            let mut state = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.over {
+                return Poll::Ready(());
+            }
+            state.waker = Some(context.waker().clone());
+        }
+        let Some(pause) = self.pause.take() else {
+            return Poll::Pending;
+        };
+        let shared = self.shared.clone();
+        let started = std::thread::Builder::new()
+            .name("rakka-fleet-write-pause".to_string())
+            .spawn(move || {
+                std::thread::sleep(pause);
+                let waker = {
+                    let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    state.over = true;
+                    state.waker.take()
+                };
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        match started {
+            Ok(_) => Poll::Pending,
+            // No thread to wait on: the re-application follows at once.
+            Err(_) => Poll::Ready(()),
+        }
+    }
 }
 
 /// The stable code of a lost compare-and-set, under whichever wrapper
@@ -1466,6 +1601,9 @@ where
     /// The claims this handle's worker has taken and not started
     /// ([`Self::hold_claims`]).
     held: Vec<AgentDispatchClaim>,
+    /// How this handle waits before it makes a lost write again
+    /// ([`Self::set_write_pause`]).
+    write_pause: AgentFleetWritePause,
 }
 
 impl<Store> AgentDispatcherFleet<Store, SystemWorkflowClock>
@@ -1548,7 +1686,26 @@ where
             metrics,
             record: None,
             held: Vec::new(),
+            write_pause: AgentFleetWritePause::Thread,
         }
+    }
+
+    /// Replaces how this handle waits before it makes a lost write again.
+    ///
+    /// The default, [`AgentFleetWritePause::Thread`], needs no runtime and
+    /// no timer. An application replaces it to wait on its runtime's timer,
+    /// to wait in a simulated time of its own, or, with a future that ends
+    /// at once, not to wait.
+    #[must_use]
+    pub fn with_write_pause(mut self, pause: AgentFleetWritePause) -> Self {
+        self.set_write_pause(pause);
+        self
+    }
+
+    /// Replaces how this handle waits before it makes a lost write again,
+    /// in place ([`Self::with_write_pause`]).
+    pub fn set_write_pause(&mut self, pause: AgentFleetWritePause) {
+        self.write_pause = pause;
     }
 
     /// Fleet persistence id.
@@ -1600,8 +1757,9 @@ where
     /// [`AgentDispatcherRegistration::registered_effects`].
     ///
     /// **One try, against this handle's copy of the record.** A registration
-    /// that loses its compare-and-set is not read again here, unlike every
-    /// other write of the fleet, because its lost write is a fence. The
+    /// that loses its compare-and-set is not read again here, unlike a
+    /// claim, a settle, a release and a prune, because its lost write is a
+    /// fence. The
     /// list it is given must be no older than the record it is written
     /// against: a list read before the record can name an effect another
     /// worker has since run, finished and pruned, and registering it would
@@ -1678,7 +1836,8 @@ where
     ///
     /// The first attempt is made from this handle's copy of the record. A
     /// claim that loses its compare-and-set reads the record again and
-    /// claims again, up to [`FLEET_WRITE_REAPPLICATIONS`] more times. Each
+    /// claims again, up to [`FLEET_WRITE_REAPPLICATIONS`] more times, each
+    /// after a short random wait ([`AgentFleetWritePause`]). Each
     /// attempt is made whole from the record it read: what is due, the
     /// class and target limits, the batch and the fencing tokens, at the
     /// instant of that attempt. The claims of an attempt that lost are
@@ -1703,7 +1862,8 @@ where
             match self.claim_due_once(&worker_id).await {
                 Ok(batch) => return Ok(batch),
                 Err(error) => {
-                    self.reapply("claim", &mut reapplied, error).await?;
+                    self.reapply("claim", FirstAttempt::FromARead, &mut reapplied, error)
+                        .await?;
                     self.recover().await?;
                 }
             }
@@ -1976,8 +2136,9 @@ where
     /// The record is read fresh on every attempt, never from this handle's
     /// copy. A prune that finds nothing to remove writes nothing. One that
     /// loses its compare-and-set to another writer reads again and
-    /// re-applies, up to [`FLEET_WRITE_REAPPLICATIONS`] more times, the
-    /// second and third after a short random wait. Each loss is counted.
+    /// re-applies, up to [`FLEET_WRITE_REAPPLICATIONS`] more times, each
+    /// after a short random wait ([`AgentFleetWritePause`]). Each loss is
+    /// counted.
     ///
     /// # Errors
     ///
@@ -2008,7 +2169,10 @@ where
                     self.record_gauges(now);
                     return Ok(AgentDispatcherPrune { pruned, remaining });
                 }
-                Err(error) => self.reapply("prune", &mut reapplied, error).await?,
+                Err(error) => {
+                    self.reapply("prune", FirstAttempt::FromARead, &mut reapplied, error)
+                        .await?;
+                }
             }
         }
     }
@@ -2216,8 +2380,8 @@ where
     /// copy. Every current claim is released in one write, and a release
     /// that finds none writes nothing. One that loses its compare-and-set
     /// reads again and re-applies, up to [`FLEET_WRITE_REAPPLICATIONS`] more
-    /// times, the second and third after a short random wait. Each loss is
-    /// counted. Answers how many entries it released.
+    /// times, each after a short random wait ([`AgentFleetWritePause`]).
+    /// Each loss is counted. Answers how many entries it released.
     ///
     /// # Errors
     ///
@@ -2256,13 +2420,17 @@ where
                     self.record_gauges(now);
                     return Ok(released);
                 }
-                Err(error) => self.reapply("release", &mut reapplied, error).await?,
+                Err(error) => {
+                    self.reapply("release", FirstAttempt::FromARead, &mut reapplied, error)
+                        .await?;
+                }
             }
         }
     }
 
-    /// Decides what follows a registration that failed, for the caller
-    /// that made it.
+    /// Takes a registration that failed to its next attempt, for the
+    /// caller that made it: decides whether there is one, counts the loss,
+    /// and waits.
     ///
     /// [`Self::register_due_effects`] tries once, because the list it is
     /// given has to be read again before it is registered again. A caller
@@ -2272,16 +2440,20 @@ where
     /// 2. read the run's due effects, after the record and never before;
     /// 3. register them;
     /// 4. on an error, call this with how many times this registration has
-    ///    been re-applied so far. `Ok` means go back to step 1. An error is
-    ///    the one to return.
+    ///    been re-applied so far: 0 the first time, one more each time.
+    ///    `Ok` means go back to step 1. An error is the one to return.
     ///
-    /// This follows the rule of every other fleet write. Only a lost
-    /// compare-and-set (`revision-conflict`) is re-applied, at most
-    /// [`FLEET_WRITE_REAPPLICATIONS`] times. Each loss is counted on
-    /// [`METRIC_AGENT_DISPATCHER_FLEET`] under `operation=register`. The
-    /// second and third re-applications wait a short random time first,
-    /// under 60 ms in all, on the runtime's timer and never on this
-    /// fleet's clock, so `Ok` may take that long to come.
+    /// **The caller keeps the count, and the bound is in it.** A caller
+    /// that passes the same number every time is never told to stop.
+    ///
+    /// This follows the rule a claim, a release and a prune follow. Only a
+    /// lost compare-and-set (`revision-conflict`) is re-applied, at most
+    /// [`FLEET_WRITE_REAPPLICATIONS`] times. Each call with a lost
+    /// compare-and-set is counted on [`METRIC_AGENT_DISPATCHER_FLEET`]
+    /// under `operation=register`, on the caller's word that a write was
+    /// lost. Before it answers `Ok` it waits a short random time, longer
+    /// for each re-application and under 70 ms asked for in all, on this
+    /// handle's [`AgentFleetWritePause`] and never on this fleet's clock.
     ///
     /// The registration that lands answers what it changed. An effect
     /// another worker registered in between counts for nothing in it.
@@ -2296,7 +2468,8 @@ where
         error: AgentDispatcherError,
     ) -> AgentDispatcherResult<()> {
         let mut reapplied = reapplied;
-        self.reapply("register", &mut reapplied, error).await
+        self.reapply("register", FirstAttempt::FromARead, &mut reapplied, error)
+            .await
     }
 
     /// Applies `update` to the entry a current claim holds, and writes it.
@@ -2372,7 +2545,13 @@ where
                     return Ok(updated);
                 }
                 Err(error) => {
-                    self.reapply("settle", &mut reapplied, error).await?;
+                    self.reapply(
+                        "settle",
+                        FirstAttempt::FromAnOlderCopy,
+                        &mut reapplied,
+                        error,
+                    )
+                    .await?;
                     self.recover().await?;
                 }
             }
@@ -2392,13 +2571,16 @@ where
     /// - Each loss is counted once on
     ///   [`METRIC_AGENT_DISPATCHER_FLEET`] under the write's `operation`:
     ///   `outcome=reapplied` with the number of the re-application it led
-    ///   to as `detail`, or `outcome=exhausted` when it is returned.
+    ///   to as `detail`, or `outcome=revision-conflict` when it is returned.
     ///
     /// Answers how long the re-application waits before it reads again
-    /// ([`reapplication_pause`]), and `None` when it does not wait.
+    /// ([`reapplication_pause`]), and `None` for the one that does not
+    /// wait: the first re-application of a write whose first attempt was
+    /// made from an older copy ([`FirstAttempt`]).
     fn after_failed_write(
         &self,
         operation: &'static str,
+        first: FirstAttempt,
         reapplied: u32,
         error: AgentDispatcherError,
     ) -> AgentDispatcherResult<Option<Duration>> {
@@ -2406,34 +2588,39 @@ where
             return Err(error);
         }
         let Some(nth) = FLEET_REAPPLICATION_LABELS.get(reapplied as usize) else {
-            self.record_metric(operation, "exhausted", "none", 1);
+            self.record_metric(operation, REVISION_CONFLICT_CODE, "none", 1);
             return Err(error);
         };
         self.record_metric(operation, "reapplied", nth, 1);
-        Ok(reapplication_pause(reapplied + 1, reapplication_entropy()))
+        if reapplied == 0 && first == FirstAttempt::FromAnOlderCopy {
+            return Ok(None);
+        }
+        Ok(Some(reapplication_pause(
+            reapplied + 1,
+            reapplication_entropy(),
+        )))
     }
 
     /// Takes a failed fleet write to its next attempt, or returns its error
     /// ([`Self::after_failed_write`]).
     ///
-    /// On `Ok` the write has been counted, `reapplied` is one more, and any
+    /// On `Ok` the loss has been counted, `reapplied` is one more, and any
     /// wait is over: the caller reads the record again and re-applies.
     ///
-    /// The wait is on the runtime's timer, never on this fleet's clock. A
-    /// deployment may hand the fleet a logical clock that moves only when
-    /// it is told to, and a wait that watched that clock would not end.
+    /// The wait is this handle's [`AgentFleetWritePause`], never this
+    /// fleet's clock, and is already boxed: it is not laid out inside every
+    /// fleet future for the sake of a write that lost.
     async fn reapply(
         &mut self,
         operation: &'static str,
+        first: FirstAttempt,
         reapplied: &mut u32,
         error: AgentDispatcherError,
     ) -> AgentDispatcherResult<()> {
-        let pause = self.after_failed_write(operation, *reapplied, error)?;
+        let pause = self.after_failed_write(operation, first, *reapplied, error)?;
         *reapplied += 1;
         if let Some(pause) = pause {
-            // Boxed, so the timer is not laid out inside every fleet future
-            // for the sake of a write that lost twice.
-            Box::pin(tokio::time::sleep(pause)).await;
+            self.write_pause.wait(pause).await;
         }
         Ok(())
     }

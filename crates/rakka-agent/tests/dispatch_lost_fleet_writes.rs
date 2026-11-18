@@ -12,16 +12,22 @@
 //! tickets it registers must be no older than the record it writes against,
 //! so the list is read again too, after the record.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter};
 use rakka_agent::{
-    AgentEffectSpec, AgentModelTurn, AgentRunEffect, AgentTaskContent, AgentToolAuthority,
-    AgentToolCallId, AgentToolCallRequest, AgentToolId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor, AgentEffectSpec,
+    AgentModelTurn, AgentRunEffect, AgentRunEffectStatus, AgentRunScope, AgentTaskContent,
+    AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
+use rakka_agent_workflow::substrate::OutboxStatus;
 use rakka_agent_workflow::{
     AgentDispatchEntry, AgentDispatchStatus, AgentDispatcherFleet, AgentDispatcherFleetSettings,
-    AgentDispatcherFleetState, AgentTimestampMillis, METRIC_AGENT_DISPATCHER_FLEET,
+    AgentDispatcherFleetState, AgentEphemeralCredential, AgentFleetWritePause,
+    AgentTimestampMillis, METRIC_AGENT_DISPATCHER_FLEET,
 };
 use rakka_core::InMemoryMetricsRecorder;
 use rakka_persistence::DurableStateStore;
@@ -101,7 +107,7 @@ async fn fleet_entry(fx: &AuthorityFixture, effect: &AgentRunEffect) -> Option<A
 }
 
 /// The lost writes the fleet counted under one operation: its three
-/// re-applications and its exhaustion.
+/// re-applications, and the loss that was returned.
 fn lost(metrics: &InMemoryMetricsRecorder, operation: &str) -> [f64; 4] {
     let counted = |outcome: &str, detail: &str| -> f64 {
         metrics
@@ -120,8 +126,17 @@ fn lost(metrics: &InMemoryMetricsRecorder, operation: &str) -> [f64; 4] {
         counted("reapplied", "1"),
         counted("reapplied", "2"),
         counted("reapplied", "3"),
-        counted("exhausted", "none"),
+        counted("revision-conflict", "none"),
     ]
+}
+
+/// Runs a pass against a store that never lets one of its writes win, and
+/// fails if the pass does not end. A pass that lost count of its
+/// re-applications would go on for ever, and this says so in seconds.
+async fn ending<T>(pass: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(10), pass)
+        .await
+        .expect("a write that never wins is given up after its bound")
 }
 
 #[tokio::test]
@@ -301,9 +316,7 @@ async fn a_registration_that_loses_every_write_fails_the_pass_at_the_bound() {
     let (fx, effect, metrics) = ready_tool_ticket().await;
     fx.fleet_store.conflict_from(1);
 
-    let error = fx
-        .pipeline()
-        .pump_run(&run_scope())
+    let error = ending(fx.pipeline().pump_run(&run_scope()))
         .await
         .expect_err("a registration that loses four writes fails its pass");
 
@@ -330,9 +343,7 @@ async fn a_claim_that_loses_every_write_fails_the_pass_and_leaves_the_ticket_cla
     // claim is made again.
     fx.fleet_store.conflict_from(2);
 
-    let error = fx
-        .pipeline()
-        .pump_run(&run_scope())
+    let error = ending(fx.pipeline().pump_run(&run_scope()))
         .await
         .expect_err("a claim that loses four writes fails its pass");
 
@@ -349,4 +360,254 @@ async fn a_claim_that_loses_every_write_fails_the_pass_and_leaves_the_ticket_cla
     assert!(entry.lease.is_none(), "no lost claim took a lease");
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
     assert_eq!(lost(&metrics, "claim"), [1.0, 1.0, 1.0, 1.0]);
+}
+
+// ---------------------------------------------------------------------------
+// The dispatcher's own wait.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_dispatcher_waits_the_way_it_was_told_to() {
+    let (fx, _effect, metrics) = ready_tool_ticket().await;
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let record = asked.clone();
+    let pause = AgentFleetWritePause::with(move |wait: Duration| {
+        record.lock().expect("not poisoned").push(wait.as_millis());
+        std::future::ready(())
+    });
+    fx.fleet_store.conflict_from(1);
+
+    let error = ending(
+        fx.pipeline()
+            .with_fleet_write_pause(pause)
+            .pump_run(&run_scope()),
+    )
+    .await
+    .expect_err("a registration that loses four writes fails its pass");
+
+    assert_eq!(error.code(), "revision-conflict");
+    assert_eq!(lost(&metrics, "register"), [1.0, 1.0, 1.0, 1.0]);
+    // A registration follows a read, so each of its three re-applications
+    // waits, and nothing waits after the loss that is returned.
+    let asked = asked.lock().expect("not poisoned").clone();
+    assert_eq!(asked.len(), 3, "the dispatcher asked for {asked:?}");
+    assert!((5..10).contains(&asked[0]), "{asked:?}");
+    assert!((10..20).contains(&asked[1]), "{asked:?}");
+    assert!((20..40).contains(&asked[2]), "{asked:?}");
+}
+
+// ---------------------------------------------------------------------------
+// What a settle that ran out leaves behind. Not changed here, and counted
+// now: `operation=settle, outcome=revision-conflict`.
+// ---------------------------------------------------------------------------
+
+/// A tool that always refuses, definitively.
+struct Refusing;
+
+impl AgentDispatchToolExecutor for Refusing {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        Box::pin(async move {
+            Err(AgentDispatchError::Definitive {
+                code: "tool-refused".to_string(),
+                message: "the tool refused the call".to_string(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_settle_that_ran_out_after_a_delivered_result_is_ended_cancelled_at_its_re_claim() {
+    let (fx, effect, metrics) = ready_tool_ticket().await;
+    let mut pipeline = fx.pipeline();
+    pipeline
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    // The pass's first fleet write is its claim. From the second on, the
+    // settle and every time it is made again lose.
+    fx.fleet_store.conflict_from(2);
+
+    let error = ending(pipeline.claim_and_execute())
+        .await
+        .expect_err("a settle that loses four writes fails its pass");
+    fx.fleet_store.survive();
+
+    assert_eq!(error.code(), "revision-conflict");
+    assert_eq!(lost(&metrics, "settle"), [1.0, 1.0, 1.0, 1.0]);
+    // The result was delivered and the row finished before the settle.
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+    assert_eq!(
+        fx.outbox_row(&effect).await.map(|row| row.status()),
+        Some(OutboxStatus::Dispatched)
+    );
+    assert_ne!(
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Ready),
+        "the run has its result and no longer waits on the call"
+    );
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Claimed),
+        "the entry holds its slot until its lease lapses"
+    );
+
+    fx.expire_lease();
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the re-claim runs");
+
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Cancelled)
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 1, "nothing ran twice");
+}
+
+#[tokio::test]
+async fn a_settle_that_ran_out_after_an_exhausted_call_tells_the_run_at_its_re_claim() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(tool_registry_for_spec(TOOL, &spec)),
+        None,
+    )
+    .with_tool_executor(Arc::new(Refusing))
+    .with_metrics(metrics.clone());
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let effect = fx.effect_at(1).await.expect("the tool effect is committed");
+    let mut pipeline = fx.pipeline();
+    pipeline
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    fx.fleet_store.conflict_from(2);
+
+    let error = ending(pipeline.claim_and_execute())
+        .await
+        .expect_err("a settle that loses four writes fails its pass");
+    fx.fleet_store.survive();
+
+    assert_eq!(error.code(), "revision-conflict");
+    assert_eq!(lost(&metrics, "settle"), [1.0, 1.0, 1.0, 1.0]);
+    // The row is finished. The run has not been told: on this path the
+    // fleet is settled before the run is.
+    assert_eq!(
+        fx.outbox_row(&effect).await.map(|row| row.status()),
+        Some(OutboxStatus::Exhausted)
+    );
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Claimed)
+    );
+    assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
+
+    fx.expire_lease();
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the re-claim runs");
+
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Exhausted)
+    );
+    assert_eq!(
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Exhausted)
+    );
+}
+
+/// A tool whose first call fails in a way that is tried again, and whose
+/// second answers.
+#[derive(Default)]
+struct BusyOnce {
+    calls: AtomicUsize,
+}
+
+impl AgentDispatchToolExecutor for BusyOnce {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        let earlier = self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if earlier == 0 {
+                return Err(AgentDispatchError::Collaborator {
+                    code: "tool-busy".to_string(),
+                    message: "the tool is busy".to_string(),
+                });
+            }
+            Ok(
+                AgentTaskContent::inline(serde_json::json!({ "charged": true }))
+                    .expect("the result is inline-bounded"),
+            )
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_settle_that_ran_out_after_a_failure_with_attempts_left_is_tried_again_at_its_re_claim() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let tool = Arc::new(BusyOnce::default());
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(tool_registry_for_spec(TOOL, &spec)),
+        None,
+    )
+    .with_tool_executor(tool.clone())
+    .with_metrics(metrics.clone());
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let effect = fx.effect_at(1).await.expect("the tool effect is committed");
+    let mut pipeline = fx.pipeline();
+    pipeline
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    fx.fleet_store.conflict_from(2);
+
+    let error = ending(pipeline.claim_and_execute())
+        .await
+        .expect_err("a settle that loses four writes fails its pass");
+    fx.fleet_store.survive();
+
+    assert_eq!(error.code(), "revision-conflict");
+    assert_eq!(lost(&metrics, "settle"), [1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fx.outbox_row(&effect).await.map(|row| row.status()),
+        Some(OutboxStatus::Failed),
+        "the row is scheduled to be tried again"
+    );
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Claimed)
+    );
+
+    fx.expire_lease();
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the re-claim runs");
+
+    assert_eq!((pass.invoked, pass.delivered), (1, 1));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2, "the second attempt");
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Completed)
+    );
 }
