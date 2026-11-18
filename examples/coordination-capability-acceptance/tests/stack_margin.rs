@@ -18,9 +18,11 @@
 //! One line, for one path. The walk needs about 780 KiB in a debug build,
 //! so it can grow by about 240 KiB before this test fails, and no smaller
 //! growth shows here. A path the walk does not take is not held at all.
-//! When this was written two of `rakka-agent`'s test binaries needed a
-//! little more stack than the walk does (`effect_dispatch` 824 KiB,
-//! `private_memory_promotion` 808 KiB), and nothing holds either.
+//! When this was written six of `rakka-agent`'s test binaries needed more
+//! stack than the walk does, the most of them 1,064 KiB
+//! (`dispatch_failure_outcomes`), and nothing holds any of them. The
+//! measurements are in
+//! `docs/superpowers/specs/2026-11-17-dispatch-walk-stack-margin-design.md`.
 //!
 //! # When this test fails
 //!
