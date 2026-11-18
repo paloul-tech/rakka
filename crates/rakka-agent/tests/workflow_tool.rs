@@ -1937,107 +1937,135 @@ async fn an_answered_park_with_a_stragglers_cancel_out_leaves_the_run_running() 
 // An approval wait whose gate closed without a grant (issue #166).
 // ---------------------------------------------------------------------------
 
-/// Issue #166: the gated start of a fan-out's one member is denied while a
-/// goal evaluation is out. The denial is a fan-in disposition, which the run
-/// survives, and it does not rest the turn, which is held for the
-/// evaluation. The run is taken off the start's approval wait in that
-/// transition, and goes on once the evaluation settles. It used to stay
-/// `AwaitingTools` and `WaitingForApproval` with no gate and nothing in
-/// flight, and no review of the goal is involved.
-#[tokio::test]
-async fn a_denied_start_gate_with_an_evaluation_out_does_not_strand_the_run() {
-    let executor = RecordingWorkflowExecutor::new(StartMode::Started);
-    let mut fixture = workflow_fixture(executor, workflow_await_turn());
-    fixture.policies = rakka_agent::AgentEffectPolicies::new()
-        .with_workflow_start_spec(
-            rakka_agent::AgentEffectSpec::idempotent(2)
-                .expect("the spec is valid")
-                .with_checkpoint_required(),
-        )
-        .expect("the gated start spec is valid");
-    create_workflow_task(&fixture).await;
+/// Where the run rests: its phase, status and turn.
+async fn rest_of(fixture: &Fixture) -> (AgentLoopPhase, Option<AgentRunStatus>, u64) {
+    let picture = run_picture(fixture).await;
+    (picture.0, picture.1, picture.2)
+}
 
-    // An evaluation of the goal, ungated, committed beside the model call.
-    apply_to_run(
-        &fixture,
-        AgentRunEntityCommand::EvaluateGoal {
-            operation_id: rakka_agent::evaluation_operation_id(&run_scope(), "beside-the-start")
-                .expect("the operation id derives"),
-            evaluation: Box::new(common::goal_evaluation_request(
-                rakka_agent::AgentRevisionNumber::INITIAL,
-            )),
+/// The run's stored revision.
+async fn run_revision(fixture: &Fixture) -> rakka_persistence::Revision {
+    use rakka_persistence::DurableStateStore;
+
+    fixture
+        .runs
+        .load(&run_scope().persistence_id())
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists")
+        .revision
+}
+
+/// Runs the run's settle pass from durable state.
+async fn settle(fixture: &Fixture) {
+    let mut run = fixture.run();
+    let now = fixture.now();
+    run.recover(now).await.expect("recover");
+    run.settle_side_effects(&fixture.router, now)
+        .await
+        .expect("the run settles");
+}
+
+/// The run's waiting gates, each with the kind of effect it is bound to.
+async fn waiting_gates(fixture: &Fixture) -> Vec<(rakka_agent::AgentCheckpoint, String)> {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let loop_state = state.loop_state().expect("the loop is running");
+    loop_state
+        .open_checkpoints()
+        .iter()
+        .filter(|checkpoint| checkpoint.status.is_waiting())
+        .map(|checkpoint| {
+            let bound = loop_state
+                .effects()
+                .iter()
+                .find(|effect| effect.effect_id == checkpoint.bound_effect.effect_id)
+                .map_or("gone", |effect| effect.kind().as_label());
+            (checkpoint.clone(), bound.to_string())
+        })
+        .collect()
+}
+
+/// The one waiting gate bound to an effect of `kind`.
+async fn the_gate_on(fixture: &Fixture, kind: &str) -> rakka_agent::AgentCheckpoint {
+    let gates = waiting_gates(fixture).await;
+    let mut bound: Vec<_> = gates
+        .iter()
+        .filter(|(_, bound)| bound == kind)
+        .map(|(gate, _)| gate.clone())
+        .collect();
+    assert_eq!(bound.len(), 1, "one gate on a {kind}: {gates:?}");
+    bound.remove(0)
+}
+
+/// A grant or a denial of `gate`, under a decision key of its own.
+fn gate_decision(
+    gate: &rakka_agent::AgentCheckpoint,
+    key: &str,
+    grant: bool,
+) -> AgentRunEntityCommand {
+    let decision = if grant {
+        rakka_agent::AgentApprovalDecision::Approve {
+            credential_binding: None,
+            expires_at: AgentTimestampMillis::new(10_000_000),
+            allowed_use_count: 1,
+        }
+    } else {
+        rakka_agent::AgentApprovalDecision::Deny {
+            reason: "not this one".to_string(),
+        }
+    };
+    AgentRunEntityCommand::ResolveCheckpoint {
+        operation_id: rakka_agent::AgentOperationId::for_agent(
+            rakka_agent::AgentOperationKind::CheckpointResolution,
+            &common::agent_scope(),
+            key,
+        )
+        .expect("the decision key derives"),
+        checkpoint_id: gate.checkpoint_id.clone(),
+        resolver: rakka_agent_workflow::PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "approver".to_string(),
+            display_name: None,
         },
-    )
-    .await;
-    drive_model_turn_only(&fixture).await;
-    let gated = run_picture(&fixture).await;
-    assert_eq!(
-        (gated.0, gated.1, gated.2),
-        (
-            AgentLoopPhase::AwaitingTools,
-            Some(AgentRunStatus::WaitingForApproval),
-            1
-        ),
-        "the turn waits on the start's gate: {gated:?}"
-    );
-    let (gate, evaluation) = {
+        decision: Box::new(rakka_agent::AgentCheckpointDecision::Approval(decision)),
+        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+    }
+}
+
+/// An evaluation of the goal: a human review, which is always gated, or an
+/// assertion, which is gated only where the deployment's spec gates it.
+fn evaluate_goal(human_review: bool) -> AgentRunEntityCommand {
+    let mut request = common::goal_evaluation_request(rakka_agent::AgentRevisionNumber::INITIAL);
+    if human_review {
+        request.method = rakka_agent::AgentGoalEvaluationMethod::HumanReview;
+    }
+    AgentRunEntityCommand::EvaluateGoal {
+        operation_id: rakka_agent::evaluation_operation_id(&run_scope(), "beside-the-fan-out")
+            .expect("the operation id derives"),
+        evaluation: Box::new(request),
+    }
+}
+
+/// Lands the dispatcher's answer to the outstanding goal evaluation, and
+/// nothing else.
+async fn land_the_evaluation(fixture: &Fixture) {
+    let evaluation = {
         let mut run = fixture.run();
         run.recover(fixture.now()).await.expect("recover");
         let state = run.state().expect("state");
-        let loop_state = state.loop_state().expect("the loop is running");
-        let gates: Vec<rakka_agent::AgentCheckpoint> = loop_state
-            .open_checkpoints()
-            .iter()
-            .filter(|checkpoint| checkpoint.status.is_waiting())
-            .cloned()
-            .collect();
-        assert_eq!(gates.len(), 1, "one gate, the start's: {gates:?}");
-        let evaluation = loop_state
+        let found = state
+            .loop_state()
+            .expect("the loop is running")
             .outstanding_effects()
             .find(|effect| effect.kind() == rakka_agent::AgentRunEffectKind::GoalEvaluationCall)
-            .cloned()
-            .expect("the evaluation is out");
-        (gates[0].clone(), evaluation)
+            .cloned();
+        found.expect("the evaluation is out")
     };
-
-    apply_to_run(
-        &fixture,
-        AgentRunEntityCommand::ResolveCheckpoint {
-            operation_id: rakka_agent::AgentOperationId::for_agent(
-                rakka_agent::AgentOperationKind::CheckpointResolution,
-                &common::agent_scope(),
-                "start-denied",
-            )
-            .expect("the decision key derives"),
-            checkpoint_id: gate.checkpoint_id.clone(),
-            resolver: rakka_agent_workflow::PrincipalRef {
-                principal_type: "user".to_string(),
-                principal_id: "approver".to_string(),
-                display_name: None,
-            },
-            decision: Box::new(rakka_agent::AgentCheckpointDecision::Approval(
-                rakka_agent::AgentApprovalDecision::Deny {
-                    reason: "not this workflow".to_string(),
-                },
-            )),
-            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
-        },
-    )
-    .await;
-    let denied = run_picture(&fixture).await;
-    assert_eq!(
-        (denied.0, denied.2, denied.4),
-        (AgentLoopPhase::AwaitingTools, 1, true),
-        "the turn is held for the evaluation: {denied:?}"
-    );
-    assert!(
-        denied.1.is_some_and(AgentRunStatus::permits_progress),
-        "the run is off the approval wait of a gate that closed: {denied:?}"
-    );
-
     let outcome = fixture.dispatcher.answer(&evaluation).await;
     apply_to_run(
-        &fixture,
+        fixture,
         AgentRunEntityCommand::RecordEffectResult {
             operation_id: evaluation
                 .result_operation_id(&run_scope())
@@ -2050,14 +2078,268 @@ async fn a_denied_start_gate_with_an_evaluation_out_does_not_strand_the_run() {
         },
     )
     .await;
-    let ending = run_picture(&fixture).await;
+}
+
+/// One delegation plus the declared await.
+fn delegate_await_turn() -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Delegating, then awaiting.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-1").expect("call id should be valid"),
+                delegation_tool_id(),
+                json!({ "skill": SKILL, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({}),
+            )
+            .expect("the tool call is bounded"),
+        )
+}
+
+/// Gates that expire a second after they open.
+fn a_second() -> rakka_agent::AgentCheckpointSla {
+    rakka_agent::AgentCheckpointSla {
+        due_after_ms: None,
+        expire_after_ms: Some(1_000),
+        escalation_target: None,
+    }
+}
+
+/// An idempotent spec of two attempts that needs an approval.
+fn approval_gated() -> rakka_agent::AgentEffectSpec {
+    rakka_agent::AgentEffectSpec::idempotent(2)
+        .expect("the spec is valid")
+        .with_checkpoint_required()
+}
+
+/// Issue #166: the gate on a fan-out's one member closes without a grant
+/// while a goal evaluation is out. The member's failure is a fan-in
+/// disposition, which the run survives, and it does not rest the turn, which
+/// is held for the evaluation. The run is taken off the gate's approval wait
+/// in that transition, onto the wait a held turn has, and goes on once the
+/// evaluation settles. It used to stay `AwaitingTools` and
+/// `WaitingForApproval` with no gate and nothing in flight, and no review of
+/// the goal is involved.
+///
+/// The member is a workflow start whose gate is denied, one whose gate
+/// expires, and an A2A send whose gate is denied.
+#[tokio::test]
+async fn a_fan_out_members_gate_that_closes_with_an_evaluation_out_does_not_strand_the_run() {
+    for (member, closing) in [
+        ("workflow-start-call", "denied"),
+        ("workflow-start-call", "expired"),
+        ("a2a-send-call", "denied"),
+    ] {
+        let case = format!("{member} {closing}");
+        let mut fixture = if member == "a2a-send-call" {
+            Fixture::new(
+                ScriptedDispatcher::with_adapter(
+                    DeterministicModelAdapter::new()
+                        .with_turn(delegate_await_turn())
+                        .with_turn(proposing_turn()),
+                )
+                .with_a2a_send_executor(sending_executor()),
+            )
+            .with_delegation(delegation_config_with_fan_in())
+            .with_workflow_tools(workflow_config())
+        } else {
+            workflow_fixture(
+                RecordingWorkflowExecutor::new(StartMode::Started),
+                workflow_await_turn(),
+            )
+        };
+        fixture.policies = rakka_agent::AgentEffectPolicies::new()
+            .with_workflow_start_spec(approval_gated())
+            .expect("the gated start spec is valid")
+            .with_a2a_send_spec(approval_gated())
+            .expect("the gated send spec is valid")
+            .with_checkpoint_sla(a_second());
+        create_workflow_task(&fixture).await;
+
+        // An evaluation of the goal, ungated, committed beside the model
+        // call.
+        apply_to_run(&fixture, evaluate_goal(false)).await;
+        drive_model_turn_only(&fixture).await;
+        assert_eq!(
+            rest_of(&fixture).await,
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForApproval),
+                1
+            ),
+            "{case}: the turn waits on the member's gate"
+        );
+        let gate = the_gate_on(&fixture, member).await;
+
+        if closing == "denied" {
+            apply_to_run(&fixture, gate_decision(&gate, "member-denied", false)).await;
+        } else {
+            let expires = gate.expires_at.expect("the SLA stamped an expiry");
+            fixture
+                .clock
+                .store(expires.as_millis() + 1, Ordering::SeqCst);
+            apply_to_run(
+                &fixture,
+                AgentRunEntityCommand::FireCheckpointTimers {
+                    operation_id: rakka_agent::AgentOperationId::for_agent(
+                        rakka_agent::AgentOperationKind::CheckpointResolution,
+                        &common::agent_scope(),
+                        "timer",
+                    )
+                    .expect("the timer key derives"),
+                },
+            )
+            .await;
+        }
+        let held = run_picture(&fixture).await;
+        assert_eq!(
+            (held.0, held.1, held.2, held.4),
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForEffect),
+                1,
+                true
+            ),
+            "{case}: the turn is held for the evaluation, on the effect wait: {held:?}"
+        );
+        assert!(
+            waiting_gates(&fixture).await.is_empty(),
+            "{case}: no gate is left"
+        );
+
+        land_the_evaluation(&fixture).await;
+        assert_eq!(
+            rest_of(&fixture).await,
+            (
+                AgentLoopPhase::AwaitingModel,
+                Some(AgentRunStatus::WaitingForEffect),
+                2
+            ),
+            "{case}: the run goes on to its next turn"
+        );
+    }
+}
+
+/// A released run waits on a gate that still stands. The member's approval
+/// is denied while the evaluation the turn is held for waits on a security
+/// authorization of its own: the run reports that authorization, a settle
+/// pass writes nothing, and its grant puts the run on the effect wait.
+#[tokio::test]
+async fn a_denied_start_gate_leaves_the_run_on_the_evaluations_authorization() {
+    let mut fixture = workflow_fixture(
+        RecordingWorkflowExecutor::new(StartMode::Started),
+        workflow_await_turn(),
+    );
+    let policies = rakka_agent::AgentEffectPolicies::new();
+    let evaluation_spec = policies
+        .spec_for(&rakka_agent::AgentRunEffectRequest::Evaluation {
+            evaluation: Box::new(common::goal_evaluation_request(
+                rakka_agent::AgentRevisionNumber::INITIAL,
+            )),
+        })
+        .clone()
+        .with_authorization_required();
+    fixture.policies = policies
+        .with_workflow_start_spec(approval_gated())
+        .expect("the gated start spec is valid")
+        .with_goal_evaluation_spec(evaluation_spec)
+        .expect("the gated evaluation spec is valid");
+    create_workflow_task(&fixture).await;
+    apply_to_run(&fixture, evaluate_goal(false)).await;
+    drive_model_turn_only(&fixture).await;
     assert_eq!(
-        (ending.0, ending.1, ending.2),
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingTools,
+            Some(AgentRunStatus::WaitingForApproval),
+            1
+        ),
+        "an approval is reported ahead of an authorization"
+    );
+    let start = the_gate_on(&fixture, "workflow-start-call").await;
+    let authorization = the_gate_on(&fixture, "goal-evaluation-call").await;
+
+    apply_to_run(&fixture, gate_decision(&start, "start-denied", false)).await;
+    let standing = (rest_of(&fixture).await, run_revision(&fixture).await);
+    assert_eq!(
+        standing.0,
+        (
+            AgentLoopPhase::AwaitingTools,
+            Some(AgentRunStatus::WaitingForAuthorization),
+            1
+        ),
+        "the run waits on the gate that still stands"
+    );
+    settle(&fixture).await;
+    assert_eq!(
+        (rest_of(&fixture).await, run_revision(&fixture).await),
+        standing,
+        "a settle pass writes nothing"
+    );
+
+    apply_to_run(
+        &fixture,
+        gate_decision(&authorization, "evaluation-authorized", true),
+    )
+    .await;
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingTools,
+            Some(AgentRunStatus::WaitingForEffect),
+            1
+        ),
+        "the grant puts the held turn on the effect wait"
+    );
+    land_the_evaluation(&fixture).await;
+    assert_eq!(
+        rest_of(&fixture).await,
         (
             AgentLoopPhase::AwaitingModel,
             Some(AgentRunStatus::WaitingForEffect),
             2
         ),
-        "the run goes on to its next turn: {ending:?}"
+        "the run goes on to its next turn"
     );
+}
+
+/// A review of the goal granted while the run rests on its children puts the
+/// run on no dispatch wait: it rests there `Running`, as it did before the
+/// review was commanded.
+#[tokio::test]
+async fn a_review_granted_while_the_run_rests_on_its_children_leaves_its_status() {
+    let fixture = workflow_fixture(
+        RecordingWorkflowExecutor::new(StartMode::Started),
+        workflow_await_turn(),
+    );
+    create_workflow_task(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+    let resting = (
+        AgentLoopPhase::AwaitingChildren,
+        Some(AgentRunStatus::Running),
+        1,
+    );
+    assert_eq!(rest_of(&fixture).await, resting);
+
+    apply_to_run(&fixture, evaluate_goal(true)).await;
+    assert_eq!(
+        rest_of(&fixture).await,
+        resting,
+        "an open review moves no status"
+    );
+    let review = the_gate_on(&fixture, "goal-evaluation-call").await;
+    apply_to_run(&fixture, gate_decision(&review, "review-granted", true)).await;
+    assert_eq!(
+        rest_of(&fixture).await,
+        resting,
+        "the grant puts the run on no dispatch wait"
+    );
+    settle(&fixture).await;
+    assert_eq!(rest_of(&fixture).await, resting);
 }

@@ -772,7 +772,7 @@ impl AgentRun {
     ///
     /// The status must permit progress. An approval or authorization wait
     /// does not, and one whose gate has closed is released before this is
-    /// asked ([`Self::needs_gate_wait_release`]).
+    /// asked (issue #166).
     ///
     /// The guard mirrors the tool arm's own and narrows it once: an
     /// ambiguous effect of the turn is left to its reconciliation decision,
@@ -842,25 +842,40 @@ impl AgentRun {
     }
 
     /// Whether the record is on an approval or authorization wait that no
-    /// waiting gate of the turn holds.
+    /// waiting gate of that kind holds.
     ///
     /// A grant recomputes the wait. A gate that closes any other way, denied
     /// or expired, fails its effect, and where the run survives that failure
-    /// the wait stayed: a review of the goal that held a turn, or the gated
-    /// send or start of a fan-out member with a goal evaluation out. Neither
-    /// wait permits progress, so the settle pass could not rest the turn
-    /// ([`Self::needs_turn_rest`]), and a run with nothing in flight took no
-    /// transition again (issue #166).
+    /// the wait stayed: a goal evaluation's gate that held a turn, or the
+    /// gated send or start of a fan-out member with a goal evaluation out.
+    /// Neither wait permits progress, so the settle pass could not rest the
+    /// turn ([`Self::needs_turn_rest`]), and a run with nothing in flight
+    /// took no transition again (issue #166).
     ///
     /// `settle_run_disposition` releases such a wait, in the transition
     /// that closes the gate. A record a binary before issue #166 left on one
     /// is repaired by the same function on the first settle pass that
     /// touches it.
+    ///
+    /// The gates asked are the turn's: every waiting gate of the status's
+    /// own kind but one on an effect held outside the turn (a memory
+    /// promotion or a claim append), which is never the run's wait. The
+    /// question is asked of that kind alone, and not of the wait the gates
+    /// add up to: an approval is reported ahead of an authorization, so a
+    /// run on an authorization's wait with an approval opened beside it
+    /// would look unheld, be released to the same status, and be written
+    /// again at every step of every settle pass.
     pub(crate) fn needs_gate_wait_release(&self) -> bool {
-        matches!(
-            self.status,
-            AgentRunStatus::WaitingForApproval | AgentRunStatus::WaitingForAuthorization
-        ) && gate_wait(&self.loop_state) != Some(self.status)
+        let kind = match self.status {
+            AgentRunStatus::WaitingForApproval => AgentCheckpointKind::Approval,
+            AgentRunStatus::WaitingForAuthorization => AgentCheckpointKind::SecurityAuthorization,
+            _ => return false,
+        };
+        !self.loop_state.open_checkpoints().iter().any(|checkpoint| {
+            checkpoint.status.is_waiting()
+                && checkpoint.kind == kind
+                && !self.holds_outside_the_turn_effect(&checkpoint.bound_effect.effect_id)
+        })
     }
 
     /// Whether the record holds a park a binary before issue #106 left
@@ -4335,19 +4350,14 @@ fn repair_park(
     settle_run_disposition(state, now)
 }
 
-/// The approval or authorization wait a waiting gate of the turn holds the
-/// run on, when one does ([`AgentLoopState::approval_family_wait`]).
-fn gate_wait(loop_state: &AgentLoopState) -> Option<AgentRunStatus> {
-    loop_state.approval_family_wait().map(|kind| match kind {
-        AgentCheckpointKind::SecurityAuthorization => AgentRunStatus::WaitingForAuthorization,
-        _ => AgentRunStatus::WaitingForApproval,
-    })
-}
-
 /// The status of a run whose next step is dispatch: parked on whichever
 /// approval-family checkpoint wait it holds, or waiting on its effects.
 fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
-    gate_wait(loop_state).unwrap_or(AgentRunStatus::WaitingForEffect)
+    match loop_state.approval_family_wait() {
+        Some(AgentCheckpointKind::SecurityAuthorization) => AgentRunStatus::WaitingForAuthorization,
+        Some(_) => AgentRunStatus::WaitingForApproval,
+        None => AgentRunStatus::WaitingForEffect,
+    }
 }
 
 /// The status of a live run that is neither parked in reconciliation nor
@@ -5416,6 +5426,11 @@ fn apply_effect_outcome(
 ///   (issue #131). The status is read from what the run
 ///   holds now and not kept from before the park, because a run can move
 ///   while it is parked: a tool result that lands then rests the turn;
+/// - a live run on an approval or authorization wait that no waiting gate
+///   of that kind holds leaves it too (`AgentRun::needs_gate_wait_release`).
+///   A grant recomputes the wait; a gate that closed any other way, on an
+///   effect whose failure the run survives, left it standing (issue #166).
+///   The dispatch wait is recomputed as a grant recomputes it;
 /// - otherwise the run keeps whatever live status the outcome application set.
 fn settle_run_disposition(
     state: &mut AgentRunState,
@@ -5456,13 +5471,16 @@ fn settle_run_disposition(
     if run.status == AgentRunStatus::WaitingForReconciliation {
         run.status = live_status(&run.loop_state);
     } else if run.needs_gate_wait_release() {
-        // An approval or authorization wait that no gate holds any longer:
-        // the gate closed without a grant, and its effect's failure neither
-        // wound the run down nor wrote a status. The run takes the status of
-        // what it rests on, as it does when a park ends. Neither wait
-        // permits progress, so left here a turn whose last effect has
+        // An approval or authorization wait that no gate of its kind holds
+        // any longer: the gate closed without a grant, and its effect's
+        // failure neither wound the run down nor wrote a status. Neither
+        // wait permits progress, so left here a turn whose last effect has
         // resolved could not be rested (issue #166).
-        run.status = live_status(&run.loop_state);
+        //
+        // The dispatch wait is recomputed, exactly as a grant recomputes
+        // it: the wait of a gate that still stands, or the effect wait. From
+        // there the settle pass rests a turn that has nothing left out.
+        run.status = checkpoint_wait_status(&run.loop_state);
     }
     state.updated_at = now;
     Ok(())

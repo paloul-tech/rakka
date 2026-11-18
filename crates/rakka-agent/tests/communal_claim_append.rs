@@ -2075,3 +2075,80 @@ async fn a_review_granted_while_the_run_rests_on_its_proposal_leaves_its_status(
         "the run still rests on its proposal"
     );
 }
+
+/// A gate outside the turn does not hold the run's wait. A review of the
+/// goal holds a turn on its approval wait, and a claim append the deployment
+/// gates opens an approval of its own beside it, which was never the run's
+/// wait. When the review is denied the run goes on, with the append's gate
+/// still open.
+#[tokio::test]
+async fn a_denied_review_releases_the_run_with_a_claim_appends_gate_still_open() {
+    let executor = RecordingClaimAppendExecutor::new();
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, common::proposing_turn()),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    )
+    .with_claim_append_executor(executor);
+    let mut fx = Fixture::new(dispatcher);
+    fx.policies = rakka_agent::AgentEffectPolicies::new()
+        .with_claim_append_spec(
+            rakka_agent::AgentEffectSpec::idempotent(3)
+                .expect("the spec is valid")
+                .with_checkpoint_required(),
+        )
+        .expect("the policies are valid");
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec();
+    spec.knowledge_spaces.insert(space("space-alpha"));
+    fx.apply_task_command(goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(spec, true),
+    ))
+    .await
+    .expect("the goal task creates");
+    settle(&fx).await;
+
+    // The review is open when the turn commits its tool call, so the run is
+    // on the review's approval wait.
+    apply_to_run(&fx, human_review_command()).await;
+    let review = the_review_gate(&fx).await;
+    drive(&fx).await;
+    settle(&fx).await;
+    let reply = apply_append(&fx, "beside-the-review", append_request("space-alpha"))
+        .await
+        .expect("the append applies");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let held = run_picture(&fx).await;
+    assert_eq!(
+        (held.0, held.1, held.2, held.4),
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            AgentRunStatus::WaitingForApproval,
+            1,
+            2
+        ),
+        "the run is on the review's wait, with the append's gate open beside it"
+    );
+    let tool = dispatched_effect(&fx, AgentRunEffectKind::ToolCall).await;
+    answer_effect(&fx, &tool).await;
+
+    apply_to_run(&fx, deny_command(&review)).await;
+
+    let ending = run_picture(&fx).await;
+    assert_eq!(
+        (ending.0, ending.1, ending.2, ending.4),
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            AgentRunStatus::WaitingForEffect,
+            2,
+            1
+        ),
+        "the run goes on to its next turn, and the append's gate still waits"
+    );
+}

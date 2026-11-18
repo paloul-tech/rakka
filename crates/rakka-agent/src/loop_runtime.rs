@@ -1189,11 +1189,13 @@ impl AgentLoopState {
     /// outcome moves the run and no others
     /// ([`crate::AgentRunEffectKind::moves_the_run`]).
     ///
-    /// A goal evaluation's gate is an approval-family wait of the turn when
-    /// a turn commits under it, and not otherwise: its command opens it at
-    /// any rest and moves no status. A reconciliation park can end at any
-    /// rest too, so the status a park's end writes is read from this and
-    /// never puts a run on a review's wait it was not on.
+    /// A goal evaluation's gate is an approval-family wait of the turn, and
+    /// the run reports it when the turn's dispatch wait is computed with it
+    /// open: when the turn commits, when another gate of the turn is
+    /// granted, or when one closes. Its own command opens it at any rest
+    /// and moves no status. A reconciliation park can end at any rest too,
+    /// so the status a park's end writes is read from this and never puts a
+    /// run on a review's wait it was not on.
     #[must_use]
     pub(crate) fn approval_family_wait_of_the_run(
         &self,
