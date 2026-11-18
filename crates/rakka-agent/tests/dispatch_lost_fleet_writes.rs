@@ -371,9 +371,12 @@ async fn a_dispatcher_waits_the_way_it_was_told_to() {
     let (fx, _effect, metrics) = ready_tool_ticket().await;
     let asked = Arc::new(Mutex::new(Vec::new()));
     let record = asked.clone();
+    // The wait records what it was asked for and gives way once. It does
+    // not end at once: a pass that never stopped re-applying would then
+    // never give way either, and nothing could stop this test.
     let pause = AgentFleetWritePause::with(move |wait: Duration| {
         record.lock().expect("not poisoned").push(wait.as_millis());
-        std::future::ready(())
+        tokio::task::yield_now()
     });
     fx.fleet_store.conflict_from(1);
 
