@@ -424,61 +424,117 @@ async fn an_unknown_outcome_the_reconciler_finds_not_executed_is_reinvoked_under
     );
 }
 
-/// Issue #165: the stack one claim needs does not grow with the attempts it
-/// makes.
+/// Where the stack is: the address of a local of this function.
+#[inline(never)]
+fn stack_address() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(std::ptr::from_ref(&marker) as usize)
+}
+
+/// A tool executor whose every outcome is unknown, and which records where
+/// the stack is each time it is called.
+struct DepthExecutor {
+    called_at: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl AgentDispatchToolExecutor for DepthExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        self.called_at
+            .lock()
+            .expect("the depths are readable")
+            .push(stack_address());
+        Box::pin(async move { Err(unknown()) })
+    }
+}
+
+/// Issue #165: one claim makes its attempts one after another, at one depth
+/// of stack, not each inside the one before it.
 ///
 /// Every attempt ends unknown and is found not executed, so the claim
 /// re-invokes until the budget is spent, all in one pass. Each re-invocation
-/// used to run inside the attempt before it: four futures deeper each time,
-/// 174 KiB of stack in a debug build, with nothing bounding the budget above.
-/// Sixty-four attempts would have needed about 11 MiB.
+/// used to run inside the attempt before it, four futures deeper each time,
+/// with nothing bounding the budget above: 174 KiB of stack an attempt in a
+/// debug build and 13 KiB in a release build.
 ///
-/// The claim runs on a thread of its own with the 2 MiB a thread has by
-/// default, whatever `RUST_MIN_STACK` gives the test's. A claim that nests
-/// again does not fail an assertion: it overflows that thread, and the
-/// process aborts naming it.
+/// The executor records where the stack is at each call. The claim runs on
+/// a thread with room for the nest, so a claim that nests again fails the
+/// assertion here, in either build, and does not overflow.
 #[test]
-fn a_claim_that_spends_a_large_budget_needs_no_more_stack_than_one_attempt() {
+fn a_claim_makes_every_attempt_of_a_large_budget_at_one_stack_depth() {
     const ATTEMPTS: u32 = 64;
-    const A_DEFAULT_THREAD_STACK: usize = 2 * 1024 * 1024;
+    const ROOM_FOR_A_NEST: usize = 64 * 1024 * 1024;
+    // The attempts are made at the same address to the byte. The allowance
+    // is for an attempt that takes a different branch on its way to the
+    // call; one nested attempt is three times it in a release build.
+    const ONE_DEPTH: usize = 4 * 1024;
 
     let claim = std::thread::Builder::new()
         .name("one-claim-of-64-attempts".to_string())
-        .stack_size(A_DEFAULT_THREAD_STACK)
+        .stack_size(ROOM_FOR_A_NEST)
         .spawn(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("the runtime builds")
                 .block_on(async {
-                    let (fx, calls, reconciler) =
-                        reconcileable_fixture_of(ATTEMPTS, AgentReconciliationFinding::NotExecuted);
+                    let protocol = AgentReconciliationProtocolRef::new("payment-ledger")
+                        .expect("the ref is valid");
+                    let spec = AgentEffectSpec::reconcileable(protocol, ATTEMPTS)
+                        .expect("the spec is valid");
+                    let reconciler = ScriptedReconciler::new()
+                        .with_finding(AgentReconciliationFinding::NotExecuted);
+                    let called_at = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let fx = AuthorityFixture::new(
+                        tool_then_proposal(),
+                        AgentToolAuthority::new(tool_registry_for_spec(TOOL, &spec)),
+                        None,
+                    )
+                    .with_tool_executor(Arc::new(DepthExecutor {
+                        called_at: called_at.clone(),
+                    }))
+                    .with_reconciler(Arc::new(reconciler.clone()));
                     let effect = ready(&fx).await;
 
                     let pass = fx.one_pass().await;
 
                     let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+                    let called_at = called_at.lock().expect("the depths are readable").clone();
                     (
                         pass.invoked,
-                        calls.load(Ordering::SeqCst),
                         reconciler.queries(),
                         row.status(),
                         row.attempts().attempts(),
+                        called_at,
                     )
                 })
         })
         .expect("the thread starts");
 
-    let (invoked, calls, queries, status, attempts) =
+    let (invoked, queries, status, attempts, called_at) =
         claim.join().expect("the claim ran to its end");
     let all = ATTEMPTS as usize;
     assert_eq!(
-        (invoked, calls, queries),
+        (invoked, called_at.len(), queries),
         (all, all, all),
         "every attempt of the budget ran under the one claim"
     );
     assert_eq!(status, OutboxStatus::Exhausted);
     assert_eq!(attempts, ATTEMPTS);
+
+    let shallowest = called_at.iter().max().expect("the tool was called");
+    let deepest = called_at.iter().min().expect("the tool was called");
+    let moved = shallowest - deepest;
+    assert!(
+        moved < ONE_DEPTH,
+        "the stack was {moved} bytes deeper at one attempt than at another: \
+         the attempts of a claim are nesting again"
+    );
 }
 
 #[tokio::test]

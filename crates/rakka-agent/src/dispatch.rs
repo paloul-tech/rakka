@@ -2261,6 +2261,7 @@ enum ClaimConclusion {
 /// found not executed is re-invoked once for each attempt of its budget, and
 /// calling would nest each inside the one before it, to a depth nothing
 /// bounds (issue #165).
+#[must_use = "an attempt handed back must be made, or the claim ends without a conclusion"]
 enum ClaimStep {
     /// The claim is over.
     Concluded(ClaimConclusion),

@@ -634,7 +634,15 @@ async fn the_worker_holding_the_claim_delivers_the_exhaustion_of_a_row_exhausted
             .send(Answer::RetryableFailure)
             .expect("the second call is waiting");
     };
-    let (late_pass, current_pass, ()) = tokio::join!(late_pass, current_pass, order);
+    // Bounded: a second worker that never makes its call would leave all
+    // three waiting, and the binary with them. A dispatcher that drops the
+    // attempt a recovery hands back does exactly that (issue #165).
+    let (late_pass, current_pass, ()) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(late_pass, current_pass, order)
+        })
+        .await
+        .expect("both workers call the tool, and both passes end");
 
     // The late worker exhausted the row and was fenced before it delivered.
     let late_error = late_pass.expect_err("the late worker's fleet write is fenced");
