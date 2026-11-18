@@ -8,8 +8,11 @@
 //! answer nothing; and it kept the attempts the call had reserved. A run that
 //! ended without winding down ran no fence at all.
 //!
-//! Each test here ends by checking that the attempts the run holds reserved
-//! are those of the calls it still waits on, and no others.
+//! A test that reaches its record through commands alone ends by checking
+//! that the attempts the run holds reserved are those of the calls it still
+//! waits on, and no others. The tests that rewrite a record as an older
+//! binary left it do not: that record's reservation is the leak itself,
+//! which is not repaired.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -485,6 +488,11 @@ async fn a_failed_call_closes_the_gate_of_the_call_it_cancels() {
             Vec::new(),
             "{gate:?}: no gate waits on the ended run"
         );
+        assert_eq!(
+            loop_state(&fx).await.pending_checkpoint(),
+            None,
+            "{gate:?}: and the run is pending on none"
+        );
         let closed = held(&fx, gate.kind()).await;
         assert_eq!(closed.status, AgentCheckpointStatus::Cancelled, "{gate:?}");
         assert_eq!(
@@ -597,6 +605,7 @@ async fn a_compensation_closes_the_gate_of_the_call_it_cancels() {
         "the decision's wind-down cancelled the unsent call"
     );
     assert_eq!(waiting(&fx).await, Vec::new(), "its gate closed with it");
+    assert_eq!(loop_state(&fx).await.pending_checkpoint(), None);
     assert!(
         !status(&fx).await.is_terminal(),
         "the run ends after its compensation"
@@ -615,6 +624,78 @@ async fn a_compensation_closes_the_gate_of_the_call_it_cancels() {
     assert_eq!(listed_open(&fx).await, 0);
     assert_closed_as_a_cancel_closes(&sink.events(&run_scope()), &gate.checkpoint_id);
     assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// Two gated calls of one turn whose gates expire in the same sweep. The
+/// first expiry fails its call, and that failure cancels the second call and
+/// closes its gate as cancelled, though its own expiry had passed too: the
+/// sweep's next step finds it closed. Before, both gates expired and both
+/// calls were failed, the second on a run that was already winding down.
+#[tokio::test]
+async fn two_gates_due_in_one_sweep_expire_one_call_and_cancel_the_other() {
+    let calls = [CHARGE, WIRE];
+    let sla = rakka_agent::AgentCheckpointSla {
+        due_after_ms: None,
+        expire_after_ms: Some(5_000),
+        escalation_target: None,
+    };
+    let both_gated = policies(&calls, Some((CHARGE, Gate::Approval)))
+        .with_tool_spec(tool(WIRE), Gate::Approval.spec())
+        .expect("the tool spec is valid")
+        .with_checkpoint_sla(sla);
+    let (fx, sink) = world(&calls, both_gated);
+    start(&fx, None).await;
+    commit_the_turn(&fx).await;
+    let gates = waiting(&fx).await;
+    assert_eq!(gates.len(), 2, "each call waits behind its own approval");
+    let expires = gates
+        .iter()
+        .filter_map(|gate| gate.expires_at)
+        .max()
+        .expect("the SLA stamped an expiry");
+
+    fx.clock
+        .store(expires.as_millis() + 1, std::sync::atomic::Ordering::SeqCst);
+    apply(
+        &fx,
+        AgentRunEntityCommand::FireCheckpointTimers {
+            operation_id: decision_key("timer-expiry"),
+        },
+    )
+    .await
+    .expect("the timers fire");
+
+    assert_eq!(status(&fx).await, AgentRunStatus::Failed);
+    let charge = call_to(&fx, CHARGE).await;
+    assert_eq!(charge.status, AgentRunEffectStatus::Failed);
+    assert_eq!(
+        charge.last_error_code.as_deref(),
+        Some("checkpoint-expired")
+    );
+    let wire = call_to(&fx, WIRE).await;
+    assert_eq!(wire.status, AgentRunEffectStatus::Cancelled);
+    assert_eq!(wire.last_error_code, None);
+    assert_eq!(waiting(&fx).await, Vec::new());
+    let events = sink.events(&run_scope());
+    let closes: Vec<Option<AgentDecisionOutcome>> = events
+        .iter()
+        .filter(|event| event.kind == AgentDecisionKind::ResolveCheckpoint)
+        .map(|event| event.outcome)
+        .collect();
+    assert_eq!(
+        closes,
+        [
+            Some(AgentDecisionOutcome::Expired),
+            Some(AgentDecisionOutcome::Cancelled)
+        ],
+        "one expiry, then the other gate's close: {events:?}"
+    );
+    assert_eq!(
+        events.last().map(|event| event.kind),
+        Some(AgentDecisionKind::Fail)
+    );
+    assert_only_what_is_out_is_reserved(&fx, "after the sweep").await;
     assert_at_rest(&fx, &sink).await;
 }
 
@@ -806,6 +887,7 @@ async fn a_compensation_can_spend_what_its_own_wind_down_releases() {
     assert_only_what_is_out_is_reserved(&fx, "behind the compensation").await;
     fx.pump().await.expect("the compensation lands");
     assert!(status(&fx).await.is_terminal());
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
     assert_at_rest(&fx, &sink).await;
 }
 
@@ -838,6 +920,7 @@ async fn a_compensation_the_run_cannot_afford_changes_nothing() {
         AgentRunEffectStatus::Pending
     );
     assert_eq!(waiting(&fx).await.len(), 2, "both checkpoints still wait");
+    assert_only_what_is_out_is_reserved(&fx, "after the refusal").await;
 }
 
 /// A cancel runs the fence too. It already closed the gate; it now releases
@@ -926,6 +1009,20 @@ async fn reopen_the_approval_as_an_older_binary_left_it(fx: &Fixture) {
     .await;
 }
 
+/// What a repair of an ended record must leave as it found it: the run's
+/// decision sequence, the events its sink holds, and the record's
+/// `updated_at`.
+async fn recorded(
+    fx: &Fixture,
+    sink: &CountingDecisionSink,
+) -> (u64, Vec<AgentDecisionEvent>, AgentTimestampMillis) {
+    (
+        loop_state(fx).await.decision_sequence(),
+        sink.events(&run_scope()),
+        fx.run_snapshot().await.expect("the run exists").updated_at,
+    )
+}
+
 /// The terminal facts of the run that must never move once it has ended.
 async fn terminal_record(
     fx: &Fixture,
@@ -940,12 +1037,15 @@ async fn terminal_record(
 
 /// A run that ended under an older binary still holding a cancelled call's
 /// approval has it closed by the first settle pass that touches the record,
-/// once: the terminal status, reason and stamp do not move, and a further
-/// pass writes nothing.
+/// once. The pass corrects the record and nothing else: the terminal status,
+/// reason and stamp do not move, no decision is added to a stream the run's
+/// end already closed, and `updated_at`, the clock a terminal-stamp backfill
+/// reads for a record with no stamp, stays where the last transition left
+/// it. A further pass writes nothing.
 #[tokio::test]
 async fn an_ended_record_holding_a_cancelled_calls_approval_is_closed_once() {
     let calls = [CHARGE, FLAKY];
-    let (fx, _sink) = world(&calls, policies(&calls, Some((CHARGE, Gate::Approval))));
+    let (fx, sink) = world(&calls, policies(&calls, Some((CHARGE, Gate::Approval))));
     start(&fx, None).await;
     fx.pump().await.expect("the loop runs to its end");
     reopen_the_approval_as_an_older_binary_left_it(&fx).await;
@@ -953,7 +1053,7 @@ async fn an_ended_record_holding_a_cancelled_calls_approval_is_closed_once() {
     assert_eq!(ended.0, AgentRunStatus::Failed);
     assert_eq!(waiting(&fx).await.len(), 1, "the record as it was left");
     assert_eq!(listed_open(&fx).await, 1);
-    let sequence = loop_state(&fx).await.decision_sequence();
+    let stream = recorded(&fx, &sink).await;
 
     settle(&fx).await;
 
@@ -962,11 +1062,16 @@ async fn an_ended_record_holding_a_cancelled_calls_approval_is_closed_once() {
         held(&fx, AgentCheckpointKind::Approval).await.status,
         AgentCheckpointStatus::Cancelled
     );
+    assert_eq!(
+        loop_state(&fx).await.pending_checkpoint(),
+        None,
+        "and the run is pending on no checkpoint"
+    );
     assert_eq!(listed_open(&fx).await, 0);
     assert_eq!(
-        loop_state(&fx).await.decision_sequence(),
-        sequence + 1,
-        "the close is recorded once"
+        recorded(&fx, &sink).await,
+        stream,
+        "nothing is recorded, and the record's clock does not move"
     );
     assert_eq!(terminal_record(&fx).await, ended, "the end does not move");
     let repaired = revision(&fx).await;
@@ -995,6 +1100,7 @@ async fn a_winding_down_record_holding_a_cancelled_calls_approval_is_closed_once
     settle(&fx).await;
 
     assert_eq!(waiting(&fx).await, Vec::new(), "the pass closed it");
+    assert_eq!(loop_state(&fx).await.pending_checkpoint(), None);
     assert_eq!(status(&fx).await, AgentRunStatus::Cancelling);
     assert_eq!(loop_state(&fx).await.decision_sequence(), sequence + 1);
     let repaired = revision(&fx).await;
@@ -1010,13 +1116,127 @@ async fn a_winding_down_record_holding_a_cancelled_calls_approval_is_closed_once
     assert_eq!(waiting(&fx).await, Vec::new());
 }
 
+/// A decision can reach such a record before any settle pass does: the
+/// command's own transition runs first. It is refused as one for a closed
+/// checkpoint, and changes nothing, as on a record this binary wrote. It
+/// used to be applied: the grant stored for the cancelled call, the denial
+/// rewriting the cancelled call as failed. The next pass closes the gate.
+#[tokio::test]
+async fn a_decision_that_reaches_an_older_record_first_is_refused() {
+    for (key, decision) in [("grant", approve()), ("deny", deny())] {
+        let calls = [CHARGE, FLAKY, LOOKUP];
+        let (fx, _sink) = world(&calls, policies(&calls, Some((CHARGE, Gate::Approval))));
+        start(&fx, None).await;
+        commit_the_turn(&fx).await;
+        land(&fx, &call_to(&fx, FLAKY).await).await;
+        reopen_the_approval_as_an_older_binary_left_it(&fx).await;
+        assert_eq!(status(&fx).await, AgentRunStatus::Cancelling);
+        let gate = waiting(&fx).await.remove(0);
+        let before = (revision(&fx).await, loop_state(&fx).await);
+
+        let refused = decide(&fx, &gate.checkpoint_id, key, decision)
+            .await
+            .expect_err("a decision for a gate that gates nothing is refused");
+
+        assert_eq!(refused.code(), "checkpoint-already-resolved", "{key}");
+        assert_eq!(
+            (revision(&fx).await, loop_state(&fx).await),
+            before,
+            "{key}: the refusal changes nothing"
+        );
+        settle(&fx).await;
+        assert_eq!(waiting(&fx).await, Vec::new(), "{key}: the pass closed it");
+        assert_eq!(
+            call_to(&fx, CHARGE).await.status,
+            AgentRunEffectStatus::Cancelled,
+            "{key}"
+        );
+    }
+}
+
+/// The gate's own expiry can reach such a record first too. The timer leaves
+/// the gate alone and writes nothing, and the snapshot reports no wake for
+/// it: the cancelled call is not rewritten as failed, which is what an
+/// expiry did. The next settle pass closes the gate, as cancelled.
+#[tokio::test]
+async fn an_expiry_that_reaches_an_older_record_first_expires_nothing() {
+    let calls = [CHARGE, FLAKY, LOOKUP];
+    let sla = rakka_agent::AgentCheckpointSla {
+        due_after_ms: None,
+        expire_after_ms: Some(5_000),
+        escalation_target: None,
+    };
+    let (fx, sink) = world(
+        &calls,
+        policies(&calls, Some((CHARGE, Gate::Approval))).with_checkpoint_sla(sla),
+    );
+    start(&fx, None).await;
+    commit_the_turn(&fx).await;
+    land(&fx, &call_to(&fx, FLAKY).await).await;
+    reopen_the_approval_as_an_older_binary_left_it(&fx).await;
+    assert_eq!(status(&fx).await, AgentRunStatus::Cancelling);
+    let gate = waiting(&fx).await.remove(0);
+    let expires = gate.expires_at.expect("the SLA stamped an expiry");
+    let cancelled = call_to(&fx, CHARGE).await;
+    assert_eq!(cancelled.status, AgentRunEffectStatus::Cancelled);
+    let snapshot = agent_operational_snapshot(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists");
+    assert_eq!(
+        snapshot.next_wake, None,
+        "no wake is reported for a deadline the timer will not act on"
+    );
+    let before = revision(&fx).await;
+
+    fx.clock
+        .store(expires.as_millis() + 1, std::sync::atomic::Ordering::SeqCst);
+    let reply = apply(
+        &fx,
+        AgentRunEntityCommand::FireCheckpointTimers {
+            operation_id: decision_key("timer-expiry"),
+        },
+    )
+    .await
+    .expect("the timer is answered");
+
+    assert!(
+        matches!(reply, AgentRunEntityReply::Unchanged { .. }),
+        "the timer acts on nothing: {reply:?}"
+    );
+    assert_eq!(revision(&fx).await, before, "and writes nothing");
+    assert_eq!(
+        call_to(&fx, CHARGE).await,
+        cancelled,
+        "the cancelled call is as it was"
+    );
+    settle(&fx).await;
+    assert_eq!(
+        held(&fx, AgentCheckpointKind::Approval).await.status,
+        AgentCheckpointStatus::Cancelled,
+        "the pass closes the gate, as cancelled and not expired"
+    );
+    assert!(
+        sink.events(&run_scope())
+            .iter()
+            .all(|event| event.outcome != Some(AgentDecisionOutcome::Expired)),
+        "no expiry is recorded"
+    );
+    assert_eq!(status(&fx).await, AgentRunStatus::Cancelling);
+}
+
 /// A run that completed under an older binary still holding its goal
 /// evaluation `Pending` behind an open review: the first settle pass cancels
 /// the evaluation the ended run will never send, releases what it reserved
 /// and closes the review.
 #[tokio::test]
 async fn a_completed_record_holding_an_unsent_review_is_cancelled_and_closed_once() {
-    let (fx, _sink) = proposing_goal_world().await;
+    let (fx, sink) = proposing_goal_world().await;
     let (evaluation, _review) = command_a_review(&fx).await;
     fx.pump().await.expect("the task accepts the result");
     reopen_the_approval_as_an_older_binary_left_it(&fx).await;
@@ -1047,7 +1267,7 @@ async fn a_completed_record_holding_an_unsent_review_is_cancelled_and_closed_onc
         AgentRunEffectStatus::Pending
     );
     assert_eq!(waiting(&fx).await.len(), 1, "the record as it was left");
-    let sequence = loop_state(&fx).await.decision_sequence();
+    let stream = recorded(&fx, &sink).await;
 
     settle(&fx).await;
 
@@ -1056,7 +1276,11 @@ async fn a_completed_record_holding_an_unsent_review_is_cancelled_and_closed_onc
         AgentRunEffectStatus::Cancelled
     );
     assert_eq!(waiting(&fx).await, Vec::new(), "the pass closed the review");
-    assert_eq!(loop_state(&fx).await.decision_sequence(), sequence + 1);
+    assert_eq!(
+        recorded(&fx, &sink).await,
+        stream,
+        "nothing is recorded, and the record's clock does not move"
+    );
     assert_only_what_is_out_is_reserved(&fx, "after the repair").await;
     assert_eq!(terminal_record(&fx).await, ended, "the end does not move");
     let repaired = revision(&fx).await;

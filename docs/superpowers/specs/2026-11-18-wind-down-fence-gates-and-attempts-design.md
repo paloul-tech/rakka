@@ -46,9 +46,9 @@ append, the timer sweep skips it, and `Cancel` is refused.
 
 For the attempts, I measured where the counter goes wrong, and did not rely
 on reading. With a check at the point every run write is sealed, across the
-1,671 tests of `rakka-agent` the reserved attempts stop matching the calls
-still out in one place only: the write in which the fence cancels a call,
-by exactly that call's bound.
+`rakka-agent` suite (1,668 tests on `main`) the reserved attempts stop
+matching the calls still out in one place only: the write in which the
+fence cancels a call, by exactly that call's bound.
 
 The leak matters only under an `EffectAttempts` limit. Reproduced on `main`:
 under a limit of four, a run that consumed three and holds one leaked is
@@ -83,26 +83,29 @@ through a function that also moves the run's status and phase, for no gain.
 
 - `fence_unsent_effects` settles each call it cancels: its whole
   reservation is released and none of it is consumed.
-- `close_stranded_gates` closes every approval and authorization that still
-  waits and that no decision can be applied to, as a cancel closes one:
-  status `Cancelled`, kept on the record. A gate is stranded when the call
-  it is bound to is held and is no longer `Pending`, or when the run has
-  ended and the call is not a memory promotion or a claim append. A
-  reconciliation checkpoint is never one.
+- `strands` says whether a waiting approval or authorization can still have
+  a decision applied to it. It cannot when the call it is bound to is held
+  and is no longer `Pending`, or when the run has ended and the call is not
+  a memory promotion or a claim append. A reconciliation checkpoint is never
+  asked.
+- `close_stranded_gates` closes every gate `strands` names, as a cancel
+  closes one: status `Cancelled`, kept on the record.
 
 `crates/rakka-agent/src/run.rs`:
 
-- `fence_unsent` runs the two together and records each close. A failed
-  call, a scheduled compensation and an accepted handoff call it where they
-  called the bare fence.
+- `fence_unsent` runs the fence and the close together and records each
+  close. A failed call, a scheduled compensation and an accepted handoff
+  call it where they called the bare fence.
 - `terminate` calls it. Every end now cancels what the run never sent and
   closes what the ended run could not answer.
 - `cancel` is unchanged in what it does to gates and in what it records. It
   still closes every approval and authorization itself. It gains the
   release, because it runs the same fence.
 - `schedule_compensation` fences before it reserves.
-- `AgentRun::needs_gate_close` and `close_what_nothing_can_answer` repair a
-  record an older binary wrote, on the first settle pass that touches it.
+- `AgentRun::strands` asks the same question of a run that is winding down
+  or has ended. Four readers share it: the settle pass's repair
+  (`needs_gate_close`, `close_what_nothing_can_answer`), the decision door,
+  the timer sweep and the snapshot's `next_wake`.
 
 No durable field, status, error code, event kind or metric is added.
 
@@ -115,58 +118,77 @@ No durable field, status, error code, event kind or metric is added.
    once it has ended, which is what a decision gets after a cancel.
 2. **The close is recorded as a cancel's is:** `resolve-checkpoint`, outcome
    and reason `cancelled`, source `deterministic-policy`, before the run's
-   end event. The product doc said such a gate "gets no close event; the
-   run's end event closes it for readers". It gets one now.
+   end event. That is under the `Version2` vocabulary; `Version1`, the
+   default, writes no `resolve-checkpoint` at all. The product doc said such
+   a gate "gets no close event; the run's end event closes it for readers".
 3. **Every end runs the fence.** This is new behaviour beyond the two
    issues: a run that completes, or ends on its budget, no longer keeps a
    goal evaluation `Pending`. It is `Cancelled`, its review is closed and
    its attempts are released. The code already said so in two comments
    ("everything else was fenced at the terminal transition"); it was not
-   true.
+   true. The four kinds the fence exempts are still sent after an end, as
+   before.
 4. **What is closed is asked of the record, not of the fence.** The fence
    cancels; a separate question, asked right after, finds the gates that now
    gate nothing. The same question is the repair's test, so the two cannot
-   disagree, and a gate an older binary left is closed by the next wind-down
-   transition or by the end as well as by the repair.
+   disagree.
 5. **A record an older binary wrote is repaired, for the gate.** The settle
-   pass closes it once; the terminal status, reason and stamp do not move. I
-   did not add a filter to the point query: until a pass touches the record,
+   pass closes it once. On a run still winding down the close is recorded.
+   On a run that has ended the pass corrects the record and nothing else:
+   no event is added after the end, and `updated_at` is not moved. I did
+   not add a filter to the point query: until a pass touches the record,
    the snapshot lists the gate, because the record holds it.
-6. **A leaked reservation in a record an older binary wrote is not
+6. **Until that pass, nothing acts on such a gate.** A command's own
+   transition runs before the pass that follows it, so a decision or a
+   timer can reach an older record first. The decision is refused as one
+   for a closed checkpoint, and the timer sweep and `next_wake` leave the
+   gate out. Neither writes anything, so a refusal still changes nothing.
+7. **A leaked reservation in a record an older binary wrote is not
    repaired.** Nothing marks a cancelled call as fenced, so a repair would
    have to recompute the counter from the calls still out and tie the two
-   together for good. Nothing is stuck. An ended run reserves only inside
-   its post-terminal memory window, ten minutes by default, so the records
-   it could still matter for are runs that were winding down across the
-   upgrade under an attempts limit. If you want it, the measurement in
-   section 1 says the recompute is sound today, and it is one predicate.
-7. **A compensation fences before it reserves,** so it can spend what the
+   together for good, and it would have to run in every door that reserves
+   as well as in the settle pass, for the reason in call 6. Nothing is
+   stuck. What it costs: under an `EffectAttempts` limit such a record can
+   still be refused a reservation it could afford. That is a compensation
+   or a workflow cancel while it winds down, a memory promotion or a claim
+   append inside the post-terminal window, and the re-send of a parked
+   promotion or claim append, which can come at any time after the end.
+   **This one is yours to reverse.** The measurement in section 1 says the
+   recompute is sound today.
+8. **A compensation fences before it reserves,** so it can spend what the
    calls it cancels had reserved. The fence alone would not have helped the
    decision that starts the wind-down, which reserved first. A compensation
    the run still cannot afford is refused as before, and the refusal changes
    nothing.
-8. **The repair never asks a live run that is not winding down.** Nothing
+9. **The repair never asks a live run that is not winding down.** Nothing
    leaves such a gate on one, and its gate is its wait.
+
+One consequence I did not choose and want named: of two gated calls whose
+gates expire in the same timer sweep, the first expires and fails its call,
+and that failure cancels the second call and closes its gate as cancelled.
+Before, both expired and both calls were failed.
 
 ## 5. What a reader sees
 
 | State | Before | Now |
 |---|---|---|
-| A failed call cancels a gated call | the gate waits, through the wind-down and on the ended run | the gate is `Cancelled` in that transition, with a close event |
+| A failed call cancels a gated call | the gate waits, through the wind-down and on the ended run | the gate is `Cancelled` in that transition, with a close event under `Version2` |
 | A grant, a denial or an expiry of that gate while the run winds down | applied: a grant stored for a cancelled call, or the call rewritten `Failed` | refused `checkpoint-already-resolved`; the timer acts on nothing |
 | A compensation or an accepted handoff cancels a gated call | as the first row | as the first row |
 | A run ends at once with a goal evaluation waiting behind its gate | the run ends holding the evaluation `Pending` and the gate open | the evaluation is `Cancelled` and the gate closed, before the end event |
+| Two gated calls whose gates expire in one sweep | both expire, both calls `Failed` | the first expires; the second call is `Cancelled` and its gate closed |
 | The attempts of a call the fence cancels | reserved for the rest of the run's life | released; none consumed |
 | A compensation scheduled while unsent calls hold attempts | may be refused though the run can afford it | can spend what those calls reserved |
 | A cancel | closes every approval and authorization | the same, in the same order; and releases the attempts |
 | The gate of a memory promotion or a claim append | not touched by a wind-down that is not a cancel; answered on an ended run | unchanged |
 | A gate while its call is `Pending` on a live run | its wait | unchanged |
+| A record an older binary left with such a gate | as the first two rows, for good | closed by the first settle pass; until then refused and not swept |
 
 ## 6. Tests
 
-`crates/rakka-agent/tests/wind_down_fence.rs`, new, thirteen tests. All but
-the forged ones end by checking that the attempts the run holds reserved
-are those of the calls it still waits on.
+`crates/rakka-agent/tests/wind_down_fence.rs`, new, sixteen tests. A test
+that reaches its record through commands alone ends by checking that the
+attempts the run holds reserved are those of the calls it still waits on.
 
 - A failed call closes the gate of the call it cancels, for an approval and
   for an authorization; the close is recorded once, before the end.
@@ -175,6 +197,7 @@ are those of the calls it still waits on.
   are each refused and change nothing.
 - A compensation closes the gate of the call it cancels, in the decision's
   own transition.
+- Two gates due in one sweep: one call expires, the other is cancelled.
 - A run that completes cancels its unsent evaluation and closes its review,
   before the end event; a late decision is refused `run-terminal`.
 - A cancelled call's attempts are free for the compensation that follows,
@@ -184,9 +207,14 @@ are those of the calls it still waits on.
 - A cancel releases the attempts of the call it cancels.
 - Three records as an older binary left them (ended with a cancelled call's
   approval, winding down with one, completed with an unsent review): each is
-  closed by one settle pass, once, and the end does not move.
+  closed by one settle pass, once. On the two ended ones the end, the
+  decision stream and `updated_at` do not move.
+- A decision that reaches such a record before any pass is refused and
+  changes nothing; an expiry that reaches it first changes nothing and
+  reports no wake.
 - Ninety-six forged records: each standing of the run, each kind of gate,
-  each status of the gated call or no call at all, the gate open or
+  seven of the gated call's eight statuses (all but `indeterminate`, which
+  is the reconciliation park's) or no call at all, the gate open or
   escalated. All are at rest in two passes; a live run's gate is never
   closed for it; an ended run is left with no waiting gate and no unsent
   call.
@@ -196,33 +224,62 @@ One unit test in `run.rs`, for the handoff: an accepted notice closes the
 gate of a re-send it cancels, with nothing else out and with another call
 still out.
 
-Thirteen of the fourteen fail on `main`: twelve when the file is run
-against `main`'s source, and the unit test when the three lines it covers
-are put back. The one that passes there, the refused compensation, holds
-what must not change.
+Sixteen of the seventeen fail on `main`: fifteen when the file is run
+against `main`'s two source files, and the unit test when the three lines
+it covers are put back. The one that passes there, the refused
+compensation, holds what must not change.
 
 One existing test changed. `an_ended_runs_next_wake_reads_only_what_its_sweep_acts_on`
-built the defect through commands and asserted the approval was "exactly as
-the run ended". It now starts from a rewritten record, reads the snapshot
-before anything touches it, and then checks the first settle pass closes the
-approval.
+built the defect through commands. It now starts from a rewritten record,
+and rewrites it once more after the promotion's own pass has closed the
+approval, so it still holds what it was written for: with a skipped
+approval and a swept gate both waiting, `next_wake` is the gate's deadline
+and not the approval's earlier one.
 
-Eighteen deliberate breaks of the change were run against these tests and
-the promotion, claim, checkpoint and goal tests. Seventeen each fail at
-least one test. The first run caught thirteen; the five that survived
-showed where a test could not tell my change from the repair that follows
-it one pass later, and four of them are now caught: the failed call's and
-the compensation's close are tied to their own transition, the forged
-records include a gate with no call, and the repair's step is checked
-against the turn metrics. The eighteenth cannot be caught by any record a
-binary writes: the end passing "not ended" to the close. The fence that
-runs just before has already cancelled every unsent call, so the two
-answers only differ for a gate whose call the record does not hold.
+Twenty-five deliberate breaks of the final code were run against these
+tests and the promotion, claim, checkpoint, goal and query tests.
+Twenty-four each fail at least one test. The one that does not cannot be
+caught by any record a binary writes: the end passing "not ended" to the
+close. The fence that runs just before has already cancelled every unsent
+call, so the two answers only differ for a gate whose call the record does
+not hold. The breaks that close too much (every gate at a wind-down, a
+promotion's gate at the end) are caught by tests that were already there.
 
-The breaks that close too much (every gate at a wind-down, a promotion's
-gate at the end) are caught by tests that were already there.
+The first run, before the review, caught thirteen of eighteen. The five
+that survived showed where a test could not tell my change from the repair
+that follows it one pass later, and four of them are caught now: the
+failed call's and the compensation's close are tied to their own
+transition, the forged records include a gate with no call, and the
+repair's step is checked against the turn metrics.
 
-## 7. Found, not done
+## 7. The review
+
+A fresh reviewer read the first build alone and found no defect on a record
+this binary writes. What it did find, each with a test that showed it:
+
+- **The repair re-dated an ended record.** It set `updated_at`, and its
+  recorded close moved it again when the outbox was flushed. A record with
+  no terminal stamp is backfilled from that clock, so the repair could
+  reopen its memory window. The repair of an ended record now writes no
+  event and leaves the clock alone (call 5).
+- **A decision or a timer could reach an older record before the repair**
+  and be applied as on `main`. My first answer closed the gate inside the
+  two doors; that broke two existing tests which hold that a refused
+  decision changes nothing and that a timer leaves an ended run's other
+  checkpoints alone. The doors now refuse and skip without writing (call 6).
+- **My rewrite of the one existing test no longer tested its subject.** Once
+  the promotion's pass closed the approval, nothing held that `next_wake`
+  leaves out a skipped earlier deadline. Restored, and held by two breaks.
+- **One line had no test:** the run's pending checkpoint after a close.
+- **Statements that were not true.** That an ended run reserves only inside
+  its memory window, which was my reason for call 7 (corrected there). That
+  only an older binary leaves an ended run a waiting checkpoint the timer
+  skips (see section 8). That every end cancels every unsent call (four
+  kinds are exempt). That a late decision is always
+  `checkpoint-already-resolved` (it is `run-terminal` after the end). That
+  the close is in the stream (only under `Version2`). And two counts.
+
+## 8. Found, not done
 
 - **An ended run can hold a goal evaluation `Ready` for good.** An ungated
   evaluation that was sent before the run ended at once is not the fence's
@@ -230,8 +287,17 @@ gate at the end) are caught by tests that were already there.
   the ended run refuses that result `run-terminal`, because an ended run
   takes results only for the four exempt kinds. The record lists the call
   among its pending effects for good and keeps its reserved attempts.
-  Reproduced on `main` and on this branch. Drafted, not filed:
-  `tmp/2026-11-18-issue-draft-ended-run-ready-evaluation.md`.
+  Reproduced on `main` and on this branch.
+- **An ended run can hold a goal evaluation's reconciliation checkpoint
+  that nothing answers.** The evaluation's outcome is unknown while the
+  run's proposal is with the task, and the task accepts. The run ends
+  `Completed` with the checkpoint open, a decision for it is refused
+  `run-terminal`, and the timer skips it. The reviewer's finding;
+  reproduced on `main` and on this branch. It is #133's title with another
+  kind of checkpoint, and #123's family (a run that ends at once with
+  something outstanding).
 - **A gated compensation or workflow cancel never opens its gate** (#128,
   open). Unchanged.
-- A leaked reservation in a record an older binary wrote (call 6).
+- A leaked reservation in a record an older binary wrote (call 7).
+
+The first two are drafted for the owner and not filed.

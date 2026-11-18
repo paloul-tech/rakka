@@ -1372,7 +1372,11 @@ impl AgentLoopState {
     ///
     /// A reconciliation checkpoint is never one: it is bound to an effect
     /// whose outcome is unknown, and stays until that is decided.
-    fn strands(&self, checkpoint: &crate::checkpoints::AgentCheckpoint, ended: bool) -> bool {
+    pub(crate) fn strands(
+        &self,
+        checkpoint: &crate::checkpoints::AgentCheckpoint,
+        ended: bool,
+    ) -> bool {
         if checkpoint.kind
             == crate::checkpoints::AgentCheckpointKind::IndeterminateEffectReconciliation
             || !checkpoint.status.is_waiting()
@@ -1387,15 +1391,6 @@ impl AgentLoopState {
             Some(effect) => !effect.is_pending() || (ended && !effect.kind().outside_the_turn()),
             None => ended,
         }
-    }
-
-    /// Whether the run holds a gate [`Self::close_stranded_gates`] would
-    /// close.
-    #[must_use]
-    pub(crate) fn holds_stranded_gate(&self, ended: bool) -> bool {
-        self.open_checkpoints
-            .iter()
-            .any(|checkpoint| self.strands(checkpoint, ended))
     }
 
     /// Closes every approval and authorization that waits and that no

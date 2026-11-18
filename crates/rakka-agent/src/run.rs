@@ -800,16 +800,22 @@ impl AgentRun {
     /// A waiting checkpoint is swept on a live run. On a run that has ended,
     /// only one bound to an effect held outside the turn (a memory promotion
     /// or a claim append) is. Expiring any other would apply a failure to an
-    /// effect of a run that already ended, so the sweep leaves it alone; the
-    /// run's end closes every other approval and authorization, and the
-    /// settle pass closes one an older binary left
-    /// ([`Self::needs_gate_close`]).
+    /// effect of a run that already ended, so the sweep leaves it alone. The
+    /// run's end closes every other approval and authorization; a
+    /// reconciliation checkpoint parked on a call of another kind is not
+    /// closed, and an ended run can still hold one.
+    ///
+    /// Nor is a gate that gates nothing swept, on a run that is winding down
+    /// or has ended ([`Self::strands`]): its expiry would fail a call that
+    /// was cancelled. A record an older binary wrote can hold one until the
+    /// settle pass closes it.
     ///
     /// `fire_checkpoint_timers` and the operational snapshot's `next_wake`
     /// both read this one predicate, so the snapshot never reports a deadline
     /// the sweep skips (issue #127).
     pub(crate) fn timer_sweep_acts_on(&self, checkpoint: &AgentCheckpoint) -> bool {
         checkpoint.status.is_waiting()
+            && !self.strands(checkpoint)
             && (!self.status.is_terminal()
                 || self.holds_outside_the_turn_effect(&checkpoint.bound_effect.effect_id))
     }
@@ -846,15 +852,35 @@ impl AgentRun {
     /// gate an ended run refuses every decision for.
     ///
     /// The settle pass repairs such a record on the first pass that touches
-    /// it, with `close_what_nothing_can_answer`. Under the fixed transitions
-    /// the shape is unreachable: the fence closes the gate of each call it
-    /// cancels, and every end runs the fence.
+    /// it, with `close_what_nothing_can_answer`, which on an ended run
+    /// records nothing and leaves `updated_at` where it was. Under the fixed
+    /// transitions the shape is unreachable: the fence closes the gate of
+    /// each call it cancels, and every end runs the fence.
     ///
     /// A live run that is not winding down is never asked. Nothing leaves
     /// such a gate on one, and its gate is its wait.
     pub(crate) fn needs_gate_close(&self) -> bool {
+        self.loop_state
+            .open_checkpoints()
+            .iter()
+            .any(|checkpoint| self.strands(checkpoint))
+    }
+
+    /// Whether `checkpoint` is one [`Self::needs_gate_close`] asks about: a
+    /// waiting approval or authorization, on a run that is winding down or
+    /// has ended, that no decision can be applied to.
+    ///
+    /// The settle pass closes it. A decision or a checkpoint timer can reach
+    /// the record first, since a command's own transition runs before the
+    /// pass that follows it, and neither may act on such a gate: a grant
+    /// would be stored for a cancelled call, and a denial or an expiry would
+    /// rewrite the cancelled call as failed. So the decision door refuses a
+    /// decision for it as one for a closed checkpoint, and the timer sweep
+    /// and the snapshot's `next_wake` leave it out, by this one predicate.
+    /// Neither writes anything; the pass still does the closing.
+    pub(crate) fn strands(&self, checkpoint: &AgentCheckpoint) -> bool {
         let ended = self.status.is_terminal();
-        (ended || self.winding_down()) && self.loop_state.holds_stranded_gate(ended)
+        (ended || self.winding_down()) && self.loop_state.strands(checkpoint, ended)
     }
 
     /// Whether the record holds a park a binary before issue #106 left
@@ -1469,10 +1495,12 @@ fn end_kind(status: AgentRunStatus) -> AgentDecisionKind {
 
 /// Moves the run to a terminal status and records why.
 ///
-/// Whatever the run committed and never sent is cancelled first, and every
-/// gate the ended run could not answer is closed (`fence_unsent`), so an
-/// ended run holds no waiting approval or authorization but that of a memory
-/// promotion or a claim append, which it still answers.
+/// Every call the run committed and never sent is cancelled first, but for
+/// the four kinds the fence exempts, and every approval or authorization the
+/// ended run could not answer is closed (`fence_unsent`). So an ended run
+/// holds no waiting approval or authorization but that of a memory promotion
+/// or a claim append, which it still answers. A reconciliation checkpoint is
+/// not closed: one parked on a call of another kind stays on the ended run.
 ///
 /// The end is also queued as a decision (`complete`, `fail`, `cancel`,
 /// `handoff` or `supersede`) carrying the status and the reason's code. Its
@@ -5818,8 +5846,9 @@ fn apply_indeterminate_resolution(
     Ok(())
 }
 
-/// Cancels in place every call the run committed and never sent, and closes
-/// the gates that leaves with nothing to gate.
+/// Cancels in place every call the run committed and never sent, but for the
+/// four kinds the fence exempts, and closes the gates that leaves with
+/// nothing to gate.
 ///
 /// The fence is [`AgentLoopState::fence_unsent_effects`]. A call it cancels
 /// may have been waiting behind an approval or an authorization, and that
@@ -5877,19 +5906,31 @@ fn record_cancelled_checkpoints(
 /// Closes what a binary before issue #133 left waiting on a run that is
 /// winding down or has ended: the repair of [`AgentRun::needs_gate_close`].
 ///
-/// It is the fence a wind-down and an end now run. On an ended run it also
+/// On a run that is winding down it is the fence a wind-down now runs: the
+/// gate is closed and the close recorded, before the run's end.
+///
+/// On a run that has ended it corrects the record and nothing else. It
 /// cancels a call the run committed and never sent, which the older binary's
-/// end left `Pending` for good. The terminal status, reason and stamp do not
-/// move.
+/// end left `Pending` for good, and closes the gate. It records no decision:
+/// the run's end event already closed that gate for a reader of the stream,
+/// which is what the stream meant before this change, and a repair adds
+/// nothing after an end. And it does not move `updated_at`, which means the
+/// last accepted transition and is the clock a terminal-stamp backfill reads
+/// for a record with no stamp ([`AgentRunState::backfill_terminal_at`]); a
+/// recorded decision would move it too, when its flush cleared the outbox.
+/// The terminal status, reason and stamp do not move either.
 fn close_what_nothing_can_answer(
     state: &mut AgentRunState,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let scope = state.scope.clone();
     let run = state.run_mut()?;
-    let ended = run.status.is_terminal();
-    fence_unsent(run, &scope, ended, now);
-    state.updated_at = now;
+    if run.status.is_terminal() {
+        run.loop_state.fence_unsent_effects(now);
+        let _closed = run.loop_state.close_stranded_gates(true, now);
+        return Ok(());
+    }
+    fence_unsent(run, &scope, false, now);
     settle_run_disposition(state, now)
 }
 
@@ -6326,6 +6367,27 @@ fn resolve_checkpoint(
             if !answerable || compensation {
                 return Err(AgentRunError::Terminal { status: run.status });
             }
+        }
+    }
+
+    {
+        // A gate that gates nothing takes no decision, whether or not the
+        // settle pass has closed it yet: the answer is the one a decision
+        // for a closed checkpoint gets, and nothing is written
+        // ([`AgentRun::strands`], issue #133).
+        let run = state.run_mut()?;
+        let stranded = run
+            .loop_state
+            .open_checkpoints()
+            .iter()
+            .find(|checkpoint| &checkpoint.checkpoint_id == checkpoint_id)
+            .is_some_and(|checkpoint| run.strands(checkpoint));
+        if stranded {
+            return Err(AgentRunError::Checkpoint(Box::new(
+                AgentCheckpointError::AlreadyResolved {
+                    status: AgentCheckpointStatus::Cancelled,
+                },
+            )));
         }
     }
 
@@ -6987,9 +7049,12 @@ fn evaluate_goal(
 /// not move. Every other checkpoint an ended run still holds is left as it
 /// is, because expiring it would apply a failure to an effect of a run that
 /// already ended. A run's end closes every other approval and authorization
-/// (issue #133), so the only one the sweep can meet there is one a record
-/// from an older binary holds, which the settle pass closes
-/// ([`AgentRun::needs_gate_close`]).
+/// (issue #133); what an ended run can still hold besides is a
+/// reconciliation checkpoint parked on a call of another kind, which never
+/// expires, and, on a record an older binary wrote, an approval or
+/// authorization the settle pass has not closed yet. The sweep skips that
+/// one too, on a run that is winding down as on one that has ended
+/// ([`AgentRun::strands`]).
 fn fire_checkpoint_timers(
     state: &mut AgentRunState,
     now: AgentTimestampMillis,
