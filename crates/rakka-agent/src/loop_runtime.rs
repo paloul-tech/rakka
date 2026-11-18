@@ -1048,6 +1048,17 @@ impl AgentLoopState {
     /// journal's bounded window, or a second cancel command) would fence the
     /// very work the first one committed, and the cell's recorded disposition
     /// would then claim a request that was never delivered.
+    ///
+    /// Each effect it cancels gives back the attempts it reserved when it was
+    /// committed, and consumes none: it was never sent, so it made none
+    /// (issue #132). The fence is the one place an effect is resolved outside
+    /// the outcome path, which is where every other reservation is settled.
+    ///
+    /// It leaves the checkpoints alone. An effect it cancels may have been
+    /// waiting behind an approval or an authorization, and that gate now
+    /// gates nothing: [`Self::close_stranded_gates`] closes it, and every
+    /// caller but a cancel, which closes every such gate anyway, runs the two
+    /// together.
     pub(crate) fn fence_unsent_effects(&mut self, now: AgentTimestampMillis) -> usize {
         let mut fenced = 0;
         let mut fenced_sends = Vec::new();
@@ -1055,6 +1066,7 @@ impl AgentLoopState {
         for effect in &mut self.effects {
             if effect.is_pending() && !effect.kind().exempt_from_wind_down_fence() {
                 effect.status = crate::effect::AgentRunEffectStatus::Cancelled;
+                self.budget.settle_effect(effect.max_attempts, 0);
                 match effect.kind() {
                     crate::effect::AgentRunEffectKind::A2aSendCall => {
                         fenced_sends.push(effect.effect_id.clone());
@@ -1344,6 +1356,73 @@ impl AgentLoopState {
         }
         self.resync_pending_checkpoint();
         cancelled
+    }
+
+    /// Whether `checkpoint` is an approval or an authorization that still
+    /// waits and that no decision can be applied to (issue #133).
+    ///
+    /// Such a gate holds back an effect that is `Pending` until it is
+    /// granted. It is stranded when that is no longer so:
+    /// - the effect it is bound to is held and is not `Pending`: the
+    ///   wind-down fence cancelled it before it was sent;
+    /// - the run has `ended` and the effect is not one held outside the turn
+    ///   (a memory promotion or a claim append), or is not held at all. An
+    ///   ended run answers a checkpoint bound to an effect outside the turn
+    ///   and refuses every other, and its timer sweep reads the same rule.
+    ///
+    /// A reconciliation checkpoint is never one: it is bound to an effect
+    /// whose outcome is unknown, and stays until that is decided.
+    fn strands(&self, checkpoint: &crate::checkpoints::AgentCheckpoint, ended: bool) -> bool {
+        if checkpoint.kind
+            == crate::checkpoints::AgentCheckpointKind::IndeterminateEffectReconciliation
+            || !checkpoint.status.is_waiting()
+        {
+            return false;
+        }
+        match self
+            .effects
+            .iter()
+            .find(|effect| effect.effect_id == checkpoint.bound_effect.effect_id)
+        {
+            Some(effect) => !effect.is_pending() || (ended && !effect.kind().outside_the_turn()),
+            None => ended,
+        }
+    }
+
+    /// Whether the run holds a gate [`Self::close_stranded_gates`] would
+    /// close.
+    #[must_use]
+    pub(crate) fn holds_stranded_gate(&self, ended: bool) -> bool {
+        self.open_checkpoints
+            .iter()
+            .any(|checkpoint| self.strands(checkpoint, ended))
+    }
+
+    /// Closes every approval and authorization that waits and that no
+    /// decision can be applied to ([`Self::strands`]), as a cancel closes
+    /// one: cancelled, and kept on the record.
+    ///
+    /// Answers the checkpoints this call closed, in the order the run holds
+    /// them. One already closed is not among them, so a repeated call answers
+    /// nothing.
+    pub(crate) fn close_stranded_gates(
+        &mut self,
+        ended: bool,
+        now: AgentTimestampMillis,
+    ) -> Vec<HumanCheckpointId> {
+        let stranded: Vec<HumanCheckpointId> = self
+            .open_checkpoints
+            .iter()
+            .filter(|checkpoint| self.strands(checkpoint, ended))
+            .map(|checkpoint| checkpoint.checkpoint_id.clone())
+            .collect();
+        for checkpoint in &mut self.open_checkpoints {
+            if stranded.contains(&checkpoint.checkpoint_id) {
+                checkpoint.cancel(now);
+            }
+        }
+        self.resync_pending_checkpoint();
+        stranded
     }
 
     /// Fails closed on a loop state, or a record inside it, that this binary

@@ -800,7 +800,10 @@ impl AgentRun {
     /// A waiting checkpoint is swept on a live run. On a run that has ended,
     /// only one bound to an effect held outside the turn (a memory promotion
     /// or a claim append) is. Expiring any other would apply a failure to an
-    /// effect of a run that already ended, so it is left waiting.
+    /// effect of a run that already ended, so the sweep leaves it alone; the
+    /// run's end closes every other approval and authorization, and the
+    /// settle pass closes one an older binary left
+    /// ([`Self::needs_gate_close`]).
     ///
     /// `fire_checkpoint_timers` and the operational snapshot's `next_wake`
     /// both read this one predicate, so the snapshot never reports a deadline
@@ -829,6 +832,29 @@ impl AgentRun {
     pub(crate) fn needs_unpark(&self) -> bool {
         self.status == AgentRunStatus::WaitingForReconciliation
             && !self.loop_state.has_indeterminate_effect()
+    }
+
+    /// Whether a run that is winding down, or has ended, holds an approval or
+    /// an authorization that still waits and that no decision can be applied
+    /// to ([`AgentLoopState::close_stranded_gates`]).
+    ///
+    /// A binary before issue #133 left one in two ways. Its wind-down fence
+    /// cancelled a gated call that had not been sent and left the call's
+    /// gate waiting, through the wind-down and past the run's end. And a run
+    /// that ended without winding down (its result accepted, its budget
+    /// spent) ran no fence, so it kept a goal evaluation `Pending` behind a
+    /// gate an ended run refuses every decision for.
+    ///
+    /// The settle pass repairs such a record on the first pass that touches
+    /// it, with `close_what_nothing_can_answer`. Under the fixed transitions
+    /// the shape is unreachable: the fence closes the gate of each call it
+    /// cancels, and every end runs the fence.
+    ///
+    /// A live run that is not winding down is never asked. Nothing leaves
+    /// such a gate on one, and its gate is its wait.
+    pub(crate) fn needs_gate_close(&self) -> bool {
+        let ended = self.status.is_terminal();
+        (ended || self.winding_down()) && self.loop_state.holds_stranded_gate(ended)
     }
 
     /// Whether the record holds a park a binary before issue #106 left
@@ -1443,6 +1469,11 @@ fn end_kind(status: AgentRunStatus) -> AgentDecisionKind {
 
 /// Moves the run to a terminal status and records why.
 ///
+/// Whatever the run committed and never sent is cancelled first, and every
+/// gate the ended run could not answer is closed (`fence_unsent`), so an
+/// ended run holds no waiting approval or authorization but that of a memory
+/// promotion or a claim append, which it still answers.
+///
 /// The end is also queued as a decision (`complete`, `fail`, `cancel`,
 /// `handoff` or `supersede`) carrying the status and the reason's code. Its
 /// slot is `end`, and the already-terminal guard below makes it once per run,
@@ -1457,6 +1488,16 @@ fn terminate(
     if run.status.is_terminal() {
         return Ok(());
     }
+    // An ended run sends nothing but the kinds the fence exempts, so whatever
+    // else it committed and never sent is cancelled here, as a wind-down
+    // cancels it, and every approval or authorization the ended run could
+    // not answer is closed. A run that winds down has done both before it
+    // gets here. One that ends at once has not: its result accepted, its
+    // rejections or its budget spent, with a goal evaluation still waiting
+    // behind its gate (issue #133). Before the descendants fold below,
+    // because a send the fence cancels settles its cell failed, and a cell
+    // that created no child spends no descendant.
+    fence_unsent(run, &scope, true, now);
     // The conserved descendants spend materializes as consumption exactly
     // once, here: every live child and its granted sub-quota folds into what
     // the owed settlement carries up, so the task's ledger — and any
@@ -2210,6 +2251,7 @@ fn accept_handoff_result(
                 target_run,
                 generation,
             } => {
+                let scope = state.scope.clone();
                 let run = state.run_mut()?;
                 if let Some(cell) = run.loop_state.handoff_mut() {
                     // `correct_accepted`, not `settle_accepted`: on the
@@ -2251,8 +2293,10 @@ fn accept_handoff_result(
                 // pass: the winding-down run may not dispatch it, and left
                 // `Pending` it would hold the wind-down open forever. The
                 // fence's own cell settle is first-writer-wins, so the
-                // acceptance above stands (issue #106).
-                run.loop_state.fence_unsent_effects(now);
+                // acceptance above stands (issue #106). A gated re-send
+                // waits behind a fresh gate, which closes with it
+                // (issue #133).
+                fence_unsent(run, &scope, false, now);
                 Ok(())
             }
             crate::task::AgentHandoffResolutionNotice::Refused { code } => {
@@ -2844,6 +2888,15 @@ fn advance_once(
         // record that was winding down ends there, and owes what any
         // terminalization owes ([`AgentRun::needs_unpark`]).
         settle_run_disposition(state, now)?;
+        return owed_run_exchanges(state, now);
+    }
+    if run.needs_gate_close() {
+        // A record a binary before issue #133 left holding an approval or an
+        // authorization nothing can answer: the gate of a call its fence
+        // cancelled, or of one its end never cancelled. Close it, as the
+        // fence and the end do under this binary
+        // ([`AgentRun::needs_gate_close`]).
+        close_what_nothing_can_answer(state, now)?;
         return owed_run_exchanges(state, now);
     }
     if run.needs_turn_rest() {
@@ -5248,7 +5301,7 @@ fn apply_effect_outcome(
                 && !group_member_send
             {
                 let run = state.run_mut()?;
-                run.loop_state.fence_unsent_effects(now);
+                fence_unsent(run, &scope, false, now);
                 if run.terminal_reason.is_none() {
                     run.terminal_reason = Some(AgentRunTerminalReason::EffectFailed {
                         effect_id: effect_id.clone(),
@@ -5329,8 +5382,10 @@ fn apply_effect_outcome(
     // ([specification 9.7]). Every attempt that reached durable `Started`,
     // including one now `Indeterminate`, consumes its attempt budget; the retries
     // the generation did not use are released back to the run. A generation that
-    // never dispatched (a cancelled or fenced effect) reports zero attempts and
-    // so consumes none. The settle runs exactly once, on the generation's first
+    // never dispatched (one the dispatch layer cancelled) reports zero attempts
+    // and so consumes none; one the wind-down fence cancels in place never
+    // comes through here, and the fence settles it the same way (issue #132).
+    // The settle runs exactly once, on the generation's first
     // resolution: a reconciliation that later confirms an `Indeterminate`
     // generation executed changes what is known, not what was attempted, and
     // billing the same attempts again would inflate the run's consumption — and,
@@ -5763,6 +5818,81 @@ fn apply_indeterminate_resolution(
     Ok(())
 }
 
+/// Cancels in place every call the run committed and never sent, and closes
+/// the gates that leaves with nothing to gate.
+///
+/// The fence is [`AgentLoopState::fence_unsent_effects`]. A call it cancels
+/// may have been waiting behind an approval or an authorization, and that
+/// gate is closed in the same transition, as a cancel closes one, and
+/// recorded as closed ([`AgentLoopState::close_stranded_gates`]). Left
+/// waiting, it would outlive the call: through the wind-down, where a grant
+/// would be stored for a cancelled call and a denial or an expiry would
+/// rewrite the cancelled call as failed, and past the run's end, where a
+/// decision is refused, the timer sweep skips it and a cancel is refused
+/// (issue #133).
+///
+/// `ended` is whether the run is ending in this transition. An ended run
+/// answers only a checkpoint bound to a memory promotion or a claim append,
+/// so every other waiting approval or authorization is closed then, whatever
+/// its effect's status.
+///
+/// What is closed is asked of the record and not of the fence, so a gate an
+/// older binary's fence left waiting is closed by the next wind-down
+/// transition, or by the run's end, as well as by the settle pass's repair.
+fn fence_unsent(run: &mut AgentRun, scope: &AgentRunScope, ended: bool, now: AgentTimestampMillis) {
+    run.loop_state.fence_unsent_effects(now);
+    let closed = run.loop_state.close_stranded_gates(ended, now);
+    record_cancelled_checkpoints(run, scope, &closed, now);
+}
+
+/// Queues the `resolve-checkpoint` decision of each checkpoint in `closed`,
+/// which the run's own policy just cancelled, in the order given.
+fn record_cancelled_checkpoints(
+    run: &mut AgentRun,
+    scope: &AgentRunScope,
+    closed: &[HumanCheckpointId],
+    now: AgentTimestampMillis,
+) {
+    for checkpoint_id in closed {
+        let Some(draft) = run
+            .loop_state
+            .open_checkpoints()
+            .iter()
+            .find(|checkpoint| &checkpoint.checkpoint_id == checkpoint_id)
+            .map(|checkpoint| {
+                checkpoint_close_draft(
+                    &run.loop_state,
+                    checkpoint,
+                    AgentDecisionSource::DeterministicPolicy,
+                    AgentDecisionOutcome::Cancelled,
+                )
+            })
+        else {
+            continue;
+        };
+        run.loop_state.queue_decision(scope, draft, now);
+    }
+}
+
+/// Closes what a binary before issue #133 left waiting on a run that is
+/// winding down or has ended: the repair of [`AgentRun::needs_gate_close`].
+///
+/// It is the fence a wind-down and an end now run. On an ended run it also
+/// cancels a call the run committed and never sent, which the older binary's
+/// end left `Pending` for good. The terminal status, reason and stamp do not
+/// move.
+fn close_what_nothing_can_answer(
+    state: &mut AgentRunState,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
+    let run = state.run_mut()?;
+    let ended = run.status.is_terminal();
+    fence_unsent(run, &scope, ended, now);
+    state.updated_at = now;
+    settle_run_disposition(state, now)
+}
+
 /// Requests cancellation.
 ///
 /// Acceptance fences new dispatch *in the same compare-and-set*
@@ -5803,29 +5933,15 @@ fn cancel(
         return Err(AgentRunError::Terminal { status: run.status });
     }
 
+    // The fence alone, and not `fence_unsent`: a cancel closes every waiting
+    // approval and authorization just below, the gate of a call the fence
+    // cancels among them, and records them in the order the run holds them.
     run.loop_state.fence_unsent_effects(now);
     // Each checkpoint the wind-down closes is recorded as closed, before the
     // settle below may end the run; one a repeated cancellation finds already
     // closed is not among them, so it is recorded once.
-    for checkpoint_id in run.loop_state.cancel_open_checkpoints(now) {
-        let Some(draft) = run
-            .loop_state
-            .open_checkpoints()
-            .iter()
-            .find(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
-            .map(|checkpoint| {
-                checkpoint_close_draft(
-                    &run.loop_state,
-                    checkpoint,
-                    AgentDecisionSource::DeterministicPolicy,
-                    AgentDecisionOutcome::Cancelled,
-                )
-            })
-        else {
-            continue;
-        };
-        run.loop_state.queue_decision(&scope, draft, now);
-    }
+    let closed = run.loop_state.cancel_open_checkpoints(now);
+    record_cancelled_checkpoints(run, &scope, &closed, now);
     // An ungranted gated effect outside the turn settles with its gate, which
     // closed above if it had one: nothing can grant it now (issue #126).
     let ungranted: Vec<AgentEffectId> = run
@@ -6394,6 +6510,14 @@ fn schedule_compensation(
         }
     }
 
+    // Wind down first, then commit the compensation: the fence cancels only
+    // what was pending before it, and the effect recorded after it is exactly
+    // the one piece of new work the decision authorizes. It also runs before
+    // the reservation below, so the compensation can spend the attempts the
+    // calls it cancels had reserved (issue #132). A refusal below rejects
+    // the transition, and the fence is discarded with it.
+    fence_unsent(run, &scope, false, now);
+
     // The compensation is new spend, reserved exactly like a re-authorized
     // generation's attempts ([specification 9.7](../../../docs/plans/rakka-agent/spec.md));
     // a run that cannot afford it keeps the effect parked `Indeterminate` and
@@ -6423,10 +6547,6 @@ fn schedule_compensation(
         }
     }
 
-    // Wind down first, then commit the compensation: the fence cancels only
-    // what was pending before it, and the effect recorded after it is exactly
-    // the one piece of new work the decision authorizes.
-    run.loop_state.fence_unsent_effects(now);
     if run.terminal_reason.is_none() {
         run.terminal_reason = Some(AgentRunTerminalReason::EffectCompensated {
             effect_id: effect_id.clone(),
@@ -6864,10 +6984,12 @@ fn evaluate_goal(
 /// promotion's or claim append's approval or authorization checkpoint still
 /// expires on an ended run, as on a live one: the expiry fails only that
 /// generation, and the run's status, terminal reason and terminal stamp do
-/// not move. Every other checkpoint an ended run still holds, such as an
-/// approval a failed run left open on a tool effect, is left waiting, because
-/// expiring it would apply a failure to an effect of a run that already
-/// ended.
+/// not move. Every other checkpoint an ended run still holds is left as it
+/// is, because expiring it would apply a failure to an effect of a run that
+/// already ended. A run's end closes every other approval and authorization
+/// (issue #133), so the only one the sweep can meet there is one a record
+/// from an older binary holds, which the settle pass closes
+/// ([`AgentRun::needs_gate_close`]).
 fn fire_checkpoint_timers(
     state: &mut AgentRunState,
     now: AgentTimestampMillis,
@@ -8947,12 +9069,15 @@ where
             // ended run's outside-the-turn park (#120)
             // ([`AgentRun::needs_park_repair`]), and a park a binary before
             // issue #131 left standing after its answer
-            // ([`AgentRun::needs_unpark`]).
+            // ([`AgentRun::needs_unpark`]), and a gate a binary before issue
+            // #133 left waiting with nothing to gate
+            // ([`AgentRun::needs_gate_close`]).
             let can_advance = self.state()?.run().is_some_and(|run| {
                 run.can_advance()
                     || run.needs_turn_rest()
                     || run.needs_park_repair()
                     || run.needs_unpark()
+                    || run.needs_gate_close()
             });
             if !can_advance {
                 break;
@@ -8976,7 +9101,10 @@ where
             // the step to measure: the fold that follows it is. Measuring
             // both counted a record healed at `RecordingTurn` twice.
             let repairs = self.state()?.run().is_some_and(|run| {
-                run.needs_park_repair() || run.needs_unpark() || run.needs_turn_rest()
+                run.needs_park_repair()
+                    || run.needs_unpark()
+                    || run.needs_gate_close()
+                    || run.needs_turn_rest()
             });
             let turn_measurements = (!repairs && phase == AgentLoopPhase::RecordingTurn.as_label())
                 .then(|| {
@@ -14342,6 +14470,133 @@ mod tests {
             fx.cell().status
         );
         assert_eq!(fx.run().status, AgentRunStatus::HandedOff);
+    }
+
+    /// Issues #133 and #132: the re-send the notice fences may be gated. A
+    /// gated send re-parks behind a fresh approval when its new generation
+    /// is minted, and the notice cancels that generation before anyone
+    /// grants it. The approval closes with it, in the notice's transition,
+    /// recorded as closed, and the attempts the generation reserved are
+    /// released. The run used to end `HandedOff` holding both.
+    ///
+    /// Twice: with nothing else out, so the run ends in the same transition,
+    /// and with another call still out, so it winds down first. The second
+    /// is what tells the notice's own close from the end's.
+    #[test]
+    fn an_accepted_notice_closes_the_gate_of_a_resend_it_fences() {
+        for still_out in [false, true] {
+            let mut fx = parked();
+            let effect_id = fx.effect_id.clone();
+            fx.state
+                .run_mut()
+                .expect("the run exists")
+                .loop_state
+                .effect_mut(&effect_id)
+                .expect("the send is held")
+                .checkpoint_required = true;
+            let checkpoint_id = fx.checkpoint_id();
+            resolve_checkpoint(
+                &mut fx.state,
+                &checkpoint_id,
+                operator(),
+                reconcile(crate::checkpoints::AgentReconciliationDecision::ConfirmedNotExecuted),
+                decision_key("resend"),
+                &AgentSchemaPolicy::default(),
+                &AgentEffectPolicies::default(),
+                fx.now,
+            )
+            .expect("the decision applies");
+            assert_eq!(fx.send().status, AgentRunEffectStatus::Pending);
+            let gate = AgentCheckpoint::id_for_effect(
+                &effect_id,
+                fx.send().generation,
+                AgentCheckpointKind::Approval,
+            );
+            let gate_status = |fx: &HandoffSendFixture| {
+                fx.run()
+                    .loop_state
+                    .open_checkpoints()
+                    .iter()
+                    .find(|checkpoint| checkpoint.checkpoint_id == gate)
+                    .map(|checkpoint| checkpoint.status)
+            };
+            assert_eq!(
+                gate_status(&fx),
+                Some(AgentCheckpointStatus::Open),
+                "the re-send waits behind a fresh approval"
+            );
+            let reserved = fx.run().loop_state.budget().reserved_attempts();
+            assert_eq!(reserved, u64::from(fx.send().max_attempts));
+            if still_out {
+                // A second call the run handed to the sink and has no result
+                // for yet.
+                let mut other = fx.send().clone();
+                other.effect_id = AgentEffectId::new(format!("{}-other", effect_id.as_str()));
+                other.slot = other.slot.saturating_add(1);
+                other.status = AgentRunEffectStatus::Ready;
+                other.checkpoint_required = false;
+                fx.state
+                    .run_mut()
+                    .expect("the run exists")
+                    .loop_state
+                    .record_effect(other)
+                    .expect("the second call records");
+            }
+
+            let envelope = fx.notice(accepted());
+            assert!(accept_handoff_result(&mut fx.state, &envelope, fx.now).is_accepted());
+
+            assert_eq!(fx.send().status, AgentRunEffectStatus::Cancelled);
+            assert_eq!(
+                gate_status(&fx),
+                Some(AgentCheckpointStatus::Cancelled),
+                "still out {still_out}: the approval closed with the re-send it gated"
+            );
+            assert_eq!(
+                fx.run().status,
+                if still_out {
+                    AgentRunStatus::Cancelling
+                } else {
+                    AgentRunStatus::HandedOff
+                }
+            );
+            assert_eq!(
+                fx.run().loop_state.budget().reserved_attempts(),
+                0,
+                "the cancelled re-send holds no attempts"
+            );
+            let loop_state = &mut fx.state.run_mut().expect("the run exists").loop_state;
+            loop_state.commit_decisions(AgentDecisionEventVocabulary::Version2);
+            let recorded: Vec<(AgentDecisionKind, Option<AgentDecisionOutcome>)> = loop_state
+                .decision_outbox()
+                .iter()
+                .filter(|event| {
+                    event
+                        .checkpoint
+                        .as_ref()
+                        .is_some_and(|checkpoint| checkpoint.checkpoint_id == gate)
+                        || event.kind == AgentDecisionKind::Handoff
+                })
+                .map(|event| (event.kind, event.outcome))
+                .collect();
+            let close = (
+                AgentDecisionKind::ResolveCheckpoint,
+                Some(AgentDecisionOutcome::Cancelled),
+            );
+            if still_out {
+                assert_eq!(
+                    recorded.last(),
+                    Some(&close),
+                    "the close is recorded, and no end yet: {recorded:?}"
+                );
+            } else {
+                assert_eq!(
+                    recorded.iter().rev().take(2).collect::<Vec<_>>(),
+                    [&(AgentDecisionKind::Handoff, None), &close],
+                    "the close is recorded, then the end: {recorded:?}"
+                );
+            }
+        }
     }
 
     /// A definitive refusal, as the dispatcher delivers it: a spent budget

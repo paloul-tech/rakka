@@ -5542,10 +5542,14 @@ async fn a_gated_promotion_commanded_while_winding_down_holds_the_run_until_answ
 // ---------------------------------------------------------------------------
 
 /// A world whose first turn calls a checkpoint-required tool beside one that
-/// fails, under `sla`, with the promotion spec gated too. The failure fences
-/// the gated call, so the run ends `Failed` still holding that call's
-/// approval, waiting: a checkpoint an ended run's timer sweep leaves alone.
-async fn failed_world_holding_a_tool_approval(
+/// fails, under `sla`, with the promotion spec gated too, returned as a
+/// binary before issue #133 left it: the failure cancelled the gated call,
+/// the run ended `Failed`, and that call's approval still waits. An ended
+/// run's timer sweep leaves such a checkpoint alone.
+///
+/// This binary's failure closes the approval with the call, so the record is
+/// rewritten to put it back to waiting.
+async fn failed_world_left_holding_a_tool_approval(
     sla: rakka_agent::AgentCheckpointSla,
 ) -> (Fixture, Stores) {
     let stores = stores();
@@ -5599,6 +5603,30 @@ async fn failed_world_holding_a_tool_approval(
         AgentRunStatus::Failed,
         "the failed call ended the run"
     );
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    let loop_state = value["run"]["loop_state"]
+        .as_object_mut()
+        .expect("the loop state is an object");
+    let held = loop_state["open_checkpoints"]
+        .as_array_mut()
+        .expect("the checkpoints are an array");
+    assert_eq!(held.len(), 1, "the run holds the gated call's approval");
+    assert_eq!(held[0]["status"].as_str(), Some("cancelled"));
+    held[0]["status"] = serde_json::json!("open");
+    let reopened = held[0]["checkpoint_id"].clone();
+    loop_state.insert("pending_checkpoint".to_string(), reopened);
+    let left = serde_json::from_value(value).expect("the rewritten record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, left)
+        .await
+        .expect("the rewritten record persists");
     (fx, stores)
 }
 
@@ -5638,16 +5666,19 @@ async fn fire_checkpoint_timers_at(
 }
 
 /// An ended run's `next_wake` reads only the checkpoints its timer sweep acts
-/// on. The run ended `Failed` holding a tool call's approval, which the sweep
-/// leaves waiting on an ended run, so that approval's deadline is never
-/// reported, though it is the earliest the run holds. A gated promotion
-/// commanded after the end opens a gate the sweep does act on, and `next_wake`
-/// is that gate's deadline. The timer at the approval's deadline changes
-/// nothing; the timer at each reported deadline changes the record; and once
-/// nothing is reported, a timer at any time changes no checkpoint.
+/// on. The run ended `Failed` under an older binary, holding a tool call's
+/// approval, which the sweep leaves waiting on an ended run, so that
+/// approval's deadline is never reported, though it is the earliest the run
+/// holds. The first settle pass then closes that approval (issue #133). A
+/// gated promotion commanded after the end opens a gate the sweep does act
+/// on, and `next_wake` is that gate's deadline. The timer at the approval's
+/// deadline changes nothing; the timer at each reported deadline changes the
+/// record; and once nothing is reported, a timer at any time changes no
+/// checkpoint.
 ///
-/// The approval is reached through commands, not by editing the record: the
-/// failed sibling call fences the gated call, and nothing closes its approval.
+/// Until issue #133 the approval was reached through commands: the failed
+/// sibling call fenced the gated call, and nothing closed its approval. It is
+/// a rewritten record now, because the fence closes it.
 #[tokio::test]
 async fn an_ended_runs_next_wake_reads_only_what_its_sweep_acts_on() {
     let sla = rakka_agent::AgentCheckpointSla {
@@ -5655,7 +5686,7 @@ async fn an_ended_runs_next_wake_reads_only_what_its_sweep_acts_on() {
         expire_after_ms: Some(5_000),
         escalation_target: Some("ops-oncall".to_string()),
     };
-    let (fx, _stores) = Box::pin(failed_world_holding_a_tool_approval(sla)).await;
+    let (fx, _stores) = Box::pin(failed_world_left_holding_a_tool_approval(sla)).await;
     let before = fx.run_snapshot().await.expect("the run exists");
     let approval = the_open_checkpoint(&fx).await;
     assert_eq!(approval.kind, AgentCheckpointKind::Approval);
@@ -5682,13 +5713,30 @@ async fn an_ended_runs_next_wake_reads_only_what_its_sweep_acts_on() {
         .next_timer_deadline()
         .expect("on its own, the approval would wake at its due time");
     assert_eq!(Some(skipped), approval.due_at);
+    let left = operational_snapshot(&fx).await;
+    assert_eq!(left.open_checkpoints.len(), 1, "the approval is listed");
     assert_eq!(
-        operational_snapshot(&fx).await.next_wake,
-        None,
+        left.next_wake, None,
         "the sweep skips the approval, so it wakes nothing"
     );
 
+    // The promotion's command is the first thing to touch the record, and
+    // its settle pass closes the approval the older binary left.
     let promotion = promote_gated(&fx, "gated").await;
+    let closed = open_checkpoints(&fx)
+        .await
+        .into_iter()
+        .find(|held| held.checkpoint_id == approval.checkpoint_id)
+        .expect("the approval is still held");
+    assert_eq!(
+        closed.status,
+        rakka_agent::AgentCheckpointStatus::Cancelled,
+        "the pass closed the approval"
+    );
+    let mut reopened = closed.clone();
+    reopened.status = approval.status;
+    reopened.updated_at = approval.updated_at;
+    assert_eq!(reopened, approval, "and changed nothing else about it");
     let gate = the_gate_of(&fx, &promotion).await;
     let gate_due = gate.due_at.expect("the SLA stamped the gate's due time");
     let gate_expires = gate.expires_at.expect("the SLA stamped the gate's expiry");
@@ -5697,7 +5745,11 @@ async fn an_ended_runs_next_wake_reads_only_what_its_sweep_acts_on() {
         "the skipped approval's deadline is earlier"
     );
     let snapshot = operational_snapshot(&fx).await;
-    assert_eq!(snapshot.open_checkpoints.len(), 2);
+    assert_eq!(
+        snapshot.open_checkpoints.len(),
+        1,
+        "only the promotion's gate is open"
+    );
     assert_eq!(
         snapshot.next_wake,
         Some(gate_due),
@@ -5760,8 +5812,8 @@ async fn an_ended_runs_next_wake_reads_only_what_its_sweep_acts_on() {
     );
     assert_eq!(
         open_checkpoints(&fx).await,
-        vec![approval.clone()],
-        "the approval is exactly as the run ended"
+        vec![closed.clone()],
+        "the closed approval is all the run holds"
     );
     assert_eq!(operational_snapshot(&fx).await.next_wake, None);
 
@@ -5772,7 +5824,7 @@ async fn an_ended_runs_next_wake_reads_only_what_its_sweep_acts_on() {
         matches!(reply, AgentRunEntityReply::Unchanged { .. }),
         "{reply:?}"
     );
-    assert_eq!(open_checkpoints(&fx).await, vec![approval]);
+    assert_eq!(open_checkpoints(&fx).await, vec![closed]);
     assert_terminal_unmoved(&fx, &before, "after the timers").await;
 }
 

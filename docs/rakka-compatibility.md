@@ -614,6 +614,27 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Not changed.** A turn that commits while a goal evaluation or a workflow cancel is outstanding is still rested on a wait that counts it, and on the approval wait of an evaluation's gate; and a granted evaluation gate still writes the dispatch wait. Those are the turn's own rules and this entry does not touch them; only the status an answered park leaves is read without them. A workflow cancel that fails still winds its run down. The park itself, the checkpoint and its decisions, and what each answer does to the effect are as they were.
 
+- Issues #133 and #132 ("a call the run cancels before it is sent takes its gate and its attempts with it") change what a run does with the approval or authorization of a call it cancels unsent, and with the attempts that call reserved. No type, field, status, code, event kind or schema version is added.
+
+  | State | Before | Now |
+  |---|---|---|
+  | A failed call, a scheduled compensation or an accepted handoff cancels a gated call that was not sent | The call is `Cancelled` and its approval or authorization stays waiting, through the wind-down and on the ended run | The gate is `Cancelled` in the same transition and records `resolve-checkpoint` with outcome and reason `cancelled`, source `deterministic-policy`, before the run's end event |
+  | A decision for that gate while the run winds down | Applied: a grant was stored for the cancelled call, and a denial or an expiry rewrote the cancelled call as `Failed` | Refused `checkpoint-already-resolved`. The timer acts on nothing |
+  | A decision for that gate after the run ended | Refused `run-terminal`; the timer skipped it and `Cancel` was refused, so it waited for good | Refused `run-terminal`; nothing waits |
+  | A run ends at once (its result accepted, its rejections or its budget spent) holding a goal evaluation not yet sent | The run ends with the evaluation `Pending` and its gate, if it has one, waiting | The evaluation is `Cancelled`, its gate closed and recorded, before the end event |
+  | The attempts a call reserved, when the run cancels it unsent | Kept reserved for the rest of the run's life, and counted against an `EffectAttempts` limit | Released in the transition that cancels the call; none consumed |
+  | `Compensate` on a run whose unsent calls hold attempts | Reserved before those calls were cancelled, so it could be refused `run-redispatch-unaffordable` though the run could afford it | Reserved after, so it can spend what they held. A compensation the run still cannot afford is refused as before, and the refusal changes nothing |
+  | `Cancel` | Closes every waiting approval and authorization, and records each | The same, in the same order. It also releases the attempts of the calls it cancels |
+  | The gate of a memory promotion or a claim append | Left open by a wind-down that is not a cancel; answered and timed on an ended run | Unchanged |
+
+  **What this changes for a reader.** An ended run's record, and its operational snapshot, list no waiting approval or authorization except one bound to a memory promotion or a claim append. The decision stream carries one more `resolve-checkpoint` event for each gate closed this way; it is written under `Version2` only, as every `resolve-checkpoint` is. A run that completed with a review of its goal open reports that review closed and its evaluation `cancelled`, where it reported the evaluation `pending`. A run under an `EffectAttempts` limit has more headroom after a wind-down than it had.
+
+  **A record an earlier binary left holding such a gate** has it closed by the first settle pass that touches it, in one write: a run that is winding down, or has ended, and holds a waiting approval or authorization whose call is no longer `Pending`, or, on an ended run, whose call is not a memory promotion or a claim append. On an ended run the pass also cancels a call the run never sent. The terminal status, reason and stamp do not move, and the close is recorded after the run's end event. Until a pass touches the record, the snapshot still lists the gate, because the record holds it. `Settle` runs a pass, and so does a command the run applies, such as the `PromoteMemory` an application sends after a run ends. A read does not.
+
+  **A reservation an earlier binary leaked is not released.** Nothing on the record marks a cancelled call as one the fence cancelled, so the counter is left as it was written. It matters only under an `EffectAttempts` limit and only to what such a run could still reserve: an ended run reserves only inside its post-terminal memory window.
+
+  **Mixed builds and rollback.** A replica of an earlier build still leaves the gate and the reservation when its fence runs; this build closes the gate on its next pass over the record. An earlier build reads everything this one writes: a `Cancelled` checkpoint is what a cancel already wrote, and a `Cancelled` goal evaluation on an ended run is a status it knows. After a rollback, new wind-downs leave gates again.
+
 Run the default compatibility matrix:
 
 ```sh
