@@ -496,14 +496,17 @@ where
         params: &ServiceParams,
         request: &SendMessageRequest,
     ) -> RakkaAgentA2AResult<a2a::SendMessageResponse> {
-        // Boxed. A request's future holds every entity command it sends
-        // inline, and a caller that awaits it holds that in turn: an
-        // application's handler, or a dispatch pass whose handoff calls
-        // this service in-process (issue #162).
+        // Boxed. A request's future is 9 KiB of what one request holds
+        // across its awaits, in every branch it could take. A caller holds
+        // a future it awaits inline, and a debug build keeps stack for it
+        // at each await: an application's handler, or a dispatch pass
+        // whose handoff calls this service in-process (issue #162). The
+        // test at the end of this file holds the size of what is boxed,
+        // and `tests/service_shape.rs` holds the box.
         Box::pin(self.send_unboxed(params, request)).await
     }
 
-    /// [`Self::send`], as one future that holds what it sends.
+    /// The work of [`Self::send`], as the one future it boxes.
     async fn send_unboxed(
         &self,
         params: &ServiceParams,
@@ -1082,14 +1085,17 @@ where
         params: &ServiceParams,
         request: &SendMessageRequest,
     ) -> RakkaAgentA2AResult<Task> {
-        // Boxed. A request's future holds every entity command it sends
-        // inline, and a caller that awaits it holds that in turn: an
-        // application's handler, or a dispatch pass whose handoff calls
-        // this service in-process (issue #162).
+        // Boxed. A request's future is 9 KiB of what one request holds
+        // across its awaits, in every branch it could take. A caller holds
+        // a future it awaits inline, and a debug build keeps stack for it
+        // at each await: an application's handler, or a dispatch pass
+        // whose handoff calls this service in-process (issue #162). The
+        // test at the end of this file holds the size of what is boxed,
+        // and `tests/service_shape.rs` holds the box.
         Box::pin(self.send_message_unboxed(params, request)).await
     }
 
-    /// [`Self::send_message`], as one future that holds what it sends.
+    /// The work of [`Self::send_message`], as the one future it boxes.
     async fn send_message_unboxed(
         &self,
         params: &ServiceParams,

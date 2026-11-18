@@ -2197,17 +2197,17 @@ where
         now: AgentTimestampMillis,
     ) -> AgentChoreographyResult<AgentExchangeReply> {
         // Boxed, and the same in every operation of this host that writes.
-        // Each holds the participant's whole state across its write: the
-        // record it read, the copy it changed and the copy it hands to the
-        // store, which is several kilobytes for a task. Every entity
+        // Each holds the participant's whole state three times across its
+        // write: the record it read, the copy it changed and the copy it
+        // hands to the store. For a task that is 6.8 KiB. Every entity
         // operation awaits one of these, most of them many, and a caller
-        // holds a future it awaits inline: without the box, each of those
-        // kilobytes is carried by every future above this one, and in a
-        // debug build by every stack frame above it once for each of its
-        // awaits. That put one frame of the task entity at 300 KiB, and
-        // the deepest chain of polls in the repository within 64 KiB of a
-        // 2 MiB stack (issue #162). The box costs one allocation beside a
-        // durable write.
+        // holds a future it awaits inline: without the box those kilobytes
+        // are in every future above this one, and in a debug build every
+        // function above it keeps stack for them at each of its awaits,
+        // about twice over. That put one frame of the task entity at
+        // 308 KiB, and the coordination acceptance walk within 100 KiB of
+        // a 2 MiB stack (issue #162). The box costs one heap allocation a
+        // call, and every call that reads the record already clones it.
         Box::pin(self.accept_unboxed(envelope, now)).await
     }
 

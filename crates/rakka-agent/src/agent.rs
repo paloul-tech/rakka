@@ -757,16 +757,17 @@ where
         &mut self,
         command: AgentEntityCommand,
     ) -> AgentEntityResult<AgentEntityReply> {
-        // Boxed. An entity command reads, changes and writes the entity's
-        // whole state, and the future that does it holds that state. A
-        // caller holds a future it awaits inline, and a debug build keeps a
-        // stack slot for each future a function awaits, so without the box
-        // every caller pays for this future once for each command it sends
-        // (issue #162; `AgentExchangeHost::accept` has the measurements).
+        // Boxed. A caller holds a future it awaits inline, and a debug
+        // build keeps stack for it at each await, about twice its size.
+        // This store has no choreography host, so the futures below hold
+        // the agent's record themselves and a command's future is 7 KiB:
+        // a function that sends many commands would carry every one of
+        // them (issue #162; `AgentExchangeHost::accept` has the
+        // measurements).
         Box::pin(self.apply_unboxed(command)).await
     }
 
-    /// [`Self::apply`], as one future that holds the state it works on.
+    /// The work of [`Self::apply`], as the one future it boxes.
     async fn apply_unboxed(
         &mut self,
         command: AgentEntityCommand,
