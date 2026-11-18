@@ -2251,6 +2251,29 @@ enum ClaimConclusion {
     Lapsed,
 }
 
+/// How one step of a claim ended: with the claim concluded, or with another
+/// attempt to make under it.
+///
+/// An attempt that may be made again is handed back to the function that
+/// holds the claim ([`AgentRunEffectDispatcher::execute_claim`]), which makes
+/// it. The functions that decide a retry do not call the next attempt
+/// themselves: a reconcileable effect whose every attempt ends unknown and is
+/// found not executed is re-invoked once for each attempt of its budget, and
+/// calling would nest each inside the one before it, to a depth nothing
+/// bounds (issue #165).
+enum ClaimStep {
+    /// The claim is over.
+    Concluded(ClaimConclusion),
+    /// The budget permits another attempt and nothing forbids it: invoke
+    /// under this claim, as attempt `attempt`.
+    Invoke {
+        /// The claim the attempt runs under.
+        claim: AgentDispatchClaim,
+        /// The attempt's number.
+        attempt: u32,
+    },
+}
+
 /// How a park ends its claim's ticket.
 enum ParkedTicket {
     /// The outbox row and the fleet entry, as every park but one does.
@@ -3702,13 +3725,10 @@ where
         let ambiguous = row.status() == OutboxStatus::Dispatching
             || (row.status() == OutboxStatus::Failed
                 && intent.safety.class() == AgentEffectSafetyClass::Reconcileable);
-        if ambiguous {
-            return self
-                .recover_ambiguous(scope, claim, state, &intent, attempt, winding_down, pass)
-                .await;
-        }
-
-        if winding_down && !intent.kind().exempt_from_wind_down_fence() {
+        let mut step = if ambiguous {
+            self.recover_ambiguous(scope, claim, &intent, attempt, winding_down, pass)
+                .await?
+        } else if winding_down && !intent.kind().exempt_from_wind_down_fence() {
             // The fence: a ticket that provably never started is cancelled and
             // its intent settled, never dispatched after the cancellation. A
             // compensation or workflow-cancel is exempt — it is exactly the
@@ -3730,10 +3750,24 @@ where
             )
             .await?;
             return Ok(ClaimConclusion::Settled);
-        }
+        } else {
+            ClaimStep::Invoke { claim, attempt }
+        };
 
-        self.attempt_invocation(scope, claim, state, &intent, attempt, pass)
-            .await
+        // The attempts of this claim, one after another. An attempt that
+        // ends with another to make hands it back here, so a claim that
+        // spends a budget of any size is as deep as its first attempt
+        // (issue #165).
+        loop {
+            match step {
+                ClaimStep::Concluded(conclusion) => return Ok(conclusion),
+                ClaimStep::Invoke { claim, attempt } => {
+                    step = self
+                        .attempt_invocation(scope, claim, state, &intent, attempt, pass)
+                        .await?;
+                }
+            }
+        }
     }
 
     /// One fresh, unambiguous dispatch attempt: authorization, durable
@@ -3746,7 +3780,7 @@ where
         intent: &AgentRunEffect,
         attempt: u32,
         pass: &mut AgentDispatchPass,
-    ) -> AgentDispatchResult<ClaimConclusion> {
+    ) -> AgentDispatchResult<ClaimStep> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
 
         // Whether an earlier attempt of this generation may already have
@@ -3794,7 +3828,8 @@ where
                         possibly_executed,
                         pass,
                     )
-                    .await;
+                    .await
+                    .map(ClaimStep::Concluded);
             }
         }
 
@@ -3845,7 +3880,8 @@ where
                             possibly_executed,
                             pass,
                         )
-                        .await;
+                        .await
+                        .map(ClaimStep::Concluded);
                 }
                 granted
             }
@@ -3860,7 +3896,8 @@ where
                         possibly_executed,
                         pass,
                     )
-                    .await;
+                    .await
+                    .map(ClaimStep::Concluded);
             }
         };
 
@@ -3902,7 +3939,8 @@ where
                     possibly_executed,
                     pass,
                 )
-                .await;
+                .await
+                .map(ClaimStep::Concluded);
         }
 
         // Applied transforms and report-only findings are recorded, not
@@ -3933,7 +3971,7 @@ where
         }
 
         if !self.survives(AgentDispatchWindow::BeforeStarted) {
-            return Ok(ClaimConclusion::Died);
+            return Ok(ClaimStep::Concluded(ClaimConclusion::Died));
         }
 
         // Durable `Started`: the outbox row turns `Dispatching` under the
@@ -3950,11 +3988,12 @@ where
             let fence_applies = winding_down && !intent.kind().exempt_from_wind_down_fence();
             return self
                 .conclude_on_untold_row(scope, &claim, &row, intent, fence_applies, pass)
-                .await;
+                .await
+                .map(ClaimStep::Concluded);
         }
 
         if !self.survives(AgentDispatchWindow::AfterStarted) {
-            return Ok(ClaimConclusion::Died);
+            return Ok(ClaimStep::Concluded(ClaimConclusion::Died));
         }
 
         // The attempt bound, stamped once per attempt and never persisted:
@@ -3994,7 +4033,8 @@ where
                             possibly_executed,
                             pass,
                         )
-                        .await;
+                        .await
+                        .map(ClaimStep::Concluded);
                 }
                 Some(resolver) => match resolver.resolve(scope, binding, attempt_intent).await {
                     Ok(credential) => Some(credential),
@@ -4060,7 +4100,8 @@ where
                                 definitive,
                                 pass,
                             )
-                            .await;
+                            .await
+                            .map(ClaimStep::Concluded);
                     }
                 },
             },
@@ -4072,7 +4113,7 @@ where
         // again rather than reusing anything persisted
         // ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
         if credential.is_some() && !self.survives(AgentDispatchWindow::CredentialResolved) {
-            return Ok(ClaimConclusion::Died);
+            return Ok(ClaimStep::Concluded(ClaimConclusion::Died));
         }
 
         pass.invoked += 1;
@@ -4136,16 +4177,14 @@ where
         self.close_segment(scope, &intent.telemetry, attempt_segment);
 
         if !self.survives(AgentDispatchWindow::AfterInvocation) {
-            return Ok(ClaimConclusion::Died);
+            return Ok(ClaimStep::Concluded(ClaimConclusion::Died));
         }
 
         let outcome = match invoked {
             Ok(outcome) => outcome,
             Err(error @ AgentDispatchError::OutcomeUnknown { .. }) => {
                 return self
-                    .settle_unknown_outcome(
-                        scope, claim, state, intent, attempt, invoked_at, &error, pass,
-                    )
+                    .settle_unknown_outcome(scope, claim, intent, attempt, invoked_at, &error, pass)
                     .await;
             }
             Err(error) => {
@@ -4161,7 +4200,8 @@ where
                         matches!(error, AgentDispatchError::Definitive { .. }),
                         pass,
                     )
-                    .await;
+                    .await
+                    .map(ClaimStep::Concluded);
             }
         };
 
@@ -4169,7 +4209,7 @@ where
             .await?;
 
         if !self.survives(AgentDispatchWindow::AfterResultDelivery) {
-            return Ok(ClaimConclusion::Died);
+            return Ok(ClaimStep::Concluded(ClaimConclusion::Died));
         }
 
         if let Err(row) = self
@@ -4179,10 +4219,11 @@ where
             // The outcome was delivered before this write.
             return self
                 .conclude_on_finished_row(&claim, &row, None, pass)
-                .await;
+                .await
+                .map(ClaimStep::Concluded);
         }
         self.fleet.complete_claim(&claim).await?;
-        Ok(ClaimConclusion::Settled)
+        Ok(ClaimStep::Concluded(ClaimConclusion::Settled))
     }
 
     /// Recovery of an attempt that wrote durable `Started` and disappeared,
@@ -4193,12 +4234,11 @@ where
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
-        state: &AgentRunState,
         intent: &AgentRunEffect,
         attempt: u32,
         winding_down: bool,
         pass: &mut AgentDispatchPass,
-    ) -> AgentDispatchResult<ClaimConclusion> {
+    ) -> AgentDispatchResult<ClaimStep> {
         match intent.safety.class() {
             AgentEffectSafetyClass::ReadOnly => {
                 if winding_down {
@@ -4217,9 +4257,9 @@ where
                         pass,
                     )
                     .await?;
-                    return Ok(ClaimConclusion::Settled);
+                    return Ok(ClaimStep::Concluded(ClaimConclusion::Settled));
                 }
-                self.retry_ambiguous(scope, claim, state, intent, &WORKER_LOST, pass)
+                self.retry_ambiguous(scope, claim, intent, &WORKER_LOST, pass)
                     .await
             }
             AgentEffectSafetyClass::Idempotent => {
@@ -4228,14 +4268,13 @@ where
                 // generation hands the target the same one. Under a wind-down
                 // the retry still runs: it is the truthful way to learn what
                 // the ambiguous attempt did, and the target deduplicates it.
-                self.retry_ambiguous(scope, claim, state, intent, &WORKER_LOST, pass)
+                self.retry_ambiguous(scope, claim, intent, &WORKER_LOST, pass)
                     .await
             }
             AgentEffectSafetyClass::Reconcileable => {
                 self.reconcile_ambiguous(
                     scope,
                     claim,
-                    state,
                     intent,
                     attempt,
                     winding_down,
@@ -4268,6 +4307,7 @@ where
                     pass,
                 )
                 .await
+                .map(ClaimStep::Concluded)
             }
         }
     }
@@ -4291,13 +4331,12 @@ where
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
-        state: &AgentRunState,
         intent: &AgentRunEffect,
         attempt: u32,
         invoked_at: AgentTimestampMillis,
         error: &AgentDispatchError,
         pass: &mut AgentDispatchPass,
-    ) -> AgentDispatchResult<ClaimConclusion> {
+    ) -> AgentDispatchResult<ClaimStep> {
         let AgentDispatchError::OutcomeUnknown {
             code,
             message,
@@ -4307,8 +4346,8 @@ where
             unreachable!("only an unknown outcome is settled here");
         };
         match intent.safety.class() {
-            AgentEffectSafetyClass::ReadOnly | AgentEffectSafetyClass::Idempotent => {
-                self.record_attempt_failure(
+            AgentEffectSafetyClass::ReadOnly | AgentEffectSafetyClass::Idempotent => self
+                .record_attempt_failure(
                     scope,
                     &claim,
                     intent,
@@ -4320,21 +4359,16 @@ where
                     pass,
                 )
                 .await
-            }
+                .map(ClaimStep::Concluded),
             AgentEffectSafetyClass::Reconcileable => {
                 // An attempt the reconciliation finds not executed is burned
                 // under the executor's code, not a lost dispatcher's.
                 let line = bounded_failure_line("", code, message);
                 let ambiguity = Ambiguity { code, line: &line };
-                // Boxed: a reconciliation that finds the effect not executed
-                // re-invokes through `retry_ambiguous`, which reaches
-                // `attempt_invocation` and so this function again. Each lap
-                // spends an attempt first, so the depth is bounded by the
-                // effect's budget; the box only gives the future a size.
-                Box::pin(self.reconcile_ambiguous(
-                    scope, claim, state, intent, attempt, false, &ambiguity, pass,
-                ))
-                .await
+                // A finding of not executed hands the next attempt back
+                // ([`ClaimStep::Invoke`]); it is not made from here.
+                self.reconcile_ambiguous(scope, claim, intent, attempt, false, &ambiguity, pass)
+                    .await
             }
             AgentEffectSafetyClass::NonIdempotent => {
                 // Only the park records what the executor knew: a retried
@@ -4360,22 +4394,23 @@ where
                     pass,
                 )
                 .await
+                .map(ClaimStep::Concluded)
             }
         }
     }
 
     /// Burns one attempt for the ambiguous loss, then — if the intent's budget
-    /// still permits — re-invokes. `ambiguity` names why the outcome was
+    /// still permits — hands the next attempt back to be made
+    /// ([`ClaimStep::Invoke`]). `ambiguity` names why the outcome was
     /// unknown: the row's line, and the code an exhausted generation carries.
     async fn retry_ambiguous(
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
-        state: &AgentRunState,
         intent: &AgentRunEffect,
         ambiguity: &Ambiguity<'_>,
         pass: &mut AgentDispatchPass,
-    ) -> AgentDispatchResult<ClaimConclusion> {
+    ) -> AgentDispatchResult<ClaimStep> {
         let timer = AgentSegmentTimer::start(self.now());
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
         let event = match self
@@ -4402,7 +4437,8 @@ where
                 };
                 return self
                     .conclude_on_finished_row(&claim, &row, Some(owed), pass)
-                    .await;
+                    .await
+                    .map(ClaimStep::Concluded);
             }
         };
         pass.failed_attempts += 1;
@@ -4433,11 +4469,12 @@ where
                     .attribute(SEGMENT_ATTR_EFFECT_ATTEMPT, attempts.to_string())
                     .failed("rakka.agent.effect", ambiguity.code),
             );
-            return Ok(ClaimConclusion::Settled);
+            return Ok(ClaimStep::Concluded(ClaimConclusion::Settled));
         }
 
-        // The budget permits another attempt: run it now, under this claim,
-        // as a fresh invocation. The attempt number moves past the burned one.
+        // The budget permits another attempt: it runs now, under this claim,
+        // as a fresh invocation, and the function that holds the claim makes
+        // it. The attempt number moves past the burned one.
         let attempt = {
             let mut inbox = self.inbox(scope);
             inbox.recover().await?;
@@ -4450,8 +4487,7 @@ where
                 .unwrap_or(0)
                 .saturating_add(1)
         };
-        self.attempt_invocation(scope, claim, state, intent, attempt, pass)
-            .await
+        Ok(ClaimStep::Invoke { claim, attempt })
     }
 
     /// Queries the reconciliation protocol before any retry
@@ -4462,13 +4498,12 @@ where
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
-        state: &AgentRunState,
         intent: &AgentRunEffect,
         attempt: u32,
         winding_down: bool,
         ambiguity: &Ambiguity<'_>,
         pass: &mut AgentDispatchPass,
-    ) -> AgentDispatchResult<ClaimConclusion> {
+    ) -> AgentDispatchResult<ClaimStep> {
         let Some(protocol) = intent.safety.reconciliation_protocol().cloned() else {
             // The spec validation makes this unreachable; parking is the only
             // honest fallback for a record that somehow lost its protocol.
@@ -4482,7 +4517,8 @@ where
                     INDETERMINATE_OUTCOME_MESSAGE,
                     pass,
                 )
-                .await;
+                .await
+                .map(ClaimStep::Concluded);
         };
         let Some(reconciler) = self.reconciler.clone() else {
             return self
@@ -4495,7 +4531,8 @@ where
                     INDETERMINATE_OUTCOME_MESSAGE,
                     pass,
                 )
-                .await;
+                .await
+                .map(ClaimStep::Concluded);
         };
 
         let finding = reconciler.reconcile(&protocol, scope, intent).await?;
@@ -4526,7 +4563,8 @@ where
                             &OUTCOME_MISMATCH,
                             pass,
                         )
-                        .await;
+                        .await
+                        .map(ClaimStep::Concluded);
                 }
                 // The authoritative outcome, recorded without re-invocation.
                 self.deliver_outcome(scope, intent, attempt, claim.fencing_token, *outcome, pass)
@@ -4539,10 +4577,11 @@ where
                     // The reconciled outcome was delivered before this write.
                     return self
                         .conclude_on_finished_row(&claim, &row, None, pass)
-                        .await;
+                        .await
+                        .map(ClaimStep::Concluded);
                 }
                 self.fleet.complete_claim(&claim).await?;
-                Ok(ClaimConclusion::Settled)
+                Ok(ClaimStep::Concluded(ClaimConclusion::Settled))
             }
             AgentReconciliationFinding::NotExecuted => {
                 if winding_down {
@@ -4560,14 +4599,14 @@ where
                         pass,
                     )
                     .await?;
-                    return Ok(ClaimConclusion::Settled);
+                    return Ok(ClaimStep::Concluded(ClaimConclusion::Settled));
                 }
                 // Proven absent: a retry is a fresh invocation, under budget.
-                self.retry_ambiguous(scope, claim, state, intent, ambiguity, pass)
+                self.retry_ambiguous(scope, claim, intent, ambiguity, pass)
                     .await
             }
-            AgentReconciliationFinding::Unknown => {
-                self.settle_unknown_finding(
+            AgentReconciliationFinding::Unknown => self
+                .settle_unknown_finding(
                     scope,
                     claim,
                     intent,
@@ -4577,7 +4616,7 @@ where
                     pass,
                 )
                 .await
-            }
+                .map(ClaimStep::Concluded),
         }
     }
 

@@ -216,6 +216,9 @@ the claim, a loop where there is a call), or a bound on the budget, or
 both. This change is wrappers that alter no behaviour, and should stay
 reviewable as that.
 
+**Since fixed.** Issue #165 made the attempts of one claim a loop. Its
+record is `2026-11-17-reconcile-retry-loop-design.md`.
+
 ## 11. The review
 
 A fresh reviewer read the branch and measured its claims. It found no

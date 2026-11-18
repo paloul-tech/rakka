@@ -366,13 +366,21 @@ async fn an_unknown_outcome_asks_the_reconciler_of_a_reconcileable_effect_in_the
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
-/// A reconcileable effect whose reconciler answers `finding`, behind an
-/// executor whose every outcome is unknown.
+/// A reconcileable effect of three attempts whose reconciler answers
+/// `finding`, behind an executor whose every outcome is unknown.
 fn reconcileable_fixture(
     finding: AgentReconciliationFinding,
 ) -> (AuthorityFixture, Arc<AtomicUsize>, ScriptedReconciler) {
+    reconcileable_fixture_of(3, finding)
+}
+
+/// [`reconcileable_fixture`], with a budget of `attempts`.
+fn reconcileable_fixture_of(
+    attempts: u32,
+    finding: AgentReconciliationFinding,
+) -> (AuthorityFixture, Arc<AtomicUsize>, ScriptedReconciler) {
     let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
-    let spec = AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid");
+    let spec = AgentEffectSpec::reconcileable(protocol, attempts).expect("the spec is valid");
     let reconciler = ScriptedReconciler::new().with_finding(finding);
     let (fx, calls) = fixture(&spec, unknown);
     (
@@ -414,6 +422,63 @@ async fn an_unknown_outcome_the_reconciler_finds_not_executed_is_reinvoked_under
         Some("scripted-outcome-unknown"),
         "the run's record names what happened"
     );
+}
+
+/// Issue #165: the stack one claim needs does not grow with the attempts it
+/// makes.
+///
+/// Every attempt ends unknown and is found not executed, so the claim
+/// re-invokes until the budget is spent, all in one pass. Each re-invocation
+/// used to run inside the attempt before it: four futures deeper each time,
+/// 174 KiB of stack in a debug build, with nothing bounding the budget above.
+/// Sixty-four attempts would have needed about 11 MiB.
+///
+/// The claim runs on a thread of its own with the 2 MiB a thread has by
+/// default, whatever `RUST_MIN_STACK` gives the test's. A claim that nests
+/// again does not fail an assertion: it overflows that thread, and the
+/// process aborts naming it.
+#[test]
+fn a_claim_that_spends_a_large_budget_needs_no_more_stack_than_one_attempt() {
+    const ATTEMPTS: u32 = 64;
+    const A_DEFAULT_THREAD_STACK: usize = 2 * 1024 * 1024;
+
+    let claim = std::thread::Builder::new()
+        .name("one-claim-of-64-attempts".to_string())
+        .stack_size(A_DEFAULT_THREAD_STACK)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the runtime builds")
+                .block_on(async {
+                    let (fx, calls, reconciler) =
+                        reconcileable_fixture_of(ATTEMPTS, AgentReconciliationFinding::NotExecuted);
+                    let effect = ready(&fx).await;
+
+                    let pass = fx.one_pass().await;
+
+                    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+                    (
+                        pass.invoked,
+                        calls.load(Ordering::SeqCst),
+                        reconciler.queries(),
+                        row.status(),
+                        row.attempts().attempts(),
+                    )
+                })
+        })
+        .expect("the thread starts");
+
+    let (invoked, calls, queries, status, attempts) =
+        claim.join().expect("the claim ran to its end");
+    let all = ATTEMPTS as usize;
+    assert_eq!(
+        (invoked, calls, queries),
+        (all, all, all),
+        "every attempt of the budget ran under the one claim"
+    );
+    assert_eq!(status, OutboxStatus::Exhausted);
+    assert_eq!(attempts, ATTEMPTS);
 }
 
 #[tokio::test]
