@@ -619,12 +619,13 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   | | Before | Now |
   |---|---|---|
   | One memory the embedder refuses: an error, or an answer of the wrong length or with a component that is not finite | The call returned the embedder's error and no page. Every retry from the same cursor failed on that memory, and no memory after it was embedded | The page counts it in `ReindexPage::failed` and the cursor moves past it |
-  | The embedder is unavailable | The call returned the embedder's error on the first memory it tried | Every page counts each memory it tried in `failed`. The sweep runs to its end and embeds nothing |
-  | A SQL failure, or an embedder identity that cannot be stored | The call returned it | Unchanged |
+  | The embedder fails for every input: it is unavailable, its credentials or quota are refused, or its answers contradict the identity it declares | The call returned the embedder's error on the first memory it tried | Every page counts each memory it tried in `failed`. The sweep runs to its end and embeds nothing |
+  | A failed write | The call returned it | Unchanged |
+  | An embedder identity that cannot be stored (no model, no dimensions, more than the pgvector ceiling, or a count or version out of range) | The call returned it | Unchanged, and it is checked before a page is read |
 
-  **What a caller must change.** A caller that detected an embedder outage by the error must read the page: one whose `failed` is everything it read, with nothing indexed, is what an outage looks like. During an outage a sweep makes one failing model call for each memory it reads, so a caller that pages a sweep to its end can stop at a page whose `failed` is everything it read. And `failed` now counts three things without saying which: a record this binary cannot decode, a record its schema policy refuses, and a memory whose embedding failed. A caller that reports the count as undecodable records is wrong for the third.
+  **What a caller must change.** A caller that detected an outage or a misconfigured embedder by the error no longer gets one, and a page cannot stand in for it: one refused memory in a page of one, and an outage, are the same page. So a caller must not stop a sweep because a page embedded nothing, which would hold it on the refused memory as the error did. A caller that needs to know whether its embedder works asks the embedder, with a text of its own. During an outage a sweep makes one failing model call for each memory it tries to embed, where it made one in all, so a caller bounds that by how many pages it asks for. And `failed` now also counts a memory whose embedding failed, without saying which cause it was: a caller that reports the count as undecodable records is wrong for those.
 
-  **Not changed.** A memory that failed stays a candidate, so the next sweep reads it again, and a rerun reads exactly what is still missing. `index_memory` for one memory id still returns the embedder's error, which is how to learn why one memory fails.
+  **Not changed.** A memory that failed stays a candidate, so the next sweep reads it again, and a rerun reads exactly what is still missing. `index_memory` for one memory id still returns the embedder's error, which is how to learn why one memory fails. A write that fails because of one record's own data is still returned, and still met again by every retry.
 
 Run the default compatibility matrix:
 
