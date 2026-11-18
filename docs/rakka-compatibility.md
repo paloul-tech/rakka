@@ -614,6 +614,18 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Not changed.** A turn that commits while a goal evaluation or a workflow cancel is outstanding is still rested on a wait that counts it, and on the approval wait of an evaluation's gate; and a granted evaluation gate still writes the dispatch wait. Those are the turn's own rules and this entry does not touch them; only the status an answered park leaves is read without them. A workflow cancel that fails still winds its run down. The park itself, the checkpoint and its decisions, and what each answer does to the effect are as they were.
 
+- Issue #151 ("a private memory reindex is stopped for good by one memory its embedder refuses") changes what `PgvectorPrivateMemoryRetriever::reindex` (`rakka-agent-postgres`) answers when an embedding fails. No type, field, code or schema is added.
+
+  | | Before | Now |
+  |---|---|---|
+  | One memory the embedder refuses: an error, or an answer of the wrong length or with a component that is not finite | The call returned the embedder's error and no page. Every retry from the same cursor failed on that memory, and no memory after it was embedded | The page counts it in `ReindexPage::failed` and the cursor moves past it |
+  | The embedder is unavailable | The call returned the embedder's error on the first memory it tried | Every page counts each memory it tried in `failed`. The sweep runs to its end and embeds nothing |
+  | A SQL failure, or an embedder identity that cannot be stored | The call returned it | Unchanged |
+
+  **What a caller must change.** A caller that detected an embedder outage by the error must read the page: one whose `failed` is everything it read, with nothing indexed, is what an outage looks like. During an outage a sweep makes one failing model call for each memory it reads, so a caller that pages a sweep to its end can stop at a page whose `failed` is everything it read. And `failed` now counts three things without saying which: a record this binary cannot decode, a record its schema policy refuses, and a memory whose embedding failed. A caller that reports the count as undecodable records is wrong for the third.
+
+  **Not changed.** A memory that failed stays a candidate, so the next sweep reads it again, and a rerun reads exactly what is still missing. `index_memory` for one memory id still returns the embedder's error, which is how to learn why one memory fails.
+
 Run the default compatibility matrix:
 
 ```sh
