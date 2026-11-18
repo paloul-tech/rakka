@@ -1,8 +1,9 @@
 # The stack a dispatch walk needs in a debug build
 
 Issue #162. A record of what was measured, what the cause was, and the rule
-the fix follows, because the same thing has been fixed by hand three times
-before without anyone measuring it.
+the fix follows. A stack overflow on these paths has come up several times
+before, and each time one future was boxed where it was noticed, without a
+measurement.
 
 ## 1. What was wrong
 
