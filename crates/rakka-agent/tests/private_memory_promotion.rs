@@ -6673,3 +6673,111 @@ async fn a_healed_record_measures_its_turn_once() {
         "one recorded turn is measured once, healed or answered"
     );
 }
+
+/// Rewrites the stored record as a binary before issue #131's fix could
+/// leave it: the park answered as that binary answered it, and the status an
+/// approval wait that no gate holds. That binary wrote the dispatch wait on
+/// a re-send whatever the run rested on, so a run parked at `RecordingTurn`
+/// with a review of the goal open was put on the review's wait there, and a
+/// denied review then left the wait with no gate.
+async fn leave_on_an_approval_wait_no_gate_holds(fx: &Fixture) {
+    answer_as_an_older_binary_did(fx).await;
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    value["run"]["status"] =
+        serde_json::to_value(AgentRunStatus::WaitingForApproval).expect("the status serializes");
+    let rewritten = serde_json::from_value(value).expect("the rewritten record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, rewritten)
+        .await
+        .expect("the rewritten record persists");
+}
+
+/// A turn recorded after an approval wait is released is measured once, as
+/// one recorded after an answer is (issue #166).
+///
+/// The release is a repair step like the heal of a park: it commits at
+/// `RecordingTurn` without folding the turn, and the loop measures a turn
+/// at every committed step in that phase that is not a repair.
+#[tokio::test]
+async fn a_record_released_at_recording_turn_measures_its_turn_once() {
+    use rakka_core::InMemoryMetricsRecorder;
+
+    let mut samples = Vec::new();
+    for released in [false, true] {
+        let metrics = Arc::new(InMemoryMetricsRecorder::new());
+        let (fx, _stores) = tool_promoting_world();
+        let fx = fx.with_metrics(metrics.clone());
+        Box::pin(fx.instantiate_agent()).await;
+        Box::pin(fx.create_task()).await;
+        crank(&fx).await;
+        drive_turn(&fx).await;
+        crank(&fx).await;
+        let parked = park_promotion(&fx, "ambiguous").await;
+        let tools = dispatched_effects_of(&fx, AgentRunEffectKind::ToolCall).await;
+        answer_effect(&fx, &tools[0]).await;
+        assert_eq!(
+            status_and_phase(&fx).await,
+            (
+                AgentRunStatus::WaitingForReconciliation,
+                AgentLoopPhase::RecordingTurn
+            )
+        );
+        let count = |name: &str| metrics.snapshot().observations_named(name).len();
+        let before = (
+            count(rakka_agent::METRIC_AGENT_TURN_DURATION),
+            count(rakka_agent::METRIC_AGENT_MODEL_TOKENS),
+        );
+        if released {
+            leave_on_an_approval_wait_no_gate_holds(&fx).await;
+            assert_eq!(
+                status_and_phase(&fx).await,
+                (
+                    AgentRunStatus::WaitingForApproval,
+                    AgentLoopPhase::RecordingTurn
+                ),
+                "the record as the older binary left it"
+            );
+            settle_pass(&fx).await;
+        } else {
+            answer_park(
+                &fx,
+                &parked,
+                ParkAnswer::Completed,
+                Route::Command,
+                "answer",
+            )
+            .await;
+        }
+        let (phase, status, turn, _) = resting_at(&fx).await;
+        assert_eq!(
+            (phase, status, turn),
+            (
+                AgentLoopPhase::AwaitingModel,
+                AgentRunStatus::WaitingForEffect,
+                2
+            ),
+            "released={released}: the run went on to turn two"
+        );
+        let after = (
+            count(rakka_agent::METRIC_AGENT_TURN_DURATION),
+            count(rakka_agent::METRIC_AGENT_MODEL_TOKENS),
+        );
+        samples.push((after.0 - before.0, after.1 - before.1));
+    }
+    assert_eq!(
+        samples[0],
+        (1, 2),
+        "an answered turn is one duration sample and two token samples"
+    );
+    assert_eq!(
+        samples[0], samples[1],
+        "one recorded turn is measured once, released or answered"
+    );
+}

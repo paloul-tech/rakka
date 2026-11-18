@@ -1192,8 +1192,9 @@ impl AgentLoopState {
     /// A goal evaluation's gate is an approval-family wait of the turn, and
     /// the run reports it when the turn's dispatch wait is computed with it
     /// open: when the turn commits, when another gate of the turn is
-    /// granted, or when one closes. Its own command opens it at any rest
-    /// and moves no status. A reconciliation park can end at any rest too,
+    /// granted, or when the last gate of a kind closes without a grant. Its
+    /// own command opens it at any rest and moves no status. A
+    /// reconciliation park can end at any rest too,
     /// so the status a park's end writes is read from this and never puts a
     /// run on a review's wait it was not on.
     #[must_use]
@@ -1211,24 +1212,37 @@ impl AgentLoopState {
             .any(|effect| effect.kind().moves_the_run())
     }
 
+    /// The waiting checkpoints whose bound effect is of a kind `counts`
+    /// admits. A checkpoint whose effect the loop state no longer holds is
+    /// counted.
+    ///
+    /// The one definition of which gates count, for the wait they add up to
+    /// ([`Self::approval_family_wait_among`]) and for whether one of a kind
+    /// stands ([`Self::turn_gate_waits`]). The two are asked together when a
+    /// wait is released, and if they read different gates a wait could be
+    /// judged unheld and then rewritten as it was, at every settle
+    /// (issue #166).
+    fn waiting_gates_among<'a>(
+        &'a self,
+        counts: impl Fn(crate::AgentRunEffectKind) -> bool + 'a,
+    ) -> impl Iterator<Item = &'a crate::checkpoints::AgentCheckpoint> + 'a {
+        self.open_checkpoints.iter().filter(move |checkpoint| {
+            checkpoint.status.is_waiting()
+                && !self.effects.iter().any(|effect| {
+                    effect.effect_id == checkpoint.bound_effect.effect_id && !counts(effect.kind())
+                })
+        })
+    }
+
     /// The approval-family wait among the waiting checkpoints whose bound
-    /// effect is of a kind `counts` admits. A checkpoint whose effect the
-    /// loop state no longer holds is counted.
+    /// effect is of a kind `counts` admits: an approval ahead of a security
+    /// authorization.
     fn approval_family_wait_among(
         &self,
         counts: impl Fn(crate::AgentRunEffectKind) -> bool,
     ) -> Option<crate::checkpoints::AgentCheckpointKind> {
         let mut wait = None;
-        for checkpoint in &self.open_checkpoints {
-            if !checkpoint.status.is_waiting() {
-                continue;
-            }
-            let left_out = self.effects.iter().any(|effect| {
-                effect.effect_id == checkpoint.bound_effect.effect_id && !counts(effect.kind())
-            });
-            if left_out {
-                continue;
-            }
+        for checkpoint in self.waiting_gates_among(counts) {
             match checkpoint.kind {
                 crate::checkpoints::AgentCheckpointKind::Approval => {
                     return Some(crate::checkpoints::AgentCheckpointKind::Approval)
@@ -1240,6 +1254,14 @@ impl AgentLoopState {
             }
         }
         wait
+    }
+
+    /// Whether a gate of `kind` among the turn's waits: the gates
+    /// [`Self::approval_family_wait`] reads, asked of one kind alone.
+    #[must_use]
+    pub(crate) fn turn_gate_waits(&self, kind: crate::checkpoints::AgentCheckpointKind) -> bool {
+        self.waiting_gates_among(|effect| !effect.outside_the_turn())
+            .any(|checkpoint| checkpoint.kind == kind)
     }
 
     /// The digest-bound grant the run holds for exactly this effect intent, when

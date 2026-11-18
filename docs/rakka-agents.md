@@ -206,9 +206,10 @@ leaves behind is the same either way.
    (denied or expired) fails its effect. For a tool call that winds the run
    down. Where the run survives the failure, as it does for a goal
    evaluation and for the send or start of a fan-out member, a run that
-   was on that gate's `WaitingForApproval` or `WaitingForAuthorization`
-   has its wait recomputed as a grant would recompute it: the wait of a
-   gate that still stands, or `WaitingForEffect`.
+   was on that gate's `WaitingForApproval` or `WaitingForAuthorization`,
+   with no other gate of that kind standing, has its dispatch wait
+   recomputed: the wait of a gate that still stands, or
+   `WaitingForEffect`.
 6. **Budgets.** Every run holds an escrow ledger: allocations flow down from a
    parent scope in the parent's own transition, settlements and returns flow
    back up through the exchange path, and a `Started` attempt that becomes

@@ -1965,17 +1965,17 @@ async fn a_review_that_ends_without_a_grant_lets_the_turn_it_held_go_on() {
     }
 }
 
-/// The same wait reached through a grant alone. The tool call is gated, and
-/// its turn commits on its own gate. The review is commanded only then, so
-/// the run is not on the review's wait: granting the tool's gate is what
-/// puts it there, as it did. The review is then denied after the tool's
-/// result has landed.
+/// The same wait reached through a grant alone. The tool call needs a
+/// security authorization, and its turn commits on that wait. The review is
+/// commanded only then, and moves no status. Granting the tool's gate is
+/// what puts the run on the review's approval wait. The review is then
+/// denied after the tool's result has landed.
 #[tokio::test]
 async fn a_review_denied_after_the_grant_that_put_the_run_on_its_wait_lets_the_turn_go_on() {
     let policies = rakka_agent::AgentEffectPolicies::new()
         .with_tool_spec(
             rakka_agent::AgentToolId::new(LOOKUP).expect("the tool id is valid"),
-            rakka_agent::AgentEffectSpec::non_idempotent().with_checkpoint_required(),
+            rakka_agent::AgentEffectSpec::non_idempotent().with_authorization_required(),
         )
         .expect("the gated tool spec is valid");
     let fx = tool_turn_world(policies).await;
@@ -1987,6 +1987,16 @@ async fn a_review_denied_after_the_grant_that_put_the_run_on_its_wait_lets_the_t
         "the tool call is gated: {tool_gates:?}"
     );
     let (_effect, review) = commanded_human_review(&fx).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForAuthorization,
+            2
+        ),
+        "the run is on the tool's wait, and the review moved no status"
+    );
 
     decide_gate(&fx, &tool_gates[0], "tool", approve()).await;
     assert_eq!(
@@ -2424,4 +2434,80 @@ async fn a_record_left_on_an_authorization_wait_with_no_gate_heals_and_goes_on()
     );
     settle_run(&fx).await;
     assert_eq!((rest_of(&fx).await, run_revision(&fx).await), healed);
+}
+
+/// Which commands repair a record left on a wait no gate holds: those that
+/// end in the run's disposition. A checkpoint timer does, with nothing due:
+/// its firing recomputes the disposition, the release changes the record,
+/// and the command commits and settles. A fan-in deadline with nothing due
+/// changes nothing and leaves the record. And on a record that needs no
+/// repair, a checkpoint timer with nothing due writes nothing.
+#[tokio::test]
+async fn a_checkpoint_timer_with_nothing_due_repairs_a_record_and_a_fan_in_deadline_does_not() {
+    let timer = |fan_in: bool, key: &str| {
+        let operation_id = AgentOperationId::for_agent(
+            AgentOperationKind::CheckpointResolution,
+            &agent_scope(),
+            key,
+        )
+        .expect("the timer key derives");
+        if fan_in {
+            AgentRunEntityCommand::FireFanInDeadline { operation_id }
+        } else {
+            AgentRunEntityCommand::FireCheckpointTimers { operation_id }
+        }
+    };
+    // No gate here has a deadline, so no timer has anything due.
+    let stuck = || async {
+        let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+        let (_effect, _gate) = commanded_human_review(&fx).await;
+        answer_with_the_tool_call(&fx).await;
+        land_the_tool_result(&fx).await;
+        deny_the_review_as_an_older_binary_did(&fx).await;
+        fx
+    };
+
+    let fx = stuck().await;
+    let before = (rest_of(&fx).await, run_revision(&fx).await);
+    apply_run(&fx, timer(true, "fan-in-deadline"))
+        .await
+        .expect("the timer applies");
+    assert_eq!(
+        (rest_of(&fx).await, run_revision(&fx).await),
+        before,
+        "a fan-in deadline with nothing due leaves the record"
+    );
+
+    let fx = stuck().await;
+    apply_run(&fx, timer(false, "checkpoint-timers"))
+        .await
+        .expect("the timer applies");
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            2,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "a checkpoint timer with nothing due repairs it, and the run goes on"
+    );
+
+    let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+    let (_effect, _gate) = commanded_human_review(&fx).await;
+    answer_with_the_tool_call(&fx).await;
+    settle_run(&fx).await;
+    let before = (rest_of(&fx).await, run_revision(&fx).await);
+    let reply = apply_run(&fx, timer(false, "checkpoint-timers"))
+        .await
+        .expect("the timer applies");
+    assert!(
+        matches!(reply, AgentRunEntityReply::Unchanged { .. }),
+        "{reply:?}"
+    );
+    assert_eq!(
+        (rest_of(&fx).await, run_revision(&fx).await),
+        before,
+        "a standing wait is not written by a timer with nothing due"
+    );
 }

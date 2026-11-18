@@ -2343,3 +2343,105 @@ async fn a_review_granted_while_the_run_rests_on_its_children_leaves_its_status(
     settle(&fixture).await;
     assert_eq!(rest_of(&fixture).await, resting);
 }
+
+/// A turn that fans out to two workflows and awaits them.
+fn two_starts_await_turn() -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Invoking two workflows and awaiting them.")
+        .with_tool_call(workflow_call("invoke-1"))
+        .with_tool_call(workflow_call("invoke-2"))
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({}),
+            )
+            .expect("the tool call is bounded"),
+        )
+}
+
+/// Two fan-out members, each behind a security authorization, and a review
+/// of the goal commanded after the turn committed: the run is on the
+/// authorizations' wait, with the review's approval open beside them.
+async fn two_authorizations_and_a_late_review() -> Fixture {
+    let mut fixture = workflow_fixture(
+        RecordingWorkflowExecutor::new(StartMode::Started),
+        two_starts_await_turn(),
+    );
+    fixture.policies = rakka_agent::AgentEffectPolicies::new()
+        .with_workflow_start_spec(
+            rakka_agent::AgentEffectSpec::idempotent(2)
+                .expect("the spec is valid")
+                .with_authorization_required(),
+        )
+        .expect("the gated start spec is valid");
+    create_workflow_task(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+    apply_to_run(&fixture, evaluate_goal(true)).await;
+    let gates: Vec<String> = waiting_gates(&fixture)
+        .await
+        .iter()
+        .map(|(gate, bound)| format!("{} on {bound}", gate.kind.as_label()))
+        .collect();
+    assert_eq!(
+        gates,
+        [
+            "security-authorization on workflow-start-call",
+            "security-authorization on workflow-start-call",
+            "approval on goal-evaluation-call"
+        ]
+    );
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingTools,
+            Some(AgentRunStatus::WaitingForAuthorization),
+            1
+        ),
+        "the review commanded after the commit moved no status"
+    );
+    fixture
+}
+
+/// A grant recomputes the dispatch wait whatever else stands; a gate that
+/// closes without one releases a wait only when it was the last of its kind.
+/// So with two members behind authorizations and a review commanded after
+/// the turn committed, granting one member's gate reports the review, and
+/// denying that gate leaves the run on the other member's authorization.
+/// Both are true waits. The grant's half is what issue #166 left as it was;
+/// the denial's half writes nothing, because the wait still stands.
+#[tokio::test]
+async fn a_members_grant_recomputes_the_wait_and_its_denial_keeps_a_wait_that_stands() {
+    let fixture = two_authorizations_and_a_late_review().await;
+    let gate = waiting_gates(&fixture).await.remove(0).0;
+    apply_to_run(&fixture, gate_decision(&gate, "first-start", true)).await;
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingTools,
+            Some(AgentRunStatus::WaitingForApproval),
+            1
+        ),
+        "the grant recomputes the dispatch wait, and an approval is reported first"
+    );
+
+    let fixture = two_authorizations_and_a_late_review().await;
+    let gate = waiting_gates(&fixture).await.remove(0).0;
+    apply_to_run(&fixture, gate_decision(&gate, "first-start", false)).await;
+    let standing = (rest_of(&fixture).await, run_revision(&fixture).await);
+    assert_eq!(
+        standing.0,
+        (
+            AgentLoopPhase::AwaitingTools,
+            Some(AgentRunStatus::WaitingForAuthorization),
+            1
+        ),
+        "the other member's authorization still holds the wait"
+    );
+    settle(&fixture).await;
+    assert_eq!(
+        (rest_of(&fixture).await, run_revision(&fixture).await),
+        standing,
+        "a settle pass writes nothing"
+    );
+}

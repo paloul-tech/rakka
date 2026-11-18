@@ -200,7 +200,9 @@ the code comments:
 - "answering a goal evaluation's gate moves no status" is not true of a
   grant, which writes the dispatch wait;
 - "any command or exchange runs a settle pass" is not true of a read, a
-  refused command or a timer with nothing due;
+  refused command or a timer with nothing due (of a fan-in deadline, that
+  is: the review of #166 showed a checkpoint timer with nothing due does
+  run one and repairs the record);
 - the difference on the re-send was stated for a tool call only.
 
 It also had five tests tightened: two compared a parked world with a

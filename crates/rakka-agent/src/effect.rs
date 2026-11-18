@@ -1129,11 +1129,14 @@ impl AgentRunEffectKind {
     /// This is narrower than the complement of [`Self::outside_the_turn`]. A
     /// goal evaluation and a workflow cancel are counted among the effects a
     /// turn awaits, yet neither's success rests a turn. So when a
-    /// reconciliation park ends, the run's status is read from this and not
-    /// from that. A park can end at any rest, and at a rest other than the
-    /// turn's dispatch wait the run was on no wait for an evaluation or a
-    /// cancel, nor on the approval wait of an evaluation's gate (issues
-    /// #131 and #130).
+    /// reconciliation park ends, or an approval wait is released where the
+    /// run does not wait on dispatch, the run's status is read from this
+    /// and not from that. Either can happen at any rest, and at a rest
+    /// other than the turn's dispatch wait the run was on no wait for an
+    /// evaluation or a cancel, nor on the approval wait of an evaluation's
+    /// gate (issues #131, #130 and #166). At the turn's dispatch wait a
+    /// park's end under-reports for it: a turn held for a review is left
+    /// `Running` with the review's gate open, until that gate is decided.
     #[must_use]
     pub(crate) const fn moves_the_run(self) -> bool {
         !matches!(

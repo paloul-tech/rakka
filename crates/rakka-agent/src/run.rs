@@ -846,8 +846,9 @@ impl AgentRun {
     ///
     /// A grant recomputes the wait. A gate that closes any other way, denied
     /// or expired, fails its effect, and where the run survives that failure
-    /// the wait stayed: a goal evaluation's gate that held a turn, or the
-    /// gated send or start of a fan-out member with a goal evaluation out.
+    /// the wait stayed. Two such are a goal evaluation's gate that held a
+    /// turn, and the gated send or start of a fan-out member whose turn is
+    /// held for a goal evaluation.
     /// Neither wait permits progress, so the settle pass could not rest the
     /// turn ([`Self::needs_turn_rest`]), and a run with nothing in flight
     /// took no transition again (issue #166).
@@ -857,12 +858,13 @@ impl AgentRun {
     /// is repaired by the same function on the first settle pass that
     /// touches it.
     ///
-    /// The gates asked are the turn's: every waiting gate of the status's
-    /// own kind but one on an effect held outside the turn (a memory
-    /// promotion or a claim append), which is never the run's wait. The
-    /// question is asked of that kind alone, and not of the wait the gates
-    /// add up to: an approval is reported ahead of an authorization, so a
-    /// run on an authorization's wait with an approval opened beside it
+    /// The gates asked are the turn's, the same ones the dispatch wait is
+    /// read from (`AgentLoopState::turn_gate_waits`): every waiting gate of
+    /// the status's own kind but one on an effect held outside the turn (a
+    /// memory promotion or a claim append), which is never the run's wait.
+    /// The question is asked of that kind alone, and not of the wait the
+    /// gates add up to: an approval is reported ahead of an authorization,
+    /// so a run on an authorization's wait with an approval opened beside it
     /// would look unheld, be released to the same status, and be written
     /// again at every step of every settle pass.
     pub(crate) fn needs_gate_wait_release(&self) -> bool {
@@ -871,11 +873,7 @@ impl AgentRun {
             AgentRunStatus::WaitingForAuthorization => AgentCheckpointKind::SecurityAuthorization,
             _ => return false,
         };
-        !self.loop_state.open_checkpoints().iter().any(|checkpoint| {
-            checkpoint.status.is_waiting()
-                && checkpoint.kind == kind
-                && !self.holds_outside_the_turn_effect(&checkpoint.bound_effect.effect_id)
-        })
+        !self.loop_state.turn_gate_waits(kind)
     }
 
     /// Whether the record holds a park a binary before issue #106 left
@@ -4350,6 +4348,17 @@ fn repair_park(
     settle_run_disposition(state, now)
 }
 
+/// Whether the run rests where its next step is dispatch: on its model call,
+/// or on the calls of its turn. Only there does it hold a dispatch wait
+/// ([`checkpoint_wait_status`]). Resting on its children, its proposal or a
+/// top-up, or between two phases, it holds none.
+fn at_a_dispatch_rest(loop_state: &AgentLoopState) -> bool {
+    matches!(
+        loop_state.phase(),
+        AgentLoopPhase::AwaitingModel | AgentLoopPhase::AwaitingTools
+    )
+}
+
 /// The status of a run whose next step is dispatch: parked on whichever
 /// approval-family checkpoint wait it holds, or waiting on its effects.
 fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
@@ -4375,7 +4384,8 @@ fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
 ///
 /// That is what lets a reconciliation park be undone without recording what
 /// it overwrote: [`settle_run_disposition`] asks this when the park ends
-/// (issues #131 and #130).
+/// (issues #131 and #130), and when it releases an approval wait where the
+/// run does not wait on dispatch (issue #166).
 ///
 /// It is not the status half of [`turn_rest`]. That counts a goal evaluation
 /// and a workflow cancel among the effects a turn awaits, and the gate of an
@@ -5430,7 +5440,9 @@ fn apply_effect_outcome(
 ///   of that kind holds leaves it too (`AgentRun::needs_gate_wait_release`).
 ///   A grant recomputes the wait; a gate that closed any other way, on an
 ///   effect whose failure the run survives, left it standing (issue #166).
-///   The dispatch wait is recomputed as a grant recomputes it;
+///   At a dispatch rest the dispatch wait is recomputed with the function a
+///   grant recomputes it with, and at any other rest the run takes
+///   [`live_status`];
 /// - otherwise the run keeps whatever live status the outcome application set.
 fn settle_run_disposition(
     state: &mut AgentRunState,
@@ -5477,10 +5489,18 @@ fn settle_run_disposition(
         // wait permits progress, so left here a turn whose last effect has
         // resolved could not be rested (issue #166).
         //
-        // The dispatch wait is recomputed, exactly as a grant recomputes
-        // it: the wait of a gate that still stands, or the effect wait. From
-        // there the settle pass rests a turn that has nothing left out.
-        run.status = checkpoint_wait_status(&run.loop_state);
+        // At a dispatch rest the dispatch wait is recomputed, with the
+        // function a grant recomputes it with: the wait of a gate that still
+        // stands, or the effect wait. From there the settle pass rests a
+        // turn that has nothing left out. At any other rest the run holds
+        // no dispatch wait, and takes the status of what it rests on, as it
+        // does when a park ends: a binary before issue #131 could leave an
+        // approval wait there.
+        run.status = if at_a_dispatch_rest(&run.loop_state) {
+            checkpoint_wait_status(&run.loop_state)
+        } else {
+            live_status(&run.loop_state)
+        };
     }
     state.updated_at = now;
     Ok(())
@@ -6329,21 +6349,16 @@ fn resolve_checkpoint(
             // that gate was never the run's wait, so whatever the run waited
             // on, it still waits on (issue #126).
             //
-            // Only a run that is on a dispatch wait has one to recompute. A
-            // goal evaluation's command opens its gate at any rest, and
-            // nothing an evaluation does afterwards writes a status, so a
-            // review granted while the run rested on its proposal used to
-            // leave it reporting `WaitingForEffect` there (issue #166). A
-            // gate on a call that moves the run is only ever open on a
-            // dispatch wait, or under a park or a wind-down, and the settle
-            // below keeps both.
-            let on_a_dispatch_wait = matches!(
-                run.status,
-                AgentRunStatus::WaitingForEffect
-                    | AgentRunStatus::WaitingForApproval
-                    | AgentRunStatus::WaitingForAuthorization
-            );
-            if on_a_dispatch_wait && !run.holds_outside_the_turn_effect(&bound_effect_id) {
+            // Only at a dispatch rest is there a dispatch wait to
+            // recompute. A goal evaluation's command opens its gate at any
+            // rest, and nothing an evaluation does afterwards writes a
+            // status, so a review granted while the run rested on its
+            // proposal or its children used to leave it reporting
+            // `WaitingForEffect` there (issue #166).
+            if !run.status.is_terminal()
+                && at_a_dispatch_rest(&run.loop_state)
+                && !run.holds_outside_the_turn_effect(&bound_effect_id)
+            {
                 run.status = checkpoint_wait_status(&run.loop_state);
             }
             state.updated_at = now;
