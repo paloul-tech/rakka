@@ -3271,7 +3271,10 @@ where
         scope: &AgentRunScope,
     ) -> AgentDispatchResult<AgentDispatchPass> {
         let mut pass = AgentDispatchPass::default();
-        let fleet_current = self.register_run_into(scope, &mut pass).await?;
+        // Boxed: the per-run half holds the run's state and its outbox, and
+        // a caller that pumps many runs would carry that once for each call
+        // (issue #162).
+        let fleet_current = Box::pin(self.register_run_into(scope, &mut pass)).await?;
         self.claim_into(fleet_current, &mut pass).await?;
         Ok(pass)
     }
@@ -3338,7 +3341,8 @@ where
         scope: &AgentRunScope,
     ) -> AgentDispatchResult<AgentDispatchPass> {
         let mut pass = AgentDispatchPass::default();
-        self.register_run_into(scope, &mut pass).await?;
+        // Boxed, as in `Self::pump_run`.
+        Box::pin(self.register_run_into(scope, &mut pass)).await?;
         Ok(pass)
     }
 

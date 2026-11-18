@@ -7868,6 +7868,22 @@ where
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentRunEntityReply> {
+        // Boxed. An entity command reads, changes and writes the entity's
+        // whole state, and the future that does it holds that state. A
+        // caller holds a future it awaits inline, and a debug build keeps a
+        // stack slot for each future a function awaits, so without the box
+        // every caller pays for this future once for each command it sends
+        // (issue #162; `AgentExchangeHost::accept` has the measurements).
+        Box::pin(self.apply_unboxed(command, router, now)).await
+    }
+
+    /// [`Self::apply`], as one future that holds the state it works on.
+    async fn apply_unboxed(
+        &mut self,
+        command: AgentRunEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentRunResult<AgentRunEntityReply> {
         self.ensure_recovered(now).await?;
         // Counted across the whole operation, not at one resolving site: a
         // command resolves a group from three different places — the deadline

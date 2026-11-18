@@ -496,6 +496,19 @@ where
         params: &ServiceParams,
         request: &SendMessageRequest,
     ) -> RakkaAgentA2AResult<a2a::SendMessageResponse> {
+        // Boxed. A request's future holds every entity command it sends
+        // inline, and a caller that awaits it holds that in turn: an
+        // application's handler, or a dispatch pass whose handoff calls
+        // this service in-process (issue #162).
+        Box::pin(self.send_unboxed(params, request)).await
+    }
+
+    /// [`Self::send`], as one future that holds what it sends.
+    async fn send_unboxed(
+        &self,
+        params: &ServiceParams,
+        request: &SendMessageRequest,
+    ) -> RakkaAgentA2AResult<a2a::SendMessageResponse> {
         // The ingress `SERVER` span is closed here, at the routing entry
         // point, and not only in `send_message`. This is the method an
         // application wires for `message/send` — routing through it is
@@ -1065,6 +1078,19 @@ where
     /// entity refusal, or projection failure. A duplicate send is not an
     /// error: it returns the original task.
     pub async fn send_message(
+        &self,
+        params: &ServiceParams,
+        request: &SendMessageRequest,
+    ) -> RakkaAgentA2AResult<Task> {
+        // Boxed. A request's future holds every entity command it sends
+        // inline, and a caller that awaits it holds that in turn: an
+        // application's handler, or a dispatch pass whose handoff calls
+        // this service in-process (issue #162).
+        Box::pin(self.send_message_unboxed(params, request)).await
+    }
+
+    /// [`Self::send_message`], as one future that holds what it sends.
+    async fn send_message_unboxed(
         &self,
         params: &ServiceParams,
         request: &SendMessageRequest,

@@ -2232,6 +2232,22 @@ where
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentTeamResult<AgentTeamEntityReply> {
+        // Boxed. An entity command reads, changes and writes the entity's
+        // whole state, and the future that does it holds that state. A
+        // caller holds a future it awaits inline, and a debug build keeps a
+        // stack slot for each future a function awaits, so without the box
+        // every caller pays for this future once for each command it sends
+        // (issue #162; `AgentExchangeHost::accept` has the measurements).
+        Box::pin(self.apply_unboxed(command, router, now)).await
+    }
+
+    /// [`Self::apply`], as one future that holds the state it works on.
+    async fn apply_unboxed(
+        &mut self,
+        command: AgentTeamEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentTeamResult<AgentTeamEntityReply> {
         let operation = command.operation_label();
         // Counted once, on the verdict that actually left the entity: the
         // re-verified pass can answer a first-pass refusal differently.
