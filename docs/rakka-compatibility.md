@@ -593,6 +593,27 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Not changed.** The bound of three re-applications. The two writes of a cancellation through `AgentDispatcherWorker` (`request_run_cancellation`, `finalize_run_cancellations`): one try each, not counted.
 
+- Issues #131 and #130 ("a live run's status after its reconciliation park is answered") change what status a live run holds once the last ambiguous outcome it was parked on is answered. No type, field, status, code, event or schema version is added, and an ended run is not affected: its status never moves.
+
+  | Answer to the park | Before | Now |
+  |---|---|---|
+  | `ConfirmedExecuted` with a successful outcome, or `ConfirmedCompleted` at the checkpoint | The run stayed `WaitingForReconciliation` unless the outcome itself rested the turn. A memory promotion's, a claim append's and a goal evaluation's never did, and a tool call's did not while another effect of its turn was out | The run takes the status of what it rests on |
+  | A failure confirmed, or `AbandonAndFail`, of a memory promotion, a claim append or a goal evaluation | The generation failed, and the run stayed parked | The same generation fails, and the run takes the status of what it rests on |
+  | A failure confirmed, or `AbandonAndFail`, of any other call | The run winds down under the failure, except that a fan-out member's send or start becomes a fan-in disposition | Unchanged |
+  | `ConfirmedNotExecuted` | The dispatch wait (`WaitingForEffect`, or the wait of an open gate), whatever the run rested on | The status of what the run rests on. For a call whose outcome moves the run that is still the dispatch wait |
+  | `Compensate` | The run winds down behind the compensation | Unchanged |
+  | `Escalate` | The park stands | Unchanged |
+
+  **The status of what a run rests on** is the dispatch wait while a call whose outcome moves the run is outstanding, and `Running` otherwise. Those calls are the model call, a tool call, an A2A send and a workflow start. The dispatch wait is `WaitingForEffect`, or `WaitingForApproval` or `WaitingForAuthorization` while a gate on one of those calls is open. A memory promotion, a claim append, a goal evaluation and a workflow cancel are committed without a status, and the success of one neither puts the run on a status nor takes it off one, so neither they nor their gates are part of it. The status is read when the park ends, and not kept from before the park: a tool result that lands during the park rests the turn, and the run goes on from there.
+
+  **What this changes for a reader of the status.** A live run that was parked on a memory promotion, a claim append or a goal evaluation no longer reports `WaitingForReconciliation` after the answer, and no longer reports `WaitingForEffect` after a re-send while it rests on its proposal or its children. `WaitingForReconciliation` does not permit progress, so before this a run answered that way took no loop transition until something else wrote its status, and a run with nothing in flight never did.
+
+  **A record an earlier binary left parked** with nothing to reconcile is repaired by the first settle pass that touches it, in one write. `Settle` runs one, and so does any command or exchange the run applies. A read, a refused command and a timer with nothing due do not, so a run with nothing in flight stays as it is until a settle reaches it. A park that still has its ambiguous outcome is not written. A record a re-send left on `WaitingForEffect` is not repaired: that status permits progress, and the next status write corrects it.
+
+  **Two differences on the re-send.** With the gate of a goal evaluation open, re-sending a call that moves the run used to put the run on that gate's wait, `WaitingForApproval` or `WaitingForAuthorization`. It now puts it on `WaitingForEffect`, because a denial or an expiry of that gate writes no status to take the run off it. And re-sending a goal evaluation or a workflow cancel used to put the run on the dispatch wait; it now leaves the run on what it rests on, as it does for a memory promotion and a claim append.
+
+  **Not changed.** A turn that commits while a goal evaluation or a workflow cancel is outstanding is still rested on a wait that counts it, and on the approval wait of an evaluation's gate; and a granted evaluation gate still writes the dispatch wait. Those are the turn's own rules and this entry does not touch them; only the status an answered park leaves is read without them. A workflow cancel that fails still winds its run down. The park itself, the checkpoint and its decisions, and what each answer does to the effect are as they were.
+
 Run the default compatibility matrix:
 
 ```sh

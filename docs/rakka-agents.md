@@ -191,7 +191,18 @@ leaves behind is the same either way.
    changed argument invalidates it. A worker lost after a non-idempotent effect
    was `Started` parks one `Indeterminate` outcome and waits for an explicit,
    deduplicated reconciliation decision — never an automatic re-invocation.
-   Parked runs consume no live task, thread, or timer.
+   Parked runs consume no live task, thread, or timer. When the last
+   ambiguous outcome is answered, a run that is still live and not winding
+   down leaves `WaitingForReconciliation` for the status of what it rests on
+   at that moment: the dispatch wait while a call whose outcome moves the
+   run is outstanding (the model call, a tool call, an A2A send, a workflow
+   start), and `Running` otherwise. A memory promotion, a claim append, a
+   goal evaluation and a workflow cancel are no part of that status. An
+   answer that fails the model call, a tool call or a workflow cancel winds
+   the run down, as that failure always does, `Compensate` winds it down
+   behind the compensation, and `Escalate` keeps the park. A record an
+   earlier binary left parked with nothing to reconcile is repaired by the
+   first settle pass that reaches it.
 6. **Budgets.** Every run holds an escrow ledger: allocations flow down from a
    parent scope in the parent's own transition, settlements and returns flow
    back up through the exchange path, and a `Started` attempt that becomes

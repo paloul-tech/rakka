@@ -811,6 +811,26 @@ impl AgentRun {
                 || self.holds_outside_the_turn_effect(&checkpoint.bound_effect.effect_id))
     }
 
+    /// Whether the record is parked in reconciliation with nothing left to
+    /// reconcile.
+    ///
+    /// A binary before issue #131 left a live run here when its park was
+    /// answered and the answer wrote no status: a memory promotion or a
+    /// claim append confirmed or abandoned, or a tool call confirmed while
+    /// another effect of its turn was out. `WaitingForReconciliation` does
+    /// not permit progress, so such a run takes no loop transition, and one
+    /// with nothing in flight never would again.
+    ///
+    /// The settle pass repairs such a record on the first pass that touches
+    /// it, with `settle_run_disposition`, which is the transition the answer
+    /// should have ended in. Under the fixed transitions the shape is
+    /// unreachable: every transition that can end a park ends in that
+    /// function.
+    pub(crate) fn needs_unpark(&self) -> bool {
+        self.status == AgentRunStatus::WaitingForReconciliation
+            && !self.loop_state.has_indeterminate_effect()
+    }
+
     /// Whether the record holds a park a binary before issue #106 left
     /// unresolvable:
     /// - a live run whose handoff cell the task already answered while the
@@ -2816,6 +2836,16 @@ fn advance_once(
         repair_park(state, policies, now)?;
         return owed_run_exchanges(state, now);
     }
+    if run.needs_unpark() {
+        // A record a binary before issue #131 left parked in reconciliation
+        // after its park was answered: nothing is left to reconcile, and
+        // nothing would ever write its status. The disposition settle takes
+        // it out of the park, as it does for an answer under this binary. A
+        // record that was winding down ends there, and owes what any
+        // terminalization owes ([`AgentRun::needs_unpark`]).
+        settle_run_disposition(state, now)?;
+        return owed_run_exchanges(state, now);
+    }
     if run.needs_turn_rest() {
         // A record a binary before gap slice 3 left wedged: its turn is
         // over and nothing will ever rest it. Rest it here, as the tool arm
@@ -4279,6 +4309,41 @@ fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
     }
 }
 
+/// The status of a live run that is neither parked in reconciliation nor
+/// winding down, read from what it holds: the dispatch wait while an effect
+/// whose outcome moves the run is outstanding, and `Running` otherwise.
+///
+/// The loop's own transitions write this. Committing the model call or the
+/// turn's calls rests the run on the dispatch wait, and everything else a
+/// live run does or waits for (its children, its handoff, the task's
+/// decision on its proposal, a top-up) it does `Running`. A memory
+/// promotion, a claim append, a goal evaluation and a workflow cancel are
+/// committed without a status, and the success of one neither puts the run
+/// on a status nor takes it off one, so they are no part of it
+/// ([`AgentRunEffectKind::moves_the_run`]).
+///
+/// That is what lets a reconciliation park be undone without recording what
+/// it overwrote: [`settle_run_disposition`] asks this when the park ends
+/// (issues #131 and #130).
+///
+/// It is not the status half of [`turn_rest`]. That counts a goal evaluation
+/// and a workflow cancel among the effects a turn awaits, and the gate of an
+/// evaluation among its approval waits, so a turn that commits with either
+/// out is rested on a wait this does not answer. A park that ends in that
+/// state leaves the run on the status it would hold had the evaluation or
+/// the cancel been committed a moment later, which is one that permits
+/// progress.
+fn live_status(loop_state: &AgentLoopState) -> AgentRunStatus {
+    if !loop_state.awaits_effect_that_moves_the_run() {
+        return AgentRunStatus::Running;
+    }
+    match loop_state.approval_family_wait_of_the_run() {
+        Some(AgentCheckpointKind::SecurityAuthorization) => AgentRunStatus::WaitingForAuthorization,
+        Some(_) => AgentRunStatus::WaitingForApproval,
+        None => AgentRunStatus::WaitingForEffect,
+    }
+}
+
 /// Where a turn rests once its planned work is committed or resolved: the
 /// effect wait, the fan-in wait, or completion — the one decision every
 /// turn-completing site shares.
@@ -5301,6 +5366,15 @@ fn apply_effect_outcome(
 /// - a run that is winding down becomes terminal exactly when nothing blocks
 ///   settlement, under the reason recorded when the wind-down began — a run
 ///   cancelled before an effect failed is cancelled, not failed;
+/// - a live run still parked with nothing left to reconcile leaves the park
+///   for the status of what it now rests on ([`live_status`]). The park
+///   overwrote its status, and the outcome that ended the park wrote one
+///   back only if it rested the turn: a memory promotion's, a claim
+///   append's, a goal evaluation's and a workflow cancel's never do, and a
+///   tool call's does not while another effect of the turn is out
+///   (issue #131). The status is read from what the run
+///   holds now and not kept from before the park, because a run can move
+///   while it is parked: a tool result that lands then rests the turn;
 /// - otherwise the run keeps whatever live status the outcome application set.
 fn settle_run_disposition(
     state: &mut AgentRunState,
@@ -5338,6 +5412,9 @@ fn settle_run_disposition(
         return terminate(state, reason, now);
     }
 
+    if run.status == AgentRunStatus::WaitingForReconciliation {
+        run.status = live_status(&run.loop_state);
+    }
     state.updated_at = now;
     Ok(())
 }
@@ -5667,9 +5744,16 @@ fn apply_indeterminate_resolution(
                 }
                 let run = state.run_mut()?;
                 // The terminal status never moves: an ended run's re-sent
-                // generation rides the outbox without a wait status.
+                // generation rides the outbox without a wait status. A live
+                // run takes the status of what it rests on. For a call whose
+                // outcome moves the run that is the dispatch wait, as the
+                // new generation is out. A memory promotion, a claim append,
+                // a goal evaluation or a workflow cancel is not what a run
+                // rests on, so re-sending one leaves the run resting where
+                // it was, and not on a dispatch wait it was never in
+                // (issue #130).
                 if !run.status.is_terminal() {
-                    run.status = checkpoint_wait_status(&run.loop_state);
+                    run.status = live_status(&run.loop_state);
                 }
                 state.updated_at = now;
             }
@@ -6076,7 +6160,12 @@ fn checkpoint_decision_draft(
 /// checkpoint is parked on: the confirming decisions flow through the shared
 /// effect-resolution core, `Compensate` schedules the named compensation and
 /// winds the run down behind it, `Escalate` keeps the wait, and
-/// `AbandonAndFail` fails the run terminally. The decision is deduplicated
+/// `AbandonAndFail` fails the parked generation. What that does to the run
+/// is what that kind's failure always does: the model call's or a tool
+/// call's winds the run down, a fan-out member's send or start becomes a
+/// fan-in disposition, and a memory promotion's, a claim append's or a goal
+/// evaluation's fails the generation only, after which a live run goes on
+/// from what it rests on. The decision is deduplicated
 /// inside the checkpoint on its decision key, so a duplicate submission never
 /// resumes the run twice (scenario 11). A decision for a checkpoint the run no
 /// longer holds, or one that does not fit the checkpoint kind, is refused.
@@ -6224,9 +6313,11 @@ fn resolve_checkpoint(
                 }
             }
             // The operator abandoned the ambiguity: the generation fails under
-            // a truthful code and the run winds down — or finishes the
-            // wind-down a cancellation already began, under that earlier
-            // reason (scenario 57).
+            // a truthful code. For a call the run cannot go on without, the
+            // run winds down, or finishes the wind-down a cancellation
+            // already began, under that earlier reason (scenario 57). A
+            // memory promotion's, a claim append's or a goal evaluation's
+            // failure is kept out of the wind-down, and a live run goes on.
             let abandonment = AgentRunEffectOutcome::failed(
                 "reconciliation-abandoned".to_string(),
                 "the operator abandoned the ambiguous effect".to_string(),
@@ -8837,9 +8928,14 @@ where
             // ([`AgentRun::needs_turn_rest`]). A park a binary before issue
             // #106 left unresolvable is repaired the same way, and so is an
             // ended run's outside-the-turn park (#120)
-            // ([`AgentRun::needs_park_repair`]).
+            // ([`AgentRun::needs_park_repair`]), and a park a binary before
+            // issue #131 left standing after its answer
+            // ([`AgentRun::needs_unpark`]).
             let can_advance = self.state()?.run().is_some_and(|run| {
-                run.can_advance() || run.needs_turn_rest() || run.needs_park_repair()
+                run.can_advance()
+                    || run.needs_turn_rest()
+                    || run.needs_park_repair()
+                    || run.needs_unpark()
             });
             if !can_advance {
                 break;
@@ -8859,7 +8955,13 @@ where
             // acceptance of the model effect it waited on, so the duration
             // spans the passivation, recovery, and shard movement a turn may
             // cross — which a live segment could not.
-            let turn_measurements = (phase == AgentLoopPhase::RecordingTurn.as_label())
+            // A repair step commits without folding the turn, so it is not
+            // the step to measure: the fold that follows it is. Measuring
+            // both counted a record healed at `RecordingTurn` twice.
+            let repairs = self.state()?.run().is_some_and(|run| {
+                run.needs_park_repair() || run.needs_unpark() || run.needs_turn_rest()
+            });
+            let turn_measurements = (!repairs && phase == AgentLoopPhase::RecordingTurn.as_label())
                 .then(|| {
                     self.state().ok().and_then(|state| {
                         state.loop_state().map(|loop_state| {

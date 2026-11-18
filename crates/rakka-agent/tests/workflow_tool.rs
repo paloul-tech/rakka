@@ -1579,3 +1579,356 @@ fn strip_keys(value: &mut serde_json::Value, keys: &[&str]) {
         _ => {}
     }
 }
+
+// ---------------------------------------------------------------------------
+// A live run's reconciliation park, answered (issues #131 and #130).
+// ---------------------------------------------------------------------------
+
+/// The run's phase, status and turn, its outstanding effects by kind and
+/// status, and whether its turn counts one of them.
+async fn run_picture(
+    fixture: &Fixture,
+) -> (
+    AgentLoopPhase,
+    Option<AgentRunStatus>,
+    u64,
+    Vec<(String, String)>,
+    bool,
+) {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let loop_state = state.loop_state().expect("the loop is running");
+    (
+        loop_state.phase(),
+        state.status(),
+        loop_state.turn(),
+        loop_state
+            .outstanding_effects()
+            .map(|effect| {
+                (
+                    effect.kind().as_label().to_string(),
+                    effect.status.as_label().to_string(),
+                )
+            })
+            .collect(),
+        loop_state.awaits_turn_effect(),
+    )
+}
+
+/// Applies `command` to the run.
+async fn apply_to_run(
+    fixture: &Fixture,
+    command: AgentRunEntityCommand,
+) -> rakka_agent::AgentRunEntityReply {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.apply(command, &fixture.router, fixture.now())
+        .await
+        .expect("the command applies")
+}
+
+/// A run resting on its children whose claim append parks and is answered
+/// goes back to resting on them, `Running`, whichever way it is answered.
+#[tokio::test]
+async fn an_answered_park_puts_a_run_resting_on_its_children_back_there() {
+    for answer in ["confirmed", "failed", "not-executed"] {
+        let executor = RecordingWorkflowExecutor::new(StartMode::Started);
+        let fixture = workflow_fixture(executor, workflow_await_turn());
+        fixture.instantiate_agent().await;
+        let space =
+            rakka_agent::KnowledgeSpaceId::new("space-alpha").expect("the space id is valid");
+        let mut spec = goal_spec_with_workflow(None);
+        spec.knowledge_spaces.insert(space.clone());
+        fixture
+            .apply_task_command(goal_task_creation_command(
+                task_definition(),
+                goal_spec_draft(spec, true),
+            ))
+            .await
+            .expect("the goal task should create");
+        fixture.pump().await.expect("the loop should converge");
+        let resting = run_picture(&fixture).await;
+        assert_eq!(
+            (resting.0, resting.1),
+            (
+                AgentLoopPhase::AwaitingChildren,
+                Some(AgentRunStatus::Running)
+            )
+        );
+        apply_to_run(
+            &fixture,
+            AgentRunEntityCommand::AppendClaim {
+                operation_id: rakka_agent::claim_append_operation_id(
+                    &run_scope(),
+                    "beside-the-park",
+                )
+                .expect("the operation id derives"),
+                append: Box::new(rakka_agent::AgentClaimAppendRequest {
+                    space,
+                    subject: "finding".to_string(),
+                    predicate: "links".to_string(),
+                    object: rakka_agent::AgentClaimObjectRequest::Value(
+                        AgentTaskContent::inline(json!({ "note": "observed" }))
+                            .expect("the object is inline-bounded"),
+                    ),
+                    confidence_bps: 5_000,
+                    classification: rakka_agent::MemoryClassification::Unclassified,
+                    evidence: Vec::new(),
+                    requested_by: rakka_agent_workflow::PrincipalRef {
+                        principal_type: "service".to_string(),
+                        principal_id: "researcher".to_string(),
+                        display_name: None,
+                    },
+                }),
+            },
+        )
+        .await;
+        let append = {
+            let mut run = fixture.run();
+            run.recover(fixture.now()).await.expect("recover");
+            let state = run.state().expect("state");
+            state
+                .loop_state()
+                .expect("the loop is running")
+                .effects()
+                .iter()
+                .find(|effect| effect.kind() == rakka_agent::AgentRunEffectKind::ClaimAppendCall)
+                .cloned()
+                .expect("the append is held")
+        };
+        apply_to_run(
+            &fixture,
+            AgentRunEntityCommand::RecordEffectResult {
+                operation_id: append.result_operation_id(&run_scope()).expect("derives"),
+                effect_id: append.effect_id.clone(),
+                generation: append.generation,
+                attempt: append.attempts.saturating_add(1),
+                fence: 0,
+                outcome: Box::new(rakka_agent::AgentRunEffectOutcome::indeterminate(
+                    "dispatcher-lost-after-started",
+                    "the recovery retry was refused",
+                )),
+            },
+        )
+        .await;
+        let parked = run_picture(&fixture).await;
+        assert_eq!(parked.1, Some(AgentRunStatus::WaitingForReconciliation));
+        let resolution = match answer {
+            "confirmed" => rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                outcome: Box::new(rakka_agent::AgentRunEffectOutcome::ClaimAppend {
+                    claim: rakka_agent::AgentCommunalClaimId::new("claim-established")
+                        .expect("the claim id is valid"),
+                }),
+            },
+            "failed" => rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                outcome: Box::new(rakka_agent::AgentRunEffectOutcome::failed(
+                    "claim-refused".to_string(),
+                    "a person found the attempt had failed".to_string(),
+                )),
+            },
+            _ => rakka_agent::AgentEffectResolution::ConfirmedNotExecuted,
+        };
+        apply_to_run(
+            &fixture,
+            AgentRunEntityCommand::ResolveIndeterminateEffect {
+                operation_id: rakka_agent::AgentOperationId::for_agent(
+                    rakka_agent::AgentOperationKind::CheckpointResolution,
+                    &common::agent_scope(),
+                    "park-answer",
+                )
+                .expect("the decision key derives"),
+                effect_id: append.effect_id.clone(),
+                generation: append.generation,
+                resolution: Box::new(resolution),
+                telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+            },
+        )
+        .await;
+        let answered = run_picture(&fixture).await;
+        assert_eq!(
+            (answered.0, answered.1),
+            (resting.0, resting.1),
+            "{answer}: back on its children"
+        );
+    }
+}
+
+/// A run with a straggler's workflow cancel out goes back to `Running` when
+/// a claim append's park is answered.
+///
+/// An `Any` fan-in that resolves on its first child chases the other with a
+/// workflow cancel. The run is not winding down, and the cancel is counted
+/// among its turn's effects, but it was committed without a status and its
+/// success writes none. A status read from it when the park ended put the
+/// run on `WaitingForEffect`, with nothing to take it off again when the
+/// cancel settled.
+#[tokio::test]
+async fn an_answered_park_with_a_stragglers_cancel_out_leaves_the_run_running() {
+    use rakka_agent::testkit::ExchangeFault;
+
+    let executor = RecordingWorkflowExecutor::new(StartMode::Started);
+    let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Invoking two workflows and awaiting any.")
+        .with_tool_call(workflow_call("invoke-1"))
+        .with_tool_call(workflow_call("invoke-2"))
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({}),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first_turn)
+                .with_turn(proposing_turn()),
+        )
+        .with_workflow_start_executor(executor),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_workflow_tools(
+        rakka_agent::AgentRunWorkflowConfig::new()
+            .with_descriptor(common::workflow_tool_descriptor().with_cancellation_support())
+            .expect("the workflow configuration should accept the descriptor"),
+    );
+    fixture.instantiate_agent().await;
+    let space = rakka_agent::KnowledgeSpaceId::new("space-alpha").expect("the space id is valid");
+    let mut spec = goal_spec_with_workflow(Some(rakka_agent::AgentFanInPolicy::Any));
+    spec.knowledge_spaces.insert(space.clone());
+    fixture
+        .apply_task_command(goal_task_creation_command(
+            task_definition(),
+            goal_spec_draft(spec, true),
+        ))
+        .await
+        .expect("the goal task should create");
+    fixture.pump().await.expect("the loop should converge");
+
+    let (_, cells) = held_starts(&fixture).await;
+    assert_eq!(cells.len(), 2, "two invocations");
+    let first = cells.keys().next().expect("one").clone();
+    deliver_result(
+        &fixture,
+        &first,
+        child_workflow_run_id(&first),
+        AgentWorkflowTerminalStatus::Completed,
+    )
+    .await
+    .expect("the first child's result records");
+
+    // The proposal's deliveries are lost from here on, so the run rests on it.
+    for _ in 0..64 {
+        fixture.task_transport.inject(ExchangeFault::LoseEnvelope);
+    }
+    drive_model_turn_only(&fixture).await;
+    let resting = run_picture(&fixture).await;
+    let snapshot = fixture.run_snapshot().await.expect("the run exists");
+    assert!(snapshot.proposal.is_some(), "the run rests on its proposal");
+    assert!(
+        snapshot.terminal_reason.is_none(),
+        "and is not winding down"
+    );
+    assert_eq!(
+        resting.1,
+        Some(AgentRunStatus::Running),
+        "it rests `Running`"
+    );
+    assert!(
+        resting
+            .3
+            .iter()
+            .any(|(kind, _)| kind == "workflow-cancel-call"),
+        "with the straggler's cancel out: {:?}",
+        resting.3
+    );
+    assert!(resting.4, "which its turn counts among its effects");
+
+    // A claim append parks and is confirmed.
+    let reply = apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::AppendClaim {
+            operation_id: rakka_agent::claim_append_operation_id(&run_scope(), "beside-the-park")
+                .expect("the operation id derives"),
+            append: Box::new(rakka_agent::AgentClaimAppendRequest {
+                space,
+                subject: "finding".to_string(),
+                predicate: "links".to_string(),
+                object: rakka_agent::AgentClaimObjectRequest::Value(
+                    AgentTaskContent::inline(json!({ "note": "observed" }))
+                        .expect("the object is inline-bounded"),
+                ),
+                confidence_bps: 5_000,
+                classification: rakka_agent::MemoryClassification::Unclassified,
+                evidence: Vec::new(),
+                requested_by: rakka_agent_workflow::PrincipalRef {
+                    principal_type: "service".to_string(),
+                    principal_id: "researcher".to_string(),
+                    display_name: None,
+                },
+            }),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply, rakka_agent::AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    let append = {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        let state = run.state().expect("state");
+        state
+            .loop_state()
+            .expect("the loop is running")
+            .effects()
+            .iter()
+            .find(|effect| effect.kind() == rakka_agent::AgentRunEffectKind::ClaimAppendCall)
+            .cloned()
+            .expect("the append is held")
+    };
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: append.result_operation_id(&run_scope()).expect("derives"),
+            effect_id: append.effect_id.clone(),
+            generation: append.generation,
+            attempt: append.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the recovery retry was refused",
+            )),
+        },
+    )
+    .await;
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::ResolveIndeterminateEffect {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "park-confirmed",
+            )
+            .expect("the decision key derives"),
+            effect_id: append.effect_id.clone(),
+            generation: append.generation,
+            resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                outcome: Box::new(rakka_agent::AgentRunEffectOutcome::ClaimAppend {
+                    claim: rakka_agent::AgentCommunalClaimId::new("claim-established")
+                        .expect("the claim id is valid"),
+                }),
+            }),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await;
+    let answered = run_picture(&fixture).await;
+    assert_eq!(
+        (answered.0, answered.1),
+        (resting.0, resting.1),
+        "the answered park puts the run back where it rested"
+    );
+}

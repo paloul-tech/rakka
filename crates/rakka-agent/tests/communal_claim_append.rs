@@ -1609,3 +1609,389 @@ async fn a_cancel_settles_a_gated_claim_append_with_its_gate() {
         assert!(executor.invocations().is_empty(), "{at}: no claim landed");
     }
 }
+
+// ---------------------------------------------------------------------------
+// A live run's reconciliation park, answered (issues #131 and #130).
+// ---------------------------------------------------------------------------
+
+/// A live run parked on a claim append goes back to its tool wait when the
+/// park is answered, whichever way it is answered.
+///
+/// A claim append is outside the turn, so no arm of its outcome writes the
+/// run's status. Confirmed or failed, the run was left parked with nothing
+/// to reconcile (issue #131). The promotion suite walks every rest and both
+/// doors; this is the other kind held outside the turn, at one rest.
+#[tokio::test]
+async fn an_answered_claim_append_park_puts_a_live_run_back_on_its_tool_wait() {
+    let confirmed = || rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+        outcome: Box::new(AgentRunEffectOutcome::ClaimAppend {
+            claim: AgentCommunalClaimId::new("claim-established").expect("the claim id is valid"),
+        }),
+    };
+    let failed = || rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+        outcome: Box::new(AgentRunEffectOutcome::failed(
+            "claim-refused".to_string(),
+            "a person found the attempt had failed".to_string(),
+        )),
+    };
+    let not_executed = || rakka_agent::AgentEffectResolution::ConfirmedNotExecuted;
+    let answers: [(&str, &dyn Fn() -> rakka_agent::AgentEffectResolution); 3] = [
+        ("confirmed", &confirmed),
+        ("failed", &failed),
+        ("not-executed", &not_executed),
+    ];
+
+    for (at, resolution) in answers {
+        let (fx, _executor, _tool, _append) = mid_turn_appending_world().await;
+        let (phase, status, turn, _) = resting_at(&fx).await;
+        assert_eq!(
+            (phase, status),
+            (
+                rakka_agent::AgentLoopPhase::AwaitingTools,
+                AgentRunStatus::WaitingForEffect
+            ),
+            "{at}: the tool is in flight"
+        );
+
+        let parked = resolve_claim_append(
+            &fx,
+            AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the recovery retry was refused",
+            ),
+        )
+        .await;
+        assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate, "{at}");
+        let (parked_phase, parked_status, _, _) = resting_at(&fx).await;
+        assert_eq!(
+            (parked_phase, parked_status),
+            (phase, AgentRunStatus::WaitingForReconciliation),
+            "{at}: the park"
+        );
+
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("recover");
+        let reply = run
+            .apply(
+                AgentRunEntityCommand::ResolveIndeterminateEffect {
+                    operation_id: AgentOperationId::for_agent(
+                        AgentOperationKind::CheckpointResolution,
+                        &common::agent_scope(),
+                        at,
+                    )
+                    .expect("the decision key derives"),
+                    effect_id: parked.effect_id.clone(),
+                    generation: parked.generation,
+                    resolution: Box::new(resolution()),
+                    telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+                },
+                &fx.router,
+                fx.now(),
+            )
+            .await
+            .expect("the park is answered");
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{at}: {reply:?}"
+        );
+
+        let (after_phase, after_status, after_turn, _) = resting_at(&fx).await;
+        assert_eq!(
+            (after_phase, after_status, after_turn),
+            (phase, status, turn),
+            "{at}: the run is back on its tool wait"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// An answered park beside a human review of the goal (issue #131's review).
+// ---------------------------------------------------------------------------
+
+/// The run's phase, status and turn, and how many effects are outstanding and
+/// how many checkpoints wait.
+async fn run_picture(
+    fx: &Fixture,
+) -> (
+    rakka_agent::AgentLoopPhase,
+    AgentRunStatus,
+    u64,
+    usize,
+    usize,
+) {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let loop_state = state.loop_state().expect("the loop is started");
+    (
+        loop_state.phase(),
+        state.status().expect("the run exists"),
+        loop_state.turn(),
+        loop_state.outstanding_effects().count(),
+        loop_state
+            .open_checkpoints()
+            .iter()
+            .filter(|checkpoint| checkpoint.status.is_waiting())
+            .count(),
+    )
+}
+
+/// Applies `command` to the run.
+async fn apply_to_run(fx: &Fixture, command: AgentRunEntityCommand) -> AgentRunEntityReply {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    run.apply(command, &fx.router, fx.now())
+        .await
+        .expect("the command applies")
+}
+
+/// A human review of the goal, which is always gated.
+fn human_review_command() -> AgentRunEntityCommand {
+    let mut request = common::goal_evaluation_request(rakka_agent::AgentRevisionNumber::INITIAL);
+    request.method = rakka_agent::AgentGoalEvaluationMethod::HumanReview;
+    AgentRunEntityCommand::EvaluateGoal {
+        operation_id: rakka_agent::evaluation_operation_id(&common::run_scope(), "beside-the-park")
+            .expect("the operation id derives"),
+        evaluation: Box::new(request),
+    }
+}
+
+/// The one approval gate the run holds open.
+async fn the_review_gate(fx: &Fixture) -> AgentCheckpoint {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let gates: Vec<AgentCheckpoint> = state
+        .loop_state()
+        .expect("the loop is started")
+        .open_checkpoints()
+        .iter()
+        .filter(|checkpoint| {
+            checkpoint.status.is_waiting() && checkpoint.kind == AgentCheckpointKind::Approval
+        })
+        .cloned()
+        .collect();
+    assert_eq!(gates.len(), 1, "one approval gate: {gates:?}");
+    gates.into_iter().next().expect("one gate")
+}
+
+/// A denial of `gate`.
+fn deny_command(gate: &AgentCheckpoint) -> AgentRunEntityCommand {
+    AgentRunEntityCommand::ResolveCheckpoint {
+        operation_id: AgentOperationId::for_agent(
+            AgentOperationKind::CheckpointResolution,
+            &common::agent_scope(),
+            "review-denied",
+        )
+        .expect("the decision key derives"),
+        checkpoint_id: gate.checkpoint_id.clone(),
+        resolver: PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "goal-approver".to_string(),
+            display_name: None,
+        },
+        decision: Box::new(rakka_agent::AgentCheckpointDecision::Approval(
+            rakka_agent::AgentApprovalDecision::Deny {
+                reason: "not convinced".to_string(),
+            },
+        )),
+        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+    }
+}
+
+/// A run whose claim append parked and was confirmed ends where a run whose
+/// append landed normally ends, with a human review of its goal open.
+///
+/// The review's gate is an approval wait of the turn, but denying it moves
+/// no status: the evaluation fails, and a failed evaluation writes none. A
+/// status read from that gate when the park ended left the run on
+/// `WaitingForApproval`, which does not permit progress, and once the
+/// review was denied, with no gate and nothing in flight, for good. Both worlds see the tool result land and the review
+/// denied.
+#[tokio::test]
+async fn an_answered_park_with_a_human_review_open_ends_where_an_unparked_run_ends() {
+    let mut endings = Vec::new();
+    for parked in [false, true] {
+        let (fx, _executor, tool, append) = mid_turn_appending_world().await;
+        let reply = apply_to_run(&fx, human_review_command()).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{reply:?}"
+        );
+
+        if parked {
+            let held = resolve_claim_append(
+                &fx,
+                AgentRunEffectOutcome::indeterminate(
+                    "dispatcher-lost-after-started",
+                    "the recovery retry was refused",
+                ),
+            )
+            .await;
+            assert_eq!(held.status, AgentRunEffectStatus::Indeterminate);
+            let reply = apply_to_run(
+                &fx,
+                AgentRunEntityCommand::ResolveIndeterminateEffect {
+                    operation_id: AgentOperationId::for_agent(
+                        AgentOperationKind::CheckpointResolution,
+                        &common::agent_scope(),
+                        "park-confirmed",
+                    )
+                    .expect("the decision key derives"),
+                    effect_id: held.effect_id.clone(),
+                    generation: held.generation,
+                    resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                        outcome: Box::new(AgentRunEffectOutcome::ClaimAppend {
+                            claim: AgentCommunalClaimId::new("claim-established")
+                                .expect("the claim id is valid"),
+                        }),
+                    }),
+                    telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(reply, AgentRunEntityReply::Applied { .. }),
+                "{reply:?}"
+            );
+        } else {
+            answer_append(&fx, &append).await;
+        }
+
+        let reply = answer_effect(&fx, &tool).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{reply:?}"
+        );
+
+        let gate = the_review_gate(&fx).await;
+        let reply = apply_to_run(&fx, deny_command(&gate)).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{reply:?}"
+        );
+
+        for _ in 0..3 {
+            settle(&fx).await;
+        }
+        let ending = run_picture(&fx).await;
+        let snapshot = fx.run_snapshot().await.expect("the run exists");
+        assert!(
+            snapshot.terminal_reason.is_none(),
+            "parked={parked}: the run is live and not winding down"
+        );
+        endings.push(ending);
+    }
+    assert_eq!(
+        endings[0], endings[1],
+        "the run whose append parked and was confirmed ends where the control run ends"
+    );
+    assert_eq!(
+        (endings[0].0, endings[0].1, endings[0].2),
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            AgentRunStatus::WaitingForEffect,
+            2
+        ),
+        "and that is turn two's model call, not a place both are stuck"
+    );
+}
+
+/// The same with the model result landing during the park, so the park ends
+/// at a phase the loop advances from: the answered run goes on as the run
+/// that never parked does.
+#[tokio::test]
+async fn an_answered_park_at_an_advancing_phase_with_a_human_review_open_goes_on() {
+    let mut before_denial = Vec::new();
+    let mut endings = Vec::new();
+    for parked in [false, true] {
+        let fx = scripted_goal_fixture(RecordingClaimAppendExecutor::new()).await;
+        settle(&fx).await;
+        let reply = apply_to_run(&fx, human_review_command()).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{reply:?}"
+        );
+        apply_append(&fx, "beside-the-review", append_request("space-alpha"))
+            .await
+            .expect("the append applies");
+        settle(&fx).await;
+        let append = dispatched_effect(&fx, AgentRunEffectKind::ClaimAppendCall).await;
+        let model = dispatched_effect(&fx, AgentRunEffectKind::ModelCall).await;
+
+        let held = if parked {
+            let held = resolve_claim_append(
+                &fx,
+                AgentRunEffectOutcome::indeterminate(
+                    "dispatcher-lost-after-started",
+                    "the recovery retry was refused",
+                ),
+            )
+            .await;
+            Some(held)
+        } else {
+            answer_append(&fx, &append).await;
+            None
+        };
+
+        let reply = answer_effect(&fx, &model).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{reply:?}"
+        );
+
+        if let Some(held) = held {
+            let reply = apply_to_run(
+                &fx,
+                AgentRunEntityCommand::ResolveIndeterminateEffect {
+                    operation_id: AgentOperationId::for_agent(
+                        AgentOperationKind::CheckpointResolution,
+                        &common::agent_scope(),
+                        "park-confirmed",
+                    )
+                    .expect("the decision key derives"),
+                    effect_id: held.effect_id.clone(),
+                    generation: held.generation,
+                    resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                        outcome: Box::new(AgentRunEffectOutcome::ClaimAppend {
+                            claim: AgentCommunalClaimId::new("claim-established")
+                                .expect("the claim id is valid"),
+                        }),
+                    }),
+                    telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(reply, AgentRunEntityReply::Applied { .. }),
+                "{reply:?}"
+            );
+        }
+        for _ in 0..3 {
+            settle(&fx).await;
+        }
+        let picture = run_picture(&fx).await;
+        before_denial.push(picture);
+
+        let gate = the_review_gate(&fx).await;
+        let reply = apply_to_run(&fx, deny_command(&gate)).await;
+        assert!(
+            matches!(reply, AgentRunEntityReply::Applied { .. }),
+            "{reply:?}"
+        );
+        for _ in 0..3 {
+            settle(&fx).await;
+        }
+        let ending = run_picture(&fx).await;
+        endings.push(ending);
+    }
+    assert_eq!(
+        (before_denial[0], endings[0]),
+        (before_denial[1], endings[1]),
+        "the parked-and-answered run goes where the control run goes"
+    );
+    assert_eq!(
+        endings[0].2, 2,
+        "and that is on to turn two, not a place both are stuck"
+    );
+}
