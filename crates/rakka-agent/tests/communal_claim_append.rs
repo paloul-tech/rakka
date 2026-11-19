@@ -1995,3 +1995,638 @@ async fn an_answered_park_at_an_advancing_phase_with_a_human_review_open_goes_on
         "and that is on to turn two, not a place both are stuck"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A review of the goal granted off the dispatch wait (issue #166).
+// ---------------------------------------------------------------------------
+
+/// A grant of `gate`.
+fn grant_command(gate: &AgentCheckpoint) -> AgentRunEntityCommand {
+    AgentRunEntityCommand::ResolveCheckpoint {
+        operation_id: AgentOperationId::for_agent(
+            AgentOperationKind::CheckpointResolution,
+            &common::agent_scope(),
+            "review-granted",
+        )
+        .expect("the decision key derives"),
+        checkpoint_id: gate.checkpoint_id.clone(),
+        resolver: PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "goal-approver".to_string(),
+            display_name: None,
+        },
+        decision: Box::new(rakka_agent::AgentCheckpointDecision::Approval(
+            rakka_agent::AgentApprovalDecision::Approve {
+                credential_binding: None,
+                expires_at: rakka_agent_workflow::AgentTimestampMillis::new(1_000_000),
+                allowed_use_count: 1,
+            },
+        )),
+        telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+    }
+}
+
+/// Issue #166: a review of the goal granted while the run rests on its
+/// proposal puts the run on no dispatch wait. The grant used to write
+/// `WaitingForEffect`, and nothing an evaluation does afterwards writes a
+/// status, so the run reported a dispatch wait while it waited for the task.
+#[tokio::test]
+async fn a_review_granted_while_the_run_rests_on_its_proposal_leaves_its_status() {
+    use rakka_agent::testkit::ExchangeFault;
+
+    let fx = scripted_goal_fixture(RecordingClaimAppendExecutor::new()).await;
+    settle(&fx).await;
+    drive(&fx).await;
+    settle(&fx).await;
+    // Turn two proposes, and the proposal's deliveries are lost for the rest
+    // of the test, so the run rests on its proposal.
+    for _ in 0..64 {
+        fx.task_transport.inject(ExchangeFault::LoseEnvelope);
+    }
+    drive(&fx).await;
+    settle(&fx).await;
+    let resting = fx.run_snapshot().await.expect("the run exists");
+    assert!(resting.proposal.is_some(), "the run rests on its proposal");
+    assert_eq!(resting.status, AgentRunStatus::Running);
+
+    apply_to_run(&fx, human_review_command()).await;
+    let gate = the_review_gate(&fx).await;
+    assert_eq!(
+        run_picture(&fx).await.1,
+        AgentRunStatus::Running,
+        "an open review moves no status"
+    );
+
+    apply_to_run(&fx, grant_command(&gate)).await;
+    let granted = run_picture(&fx).await;
+    assert_eq!(
+        (granted.1, granted.4),
+        (AgentRunStatus::Running, 0),
+        "the grant closes the gate and puts the run on no dispatch wait"
+    );
+    settle(&fx).await;
+    assert_eq!(run_picture(&fx).await.1, AgentRunStatus::Running);
+    assert!(
+        fx.run_snapshot()
+            .await
+            .expect("the run exists")
+            .proposal
+            .is_some(),
+        "the run still rests on its proposal"
+    );
+}
+
+/// A gate outside the turn does not hold the run's wait. A review of the
+/// goal holds a turn on its approval wait, and a claim append the deployment
+/// gates opens an approval of its own beside it, which was never the run's
+/// wait. When the review is denied the run goes on, with the append's gate
+/// still open.
+#[tokio::test]
+async fn a_denied_review_releases_the_run_with_a_claim_appends_gate_still_open() {
+    let executor = RecordingClaimAppendExecutor::new();
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, common::proposing_turn()),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    )
+    .with_claim_append_executor(executor);
+    let mut fx = Fixture::new(dispatcher);
+    fx.policies = rakka_agent::AgentEffectPolicies::new()
+        .with_claim_append_spec(
+            rakka_agent::AgentEffectSpec::idempotent(3)
+                .expect("the spec is valid")
+                .with_checkpoint_required(),
+        )
+        .expect("the policies are valid");
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec();
+    spec.knowledge_spaces.insert(space("space-alpha"));
+    fx.apply_task_command(goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(spec, true),
+    ))
+    .await
+    .expect("the goal task creates");
+    settle(&fx).await;
+
+    // The review is open when the turn commits its tool call, so the run is
+    // on the review's approval wait.
+    apply_to_run(&fx, human_review_command()).await;
+    let review = the_review_gate(&fx).await;
+    drive(&fx).await;
+    settle(&fx).await;
+    let reply = apply_append(&fx, "beside-the-review", append_request("space-alpha"))
+        .await
+        .expect("the append applies");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+    let held = run_picture(&fx).await;
+    assert_eq!(
+        (held.0, held.1, held.2, held.4),
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            AgentRunStatus::WaitingForApproval,
+            1,
+            2
+        ),
+        "the run is on the review's wait, with the append's gate open beside it"
+    );
+    let tool = dispatched_effect(&fx, AgentRunEffectKind::ToolCall).await;
+    answer_effect(&fx, &tool).await;
+
+    apply_to_run(&fx, deny_command(&review)).await;
+
+    let ending = run_picture(&fx).await;
+    assert_eq!(
+        (ending.0, ending.1, ending.2, ending.4),
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            AgentRunStatus::WaitingForEffect,
+            2,
+            1
+        ),
+        "the run goes on to its next turn, and the append's gate still waits"
+    );
+}
+
+/// A turn held for a review of the goal, whose claim append parked and was
+/// answered. The park overwrote the review's approval wait, and its end
+/// leaves the run `Running`: the status a park's end writes does not read a
+/// goal evaluation's gate (issue #131). Returned with the review's gate
+/// still open.
+async fn held_turn_after_an_answered_park() -> (Fixture, AgentCheckpoint) {
+    let executor = RecordingClaimAppendExecutor::new();
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, common::proposing_turn()),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    )
+    .with_claim_append_executor(executor);
+    let fx = Fixture::new(dispatcher);
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec();
+    spec.knowledge_spaces.insert(space("space-alpha"));
+    fx.apply_task_command(goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(spec, true),
+    ))
+    .await
+    .expect("the goal task creates");
+    settle(&fx).await;
+
+    apply_to_run(&fx, human_review_command()).await;
+    let review = the_review_gate(&fx).await;
+    drive(&fx).await;
+    settle(&fx).await;
+    apply_append(&fx, "beside-the-review", append_request("space-alpha"))
+        .await
+        .expect("the append applies");
+    settle(&fx).await;
+    let tool = dispatched_effect(&fx, AgentRunEffectKind::ToolCall).await;
+    answer_effect(&fx, &tool).await;
+
+    let parked = resolve_claim_append(
+        &fx,
+        AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the recovery retry was refused",
+        ),
+    )
+    .await;
+    assert_eq!(parked.status, AgentRunEffectStatus::Indeterminate);
+    assert_eq!(
+        run_picture(&fx).await.1,
+        AgentRunStatus::WaitingForReconciliation
+    );
+    apply_to_run(
+        &fx,
+        AgentRunEntityCommand::ResolveIndeterminateEffect {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "park-confirmed",
+            )
+            .expect("the decision key derives"),
+            effect_id: parked.effect_id.clone(),
+            generation: parked.generation,
+            resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                outcome: Box::new(AgentRunEffectOutcome::ClaimAppend {
+                    claim: AgentCommunalClaimId::new("claim-established")
+                        .expect("the claim id is valid"),
+                }),
+            }),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await;
+    settle(&fx).await;
+    let held = run_picture(&fx).await;
+    assert_eq!(
+        (held.0, held.1, held.2, held.4),
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            AgentRunStatus::Running,
+            1,
+            1
+        ),
+        "the turn is held for the review, and the park's end left it `Running`"
+    );
+    (fx, review)
+}
+
+/// A grant recomputes the dispatch wait by where the run rests, not by the
+/// status it has. A held turn that a park's end left `Running` is at a
+/// dispatch rest: the review's grant dispatches the evaluation and puts the
+/// run on the effect wait, as it did before issue #166, and the evaluation's
+/// result lets the run go on.
+#[tokio::test]
+async fn a_review_granted_on_a_held_turn_that_is_running_puts_it_on_the_effect_wait() {
+    let (fx, review) = held_turn_after_an_answered_park().await;
+
+    apply_to_run(&fx, grant_command(&review)).await;
+    settle(&fx).await;
+    let granted = run_picture(&fx).await;
+    assert_eq!(
+        (granted.0, granted.1, granted.2, granted.4),
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            AgentRunStatus::WaitingForEffect,
+            1,
+            0
+        ),
+        "the turn is held for the evaluation the grant released, on the effect wait"
+    );
+
+    let evaluation = dispatched_effect(&fx, AgentRunEffectKind::GoalEvaluationCall).await;
+    answer_effect(&fx, &evaluation).await;
+    let ending = run_picture(&fx).await;
+    assert_eq!(
+        (ending.0, ending.1, ending.2),
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            AgentRunStatus::WaitingForEffect,
+            2
+        ),
+        "the run goes on to its next turn"
+    );
+}
+
+/// The same held turn with its review denied: the run is on a status that
+/// permits progress, so the settle pass rests the turn and the run goes on.
+#[tokio::test]
+async fn a_review_denied_on_a_held_turn_that_is_running_lets_the_turn_go_on() {
+    let (fx, review) = held_turn_after_an_answered_park().await;
+
+    apply_to_run(&fx, deny_command(&review)).await;
+
+    let ending = run_picture(&fx).await;
+    assert_eq!(
+        (ending.0, ending.1, ending.2, ending.4),
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            AgentRunStatus::WaitingForEffect,
+            2,
+            0
+        ),
+        "the run goes on to its next turn"
+    );
+}
+
+/// The forged-record matrix of issue #166: every wait a record can be left
+/// on, against every set of gates it can hold.
+mod forged_waits {
+    use super::*;
+    use rakka_persistence::DurableStateStore;
+
+    /// The gate one effect is behind.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Gate {
+        None,
+        Approval,
+        Authorization,
+    }
+
+    /// Where the run rests when its record is forged.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Rest {
+        /// `AwaitingTools`, with the turn's tool call out.
+        ToolOut,
+        /// `AwaitingTools`, the tool landed and the turn held for a review.
+        Held,
+        /// `AwaitingModel` of turn two.
+        ModelCall,
+        /// `DecidingContinuation`, with the proposal out.
+        Proposal,
+    }
+
+    fn behind(spec: rakka_agent::AgentEffectSpec, gate: Gate) -> rakka_agent::AgentEffectSpec {
+        match gate {
+            Gate::None => spec,
+            Gate::Approval => spec.with_checkpoint_required(),
+            Gate::Authorization => spec.with_authorization_required(),
+        }
+    }
+
+    /// A goal-bearing run at `rest`, its tool call behind `tool`, a review of
+    /// the goal commanded when `review` is not `None` (behind an approval,
+    /// which a review always is, or with a security authorization the spec
+    /// adds), and a claim append commanded behind `claim` when that is not
+    /// `None`.
+    pub(super) async fn world(rest: Rest, tool: Gate, review: Gate, claim: Gate) -> Fixture {
+        use rakka_agent::testkit::ExchangeFault;
+
+        let dispatcher = ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn_for(1, tool_calling_turn("lookup"))
+                .with_turn_for(2, common::proposing_turn()),
+        )
+        .with_tool_result(
+            "lookup",
+            AgentTaskContent::inline(json!({ "found": true }))
+                .expect("the tool result is inline-bounded"),
+        )
+        .with_claim_append_executor(RecordingClaimAppendExecutor::new());
+        let mut fx = Fixture::new(dispatcher);
+        let base = rakka_agent::AgentEffectPolicies::new();
+        let evaluation_spec = base
+            .spec_for(&rakka_agent::AgentRunEffectRequest::Evaluation {
+                evaluation: Box::new(common::goal_evaluation_request(
+                    rakka_agent::AgentRevisionNumber::INITIAL,
+                )),
+            })
+            .clone();
+        let evaluation_spec = if review == Gate::Authorization {
+            evaluation_spec.with_authorization_required()
+        } else {
+            evaluation_spec
+        };
+        fx.policies = base
+            .with_tool_spec(
+                rakka_agent::AgentToolId::new("lookup").expect("the tool id is valid"),
+                behind(rakka_agent::AgentEffectSpec::non_idempotent(), tool),
+            )
+            .expect("the tool spec is valid")
+            .with_claim_append_spec(behind(
+                rakka_agent::AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+                claim,
+            ))
+            .expect("the claim append spec is valid")
+            .with_goal_evaluation_spec(evaluation_spec)
+            .expect("the evaluation spec is valid");
+        fx.instantiate_agent().await;
+        let mut spec = goal_spec();
+        spec.knowledge_spaces.insert(space("space-alpha"));
+        fx.apply_task_command(goal_task_creation_command(
+            task_definition(),
+            goal_spec_draft(spec, true),
+        ))
+        .await
+        .expect("the goal task creates");
+        settle(&fx).await;
+
+        // A review commanded before the turn commits is the turn's approval
+        // wait; one commanded after it moves no status.
+        let before_the_turn = matches!(rest, Rest::ToolOut | Rest::Held);
+        if review != Gate::None && before_the_turn {
+            apply_to_run(&fx, human_review_command()).await;
+        }
+        drive(&fx).await;
+        settle(&fx).await;
+        if rest != Rest::ToolOut {
+            assert_eq!(tool, Gate::None, "a tool call that lands is not gated");
+            let call = dispatched_effect(&fx, AgentRunEffectKind::ToolCall).await;
+            answer_effect(&fx, &call).await;
+            settle(&fx).await;
+        }
+        if rest == Rest::Proposal {
+            for _ in 0..256 {
+                fx.task_transport.inject(ExchangeFault::LoseEnvelope);
+            }
+            drive(&fx).await;
+            settle(&fx).await;
+            assert!(
+                fx.run_snapshot()
+                    .await
+                    .expect("the run exists")
+                    .proposal
+                    .is_some(),
+                "the run rests on its proposal"
+            );
+        }
+        if review != Gate::None && !before_the_turn {
+            apply_to_run(&fx, human_review_command()).await;
+        }
+        if claim != Gate::None {
+            apply_append(&fx, "forged", append_request("space-alpha"))
+                .await
+                .expect("the append applies");
+        }
+        settle(&fx).await;
+        settle(&fx).await;
+        fx
+    }
+
+    /// The stored run state and its revision.
+    pub(super) async fn stored(fx: &Fixture) -> (rakka_agent::AgentRunState, u64) {
+        let record = fx
+            .runs
+            .load(&common::run_scope().persistence_id())
+            .await
+            .expect("the run record loads")
+            .expect("the run record exists");
+        (record.state, record.revision.get())
+    }
+
+    /// Writes `status` onto the stored record. With `dropped`, the effect of
+    /// that kind is removed from the loop and its gate left, as nothing in
+    /// this binary leaves one.
+    pub(super) async fn forge(
+        fx: &Fixture,
+        status: AgentRunStatus,
+        dropped: Option<AgentRunEffectKind>,
+    ) {
+        let id = common::run_scope().persistence_id();
+        let record = fx
+            .runs
+            .load(&id)
+            .await
+            .expect("the run record loads")
+            .expect("the run record exists");
+        let dropped_id = dropped.and_then(|kind| {
+            record
+                .state
+                .loop_state()
+                .expect("the loop is started")
+                .effects()
+                .iter()
+                .find(|effect| effect.kind() == kind)
+                .map(|effect| serde_json::to_value(&effect.effect_id).expect("the id serializes"))
+        });
+        let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+        value["run"]["status"] = serde_json::to_value(status).expect("the status serializes");
+        if let Some(dropped_id) = dropped_id {
+            value["run"]["loop_state"]["effects"]
+                .as_array_mut()
+                .expect("the effects are an array")
+                .retain(|effect| effect["effect_id"] != dropped_id);
+        }
+        let rewritten = serde_json::from_value(value).expect("the rewritten record deserializes");
+        fx.runs
+            .compare_and_set(&id, record.revision, rewritten)
+            .await
+            .expect("the rewritten record persists");
+    }
+
+    /// The kind of gate `status` is the wait of.
+    pub(super) fn gate_kind_of(status: AgentRunStatus) -> Option<AgentCheckpointKind> {
+        match status {
+            AgentRunStatus::WaitingForApproval => Some(AgentCheckpointKind::Approval),
+            AgentRunStatus::WaitingForAuthorization => {
+                Some(AgentCheckpointKind::SecurityAuthorization)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a waiting gate of `kind` holds the run's wait, written out
+    /// from the public surface: any but one on an effect held outside the
+    /// turn.
+    pub(super) fn held(state: &rakka_agent::AgentRunState, kind: AgentCheckpointKind) -> bool {
+        let loop_state = state.loop_state().expect("the loop is started");
+        loop_state.open_checkpoints().iter().any(|checkpoint| {
+            checkpoint.status.is_waiting()
+                && checkpoint.kind == kind
+                && !loop_state.effects().iter().any(|effect| {
+                    effect.effect_id == checkpoint.bound_effect.effect_id
+                        && effect.kind().outside_the_turn()
+                })
+        })
+    }
+}
+
+/// Issue #166's release has no fixed point and leaves nothing stale. Every
+/// combination of gates a run can hold at four rests is built, each of the
+/// two waits is forged onto the stored record, with and without an effect
+/// dropped from under its gate, and four settle passes are run with the
+/// stored revision read after each.
+///
+/// - A wait that a gate of its kind holds is not written.
+/// - A wait that none holds is released by the first pass.
+/// - No pass after the first writes.
+/// - No record is left on a wait no gate of its kind holds.
+/// - No turn is left with nothing out, free to go on, and not rested.
+/// - A record released while the run rests on its proposal takes the status
+///   it had there, and not a dispatch wait.
+///
+/// A first build judged a wait against the wait the turn's gates add up to,
+/// and rewrote a standing wait 32 times in each pass.
+#[tokio::test]
+async fn no_forged_wait_is_written_twice_or_left_stale() {
+    use forged_waits::{forge, gate_kind_of, held, stored, world, Gate, Rest};
+
+    let gates = [Gate::None, Gate::Approval, Gate::Authorization];
+    let mut records = 0;
+    let mut released_at_the_proposal = 0;
+    for rest in [Rest::ToolOut, Rest::Held, Rest::ModelCall, Rest::Proposal] {
+        for tool in gates {
+            if rest != Rest::ToolOut && tool != Gate::None {
+                continue;
+            }
+            for review in gates {
+                if rest == Rest::Held && review == Gate::None {
+                    continue;
+                }
+                for claim in gates {
+                    for dropped in [
+                        None,
+                        Some(AgentRunEffectKind::ClaimAppendCall),
+                        Some(AgentRunEffectKind::GoalEvaluationCall),
+                        Some(AgentRunEffectKind::ToolCall),
+                    ] {
+                        let absent = match dropped {
+                            Some(AgentRunEffectKind::ClaimAppendCall) => claim == Gate::None,
+                            Some(AgentRunEffectKind::GoalEvaluationCall) => review == Gate::None,
+                            Some(_) => rest != Rest::ToolOut,
+                            None => false,
+                        };
+                        if absent {
+                            continue;
+                        }
+                        for forged in [
+                            AgentRunStatus::WaitingForApproval,
+                            AgentRunStatus::WaitingForAuthorization,
+                        ] {
+                            let fx = world(rest, tool, review, claim).await;
+                            let natural =
+                                stored(&fx).await.0.status().expect("the run has a status");
+                            forge(&fx, forged, dropped).await;
+                            let (before, mut revision) = stored(&fx).await;
+                            let is_held =
+                                held(&before, gate_kind_of(forged).expect("a gate's wait"));
+                            let at = format!(
+                                "{rest:?}, tool {tool:?}, review {review:?}, claim {claim:?}, \
+                                 dropped {dropped:?}, forged {forged}"
+                            );
+
+                            for pass in 1..=4 {
+                                settle(&fx).await;
+                                let (state, next) = stored(&fx).await;
+                                let status = state.status().expect("the run has a status");
+                                let wrote = next != revision;
+                                revision = next;
+                                if pass == 1 && is_held {
+                                    assert!(!wrote, "{at}: a held wait was written");
+                                    assert_eq!(status, forged, "{at}: a held wait moved");
+                                } else if pass == 1 {
+                                    assert_ne!(status, forged, "{at}: the wait was not released");
+                                    if rest == Rest::Proposal {
+                                        assert_eq!(
+                                            status, natural,
+                                            "{at}: released to the status the run had"
+                                        );
+                                        released_at_the_proposal += 1;
+                                    }
+                                } else {
+                                    assert!(!wrote, "{at}: pass {pass} wrote again");
+                                }
+                                if let Some(kind) = gate_kind_of(status) {
+                                    assert!(
+                                        held(&state, kind),
+                                        "{at}: pass {pass} left a wait no gate holds"
+                                    );
+                                }
+                            }
+
+                            let (after, _) = stored(&fx).await;
+                            let loop_state = after.loop_state().expect("the loop is started");
+                            assert!(
+                                loop_state.phase() != rakka_agent::AgentLoopPhase::AwaitingTools
+                                    || loop_state.awaits_turn_effect()
+                                    || !after
+                                        .status()
+                                        .expect("the run has a status")
+                                        .permits_progress(),
+                                "{at}: a turn with nothing out was left unrested"
+                            );
+                            records += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(records, 296, "the matrix is the size it was written as");
+    assert!(
+        released_at_the_proposal > 0,
+        "the proposal rest is among the released"
+    );
+}

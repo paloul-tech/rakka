@@ -21,6 +21,7 @@ use rakka_agent::{
     AGENT_GOAL_EVALUATION_MAX_EVIDENCE, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis, PrincipalRef};
+use rakka_persistence::DurableStateStore;
 
 mod common;
 
@@ -1786,5 +1787,727 @@ async fn an_answered_goal_evaluation_park_puts_a_live_run_back_where_it_rests() 
         run_status(&fx).await,
         resting,
         "the run is back on its model wait"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// An approval wait whose gate closed without a grant (issue #166).
+// ---------------------------------------------------------------------------
+
+/// Where the run rests: its phase, turn and status, and how many of its
+/// gates still wait.
+async fn rest_of(fx: &Fixture) -> (rakka_agent::AgentLoopPhase, u64, AgentRunStatus, usize) {
+    let loop_state = run_loop_state(fx).await;
+    let waiting = loop_state
+        .open_checkpoints()
+        .iter()
+        .filter(|checkpoint| checkpoint.status.is_waiting())
+        .count();
+    (
+        loop_state.phase(),
+        loop_state.turn(),
+        run_status(fx).await,
+        waiting,
+    )
+}
+
+/// Lands the dispatcher's answer to `effect`, and nothing else.
+async fn land_the_result_of(fx: &Fixture, effect: &AgentRunEffect) {
+    let outcome = fx.dispatcher.answer(effect).await;
+    apply_run(
+        fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: effect.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(outcome),
+        },
+    )
+    .await
+    .expect("the result applies");
+}
+
+/// Lands the result of the turn's one tool call, and nothing else.
+async fn land_the_tool_result(fx: &Fixture) {
+    let tool = tool_effect(fx).await;
+    land_the_result_of(fx, &tool).await;
+}
+
+/// Answers `gate` with `decision`, under a decision key of its own.
+async fn decide_gate(
+    fx: &Fixture,
+    gate: &rakka_agent::AgentCheckpoint,
+    key: &str,
+    decision: rakka_agent::AgentApprovalDecision,
+) {
+    apply_run(
+        fx,
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                key,
+            )
+            .expect("the decision key derives"),
+            checkpoint_id: gate.checkpoint_id.clone(),
+            resolver: authorizer(),
+            decision: Box::new(rakka_agent::AgentCheckpointDecision::Approval(decision)),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await
+    .expect("the decision applies");
+}
+
+/// A denial of an approval-family gate.
+fn deny() -> rakka_agent::AgentApprovalDecision {
+    rakka_agent::AgentApprovalDecision::Deny {
+        reason: "not convinced".to_string(),
+    }
+}
+
+/// Moves the clock past `gate`'s expiry and fires the run's checkpoint
+/// timers.
+async fn expire_gate(fx: &Fixture, gate: &rakka_agent::AgentCheckpoint) {
+    let expires = gate.expires_at.expect("the SLA stamped an expiry");
+    fx.clock.store(expires.as_millis() + 1, Ordering::SeqCst);
+    apply_run(
+        fx,
+        AgentRunEntityCommand::FireCheckpointTimers {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "timer",
+            )
+            .expect("the timer key derives"),
+        },
+    )
+    .await
+    .expect("the timer applies");
+}
+
+/// Effect policies under which every gate expires a second after it opens.
+fn expiring_gates() -> rakka_agent::AgentEffectPolicies {
+    rakka_agent::AgentEffectPolicies::default().with_checkpoint_sla(
+        rakka_agent::AgentCheckpointSla {
+            due_after_ms: None,
+            expire_after_ms: Some(1_000),
+            escalation_target: None,
+        },
+    )
+}
+
+/// The run's stored revision.
+async fn run_revision(fx: &Fixture) -> rakka_persistence::Revision {
+    fx.runs
+        .load(&run_scope().persistence_id())
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists")
+        .revision
+}
+
+/// Issue #166: a review of the goal that is open when a turn commits its
+/// tool call is the turn's approval wait, and the turn is held for it after
+/// the tool's result lands. A review that then ends without a grant fails
+/// its evaluation, which writes no status. The run is taken off the wait in
+/// that transition and goes on to its next turn. It used to stay
+/// `AwaitingTools` and `WaitingForApproval` with no gate, nothing in flight
+/// and no wake.
+#[tokio::test]
+async fn a_review_that_ends_without_a_grant_lets_the_turn_it_held_go_on() {
+    for ending in ["denied", "expired"] {
+        let fx = tool_turn_world(expiring_gates()).await;
+        let (effect, gate) = commanded_human_review(&fx).await;
+        answer_with_the_tool_call(&fx).await;
+        land_the_tool_result(&fx).await;
+        assert_eq!(
+            rest_of(&fx).await,
+            (
+                rakka_agent::AgentLoopPhase::AwaitingTools,
+                1,
+                AgentRunStatus::WaitingForApproval,
+                1
+            ),
+            "{ending}: the turn is held for the review"
+        );
+
+        match ending {
+            "denied" => decide_gate(&fx, &gate, "review", deny()).await,
+            _ => expire_gate(&fx, &gate).await,
+        }
+
+        assert_eq!(
+            rest_of(&fx).await,
+            (
+                rakka_agent::AgentLoopPhase::AwaitingModel,
+                2,
+                AgentRunStatus::WaitingForEffect,
+                0
+            ),
+            "{ending}: the run goes on to its next turn"
+        );
+        let outstanding: Vec<AgentRunEffectKind> = run_loop_state(&fx)
+            .await
+            .outstanding_effects()
+            .map(AgentRunEffect::kind)
+            .collect();
+        assert_eq!(
+            outstanding,
+            [AgentRunEffectKind::ModelCall],
+            "{ending}: the evaluation {} ended, and only turn two's model call is out",
+            effect.effect_id.as_str()
+        );
+    }
+}
+
+/// The same wait reached through a grant alone. The tool call needs a
+/// security authorization, and its turn commits on that wait. The review is
+/// commanded only then, and moves no status. Granting the tool's gate is
+/// what puts the run on the review's approval wait. The review is then
+/// denied after the tool's result has landed.
+#[tokio::test]
+async fn a_review_denied_after_the_grant_that_put_the_run_on_its_wait_lets_the_turn_go_on() {
+    let policies = rakka_agent::AgentEffectPolicies::new()
+        .with_tool_spec(
+            rakka_agent::AgentToolId::new(LOOKUP).expect("the tool id is valid"),
+            rakka_agent::AgentEffectSpec::non_idempotent().with_authorization_required(),
+        )
+        .expect("the gated tool spec is valid");
+    let fx = tool_turn_world(policies).await;
+    answer_with_the_tool_call(&fx).await;
+    let tool_gates = gates_on(&fx, &tool_effect(&fx).await).await;
+    assert_eq!(
+        tool_gates.len(),
+        1,
+        "the tool call is gated: {tool_gates:?}"
+    );
+    let (_effect, review) = commanded_human_review(&fx).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForAuthorization,
+            2
+        ),
+        "the run is on the tool's wait, and the review moved no status"
+    );
+
+    decide_gate(&fx, &tool_gates[0], "tool", approve()).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForApproval,
+            1
+        ),
+        "the grant puts the run on the review's wait"
+    );
+    settle_run(&fx).await;
+    land_the_tool_result(&fx).await;
+
+    decide_gate(&fx, &review, "review", deny()).await;
+
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            2,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "the run goes on to its next turn"
+    );
+}
+
+/// A review denied while the turn's tool call is still out takes the run off
+/// the review's wait and onto the tool's: the turn then rests when the
+/// result lands.
+#[tokio::test]
+async fn a_review_denied_with_the_tool_call_out_puts_the_run_on_the_tools_wait() {
+    let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+    let (_effect, gate) = commanded_human_review(&fx).await;
+    answer_with_the_tool_call(&fx).await;
+    assert_eq!(run_status(&fx).await, AgentRunStatus::WaitingForApproval);
+
+    decide_gate(&fx, &gate, "review", deny()).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "the run waits for its tool call"
+    );
+
+    land_the_tool_result(&fx).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            2,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "the tool's result rests the turn"
+    );
+}
+
+/// A review that stands keeps the run on its wait: a settle pass writes
+/// nothing, with the tool call out and after its result has landed.
+#[tokio::test]
+async fn a_standing_review_keeps_its_wait_and_is_not_rewritten_by_a_settle_pass() {
+    let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+    let (_effect, _gate) = commanded_human_review(&fx).await;
+    answer_with_the_tool_call(&fx).await;
+    settle_run(&fx).await;
+    let held = (rest_of(&fx).await, run_revision(&fx).await);
+    assert_eq!(held.0 .2, AgentRunStatus::WaitingForApproval);
+    settle_run(&fx).await;
+    assert_eq!((rest_of(&fx).await, run_revision(&fx).await), held);
+
+    land_the_tool_result(&fx).await;
+    settle_run(&fx).await;
+    let held = (rest_of(&fx).await, run_revision(&fx).await);
+    assert_eq!(
+        held.0,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForApproval,
+            1
+        ),
+        "the turn is held for the review"
+    );
+    settle_run(&fx).await;
+    assert_eq!((rest_of(&fx).await, run_revision(&fx).await), held);
+}
+
+/// Rewrites the stored record as a binary before issue #166 left it when a
+/// gate that held a turn for a goal evaluation was denied: the evaluation
+/// failed, its gate gone, and the status still that gate's wait.
+async fn deny_the_review_as_an_older_binary_did(fx: &Fixture) {
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    let loop_state = value["run"]["loop_state"]
+        .as_object_mut()
+        .expect("the loop state is an object");
+    loop_state.insert("open_checkpoints".to_string(), serde_json::json!([]));
+    loop_state.insert("pending_checkpoint".to_string(), serde_json::Value::Null);
+    let mut failed = 0;
+    for effect in loop_state["effects"]
+        .as_array_mut()
+        .expect("the effects are an array")
+    {
+        if effect["status"].as_str() == Some("pending") {
+            effect["status"] = serde_json::json!("failed");
+            effect["last_error_code"] = serde_json::json!("checkpoint-denied");
+            failed += 1;
+        }
+    }
+    assert_eq!(failed, 1, "the one pending effect is the gated evaluation");
+    let rewritten = serde_json::from_value(value).expect("the rewritten record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, rewritten)
+        .await
+        .expect("the rewritten record persists");
+}
+
+/// A record an older binary left on the approval wait with no gate heals on
+/// the first settle pass that touches it: the wait is released, the turn is
+/// rested, and the run goes on to its next turn. A further pass writes
+/// nothing.
+#[tokio::test]
+async fn a_record_left_on_an_approval_wait_with_no_gate_heals_and_goes_on() {
+    let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+    let (_effect, _gate) = commanded_human_review(&fx).await;
+    answer_with_the_tool_call(&fx).await;
+    land_the_tool_result(&fx).await;
+    deny_the_review_as_an_older_binary_did(&fx).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForApproval,
+            0
+        ),
+        "the record as an older binary left it"
+    );
+    assert_eq!(
+        run_loop_state(&fx).await.outstanding_effects().count(),
+        0,
+        "nothing is in flight"
+    );
+
+    settle_run(&fx).await;
+    let healed = (rest_of(&fx).await, run_revision(&fx).await);
+    assert_eq!(
+        healed.0,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            2,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "the run goes on to its next turn"
+    );
+    settle_run(&fx).await;
+    assert_eq!((rest_of(&fx).await, run_revision(&fx).await), healed);
+}
+
+/// A review denied while another gate of the turn still stands puts the run
+/// on that gate's wait. The tool call needs a security authorization, and an
+/// open approval is reported ahead of one, so the run was on the review's
+/// approval wait.
+#[tokio::test]
+async fn a_review_denied_beside_a_tool_calls_authorization_puts_the_run_on_that_wait() {
+    let policies = rakka_agent::AgentEffectPolicies::new()
+        .with_tool_spec(
+            rakka_agent::AgentToolId::new(LOOKUP).expect("the tool id is valid"),
+            rakka_agent::AgentEffectSpec::non_idempotent().with_authorization_required(),
+        )
+        .expect("the gated tool spec is valid");
+    let fx = tool_turn_world(policies).await;
+    let (_effect, review) = commanded_human_review(&fx).await;
+    answer_with_the_tool_call(&fx).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForApproval,
+            2
+        ),
+        "the review's approval is reported ahead of the tool's authorization"
+    );
+
+    decide_gate(&fx, &review, "review", deny()).await;
+
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForAuthorization,
+            1
+        ),
+        "the run waits on the gate that still stands"
+    );
+}
+
+/// What issue #166 leaves as it was: a turn is held for a goal evaluation
+/// that is out when its last tool result lands, and goes on when the
+/// evaluation settles.
+#[tokio::test]
+async fn a_turn_is_held_for_an_evaluation_that_is_out_and_goes_on_when_it_settles() {
+    let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+    apply_run(
+        &fx,
+        evaluate_command("1", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the evaluation commits");
+    // The model call alone is answered: a drive would answer the
+    // evaluation with it.
+    let model_call = run_loop_state(&fx)
+        .await
+        .outstanding_effects()
+        .find(|effect| effect.kind() == AgentRunEffectKind::ModelCall)
+        .cloned()
+        .expect("the model call is out");
+    land_the_result_of(&fx, &model_call).await;
+    settle_run(&fx).await;
+    land_the_tool_result(&fx).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "the turn is held for the evaluation"
+    );
+
+    let evaluation = evaluation_effect(&fx).await;
+    land_the_result_of(&fx, &evaluation).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            2,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "the run goes on to its next turn"
+    );
+}
+
+/// The grant of a review that held a turn puts the run on the dispatch wait,
+/// as it did: the evaluation is now what the turn is held for. Its result
+/// then lets the run go on.
+#[tokio::test]
+async fn a_review_granted_after_the_tool_landed_holds_the_turn_for_its_evaluation() {
+    let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+    let (_effect, gate) = commanded_human_review(&fx).await;
+    answer_with_the_tool_call(&fx).await;
+    land_the_tool_result(&fx).await;
+    assert_eq!(run_status(&fx).await, AgentRunStatus::WaitingForApproval);
+
+    decide_gate(&fx, &gate, "review", approve()).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "the turn is held for the evaluation the grant released"
+    );
+
+    answer_evaluation(&fx).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            2,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "the run goes on to its next turn"
+    );
+}
+
+/// A wait is released only when no gate of its own kind stands. A tool call
+/// that needs a security authorization commits its turn, and a review of the
+/// goal is commanded afterwards: an approval opens beside the authorization,
+/// and the command moves no status. The run stays on the authorization's
+/// wait, and a settle pass writes nothing. An approval is reported ahead of
+/// an authorization, and a first build compared the run's wait with that
+/// order: it found the wait unheld, wrote the same status back, and did so
+/// at every step of every settle pass.
+#[tokio::test]
+async fn a_review_commanded_beside_a_standing_authorization_is_not_rewritten() {
+    let policies = rakka_agent::AgentEffectPolicies::new()
+        .with_tool_spec(
+            rakka_agent::AgentToolId::new(LOOKUP).expect("the tool id is valid"),
+            rakka_agent::AgentEffectSpec::non_idempotent().with_authorization_required(),
+        )
+        .expect("the gated tool spec is valid");
+    let fx = tool_turn_world(policies).await;
+    answer_with_the_tool_call(&fx).await;
+    let (_effect, _review) = commanded_human_review(&fx).await;
+    let standing = (rest_of(&fx).await, run_revision(&fx).await);
+    assert_eq!(
+        standing.0,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForAuthorization,
+            2
+        ),
+        "the run waits on the tool's authorization, with both gates open"
+    );
+
+    for pass in 1..=3 {
+        settle_run(&fx).await;
+        assert_eq!(
+            (rest_of(&fx).await, run_revision(&fx).await),
+            standing,
+            "settle pass {pass} writes nothing"
+        );
+    }
+}
+
+/// A goal-bearing world whose every goal evaluation needs a security
+/// authorization, and whose gates expire a second after they open. Returned
+/// with an evaluation committed behind its authorization and the turn's tool
+/// call out.
+async fn authorized_evaluation_world() -> (Fixture, rakka_agent::AgentCheckpoint) {
+    let policies = gated_evaluation_policies(Gate::Authorization).with_checkpoint_sla(
+        rakka_agent::AgentCheckpointSla {
+            due_after_ms: None,
+            expire_after_ms: Some(1_000),
+            escalation_target: None,
+        },
+    );
+    let fx = tool_turn_world(policies).await;
+    apply_run(
+        &fx,
+        evaluate_command("1", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the evaluation commits");
+    let gates = gates_on(&fx, &evaluation_effect(&fx).await).await;
+    assert_eq!(gates.len(), 1, "the evaluation is gated: {gates:?}");
+    assert_eq!(
+        gates[0].kind,
+        rakka_agent::AgentCheckpointKind::SecurityAuthorization
+    );
+    answer_with_the_tool_call(&fx).await;
+    (fx, gates[0].clone())
+}
+
+/// The authorization half of issue #166: an evaluation its spec gates behind
+/// a security authorization holds a turn on `WaitingForAuthorization`, and
+/// the run goes on when that gate is denied or expires. No review of the
+/// goal is involved.
+#[tokio::test]
+async fn an_evaluations_authorization_that_ends_without_a_grant_lets_the_turn_go_on() {
+    for ending in ["denied", "expired"] {
+        let (fx, gate) = authorized_evaluation_world().await;
+        land_the_tool_result(&fx).await;
+        assert_eq!(
+            rest_of(&fx).await,
+            (
+                rakka_agent::AgentLoopPhase::AwaitingTools,
+                1,
+                AgentRunStatus::WaitingForAuthorization,
+                1
+            ),
+            "{ending}: the turn is held for the evaluation's authorization"
+        );
+
+        match ending {
+            "denied" => decide_gate(&fx, &gate, "authorization", deny()).await,
+            _ => expire_gate(&fx, &gate).await,
+        }
+
+        assert_eq!(
+            rest_of(&fx).await,
+            (
+                rakka_agent::AgentLoopPhase::AwaitingModel,
+                2,
+                AgentRunStatus::WaitingForEffect,
+                0
+            ),
+            "{ending}: the run goes on to its next turn"
+        );
+    }
+}
+
+/// A record an older binary left on the authorization wait with no gate
+/// heals as one left on the approval wait does.
+#[tokio::test]
+async fn a_record_left_on_an_authorization_wait_with_no_gate_heals_and_goes_on() {
+    let (fx, _gate) = authorized_evaluation_world().await;
+    land_the_tool_result(&fx).await;
+    deny_the_review_as_an_older_binary_did(&fx).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForAuthorization,
+            0
+        ),
+        "the record as an older binary left it"
+    );
+
+    settle_run(&fx).await;
+    let healed = (rest_of(&fx).await, run_revision(&fx).await);
+    assert_eq!(
+        healed.0,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            2,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "the run goes on to its next turn"
+    );
+    settle_run(&fx).await;
+    assert_eq!((rest_of(&fx).await, run_revision(&fx).await), healed);
+}
+
+/// Which commands repair a record left on a wait no gate holds: those that
+/// end in the run's disposition. A checkpoint timer does, with nothing due:
+/// its firing recomputes the disposition, the release changes the record,
+/// and the command commits and settles. A fan-in deadline with nothing due
+/// changes nothing and leaves the record. And on a record that needs no
+/// repair, a checkpoint timer with nothing due writes nothing.
+#[tokio::test]
+async fn a_checkpoint_timer_with_nothing_due_repairs_a_record_and_a_fan_in_deadline_does_not() {
+    let timer = |fan_in: bool, key: &str| {
+        let operation_id = AgentOperationId::for_agent(
+            AgentOperationKind::CheckpointResolution,
+            &agent_scope(),
+            key,
+        )
+        .expect("the timer key derives");
+        if fan_in {
+            AgentRunEntityCommand::FireFanInDeadline { operation_id }
+        } else {
+            AgentRunEntityCommand::FireCheckpointTimers { operation_id }
+        }
+    };
+    // No gate here has a deadline, so no timer has anything due.
+    let stuck = || async {
+        let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+        let (_effect, _gate) = commanded_human_review(&fx).await;
+        answer_with_the_tool_call(&fx).await;
+        land_the_tool_result(&fx).await;
+        deny_the_review_as_an_older_binary_did(&fx).await;
+        fx
+    };
+
+    let fx = stuck().await;
+    let before = (rest_of(&fx).await, run_revision(&fx).await);
+    apply_run(&fx, timer(true, "fan-in-deadline"))
+        .await
+        .expect("the timer applies");
+    assert_eq!(
+        (rest_of(&fx).await, run_revision(&fx).await),
+        before,
+        "a fan-in deadline with nothing due leaves the record"
+    );
+
+    let fx = stuck().await;
+    apply_run(&fx, timer(false, "checkpoint-timers"))
+        .await
+        .expect("the timer applies");
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            2,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "a checkpoint timer with nothing due repairs it, and the run goes on"
+    );
+
+    let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+    let (_effect, _gate) = commanded_human_review(&fx).await;
+    answer_with_the_tool_call(&fx).await;
+    settle_run(&fx).await;
+    let before = (rest_of(&fx).await, run_revision(&fx).await);
+    let reply = apply_run(&fx, timer(false, "checkpoint-timers"))
+        .await
+        .expect("the timer applies");
+    assert!(
+        matches!(reply, AgentRunEntityReply::Unchanged { .. }),
+        "{reply:?}"
+    );
+    assert_eq!(
+        (rest_of(&fx).await, run_revision(&fx).await),
+        before,
+        "a standing wait is not written by a timer with nothing due"
     );
 }

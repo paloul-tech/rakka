@@ -200,7 +200,9 @@ the code comments:
 - "answering a goal evaluation's gate moves no status" is not true of a
   grant, which writes the dispatch wait;
 - "any command or exchange runs a settle pass" is not true of a read, a
-  refused command or a timer with nothing due;
+  refused command or a timer with nothing due (of a fan-in deadline, that
+  is: the review of #166 showed a checkpoint timer with nothing due does
+  run one and repairs the record);
 - the difference on the re-send was stated for a tool call only.
 
 It also had five tests tightened: two compared a parked world with a
@@ -229,6 +231,8 @@ ways in.
   - a review granted while the run rests on its proposal leaves the run
     on `WaitingForEffect` after the evaluation settles, which is #130's
     symptom through a door #130 does not name.
+  **Since fixed.** Issue #166 releases a wait whose gate closed without a
+  grant. Its record is `2026-11-17-approval-wait-release-design.md`.
 - **A re-sent tool call can leave the run a turn ahead of it.** In a
   two-call turn, one call parks and the other lands. The tool arm rests
   the turn, because it counts only outstanding effects and the parked one
