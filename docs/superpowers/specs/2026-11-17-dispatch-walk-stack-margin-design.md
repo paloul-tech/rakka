@@ -216,6 +216,9 @@ the claim, a loop where there is a call), or a bound on the budget, or
 both. This change is wrappers that alter no behaviour, and should stay
 reviewable as that.
 
+**Since fixed.** Issue #165 made the attempts of one claim a loop. Its
+record is `2026-11-17-reconcile-retry-loop-design.md`.
+
 ## 11. The review
 
 A fresh reviewer read the branch and measured its claims. It found no
@@ -246,3 +249,14 @@ found wrong, and what changed:
    sends. The texts say one allocation a call.
 8. Doors left unboxed, the hand-boxed test call sites and the coarseness
    of the walk's guard are in sections 7 and 9.
+
+## 12. A correction to the precision of the figures
+
+Found by the review of issue #165. A thread's stack is a whole number of
+pages, and a page on the machine these figures were taken on is 16 KiB. So
+wherever this record says a smallest passing stack was found "to 8 KiB",
+it was found to one 16 KiB page, and a difference of 16 KiB between two
+builds means only that their needs fall in adjacent pages: anything from a
+few bytes to 32 KiB. The larger figures and the conclusions drawn from
+them stand. The smallest one, the 16 KiB the five `apply` boxes are said
+to be worth on the walk, is one page or less.
