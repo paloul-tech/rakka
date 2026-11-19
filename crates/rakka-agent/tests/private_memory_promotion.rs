@@ -5218,8 +5218,8 @@ async fn a_cancel_settles_a_gated_promotion_that_has_no_gate() {
 /// exempt from the wind-down fence as a promotion is. A gated compensation
 /// spec is refused where it is set (issue #128), but a record written
 /// before that can hold a compensation its deployment gated: it waits
-/// `Pending` with no gate, since nothing opens a compensation's gate. A
-/// cancel leaves such a compensation exactly as it was.
+/// `Pending` with no gate, since the run opened none when it recorded it.
+/// A cancel leaves such a compensation exactly as it was.
 #[tokio::test]
 async fn a_cancel_leaves_a_gated_compensation_as_it_was() {
     let policies = rakka_agent::AgentEffectPolicies::new()
@@ -5293,6 +5293,7 @@ async fn a_cancel_leaves_a_gated_compensation_as_it_was() {
     gate_the_compensation_as_an_older_record_held_it(&fx).await;
     let scheduled = compensation(&fx).await;
     assert_eq!(scheduled.status, AgentRunEffectStatus::Pending);
+    assert_eq!(scheduled.dispatched_at, None, "it was never handed over");
     assert!(scheduled.checkpoint_required, "the compensation is gated");
     assert!(
         !open_checkpoints(&fx)
@@ -5613,9 +5614,12 @@ async fn failed_world_left_holding_a_tool_approval(
     (fx, stores)
 }
 
-/// Rewrites the stored record so its one compensation is gated and
-/// `Pending`: a compensation recorded under a spec that required a
-/// checkpoint, which a deployment could set before issue #128.
+/// Rewrites the stored record so its one compensation is gated, `Pending`
+/// and never handed to the sink: how the run record held a compensation
+/// recorded under a spec that required a checkpoint, which a deployment
+/// could set before issue #128. Only the run record is rewritten. This
+/// build has already handed the compensation to the sink, and that ticket
+/// is left where it is; a cancel does not read it.
 async fn gate_the_compensation_as_an_older_record_held_it(fx: &Fixture) {
     let id = run_scope().persistence_id();
     let record = fx
@@ -5632,6 +5636,7 @@ async fn gate_the_compensation_as_an_older_record_held_it(fx: &Fixture) {
     {
         if effect["request"].get("compensation").is_some() {
             effect["status"] = serde_json::json!("pending");
+            effect["dispatched_at"] = serde_json::Value::Null;
             effect["checkpoint_required"] = serde_json::json!(true);
             gated += 1;
         }

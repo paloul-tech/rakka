@@ -673,17 +673,24 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   | Configuration | Before | Now |
   |---|---|---|
-  | `with_compensation_spec` or `with_workflow_cancel_spec`, given a spec that requires a checkpoint or an authorization | Accepted. The run recorded the compensation or the cancel under it and opened no gate, so the effect stayed `Pending` and the run `Cancelling`, for good | Refused `effect-policy-invalid`, where the policies are built |
-  | The same two, given a spec with no gate | Accepted | Unchanged |
+  | `with_compensation_spec`, given a spec that requires a checkpoint or an authorization | Accepted. The run recorded the compensation and opened no gate, so it stayed `Pending`, unsent, and the run stayed `Cancelling`, for good, with the original effect already marked `Compensated` | Refused `effect-policy-invalid`, where the policies are built |
+  | `with_workflow_cancel_spec`, given such a spec | Accepted. The run recorded the cancel and opened no gate, so it stayed `Pending` and the child was not told to stop. See below for what followed | Refused `effect-policy-invalid`, where the policies are built |
+  | Either, given a spec with no gate | Accepted | Unchanged |
   | Any other kind's spec, gated or not | Accepted | Unchanged |
 
-  **Why it is refused and not made to work.** A compensation and a workflow cancel are recorded by a run that is already winding down, after the transition in which a turn opens the gates of its calls. A gate opened for one would have no meaning that holds: the original effect is marked `Compensated` in the transition that records the compensation, so a denial would leave it compensated with no compensation run; a `Cancel` closes every waiting approval and authorization, and would leave the effect waiting again; and a gated workflow cancel only delays stopping a child its parent has already decided to stop.
+  **What a gated workflow cancel did.** A run records one in two places, and opens no gate in either.
+
+  - *A run that is winding down*, to stop its children. The cancel stayed `Pending`, and the wind-down does not fence it; a `Pending` effect holds a wind-down open.
+  - *A run that goes on*, to stop the children a resolved fan-in no longer needs. The cancel stayed `Pending` while the run went on, and the run could end with it so.
+  - *One arrangement opened a gate, by a side effect.* Where the turn such a cancel was recorded in went on to commit tool calls, that turn opened an approval for the cancel with its own, and the run waited for it. An approval released the cancel. A denial failed it and wound the run down. A run cancel closed the gate and left the cancel `Pending`, in a run that was now winding down: the first case again. This arrangement is refused with the rest.
+
+  **Why it is refused and not made to work.** A gate on either kind has no meaning that holds. The original effect is marked `Compensated` in the transition that records its compensation, so a denial would leave it compensated with no compensation run. A `Cancel` closes every waiting approval and authorization, and would leave the effect waiting again. And a gated workflow cancel only delays stopping a child its parent has already decided to stop.
 
   **What a deployment changes.** One that built its policies with either spec gated now gets the refusal at start, and removes `with_checkpoint_required` or `with_authorization_required` from that spec. The two setters are the only way either spec enters `AgentEffectPolicies`.
 
-  **A record that already holds one is not repaired.** A run that recorded a gated compensation or workflow cancel under an earlier build keeps it `Pending`. A `Cancel` leaves it as it was.
+  **A record that already holds one is not repaired.** A run that recorded a gated compensation or workflow cancel under an earlier build keeps it `Pending`. A `Cancel` leaves the effect as it was.
 
-  **Rollback.** An earlier build accepts the gated spec again, and with it the stuck effect.
+  **Rollback.** An earlier build accepts the gated spec again, and with it the behaviour above.
 
 Run the default compatibility matrix:
 
