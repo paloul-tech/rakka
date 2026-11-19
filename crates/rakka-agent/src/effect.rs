@@ -773,8 +773,14 @@ impl AgentEffectPolicies {
     }
 
     /// Sets the spec model calls dispatch under.
+    ///
+    /// A spec that requires a checkpoint or an authorization is refused
+    /// `effect-policy-invalid`: the run opens no gate when it records a
+    /// model call, so a gated one waited unsent and its run rested
+    /// `WaitingForEffect` on it for good (issue #176).
     pub fn with_model_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
         spec.validate()?;
+        refuse_gated_spec(&spec, "model call")?;
         self.model = spec;
         Ok(self)
     }
@@ -970,29 +976,35 @@ impl Default for AgentEffectPolicies {
     }
 }
 
-/// Refuses a compensation or workflow-cancel spec that requires a checkpoint
-/// or an authorization (issue #128).
+/// Refuses a model, compensation or workflow-cancel spec that requires a
+/// checkpoint or an authorization (issues #128 and #176).
 ///
-/// The run opens no gate in the transition that records either effect, so a
-/// gated one waited `Pending`, unsent, and a wind-down fences neither.
+/// The run opens no gate in the transition that records any of the three,
+/// so a gated one waited `Pending`, unsent.
 ///
-/// - A compensation is recorded by a run that is winding down. It held the
-///   run `Cancelling` for good, with the original effect already marked
-///   `Compensated`.
-/// - A workflow cancel left its child untold to stop. Recorded by a
-///   wind-down, it stayed `Pending`, and a `Pending` effect holds a
-///   wind-down open. Recorded to chase a fan-in straggler, by a run that
-///   goes on, it stayed `Pending` while the run went on and ended.
+/// - A model call held its run `WaitingForEffect` for good. Nothing else
+///   opens its gate: a turn opens the gates of its calls once its model call
+///   has answered.
+/// - A compensation is recorded by a run that is winding down, and a
+///   wind-down does not fence it. It held the run `Cancelling` for good,
+///   with the original effect already marked `Compensated`.
+/// - A workflow cancel, which a wind-down does not fence either, left its
+///   child untold to stop. Recorded by a wind-down, it stayed `Pending`,
+///   and a `Pending` effect holds a wind-down open. Recorded to chase a
+///   fan-in straggler, by a run that goes on, it stayed `Pending` while the
+///   run went on and ended.
 ///
 /// A gate did open in one arrangement, by a side effect: where the turn a
 /// straggler's cancel was recorded in went on to commit tool calls, that
 /// turn opened an approval for the cancel with its own. A denial there
 /// failed the cancel and wound the run down, and a run cancel closed the
-/// gate and left the cancel `Pending`. So a gate on either kind had no
-/// meaning that held, and the spec is refused instead.
+/// gate and left the cancel `Pending`. So a gate on a compensation or a
+/// workflow cancel had no meaning that held. A gate on a model call has
+/// none defined: what a denial, an expiry or a cancel does to the turn, and
+/// whether it is asked once or every turn. Each spec is refused instead.
 ///
-/// The refusal is at the two setters, which are the only way either spec
-/// enters [`AgentEffectPolicies`]. `kind` names the spec in the message.
+/// The refusal is at the three setters, each the only way its spec enters
+/// [`AgentEffectPolicies`]. `kind` names the spec in the message.
 fn refuse_gated_spec(spec: &AgentEffectSpec, kind: &str) -> AgentEffectResult<()> {
     if spec.checkpoint_required || spec.authorization_required {
         return Err(AgentEffectError::InvalidPolicy {
@@ -3443,6 +3455,43 @@ mod tests {
         let encoded = serde_json::to_value(&missing).expect("the spec serializes");
         serde_json::from_value::<AgentEffectSpec>(encoded)
             .expect_err("an unenforceable spec is refused on load");
+    }
+
+    /// Issue #176: the run opens no gate when it records a model call, so a
+    /// model spec that requires one is refused where it is set.
+    #[test]
+    fn a_gated_model_spec_is_refused() {
+        let gated = [
+            AgentEffectSpec::read_only().with_checkpoint_required(),
+            AgentEffectSpec::read_only().with_authorization_required(),
+            AgentEffectSpec::read_only()
+                .with_checkpoint_required()
+                .with_authorization_required(),
+        ];
+        for spec in gated {
+            let refused = AgentEffectPolicies::new()
+                .with_model_spec(spec)
+                .expect_err("a gated model spec is refused");
+            assert_eq!(refused.code(), "effect-policy-invalid");
+            assert!(
+                refused.to_string().contains("model call"),
+                "the refusal names the kind: {refused}"
+            );
+        }
+
+        // A model spec with no gate is accepted, as before.
+        let ungated =
+            AgentEffectSpec::for_model_policy(crate::model::AgentModelRetryPolicy::DEFAULT, None)
+                .expect("the default model policy is a valid spec")
+                .with_timeout_ms(30_000);
+        let policies = AgentEffectPolicies::new()
+            .with_model_spec(ungated.clone())
+            .expect("an ungated model spec is accepted");
+        assert_eq!(policies.model, ungated);
+
+        // And the spec a deployment gets without setting one has no gate.
+        let default = AgentEffectPolicies::new().model;
+        assert!(!default.checkpoint_required && !default.authorization_required);
     }
 
     /// Issue #128: the run opens no gate when it records a compensation or a

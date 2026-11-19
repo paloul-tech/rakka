@@ -654,9 +654,10 @@ incorrectly.
   run's end event (see Observability below). A compensation or workflow
   cancel parked on an ended run stays as it was (issue #123), and every
   other resolution on an ended run is still refused `run-terminal`. A
-  compensation or workflow-cancel spec may not require a checkpoint or an
-  authorization: the run opens no gate when it records either, so the spec
-  is refused where it is set (`effect-policy-invalid`, issue #128). The
+  model, compensation or workflow-cancel spec may not require a checkpoint
+  or an authorization: the run opens no gate when it records any of the
+  three, so the spec is refused where it is set (`effect-policy-invalid`,
+  issues #128 and #176). The
   retriever supplies a ranking and nothing else: every ranked identity is
   resolved through the authoritative store before it is admitted, so a foreign
   or forged record is dropped and counted, and an unauthorized read reveals
