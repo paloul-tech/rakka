@@ -328,13 +328,16 @@ pass is still working, and from being run by two:
   reconcileable effect whose attempt ends unknown and is found not
   executed. Each attempt after the first is made only if the lease is still
   active for the length of an attempt: the effect's `timeout_ms`, or the
-  instant itself when it declares none. Otherwise the claim ends there,
-  writes nothing and is counted in `AgentDispatchPass::lapsed`. Once the
-  lease has lapsed, the next claim asks the reconciler about the attempt
-  that one left and goes on from its answer, so a budget is spent exactly,
-  over as many claims as it takes. The lease has to cover one attempt, not
-  a budget. An attempt that spends the budget is settled by the claim that
-  made it, and a claim's first attempt is not asked.
+  instant itself when it declares none. That attempt's `deadline_at` is
+  counted from the instant the claim asked, so it falls inside the lease.
+  Otherwise the claim ends there, writes nothing and is counted in
+  `AgentDispatchPass::lapsed`. Its batch ends with it: nothing renewed the
+  claims behind it, so the pass gives them back, claimable at once. Once
+  the lease has lapsed, the next claim asks the reconciler about the
+  attempt that one left and goes on from its answer, as for an attempt
+  whose worker was lost. The lease has to cover one attempt, not a budget.
+  An attempt that spends the budget is settled by the claim that made it,
+  and a claim's first attempt is not asked.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,

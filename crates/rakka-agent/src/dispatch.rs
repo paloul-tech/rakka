@@ -2235,12 +2235,15 @@ pub struct AgentDispatchPass {
     /// is made only if the claim's lease is still active for the length of
     /// an attempt (the effect's `timeout_ms`; the instant itself when none
     /// is declared). A value that stays above zero for a tool says its
-    /// attempts together outlast the lease: the budget is still spent, over
-    /// several claims.
+    /// attempts together outlast the lease, and its budget is being spent
+    /// over several claims. A pass counts at most one such claim, because its
+    /// batch ends there: the claims behind it are given back, claimable at
+    /// once, and are not counted here or anywhere else in the report.
     ///
-    /// Nothing is written as either ends: once the lease is over any worker
-    /// can take the ticket. A pass that ends in an error returns no report,
-    /// and the claims it passed over are then counted nowhere.
+    /// Nothing is written to either kind's ticket as its claim ends: once
+    /// the lease is over any worker can take it. A pass that ends in an
+    /// error returns no report, and the claims it passed over are then
+    /// counted nowhere.
     pub lapsed: usize,
     /// True when the probe killed the worker mid-pass.
     pub died: bool,
@@ -2265,12 +2268,14 @@ enum ClaimConclusion {
     /// The probe killed the worker; durable state is exactly as a crash
     /// leaves it.
     Died,
-    /// The claim ran out of lease and ended with its ticket unsettled.
-    /// Either its lease had lapsed before the pass reached it, and nothing
-    /// was started, or it had made an attempt that was found not executed
-    /// and its lease did not cover another (issue #171). The claim wrote
-    /// nothing as it ended.
+    /// The claim's lease had lapsed before the pass reached it. Nothing was
+    /// started and nothing was written.
     Lapsed,
+    /// The claim made an attempt that was found not executed, and its lease
+    /// did not cover another (issue #171). It wrote nothing as it ended, so
+    /// its ticket is unsettled, and no settle renewed the claims its pass
+    /// holds behind it.
+    OutOfLease,
 }
 
 /// How one step of a claim ended: with the claim concluded, or with another
@@ -2294,6 +2299,11 @@ enum ClaimStep {
         claim: AgentDispatchClaim,
         /// The attempt's number.
         attempt: u32,
+        /// When the attempt's bound is counted from, for an attempt after
+        /// the claim's first: the instant the claim asked whether its lease
+        /// covers the attempt (issue #171). `None` for a claim's first
+        /// attempt, whose bound is counted from its own start.
+        bound_from: Option<AgentTimestampMillis>,
     },
 }
 
@@ -3421,14 +3431,23 @@ where
     /// unknown and is found not executed. Each attempt after the first is
     /// made only if the lease is still active for the length of an attempt:
     /// the effect's `timeout_ms`, or the instant itself when it declares
-    /// none. Otherwise the claim ends there, writes nothing and is counted
-    /// in [`AgentDispatchPass::lapsed`]. The claim that takes the ticket
-    /// next, once the lease has lapsed, asks the reconciler about the
-    /// attempt this one left and goes on from there, so the budget is spent
-    /// exactly, over as many claims as it takes. The lease therefore has to
-    /// cover one attempt, as it does for a batch, and not a budget. A
-    /// claim's first attempt is not asked: a call that outlives the lease
-    /// loses its claim as before.
+    /// none. The attempt's bound is counted from the instant the claim
+    /// asked, so the `deadline_at` its executor is handed falls inside the
+    /// lease, and what the dispatcher does between asking and invoking
+    /// comes out of the attempt's time. Otherwise the claim ends there,
+    /// writes nothing and is counted in [`AgentDispatchPass::lapsed`]. The
+    /// claim that takes the ticket next, once the lease has lapsed, asks
+    /// the reconciler about the attempt this one left and goes on from its
+    /// answer, as it does for an attempt whose worker was lost. The lease
+    /// therefore has to cover one attempt and not a budget. A claim's first
+    /// attempt is not asked: a call that outlives the lease loses its claim
+    /// as before.
+    ///
+    /// Such a claim has spent lease and written no settle, so the claims
+    /// behind it were not renewed. The batch ends with it, and the pass
+    /// gives those claims back as a failed pass does
+    /// ([`Self::release_unstarted`]): they are claimable at once, under a
+    /// full lease, and are counted nowhere in this pass's report.
     ///
     /// A renewed batch stays with its worker. A ticket claimed behind long
     /// calls waits for every one of them, and no other worker can take it
@@ -3559,10 +3578,23 @@ where
         pass.concurrency_limited = batch.concurrency_limited;
         let mut unstarted: VecDeque<AgentDispatchClaim> = batch.claims.into();
         let mut failure = None;
+        let mut stopped_short = false;
         while let Some(claim) = unstarted.pop_front() {
             match self.execute_batch_claim(claim, &unstarted, pass).await {
                 Ok(ClaimConclusion::Settled) => {}
                 Ok(ClaimConclusion::Lapsed) => pass.lapsed += 1,
+                Ok(ClaimConclusion::OutOfLease) => {
+                    // The claim spent lease on its attempts and ended with
+                    // no settle, so nothing renewed the claims behind it:
+                    // they hold what is left of the lease this one ran out
+                    // of, and a claim's first attempt is not asked whether
+                    // its lease covers it. The batch ends here and those
+                    // claims are given back, to be claimed again under a
+                    // full lease.
+                    pass.lapsed += 1;
+                    stopped_short = true;
+                    break;
+                }
                 Ok(ClaimConclusion::Died) => {
                     // A killed worker gives nothing back: the claims behind
                     // this one wait out their lease, as after a crash.
@@ -3580,13 +3612,10 @@ where
         // settle to renew. No settle of this dispatcher's is written
         // outside this loop, so this is a rule kept, not a defect closed.
         self.fleet.hold_claims(Vec::new());
-        match failure {
-            Some(error) => {
-                self.release_unstarted(unstarted.into()).await;
-                Err(error)
-            }
-            None => Ok(()),
+        if failure.is_some() || stopped_short {
+            self.release_unstarted(unstarted.into()).await;
         }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Runs one claim of a batch, with the claims behind it still unstarted.
@@ -3630,15 +3659,18 @@ where
         Box::pin(self.execute_claim(&claim_scope, claim, pass)).await
     }
 
-    /// Gives back the claims a failed pass never started
+    /// Gives back the claims a pass that stopped short never started
     /// ([`AgentDispatcherFleet::release_claims`]), so they are claimable at
-    /// once instead of leased until the batch's lease lapses.
+    /// once instead of leased until the batch's lease lapses. A pass stops
+    /// short when a claim fails it, and when a claim runs out of lease
+    /// between two attempts (issue #171).
     ///
-    /// The claim that failed is not among them. Its lease is its backoff: a
-    /// ticket that fails every pass would otherwise be first in every
-    /// pass's batch and fail the claims behind it each time.
+    /// The claim that stopped the pass is not among them. Its lease is its
+    /// backoff: a ticket that fails every pass would otherwise be first in
+    /// every pass's batch and fail the claims behind it each time, and one
+    /// that ran out of lease is waiting for that lease to end.
     ///
-    /// The pass returns the error it had. A release that fails too is
+    /// A failed pass returns the error it had. A release that fails too is
     /// logged, and those claims wait out their lease as they did before.
     async fn release_unstarted(&mut self, unstarted: Vec<AgentDispatchClaim>) {
         if let Err(error) = self.fleet.release_claims(&unstarted).await {
@@ -3646,8 +3678,8 @@ where
                 worker_id = self.worker_id.as_str(),
                 claims = unstarted.len(),
                 code = error.code(),
-                "a failed dispatch pass could not give back the claims it did not start; \
-                 they stay leased until their lease lapses"
+                "a dispatch pass that stopped short could not give back the claims it did \
+                 not start; they stay leased until their lease lapses"
             );
         }
     }
@@ -3788,7 +3820,11 @@ where
             .await?;
             return Ok(ClaimConclusion::Settled);
         } else {
-            ClaimStep::Invoke { claim, attempt }
+            ClaimStep::Invoke {
+                claim,
+                attempt,
+                bound_from: None,
+            }
         };
 
         // The attempts of this claim, one after another. An attempt that
@@ -3798,9 +3834,13 @@ where
         loop {
             match step {
                 ClaimStep::Concluded(conclusion) => return Ok(conclusion),
-                ClaimStep::Invoke { claim, attempt } => {
+                ClaimStep::Invoke {
+                    claim,
+                    attempt,
+                    bound_from,
+                } => {
                     step = self
-                        .attempt_invocation(scope, claim, state, &intent, attempt, pass)
+                        .attempt_invocation(scope, claim, state, &intent, attempt, bound_from, pass)
                         .await?;
                 }
             }
@@ -3809,6 +3849,10 @@ where
 
     /// One fresh, unambiguous dispatch attempt: authorization, durable
     /// `Started`, bounded invocation, result delivery, settlement.
+    ///
+    /// `bound_from` is when the attempt's bound is counted from, when that
+    /// is not its own start ([`ClaimStep::Invoke`]).
+    #[allow(clippy::too_many_arguments)]
     async fn attempt_invocation(
         &mut self,
         scope: &AgentRunScope,
@@ -3816,6 +3860,7 @@ where
         state: &AgentRunState,
         intent: &AgentRunEffect,
         attempt: u32,
+        bound_from: Option<AgentTimestampMillis>,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimStep> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
@@ -4035,10 +4080,19 @@ where
 
         // The attempt bound, stamped once per attempt and never persisted:
         // a durable deadline would outlive the generation it bounds.
+        //
+        // A claim's first attempt is bounded from here. A later one is
+        // bounded from the instant its claim asked whether the lease covers
+        // it, which is earlier by the time the dispatcher took to record the
+        // attempt before, authorize this one and write its `Started`. So the
+        // deadline an executor is handed for a later attempt falls inside
+        // the lease, and that time comes out of the attempt's bound
+        // (issue #171).
         let attempt_started_at = self.now();
+        let bounded_from = bound_from.unwrap_or(attempt_started_at);
         let mut attempt_intent = intent.clone();
         attempt_intent.deadline_at = intent.timeout_ms.map(|timeout_ms| {
-            AgentTimestampMillis::new(attempt_started_at.as_millis().saturating_add(timeout_ms))
+            AgentTimestampMillis::new(bounded_from.as_millis().saturating_add(timeout_ms))
         });
         let attempt_intent = &attempt_intent;
         // The binding: the intent's own, or the one the grant carries from
@@ -4296,7 +4350,7 @@ where
                     .await?;
                     return Ok(ClaimStep::Concluded(ClaimConclusion::Settled));
                 }
-                self.retry_ambiguous(scope, claim, intent, &WORKER_LOST, pass)
+                self.retry_ambiguous(scope, claim, intent, &WORKER_LOST, None, pass)
                     .await
             }
             AgentEffectSafetyClass::Idempotent => {
@@ -4305,7 +4359,7 @@ where
                 // generation hands the target the same one. Under a wind-down
                 // the retry still runs: it is the truthful way to learn what
                 // the ambiguous attempt did, and the target deduplicates it.
-                self.retry_ambiguous(scope, claim, intent, &WORKER_LOST, pass)
+                self.retry_ambiguous(scope, claim, intent, &WORKER_LOST, None, pass)
                     .await
             }
             AgentEffectSafetyClass::Reconcileable => {
@@ -4444,12 +4498,14 @@ where
     /// still permits — hands the next attempt back to be made
     /// ([`ClaimStep::Invoke`]). `ambiguity` names why the outcome was
     /// unknown: the row's line, and the code an exhausted generation carries.
+    /// `bound_from` is handed on with the next attempt.
     async fn retry_ambiguous(
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
         intent: &AgentRunEffect,
         ambiguity: &Ambiguity<'_>,
+        bound_from: Option<AgentTimestampMillis>,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimStep> {
         let timer = AgentSegmentTimer::start(self.now());
@@ -4528,7 +4584,11 @@ where
                 .unwrap_or(0)
                 .saturating_add(1)
         };
-        Ok(ClaimStep::Invoke { claim, attempt })
+        Ok(ClaimStep::Invoke {
+            claim,
+            attempt,
+            bound_from,
+        })
     }
 
     /// Queries the reconciliation protocol before any retry
@@ -4625,8 +4685,15 @@ where
                 Ok(ClaimStep::Concluded(ClaimConclusion::Settled))
             }
             AgentReconciliationFinding::NotExecuted => {
-                if winding_down {
-                    // Proven absent, and the run wants nothing further.
+                if winding_down && !intent.kind().exempt_from_wind_down_fence() {
+                    // Proven absent, and the run wants nothing further. That
+                    // is so only of an effect the wind-down's fence applies
+                    // to. A compensation or a workflow cancel is what the
+                    // wind-down is waiting for, and a memory promotion or a
+                    // claim append is accepted after the run has ended:
+                    // cancelling one here left it `Cancelled` with budget
+                    // unspent, for a worker lost after `Started` and for a
+                    // claim that ran out of lease alike (issue #171).
                     self.settle_ticket_cancelled(scope, &claim, "run-cancelled", pass)
                         .await?;
                     self.deliver_outcome(
@@ -4655,17 +4722,29 @@ where
                 // about this attempt and burns it, and the budget counts it
                 // once. An attempt that spends the budget has none after it,
                 // so it is settled here whatever is left of the lease.
-                if ambiguity.under_this_claim
-                    && attempt < intent.max_attempts
+                //
+                // The next attempt's bound is counted from this instant, read
+                // before the fleet reads its own clock, so the deadline it is
+                // handed is inside the lease the fleet just answered for.
+                let asked_at = self.now();
+                let another_follows = ambiguity.under_this_claim && attempt < intent.max_attempts;
+                if another_follows
                     && !self
                         .fleet
                         .is_current_claim_for(&claim, intent.timeout_ms.unwrap_or(0))?
                 {
-                    return Ok(ClaimStep::Concluded(ClaimConclusion::Lapsed));
+                    return Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease));
                 }
                 // Proven absent: a retry is a fresh invocation, under budget.
-                self.retry_ambiguous(scope, claim, intent, ambiguity, pass)
-                    .await
+                self.retry_ambiguous(
+                    scope,
+                    claim,
+                    intent,
+                    ambiguity,
+                    another_follows.then_some(asked_at),
+                    pass,
+                )
+                .await
             }
             AgentReconciliationFinding::Unknown => self
                 .settle_unknown_finding(
