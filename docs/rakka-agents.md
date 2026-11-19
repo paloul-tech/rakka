@@ -336,8 +336,9 @@ pass is still working, and from being run by two:
   the lease has lapsed, the next claim asks the reconciler about the
   attempt that one left and goes on from its answer, as for an attempt
   whose worker was lost. The lease has to cover one attempt, not a budget.
-  An attempt that spends the budget is settled by the claim that made it,
-  and a claim's first attempt is not asked.
+  An attempt that spends the budget has none after it, so its claim is not
+  asked and settles it as before; a claim's first attempt is not asked
+  either.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,

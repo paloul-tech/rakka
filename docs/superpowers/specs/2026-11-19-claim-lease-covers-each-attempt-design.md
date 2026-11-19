@@ -24,8 +24,9 @@ The brief was read from the code, not run. Two things were measured here.
 lease, with a second worker that looks for work as each call ends. The
 first worker starts its third attempt 50 s into the lease. At 75 s, with
 that attempt still in flight, the second worker takes the lapsed ticket, is
-told by the reconciler that nothing executed, and invokes beside it. The
-first worker's pass then fails `claim-fenced`.
+told by the reconciler that nothing executed, and invokes beside it. With
+no second worker the first one spends the whole budget, and its last write
+to the fleet is answered `claim-fenced`, which fails its pass.
 
 **A claim that takes over a retry-scheduled reconcileable row spends an
 attempt before it invokes.** A budget of six, with every call refused and
@@ -108,9 +109,10 @@ No durable field, status, error code or metric is added.
    already reads that field. A new field would need every reader taught.
    The meaning widens from "not started" to "ended for want of lease", and
    the doc says so. The claims given back are not counted anywhere.
-7. **The attempt that spends the budget is settled by the claim that made
-   it,** whatever is left of the lease. Nothing follows it for the lease to
-   cover, and ending there would only delay telling the run.
+7. **The attempt that spends the budget is not asked, and is settled by
+   the claim that made it, as before.** Nothing follows it for the lease to
+   cover, and ending there would only delay telling the run. What that
+   leaves is in section 6.
 8. **A claim's first attempt is not asked.** The rule is for what a claim
    does beyond what it was claimed for. Applied to the first attempt, a
    lease no longer than an attempt's bound would never run anything.
@@ -131,7 +133,7 @@ No durable field, status, error code or metric is added.
 | State | Before | Now |
 |---|---|---|
 | An attempt is found not executed, budget is left, and the lease covers another | the next attempt, at once, bounded from its own start | the next attempt, at once, bounded from the instant the claim asked |
-| The same, and the lease has lapsed or will before another attempt's bound | the next attempt anyway, to the end of the budget; the pass fails `claim-fenced` | the claim ends, writes nothing, counts in `lapsed` |
+| The same, and the lease has lapsed or will before another attempt's bound | the next attempt anyway, to the end of the budget; with no other worker about, the pass fails `claim-fenced` | the claim ends, writes nothing, counts in `lapsed` |
 | The claims the pass had not started | run after it, unless the pass failed | given back, claimable at once; the pass ends |
 | The ticket after such a claim | n/a | `Claimed` until the lease lapses; then any worker asks the reconciler and goes on from its answer |
 | An exempt reconcileable effect found not executed while its run winds down | cancelled `run-cancelled` | retried under its budget |
@@ -163,10 +165,19 @@ Three things follow that I want named:
   the budget is spent exactly only when each finding is "not executed".
 - A run that is cancelled between the two claims. The claim that follows
   cancels an effect the wind-down's fence applies to, as a wind-down does.
+- A budget's last attempt that ends after its lease has lapsed. The claim
+  still writes the row `Exhausted`, the fleet answers it `claim-fenced`,
+  its pass fails, and a later claim tells the run. As before.
+- A fleet cancellation request
+  (`AgentDispatcherFleet::request_run_cancellation`) made while such a
+  claim runs. The claim can now end with its entry fenced and unfinished,
+  which no claim takes and only the workflow tier's canceller finishes. A
+  worker lost after `Started` leaves the same. `rakka-agent` and the host
+  never request one.
 
 ## 7. Tests
 
-`crates/rakka-agent/tests/dispatch_attempt_lease.rs`, new, twelve tests. An
+`crates/rakka-agent/tests/dispatch_attempt_lease.rs`, new, fourteen tests. An
 executor moves the shared clock by the time each call takes, so where the
 clock stands when a call starts is the evidence.
 
@@ -190,13 +201,17 @@ clock stands when a call starts is the evidence.
 - A budget that fits its lease is spent under one claim.
 - A compensation goes on under the claim that follows.
 - A compensation whose worker was lost goes on too.
+- An attempt needs more lease than its bound: with exactly its bound left
+  the claim ends, and with a millisecond more it goes on.
+- A renewed claim makes the attempts its renewed lease covers.
 
-Ten fail on `main`; the last-attempt and fits-its-lease tests hold what
+Twelve fail on `main`; the last-attempt and fits-its-lease tests hold what
 must not change.
 
 `crates/rakka-agent-workflow/tests/dispatcher_fleet_leases.rs`, three
 tests of the fleet's question: what is left of a lease, a renewed claim,
-and a claim another worker took over.
+and a claim another worker took over. One assertion in
+`dispatcher_fleet_prune.rs`: a claim whose entry is gone covers nothing.
 
 ## 8. The review
 
@@ -214,8 +229,13 @@ now in the file:
 - **A compensation was cancelled by the claim that followed.** Call 9.
 
 And statements that were too strong: that no later attempt could be in
-flight at the lapse, and that the budget is always spent exactly
-(section 6).
+flight at the lapse, that the budget is always spent exactly, that the
+first worker's pass always failed, and that the last attempt is settled
+"whatever is left of the lease" (section 6).
+
+The reviewer broke the new code twenty-five ways. Three breaks survived
+the first build's tests, and each has a test now: the rule's edge, the
+lease a renewed claim asks about, and a claim whose entry is gone.
 
 ## 9. Found, not done
 

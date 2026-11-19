@@ -4721,7 +4721,9 @@ where
                 // `Dispatching`, the claim that follows asks the reconciler
                 // about this attempt and burns it, and the budget counts it
                 // once. An attempt that spends the budget has none after it,
-                // so it is settled here whatever is left of the lease.
+                // so it is not asked and is settled here as before: under a
+                // lease that is over, the row is still written `Exhausted`
+                // and the fleet answers the claim `claim-fenced`.
                 //
                 // The next attempt's bound is counted from this instant, read
                 // before the fleet reads its own clock, so the deadline it is

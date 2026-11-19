@@ -104,6 +104,12 @@ struct Calls {
     /// before it answers, the rival runs one dispatch pass: what any other
     /// worker of the fleet could do while that call is in flight.
     rival: Arc<tokio::sync::Mutex<Option<Pipeline>>>,
+    /// A tool call whose call answers, when a test names one. Every other
+    /// call ends unknown.
+    answers: Arc<Mutex<Option<String>>>,
+    /// When a test sets it: the first call ends with exactly this much of
+    /// its claim's lease left, whatever `takes_ms` says.
+    first_call_leaves: Arc<Mutex<Option<u64>>>,
     /// The passes the rival ran.
     rival_passes: Arc<AtomicU64>,
     /// The calls the rival made in them.
@@ -141,8 +147,28 @@ impl Calls {
 /// ends with an unknown outcome.
 struct SlowExecutor {
     clock: SharedAtomicWorkflowClock,
+    fleet_store: FleetStore,
     takes_ms: u64,
     calls: Calls,
+}
+
+impl SlowExecutor {
+    /// How long this call takes.
+    async fn duration_of(&self, intent: &AgentRunEffect) -> u64 {
+        let leaves = self
+            .calls
+            .first_call_leaves
+            .lock()
+            .expect("the knob is readable")
+            .take();
+        match leaves {
+            Some(leaves) => {
+                let expires_at = lease_expiry_in(&self.fleet_store, intent).await;
+                expires_at - leaves - self.clock.now().as_millis()
+            }
+            None => self.takes_ms,
+        }
+    }
 }
 
 impl AgentDispatchToolExecutor for SlowExecutor {
@@ -176,15 +202,19 @@ impl AgentDispatchToolExecutor for SlowExecutor {
                     self.clock.now().as_millis(),
                     intent.deadline_at.map(|at| at.as_millis()),
                 ));
-            self.clock.advance(self.takes_ms);
-            self.calls
-                .elapsed
-                .fetch_add(self.takes_ms, Ordering::SeqCst);
+            let takes_ms = self.duration_of(intent).await;
+            self.clock.advance(takes_ms);
+            self.calls.elapsed.fetch_add(takes_ms, Ordering::SeqCst);
             if let Some(rival) = rival.as_mut() {
                 self.calls.rival_passes.fetch_add(1, Ordering::SeqCst);
                 // Whatever the rival's pass answers, what it invoked is the
                 // evidence.
                 let _ = Box::pin(rival.pump_run(&run_scope())).await;
+            }
+            let answers = self.calls.answers.lock().expect("the knob is readable");
+            if answers.as_deref() == Some(call.call_id.as_str()) {
+                return Ok(AgentTaskContent::inline(serde_json::json!({ "ok": true }))
+                    .expect("the content is inline-bounded"));
             }
             Err(unknown())
         })
@@ -232,6 +262,7 @@ fn world_of(
     let calls = Calls::default();
     let executor = SlowExecutor {
         clock: fx.wf_clock.clone(),
+        fleet_store: fx.fleet_store.clone(),
         takes_ms,
         calls: calls.clone(),
     };
@@ -620,8 +651,12 @@ fn worker_behind_a_slow_gate(
 
 /// When the lease of the ticket's entry expires.
 async fn lease_expiry_of(fx: &AuthorityFixture, effect: &AgentRunEffect) -> u64 {
-    let record = fx
-        .fleet_store
+    lease_expiry_in(&fx.fleet_store, effect).await
+}
+
+/// [`lease_expiry_of`], from the fleet's store.
+async fn lease_expiry_in(fleet_store: &FleetStore, effect: &AgentRunEffect) -> u64 {
+    let record = fleet_store
         .load(&agent_dispatcher_fleet_persistence_id())
         .await
         .expect("the fleet record loads")
@@ -744,9 +779,11 @@ async fn compensating_world(attempts: u32) -> (AuthorityFixture, Arc<AtomicU64>)
         .expect("the compensation spec is valid");
     let compensations = Arc::new(AtomicU64::new(0));
     let clock = fx.wf_clock.clone();
+    let fleet_store = fx.fleet_store.clone();
     let fx = fx
         .with_tool_executor(Arc::new(SlowExecutor {
             clock: clock.clone(),
+            fleet_store,
             takes_ms: 1,
             calls: Calls::default(),
         }))
@@ -877,4 +914,45 @@ async fn a_compensation_whose_worker_was_lost_goes_on_too() {
         AgentRunEffectStatus::Exhausted,
         "the budget of two is spent: the lost attempt, and the one that was made"
     );
+}
+
+/// The rule at its edge. A lease is over at the instant it expires, so an
+/// attempt of 25 s is covered only by more than 25 s of lease: with exactly
+/// 25 s left the claim ends, and with one millisecond more it goes on.
+#[tokio::test]
+async fn an_attempt_needs_more_lease_than_its_bound() {
+    for (left, calls_made) in [(25_000, 1), (25_001, 2)] {
+        let (fx, calls, _reconciler) = world(2, Some(25_000), 1_000);
+        ready(&fx).await;
+        *calls
+            .first_call_leaves
+            .lock()
+            .expect("the knob is writable") = Some(left);
+
+        pass_of(&fx, "worker-1").await;
+
+        assert_eq!(
+            calls.count(),
+            calls_made,
+            "with {left} ms of lease left after the first call"
+        );
+    }
+}
+
+/// The lease a claim asks about is the one its entry holds, which a renewal
+/// moves, and not the expiry the claim was handed. The first ticket of a
+/// batch answers at 25 s, and its settle renews the second to 85 s. So the
+/// second ticket's second attempt, which ends at 75 s, is made, though the
+/// batch was leased to 60 s.
+#[tokio::test]
+async fn a_renewed_claim_makes_the_attempts_its_renewed_lease_covers() {
+    let (fx, calls, _reconciler) = world_of(&[TOOL, OTHER_TOOL], 4, Some(25_000), 25_000);
+    ready(&fx).await;
+    *calls.answers.lock().expect("the knob is writable") = Some("call-1".to_string());
+
+    let pass = pass_of(&fx, "worker-1").await;
+
+    assert_eq!(calls.started_at_of("call-1"), vec![0]);
+    assert_eq!(calls.started_at_of("call-2"), vec![25_000, 50_000]);
+    assert_eq!((pass.invoked, pass.lapsed), (3, 1));
 }
