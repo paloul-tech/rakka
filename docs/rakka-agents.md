@@ -202,7 +202,14 @@ leaves behind is the same either way.
    the run down, as that failure always does, `Compensate` winds it down
    behind the compensation, and `Escalate` keeps the park. A record an
    earlier binary left parked with nothing to reconcile is repaired by the
-   first settle pass that reaches it.
+   first settle pass that reaches it. A gate that closes without a grant
+   (denied or expired) fails its effect. For a tool call that winds the run
+   down. Where the run survives the failure, as it does for a goal
+   evaluation and for the send or start of a fan-out member, a run that
+   was on that gate's `WaitingForApproval` or `WaitingForAuthorization`,
+   with no other gate of that kind standing, has its dispatch wait
+   recomputed: the wait of a gate that still stands, or
+   `WaitingForEffect`.
    A call the run committed and has not sent is cancelled in place when the
    run stops dispatching: when a call fails for good, on a `Cancel`, when a
    compensation is scheduled, when a handoff is accepted, and when the run

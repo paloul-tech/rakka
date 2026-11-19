@@ -760,9 +760,19 @@ impl AgentRun {
     /// such a record on the first pass that touches it, resting the turn
     /// exactly as the tool arm would have, so a record wedged under the old
     /// binary heals on its next settle whether or not any further effect
-    /// outcome arrives. Under the fixed transitions the shape is
-    /// unreachable: every turn-rest site rests the turn the moment its last
-    /// effect resolves.
+    /// outcome arrives.
+    ///
+    /// It is also how a turn held for a goal evaluation or a workflow cancel
+    /// is rested. Both are counted among the effects a turn awaits, so the
+    /// turn's last tool result does not rest it while one is out, and
+    /// neither's own outcome rests anything: the settle pass that follows
+    /// the outcome finds the shape here. For every other kind the shape is
+    /// unreachable under the fixed transitions, because the arm that
+    /// resolves the turn's last effect rests the turn.
+    ///
+    /// The status must permit progress. An approval or authorization wait
+    /// does not, and one whose gate has closed is released before this is
+    /// asked (issue #166).
     ///
     /// The guard mirrors the tool arm's own and narrows it once: an
     /// ambiguous effect of the turn is left to its reconciliation decision,
@@ -838,6 +848,41 @@ impl AgentRun {
     pub(crate) fn needs_unpark(&self) -> bool {
         self.status == AgentRunStatus::WaitingForReconciliation
             && !self.loop_state.has_indeterminate_effect()
+    }
+
+    /// Whether the record is on an approval or authorization wait that no
+    /// waiting gate of that kind holds.
+    ///
+    /// A grant recomputes the wait. A gate that closes any other way, denied
+    /// or expired, fails its effect, and where the run survives that failure
+    /// the wait stayed. Two such are a goal evaluation's gate that held a
+    /// turn, and the gated send or start of a fan-out member whose turn is
+    /// held for a goal evaluation.
+    /// Neither wait permits progress, so the settle pass could not rest the
+    /// turn ([`Self::needs_turn_rest`]), and a run with nothing in flight
+    /// took no transition again (issue #166).
+    ///
+    /// `settle_run_disposition` releases such a wait, in the transition
+    /// that closes the gate. A record a binary before issue #166 left on one
+    /// is repaired by the same function on the first settle pass that
+    /// touches it.
+    ///
+    /// The gates asked are the turn's, the same ones the dispatch wait is
+    /// read from (`AgentLoopState::turn_gate_waits`): every waiting gate of
+    /// the status's own kind but one on an effect held outside the turn (a
+    /// memory promotion or a claim append), which is never the run's wait.
+    /// The question is asked of that kind alone, and not of the wait the
+    /// gates add up to: an approval is reported ahead of an authorization,
+    /// so a run on an authorization's wait with an approval opened beside it
+    /// would look unheld, be released to the same status, and be written
+    /// again at every step of every settle pass.
+    pub(crate) fn needs_gate_wait_release(&self) -> bool {
+        let kind = match self.status {
+            AgentRunStatus::WaitingForApproval => AgentCheckpointKind::Approval,
+            AgentRunStatus::WaitingForAuthorization => AgentCheckpointKind::SecurityAuthorization,
+            _ => return false,
+        };
+        !self.loop_state.turn_gate_waits(kind)
     }
 
     /// Whether a run that is winding down, or has ended, holds an approval or
@@ -2908,13 +2953,17 @@ fn advance_once(
         repair_park(state, policies, now)?;
         return owed_run_exchanges(state, now);
     }
-    if run.needs_unpark() {
+    if run.needs_unpark() || run.needs_gate_wait_release() {
         // A record a binary before issue #131 left parked in reconciliation
         // after its park was answered: nothing is left to reconcile, and
         // nothing would ever write its status. The disposition settle takes
         // it out of the park, as it does for an answer under this binary. A
         // record that was winding down ends there, and owes what any
         // terminalization owes ([`AgentRun::needs_unpark`]).
+        //
+        // And a record a binary before issue #166 left on an approval or
+        // authorization wait whose gate had closed without a grant: the same
+        // settle releases it ([`AgentRun::needs_gate_wait_release`]).
         settle_run_disposition(state, now)?;
         return owed_run_exchanges(state, now);
     }
@@ -4380,6 +4429,17 @@ fn repair_park(
     settle_run_disposition(state, now)
 }
 
+/// Whether the run rests where its next step is dispatch: on its model call,
+/// or on the calls of its turn. Only there does it hold a dispatch wait
+/// ([`checkpoint_wait_status`]). Resting on its children, its proposal or a
+/// top-up, or between two phases, it holds none.
+fn at_a_dispatch_rest(loop_state: &AgentLoopState) -> bool {
+    matches!(
+        loop_state.phase(),
+        AgentLoopPhase::AwaitingModel | AgentLoopPhase::AwaitingTools
+    )
+}
+
 /// The status of a run whose next step is dispatch: parked on whichever
 /// approval-family checkpoint wait it holds, or waiting on its effects.
 fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
@@ -4405,7 +4465,8 @@ fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
 ///
 /// That is what lets a reconciliation park be undone without recording what
 /// it overwrote: [`settle_run_disposition`] asks this when the park ends
-/// (issues #131 and #130).
+/// (issues #131 and #130), and when it releases an approval wait where the
+/// run does not wait on dispatch (issue #166).
 ///
 /// It is not the status half of [`turn_rest`]. That counts a goal evaluation
 /// and a workflow cancel among the effects a turn awaits, and the gate of an
@@ -5458,6 +5519,13 @@ fn apply_effect_outcome(
 ///   (issue #131). The status is read from what the run
 ///   holds now and not kept from before the park, because a run can move
 ///   while it is parked: a tool result that lands then rests the turn;
+/// - a live run on an approval or authorization wait that no waiting gate
+///   of that kind holds leaves it too (`AgentRun::needs_gate_wait_release`).
+///   A grant recomputes the wait; a gate that closed any other way, on an
+///   effect whose failure the run survives, left it standing (issue #166).
+///   At a dispatch rest the dispatch wait is recomputed with the function a
+///   grant recomputes it with, and at any other rest the run takes
+///   [`live_status`];
 /// - otherwise the run keeps whatever live status the outcome application set.
 fn settle_run_disposition(
     state: &mut AgentRunState,
@@ -5497,6 +5565,25 @@ fn settle_run_disposition(
 
     if run.status == AgentRunStatus::WaitingForReconciliation {
         run.status = live_status(&run.loop_state);
+    } else if run.needs_gate_wait_release() {
+        // An approval or authorization wait that no gate of its kind holds
+        // any longer: the gate closed without a grant, and its effect's
+        // failure neither wound the run down nor wrote a status. Neither
+        // wait permits progress, so left here a turn whose last effect has
+        // resolved could not be rested (issue #166).
+        //
+        // At a dispatch rest the dispatch wait is recomputed, with the
+        // function a grant recomputes it with: the wait of a gate that still
+        // stands, or the effect wait. From there the settle pass rests a
+        // turn that has nothing left out. At any other rest the run holds
+        // no dispatch wait, and takes the status of what it rests on, as it
+        // does when a park ends: a binary before issue #131 could leave an
+        // approval wait there.
+        run.status = if at_a_dispatch_rest(&run.loop_state) {
+            checkpoint_wait_status(&run.loop_state)
+        } else {
+            live_status(&run.loop_state)
+        };
     }
     state.updated_at = now;
     Ok(())
@@ -6439,7 +6526,17 @@ fn resolve_checkpoint(
             // turn (a memory promotion or a claim append) move a live run's:
             // that gate was never the run's wait, so whatever the run waited
             // on, it still waits on (issue #126).
-            if !run.status.is_terminal() && !run.holds_outside_the_turn_effect(&bound_effect_id) {
+            //
+            // Only at a dispatch rest is there a dispatch wait to
+            // recompute. A goal evaluation's command opens its gate at any
+            // rest, and nothing an evaluation does afterwards writes a
+            // status, so a review granted while the run rested on its
+            // proposal or its children used to leave it reporting
+            // `WaitingForEffect` there (issue #166).
+            if !run.status.is_terminal()
+                && at_a_dispatch_rest(&run.loop_state)
+                && !run.holds_outside_the_turn_effect(&bound_effect_id)
+            {
                 run.status = checkpoint_wait_status(&run.loop_state);
             }
             state.updated_at = now;
@@ -9134,14 +9231,17 @@ where
             // ended run's outside-the-turn park (#120)
             // ([`AgentRun::needs_park_repair`]), and a park a binary before
             // issue #131 left standing after its answer
-            // ([`AgentRun::needs_unpark`]), and a gate a binary before issue
-            // #133 left waiting with nothing to gate
+            // ([`AgentRun::needs_unpark`]), and an approval wait a binary
+            // before issue #166 left standing after its gate closed
+            // ([`AgentRun::needs_gate_wait_release`]), and a gate a binary
+            // before issue #133 left waiting with nothing to gate
             // ([`AgentRun::needs_gate_close`]).
             let can_advance = self.state()?.run().is_some_and(|run| {
                 run.can_advance()
                     || run.needs_turn_rest()
                     || run.needs_park_repair()
                     || run.needs_unpark()
+                    || run.needs_gate_wait_release()
                     || run.needs_gate_close()
             });
             if !can_advance {
@@ -9168,6 +9268,7 @@ where
             let repairs = self.state()?.run().is_some_and(|run| {
                 run.needs_park_repair()
                     || run.needs_unpark()
+                    || run.needs_gate_wait_release()
                     || run.needs_gate_close()
                     || run.needs_turn_rest()
             });
