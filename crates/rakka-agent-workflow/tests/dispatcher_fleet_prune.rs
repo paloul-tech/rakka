@@ -411,6 +411,10 @@ async fn a_lapsed_claim_on_a_pruned_entry_is_fenced() {
         .fleet_mut()
         .is_current_claim(&stale)
         .expect("an absent entry is an answer, not an error");
+    let covers = worker_a
+        .fleet_mut()
+        .is_current_claim_for(&stale, 0)
+        .expect("an absent entry is an answer, not an error");
     let error = worker_a
         .fleet_mut()
         .complete_claim(&stale)
@@ -418,6 +422,7 @@ async fn a_lapsed_claim_on_a_pruned_entry_is_fenced() {
         .expect_err("a claim on a pruned entry is not settled");
 
     assert!(!current);
+    assert!(!covers, "a claim whose entry is gone covers nothing");
     assert_eq!(error.code(), "claim-fenced");
     assert_eq!(world.fleet_revision().await, before, "nothing was written");
 }

@@ -11,7 +11,9 @@
 //!   unbounded.** One deadline, taken when the attempt starts, covers the
 //!   handshake, the recheck's listing, the call, and the mapping — mirroring
 //!   the `deadline_at` the dispatcher stamps for the attempt and derives the
-//!   credential lease from. An effect that committed no timeout is bounded by
+//!   credential lease from. The timeout is the one the attempt is handed,
+//!   which for an attempt a dispatch claim makes after its first is what the
+//!   dispatcher left of the effect's own. An effect that committed no timeout is bounded by
 //!   the executor's own default instead
 //!   ([`MCP_ATTEMPT_TIMEOUT_DEFAULT_MS`], or
 //!   [`McpDispatchToolExecutor::with_attempt_timeout_default_ms`]). A server
