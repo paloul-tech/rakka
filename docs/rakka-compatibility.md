@@ -676,7 +676,7 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   | `with_compensation_spec`, given a spec that requires a checkpoint or an authorization | Accepted. The run recorded the compensation and opened no gate, so it stayed `Pending`, unsent, and the run stayed `Cancelling`, for good, with the original effect already marked `Compensated` | Refused `effect-policy-invalid`, where the policies are built |
   | `with_workflow_cancel_spec`, given such a spec | Accepted. The run recorded the cancel and opened no gate, so it stayed `Pending` and the child was not told to stop. See below for what followed | Refused `effect-policy-invalid`, where the policies are built |
   | Either, given a spec with no gate | Accepted | Unchanged |
-  | Any other kind's spec, gated or not | Accepted | Unchanged |
+  | Any other kind's spec, gated or not | Accepted | Unchanged by this issue. A gated model spec is refused under issue #176, below |
 
   **What a gated workflow cancel did.** A run records one in two places, and opens no gate in either.
 
@@ -717,6 +717,24 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   **Mixed builds.** A worker of an earlier build still runs a budget past its lease. This build's worker that takes such a ticket over recovers it as it always did.
 
   **Public names.** `AgentDispatcherFleet::is_current_claim_for` in `rakka-agent-workflow`, new. `AgentDispatchPass::lapsed` in `rakka-agent`, whose meaning widens.
+
+- Issue #176 ("a gated model spec is accepted, and its model call is never sent") changes which model spec `AgentEffectPolicies` accepts, as issue #128 does for a compensation and a workflow cancel. **No durable field, status, schema version or error code is added.**
+
+  | Configuration | Before | Now |
+  |---|---|---|
+  | `with_model_spec`, given a spec that requires a checkpoint or an authorization | Accepted. The run recorded a turn's model call and opened no gate, so the call stayed `Pending`, unsent, and the run rested `WaitingForEffect` on it, for good. No checkpoint was opened, so there was nothing to answer | Refused `effect-policy-invalid`, where the policies are built |
+  | `with_model_spec`, given a spec with no gate | Accepted | Unchanged |
+  | No model spec set | The default, which has no gate | Unchanged |
+
+  **Why nothing opened the gate.** The transition that records a model call opens none. A turn opens the gates of its calls when it commits them, which is after its model call has answered. No command opens a gate for a model call. One path could: a call re-sent as a new generation has its gate opened, but that takes a result reported for a call that was never sent, which no dispatcher makes.
+
+  **Why it is refused and not made to work.** A gate on a model call has no defined meaning: what a denial, an expiry or a cancel does to the turn, and whether the gate is asked once for the run or again every turn. Refusing turns a run that silently never makes a model call into an error where the deployment builds its policies. It rules nothing out: a later change can define the gate and accept the spec.
+
+  **What a deployment changes.** One that built its policies with a gated model spec now gets the refusal at start, and removes `with_checkpoint_required` or `with_authorization_required` from that spec. `with_model_spec` is the only way a model spec enters `AgentEffectPolicies`, and `AgentEffectSpec::for_model_policy` builds one with no gate.
+
+  **A run that already rests on such a call is not repaired.** Its model call keeps the gate it was recorded with, whatever the policies now say, and stays `Pending`. A `Cancel` cancels the call and ends the run `Cancelled`.
+
+  **Rollback.** An earlier build accepts the gated spec again, and with it the run that never makes a model call.
 
 Run the default compatibility matrix:
 
