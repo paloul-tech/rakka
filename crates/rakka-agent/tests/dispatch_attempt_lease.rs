@@ -85,9 +85,9 @@ fn unknown() -> AgentDispatchError {
     )
 }
 
-/// When a call started, on the shared clock, and the deadline its attempt
-/// was handed.
-type Bound = (u64, Option<u64>);
+/// When a call started, on the shared clock, and the deadline and the bound
+/// its attempt was handed.
+type Bound = (u64, Option<u64>, Option<u64>);
 
 /// What a [`SlowExecutor`] saw.
 #[derive(Clone, Default)]
@@ -201,6 +201,7 @@ impl AgentDispatchToolExecutor for SlowExecutor {
                 .push((
                     self.clock.now().as_millis(),
                     intent.deadline_at.map(|at| at.as_millis()),
+                    intent.timeout_ms,
                 ));
             let takes_ms = self.duration_of(intent).await;
             self.clock.advance(takes_ms);
@@ -695,14 +696,20 @@ async fn a_later_attempts_deadline_falls_inside_the_lease() {
     assert_eq!((pass.invoked, pass.lapsed), (3, 1));
     let lease_expires_at = lease_expiry_of(&fx, &effect).await;
     let bounds = calls.bounds.lock().expect("the calls are readable").clone();
-    let (first_started_at, first_deadline) = bounds[0];
+    let (first_started_at, first_deadline, first_bound) = bounds[0];
     assert_eq!(
-        first_deadline,
-        Some(first_started_at + 25_000),
+        (first_deadline, first_bound),
+        (Some(first_started_at + 25_000), Some(25_000)),
         "a claim's first attempt is bounded from its own start"
     );
-    for (attempt, (started_at, deadline)) in bounds.iter().enumerate().skip(1) {
+    for (attempt, (started_at, deadline, bound)) in bounds.iter().enumerate().skip(1) {
         let deadline = deadline.expect("the tool declares a bound");
+        assert_eq!(
+            *bound,
+            Some(23_000),
+            "attempt {}: the bound it is handed is what is left of its 25 s",
+            attempt + 1
+        );
         assert!(
             deadline < lease_expires_at,
             "attempt {} was handed a deadline of {deadline}, past the lease's end at \

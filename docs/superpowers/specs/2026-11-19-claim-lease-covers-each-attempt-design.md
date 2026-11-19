@@ -97,7 +97,9 @@ No durable field, status, error code or metric is added.
    attempt's own start, that time would carry its deadline past the lease
    the claim had just been told covered it. So it comes out of the
    attempt's time, and the deadline the executor is handed is inside the
-   lease.
+   lease. The `timeout_ms` handed with it is what is left of the bound
+   when the attempt starts, so an executor that bounds an attempt from its
+   own start, as the MCP executor does, is held to the same instant.
 5. **A claim that ends this way ends its batch, and the pass gives back
    what it had not started.** The claims behind it are renewed by a
    settle, and this claim wrote none: they hold what is left of the lease
@@ -156,7 +158,12 @@ Three things follow that I want named:
 - A first attempt that outlives its lease, as before.
 - An attempt of an effect with no declared bound that starts inside the
   lease and outlives it.
-- An executor that does not keep the `deadline_at` it is handed.
+- An executor that does not end by the `deadline_at` it is handed. The
+  MCP executor in this repository bounds an attempt from its own start by
+  `timeout_ms` and takes up to 3 s more to close its session. So an MCP
+  attempt can end after its deadline by the time its credential took to
+  resolve plus those 3 s, for a first attempt as for a later one. By
+  reading; the reviewer's finding.
 - Workers whose clocks disagree, as for every lease.
 - What the next claim's reconciler answers. Told "not executed" again, it
   records the attempt once and goes on. Told that nothing can be

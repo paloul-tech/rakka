@@ -2234,7 +2234,7 @@ pub struct AgentDispatchPass {
     /// executed is followed by another under the same claim, and that one
     /// is made only if the claim's lease is still active for the length of
     /// an attempt (the effect's `timeout_ms`; the instant itself when none
-    /// is declared). A value that stays above zero for a tool says its
+    /// is declared). A value that stays above zero says some effect's
     /// attempts together outlast the lease, and its budget is being spent
     /// over several claims. A pass counts at most one such claim, because its
     /// batch ends there: the claims behind it are given back, claimable at
@@ -3434,7 +3434,8 @@ where
     /// none. The attempt's bound is counted from the instant the claim
     /// asked, so the `deadline_at` its executor is handed falls inside the
     /// lease, and what the dispatcher does between asking and invoking
-    /// comes out of the attempt's time. Otherwise the claim ends there,
+    /// comes out of the attempt's time: the `timeout_ms` it is handed is
+    /// what is left of the bound when it starts. Otherwise the claim ends there,
     /// writes nothing and is counted in [`AgentDispatchPass::lapsed`]. The
     /// claim that takes the ticket next, once the lease has lapsed, asks
     /// the reconciler about the attempt this one left and goes on from its
@@ -4088,11 +4089,22 @@ where
         // deadline an executor is handed for a later attempt falls inside
         // the lease, and that time comes out of the attempt's bound
         // (issue #171).
+        //
+        // The `timeout_ms` handed on with it is what is left of the bound at
+        // this instant, so `deadline_at` is still the attempt's start plus
+        // the bound it is handed, and an executor that bounds an attempt
+        // from its own start by `timeout_ms`, as the MCP executor does, is
+        // held to the same instant.
         let attempt_started_at = self.now();
         let bounded_from = bound_from.unwrap_or(attempt_started_at);
         let mut attempt_intent = intent.clone();
         attempt_intent.deadline_at = intent.timeout_ms.map(|timeout_ms| {
             AgentTimestampMillis::new(bounded_from.as_millis().saturating_add(timeout_ms))
+        });
+        attempt_intent.timeout_ms = attempt_intent.deadline_at.map(|deadline_at| {
+            deadline_at
+                .as_millis()
+                .saturating_sub(attempt_started_at.as_millis())
         });
         let attempt_intent = &attempt_intent;
         // The binding: the intent's own, or the one the grant carries from

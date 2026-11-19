@@ -310,8 +310,8 @@ settle, a release and a prune. The loss after that is returned as
 
 **A batch and its leases** (issue #157). A claim pass leases every claim of
 its batch at one instant, and a worker runs the claims one after another.
-Two rules keep a later claim from being taken by another worker while its
-pass is still working, and from being run by two:
+Three rules keep a claim from being taken by another worker while its pass
+is still working on it, and from being run by two:
 
 - **Every settle renews what the pass still holds.** In the same write, each
   claim the pass has taken and not started is leased for a full lease from
@@ -329,7 +329,9 @@ pass is still working, and from being run by two:
   executed. Each attempt after the first is made only if the lease is still
   active for the length of an attempt: the effect's `timeout_ms`, or the
   instant itself when it declares none. That attempt's `deadline_at` is
-  counted from the instant the claim asked, so it falls inside the lease.
+  counted from the instant the claim asked, so it falls inside the lease,
+  and the `timeout_ms` its executor is handed is what is left of the bound
+  when the attempt starts.
   Otherwise the claim ends there, writes nothing and is counted in
   `AgentDispatchPass::lapsed`. Its batch ends with it: nothing renewed the
   claims behind it, so the pass gives them back, claimable at once. Once
