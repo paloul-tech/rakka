@@ -19,10 +19,15 @@ with_model_spec -> Ok
 run WaitingForEffect; effects [(ModelCall, Pending)]; waiting 0     (three passes, unchanged)
 ```
 
-Nothing else opens the gate. A turn opens the gates of its calls when it
-commits them, and that is after its model call has answered. No command
-opens a gate for a model call. Unlike the workflow cancel of #128, I found
-no arrangement in which this gate opens.
+No transition the run makes on its own opens the gate. A turn opens the
+gates of its calls when it commits them, and that is after its model call
+has answered. No command opens a gate for a model call.
+
+One path could open it, and no run reaches it by itself. A call re-sent as
+a new generation has its gate opened. For a gated model call that takes a
+result reported for a call that was never sent, answered "not executed" at
+the reconciliation checkpoint. The reviewer ran it by inventing the
+result; no dispatcher reports one for a call it was never handed.
 
 It was found reviewing #128's fix, whose record had said every other
 kind's gate is opened by something.
@@ -70,6 +75,22 @@ no gate. It fails without the change.
 Nothing in the workspace set a gated model spec: two test fixtures and one
 example call the setter, each with a spec that has no gate.
 
-## 6. Not done
+## 6. The review
+
+A fresh reviewer read the commit. The refusal held: the setter is the only
+way in, nothing in the workspace set a gated model spec, and the rest, the
+cancel and the gate outliving a policy change all ran as the docs say. It
+corrected three statements:
+
+- Two sentences of #128's entries said no other kind's spec is refused.
+  They now point here.
+- "Nothing else opens that gate" was too strong; see the re-send path in
+  section 1.
+- "A run that silently never starts": it starts, and never makes a model
+  call.
+
+## 7. Not done
 
 - A gate on a model call that works (section 2).
+- `RecordEffectResult` accepts a result for an effect that was never
+  handed to the sink. Noted by the reviewer; not looked into further.

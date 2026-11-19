@@ -982,9 +982,9 @@ impl Default for AgentEffectPolicies {
 /// The run opens no gate in the transition that records any of the three,
 /// so a gated one waited `Pending`, unsent.
 ///
-/// - A model call held its run `WaitingForEffect` for good. Nothing else
-///   opens its gate: a turn opens the gates of its calls once its model call
-///   has answered.
+/// - A model call held its run `WaitingForEffect` for good. No transition
+///   the run makes on its own opens its gate: a turn opens the gates of its
+///   calls once its model call has answered.
 /// - A compensation is recorded by a run that is winding down, and a
 ///   wind-down does not fence it. It held the run `Cancelling` for good,
 ///   with the original effect already marked `Compensated`.

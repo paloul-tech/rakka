@@ -657,11 +657,10 @@ incorrectly.
   model, compensation or workflow-cancel spec may not require a checkpoint
   or an authorization: the run opens no gate when it records any of the
   three, so the spec is refused where it is set (`effect-policy-invalid`,
-  issues #128 and #176). The
-  retriever supplies a ranking and nothing else: every ranked identity is
-  resolved through the authoritative store before it is admitted, so a foreign
-  or forged record is dropped and counted, and an unauthorized read reveals
-  nothing about existence.
+  issues #128 and #176). The retriever supplies a ranking and nothing else:
+  every ranked identity is resolved through the authoritative store before it
+  is admitted, so a foreign or forged record is dropped and counted, and an
+  unauthorized read reveals nothing about existence.
 - **The communal knowledge graph** holds provenance-bearing claims in a
   `(TenantId, KnowledgeSpaceId)` space. Claims are born `Proposed`; trust moves
   through `Verified`, `Disputed`, and `Retracted` by append-only transitions,
