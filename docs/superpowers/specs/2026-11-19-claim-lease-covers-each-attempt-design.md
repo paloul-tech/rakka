@@ -98,19 +98,25 @@ No durable field, status, error code or metric is added.
    the claim had just been told covered it. So it comes out of the
    attempt's time, and the deadline the executor is handed is inside the
    lease. The `timeout_ms` handed with it is what is left of the bound
-   when the attempt starts, so an executor that bounds an attempt from its
-   own start, as the MCP executor does, is held to the same instant.
+   when the attempt starts. So an executor that bounds an attempt from its
+   own start, as the MCP executor does, overruns that deadline only by what
+   it overran before (section 6). An
+   attempt with none of its bound left is not made: the claim ends, and
+   the claim that follows makes it as its first, with its whole bound.
 5. **A claim that ends this way ends its batch, and the pass gives back
    what it had not started.** The claims behind it are renewed by a
    settle, and this claim wrote none: they hold what is left of the lease
    it ran out of. Started there, a claim's first attempt, which is not
    asked, would be in flight at the lapse. Given back, they are claimable
    at once under a full lease. It is the write a failed pass already
-   makes.
+   makes, and like it, it leaves a claim whose lease has already lapsed:
+   with no declared bound the claim ends only at the lapse, the claims
+   behind it have lapsed with it, and nothing is written.
 6. **It is counted in `lapsed`.** The brief suggests it and the host
    already reads that field. A new field would need every reader taught.
    The meaning widens from "not started" to "ended for want of lease", and
-   the doc says so. The claims given back are not counted anywhere.
+   the doc says so. The claims behind it are counted in `claimed` and in
+   nothing else.
 7. **The attempt that spends the budget is not asked, and is settled by
    the claim that made it, as before.** Nothing follows it for the lease to
    cover, and ending there would only delay telling the run. What that
@@ -125,7 +131,10 @@ No durable field, status, error code or metric is added.
    claim read the wind-down as "the run wants nothing further". On `main`
    the same reading already met a compensation whose worker was lost after
    `Started`; the change would have made it the ordinary path. It is
-   corrected where it is read, for both.
+   corrected where it is read, for both. The condition is the fence's own,
+   so it covers the four exempt kinds, on a run that is winding down or
+   has ended; the tests hold it for a compensation on a run that is
+   winding down, and the rest is by reading.
 10. **One new public method on the fleet handle.** The dispatcher could
     have read the entry's lease itself; asking the handle keeps one clock
     and one definition of "current".
@@ -136,7 +145,7 @@ No durable field, status, error code or metric is added.
 |---|---|---|
 | An attempt is found not executed, budget is left, and the lease covers another | the next attempt, at once, bounded from its own start | the next attempt, at once, bounded from the instant the claim asked |
 | The same, and the lease has lapsed or will before another attempt's bound | the next attempt anyway, to the end of the budget; with no other worker about, the pass fails `claim-fenced` | the claim ends, writes nothing, counts in `lapsed` |
-| The claims the pass had not started | run after it, unless the pass failed | given back, claimable at once; the pass ends |
+| The claims the pass had not started | run after it, unless the pass failed | not started; given back, claimable at once, where their lease still stands; the pass ends |
 | The ticket after such a claim | n/a | `Claimed` until the lease lapses; then any worker asks the reconciler and goes on from its answer |
 | An exempt reconcileable effect found not executed while its run winds down | cancelled `run-cancelled` | retried under its budget |
 | The attempt that spends the budget | `Exhausted`, run told | unchanged |
@@ -184,7 +193,7 @@ Three things follow that I want named:
 
 ## 7. Tests
 
-`crates/rakka-agent/tests/dispatch_attempt_lease.rs`, new, fourteen tests. An
+`crates/rakka-agent/tests/dispatch_attempt_lease.rs`, new, fifteen tests. An
 executor moves the shared clock by the time each call takes, so where the
 clock stands when a call starts is the evidence.
 
@@ -211,8 +220,9 @@ clock stands when a call starts is the evidence.
 - An attempt needs more lease than its bound: with exactly its bound left
   the claim ends, and with a millisecond more it goes on.
 - A renewed claim makes the attempts its renewed lease covers.
+- A later attempt whose bound is spent is not made.
 
-Twelve fail on `main`; the last-attempt and fits-its-lease tests hold what
+Thirteen fail on `main`; the last-attempt and fits-its-lease tests hold what
 must not change.
 
 `crates/rakka-agent-workflow/tests/dispatcher_fleet_leases.rs`, three

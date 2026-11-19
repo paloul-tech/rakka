@@ -963,3 +963,44 @@ async fn a_renewed_claim_makes_the_attempts_its_renewed_lease_covers() {
     assert_eq!(calls.started_at_of("call-2"), vec![25_000, 50_000]);
     assert_eq!((pass.invoked, pass.lapsed), (3, 1));
 }
+
+/// A later attempt whose bound is already spent is not made. The bound is
+/// counted from the instant the claim asked about its lease, and here the
+/// authority then takes six seconds to authorize an attempt of five. Made
+/// anyway, the attempt was handed a deadline a second in the past and no
+/// time at all, and was still counted against the budget. The claim ends
+/// instead, and the claim that follows makes the attempt as its first,
+/// with its whole bound.
+#[tokio::test]
+async fn a_later_attempt_whose_bound_is_spent_is_not_made() {
+    let (fx, calls, reconciler) = world(4, Some(5_000), 1_000);
+    let effect = ready(&fx).await;
+    fx.settle().await;
+
+    let pass = worker_behind_a_slow_gate(&fx, &reconciler, 6_000)
+        .pump_run(&run_scope())
+        .await
+        .map_err(|error| error.code().to_string())
+        .expect("the pass runs");
+
+    assert_eq!((pass.invoked, pass.lapsed), (1, 1));
+    assert_eq!(row_of(&fx, &effect).await, (OutboxStatus::Failed, 1));
+
+    fx.expire_lease();
+    fx.settle().await;
+    worker_behind_a_slow_gate(&fx, &reconciler, 6_000)
+        .pump_run(&run_scope())
+        .await
+        .map_err(|error| error.code().to_string())
+        .expect("the pass runs");
+
+    let bounds = calls.bounds.lock().expect("the calls are readable").clone();
+    assert_eq!(bounds.len(), 2, "one call to a claim");
+    for (started_at, deadline, bound) in bounds {
+        assert_eq!(
+            (deadline, bound),
+            (Some(started_at + 5_000), Some(5_000)),
+            "every attempt that was made had its whole bound"
+        );
+    }
+}

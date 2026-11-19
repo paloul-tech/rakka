@@ -1642,9 +1642,12 @@ fn consolidation_record(
 /// The resolver is consulted only after the attempt's durable `Started`, and
 /// the resolved value is dropped with the attempt.
 ///
-/// The effect handed over carries two time fields: `timeout_ms`, the attempt
-/// bound its spec declared, and `deadline_at`, which the dispatcher stamps per
-/// attempt as the attempt's start plus that bound and never persists. A
+/// The effect handed over carries two time fields: `timeout_ms`, the attempt's
+/// bound, and `deadline_at`, which the dispatcher stamps per attempt as the
+/// attempt's start plus that bound and never persists. The bound is the one
+/// the spec declared, but for an attempt a claim makes after its first: that
+/// one is handed what is left of the bound, counted from the instant the
+/// claim asked whether its lease covers the attempt (issue #171). A
 /// resolver derives the lease it asks for from `deadline_at`; when both are
 /// `None` the effect declared no bound, and a resolver may only ask for its
 /// minimum lease — which is why a credential-bearing model call without a
@@ -2237,8 +2240,9 @@ pub struct AgentDispatchPass {
     /// is declared). A value that stays above zero says some effect's
     /// attempts together outlast the lease, and its budget is being spent
     /// over several claims. A pass counts at most one such claim, because its
-    /// batch ends there: the claims behind it are given back, claimable at
-    /// once, and are not counted here or anywhere else in the report.
+    /// batch ends there. The claims behind it are not started: each whose
+    /// lease still stands is given back, claimable at once, and none is
+    /// counted here. They are in [`Self::claimed`] and in nothing else.
     ///
     /// Nothing is written to either kind's ticket as its claim ends: once
     /// the lease is over any worker can take it. A pass that ends in an
@@ -2271,11 +2275,29 @@ enum ClaimConclusion {
     /// The claim's lease had lapsed before the pass reached it. Nothing was
     /// started and nothing was written.
     Lapsed,
-    /// The claim made an attempt that was found not executed, and its lease
-    /// did not cover another (issue #171). It wrote nothing as it ended, so
-    /// its ticket is unsettled, and no settle renewed the claims its pass
-    /// holds behind it.
+    /// The claim made an attempt that was found not executed, and could not
+    /// make another in the time its lease covers (issue #171): the lease did
+    /// not cover one, or the attempt's bound, counted from the instant the
+    /// claim asked, was spent before the attempt could start. Its ticket is
+    /// unsettled, and no settle renewed the claims its pass holds behind it.
     OutOfLease,
+}
+
+/// Whether an attempt bounded from `bound_from` has none of its bound left
+/// at `now`. A claim's first attempt is bounded from its own start
+/// (`bound_from` is `None`), and an effect with no `timeout_ms` has no
+/// bound: neither is ever spent.
+fn bound_is_spent(
+    bound_from: Option<AgentTimestampMillis>,
+    timeout_ms: Option<u64>,
+    now: AgentTimestampMillis,
+) -> bool {
+    match (bound_from, timeout_ms) {
+        (Some(bound_from), Some(timeout_ms)) => {
+            now.as_millis() >= bound_from.as_millis().saturating_add(timeout_ms)
+        }
+        _ => false,
+    }
 }
 
 /// How one step of a claim ended: with the claim concluded, or with another
@@ -3447,8 +3469,13 @@ where
     /// Such a claim has spent lease and written no settle, so the claims
     /// behind it were not renewed. The batch ends with it, and the pass
     /// gives those claims back as a failed pass does
-    /// ([`Self::release_unstarted`]): they are claimable at once, under a
-    /// full lease, and are counted nowhere in this pass's report.
+    /// ([`Self::release_unstarted`]): each whose lease still stands is
+    /// claimable at once, under a full lease, and one whose lease has
+    /// lapsed is left as it is, which is anyone's. They are counted in
+    /// [`AgentDispatchPass::claimed`] and in nothing else.
+    ///
+    /// A later attempt whose bound is spent before it can start is not made
+    /// either: the claim ends the same way.
     ///
     /// A renewed batch stays with its worker. A ticket claimed behind long
     /// calls waits for every one of them, and no other worker can take it
@@ -4053,6 +4080,18 @@ where
             );
         }
 
+        // A later attempt whose bound is already spent is not made. Its
+        // bound is counted from the instant its claim asked about the lease,
+        // and the dispatcher has since recorded the attempt before and
+        // authorized this one. Where that took as long as the bound, the
+        // attempt would be handed a deadline already past and no time at
+        // all, and would still be counted. The claim ends instead, as one
+        // that ran out of lease, and the claim that follows makes the
+        // attempt as its first, with its whole bound (issue #171).
+        if bound_is_spent(bound_from, intent.timeout_ms, self.now()) {
+            return Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease));
+        }
+
         if !self.survives(AgentDispatchWindow::BeforeStarted) {
             return Ok(ClaimStep::Concluded(ClaimConclusion::Died));
         }
@@ -4091,20 +4130,32 @@ where
         // (issue #171).
         //
         // The `timeout_ms` handed on with it is what is left of the bound at
-        // this instant, so `deadline_at` is still the attempt's start plus
-        // the bound it is handed, and an executor that bounds an attempt
-        // from its own start by `timeout_ms`, as the MCP executor does, is
-        // held to the same instant.
+        // this instant, never more than the spec declared, so `deadline_at`
+        // is still the attempt's start plus the bound it is handed. An
+        // executor that bounds an attempt from its own start by
+        // `timeout_ms`, as the MCP executor does, then overruns the deadline
+        // only by what it overran before: the time a credential takes to
+        // resolve, which comes after this stamp, and its own close.
         let attempt_started_at = self.now();
+        if bound_is_spent(bound_from, intent.timeout_ms, attempt_started_at) {
+            // The `Started` write used up what was left. The row says
+            // `Dispatching` for an attempt that is not made, which is what
+            // a worker lost here leaves, and the next claim recovers it so.
+            return Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease));
+        }
         let bounded_from = bound_from.unwrap_or(attempt_started_at);
         let mut attempt_intent = intent.clone();
         attempt_intent.deadline_at = intent.timeout_ms.map(|timeout_ms| {
             AgentTimestampMillis::new(bounded_from.as_millis().saturating_add(timeout_ms))
         });
-        attempt_intent.timeout_ms = attempt_intent.deadline_at.map(|deadline_at| {
-            deadline_at
+        attempt_intent.timeout_ms = intent.timeout_ms.map(|timeout_ms| {
+            // Never more than the spec declared, should the clock have
+            // stepped back since the claim asked.
+            bounded_from
                 .as_millis()
+                .saturating_add(timeout_ms)
                 .saturating_sub(attempt_started_at.as_millis())
+                .min(timeout_ms)
         });
         let attempt_intent = &attempt_intent;
         // The binding: the intent's own, or the one the grant carries from

@@ -334,7 +334,8 @@ is still working on it, and from being run by two:
   when the attempt starts.
   Otherwise the claim ends there, writes nothing and is counted in
   `AgentDispatchPass::lapsed`. Its batch ends with it: nothing renewed the
-  claims behind it, so the pass gives them back, claimable at once. Once
+  claims behind it, so the pass gives back each whose lease still stands,
+  claimable at once. Once
   the lease has lapsed, the next claim asks the reconciler about the
   attempt that one left and goes on from its answer, as for an attempt
   whose worker was lost. The lease has to cover one attempt, not a budget.
