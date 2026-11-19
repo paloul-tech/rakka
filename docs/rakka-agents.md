@@ -210,10 +210,28 @@ leaves behind is the same either way.
    with no other gate of that kind standing, has its dispatch wait
    recomputed: the wait of a gate that still stands, or
    `WaitingForEffect`.
+   A call the run committed and has not sent is cancelled in place when the
+   run stops dispatching: when a call fails for good, on a `Cancel`, when a
+   compensation is scheduled, when a handoff is accepted, and when the run
+   ends. Four kinds are exempt and are still sent: a compensation, a
+   workflow cancel, a memory promotion and a claim append. An approval or
+   authorization a cancelled call waited behind is closed in the same
+   transition, so a decision that arrives after is refused
+   `checkpoint-already-resolved`, or `run-terminal` once the run has ended.
+   A goal evaluation still unsent when a run ends is cancelled the same way
+   and its gate closed. An ended run therefore holds no waiting approval or
+   authorization but that of a memory promotion or a claim append. A record
+   an earlier binary left holding such a gate has it closed by the first
+   settle pass that reaches it; until then a decision for it is refused the
+   same way and the timer leaves it alone.
 6. **Budgets.** Every run holds an escrow ledger: allocations flow down from a
    parent scope in the parent's own transition, settlements and returns flow
    back up through the exchange path, and a `Started` attempt that becomes
-   `Indeterminate` still consumes the attempt budget it reserved.
+   `Indeterminate` still consumes the attempt budget it reserved. A call
+   cancelled before it was sent consumes none, and what it reserved is
+   released in the transition that cancels it; a compensation is reserved
+   after the calls its decision cancels are released, so it can spend what
+   they held.
 7. **Terminal.** A typed result passes the task's result rules before the task
    completes; a malformed or rejected one records a rejection decision and
    costs bounded iterations. The terminal transition stamps the run's
@@ -515,7 +533,10 @@ escalation has spent is not reported. A person can escalate only a
 reconciliation checkpoint, which carries no expiry, so after a person's
 `Escalate` that checkpoint adds nothing to `next_wake`. On an ended run a
 checkpoint not bound to a memory promotion or claim append adds nothing either,
-because the timer leaves it alone. A deadline that has passed but that no timer
+because the timer leaves it alone. A run's end closes every other approval and
+authorization, so what is left is a reconciliation checkpoint parked on a call
+of another kind: a run whose result is accepted while a goal evaluation's
+outcome is unknown ends holding one, and no decision answers it. A deadline that has passed but that no timer
 has fired yet is still reported. The checkpoint views keep `due_at` and
 `expires_at` as the record holds them. The session view by `AgentRunId`
 joins that snapshot with retained decision events and trace segments, exposes
@@ -996,15 +1017,20 @@ events also carry the optional `checkpoint`, `effect`, `outcome`
 `cancelling`, a `budget-top-up` wait reads `running` (the run parks for a
 top-up under `Running`), and a wind-down begun while an effect's outcome is unknown reads
 `waiting-for-reconciliation`. The A2A coordination replay shows only a run
-event's kind and `reason_code`. When a failure ends a run, any other gated
-effect's approval or authorization checkpoint stays open on the ended run and
-gets no close event; the run's end event closes it for readers. On an ended
+event's kind and `reason_code`. When a call is cancelled before it is sent (by
+a failed call, a scheduled compensation, an accepted handoff or the run's
+end), the approval or authorization it waited behind records
+`resolve-checkpoint` with outcome and reason `cancelled`, as a cancel's close
+does, before the run's end event (under `Version2`; see below). On an ended
 run, events can follow the run's end event: for a parked memory promotion or
 claim append, `request-reconciliation` (the checkpoint's open),
 `escalate-checkpoint` and `reconcile`; for a gate left open on one of them,
 `resolve-checkpoint` (its grant, denial or expiry); and for a gated one
 commanded after the run ended, or a re-sent gated generation, the
-`request-approval` or `request-authorization` of its new gate.
+`request-approval` or `request-authorization` of its new gate. A record an
+earlier binary left ended with another call's approval or authorization
+waiting gets no close event when a settle pass closes it: that run's end
+event closed it for readers.
 `request-reconciliation`, `escalate-checkpoint` and `resolve-checkpoint` are
 written only under `Version2`; the other three are written under
 `Version1` too. `AgentDecisionEventVocabulary` selects what is written:
