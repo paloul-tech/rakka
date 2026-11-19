@@ -800,8 +800,13 @@ impl AgentEffectPolicies {
     /// Sets the spec compensation effects dispatch under
     /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)). The
     /// default is one non-idempotent attempt.
+    ///
+    /// A spec that requires a checkpoint or an authorization is refused
+    /// `effect-policy-invalid`: nothing opens that gate, and the run's
+    /// wind-down would wait on it for good (issue #128).
     pub fn with_compensation_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
         spec.validate()?;
+        refuse_gate_on_wind_down_effect(&spec, "compensation")?;
         self.compensation = spec;
         Ok(self)
     }
@@ -854,8 +859,13 @@ impl AgentEffectPolicies {
     /// default is
     /// [`crate::workflow_tool::AGENT_WORKFLOW_CANCEL_DEFAULT_MAX_ATTEMPTS`]
     /// idempotent attempts.
+    ///
+    /// A spec that requires a checkpoint or an authorization is refused
+    /// `effect-policy-invalid`: nothing opens that gate, and the run's
+    /// wind-down would wait on it for good (issue #128).
     pub fn with_workflow_cancel_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
         spec.validate()?;
+        refuse_gate_on_wind_down_effect(&spec, "workflow cancel")?;
         self.workflow_cancel = spec;
         Ok(self)
     }
@@ -956,6 +966,34 @@ impl Default for AgentEffectPolicies {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Refuses a compensation or workflow-cancel spec that requires a checkpoint
+/// or an authorization (issue #128).
+///
+/// A gate on either has nothing that opens it and no meaning that holds.
+/// Both are recorded by a run that is already winding down, after the
+/// transition in which a turn opens the gates of its calls, so the effect
+/// stayed `Pending` behind a gate that was never opened. Neither is fenced
+/// by the wind-down, so the run stayed `Cancelling` on it for good. And had
+/// the gate been opened, a denial would have left the original effect marked
+/// `Compensated` with no compensation run, a cancel would have closed the
+/// gate and left the effect `Pending` again, and a gated workflow cancel
+/// would only delay stopping a child its parent had already decided to
+/// stop.
+///
+/// The refusal is at the two setters, which are the only way either spec
+/// enters [`AgentEffectPolicies`]. `kind` names the spec in the message.
+fn refuse_gate_on_wind_down_effect(spec: &AgentEffectSpec, kind: &str) -> AgentEffectResult<()> {
+    if spec.checkpoint_required || spec.authorization_required {
+        return Err(AgentEffectError::InvalidPolicy {
+            message: format!(
+                "a {kind} spec may not require a checkpoint or an authorization: \
+                 nothing opens that gate, and the run's wind-down would wait on it for good"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Derives the external idempotency key of one effect generation.
@@ -3396,6 +3434,68 @@ mod tests {
         let encoded = serde_json::to_value(&missing).expect("the spec serializes");
         serde_json::from_value::<AgentEffectSpec>(encoded)
             .expect_err("an unenforceable spec is refused on load");
+    }
+
+    /// Issue #128: nothing opens the gate of a compensation or a workflow
+    /// cancel, so a spec that requires one is refused where it is set.
+    #[test]
+    fn a_gated_compensation_or_workflow_cancel_spec_is_refused() {
+        let gated = [
+            AgentEffectSpec::non_idempotent().with_checkpoint_required(),
+            AgentEffectSpec::non_idempotent().with_authorization_required(),
+            AgentEffectSpec::non_idempotent()
+                .with_checkpoint_required()
+                .with_authorization_required(),
+        ];
+        for spec in &gated {
+            let refused = AgentEffectPolicies::new()
+                .with_compensation_spec(spec.clone())
+                .expect_err("a gated compensation spec is refused");
+            assert_eq!(refused.code(), "effect-policy-invalid");
+            assert!(
+                refused.to_string().contains("compensation"),
+                "the refusal names the kind: {refused}"
+            );
+            let refused = AgentEffectPolicies::new()
+                .with_workflow_cancel_spec(spec.clone())
+                .expect_err("a gated workflow-cancel spec is refused");
+            assert_eq!(refused.code(), "effect-policy-invalid");
+            assert!(
+                refused.to_string().contains("workflow cancel"),
+                "the refusal names the kind: {refused}"
+            );
+        }
+
+        // The same two take a spec with no gate, as before.
+        let ungated = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+        let policies = AgentEffectPolicies::new()
+            .with_compensation_spec(ungated.clone())
+            .expect("an ungated compensation spec is accepted")
+            .with_workflow_cancel_spec(ungated.clone())
+            .expect("an ungated workflow-cancel spec is accepted");
+        assert_eq!(policies.compensation, ungated);
+        assert_eq!(policies.workflow_cancel, ungated);
+
+        // Every other kind's gate is opened by something, and its spec may
+        // require one.
+        let tool = AgentToolId::new("charge-card").expect("the tool id is valid");
+        for spec in gated {
+            AgentEffectPolicies::new()
+                .with_tool_spec(tool.clone(), spec.clone())
+                .expect("a gated tool spec is accepted")
+                .with_default_tool_spec(spec.clone())
+                .expect("a gated default tool spec is accepted")
+                .with_memory_promotion_spec(spec.clone())
+                .expect("a gated memory-promotion spec is accepted")
+                .with_goal_evaluation_spec(spec.clone())
+                .expect("a gated goal-evaluation spec is accepted")
+                .with_a2a_send_spec(spec.clone())
+                .expect("a gated A2A send spec is accepted")
+                .with_workflow_start_spec(spec.clone())
+                .expect("a gated workflow-start spec is accepted")
+                .with_claim_append_spec(spec)
+                .expect("a gated claim-append spec is accepted");
+        }
     }
 
     #[test]

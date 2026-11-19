@@ -5215,11 +5215,11 @@ async fn a_cancel_settles_a_gated_promotion_that_has_no_gate() {
 }
 
 /// The rule is scoped to the effects outside the turn. A compensation is
-/// exempt from the wind-down fence as a promotion is, and one the deployment
-/// gates waits `Pending` with no gate, since nothing opens a compensation's
-/// gate (issue #128 owns that). A cancel leaves such a compensation exactly
-/// as it was: what a cancel does to it is issue #128's to decide, not this
-/// rule's.
+/// exempt from the wind-down fence as a promotion is. A gated compensation
+/// spec is refused where it is set (issue #128), but a record written
+/// before that can hold a compensation its deployment gated: it waits
+/// `Pending` with no gate, since nothing opens a compensation's gate. A
+/// cancel leaves such a compensation exactly as it was.
 #[tokio::test]
 async fn a_cancel_leaves_a_gated_compensation_as_it_was() {
     let policies = rakka_agent::AgentEffectPolicies::new()
@@ -5228,9 +5228,7 @@ async fn a_cancel_leaves_a_gated_compensation_as_it_was() {
             rakka_agent::AgentEffectSpec::non_idempotent(),
         )
         .expect("the tool spec is valid")
-        .with_compensation_spec(
-            rakka_agent::AgentEffectSpec::non_idempotent().with_checkpoint_required(),
-        )
+        .with_compensation_spec(rakka_agent::AgentEffectSpec::non_idempotent())
         .expect("the compensation spec is valid");
     let (fx, _stores) = live_world(Rest::AwaitingTools, policies).await;
     let tool = dispatched_effect(&fx, AgentRunEffectKind::ToolCall).await;
@@ -5292,6 +5290,7 @@ async fn a_cancel_leaves_a_gated_compensation_as_it_was() {
         assert_eq!(held.len(), 1, "one compensation is scheduled");
         held.into_iter().next().expect("one compensation")
     }
+    gate_the_compensation_as_an_older_record_held_it(&fx).await;
     let scheduled = compensation(&fx).await;
     assert_eq!(scheduled.status, AgentRunEffectStatus::Pending);
     assert!(scheduled.checkpoint_required, "the compensation is gated");
@@ -5612,6 +5611,37 @@ async fn failed_world_left_holding_a_tool_approval(
     );
     put_back_to_waiting(&fx, &closed[0].checkpoint_id).await;
     (fx, stores)
+}
+
+/// Rewrites the stored record so its one compensation is gated and
+/// `Pending`: a compensation recorded under a spec that required a
+/// checkpoint, which a deployment could set before issue #128.
+async fn gate_the_compensation_as_an_older_record_held_it(fx: &Fixture) {
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    let mut gated = 0;
+    for effect in value["run"]["loop_state"]["effects"]
+        .as_array_mut()
+        .expect("the effects are an array")
+    {
+        if effect["request"].get("compensation").is_some() {
+            effect["status"] = serde_json::json!("pending");
+            effect["checkpoint_required"] = serde_json::json!(true);
+            gated += 1;
+        }
+    }
+    assert_eq!(gated, 1, "the record holds one compensation");
+    let left = serde_json::from_value(value).expect("the rewritten record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, left)
+        .await
+        .expect("the rewritten record persists");
 }
 
 /// Rewrites the stored record so the cancelled checkpoint `checkpoint_id` is
