@@ -310,8 +310,8 @@ settle, a release and a prune. The loss after that is returned as
 
 **A batch and its leases** (issue #157). A claim pass leases every claim of
 its batch at one instant, and a worker runs the claims one after another.
-Two rules keep a later claim from being taken by another worker while its
-pass is still working, and from being run by two:
+Three rules keep a claim from being taken by another worker while its pass
+is still working on it, and from being run by two:
 
 - **Every settle renews what the pass still holds.** In the same write, each
   claim the pass has taken and not started is leased for a full lease from
@@ -323,6 +323,25 @@ pass is still working, and from being run by two:
 - **A claim whose lease lapsed is not started.** The pass passes it over,
   counts it in `AgentDispatchPass::lapsed` and writes nothing. Any worker
   can claim it.
+- **A claim makes a later attempt only under a lease that covers it**
+  (issue #171). One claim makes more than one attempt only for a
+  reconcileable effect whose attempt ends unknown and is found not
+  executed. Each attempt after the first is made only if the lease is still
+  active for the length of an attempt: the effect's `timeout_ms`, or the
+  instant itself when it declares none. That attempt's `deadline_at` is
+  counted from the instant the claim asked, so it falls inside the lease,
+  and the `timeout_ms` its executor is handed is what is left of the bound
+  when the attempt starts.
+  Otherwise the claim ends there, writes nothing and is counted in
+  `AgentDispatchPass::lapsed`. Its batch ends with it: nothing renewed the
+  claims behind it, so the pass gives back each whose lease still stands,
+  claimable at once. Once
+  the lease has lapsed, the next claim asks the reconciler about the
+  attempt that one left and goes on from its answer, as for an attempt
+  whose worker was lost. The lease has to cover one attempt, not a budget.
+  An attempt that spends the budget has none after it, so its claim is not
+  asked and settles it as before; a claim's first attempt is not asked
+  either.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,
@@ -346,7 +365,9 @@ uses both. A hold is spent by the settle that lands, so a worker names the
 claims it still holds before each one it runs, and a claim nobody names
 again is leased for at most one more lease. The `AgentDispatchClaim` a
 worker was handed keeps the expiry of its claim pass; the entry holds the
-lease as it stands.
+lease as it stands. `AgentDispatcherFleet::is_current_claim_for` asks
+whether a claim's lease is still active a given time from now, from the
+handle's own copy of the record and its clock.
 
 **The concurrency limit counts leases.** An entry counts against its class
 and its target from its claim until it is settled or its lease lapses,
@@ -482,7 +503,10 @@ concerns a row that is not finished:
 - Nothing renews a lease during a call. A call that outlives its lease loses
   its claim, and the next claim recovers the ticket as an attempt that
   disappeared, by its safety class, while that call may still be out. The
-  lease has to be longer than the longest call.
+  lease has to be longer than the longest call. A claim's later attempts
+  are held to that (see "A batch and its leases"); its first is not, and
+  neither is an attempt of an effect that declares no `timeout_ms`, which
+  is asked only whether the lease has already lapsed.
 - A worker whose lease lapsed during its call still writes that call's
   result to a row that is not finished. Its failure burns an attempt, and
   can exhaust the row, under a ticket another worker is running; its success

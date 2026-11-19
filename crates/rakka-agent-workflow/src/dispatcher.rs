@@ -2311,6 +2311,35 @@ where
             .is_some_and(|entry| entry.is_current_claim(claim, now)))
     }
 
+    /// Returns true when the claim is current and its lease is still active
+    /// `for_ms` from now: work that takes no longer than that ends while the
+    /// claim is still this worker's.
+    ///
+    /// Nothing renews the claim a worker is running
+    /// ([`Self::hold_claims`]), so a worker that means to do more under one
+    /// claim than it was claimed for, such as another attempt after the
+    /// first, asks this before it starts. A lease is over at the instant it
+    /// expires, so work that would end at that instant is not covered, and
+    /// `for_ms` of zero asks what [`Self::is_current_claim`] asks.
+    ///
+    /// Like that question, this is answered from the handle's own copy of
+    /// the record and its clock, and reads and writes nothing. The lease is
+    /// the entry's, which a renewal moves, and not the expiry the claim was
+    /// handed. Another worker can take the ticket only once the lease has
+    /// lapsed, and that is visible on the clock alone.
+    pub fn is_current_claim_for(
+        &self,
+        claim: &AgentDispatchClaim,
+        for_ms: u64,
+    ) -> AgentDispatcherResult<bool> {
+        let now = current_agent_timestamp(&self.clock);
+        let until = AgentTimestampMillis::new(now.as_millis().saturating_add(for_ms));
+        Ok(self
+            .state()?
+            .entry(&claim.dispatch_id)
+            .is_some_and(|entry| entry.is_current_claim(claim, until)))
+    }
+
     /// Names the claims this handle's worker has taken and not yet started,
     /// for the next settle the handle writes.
     ///
