@@ -61,7 +61,10 @@
 //!   vector; [`PgvectorPrivateMemoryRetriever::reindex`] sweeps for live
 //!   records missing a current vector, which is the **rebuild** path: drop
 //!   every derived row and repeated `reindex` restores identical retrieval
-//!   ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+//!   ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)). A
+//!   memory the pass could not give a vector is counted in
+//!   [`ReindexPage::failed`] and stays unretrievable until a later sweep
+//!   embeds it.
 //! - [`PgvectorPrivateMemoryRetriever::deindex_memory`] and
 //!   [`PgvectorPrivateMemoryRetriever::purge_orphaned`] remove residual
 //!   derived rows after tombstone/delete/purge of authoritative records —
@@ -267,14 +270,25 @@ pub struct ReindexPage {
     /// artifact-backed content). Skipped candidates remain candidates; page
     /// past them with [`Self::next`].
     pub skipped: u64,
-    /// How many candidates this page could not interpret — a stored record
-    /// this binary cannot decode, or one its schema policy refuses.
+    /// How many candidates this page could not give a vector: a row whose
+    /// id or record this binary cannot read, a record its schema policy
+    /// refuses, or a memory whose embedding failed. The last is an error
+    /// from the embedder, or an answer of the wrong length or with a
+    /// component that is not finite.
     ///
-    /// These are counted and paged past rather than failing the sweep, so one
-    /// unreadable record cannot stall a rebuild (see
+    /// These are counted and paged past rather than failing the sweep, so
+    /// neither one unreadable record nor one input an embedder always
+    /// refuses can stall a rebuild (see
     /// [`PgvectorPrivateMemoryRetriever::reindex`]). A non-zero count is an
-    /// operational signal: the records behind it have no current vector and
-    /// are therefore unretrievable until whatever cannot read them is fixed.
+    /// operational signal: the memories behind it have no current vector and
+    /// are therefore unretrievable. They are still candidates, so a later
+    /// sweep reads them again: run it once whatever failed is fixed.
+    ///
+    /// The count does not say which cause it was, and a page cannot tell an
+    /// embedder that is unavailable or misconfigured from memories it
+    /// refuses: both are a page of failures. To learn why one memory fails,
+    /// call [`PgvectorPrivateMemoryRetriever::index_memory`] for it, which
+    /// returns the error.
     pub failed: u64,
     /// The cursor for the next page, `None` when the scan completed.
     pub next: Option<AgentPrivateMemoryId>,
@@ -386,8 +400,8 @@ impl PgvectorPrivateMemoryRetriever {
         Ok(memory)
     }
 
-    /// Derives and stores one memory's vector, upserting the derived row
-    /// keyed to the authoritative revision it was derived from.
+    /// Derives and stores one memory's vector. An embedder identity that
+    /// cannot be stored is refused before the model is called.
     async fn index_decoded(
         &self,
         scope: &AgentScope,
@@ -395,9 +409,29 @@ impl PgvectorPrivateMemoryRetriever {
         text: &str,
         now: AgentTimestampMillis,
     ) -> Result<IndexOutcome, MemoryError> {
-        let (reference, dimensions, version) = self.embedder_identity()?;
+        let identity = self.embedder_identity()?;
         let vector = self.embed_checked(text).await?;
-        let encoded = encode_vector(&vector)?;
+        self.store_vector(scope, memory, &vector, &identity, now)
+            .await
+    }
+
+    /// Stores the vector derived from one memory under `identity`, upserting
+    /// the derived row keyed to the authoritative revision it was derived
+    /// from.
+    ///
+    /// Apart from the model call this is everything indexing one memory
+    /// does, so [`Self::reindex`] can tell an embedder that refused one
+    /// input from a write that failed.
+    async fn store_vector(
+        &self,
+        scope: &AgentScope,
+        memory: &AgentPrivateMemory,
+        vector: &[f32],
+        identity: &(MemoryEmbeddingRef, i32, i64),
+        now: AgentTimestampMillis,
+    ) -> Result<IndexOutcome, MemoryError> {
+        let (reference, dimensions, version) = identity;
+        let encoded = encode_vector(vector)?;
         let source_revision =
             i64::try_from(memory.revision.get()).map_err(|_| MemoryError::Backend {
                 backend: BACKEND_NAME.to_string(),
@@ -514,8 +548,9 @@ impl PgvectorPrivateMemoryRetriever {
     /// This is the rebuild path
     /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)):
     /// dropping every derived row and paging `reindex` to completion restores
-    /// identical retrieval. Bounded, idempotent, deployment-invoked — page
-    /// with the returned cursor until [`ReindexPage::next`] is `None`.
+    /// identical retrieval, for every memory no page counted in
+    /// [`ReindexPage::failed`]. Bounded, idempotent, deployment-invoked —
+    /// page with the returned cursor until [`ReindexPage::next`] is `None`.
     ///
     /// # A single unreadable record cannot stall the rebuild
     ///
@@ -529,13 +564,42 @@ impl PgvectorPrivateMemoryRetriever {
     /// the same page and fail identically, and the rebuild path would be
     /// unavailable for that agent until the record was repaired by hand.
     ///
+    /// # Nor can a memory the embedder refuses
+    ///
+    /// A memory whose embedding fails is counted into [`ReindexPage::failed`]
+    /// and paged past in the same way: an error from the embedder, or an
+    /// answer of the wrong length or with a component that is not finite. An
+    /// input one provider always rejects (a content filter, a text the model
+    /// finds too long) would otherwise be the first row of every retry, and
+    /// no memory after it would be embedded (issue #151). The embedder's
+    /// error is dropped, because it can quote the text it was given.
+    ///
+    /// So an embedder that fails for every input is not an error either,
+    /// whether it is unavailable, refused for its credentials or its quota,
+    /// or answers vectors that contradict the identity it declares. Each
+    /// page makes one failing call for every memory it tries to embed and
+    /// counts them all, and the sweep runs to its end having embedded
+    /// nothing. The memories stay candidates, so a later sweep embeds them.
+    ///
+    /// A page does not say which of these happened. One refused memory in a
+    /// page of one, and an outage, are the same page, so a caller must not
+    /// stop a sweep because a page embedded nothing: that would hold it on
+    /// the refused memory again. A caller that needs to know whether its
+    /// embedder works can ask it, with a text of its own.
+    ///
     /// # Errors
     ///
-    /// Returns the same errors as
-    /// [`PgvectorPrivateMemoryRetriever::index_memory`] — SQL failures and
-    /// embedder-identity mismatches, which are conditions of the deployment
-    /// rather than of one record, so retrying the same page is the correct
-    /// response to them.
+    /// Returns [`MemoryError::InvalidEmbeddingRef`] before it reads a page
+    /// when the embedder declares an identity that cannot be stored: no
+    /// model, no dimensions, more dimensions than the pgvector ceiling, or a
+    /// dimension count or version outside the storable range. Returns
+    /// [`MemoryError::Backend`] when the page cannot be read or a vector
+    /// cannot be written. What the call already stored stays, and a retry
+    /// of the same page reads what is still missing. A failed embedding is
+    /// never an error.
+    ///
+    /// A write that fails because of one record's own data is returned like
+    /// any other, and every retry meets that record again.
     pub async fn reindex(
         &self,
         scope: &AgentScope,
@@ -543,7 +607,8 @@ impl PgvectorPrivateMemoryRetriever {
         now: AgentTimestampMillis,
         limit: usize,
     ) -> Result<ReindexPage, MemoryError> {
-        let (reference, dimensions, version) = self.embedder_identity()?;
+        let identity = self.embedder_identity()?;
+        let (reference, dimensions, version) = &identity;
         let now_raw = i64::try_from(now.as_millis()).unwrap_or(i64::MAX);
         let after_raw = after.map_or(String::new(), |id| id.as_str().to_string());
         let limit = limit.max(1);
@@ -603,7 +668,17 @@ impl PgvectorPrivateMemoryRetriever {
                 skipped += 1;
                 continue;
             };
-            self.index_decoded(scope, &memory, &text, now).await?;
+            // A memory the embedder refuses is counted and paged past, as an
+            // unreadable record is: an input one provider always rejects
+            // would otherwise be the first row of every retry (issue #151).
+            // The failure itself is dropped, because a model's error can
+            // quote the text it was given.
+            let Ok(vector) = self.embed_checked(&text).await else {
+                failed += 1;
+                continue;
+            };
+            self.store_vector(scope, &memory, &vector, &identity, now)
+                .await?;
             indexed += 1;
         }
         Ok(ReindexPage {
@@ -1007,6 +1082,13 @@ mod tests {
             .await
             .expect("the extension probe should answer")
         {
+            // The conformance suite's rule (`tests/memory_conformance.rs`):
+            // where the variable is set, a skip is a failure.
+            assert!(
+                std::env::var("RAKKA_POSTGRES_PGVECTOR_REQUIRED").as_deref() != Ok("1"),
+                "the test database lacks the pgvector extension, and \
+                 RAKKA_POSTGRES_PGVECTOR_REQUIRED=1 makes that a failure"
+            );
             eprintln!("skipping: the test database lacks the pgvector extension");
             return None;
         }
@@ -1019,13 +1101,20 @@ mod tests {
         PostgresAgentPrivateMemoryStore,
         PgvectorPrivateMemoryRetriever,
     )> {
+        vector_world_over(Arc::new(DeterministicEmbedder::new())).await
+    }
+
+    /// [`vector_world`], with the retriever over `embedder`.
+    async fn vector_world_over(
+        embedder: Arc<dyn AgentMemoryEmbedder>,
+    ) -> Option<(
+        PostgresAgentPrivateMemoryStore,
+        PgvectorPrivateMemoryRetriever,
+    )> {
         let client = Arc::new(vector_client().await?);
         let store = PostgresAgentPrivateMemoryStore::from_shared_client(client.clone());
         store.migrate().await.expect("base migration");
-        let retriever = PgvectorPrivateMemoryRetriever::from_shared_client(
-            client,
-            Arc::new(DeterministicEmbedder::new()),
-        );
+        let retriever = PgvectorPrivateMemoryRetriever::from_shared_client(client, embedder);
         retriever.migrate().await.expect("vector migration");
         Some((store, retriever))
     }
@@ -1795,5 +1884,355 @@ mod tests {
             .map(|retrieved| retrieved.memory.memory_id.as_str())
             .collect();
         assert_eq!(names, vec!["mem-b"]);
+    }
+
+    /// What a [`PickyEmbedder`] answers for a text it does not embed.
+    #[derive(Debug, Clone, Copy)]
+    enum Refusal {
+        /// An error, as a provider that rejects the input answers.
+        Errors,
+        /// A vector one component short of what it declares.
+        OneComponentShort,
+        /// A vector of the declared length with a component that is not a
+        /// number.
+        NotFinite,
+    }
+
+    /// The deterministic embedder, except for the texts that hold `refused`.
+    /// It counts its calls, and can declare an identity that is not the
+    /// deterministic embedder's.
+    struct PickyEmbedder {
+        inner: DeterministicEmbedder,
+        /// `None` refuses nothing, and `Some("")` refuses everything.
+        refused: Option<&'static str>,
+        refusal: Refusal,
+        calls: std::sync::atomic::AtomicUsize,
+        identity: Option<MemoryEmbeddingRef>,
+    }
+
+    impl PickyEmbedder {
+        fn refusing(refused: Option<&'static str>, refusal: Refusal) -> Self {
+            Self {
+                inner: DeterministicEmbedder::new(),
+                refused,
+                refusal,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                identity: None,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl AgentMemoryEmbedder for PickyEmbedder {
+        fn embedding_ref(&self) -> MemoryEmbeddingRef {
+            self.identity
+                .clone()
+                .unwrap_or_else(|| self.inner.embedding_ref())
+        }
+
+        fn embed<'a>(&'a self, text: &'a str) -> MemoryFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !self.refused.is_some_and(|needle| text.contains(needle)) {
+                    return self.inner.embed(text).await;
+                }
+                match self.refusal {
+                    Refusal::Errors => Err(MemoryError::Backend {
+                        backend: "picky-embedder".to_string(),
+                        message: "the provider refused this input".to_string(),
+                    }),
+                    Refusal::OneComponentShort => {
+                        let mut vector = self.inner.embed(text).await?;
+                        vector.pop();
+                        Ok(vector)
+                    }
+                    Refusal::NotFinite => {
+                        let mut vector = self.inner.embed(text).await?;
+                        vector[0] = f32::NAN;
+                        Ok(vector)
+                    }
+                }
+            })
+        }
+    }
+
+    const EMBEDDABLE: &str = "friday launch checklist";
+    const REFUSED: &str = "an unembeddable note";
+
+    /// Seeds one memory per `(name, text)`, none of them indexed.
+    async fn seed(
+        store: &PostgresAgentPrivateMemoryStore,
+        owner: &AgentScope,
+        memories: &[(&str, &str)],
+    ) {
+        for (name, text) in memories {
+            store
+                .upsert(
+                    owner,
+                    &memory(owner, name, text),
+                    PrivateMemoryExpectation::Absent,
+                )
+                .await
+                .expect("seed");
+        }
+    }
+
+    /// The memory ids of one agent that hold a derived row, in id order.
+    async fn embedded(
+        retriever: &PgvectorPrivateMemoryRetriever,
+        owner: &AgentScope,
+    ) -> Vec<String> {
+        retriever
+            .client
+            .query(
+                "SELECT memory_id FROM rakka_agent_private_memory_embedding \
+                 WHERE tenant = $1 AND agent = $2 ORDER BY memory_id",
+                &[&owner.tenant().as_str(), &owner.agent().as_str()],
+            )
+            .await
+            .expect("read the derived rows")
+            .iter()
+            .map(|row| row.get::<_, String>("memory_id"))
+            .collect()
+    }
+
+    /// One page as `(indexed, skipped, failed, next)`.
+    type PageCounts = (u64, u64, u64, Option<String>);
+
+    fn counts(page: &ReindexPage) -> PageCounts {
+        (
+            page.indexed,
+            page.skipped,
+            page.failed,
+            page.next.as_ref().map(|id| id.as_str().to_string()),
+        )
+    }
+
+    fn page(indexed: u64, skipped: u64, failed: u64, next: Option<&str>) -> PageCounts {
+        (indexed, skipped, failed, next.map(str::to_string))
+    }
+
+    /// Pages `reindex` from the start, `limit` at a time, following `next`
+    /// until it is `None`, and answers each page. A sweep that does not end
+    /// within sixteen pages is held on one, and fails here.
+    async fn sweep(
+        retriever: &PgvectorPrivateMemoryRetriever,
+        owner: &AgentScope,
+        limit: usize,
+    ) -> Result<Vec<PageCounts>, MemoryError> {
+        let mut after: Option<AgentPrivateMemoryId> = None;
+        let mut pages = Vec::new();
+        for _ in 0..16 {
+            let page = retriever
+                .reindex(owner, after.as_ref(), now(300), limit)
+                .await?;
+            pages.push(counts(&page));
+            match page.next {
+                Some(next) => after = Some(next),
+                None => return Ok(pages),
+            }
+        }
+        panic!("the sweep did not end within sixteen pages: {pages:?}");
+    }
+
+    #[tokio::test]
+    async fn pgvector_reindex_pages_past_a_memory_its_embedder_refuses_when_dsn_is_set() {
+        // Issue #151: one memory the embedder refuses must not stop the pass,
+        // whichever way it refuses: an error, a vector of the wrong length,
+        // or a component that is not a number. It used to end the call with
+        // the embedder's error and no page, so the caller had no cursor to go
+        // on from, and every retry met the same memory first.
+        for refusal in [
+            Refusal::Errors,
+            Refusal::OneComponentShort,
+            Refusal::NotFinite,
+        ] {
+            let embedder = Arc::new(PickyEmbedder::refusing(Some("unembeddable"), refusal));
+            let Some((store, retriever)) = vector_world_over(embedder).await else {
+                return;
+            };
+            let owner = scope(&unique(), "support");
+            // The refused memory sorts first by id, so it is the first row of
+            // the first page.
+            seed(
+                &store,
+                &owner,
+                &[("a", REFUSED), ("b", EMBEDDABLE), ("c", EMBEDDABLE)],
+            )
+            .await;
+
+            let pages = sweep(&retriever, &owner, 1).await.unwrap_or_else(|error| {
+                panic!("{refusal:?}: one refused memory never fails the sweep: {error}")
+            });
+            assert_eq!(
+                pages,
+                vec![
+                    page(0, 0, 1, Some("mem-a")),
+                    page(1, 0, 0, Some("mem-b")),
+                    page(1, 0, 0, Some("mem-c")),
+                    page(0, 0, 0, None),
+                ],
+                "{refusal:?}: the two memories behind the refused one were embedded"
+            );
+            assert_eq!(
+                embedded(&retriever, &owner).await,
+                vec!["mem-b", "mem-c"],
+                "{refusal:?}"
+            );
+
+            // The refused memory still has no vector, so the next sweep reads
+            // it again and nothing else.
+            let again = sweep(&retriever, &owner, 1)
+                .await
+                .expect("the second sweep ends too");
+            assert_eq!(
+                again,
+                vec![page(0, 0, 1, Some("mem-a")), page(0, 0, 0, None)],
+                "{refusal:?}: a rerun reads exactly what is still missing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pgvector_reindex_embeds_what_follows_a_refused_memory_in_its_page_when_dsn_is_set() {
+        // The same within one page: a refusal counts that memory and no
+        // other. A pass that gave up on the rest of a page at its first
+        // refusal would embed nothing behind one for any page size above
+        // one.
+        let embedder = Arc::new(PickyEmbedder::refusing(
+            Some("unembeddable"),
+            Refusal::Errors,
+        ));
+        let Some((store, retriever)) = vector_world_over(embedder.clone()).await else {
+            return;
+        };
+        let owner = scope(&unique(), "support");
+        seed(
+            &store,
+            &owner,
+            &[("a", EMBEDDABLE), ("b", REFUSED), ("c", EMBEDDABLE)],
+        )
+        .await;
+
+        let pages = sweep(&retriever, &owner, 3).await.expect("the sweep ends");
+        assert_eq!(
+            pages,
+            vec![page(2, 0, 1, Some("mem-c")), page(0, 0, 0, None)]
+        );
+        assert_eq!(embedded(&retriever, &owner).await, vec!["mem-a", "mem-c"]);
+        assert_eq!(
+            embedder.calls(),
+            3,
+            "one call for each memory of the page; the cursor is then past them all"
+        );
+    }
+
+    #[tokio::test]
+    async fn pgvector_reindex_through_an_embedder_outage_counts_every_memory_when_dsn_is_set() {
+        // What issue #151's fix costs: an embedder that refuses everything is
+        // not an error either. Each page counts every memory it tried, at one
+        // call each, and the sweep ends.
+        let embedder = Arc::new(PickyEmbedder::refusing(Some(""), Refusal::Errors));
+        let Some((store, retriever)) = vector_world_over(embedder.clone()).await else {
+            return;
+        };
+        let owner = scope(&unique(), "support");
+        seed(
+            &store,
+            &owner,
+            &[("a", EMBEDDABLE), ("b", EMBEDDABLE), ("c", EMBEDDABLE)],
+        )
+        .await;
+
+        let pages = sweep(&retriever, &owner, 2)
+            .await
+            .expect("an outage is counted, not returned");
+        assert_eq!(
+            pages,
+            vec![page(0, 0, 2, Some("mem-b")), page(0, 0, 1, None)]
+        );
+        assert_eq!(embedder.calls(), 3, "one failing call for each memory");
+        assert!(embedded(&retriever, &owner).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pgvector_reindex_returns_a_write_failure_and_keeps_what_it_stored_when_dsn_is_set() {
+        // A failed write still ends the call, and what the call had already
+        // stored stays. The one write failure a test can make without
+        // changing the schema belongs to a record: a digest that holds a NUL,
+        // which the store keeps inside the record's bytes and the derived
+        // table's text column refuses. That such a record holds every later
+        // sweep on its page is not new, and is not what this test is for.
+        let embedder = Arc::new(PickyEmbedder::refusing(None, Refusal::Errors));
+        let Some((store, retriever)) = vector_world_over(embedder).await else {
+            return;
+        };
+        let owner = scope(&unique(), "support");
+        seed(&store, &owner, &[("a", EMBEDDABLE)]).await;
+        let mut unwritable = memory(&owner, "b", EMBEDDABLE);
+        unwritable.content_digest.value = "00\u{0}00".to_string();
+        store
+            .upsert(&owner, &unwritable, PrivateMemoryExpectation::Absent)
+            .await
+            .expect("the store accepts the record");
+        seed(&store, &owner, &[("c", EMBEDDABLE)]).await;
+
+        let error = retriever
+            .reindex(&owner, None, now(300), 10)
+            .await
+            .expect_err("a failed write ends the call");
+        assert_eq!(error.code(), "memory-backend-failed");
+        assert_eq!(
+            embedded(&retriever, &owner).await,
+            vec!["mem-a"],
+            "what was stored before the failure stays, and nothing after it is tried"
+        );
+    }
+
+    #[tokio::test]
+    async fn pgvector_index_memory_refuses_an_unstorable_identity_before_the_model_when_dsn_is_set()
+    {
+        // Indexing one memory is as it was: an embedder identity that cannot
+        // be stored is refused before the memory's text is sent anywhere,
+        // and a failed embedding is still an error.
+        let mut embedder = PickyEmbedder::refusing(None, Refusal::Errors);
+        embedder.identity = Some(MemoryEmbeddingRef {
+            model: "too-wide".to_string(),
+            dimensions: PGVECTOR_MAX_DIMENSIONS + 1,
+            version: AgentRevisionNumber::INITIAL,
+        });
+        let embedder = Arc::new(embedder);
+        let Some((store, retriever)) = vector_world_over(embedder.clone()).await else {
+            return;
+        };
+        let owner = scope(&unique(), "support");
+        seed(&store, &owner, &[("a", EMBEDDABLE)]).await;
+        let id = AgentPrivateMemoryId::new("mem-a").expect("id");
+
+        let error = retriever
+            .index_memory(&owner, &id, now(100))
+            .await
+            .expect_err("an identity above the ceiling is refused");
+        assert_eq!(error.code(), "memory-embedding-invalid");
+        assert_eq!(embedder.calls(), 0, "the model was not called");
+        let error = retriever
+            .reindex(&owner, None, now(100), 10)
+            .await
+            .expect_err("the pass refuses it too, before it reads a page");
+        assert_eq!(error.code(), "memory-embedding-invalid");
+        assert_eq!(embedder.calls(), 0);
+
+        let refusing = Arc::new(PickyEmbedder::refusing(Some(""), Refusal::Errors));
+        let Some((_, retriever)) = vector_world_over(refusing).await else {
+            return;
+        };
+        let error = retriever
+            .index_memory(&owner, &id, now(100))
+            .await
+            .expect_err("one memory's failed embedding is still an error");
+        assert_eq!(error.code(), "memory-backend-failed");
     }
 }
