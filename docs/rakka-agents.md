@@ -323,6 +323,18 @@ pass is still working, and from being run by two:
 - **A claim whose lease lapsed is not started.** The pass passes it over,
   counts it in `AgentDispatchPass::lapsed` and writes nothing. Any worker
   can claim it.
+- **A claim makes a later attempt only under a lease that covers it**
+  (issue #171). One claim makes more than one attempt only for a
+  reconcileable effect whose attempt ends unknown and is found not
+  executed. Each attempt after the first is made only if the lease is still
+  active for the length of an attempt: the effect's `timeout_ms`, or the
+  instant itself when it declares none. Otherwise the claim ends there,
+  writes nothing and is counted in `AgentDispatchPass::lapsed`. Once the
+  lease has lapsed, the next claim asks the reconciler about the attempt
+  that one left and goes on from its answer, so a budget is spent exactly,
+  over as many claims as it takes. The lease has to cover one attempt, not
+  a budget. An attempt that spends the budget is settled by the claim that
+  made it, and a claim's first attempt is not asked.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,
@@ -346,7 +358,9 @@ uses both. A hold is spent by the settle that lands, so a worker names the
 claims it still holds before each one it runs, and a claim nobody names
 again is leased for at most one more lease. The `AgentDispatchClaim` a
 worker was handed keeps the expiry of its claim pass; the entry holds the
-lease as it stands.
+lease as it stands. `AgentDispatcherFleet::is_current_claim_for` asks
+whether a claim's lease is still active a given time from now, from the
+handle's own copy of the record and its clock.
 
 **The concurrency limit counts leases.** An entry counts against its class
 and its target from its claim until it is settled or its lease lapses,
@@ -482,7 +496,10 @@ concerns a row that is not finished:
 - Nothing renews a lease during a call. A call that outlives its lease loses
   its claim, and the next claim recovers the ticket as an attempt that
   disappeared, by its safety class, while that call may still be out. The
-  lease has to be longer than the longest call.
+  lease has to be longer than the longest call. A claim's later attempts
+  are held to that (see "A batch and its leases"); its first is not, and
+  neither is an attempt of an effect that declares no `timeout_ms`, which
+  is asked only whether the lease has already lapsed.
 - A worker whose lease lapsed during its call still writes that call's
   result to a row that is not finished. Its failure burns an attempt, and
   can exhaust the row, under a ticket another worker is running; its success

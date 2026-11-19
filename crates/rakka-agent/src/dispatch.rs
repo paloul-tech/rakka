@@ -430,12 +430,19 @@ struct Ambiguity<'a> {
     code: &'a str,
     /// The failure line the burned attempt's outbox row keeps.
     line: &'a str,
+    /// Whether the attempt was made under the claim that is recovering it.
+    /// An attempt whose worker was lost was made under an earlier claim, and
+    /// the attempt that follows its recovery is this claim's first. One this
+    /// claim made itself is followed by a later attempt of the same claim,
+    /// which the claim's lease must cover (issue #171).
+    under_this_claim: bool,
 }
 
 /// The ambiguity of an attempt whose worker was lost after `Started`.
 const WORKER_LOST: Ambiguity<'static> = Ambiguity {
     code: WORKER_LOST_CODE,
     line: WORKER_LOST_LINE,
+    under_this_claim: false,
 };
 
 /// What a worker would have told the run had its own failure spent the
@@ -2214,14 +2221,26 @@ pub struct AgentDispatchPass {
     /// report zero with a class at its limit. Zero says the limit did not
     /// turn a ticket away before the batch filled, and nothing more.
     pub concurrency_limited: usize,
-    /// Claims this pass took and did not start, because their lease had
-    /// lapsed by the time the pass reached them.
+    /// Claims this pass ended with their ticket unsettled, because they ran
+    /// out of lease.
     ///
-    /// Nothing is written for such a claim: its lease is over, so any worker
-    /// can take the ticket. A pass renews the claims it holds every time it
-    /// settles one, so this counts only when a single claim outlasted the
-    /// lease and the pass went on. A pass that ends in an error returns no
-    /// report, and the claims it passed over are then counted nowhere.
+    /// One kind is a claim the pass took and did not start, because its
+    /// lease had lapsed by the time the pass reached it. A pass renews the
+    /// claims it holds every time it settles one, so that counts only when
+    /// a single claim outlasted the lease and the pass went on.
+    ///
+    /// The other is a claim that stopped between two attempts (issue #171).
+    /// A reconcileable effect's attempt that ends unknown and is found not
+    /// executed is followed by another under the same claim, and that one
+    /// is made only if the claim's lease is still active for the length of
+    /// an attempt (the effect's `timeout_ms`; the instant itself when none
+    /// is declared). A value that stays above zero for a tool says its
+    /// attempts together outlast the lease: the budget is still spent, over
+    /// several claims.
+    ///
+    /// Nothing is written as either ends: once the lease is over any worker
+    /// can take the ticket. A pass that ends in an error returns no report,
+    /// and the claims it passed over are then counted nowhere.
     pub lapsed: usize,
     /// True when the probe killed the worker mid-pass.
     pub died: bool,
@@ -2246,8 +2265,11 @@ enum ClaimConclusion {
     /// The probe killed the worker; durable state is exactly as a crash
     /// leaves it.
     Died,
-    /// The claim's lease had lapsed before the pass reached it. Nothing was
-    /// started and nothing was written.
+    /// The claim ran out of lease and ended with its ticket unsettled.
+    /// Either its lease had lapsed before the pass reached it, and nothing
+    /// was started, or it had made an attempt that was found not executed
+    /// and its lease did not cover another (issue #171). The claim wrote
+    /// nothing as it ended.
     Lapsed,
 }
 
@@ -3394,6 +3416,20 @@ where
     /// counted in [`AgentDispatchPass::lapsed`]; any worker can then take
     /// it.
     ///
+    /// **A claim's later attempts** (issue #171). One claim makes more than
+    /// one attempt only for a reconcileable effect whose attempt ends
+    /// unknown and is found not executed. Each attempt after the first is
+    /// made only if the lease is still active for the length of an attempt:
+    /// the effect's `timeout_ms`, or the instant itself when it declares
+    /// none. Otherwise the claim ends there, writes nothing and is counted
+    /// in [`AgentDispatchPass::lapsed`]. The claim that takes the ticket
+    /// next, once the lease has lapsed, asks the reconciler about the
+    /// attempt this one left and goes on from there, so the budget is spent
+    /// exactly, over as many claims as it takes. The lease therefore has to
+    /// cover one attempt, as it does for a batch, and not a budget. A
+    /// claim's first attempt is not asked: a call that outlives the lease
+    /// loses its claim as before.
+    ///
     /// A renewed batch stays with its worker. A ticket claimed behind long
     /// calls waits for every one of them, and no other worker can take it
     /// meanwhile, where one lease used to bound that wait. The batch size
@@ -4365,7 +4401,11 @@ where
                 // An attempt the reconciliation finds not executed is burned
                 // under the executor's code, not a lost dispatcher's.
                 let line = bounded_failure_line("", code, message);
-                let ambiguity = Ambiguity { code, line: &line };
+                let ambiguity = Ambiguity {
+                    code,
+                    line: &line,
+                    under_this_claim: true,
+                };
                 // A finding of not executed hands the next attempt back
                 // ([`ClaimStep::Invoke`]); it is not made from here.
                 self.reconcile_ambiguous(scope, claim, intent, attempt, false, &ambiguity, pass)
@@ -4601,6 +4641,27 @@ where
                     )
                     .await?;
                     return Ok(ClaimStep::Concluded(ClaimConclusion::Settled));
+                }
+                // Another attempt under the same claim needs a lease that
+                // covers it. Nothing renews the claim being run, and once its
+                // lease has lapsed any worker may take the ticket, ask the
+                // reconciler while this claim's attempt is in flight, be told
+                // "not executed", and invoke beside it. So the claim asks
+                // whether its lease is still active for the length of one
+                // more attempt, and ends here when it is not (issue #171).
+                //
+                // It ends before the burn and writes nothing: the row stays
+                // `Dispatching`, the claim that follows asks the reconciler
+                // about this attempt and burns it, and the budget counts it
+                // once. An attempt that spends the budget has none after it,
+                // so it is settled here whatever is left of the lease.
+                if ambiguity.under_this_claim
+                    && attempt < intent.max_attempts
+                    && !self
+                        .fleet
+                        .is_current_claim_for(&claim, intent.timeout_ms.unwrap_or(0))?
+                {
+                    return Ok(ClaimStep::Concluded(ClaimConclusion::Lapsed));
                 }
                 // Proven absent: a retry is a fresh invocation, under budget.
                 self.retry_ambiguous(scope, claim, intent, ambiguity, pass)

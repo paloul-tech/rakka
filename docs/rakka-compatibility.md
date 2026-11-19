@@ -669,6 +669,27 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Mixed builds and rollback.** A replica of an earlier build still leaves the gate and the reservation when its fence runs; this build refuses a decision for that gate, leaves it out of its timer sweep, and closes it on its next pass over the record. An earlier build reads everything this one writes: a `Cancelled` checkpoint is what a cancel already wrote, and a `Cancelled` goal evaluation on an ended run is a status it knows. After a rollback, new wind-downs leave gates again.
 
+- Issue #171 ("a dispatch claim that checks it is still current before each attempt after the first", the rakka.host brief) changes when one dispatch claim makes another attempt. **No durable field, status, schema version, error code or metric is added**, and a rollback is clean.
+
+  | State | Before | Now |
+  |---|---|---|
+  | A reconcileable effect's attempt ends unknown and is found not executed, with budget left, and the claim's lease is still active for the length of another attempt | The next attempt is made at once, under the same claim | Unchanged |
+  | The same, and the lease has lapsed, or would lapse before another attempt's `timeout_ms` is up | The next attempt is made anyway, and so on to the end of the budget. Any worker can take the ticket meanwhile, be told the attempt in flight was not executed, and invoke beside it. The claim's last write to the fleet is answered `claim-fenced`, and its pass fails | The claim ends there and writes nothing: the row stays `Dispatching`, the entry `Claimed`. It is counted in `AgentDispatchPass::lapsed`, and the pass goes on |
+  | The ticket after such a claim | n/a | Claimable once the lease has lapsed. The next claim asks the reconciler about the attempt that was left, records it as an attempt whose worker was lost, and makes the next one |
+  | The attempt that spends the budget ends unknown and is found not executed | Settled as `Exhausted` and the run told, under the claim that made it | Unchanged, whatever is left of the lease |
+  | A claim's first attempt | Made, whatever is left of the lease | Unchanged |
+  | An effect that declares no `timeout_ms` | As the second row | A later attempt is made unless the lease has already lapsed. One that starts inside the lease can still outlive it |
+
+  **The rule.** A lease has to cover one attempt, not a budget. A budget whose attempts together outlast the lease is spent over several claims, each attempt counted once. Nothing renews the claim being run, as before: a claim that kept its ticket for a whole budget would keep every ticket behind it in the batch, and its place under a concurrency limit, for as long.
+
+  **What an operator sees.** `AgentDispatchPass::lapsed` above zero for a claim that had started. The ticket waits out what is left of the lease before another worker takes it, which is at most one attempt's `timeout_ms`.
+
+  **Not changed.** What a claim does for a read-only, an idempotent or a non-idempotent effect, none of which is attempted twice under one claim. A call that outlives its lease still loses its claim. An executor is handed the attempt's `deadline_at` as before, and the rule rests on its keeping it.
+
+  **Mixed builds.** A worker of an earlier build still runs a budget past its lease. This build's worker that takes such a ticket over recovers it as it always did.
+
+  **Public names.** `AgentDispatcherFleet::is_current_claim_for` in `rakka-agent-workflow`, new. `AgentDispatchPass::lapsed` in `rakka-agent`, whose meaning widens.
+
 Run the default compatibility matrix:
 
 ```sh

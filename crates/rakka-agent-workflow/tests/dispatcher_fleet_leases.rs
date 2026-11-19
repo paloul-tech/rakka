@@ -967,3 +967,88 @@ async fn a_cycle_keeps_its_batch_past_the_instant_it_was_leased_to() {
         );
     }
 }
+
+/// A claim covers a piece of work only while its lease outlasts it
+/// (issue #171). A lease is over at the instant it expires, so work that
+/// would end at that instant is not covered. The handle answers from its own
+/// copy of the record and its clock: it reads and writes nothing.
+#[tokio::test]
+async fn a_claim_covers_only_what_is_left_of_its_lease() {
+    let world = World::new();
+    let mut worker_a = world.worker("worker-a");
+    // Claimed at 100 and leased to 1100.
+    let claim = world.claim_one(&mut worker_a, "run-a", EFFECT).await;
+    let written = world.fleet_revision().await;
+    let covers = |worker: &mut TestWorker, for_ms: u64| {
+        worker
+            .fleet_mut()
+            .is_current_claim_for(&claim, for_ms)
+            .expect("the handle holds the record")
+    };
+
+    assert!(covers(&mut worker_a, 0));
+    assert!(covers(&mut worker_a, 999));
+    assert!(!covers(&mut worker_a, 1_000));
+    assert!(!covers(&mut worker_a, u64::MAX), "no overflow");
+
+    world.clock.advance_millis(600);
+    assert!(covers(&mut worker_a, 399));
+    assert!(!covers(&mut worker_a, 400));
+
+    world.clock.advance_millis(400);
+    assert!(!covers(&mut worker_a, 0), "the lease is over");
+    assert_eq!(world.fleet_revision().await, written, "nothing is written");
+}
+
+/// What a claim covers is read from the entry's lease, which a renewal
+/// moves, and not from the expiry the claim was handed.
+#[tokio::test]
+async fn a_renewed_claim_covers_a_full_lease_from_its_renewal() {
+    let world = World::new();
+    let mut worker_a = world.worker("worker-a");
+    let claims = claim_batch(&world, &mut worker_a, &["run-a", "run-b"]).await;
+    worker_a.fleet_mut().hold_claims(vec![claims[1].clone()]);
+
+    // At 700 the first claim settles, and renews the second to 1700.
+    world.clock.advance_millis(600);
+    worker_a
+        .fleet_mut()
+        .complete_claim(&claims[0])
+        .await
+        .expect("the claim settles");
+
+    assert_eq!(expiry(&world, "run-b").await, Some(1_700));
+    let mut covers = |for_ms: u64| {
+        worker_a
+            .fleet_mut()
+            .is_current_claim_for(&claims[1], for_ms)
+            .expect("the handle holds the record")
+    };
+    assert!(covers(999));
+    assert!(!covers(1_000));
+}
+
+/// A claim another worker took over covers nothing, once its handle has
+/// read the record again.
+#[tokio::test]
+async fn a_claim_another_worker_took_over_covers_nothing() {
+    let world = World::new();
+    let mut worker_a = world.worker("worker-a");
+    let claim = world.claim_one(&mut worker_a, "run-a", EFFECT).await;
+    world.clock.advance_millis(LEASE_MS);
+    let mut worker_b = world.worker("worker-b");
+    worker_b.recover().await.expect("the fleet recovers");
+    let taken = worker_b.claim_due().await.expect("the claim pass runs");
+    assert_eq!(taken.claims.len(), 1);
+
+    worker_a.recover().await.expect("the fleet recovers");
+
+    assert!(!worker_a
+        .fleet_mut()
+        .is_current_claim_for(&claim, 0)
+        .expect("the handle holds the record"));
+    assert!(worker_b
+        .fleet_mut()
+        .is_current_claim_for(&taken.claims[0], LEASE_MS - 1)
+        .expect("the handle holds the record"));
+}
