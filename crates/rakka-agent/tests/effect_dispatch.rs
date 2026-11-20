@@ -2920,3 +2920,90 @@ async fn a_post_terminal_claim_append_survives_the_wind_down_fence() {
     assert_eq!(after.status, before.status);
     assert_eq!(after.terminal_at, before.terminal_at);
 }
+
+/// Issue #182: a call the dispatcher cancels before it starts is charged no
+/// attempt.
+///
+/// The run's turn commits a tool call, and the run is cancelled while the
+/// call's ticket is out and unclaimed. The dispatcher's next pass claims the
+/// ticket, finds the run winding down and cancels it at the fence: the tool
+/// is never invoked. The cancellation used to carry the number of the attempt
+/// the claim was about to make, and the run recorded that as an attempt made
+/// and counted it as spent.
+#[tokio::test]
+async fn a_call_the_fence_cancels_before_it_starts_is_charged_no_attempt() {
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("unused")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    /// The tool call's status and attempts made, the effect attempts the run
+    /// counts as spent, and the attempts it still holds reserved.
+    async fn accounts(fx: &DispatchFixture) -> (AgentRunEffectStatus, u32, u64, u64) {
+        let state = rakka_agent::load_agent_run_state(
+            &fx.fx.runs,
+            &run_scope(),
+            &rakka_agent::AgentSchemaPolicy::default(),
+        )
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+        let held = state.loop_state().expect("the loop state exists");
+        let tool = held
+            .effects()
+            .iter()
+            .find(|effect| effect.kind() == rakka_agent::AgentRunEffectKind::ToolCall)
+            .expect("the run holds its tool call");
+        (
+            tool.status,
+            tool.attempts,
+            held.budget()
+                .consumption()
+                .get(rakka_agent::AgentBudgetDimension::EffectAttempts),
+            held.budget().reserved_attempts(),
+        )
+    }
+    let mut run = fx.fx.run();
+    run.recover(fx.fx.now()).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::Cancel {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Cancellation,
+                [TENANT, AGENT, "1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+        &fx.fx.router,
+        fx.fx.now(),
+    )
+    .await
+    .expect("the cancellation applies");
+    let (status, made, spent, reserved) = accounts(&fx).await;
+    assert_eq!(
+        (status, made),
+        (AgentRunEffectStatus::Ready, 0),
+        "the ticket is out, and no attempt has been made"
+    );
+    assert_eq!(reserved, 1, "the call's one attempt is reserved");
+
+    fx.pump().await;
+
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        0,
+        "the tool was never invoked"
+    );
+    assert_eq!(
+        accounts(&fx).await,
+        (AgentRunEffectStatus::Cancelled, 0, spent, 0),
+        "the call is cancelled with no attempt made, nothing more is spent, and the \
+         reservation is given back"
+    );
+}

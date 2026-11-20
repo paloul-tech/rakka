@@ -512,9 +512,9 @@ fn owed_by_finished_row(
                 };
             (verdict, counted)
         }
-        OutboxStatus::Cancelled if fence_applies => {
-            (RowVerdict::NeverStarted, counted.saturating_add(1))
-        }
+        // The fence cancels a ticket whose next attempt never started, so
+        // the attempts made are the ones the row counts (issue #182).
+        OutboxStatus::Cancelled if fence_applies => (RowVerdict::NeverStarted, counted),
         _ => (
             RowVerdict::Unknown {
                 code: TICKET_ROW_SETTLED,
@@ -3833,12 +3833,16 @@ where
             // its ticket here would strand the wind-down on it forever — and
             // so is a promotion or claim append, which copies work already
             // recorded and may be accepted after the run has ended.
+            //
+            // The run is told the attempts the row counts, and not the one
+            // this claim was about to make: that attempt never started, and
+            // the run charges every attempt it is told of (issue #182).
             self.settle_ticket_cancelled(scope, &claim, "run-cancelled", pass)
                 .await?;
             self.deliver_outcome(
                 scope,
                 &intent,
-                attempt,
+                attempt.saturating_sub(1),
                 claim.fencing_token,
                 AgentRunEffectOutcome::Cancelled {
                     reason: "run-cancelled".to_string(),
