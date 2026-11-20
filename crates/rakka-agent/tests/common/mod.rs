@@ -701,6 +701,17 @@ pub fn task_definition() -> AgentTaskDefinition {
     })
 }
 
+/// [`task_definition`] with no budget ceiling: a goal whose ledger can pay for
+/// every epoch a test admits.
+///
+/// A continuous goal admits an occurrence only when its ledger can pay for
+/// the epoch (issue #179). The wake tests admit occurrences and never run
+/// their epochs, so nothing they admit returns its budget; under the bounded
+/// definition the first admission, or the goal's own run, holds all there is.
+pub fn unbounded_task_definition() -> AgentTaskDefinition {
+    task_definition().with_budgets(AgentBudgetCeilings::unbounded())
+}
+
 /// A bounded model-visible descriptor for one test tool.
 pub fn tool_descriptor(tool: &str) -> AgentToolDescriptor {
     tool_descriptor_of_kind(tool, AgentToolKind::Function)
@@ -1278,7 +1289,10 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                     )
                     .expect("operation id should be derivable"),
                     creation: Box::new(AgentTaskCreation {
-                        definition: task_definition(),
+                        // Agent-owned, so the task's own run holds a share of
+                        // the goal's ledger beside the epochs. With no
+                        // ceiling there is always enough for both.
+                        definition: unbounded_task_definition(),
                         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                             .expect("the input is inline-bounded"),
                         assignee: Some(agent_id()),

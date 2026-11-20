@@ -535,7 +535,10 @@ for it; concurrent triggers coalesce while one epoch owns execution, a downtime
 backlog admits one coalesced representative, an obsolete schedule revision is
 fenced, and a pod, actor, or dispatcher restart never creates a wake by
 itself. Failure backs the goal off through durable re-wakes and escalates into
-suspension; an exhausted goal window defers to the window boundary. Between
+suspension; an exhausted goal window defers to the window boundary. An
+occurrence whose epoch the goal's own ledger cannot pay for is deferred too,
+and no epoch is created for it: it is admitted when an epoch still out returns
+the budget, and where no epoch holds any, the goal's exhaustion policy decides. Between
 every wake, admission, epoch, and result the controller, task, and run may
 passivate. Three things reactivate them, and nothing else: the wake scanner
 over the durable timer index for a scheduled occurrence, an `AdmitWake` command

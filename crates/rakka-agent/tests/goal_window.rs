@@ -20,7 +20,8 @@ use rakka_agent::{
 mod common;
 
 use common::{
-    continuous_goal_mode, scheduled_wake_binding, task_scope, wake_policy, Fixture, TASK, TENANT,
+    continuous_control_creation_command, continuous_goal_mode, scheduled_wake_binding, task_scope,
+    unbounded_task_definition, wake_policy, Fixture, TASK, TENANT,
 };
 
 const WINDOW_MILLIS: u64 = 3_600_000;
@@ -78,7 +79,18 @@ fn disposition_of(reply: AgentTaskEntityReply) -> AgentWakeDisposition {
 async fn the_window_ceiling_defers_admissions_and_refills_only_by_logical_time() {
     let fx = Fixture::new(ScriptedDispatcher::new());
     fx.instantiate_agent().await;
-    fx.create_continuous_control_task(windowed_mode()).await;
+    // The epochs admitted here are released by hand and never run, so none
+    // returns its budget. The goal's ledger has no ceiling, which leaves the
+    // window as the only thing that can refuse an epoch (issue #179).
+    let mut creation = continuous_control_creation_command(windowed_mode());
+    let AgentTaskEntityCommand::Create { creation: root, .. } = &mut creation else {
+        panic!("the helper builds a creation");
+    };
+    root.definition =
+        unbounded_task_definition().with_ownership(rakka_agent::AgentTaskOwnership::Human);
+    fx.apply_task_command(creation)
+        .await
+        .expect("the control task is created");
 
     // Two epochs of 8 model calls fit the 20-call window; each is completed
     // so the next admission finds a free slot.

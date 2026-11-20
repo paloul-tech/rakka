@@ -7654,6 +7654,10 @@ fn apply_epoch_result(
             ),
             None => (AgentGoalStagnationPolicy::default(), false),
         };
+        // The goal's ledger, read after it settled what this epoch returned:
+        // what it can pay for now decides whether a parked occurrence takes
+        // the place this result frees (issue #179).
+        let ledger_shortfall = epoch_ledger_gate(task);
         let controller = task
             .wake_controller
             .get_or_insert_with(AgentWakeControllerState::new);
@@ -7704,19 +7708,24 @@ fn apply_epoch_result(
         // Release the wake. A wake that is no longer active was released by
         // an explicit CompleteWakeOccurrence; the settlement above still
         // counted.
-        let release = match controller.release(&policy, &result.wake, now) {
+        let release = match controller.release_within(&policy, &result.wake, now, ledger_shortfall)
+        {
             Ok(release) => Some(release),
             Err(AgentWakeError::NotActive { .. }) => None,
             Err(error) => return Err(error.into()),
         };
+        // A result that arrives after its wake was released by hand frees no
+        // place, but it returns budget. An occurrence that waited for that
+        // budget is retried here: nothing else is promised to retry it.
+        let admitted_next = match &release {
+            Some(release) => release.admitted_next.clone(),
+            None => controller.promote_admittable_within(&policy, now, ledger_shortfall),
+        };
         controller.ensure_rewakes(&policy, now);
 
         let mut owed = Vec::new();
-        if let Some(next) = release
-            .as_ref()
-            .and_then(|release| release.admitted_next.clone())
-        {
-            owed.push(owe_epoch_creation(&scope, task, &next, now)?);
+        if let Some(next) = &admitted_next {
+            owed.push(owe_epoch_creation(&scope, task, next, now)?);
         }
         task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
         state.updated_at = now;
@@ -7740,10 +7749,7 @@ fn apply_epoch_result(
             result.result_digest.clone(),
             now,
         );
-        if let Some(next) = release
-            .as_ref()
-            .and_then(|release| release.admitted_next.as_ref())
-        {
+        if let Some(next) = &admitted_next {
             record_wake_history(
                 state,
                 AgentTaskHistoryKind::EpochAdmitted,
@@ -7752,6 +7758,7 @@ fn apply_epoch_result(
                 now,
             );
         }
+        settle_epoch_ledger_gate(state, operation_id, now)?;
         Ok((release, owed))
     })(&mut scratch);
 
@@ -8104,7 +8111,7 @@ fn admit_wake(
         .expect("continuous_task_mut proved the mode");
     let current_revision = spec.schedule_revision;
     let policy = spec.wake_policy.policy().clone();
-    let (promoted, disposition, lifecycle_flip) = {
+    let lifecycle_flip = {
         let controller = task
             .wake_controller
             .get_or_insert_with(AgentWakeControllerState::new);
@@ -8112,26 +8119,43 @@ fn admit_wake(
         // has made true is observed by this same recorded transition.
         let lifecycle_before = controller.lifecycle().status();
         controller.observe_lifecycle(&policy, now);
-        let lifecycle_flip =
-            observed_lifecycle_history(lifecycle_before, controller.lifecycle().status());
-        // Oldest parked first: a deferred occurrence takes the free slot
-        // ahead of the fresh delivery once the window can pay, so fresher
-        // occurrences never leapfrog it.
-        let promoted = controller.promote_admittable(&policy, now);
-        let disposition = controller.admit(&policy, current_revision, binding, now)?;
-        controller.ensure_rewakes(&policy, now);
-        (promoted, disposition, lifecycle_flip)
+        observed_lifecycle_history(lifecycle_before, controller.lifecycle().status())
     };
     let mut admitted_wakes = Vec::new();
+    let mut owed = Vec::new();
+    // Oldest parked first: a deferred occurrence takes the free slot ahead
+    // of the fresh delivery once it can be paid for, so fresher occurrences
+    // never leapfrog it. The goal's ledger is read before each admission,
+    // and an admitted occurrence's epoch is debited before the next is
+    // asked, so two admissions in one transition never count on the same
+    // budget (issue #179).
+    let ledger_shortfall = epoch_ledger_gate(task);
+    let promoted = task
+        .wake_controller
+        .get_or_insert_with(AgentWakeControllerState::new)
+        .promote_admittable_within(&policy, now, ledger_shortfall);
     if let Some(wake) = promoted {
+        owed.push(owe_epoch_creation(&scope, task, &wake, now)?);
         admitted_wakes.push(wake);
     }
+    let ledger_shortfall = epoch_ledger_gate(task);
+    let disposition = {
+        let controller = task
+            .wake_controller
+            .get_or_insert_with(AgentWakeControllerState::new);
+        let disposition =
+            controller.admit_within(&policy, current_revision, binding, now, ledger_shortfall)?;
+        controller.ensure_rewakes(&policy, now);
+        disposition
+    };
     if disposition.is_admission() {
+        owed.push(owe_epoch_creation(
+            &scope,
+            task,
+            disposition.wake_id(),
+            now,
+        )?);
         admitted_wakes.push(disposition.wake_id().clone());
-    }
-    let mut owed = Vec::new();
-    for wake in &admitted_wakes {
-        owed.push(owe_epoch_creation(&scope, task, wake, now)?);
     }
     // Admission stores at most the bounded slots, but the record must still
     // keep its lifecycle growth reserve free.
@@ -8157,6 +8181,7 @@ fn admit_wake(
             now,
         );
     }
+    settle_epoch_ledger_gate(state, operation_id, now)?;
     Ok((AgentWakeOutcome::Disposition(disposition), owed))
 }
 
@@ -8182,6 +8207,10 @@ fn complete_wake_occurrence(
         .wake_policy
         .policy()
         .clone();
+    // The epoch whose wake is released by hand may still hold its budget, so
+    // the goal's ledger decides whether the parked occurrence can follow it
+    // now or waits for that epoch's result (issue #179).
+    let ledger_shortfall = epoch_ledger_gate(task);
     let (release, lifecycle_flip) = {
         let controller = task
             .wake_controller
@@ -8190,7 +8219,7 @@ fn complete_wake_occurrence(
         controller.observe_lifecycle(&policy, now);
         let lifecycle_flip =
             observed_lifecycle_history(lifecycle_before, controller.lifecycle().status());
-        let release = controller.release(&policy, wake, now)?;
+        let release = controller.release_within(&policy, wake, now, ledger_shortfall)?;
         controller.ensure_rewakes(&policy, now);
         (release, lifecycle_flip)
     };
@@ -8360,13 +8389,14 @@ fn resume_continuous_goal(
         .wake_policy
         .policy()
         .clone();
+    let ledger_shortfall = epoch_ledger_gate(task);
     let (promoted, status, lifecycle_revision) = {
         let controller = task
             .wake_controller
             .get_or_insert_with(AgentWakeControllerState::new);
         controller.observe_lifecycle(&policy, now);
         let lifecycle_revision = controller.resume(expected, provenance.clone())?;
-        let promoted = controller.promote_admittable(&policy, now);
+        let promoted = controller.promote_admittable_within(&policy, now, ledger_shortfall);
         controller.ensure_rewakes(&policy, now);
         (
             promoted,
@@ -8598,6 +8628,114 @@ fn permanent_budget_exhaustion(task: &AgentTask) -> Option<AgentBudgetDimension>
         .outstanding()
         .any(|(_, escrow)| escrow.allocated().get(dimension).unwrap_or(0) > 0);
     (!outstanding_holds).then_some(dimension)
+}
+
+/// The dimension in which the goal's own ledger cannot pay for one more
+/// epoch, and whether nothing still out could refill it (issue #179).
+///
+/// An epoch is granted the wake policy's epoch budget, narrowed to what the
+/// goal has left. The ledger is what refuses where the goal itself has
+/// nothing left in a dimension the epoch's run asks for. The grant would be
+/// empty there, and the epoch's task could never escrow a run: the question
+/// [`task_budget_refusal`] would ask on the epoch's own ledger, asked before
+/// the epoch exists. An empty grant in a dimension the goal still has budget
+/// in comes from the policy's own zero. That is the policy's contradiction
+/// and not the goal's exhaustion, and no top-up could relieve it, so it is
+/// not reported here.
+///
+/// The shortfall is permanent when no epoch still out holds any of that
+/// dimension. The goal's own run, on an agent-owned goal, does not count: its
+/// budget comes back only when the task ends or its next generation takes it
+/// again, so an occurrence that waited for it would wait for good.
+///
+/// Unlike [`task_budget_refusal`], this does not report a ledger that holds
+/// as many children as it can: that is no dimension's shortfall.
+fn epoch_ledger_shortfall(task: &AgentTask) -> Option<(AgentBudgetDimension, bool)> {
+    let spec = task.goal_mode.continuous()?;
+    // With no epoch contract there is no epoch to pay for, and admission
+    // fails closed on that by itself.
+    let epoch = spec.epoch.as_ref()?;
+    let available = task.escrow.available_allocation();
+    let wanted = epoch.definition.run_allocation_request();
+    let dimension = AgentBudgetDimension::WORK.into_iter().find(|dimension| {
+        wanted.get(*dimension).unwrap_or(u64::MAX) > 0 && available.get(*dimension) == Some(0)
+    })?;
+    let own_run = task
+        .assignment
+        .as_ref()
+        .and_then(|assignment| AgentEscrowChildId::for_run(&assignment.run).ok());
+    let held_by_an_epoch = task.escrow.outstanding().any(|(child, escrow)| {
+        Some(child) != own_run.as_ref() && escrow.allocated().get(dimension).unwrap_or(0) > 0
+    });
+    Some((dimension, !held_by_an_epoch))
+}
+
+/// What the wake controller is told with each admission: the dimension in
+/// which the goal's ledger cannot pay for one more epoch, if there is one.
+fn epoch_ledger_gate(task: &AgentTask) -> Option<AgentBudgetDimension> {
+    epoch_ledger_shortfall(task).map(|(dimension, _)| dimension)
+}
+
+/// Asks the goal's exhaustion policy when a parked occurrence waits on a
+/// ledger that nothing can refill (issue #179).
+///
+/// Run by a delivery and by an epoch's result: the transitions in which an
+/// occurrence arrives or an epoch returns what it held. The policy speaks
+/// only when the budget is what stands in the way: an occurrence is parked,
+/// a place is free and the gate is open. A shortfall that an epoch still out
+/// could relieve is left alone, and that epoch's result retries the
+/// admission.
+///
+/// The policy is asked only of a goal that is authorized or parked, the
+/// guard its other callers keep. A task with no goal record has no policy,
+/// and a goal that is only proposed cannot be ended or parked for budget: in
+/// both the occurrence stays parked. With that guard nothing here can fail
+/// for a record this binary wrote, which matters inside an epoch's result,
+/// where a failure would be the exchange's durable refusal.
+fn settle_epoch_ledger_gate(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(());
+    };
+    if task.status.is_terminal() {
+        return Ok(());
+    }
+    let Some((dimension, true)) = epoch_ledger_shortfall(task) else {
+        return Ok(());
+    };
+    let asked = task.goal_state.as_deref().is_some_and(|goal| {
+        matches!(
+            goal.status(),
+            AgentGoalStatus::Active | AgentGoalStatus::Waiting
+        )
+    });
+    if !asked {
+        return Ok(());
+    }
+    let Some(spec) = task.goal_mode.continuous() else {
+        return Ok(());
+    };
+    let policy = spec.wake_policy.policy().clone();
+    let waits = task
+        .wake_controller
+        .as_ref()
+        .is_some_and(|controller| controller.holds_admittable(&policy, now));
+    if !waits {
+        return Ok(());
+    }
+    apply_goal_exhaustion(state, operation_id, dimension, now)?;
+    // The policy may have closed the gate, and a closed gate owes no re-wake.
+    if let Some(controller) = state
+        .task
+        .as_mut()
+        .and_then(|task| task.wake_controller.as_mut())
+    {
+        controller.ensure_rewakes(&policy, now);
+    }
+    Ok(())
 }
 
 /// Applies the goal's persisted budget-exhaustion policy
@@ -8888,6 +9026,7 @@ fn activate_goal(
             .wake_policy
             .policy()
             .clone();
+        let ledger_shortfall = epoch_ledger_gate(task);
         let controller = task
             .wake_controller
             .get_or_insert_with(AgentWakeControllerState::new);
@@ -8898,7 +9037,7 @@ fn activate_goal(
         {
             let revision = controller.lifecycle().lifecycle_revision();
             controller.resume(revision, provenance)?;
-            promoted = controller.promote_admittable(&policy, now);
+            promoted = controller.promote_admittable_within(&policy, now, ledger_shortfall);
             controller.ensure_rewakes(&policy, now);
             if let Some(wake) = &promoted {
                 owed.push(owe_epoch_creation(&scope, task, wake, now)?);
@@ -9111,6 +9250,9 @@ fn resume_goal(
             .wake_policy
             .policy()
             .clone();
+        // Read after the widening above, so a top-up that covers the epoch
+        // admits the occurrence that waited for it.
+        let ledger_shortfall = epoch_ledger_gate(task);
         let controller = task
             .wake_controller
             .get_or_insert_with(AgentWakeControllerState::new);
@@ -9121,7 +9263,7 @@ fn resume_goal(
         if goal_driven {
             let revision = controller.lifecycle().lifecycle_revision();
             controller.resume(revision, provenance)?;
-            promoted = controller.promote_admittable(&policy, now);
+            promoted = controller.promote_admittable_within(&policy, now, ledger_shortfall);
             controller.ensure_rewakes(&policy, now);
             if let Some(wake) = &promoted {
                 owed.push(owe_epoch_creation(&scope, task, wake, now)?);
