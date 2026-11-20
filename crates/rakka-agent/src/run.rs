@@ -894,33 +894,45 @@ impl AgentRun {
             && !self.loop_state.holds_call_an_end_waits_for()
     }
 
-    /// Whether the record is winding down, has not ended, and holds a call
-    /// it committed and never sent, which the wind-down fence cancels
+    /// Whether the record is winding down, has not ended, and is not at a
+    /// wind-down's rest: its status permits the loop a step, or it holds a
+    /// call it committed and never sent, which the wind-down fence cancels
     /// ([`AgentLoopState::holds_unsent_call_the_fence_cancels`]).
     ///
-    /// Every transition that begins a wind-down runs the fence, and a run
-    /// that is winding down commits no such call afterwards, so under this
-    /// binary the shape is unreachable. A binary before issues #123, #172
-    /// and #173 leaves it. It read a task's rejection against the status
-    /// alone, so a cancelled run parked on an unknown outcome, which is
-    /// `WaitingForReconciliation` and not `Cancelling`, began a new turn,
-    /// and the next step committed that turn's model call. No fence ran
-    /// after it. The flush hands a winding-down run's calls to the sink only
-    /// for the kinds the fence exempts, so the call stayed `Pending` for
-    /// good, and the wind-down waited for it for good: through its park, and
-    /// `Cancelling` after the park was answered.
+    /// A run that is winding down takes no step of the loop, and sends no
+    /// call but the kinds its fence exempts. Every transition that begins a
+    /// wind-down runs the fence and leaves the run `Cancelling` or parked,
+    /// and none that follows writes a status that permits progress, so under
+    /// this binary the shape is unreachable. A binary before issues #123,
+    /// #172 and #173 leaves it in two ways:
+    /// - It read a task's rejection against the status alone, so a cancelled
+    ///   run parked on an unknown outcome, which is
+    ///   `WaitingForReconciliation` and not `Cancelling`, began a new turn.
+    /// - It set a run `Running` when its top-up was granted, cancelled or
+    ///   not (`apply_top_up_grant`).
     ///
-    /// The settle pass runs the fence on the first pass that touches such a
-    /// record, and re-runs the disposition. Nothing is lost by it: the call
-    /// is one no flush would ever send.
+    /// Either way the loop's next step committed the turn's model call on a
+    /// run that was winding down. The flush hands such a run's calls to the
+    /// sink only for the kinds the fence exempts, and no fence ran after the
+    /// call was committed. So it stayed `Pending` for good, and the wind-down
+    /// waited for it for good: `WaitingForEffect`, and `Cancelling` once
+    /// whatever else it waited for was known.
+    ///
+    /// The settle pass repairs such a record on the first pass that touches
+    /// it, before the loop can take a step: it runs the fence and re-runs
+    /// the disposition, which leaves the run `Cancelling` or parked, or ends
+    /// it. A record caught between that binary's two writes, with the status
+    /// written and the call not yet committed, commits nothing. Nothing is
+    /// lost by the fence: the call is one no flush would send.
     ///
     /// A live run that is not winding down is never asked: an unsent call is
     /// its next dispatch, or waits behind its gate. Nor is a run that has
     /// ended.
-    pub(crate) fn needs_wind_down_fence(&self) -> bool {
+    pub(crate) fn needs_wind_down_rest(&self) -> bool {
         !self.status.is_terminal()
             && self.winding_down()
-            && self.loop_state.holds_unsent_call_the_fence_cancels()
+            && (self.status.permits_progress()
+                || self.loop_state.holds_unsent_call_the_fence_cancels())
     }
 
     /// Whether the record is on an approval or authorization wait that no
@@ -3013,9 +3025,17 @@ fn settle_goal_evaluation_exchange(
 /// stops the run with the *original* structured exhaustion, because a run must
 /// not park on an empty answer forever.
 ///
-/// A grant that arrives after the run has moved on (it was cancelled while
-/// parked) is ignored: the task's escrow already recorded the grant and frees it
-/// on the run's return, so there is nothing for the run to do.
+/// A grant that arrives after the run has ended is ignored: the end cleared
+/// the park, and the task's escrow already recorded the grant and frees it on
+/// the run's return, so there is nothing for the run to do.
+///
+/// A grant that arrives while the run is winding down does not resume it. Such
+/// a run was cancelled, or stopped, while its request was on its way, and
+/// holds a call it sent, so it has not ended. The grant is credited and the
+/// park cleared, and the status stays the wind-down's. `Running` would let
+/// the loop take another turn on it, and commit a model call that a run that
+/// is winding down never sends (issues #123, #172 and #173). A grant of
+/// nothing ends such a run as out of budget, as it ends any run.
 fn apply_top_up_grant(
     state: &mut AgentRunState,
     result: &AgentExchangeResult,
@@ -3061,7 +3081,7 @@ fn apply_top_up_grant(
     }
 
     if relieved {
-        if let Some(run) = state.run.as_mut() {
+        if let Some(run) = state.run.as_mut().filter(|run| !run.winding_down()) {
             run.status = AgentRunStatus::Running;
         }
         state.updated_at = now;
@@ -3148,13 +3168,15 @@ fn advance_once(
         settle_run_disposition(state, now)?;
         return owed_run_exchanges(state, now);
     }
-    if run.needs_wind_down_fence() {
+    if run.needs_wind_down_rest() {
         // A record a binary before issues #123, #172 and #173 left winding
-        // down with a call it committed after the wind-down began, and never
-        // sent: run the fence the wind-down owed, which cancels the call and
-        // closes its gate if it had one, and let the disposition end the
-        // wind-down if that was all it waited for
-        // ([`AgentRun::needs_wind_down_fence`]).
+        // down and off its rest: on a status that permits the loop a step,
+        // or with a call it committed after the wind-down began and never
+        // sent. Run the fence the wind-down owed, which cancels the call and
+        // closes its gate if it had one, and let the disposition put the run
+        // on its rest, or end it if the call was all it waited for. This
+        // comes before the loop's own step, which such a run must not take
+        // ([`AgentRun::needs_wind_down_rest`]).
         fence_unsent(state.run_mut()?, &scope, false, now);
         settle_run_disposition(state, now)?;
         return owed_run_exchanges(state, now);
@@ -9490,7 +9512,8 @@ where
             // binary left waiting for a proposal its task had answered
             // ([`AgentRunState::needs_answered_proposal_drop`]), and a call
             // an older binary committed on a run that was winding down, and
-            // never sent ([`AgentRun::needs_wind_down_fence`]).
+            // never sent, or a status it left such a run that permits the
+            // loop a step ([`AgentRun::needs_wind_down_rest`]).
             let can_advance = self.state()?.needs_answered_proposal_drop()
                 || self.state()?.run().is_some_and(|run| {
                     run.can_advance()
@@ -9499,7 +9522,7 @@ where
                         || run.needs_unpark()
                         || run.needs_gate_wait_release()
                         || run.needs_decided_end()
-                        || run.needs_wind_down_fence()
+                        || run.needs_wind_down_rest()
                         || run.needs_gate_close()
                 });
             if !can_advance {
@@ -9529,7 +9552,7 @@ where
                         || run.needs_unpark()
                         || run.needs_gate_wait_release()
                         || run.needs_decided_end()
-                        || run.needs_wind_down_fence()
+                        || run.needs_wind_down_rest()
                         || run.needs_gate_close()
                         || run.needs_turn_rest()
                 });
@@ -14336,6 +14359,148 @@ mod tests {
         ));
         apply_top_up_grant(&mut fx.state, &nothing, now);
         waits_under(&fx, "budget-exhausted");
+    }
+
+    /// A top-up's grant does not resume a run that is winding down. The run
+    /// was cancelled while its request was on its way, and holds a send
+    /// whose outcome is unknown, so it has not ended. The grant is credited
+    /// and the park cleared, as on any run, and the status stays the
+    /// wind-down's: `Running` would let the loop take another turn on a
+    /// cancelled run, and commit a model call that is never sent. A run that
+    /// is not winding down is resumed, as it always was.
+    #[test]
+    fn a_top_up_granted_to_a_run_that_is_winding_down_does_not_resume_it() {
+        let relieving = || {
+            AgentExchangeResult::accepted(
+                AgentExchangePayload::encode(
+                    AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE,
+                    &AgentBudgetLedgerOutcome {
+                        granted: Some(AgentBudgetAllocation {
+                            tokens: Some(100),
+                            ..AgentBudgetAllocation::nothing()
+                        }),
+                    },
+                )
+                .expect("the outcome encodes"),
+            )
+        };
+        let park = |fx: &mut HandoffSendFixture| {
+            let now = fx.now;
+            park_for_top_up(
+                &mut fx.state,
+                AgentBudgetExhaustion::new(crate::budget::AgentBudgetDimension::Tokens, 10, 10),
+                now,
+            )
+            .expect("the run parks on its top-up request");
+        };
+
+        let mut fx = parked();
+        let now = fx.now;
+        park(&mut fx);
+        cancel(&mut fx.state, "operator stopped the work".to_string(), now)
+            .expect("the cancellation applies");
+        let resting = fx.run().status;
+        assert!(
+            fx.run().winding_down()
+                && !resting.permits_progress()
+                && fx.run().loop_state.pending_top_up().is_some(),
+            "cancelled, not ended, and still parked on its top-up: {resting}"
+        );
+        apply_top_up_grant(&mut fx.state, &relieving(), now);
+        assert_eq!(
+            (
+                fx.run().status,
+                fx.run().loop_state.pending_top_up().is_some(),
+                fx.run()
+                    .terminal_reason
+                    .as_ref()
+                    .map(AgentRunTerminalReason::code)
+            ),
+            (resting, false, Some("cancellation-requested")),
+            "the park is cleared, and the run stays on its wind-down's rest"
+        );
+
+        let mut fx = parked();
+        park(&mut fx);
+        apply_top_up_grant(&mut fx.state, &relieving(), now);
+        assert_eq!(
+            (
+                fx.run().status,
+                fx.run().loop_state.pending_top_up().is_some()
+            ),
+            (AgentRunStatus::Running, false),
+            "a run that is not winding down is resumed"
+        );
+    }
+
+    /// The question the settle pass asks of a run that is winding down reads
+    /// the fence's own exemption. A compensation the wind-down scheduled and
+    /// has not yet sent is not a call the fence cancels, so it does not put
+    /// the run off its rest, and the fence leaves it alone. A call of a kind
+    /// the fence does not exempt does, and the fence cancels it.
+    #[test]
+    fn a_wind_down_that_holds_only_an_unsent_compensation_is_at_rest() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Cancelling,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        let now = fx.now;
+        let scope = fx.scope.clone();
+        let sent = fx.effect_id.clone();
+        let sent_generation = fx.generation;
+        let run = fx.state.run_mut().expect("the run exists");
+        run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
+            reason: "operator stopped the work".to_string(),
+        });
+        let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+        let compensation = AgentRunEffect::new(
+            &scope,
+            run.loop_state.turn(),
+            1,
+            AgentRunEffectRequest::Compensation {
+                compensation: AgentCompensationRef::new("refund-charge").expect("the ref is valid"),
+                compensated: sent.clone(),
+                compensated_generation: sent_generation,
+            },
+            &spec,
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the compensation derives");
+        assert!(compensation.is_pending() && compensation.kind().exempt_from_wind_down_fence());
+        run.loop_state
+            .budget_mut()
+            .reserve_attempts(spec.max_attempts)
+            .expect("the compensation's attempts are affordable");
+        run.loop_state
+            .record_effect(compensation)
+            .expect("the compensation records");
+
+        assert!(
+            run.winding_down() && !run.needs_wind_down_rest(),
+            "a wind-down that holds only work the fence exempts is at rest"
+        );
+        assert_eq!(
+            run.loop_state.fence_unsent_effects(now),
+            0,
+            "and the fence cancels nothing"
+        );
+
+        run.loop_state
+            .effect_mut(&sent)
+            .expect("the run holds its send")
+            .status = AgentRunEffectStatus::Pending;
+        assert!(
+            run.needs_wind_down_rest(),
+            "a send it never sent puts it off its rest"
+        );
+        assert_eq!(
+            run.loop_state.fence_unsent_effects(now),
+            1,
+            "and is the one call the fence cancels"
+        );
+        assert!(!run.needs_wind_down_rest(), "after which it is at rest");
     }
 
     /// Which reasons are an end decided for the run, and which a wind-down

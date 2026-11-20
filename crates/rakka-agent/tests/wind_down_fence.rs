@@ -1592,3 +1592,86 @@ async fn the_step_that_fences_an_unsent_call_measures_no_turn() {
         "no turn was measured"
     );
 }
+
+/// The fence is owed whatever the run rests on. A run that is winding down
+/// and holds a call it never sent is parked on another call's unknown
+/// outcome: `WaitingForReconciliation`, and not `Cancelling`. The pass
+/// cancels the unsent call and closes its gate all the same, and the run
+/// stays on its park.
+#[tokio::test]
+async fn a_parked_run_that_holds_an_unsent_call_is_fenced_too() {
+    let calls = [CHARGE, FLAKY, LOOKUP];
+    let (fx, _sink) = world(&calls, policies(&calls, Some((CHARGE, Gate::Approval))));
+    start(&fx, None).await;
+    commit_the_turn(&fx).await;
+    land(&fx, &call_to(&fx, FLAKY).await).await;
+    reopen_the_approval_as_an_older_binary_left_it(&fx).await;
+    rewrite_loop_state(&fx, |loop_state| {
+        let gated = loop_state["effects"]
+            .as_array_mut()
+            .expect("the effects are an array")
+            .iter_mut()
+            .find(|effect| effect["slot"].as_u64() == Some(1))
+            .expect("the gated call is the turn's first");
+        gated["status"] = serde_json::json!("pending");
+    })
+    .await;
+    let gated = |state: &rakka_agent::AgentLoopState| {
+        state
+            .effects()
+            .iter()
+            .find(|effect| effect.slot == 1 && effect.turn == 1)
+            .map(|effect| effect.status)
+    };
+    assert_eq!(
+        (status(&fx).await, gated(&loop_state(&fx).await)),
+        (
+            AgentRunStatus::Cancelling,
+            Some(AgentRunEffectStatus::Pending)
+        ),
+        "winding down, and holding a call it never sent"
+    );
+
+    // The call that is out ends unknown, in a command: the run parks before
+    // any pass has seen the unsent call.
+    let lookup = call_to(&fx, LOOKUP).await;
+    apply(
+        &fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: lookup
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: lookup.effect_id.clone(),
+            generation: lookup.generation,
+            attempt: 1,
+            fence: 1,
+            outcome: Box::new(AgentRunEffectOutcome::indeterminate(
+                "connection-lost",
+                "the tool host died",
+            )),
+        },
+    )
+    .await
+    .expect("the unknown outcome applies");
+
+    assert_eq!(
+        (
+            status(&fx).await,
+            gated(&loop_state(&fx).await),
+            waiting(&fx)
+                .await
+                .iter()
+                .filter(|checkpoint| checkpoint.kind == AgentCheckpointKind::Approval)
+                .count()
+        ),
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            Some(AgentRunEffectStatus::Cancelled),
+            0
+        ),
+        "parked, with the unsent call cancelled and its gate closed"
+    );
+    let rested = revision(&fx).await;
+    settle(&fx).await;
+    assert_eq!(revision(&fx).await, rested, "a further pass writes nothing");
+}

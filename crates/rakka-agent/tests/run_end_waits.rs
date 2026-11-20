@@ -1537,12 +1537,138 @@ async fn a_turn_begun_on_a_cancelled_run() -> (Fixture, Arc<CountingDecisionSink
     (fx, sink, park)
 }
 
+/// Takes the record of [`a_turn_begun_on_a_cancelled_run`] on to where the
+/// earlier build's next step left it, and answers the model call of the new
+/// turn: committed, and never sent.
+///
+/// This build takes no step on a run that is winding down, so the run's
+/// reason is set aside for the one step that commits the call, and put
+/// back. A run with no reason also hands the call to the sink, which the
+/// earlier build's wind-down never did, so the call is put back as unsent
+/// too. The sink of this world then holds a ticket the record does not
+/// know of; nothing here claims it. Run under the earlier build's sources,
+/// the same world leaves the same record but for two clock values.
+async fn the_model_call_that_turn_never_sent(fx: &Fixture) -> AgentRunEffect {
+    let mut reason = None;
+    rewrite_run(fx, |run| {
+        reason = run.insert("terminal_reason".to_string(), serde_json::Value::Null);
+    })
+    .await;
+    settle(fx).await;
+    let call = model_call_of_turn(fx, 2)
+        .await
+        .expect("the step committed the new turn's model call");
+    rewrite_run(fx, |run| {
+        run.insert(
+            "terminal_reason".to_string(),
+            reason.expect("the run recorded its reason"),
+        );
+        let unsent = run["loop_state"]["effects"]
+            .as_array_mut()
+            .expect("the effects are an array")
+            .iter_mut()
+            .find(|effect| effect["effect_id"].as_str() == Some(call.effect_id.as_str()))
+            .expect("the record holds the call");
+        unsent["status"] = serde_json::json!("pending");
+        unsent["dispatched_at"] = serde_json::Value::Null;
+    })
+    .await;
+    let call = model_call_of_turn(fx, 2)
+        .await
+        .expect("the record holds the call");
+    assert_eq!(
+        (
+            standing(fx).await,
+            call.status,
+            call.dispatched_at,
+            loop_state(fx).await.budget().reserved_attempts()
+        ),
+        (
+            (
+                AgentRunStatus::WaitingForEffect,
+                Some("cancellation-requested".to_string()),
+                false
+            ),
+            AgentRunEffectStatus::Pending,
+            None,
+            u64::from(call.max_attempts)
+        ),
+        "the record as the earlier build left it: cancelled, and waiting for a call it never sent"
+    );
+    call
+}
+
+/// A turn an earlier build began on a cancelled run goes no further. The
+/// record is caught between that build's two writes: the turn is begun and
+/// the run is `Running`, and the step that would commit the turn's model
+/// call has not run. A run that is winding down takes no step of the loop.
+/// The settle pass puts it back on its wind-down's rest: no call is
+/// committed, nothing is asked of its budget, and it ends as cancelled once
+/// its park is answered.
+#[tokio::test]
+async fn a_turn_an_earlier_build_began_on_a_cancelled_run_goes_no_further() {
+    let (fx, sink, park) = a_turn_begun_on_a_cancelled_run().await;
+    let budget = serde_json::to_value(loop_state(&fx).await.budget()).expect("the budget encodes");
+
+    settle(&fx).await;
+
+    let state = loop_state(&fx).await;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            state.turn(),
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            state.pending_top_up().is_some()
+        ),
+        (
+            (
+                AgentRunStatus::WaitingForReconciliation,
+                Some("cancellation-requested".to_string()),
+                false
+            ),
+            2,
+            None,
+            false
+        ),
+        "the run rests on its park, and the turn that was begun commits nothing"
+    );
+    assert_eq!(
+        serde_json::to_value(state.budget()).expect("the budget encodes"),
+        budget,
+        "nothing is charged to a run that takes no step"
+    );
+    let rested = revision(&fx).await;
+    settle(&fx).await;
+    assert_eq!(revision(&fx).await, rested, "a further pass writes nothing");
+
+    decide(
+        &fx,
+        &park.checkpoint_id,
+        "answer",
+        AgentCheckpointDecision::Reconciliation(AgentReconciliationDecision::AbandonAndFail),
+    )
+    .await
+    .expect("the parked run answers its checkpoint");
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelled,
+            Some("cancellation-requested".to_string()),
+            false
+        ),
+        "and it ends as cancelled once the park is answered"
+    );
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
 /// A second record an earlier build left stuck is repaired. The build began
 /// a new turn on a cancelled run
 /// ([`a_turn_begun_on_a_cancelled_run`]), and its next step committed that
-/// turn's model call. A run that is winding down sends no such call, and no
-/// fence ran after it, so the call stayed unsent for good and the run could
-/// not end.
+/// turn's model call ([`the_model_call_that_turn_never_sent`]). A run that
+/// is winding down sends no such call, and no fence ran after it, so the
+/// call stayed unsent for good and the run could not end.
 ///
 /// The settle pass runs the fence the wind-down owed. The call is cancelled
 /// and gives back the attempts it reserved, the run rests on its park, and
@@ -1550,12 +1676,13 @@ async fn a_turn_begun_on_a_cancelled_run() -> (Fixture, Arc<CountingDecisionSink
 #[tokio::test]
 async fn a_cancelled_run_an_earlier_build_began_a_turn_on_is_fenced_and_ends() {
     let (fx, sink, park) = a_turn_begun_on_a_cancelled_run().await;
+    the_model_call_that_turn_never_sent(&fx).await;
 
     settle(&fx).await;
 
     let call = model_call_of_turn(&fx, 2)
         .await
-        .expect("the next step committed the new turn's model call");
+        .expect("the record holds the call");
     assert_eq!(
         (
             standing(&fx).await,
@@ -1608,57 +1735,14 @@ async fn a_cancelled_run_an_earlier_build_began_a_turn_on_is_fenced_and_ends() {
 
 /// The same record with its park answered while it was stuck. Under the
 /// earlier build that left the run `Cancelling` for good, waiting for the
-/// call it would never send. Here the step that fences the call is the step
-/// that ends the run, and it owes what any end owes: the run settles its
-/// budget with its task.
-///
-/// The earlier build's record cannot rest under this build with its park
-/// open, because the settle pass repairs it. So it is repaired, and the
-/// three fields the repair wrote are then put back as that build left them:
-/// the call unsent, its attempts reserved, and the run on its effect wait.
-/// The park's answer then takes the record through the stuck state, in the
-/// command's own transition, and the pass that follows the command ends it.
+/// call it would never send. The park's answer takes the record there in
+/// the command's own transition, and the pass that follows the command
+/// fences the call. That step ends the run, and it owes what any end owes:
+/// the run settles its budget with its task.
 #[tokio::test]
 async fn a_stuck_cancelled_run_whose_park_was_answered_is_ended_by_the_fence() {
     let (fx, sink, park) = a_turn_begun_on_a_cancelled_run().await;
-    settle(&fx).await;
-    let call = model_call_of_turn(&fx, 2)
-        .await
-        .expect("the next step committed the new turn's model call");
-    assert_eq!(call.status, AgentRunEffectStatus::Cancelled);
-    rewrite_run(&fx, |run| {
-        run.insert(
-            "status".to_string(),
-            serde_json::json!("waiting-for-effect"),
-        );
-        let loop_state = run["loop_state"]
-            .as_object_mut()
-            .expect("the loop state is an object");
-        let unsent = loop_state["effects"]
-            .as_array_mut()
-            .expect("the effects are an array")
-            .iter_mut()
-            .find(|effect| effect["effect_id"].as_str() == Some(call.effect_id.as_str()))
-            .expect("the record holds the call");
-        unsent["status"] = serde_json::json!("pending");
-        loop_state["budget"]["reserved_attempts"] = serde_json::json!(call.max_attempts);
-    })
-    .await;
-    assert_eq!(
-        (
-            standing(&fx).await,
-            model_call_of_turn(&fx, 2).await.map(|call| call.status)
-        ),
-        (
-            (
-                AgentRunStatus::WaitingForEffect,
-                Some("cancellation-requested".to_string()),
-                false
-            ),
-            Some(AgentRunEffectStatus::Pending)
-        ),
-        "the record as the earlier build left it"
-    );
+    the_model_call_that_turn_never_sent(&fx).await;
 
     decide(
         &fx,
@@ -1695,6 +1779,152 @@ async fn a_stuck_cancelled_run_whose_park_was_answered_is_ended_by_the_fence() {
         rakka_agent::AgentRunSettlementStatus::Returned,
         "the run that ended in the repair's step settled its budget with its task"
     );
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// A transport that will not carry a top-up request, so a run stays parked
+/// on one until a pass uses the fixture's own router.
+struct HoldTopUps(Arc<dyn rakka_agent::AgentExchangeTransport>);
+
+impl rakka_agent::AgentExchangeTransport for HoldTopUps {
+    fn deliver<'a>(
+        &'a self,
+        envelope: &'a rakka_agent::AgentExchangeEnvelope,
+    ) -> rakka_agent::AgentExchangeDeliveryFuture<'a> {
+        if envelope.kind() == rakka_agent::AgentExchangeKind::BudgetAllocation {
+            return Box::pin(async {
+                Err(rakka_agent::AgentExchangeDeliveryError::new(
+                    "held",
+                    "the top-up request is held back",
+                ))
+            });
+        }
+        self.0.deliver(envelope)
+    }
+}
+
+/// A top-up granted to a cancelled run does not resume it. The run is
+/// parked on a top-up request when it is cancelled, and holds an evaluation
+/// it sent, so it has not ended when the task's grant arrives.
+///
+/// The grant used to set the run `Running`, cancelled or not. The loop then
+/// took another step on the cancelled run and committed its next turn's
+/// model call, which a run that is winding down never sends: the record of
+/// [`the_model_call_that_turn_never_sent`], written through commands alone.
+/// The grant now clears the park and moves nothing else. No turn is taken,
+/// nothing more is charged, and the run ends as cancelled when the
+/// evaluation is settled. The review of the repair found this.
+#[tokio::test]
+async fn a_top_up_granted_to_a_cancelled_run_does_not_resume_it() {
+    let definition = task_definition()
+        .with_budgets(rakka_agent::AgentBudgetCeilings {
+            max_loop_iterations: Some(4),
+            ..rakka_agent::AgentBudgetCeilings::unbounded()
+        })
+        .with_run_allocation(rakka_agent::AgentBudgetAllocation {
+            loop_iterations: Some(1),
+            ..rakka_agent::AgentBudgetAllocation::unbounded()
+        });
+    let (fx, sink) = goal_world("", definition, goal_spec_with_evaluator()).await;
+    let holding = rakka_agent::AgentExchangeRouter::new()
+        .with_route(
+            rakka_agent::AgentEntityClass::Task,
+            Arc::new(HoldTopUps(Arc::new(fx.task_transport.clone()))),
+        )
+        .with_route(
+            rakka_agent::AgentEntityClass::Run,
+            Arc::new(fx.run_transport.clone()),
+        );
+    let evaluation = send_an_evaluation(&fx).await;
+
+    // The task rejects the empty answer, the run begins its second turn,
+    // and preparing it finds the one iteration it was given spent. The run
+    // is then cancelled with its request for more still on its way.
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    for command in [
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: model
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: model.effect_id.clone(),
+            generation: model.generation,
+            attempt: 1,
+            fence: 1,
+            outcome: Box::new(turn),
+        },
+        AgentRunEntityCommand::Cancel {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::Cancellation,
+                [TENANT, AGENT, "cancel-1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+    ] {
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("the run recovers");
+        run.apply(command, &holding, fx.now())
+            .await
+            .expect("the command applies");
+    }
+    let parked = loop_state(&fx).await;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            parked.turn(),
+            parked.pending_top_up().is_some()
+        ),
+        (
+            (
+                AgentRunStatus::Cancelling,
+                Some("cancellation-requested".to_string()),
+                false
+            ),
+            2,
+            true
+        ),
+        "cancelled, waiting for its evaluation, and still parked on its top-up"
+    );
+    let spent = fx.run_snapshot().await.expect("the run exists").budget;
+    let spent = (spent.loop_iterations(), spent.model_calls());
+
+    settle(&fx).await;
+
+    let state = loop_state(&fx).await;
+    let after = fx.run_snapshot().await.expect("the run exists").budget;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            state.pending_top_up().is_some(),
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            (after.loop_iterations(), after.model_calls())
+        ),
+        (
+            (
+                AgentRunStatus::Cancelling,
+                Some("cancellation-requested".to_string()),
+                false
+            ),
+            false,
+            None,
+            spent
+        ),
+        "the grant clears the park, and the cancelled run takes no turn"
+    );
+
+    record(&fx, &evaluation, never_invoked()).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelled,
+            Some("cancellation-requested".to_string()),
+            false
+        ),
+        "and it ends as cancelled when the evaluation is settled"
+    );
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
     assert_at_rest(&fx, &sink).await;
 }
 
