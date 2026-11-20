@@ -3036,6 +3036,29 @@ impl AgentWakeControllerState {
         Some(wake)
     }
 
+    /// Releases an active occurrence of a goal that has ended, and promotes
+    /// nothing into the place it frees: an ended goal admits no further
+    /// epoch, whatever its gate says (issue #181).
+    ///
+    /// The count of released occurrences moves as it does for any release,
+    /// so admitted occurrences still equal released and active ones.
+    pub fn release_ended(&mut self, wake: &AgentWakeId) -> AgentWakeResult<AgentWakeRelease> {
+        let Some(index) = self
+            .active
+            .iter()
+            .position(|active| active.binding.wake_id() == wake)
+        else {
+            return Err(AgentWakeError::NotActive { wake: wake.clone() });
+        };
+        let released = self.active.remove(index);
+        self.counters.released += 1;
+        Ok(AgentWakeRelease {
+            released: wake.clone(),
+            admitted_next: None,
+            epoch: released.epoch,
+        })
+    }
+
     /// Attaches the finite child epoch an admitting transition created to its
     /// active occurrence.
     ///
@@ -5645,6 +5668,59 @@ mod tests {
             !controller.holds_admittable(&policy, now(3_000)),
             "a closed gate admits nothing, whatever is parked"
         );
+    }
+
+    /// Issue #181: the release of an ended goal's occurrence frees the place,
+    /// counts as a release and promotes nothing, though an occurrence is
+    /// parked and the gate would admit it.
+    #[test]
+    fn an_ended_goals_release_promotes_nothing() {
+        let policy = windowed_policy(3_600_000, 1_000);
+        let mut controller = AgentWakeControllerState::new();
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the first occurrence is admitted");
+        let wake = controller.active()[0].binding().wake_id().clone();
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_000, ScheduleRevision::INITIAL),
+                now(2_000),
+            )
+            .expect("the second occurrence is parked");
+
+        let release = controller
+            .release_ended(&wake)
+            .expect("the active occurrence releases");
+
+        assert_eq!(release.released, wake);
+        assert_eq!(release.admitted_next, None);
+        assert_eq!(controller.counters().admitted, 1);
+        assert_eq!(controller.counters().released, 1);
+        assert!(controller.active().is_empty());
+        assert_eq!(
+            controller.pending().len(),
+            1,
+            "the parked occurrence stays parked"
+        );
+        assert!(
+            controller.holds_admittable(&policy, now(3_000)),
+            "nothing but the goal's end kept it from the free place"
+        );
+        assert!(
+            matches!(
+                controller.release_ended(&wake),
+                Err(AgentWakeError::NotActive { .. })
+            ),
+            "an occurrence that is not active is not released twice"
+        );
+        assert_eq!(controller.counters().released, 1);
     }
 
     /// Issue #179: every path that would admit asks the ledger. An occurrence
