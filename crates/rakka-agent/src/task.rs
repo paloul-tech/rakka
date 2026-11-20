@@ -8243,7 +8243,6 @@ fn complete_wake_occurrence(
             now,
         );
     }
-    settle_epoch_ledger_gate(state, operation_id, now)?;
     Ok((AgentWakeOutcome::Release(release), owed))
 }
 
@@ -8635,29 +8634,40 @@ fn permanent_budget_exhaustion(task: &AgentTask) -> Option<AgentBudgetDimension>
 /// epoch, and whether nothing still out could refill it (issue #179).
 ///
 /// An epoch is granted the wake policy's epoch budget, narrowed to what the
-/// goal has left. Where that grant is empty in a dimension the epoch's run
-/// asks for, the epoch's task could never escrow a run. This is the question
+/// goal has left. The ledger is what refuses where the goal itself has
+/// nothing left in a dimension the epoch's run asks for. The grant would be
+/// empty there, and the epoch's task could never escrow a run: the question
 /// [`task_budget_refusal`] would ask on the epoch's own ledger, asked before
-/// the epoch exists. The shortfall is permanent when no child still out holds
-/// any of that dimension, as [`permanent_budget_exhaustion`] reads it for a
-/// task's own run.
+/// the epoch exists. An empty grant in a dimension the goal still has budget
+/// in comes from the policy's own zero. That is the policy's contradiction
+/// and not the goal's exhaustion, and no top-up could relieve it, so it is
+/// not reported here.
+///
+/// The shortfall is permanent when no epoch still out holds any of that
+/// dimension. The goal's own run, on an agent-owned goal, does not count: its
+/// budget comes back only when the task ends or its next generation takes it
+/// again, so an occurrence that waited for it would wait for good.
+///
+/// Unlike [`task_budget_refusal`], this does not report a ledger that holds
+/// as many children as it can: that is no dimension's shortfall.
 fn epoch_ledger_shortfall(task: &AgentTask) -> Option<(AgentBudgetDimension, bool)> {
     let spec = task.goal_mode.continuous()?;
     // With no epoch contract there is no epoch to pay for, and admission
     // fails closed on that by itself.
     let epoch = spec.epoch.as_ref()?;
-    let grant = spec
-        .wake_policy
-        .policy()
-        .epoch_budget
-        .narrowed_to(&task.escrow.available_allocation());
+    let available = task.escrow.available_allocation();
     let wanted = epoch.definition.run_allocation_request();
-    let dimension = wanted.narrowed_to(&grant).first_empty_for(&wanted)?;
-    let held_by_a_child = task
-        .escrow
-        .outstanding()
-        .any(|(_, escrow)| escrow.allocated().get(dimension).unwrap_or(0) > 0);
-    Some((dimension, !held_by_a_child))
+    let dimension = AgentBudgetDimension::WORK.into_iter().find(|dimension| {
+        wanted.get(*dimension).unwrap_or(u64::MAX) > 0 && available.get(*dimension) == Some(0)
+    })?;
+    let own_run = task
+        .assignment
+        .as_ref()
+        .and_then(|assignment| AgentEscrowChildId::for_run(&assignment.run).ok());
+    let held_by_an_epoch = task.escrow.outstanding().any(|(child, escrow)| {
+        Some(child) != own_run.as_ref() && escrow.allocated().get(dimension).unwrap_or(0) > 0
+    });
+    Some((dimension, !held_by_an_epoch))
 }
 
 /// What the wake controller is told with each admission: the dimension in
@@ -8669,12 +8679,19 @@ fn epoch_ledger_gate(task: &AgentTask) -> Option<AgentBudgetDimension> {
 /// Asks the goal's exhaustion policy when a parked occurrence waits on a
 /// ledger that nothing can refill (issue #179).
 ///
-/// Run by the transitions in which an occurrence arrives or a place comes
-/// free. The policy speaks only when the budget is what stands in the way:
-/// an occurrence is parked, a place is free and the gate is open. A shortfall
-/// that a child still out could relieve is left alone, and that child's
-/// return retries the admission. A task with no goal record has no policy,
-/// and its occurrence stays parked.
+/// Run by a delivery and by an epoch's result: the transitions in which an
+/// occurrence arrives or an epoch returns what it held. The policy speaks
+/// only when the budget is what stands in the way: an occurrence is parked,
+/// a place is free and the gate is open. A shortfall that an epoch still out
+/// could relieve is left alone, and that epoch's result retries the
+/// admission.
+///
+/// The policy is asked only of a goal that is authorized or parked, the
+/// guard its other callers keep. A task with no goal record has no policy,
+/// and a goal that is only proposed cannot be ended or parked for budget: in
+/// both the occurrence stays parked. With that guard nothing here can fail
+/// for a record this binary wrote, which matters inside an epoch's result,
+/// where a failure would be the exchange's durable refusal.
 fn settle_epoch_ledger_gate(
     state: &mut AgentTaskState,
     operation_id: &AgentOperationId,
@@ -8689,6 +8706,15 @@ fn settle_epoch_ledger_gate(
     let Some((dimension, true)) = epoch_ledger_shortfall(task) else {
         return Ok(());
     };
+    let asked = task.goal_state.as_deref().is_some_and(|goal| {
+        matches!(
+            goal.status(),
+            AgentGoalStatus::Active | AgentGoalStatus::Waiting
+        )
+    });
+    if !asked {
+        return Ok(());
+    }
     let Some(spec) = task.goal_mode.continuous() else {
         return Ok(());
     };

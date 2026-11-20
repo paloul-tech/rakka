@@ -1788,7 +1788,9 @@ pub struct AgentWakeCounters {
     /// Active occurrences released by a completed execution.
     #[serde(default)]
     pub released: u64,
-    /// Occurrences parked because the goal-window ceiling was exhausted.
+    /// Occurrences parked because their epoch could not be paid for: the
+    /// goal-window ceiling was exhausted, or the goal's own ledger had nothing
+    /// left in a dimension the epoch needs.
     #[serde(default)]
     pub deferred: u64,
     /// Occurrences parked because a failure backoff was in force.
@@ -5643,5 +5645,73 @@ mod tests {
             !controller.holds_admittable(&policy, now(3_000)),
             "a closed gate admits nothing, whatever is parked"
         );
+    }
+
+    /// Issue #179: every path that would admit asks the ledger. An occurrence
+    /// past its admission window, a missed one that would be admitted as its
+    /// backlog's representative, and a missed one replayed under bounded
+    /// catch-up are each parked when the ledger cannot pay.
+    #[test]
+    fn a_late_or_missed_occurrence_is_deferred_when_the_ledger_cannot_pay() {
+        let short = Some(AgentBudgetDimension::LoopIterations);
+        let late = default_policy()
+            .with_admission_window(1_000)
+            .expect("the admission window is accepted")
+            .with_maximum_lateness(100_000)
+            .expect("the lateness is accepted");
+        let missed = default_policy()
+            .with_maximum_lateness(1_000)
+            .expect("the lateness is accepted");
+        let catch_up = default_policy()
+            .with_maximum_lateness(1_000)
+            .expect("the lateness is accepted")
+            .with_bounded_catch_up(2)
+            .expect("the catch-up bound is accepted");
+        for (policy, at, path) in [
+            (late, 5_000, "past the admission window"),
+            (missed, 1_000_000, "missed, admitted as the representative"),
+            (
+                catch_up,
+                1_000_000,
+                "missed, replayed under bounded catch-up",
+            ),
+        ] {
+            let mut controller = AgentWakeControllerState::new();
+            let told = controller
+                .admit_within(
+                    &policy,
+                    ScheduleRevision::INITIAL,
+                    scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                    now(at),
+                    None,
+                )
+                .expect("the occurrence is dispositioned");
+            assert!(
+                told.is_admission(),
+                "{path}: the ledger can pay, got {told:?}"
+            );
+
+            let mut controller = AgentWakeControllerState::new();
+            let told = controller
+                .admit_within(
+                    &policy,
+                    ScheduleRevision::INITIAL,
+                    scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                    now(at),
+                    short,
+                )
+                .expect("the occurrence is dispositioned");
+            assert!(
+                matches!(
+                    told,
+                    AgentWakeDisposition::Deferred {
+                        dimension: AgentBudgetDimension::LoopIterations,
+                        ..
+                    }
+                ),
+                "{path}: the ledger cannot pay, got {told:?}"
+            );
+            assert_eq!(controller.counters().admitted, 0, "{path}");
+        }
     }
 }
