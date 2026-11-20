@@ -560,6 +560,26 @@ pub enum AgentRunTerminalReason {
 }
 
 impl AgentRunTerminalReason {
+    /// Whether the reason is an end decided for the run, and not a wind-down
+    /// the run entered: its result accepted, its proposal refused or its
+    /// rejections spent, its budget spent, a newer generation in its place.
+    ///
+    /// Such a run ends as soon as it holds no call of its own that an end
+    /// must wait for (`end_when_settled`). A wind-down's own reasons (a
+    /// cancellation, a failed or compensated effect, a handoff) wait for the
+    /// run's proposal and its children as well.
+    pub(crate) const fn is_decided_end(&self) -> bool {
+        matches!(
+            self,
+            Self::ResultAccepted
+                | Self::Superseded
+                | Self::TaskRefusedProposal { .. }
+                | Self::ResultRejectionsExhausted
+                | Self::BudgetExhausted { .. }
+                | Self::UndecodableDecision { .. }
+        )
+    }
+
     /// The status this reason puts the run in.
     #[must_use]
     pub fn status(&self) -> AgentRunStatus {
@@ -848,6 +868,72 @@ impl AgentRun {
     pub(crate) fn needs_unpark(&self) -> bool {
         self.status == AgentRunStatus::WaitingForReconciliation
             && !self.loop_state.has_indeterminate_effect()
+    }
+
+    /// Whether the record's end was decided, it has not ended, and it holds
+    /// no call an end waits for
+    /// ([`AgentLoopState::holds_call_an_end_waits_for`]).
+    ///
+    /// A run whose end is decided while it still holds a call it sent waits
+    /// for that call, and the transition that settles the last one ends the
+    /// run (`end_when_settled`, `settle_run_disposition`). Under this binary
+    /// the shape is therefore unreachable. A binary before issues #123, #172
+    /// and #173 leaves it, in a mixed deployment: it takes the call's result
+    /// and then goes on waiting, as its wind-down waits, for the run's
+    /// children, or for a memory promotion or a claim append that is still
+    /// out. None of those holds a decided end.
+    ///
+    /// The settle pass ends such a record on the first pass that touches it,
+    /// with `settle_run_disposition`.
+    pub(crate) fn needs_decided_end(&self) -> bool {
+        !self.status.is_terminal()
+            && self
+                .terminal_reason
+                .as_ref()
+                .is_some_and(AgentRunTerminalReason::is_decided_end)
+            && !self.loop_state.holds_call_an_end_waits_for()
+    }
+
+    /// Whether the record is winding down, has not ended, and is not at a
+    /// wind-down's rest: its status permits the loop a step, or it holds a
+    /// call it committed and never sent, which the wind-down fence cancels
+    /// ([`AgentLoopState::holds_unsent_call_the_fence_cancels`]).
+    ///
+    /// A run that is winding down takes no step of the loop, and sends no
+    /// call but the kinds its fence exempts. Every transition that begins a
+    /// wind-down runs the fence and leaves the run `Cancelling` or parked,
+    /// and none that follows writes a status that permits progress, so under
+    /// this binary the shape is unreachable. A binary before issues #123,
+    /// #172 and #173 leaves it in two ways:
+    /// - It read a task's rejection against the status alone, so a cancelled
+    ///   run parked on an unknown outcome, which is
+    ///   `WaitingForReconciliation` and not `Cancelling`, began a new turn.
+    /// - It set a run `Running` when its top-up was granted, whatever the
+    ///   run then waited on (`apply_top_up_grant`).
+    ///
+    /// Either way the loop's next step committed the turn's next calls on a
+    /// run that was winding down: its model call, or at its tool turn the
+    /// tool calls. The flush hands such a run's calls to the sink only for
+    /// the kinds the fence exempts, and no fence ran after they were
+    /// committed. So they stayed `Pending` for good, and the wind-down
+    /// waited for them for good: `WaitingForEffect`, and `Cancelling` once
+    /// whatever else it waited for was known.
+    ///
+    /// The settle pass repairs such a record on the first pass that touches
+    /// it, before the loop can take a step: it runs the fence and re-runs
+    /// the disposition, which leaves the run `Cancelling` or parked, or ends
+    /// it. A record caught between that binary's two writes, with the status
+    /// written and the call not yet committed, commits nothing. Nothing is
+    /// lost by the fence: the call is one no flush would send.
+    ///
+    /// A live run that is not winding down is never asked: an unsent call is
+    /// its next dispatch, or waits behind its gate. Nor is a run that has
+    /// ended.
+    pub(crate) fn needs_wind_down_rest(&self) -> bool {
+        !self.status.is_terminal()
+            && self.winding_down()
+            && (self.status.permits_progress()
+                || self.loop_state.holds_unsent_call_the_fence_cancels())
     }
 
     /// Whether the record is on an approval or authorization wait that no
@@ -1151,6 +1237,41 @@ impl AgentRunState {
     #[must_use]
     pub fn loop_state(&self) -> Option<&AgentLoopState> {
         self.run.as_ref().map(|run| &run.loop_state)
+    }
+
+    /// Whether the run is winding down and still holds a proposal its task
+    /// has answered.
+    ///
+    /// A wind-down waits for a proposal's answer
+    /// ([`AgentLoopState::awaits_settlement`]), and every transition that
+    /// takes an answer on a run that goes on drops the proposal from the
+    /// record. Under this binary the shape is therefore unreachable. A
+    /// binary before issues #123, #172 and #173 leaves it: it took the
+    /// task's refusal of a proposal, made because the task was being
+    /// cancelled, as the run's own cancellation, and left the refused
+    /// proposal where it was. Its wind-down then waited for an answer that
+    /// had come, for good, and the task's cancellation never completed.
+    ///
+    /// The run's status and reason cannot tell that record from a cancelled
+    /// run whose proposal is still on its way, which must go on waiting: an
+    /// acceptance still wins the race with a cancel. The journal can. A
+    /// proposal is recorded in the transition that owes its exchange, and
+    /// the exchange stays owed until its answer settles it, so a proposal
+    /// whose exchange the journal no longer owes has been answered.
+    ///
+    /// The settle pass drops such a proposal on the first pass that touches
+    /// the record, and re-runs the disposition, which ends the wind-down if
+    /// the proposal was all it waited for.
+    pub(crate) fn needs_answered_proposal_drop(&self) -> bool {
+        self.run.as_ref().is_some_and(|run| {
+            !run.status.is_terminal()
+                && run.winding_down()
+                && run.loop_state.proposal().is_some_and(|proposal| {
+                    self.journal
+                        .pending_exchange(&proposal.proposal_id)
+                        .is_none()
+                })
+        })
     }
 
     /// The bounded log of resolved operations.
@@ -1545,7 +1666,10 @@ fn end_kind(status: AgentRunStatus) -> AgentDecisionKind {
 /// ended run could not answer is closed (`fence_unsent`). So an ended run
 /// holds no waiting approval or authorization but that of a memory promotion
 /// or a claim append, which it still answers. A reconciliation checkpoint is
-/// not closed: one parked on a call of another kind stays on the ended run.
+/// not closed. Under this binary none but a promotion's or a claim append's
+/// reaches a run's end: a run that holds any other call it sent, parked or
+/// not, does not end until that call is known (`end_when_settled`). A record
+/// an earlier binary ended can hold one, and it stays on that record.
 ///
 /// The end is also queued as a decision (`complete`, `fail`, `cancel`,
 /// `handoff` or `supersede`) carrying the status and the reason's code. Its
@@ -1620,6 +1744,52 @@ fn terminate(
     Ok(())
 }
 
+/// Ends the run under `reason`, once it holds no call of its own that an end
+/// must wait for.
+///
+/// This is where an end that was decided for the run arrives: its result
+/// accepted, its proposal refused or its rejections spent, its budget spent.
+/// A run that holds nothing ends here, in this transition, as it always did.
+///
+/// A run that still holds a call it sent does not. Ended, it would take no
+/// result for that call and answer no checkpoint parked on it, and the call
+/// would stay on the record for good (issues #123, #172 and #173). So the
+/// run records `reason`, cancels what it never sent, and waits as a run that
+/// is winding down waits: `Cancelling`, or `WaitingForReconciliation` while
+/// one of those calls has an unknown outcome. It takes their results and
+/// answers their parks as any live run does, and `settle_run_disposition`
+/// ends it under `reason` when the last is known.
+///
+/// `reason` replaces whatever reason a wind-down had recorded: an accepted
+/// result wins the race with a wind-down, and so does the task's refusal.
+/// The proposal the task answered is dropped from the record of a run that
+/// waits. One that ends here keeps it, as it always did.
+/// What the run waits for is [`AgentLoopState::holds_call_an_end_waits_for`].
+/// It is not the wind-down's wait: neither the proposal, whose answer decided
+/// this end, nor the run's children hold it.
+fn end_when_settled(
+    state: &mut AgentRunState,
+    reason: AgentRunTerminalReason,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
+    let run = state.run_mut()?;
+    if run.status.is_terminal() {
+        return Ok(());
+    }
+    if !run.loop_state.holds_call_an_end_waits_for() {
+        return terminate(state, reason, now);
+    }
+    run.terminal_reason = Some(reason);
+    // A proposal whose answer decided this end is no longer pending. Left
+    // on the record it would be reported as pending while the run waits,
+    // and a wind-down that took this run over would wait for it for good.
+    // A budget's end finds none.
+    run.loop_state.clear_answered_proposal();
+    fence_unsent(run, &scope, false, now);
+    settle_run_disposition(state, now)
+}
+
 /// Responds to a budget exhaustion: park to ask the parent for more when the
 /// dimension is a conserved quantity, or stop when nothing can grant it.
 ///
@@ -1636,7 +1806,7 @@ fn park_or_terminate(
     if exhaustion.dimension.is_conserved() {
         park_for_top_up(state, exhaustion, now)
     } else {
-        terminate(
+        end_when_settled(
             state,
             AgentRunTerminalReason::BudgetExhausted { exhaustion },
             now,
@@ -2437,14 +2607,24 @@ fn chase_reason(run: &AgentRun) -> String {
 /// `unresolved_members`: a fired deadline marks its stragglers timed out
 /// *before* resolving the group, so the unresolved set is empty by the time
 /// the chase reads it and the deadline branch would chase nobody.
+///
+/// A run that waits for a call it sent before a decided end is `Cancelling`
+/// too, and its scope is not cancelled: its result was accepted, or its
+/// proposal refused, and it does to its children what it did when it ended
+/// on the spot. It still chases a straggler, as any run that has not ended
+/// does. So `Cancelling` is read as a cancelled scope only where the
+/// recorded reason is not a decided end
+/// ([`AgentRunTerminalReason::is_decided_end`]; issues #123, #172 and #173).
 fn chase_context(run: &AgentRun) -> (bool, Vec<crate::fan_in::AgentFanInMemberId>) {
+    let waits_for_a_decided_end = run
+        .terminal_reason
+        .as_ref()
+        .is_some_and(AgentRunTerminalReason::is_decided_end);
     let winding_down_cancelled = matches!(
         run.terminal_reason,
         Some(AgentRunTerminalReason::CancellationRequested { .. })
-    ) || matches!(
-        run.status,
-        AgentRunStatus::Cancelling | AgentRunStatus::Cancelled
-    );
+    ) || run.status == AgentRunStatus::Cancelled
+        || (run.status == AgentRunStatus::Cancelling && !waits_for_a_decided_end);
     let stragglers = run
         .loop_state
         .fan_in()
@@ -2846,9 +3026,21 @@ fn settle_goal_evaluation_exchange(
 /// stops the run with the *original* structured exhaustion, because a run must
 /// not park on an empty answer forever.
 ///
-/// A grant that arrives after the run has moved on (it was cancelled while
-/// parked) is ignored: the task's escrow already recorded the grant and frees it
-/// on the run's return, so there is nothing for the run to do.
+/// A grant that arrives after the run has ended is ignored: the end cleared
+/// the park, and the task's escrow already recorded the grant and frees it on
+/// the run's return, so there is nothing for the run to do.
+///
+/// The grant moves no status. A run parks under `Running` and takes no step
+/// while it is parked, so it is `Running` still when the grant arrives unless
+/// something else has moved it: a cancel or a failed call began its
+/// wind-down, an outcome came back unknown, a gate opened. That wait is not
+/// the grant's to end. The grant is credited and the park cleared, and the
+/// run goes on from where it waits when that wait ends, or not at all if it
+/// is winding down. Setting `Running` here let the loop take another turn on
+/// a cancelled run, whose calls a run that is winding down never sends, and
+/// past an unknown outcome, whose reconciliation was still open (issues
+/// #123, #172 and #173). A grant of nothing ends a run that is winding down
+/// as out of budget, as it ends any run.
 fn apply_top_up_grant(
     state: &mut AgentRunState,
     result: &AgentExchangeResult,
@@ -2894,12 +3086,13 @@ fn apply_top_up_grant(
     }
 
     if relieved {
-        if let Some(run) = state.run.as_mut() {
-            run.status = AgentRunStatus::Running;
-        }
+        // The grant relieves the park and moves no status. A run parks
+        // under `Running` (`park_for_top_up`) and is `Running` still unless
+        // something else has moved it since, and that wait is not the
+        // grant's to end.
         state.updated_at = now;
     } else {
-        let _terminated = terminate(
+        let _ended = end_when_settled(
             state,
             AgentRunTerminalReason::BudgetExhausted {
                 exhaustion: pending.exhaustion,
@@ -2953,7 +3146,7 @@ fn advance_once(
         repair_park(state, policies, now)?;
         return owed_run_exchanges(state, now);
     }
-    if run.needs_unpark() || run.needs_gate_wait_release() {
+    if run.needs_unpark() || run.needs_gate_wait_release() || run.needs_decided_end() {
         // A record a binary before issue #131 left parked in reconciliation
         // after its park was answered: nothing is left to reconcile, and
         // nothing would ever write its status. The disposition settle takes
@@ -2964,6 +3157,33 @@ fn advance_once(
         // And a record a binary before issue #166 left on an approval or
         // authorization wait whose gate had closed without a grant: the same
         // settle releases it ([`AgentRun::needs_gate_wait_release`]).
+        //
+        // And a record whose end was decided, which an older binary left
+        // waiting with no call out: the same settle ends it
+        // ([`AgentRun::needs_decided_end`]).
+        settle_run_disposition(state, now)?;
+        return owed_run_exchanges(state, now);
+    }
+    if state.needs_answered_proposal_drop() {
+        // A record a binary before issues #123, #172 and #173 left winding
+        // down over a proposal its task had already answered: drop the
+        // proposal, as the transition that takes the answer does under this
+        // binary, and let the disposition end the wind-down if that was all
+        // it waited for ([`AgentRunState::needs_answered_proposal_drop`]).
+        state.run_mut()?.loop_state.clear_answered_proposal();
+        settle_run_disposition(state, now)?;
+        return owed_run_exchanges(state, now);
+    }
+    if run.needs_wind_down_rest() {
+        // A record a binary before issues #123, #172 and #173 left winding
+        // down and off its rest: on a status that permits the loop a step,
+        // or with a call it committed after the wind-down began and never
+        // sent. Run the fence the wind-down owed, which cancels the call and
+        // closes its gate if it had one, and let the disposition put the run
+        // on its rest, or end it if the call was all it waited for. This
+        // comes before the loop's own step, which such a run must not take
+        // ([`AgentRun::needs_wind_down_rest`]).
+        fence_unsent(state.run_mut()?, &scope, false, now);
         settle_run_disposition(state, now)?;
         return owed_run_exchanges(state, now);
     }
@@ -4776,7 +4996,9 @@ fn record_effect_result(
     // resolution path can answer it, and the terminal status, reason and
     // stamp do not move. A compensation or workflow cancel parked on an ended
     // run opens none, since its checkpoint would offer decisions the ended
-    // run refuses (issue #123).
+    // run refuses. Only a record an earlier binary ended holds one out: a run
+    // now waits for the compensation or the cancel it sent before it ends
+    // (issue #123).
     let live = state.run().is_some_and(|run| !run.status.is_terminal());
     let parked = state.run().is_some_and(|run| {
         run.loop_state
@@ -5507,6 +5729,13 @@ fn apply_effect_outcome(
 ///   ambiguous outcome is explicitly resolved
 ///   ([specification 8.7](../../../docs/plans/rakka-agent/spec.md),
 ///   [11.5](../../../docs/plans/rakka-agent/spec.md); scenario 57);
+/// - a run whose end was decided for it (its result accepted, its proposal
+///   refused or its rejections spent, its budget spent) becomes terminal,
+///   under that reason, exactly when it holds no call of its own that an end
+///   waits for. Until then it is `WaitingForReconciliation` while one of
+///   those calls has an unknown outcome, and `Cancelling` otherwise
+///   (`end_when_settled`; issues #123, #172 and #173). This is read before
+///   the park above, which counts a memory promotion and a claim append;
 /// - a run that is winding down becomes terminal exactly when nothing blocks
 ///   settlement, under the reason recorded when the wind-down began — a run
 ///   cancelled before an effect failed is cancelled, not failed;
@@ -5533,6 +5762,28 @@ fn settle_run_disposition(
 ) -> AgentRunResult<()> {
     let run = state.run_mut()?;
     if run.status.is_terminal() {
+        return Ok(());
+    }
+
+    // A run whose end was decided for it waits only for the calls of its own
+    // that an end must wait for, and ends under that reason when it holds
+    // none (`end_when_settled`). Before the park below, which reads every
+    // kind: a parked memory promotion or claim append is owed after the end
+    // and does not hold it.
+    if let Some(reason) = run
+        .terminal_reason
+        .clone()
+        .filter(AgentRunTerminalReason::is_decided_end)
+    {
+        if !run.loop_state.holds_call_an_end_waits_for() {
+            return terminate(state, reason, now);
+        }
+        run.status = if run.loop_state.has_indeterminate_call_of_its_own() {
+            AgentRunStatus::WaitingForReconciliation
+        } else {
+            AgentRunStatus::Cancelling
+        };
+        state.updated_at = now;
         return Ok(());
     }
 
@@ -7395,7 +7646,11 @@ fn settle_proposal(
             // or amend the terminal record it already persisted.
             return Ok(());
         }
-        run.status == AgentRunStatus::Cancelling
+        // Winding down, and not `Cancelling` alone: a run that is winding
+        // down and parked on an unknown outcome is
+        // `WaitingForReconciliation`, and a rejection read against the
+        // status began a new turn on it.
+        run.winding_down()
     };
 
     let decision: AgentTaskDecision =
@@ -7408,7 +7663,7 @@ fn settle_proposal(
                 // run stops rather than guess. Guessing "accepted" would
                 // complete a task the rules may have refused; guessing
                 // "rejected" would burn an iteration the task never charged.
-                return terminate(
+                return end_when_settled(
                     state,
                     AgentRunTerminalReason::UndecodableDecision {
                         code: error.code().to_string(),
@@ -7423,9 +7678,11 @@ fn settle_proposal(
             // Acceptance wins the race with a wind-down: the task durably
             // completed on this result, and the run records that truthfully
             // rather than holding an accepted result under a cancelled status.
+            // It ends here unless it still holds a call it sent, and then
+            // ends as accepted once that call is known.
             let run = state.run_mut()?;
             run.loop_state.set_accepted_result(*result);
-            terminate(state, AgentRunTerminalReason::ResultAccepted, now)
+            end_when_settled(state, AgentRunTerminalReason::ResultAccepted, now)
         }
         AgentTaskDecision::Rejected {
             feedback,
@@ -7436,8 +7693,22 @@ fn settle_proposal(
                 // A rejection would begin another turn, and a cancelling run
                 // takes no further turn: the decision settles the outstanding
                 // proposal, and the wind-down finishes with the reason the
-                // operator recorded.
-                let reason = state.run_mut()?.terminal_reason.clone().unwrap_or(
+                // operator recorded. It finishes here if the proposal was all
+                // it waited for. If it still waits for a call it sent or for
+                // a child, it goes on waiting, without the proposal the task
+                // has now answered.
+                let run = state.run_mut()?;
+                if run
+                    .loop_state
+                    .effects()
+                    .iter()
+                    .any(AgentRunEffect::blocks_settlement)
+                    || run.loop_state.awaits_children()
+                {
+                    run.loop_state.clear_answered_proposal();
+                    return settle_run_disposition(state, now);
+                }
+                let reason = run.terminal_reason.clone().unwrap_or(
                     AgentRunTerminalReason::CancellationRequested {
                         reason: "cancelled".to_string(),
                     },
@@ -7448,7 +7719,7 @@ fn settle_proposal(
                 // The task's rejection budget is spent, and the task has failed.
                 // The run never silently accepts the proposal its rules refused
                 // ([specification 9.2]).
-                return terminate(
+                return end_when_settled(
                     state,
                     AgentRunTerminalReason::ResultRejectionsExhausted,
                     now,
@@ -7476,9 +7747,15 @@ fn settle_proposal(
                 // subtree quiesce gate, and leave this run's own children
                 // unchased. `cancel` keeps whatever reason a run-cancel
                 // already recorded, so the two orderings converge.
+                //
+                // The proposal has its answer, and a wind-down waits for a
+                // proposal's answer: left on the record, the refused
+                // proposal held this wind-down for good, and the task's
+                // cancellation with it.
+                state.run_mut()?.loop_state.clear_answered_proposal();
                 return cancel(state, code, now);
             }
-            terminate(
+            end_when_settled(
                 state,
                 if code == AGENT_TASK_REFUSAL_STALE_GENERATION {
                     AgentRunTerminalReason::Superseded
@@ -9235,15 +9512,25 @@ where
             // before issue #166 left standing after its gate closed
             // ([`AgentRun::needs_gate_wait_release`]), and a gate a binary
             // before issue #133 left waiting with nothing to gate
-            // ([`AgentRun::needs_gate_close`]).
-            let can_advance = self.state()?.run().is_some_and(|run| {
-                run.can_advance()
-                    || run.needs_turn_rest()
-                    || run.needs_park_repair()
-                    || run.needs_unpark()
-                    || run.needs_gate_wait_release()
-                    || run.needs_gate_close()
-            });
+            // ([`AgentRun::needs_gate_close`]), and a decided end an older
+            // binary left waiting with no call out
+            // ([`AgentRun::needs_decided_end`]), and a wind-down an older
+            // binary left waiting for a proposal its task had answered
+            // ([`AgentRunState::needs_answered_proposal_drop`]), and a call
+            // an older binary committed on a run that was winding down, and
+            // never sent, or a status it left such a run that permits the
+            // loop a step ([`AgentRun::needs_wind_down_rest`]).
+            let can_advance = self.state()?.needs_answered_proposal_drop()
+                || self.state()?.run().is_some_and(|run| {
+                    run.can_advance()
+                        || run.needs_turn_rest()
+                        || run.needs_park_repair()
+                        || run.needs_unpark()
+                        || run.needs_gate_wait_release()
+                        || run.needs_decided_end()
+                        || run.needs_wind_down_rest()
+                        || run.needs_gate_close()
+                });
             if !can_advance {
                 break;
             }
@@ -9265,13 +9552,16 @@ where
             // A repair step commits without folding the turn, so it is not
             // the step to measure: the fold that follows it is. Measuring
             // both counted a record healed at `RecordingTurn` twice.
-            let repairs = self.state()?.run().is_some_and(|run| {
-                run.needs_park_repair()
-                    || run.needs_unpark()
-                    || run.needs_gate_wait_release()
-                    || run.needs_gate_close()
-                    || run.needs_turn_rest()
-            });
+            let repairs = self.state()?.needs_answered_proposal_drop()
+                || self.state()?.run().is_some_and(|run| {
+                    run.needs_park_repair()
+                        || run.needs_unpark()
+                        || run.needs_gate_wait_release()
+                        || run.needs_decided_end()
+                        || run.needs_wind_down_rest()
+                        || run.needs_gate_close()
+                        || run.needs_turn_rest()
+                });
             let turn_measurements = (!repairs && phase == AgentLoopPhase::RecordingTurn.as_label())
                 .then(|| {
                     self.state().ok().and_then(|state| {
@@ -14014,6 +14304,296 @@ mod tests {
             !fx.state.run().expect("run").needs_park_repair(),
             "the repair leaves nothing owed"
         );
+    }
+
+    /// Every site that decides an end goes through the wait, and not only
+    /// the ones a whole run reaches easily in a test. Each is driven here on
+    /// a run that holds a send whose outcome is unknown: the reason is
+    /// recorded, and the run stays parked instead of ending over it.
+    #[test]
+    fn every_site_that_decides_an_end_waits_for_a_call_whose_outcome_is_unknown() {
+        fn waits_under(fx: &HandoffSendFixture, code: &str) {
+            let run = fx.run();
+            assert_eq!(
+                (
+                    run.status,
+                    run.terminal_reason
+                        .as_ref()
+                        .map(AgentRunTerminalReason::code)
+                ),
+                (AgentRunStatus::WaitingForReconciliation, Some(code)),
+            );
+            assert!(
+                run.loop_state.has_indeterminate_call_of_its_own(),
+                "the send's outcome is still unknown"
+            );
+        }
+
+        // The task refuses the proposal.
+        let mut fx = parked();
+        let now = fx.now;
+        let refused = AgentExchangeResult::accepted(
+            AgentExchangePayload::encode(
+                AGENT_TASK_DECISION_PAYLOAD_TYPE,
+                &AgentTaskDecision::Refused {
+                    code: "task-terminal".to_string(),
+                    status: AgentTaskStatus::Failed,
+                },
+            )
+            .expect("the decision encodes"),
+        );
+        settle_proposal(&mut fx.state, &refused, now).expect("the refusal settles");
+        waits_under(&fx, "task-refused-proposal");
+
+        // The task's decision cannot be decoded.
+        let mut fx = parked();
+        let undecodable =
+            AgentExchangeResult::accepted(AgentExchangePayload::empty("not.a.TaskDecision"));
+        settle_proposal(&mut fx.state, &undecodable, now).expect("the decision settles");
+        waits_under(&fx, "undecodable-decision");
+
+        // The parent answers a top-up request with nothing.
+        let mut fx = parked();
+        park_for_top_up(
+            &mut fx.state,
+            AgentBudgetExhaustion::new(crate::budget::AgentBudgetDimension::Tokens, 10, 10),
+            now,
+        )
+        .expect("the run parks on its top-up request");
+        let nothing = AgentExchangeResult::accepted(AgentExchangePayload::empty(
+            AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE,
+        ));
+        apply_top_up_grant(&mut fx.state, &nothing, now);
+        waits_under(&fx, "budget-exhausted");
+    }
+
+    /// A top-up's grant clears the park and moves no status. A run parks
+    /// under `Running`, and is `Running` still when the grant arrives unless
+    /// something else has moved it. Where a cancel began its wind-down, or
+    /// an outcome came back unknown, the run stays where it waits: `Running`
+    /// would let the loop take another turn on a cancelled run, or past an
+    /// unknown outcome.
+    #[test]
+    fn a_top_up_grant_moves_no_status() {
+        let relieving = || {
+            AgentExchangeResult::accepted(
+                AgentExchangePayload::encode(
+                    AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE,
+                    &AgentBudgetLedgerOutcome {
+                        granted: Some(AgentBudgetAllocation {
+                            tokens: Some(100),
+                            ..AgentBudgetAllocation::nothing()
+                        }),
+                    },
+                )
+                .expect("the outcome encodes"),
+            )
+        };
+        let park = |fx: &mut HandoffSendFixture| {
+            let now = fx.now;
+            park_for_top_up(
+                &mut fx.state,
+                AgentBudgetExhaustion::new(crate::budget::AgentBudgetDimension::Tokens, 10, 10),
+                now,
+            )
+            .expect("the run parks on its top-up request");
+            assert_eq!(
+                fx.run().status,
+                AgentRunStatus::Running,
+                "a run parks under `Running`"
+            );
+        };
+
+        // Cancelled while parked, and not ended: it holds a send whose
+        // outcome is unknown.
+        let mut fx = parked();
+        let now = fx.now;
+        park(&mut fx);
+        cancel(&mut fx.state, "operator stopped the work".to_string(), now)
+            .expect("the cancellation applies");
+        let resting = fx.run().status;
+        assert!(
+            fx.run().winding_down()
+                && !resting.permits_progress()
+                && fx.run().loop_state.pending_top_up().is_some(),
+            "cancelled, not ended, and still parked on its top-up: {resting}"
+        );
+        apply_top_up_grant(&mut fx.state, &relieving(), now);
+        assert_eq!(
+            (
+                fx.run().status,
+                fx.run().loop_state.pending_top_up().is_some(),
+                fx.run()
+                    .terminal_reason
+                    .as_ref()
+                    .map(AgentRunTerminalReason::code)
+            ),
+            (resting, false, Some("cancellation-requested")),
+            "the park is cleared, and the run stays on its wind-down's rest"
+        );
+
+        // Not winding down: an outcome came back unknown while it was
+        // parked, and it waits for its reconciliation.
+        let mut fx = parked();
+        park(&mut fx);
+        settle_run_disposition(&mut fx.state, now).expect("the disposition settles");
+        assert!(
+            !fx.run().winding_down()
+                && fx.run().status == AgentRunStatus::WaitingForReconciliation
+                && fx.run().loop_state.pending_top_up().is_some(),
+            "live, parked on an unknown outcome, and on its top-up"
+        );
+        apply_top_up_grant(&mut fx.state, &relieving(), now);
+        assert_eq!(
+            (
+                fx.run().status,
+                fx.run().loop_state.pending_top_up().is_some(),
+                fx.run().terminal_reason.is_some()
+            ),
+            (AgentRunStatus::WaitingForReconciliation, false, false),
+            "the park is cleared, and the run stays on its reconciliation"
+        );
+
+        // Nothing moved it: it is `Running` as it parked, and with the park
+        // cleared the loop's next step takes it.
+        let mut fx = parked();
+        park(&mut fx);
+        apply_top_up_grant(&mut fx.state, &relieving(), now);
+        assert_eq!(
+            (
+                fx.run().status,
+                fx.run().loop_state.pending_top_up().is_some()
+            ),
+            (AgentRunStatus::Running, false),
+            "the park is cleared, and the run is `Running` as it parked"
+        );
+    }
+
+    /// The question the settle pass asks of a run that is winding down reads
+    /// the fence's own exemption. A compensation the wind-down scheduled and
+    /// has not yet sent is not a call the fence cancels, so it does not put
+    /// the run off its rest, and the fence leaves it alone. A call of a kind
+    /// the fence does not exempt does, and the fence cancels it.
+    #[test]
+    fn a_wind_down_that_holds_only_an_unsent_compensation_is_at_rest() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Cancelling,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        let now = fx.now;
+        let scope = fx.scope.clone();
+        let sent = fx.effect_id.clone();
+        let sent_generation = fx.generation;
+        let run = fx.state.run_mut().expect("the run exists");
+        run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
+            reason: "operator stopped the work".to_string(),
+        });
+        let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+        let compensation = AgentRunEffect::new(
+            &scope,
+            run.loop_state.turn(),
+            1,
+            AgentRunEffectRequest::Compensation {
+                compensation: AgentCompensationRef::new("refund-charge").expect("the ref is valid"),
+                compensated: sent.clone(),
+                compensated_generation: sent_generation,
+            },
+            &spec,
+            AgentRevisionNumber::INITIAL,
+            now,
+        )
+        .expect("the compensation derives");
+        assert!(compensation.is_pending() && compensation.kind().exempt_from_wind_down_fence());
+        run.loop_state
+            .budget_mut()
+            .reserve_attempts(spec.max_attempts)
+            .expect("the compensation's attempts are affordable");
+        run.loop_state
+            .record_effect(compensation)
+            .expect("the compensation records");
+
+        assert!(
+            run.winding_down() && !run.needs_wind_down_rest(),
+            "a wind-down that holds only work the fence exempts is at rest"
+        );
+        assert_eq!(
+            run.loop_state.fence_unsent_effects(now),
+            0,
+            "and the fence cancels nothing"
+        );
+
+        run.loop_state
+            .effect_mut(&sent)
+            .expect("the run holds its send")
+            .status = AgentRunEffectStatus::Pending;
+        assert!(
+            run.needs_wind_down_rest(),
+            "a send it never sent puts it off its rest"
+        );
+        assert_eq!(
+            run.loop_state.fence_unsent_effects(now),
+            1,
+            "and is the one call the fence cancels"
+        );
+        assert!(!run.needs_wind_down_rest(), "after which it is at rest");
+    }
+
+    /// Which reasons are an end decided for the run, and which a wind-down
+    /// the run entered (issues #123, #172 and #173). The two wait
+    /// differently: a decided end for the calls the run sent, a wind-down
+    /// for its proposal and its children as well. And `Cancelling` is read
+    /// as a cancelled scope, whose every child is chased, only under a
+    /// reason that is not a decided end.
+    #[test]
+    fn the_decided_ends_are_the_six_the_run_does_not_enter_itself() {
+        let effect_id = parked().effect_id;
+        let decided = [
+            AgentRunTerminalReason::ResultAccepted,
+            AgentRunTerminalReason::Superseded,
+            AgentRunTerminalReason::TaskRefusedProposal {
+                code: "task-terminal".to_string(),
+                status: AgentTaskStatus::Completed,
+            },
+            AgentRunTerminalReason::ResultRejectionsExhausted,
+            AgentRunTerminalReason::BudgetExhausted {
+                exhaustion: AgentBudgetExhaustion::new(
+                    crate::budget::AgentBudgetDimension::WallClock,
+                    1,
+                    2,
+                ),
+            },
+            AgentRunTerminalReason::UndecodableDecision {
+                code: "payload-undecodable".to_string(),
+            },
+        ];
+        for reason in decided {
+            assert!(reason.is_decided_end(), "{}", reason.code());
+        }
+        let entered = [
+            AgentRunTerminalReason::CancellationRequested {
+                reason: "operator".to_string(),
+            },
+            AgentRunTerminalReason::EffectFailed {
+                effect_id: effect_id.clone(),
+                code: "tool-failed".to_string(),
+                reason: None,
+                attempts: None,
+                max_attempts: None,
+            },
+            AgentRunTerminalReason::EffectCompensated {
+                effect_id,
+                compensation: AgentCompensationRef::new("refund-charge").expect("the ref is valid"),
+            },
+            AgentRunTerminalReason::HandedOff {
+                handoff: crate::identity::AgentHandoffId::new("handoff-1")
+                    .expect("the handoff id is valid"),
+                target: AgentId::new("billing-agent").expect("the agent id is valid"),
+            },
+        ];
+        for reason in entered {
+            assert!(!reason.is_decided_end(), "{}", reason.code());
+        }
     }
 
     /// A compensation still outstanding when its run ended parks on an

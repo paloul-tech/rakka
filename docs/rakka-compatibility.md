@@ -736,6 +736,52 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Rollback.** An earlier build accepts the gated spec again, and with it the run that never makes a model call.
 
+- Issues #123, #172 and #173 ("a run ends holding a call it sent") change when a run becomes terminal. **No durable field, status, schema version, error code or decision kind is added.**
+
+  **The rule.** A run does not end while it holds a call of its own that it sent, whose outcome is unknown, or that the wind-down fence leaves for it to send. A memory promotion and a claim append are not such calls: each is owed after the end, as before (issue #120). Neither is any other call the run committed and never sent, which the end cancels, as before (issue #133).
+
+  | An end is decided for a run that holds such a call | Before | Now |
+  |---|---|---|
+  | The task accepts its result | `Completed` at once, the call left on the ended record | The reason `result-accepted` and the accepted result are recorded, and the run waits. It ends `Completed` when the call is known |
+  | The task refuses its proposal, or its rejections are spent, or its decision cannot be decoded | Ended at once under that reason | The reason is recorded, and the run waits, then ends under it |
+  | A budget is spent that cannot be topped up (a deadline, a concurrency ceiling, a top-up answered with nothing) | Ended `Failed` at once | The reason `budget-exhausted` is recorded, and the run waits, then ends under it |
+  | Any of these, and the run holds no such call | Ended at once | Unchanged, and so is its record |
+
+  **What the ended run left behind, and what happens now.**
+
+  - *A goal evaluation that was sent and not yet invoked* (#172). The dispatcher cancels the ticket of a run that has ended and tells the run, and the ended run refused to hear it: the evaluation stayed `Ready` and kept its reserved attempts. The waiting run takes the cancellation, or the evaluation's own result if it had been invoked, and ends.
+  - *A goal evaluation whose outcome was unknown* (#173). Its reconciliation checkpoint stayed open on the ended run, where every decision is refused `run-terminal`. The waiting run is `WaitingForReconciliation`, answers the checkpoint with the decisions of a live run, and ends.
+  - *A compensation or a workflow cancel still in flight* (#123). The ended run took its result, and one that ended unknown parked with no checkpoint. The waiting run opens the checkpoint as any live run does.
+
+  **While it waits** the run is `Cancelling`, or `WaitingForReconciliation` while one of those calls has an unknown outcome. Its terminal reason is already set, an accepted run's accepted result is already recorded, and the proposal the task answered is no longer on its record. It sends nothing but the kinds the fence exempts, takes no further turn, and records one `wait` decision (`winding-down`) before the decision that records its end. It does to its children what an end at once did: it neither waits for them nor cancels them. The one exception is a straggler a resolved fan-in left behind, which it chases as any run that has not ended does, and whose cancel it then waits for; that cancel's marker carries the run's reason. Where the end it waits for is `Cancelled`, because the task that refused its proposal was itself cancelled, its children are sent their cancel when it ends, and not while it waits; before, that was the transition of the refusal. A parked memory promotion or claim append does not hold it and is not what its status reports: the run ends, and the ended run answers that park. A `Cancel` is accepted and changes neither its reason nor its wait; it still closes a waiting approval or authorization, and cancels a memory promotion or claim append that waited behind one, as a cancel does on any run.
+
+  **A wind-down and an answered proposal.** A wind-down waits for a proposal's answer, and three arms took an answer without ending that wait rightly. Each is changed:
+
+  | The task answers the proposal of a run that is winding down | Before | Now |
+  |---|---|---|
+  | It rejects, and the run is `Cancelling` | Ended at once under the wind-down's reason, whatever it still waited for | Ends there if the proposal was all it waited for. Otherwise goes on winding down, for its calls and its children, without the proposal |
+  | It rejects, and the run is parked on an unknown outcome (`WaitingForReconciliation`) | Began a new turn on the cancelled run, whose model call was never sent. With no rejection left, ended the run at once under `result-rejections-exhausted`, over the parked call | As the row above: no turn begins, and the run ends under the wind-down's reason once the park is answered |
+  | It refuses because the task is being cancelled | The run took the refusal as its own cancellation, and then waited for the refused proposal for good, `Cancelling`; the task's cancellation never completed | The proposal is dropped, and the wind-down ends when what else it waits for is known |
+
+  **What a deployment sees.** A task can be `Completed`, or refused, while its run is not yet terminal. A consumer that read "the task has decided" as "the run has ended" must read the run. A run parked on an unknown outcome now waits for a person before it ends; before, it ended and nothing could answer. And `Cancelling` no longer means a cancelled scope by itself: a waiting run's reason says which it is.
+
+  **Mixed builds.** An earlier build can load a run this build left waiting. It dispatches as for any run that is winding down and takes the call's result. **It reads `Cancelling` as a cancelled scope, and sends a cancel to every child the run has.** It ends the run under its recorded reason once nothing is out, but waits first for the run's children, and for a memory promotion or claim append that is still out. Where it settled the last call and left the run waiting for one of those, this build's next settle pass ends the run (`AgentRun::needs_decided_end`). An earlier build can still write either stuck record of the **Repaired** paragraphs below while it serves runs, and sets a run `Running` when its top-up is granted, whatever it waits on; this build's next settle pass on a stuck record repairs it. An earlier build that receives the task's decision itself ends the run at once, as it always did. A deployment whose runs propose with children still running should finish the upgrade, or drain those runs, before a waiting run can meet an earlier build.
+
+  **Rollback.** A run waiting when an earlier build takes over is treated as in the paragraph above.
+
+  **Repaired.** A run an earlier build left winding down over a proposal the task had refused, with that proposal still on its record (the last row of the table above): `Cancelling`, or `WaitingForReconciliation` where a call of the run was parked. Its status and reason cannot tell it from a cancelled run whose proposal is still on its way, which must go on waiting, because an acceptance still wins the race with a cancel. Its exchange journal can: a proposal whose exchange the run no longer owes has been answered. The settle pass drops such a proposal on the first pass that touches the record, and the wind-down ends when what else it waits for is known (`AgentRunState::needs_answered_proposal_drop`). The task's cancellation then completes.
+
+  **Repaired too.** A cancelled run on which an earlier build began a new turn (the second row of the table above). That build's next step committed the turn's model call. A run that is winding down hands the sink only the kinds its fence exempts, so the call was never sent, and no fence ran after it, so it was never cancelled: the run did not end, `WaitingForEffect` while its park was open and `Cancelling` once the park was answered. The settle pass now puts a run that is winding down back on its wind-down's rest, on the first pass that touches the record and before the loop can take a step on it (`AgentRun::needs_wind_down_rest`). It runs the fence the wind-down owed: the call is cancelled and gives back the attempts it reserved, and the run rests on its park, or ends as cancelled where the call was all it waited for. A record caught between that build's two writes, with the turn begun and no call yet, commits nothing. Nothing is lost: the call is one no flush would send. The repair asks every run that is winding down and has not ended, and reads only its status and what the fence acts on. So a call of any kind the fence does not exempt, held unsent by such a run, is cancelled by the next settle pass, and a gate it waited behind is closed with it. Until this change such a record was left as it was. A memory promotion, a claim append, a compensation or a workflow cancel is never cancelled this way.
+
+  **A top-up's grant moves no status.** A run parks for a top-up under `Running` and takes no step while it is parked, so it is `Running` still when the task's grant arrives unless something else moved it. The grant used to set it `Running` whatever it then waited on. Two runs were wrong for it:
+
+  - **A run cancelled, or stopped by a failed call, while its request was on its way,** which had not ended because it still waited for a call it sent or for a child. The loop took another turn on it and committed calls that a run that is winding down never sends: the stuck run of the paragraph above, written through commands alone.
+  - **A run whose call came back unknown while it was parked.** It is not winding down; it waits for a person. The loop went on past the unknown outcome, and sent the next turn's model call with the reconciliation still open.
+
+  The grant is still credited and still clears the park. The run stays where it waits. A run that is winding down takes no turn and spends nothing more; the task's escrow holds what it granted until the run's return. A run parked on an unknown outcome goes on, with the credit, when its reconciliation is answered. A grant of nothing is unchanged in its reason: it ends a run that is winding down as out of budget, and not as cancelled, once the calls it sent are known. A run an earlier build left stuck by a grant is repaired by the paragraph above.
+
+  **Not repaired.** A run an earlier build already ended holding one of these calls keeps it: the evaluation `Ready`, the open reconciliation checkpoint, the parked compensation or workflow cancel with no checkpoint.
+
 Run the default compatibility matrix:
 
 ```sh

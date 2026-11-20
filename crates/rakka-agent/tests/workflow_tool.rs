@@ -1754,6 +1754,607 @@ async fn an_answered_park_puts_a_run_resting_on_its_children_back_there() {
     }
 }
 
+/// Issue #123. An `Any` fan-in that resolves on its first child chases the
+/// other with a workflow cancel, and the run goes on to propose its result.
+/// The task accepts while the cancel is still out. The run used to end
+/// there; a cancel that then ended unknown parked on the ended run with no
+/// checkpoint, and nothing could answer it. The run now waits, accepted. The
+/// park opens its checkpoint as on any live run, a person answers it, and
+/// the run ends.
+#[tokio::test]
+async fn an_accepted_run_waits_for_the_stragglers_cancel_it_sent() {
+    let executor = RecordingWorkflowExecutor::new(StartMode::Started);
+    let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Invoking two workflows and awaiting any.")
+        .with_tool_call(workflow_call("invoke-1"))
+        .with_tool_call(workflow_call("invoke-2"))
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({}),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first_turn)
+                .with_turn(proposing_turn()),
+        )
+        .with_workflow_start_executor(executor),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_workflow_tools(
+        rakka_agent::AgentRunWorkflowConfig::new()
+            .with_descriptor(common::workflow_tool_descriptor().with_cancellation_support())
+            .expect("the workflow configuration should accept the descriptor"),
+    );
+    fixture.instantiate_agent().await;
+    fixture
+        .apply_task_command(goal_task_creation_command(
+            task_definition(),
+            goal_spec_draft(
+                goal_spec_with_workflow(Some(rakka_agent::AgentFanInPolicy::Any)),
+                true,
+            ),
+        ))
+        .await
+        .expect("the goal task should create");
+    fixture.pump().await.expect("the loop should converge");
+    let (_, cells) = held_starts(&fixture).await;
+    let first = cells.keys().next().expect("one").clone();
+    deliver_result(
+        &fixture,
+        &first,
+        child_workflow_run_id(&first),
+        AgentWorkflowTerminalStatus::Completed,
+    )
+    .await
+    .expect("the first child's result records");
+
+    /// The run's status, the code of its terminal reason, and its waiting
+    /// checkpoints.
+    async fn standing(
+        fixture: &Fixture,
+    ) -> (
+        AgentRunStatus,
+        Option<String>,
+        Vec<rakka_agent::AgentCheckpoint>,
+    ) {
+        let snapshot = fixture.run_snapshot().await.expect("the run exists");
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        let waiting = run
+            .state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .open_checkpoints()
+            .iter()
+            .filter(|checkpoint| checkpoint.status.is_waiting())
+            .cloned()
+            .collect();
+        (
+            snapshot.status,
+            snapshot
+                .terminal_reason
+                .as_ref()
+                .map(|reason| reason.code().to_string()),
+            waiting,
+        )
+    }
+
+    // A review of the goal is commanded too. It waits behind its approval,
+    // so it is committed and not sent.
+    apply_to_run(&fixture, evaluate_goal(true)).await;
+
+    // The model proposes, and the task accepts, with the cancel out.
+    drive_model_turn_only(&fixture).await;
+    let (status, reason, waiting) = standing(&fixture).await;
+    assert_eq!(
+        (status, reason.as_deref(), waiting.len()),
+        (AgentRunStatus::Cancelling, Some("result-accepted"), 0),
+        "the result is accepted, the run has not ended, and the review's \
+         approval is closed: what was never sent is cancelled when the end \
+         is decided, not when the run ends"
+    );
+    {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        let review = run
+            .state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .effects()
+            .iter()
+            .find(|effect| effect.kind() == rakka_agent::AgentRunEffectKind::GoalEvaluationCall)
+            .cloned()
+            .expect("the review is held");
+        assert_eq!(review.status, rakka_agent::AgentRunEffectStatus::Cancelled);
+    }
+    let cancel = {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .effects()
+            .iter()
+            .find(|effect| effect.kind() == rakka_agent::AgentRunEffectKind::WorkflowCancelCall)
+            .cloned()
+            .expect("the straggler's cancel is held")
+    };
+    assert_eq!(cancel.status, rakka_agent::AgentRunEffectStatus::Ready);
+
+    // The cancel's attempt ends unknown.
+    let reply = apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: cancel.result_operation_id(&run_scope()).expect("derives"),
+            effect_id: cancel.effect_id.clone(),
+            generation: cancel.generation,
+            attempt: cancel.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the recovery retry was refused",
+            )),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply, rakka_agent::AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    let (status, reason, waiting) = standing(&fixture).await;
+    assert_eq!(
+        (status, reason.as_deref()),
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            Some("result-accepted")
+        )
+    );
+    assert_eq!(waiting.len(), 1, "the park opened its checkpoint");
+    assert_eq!(
+        waiting[0].kind,
+        rakka_agent::AgentCheckpointKind::IndeterminateEffectReconciliation
+    );
+    assert_eq!(waiting[0].bound_effect.effect_id, cancel.effect_id);
+
+    // A person answers it, and the run ends as its accepted result says.
+    let reply = apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "the-stragglers-cancel",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id: waiting[0].checkpoint_id.clone(),
+            resolver: rakka_agent_workflow::PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(rakka_agent::AgentCheckpointDecision::Reconciliation(
+                rakka_agent::AgentReconciliationDecision::AbandonAndFail,
+            )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply, rakka_agent::AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    let (status, reason, waiting) = standing(&fixture).await;
+    assert_eq!(
+        (status, reason.as_deref(), waiting.len()),
+        (AgentRunStatus::Completed, Some("result-accepted"), 0)
+    );
+}
+
+/// A run that waits for a call it sent does not cancel its children. The
+/// wait shows as `Cancelling`, which the chase read as a cancelled scope: an
+/// accepted run that happened to hold a goal evaluation sent a workflow
+/// cancel to every child it had started and awaited none of, where an
+/// accepted run that held nothing left them running. Whether a completed
+/// task's children were stopped turned on an unrelated call.
+#[tokio::test]
+async fn an_accepted_run_that_waits_leaves_its_children_as_one_that_does_not() {
+    let executor = RecordingWorkflowExecutor::new(StartMode::Started);
+    let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Invoking two workflows and awaiting neither.")
+        .with_tool_call(workflow_call("invoke-1"))
+        .with_tool_call(workflow_call("invoke-2"));
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first_turn)
+                .with_turn(proposing_turn()),
+        )
+        .with_workflow_start_executor(executor),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_workflow_tools(
+        rakka_agent::AgentRunWorkflowConfig::new()
+            .with_descriptor(common::workflow_tool_descriptor().with_cancellation_support())
+            .expect("the workflow configuration should accept the descriptor"),
+    );
+    create_workflow_task(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+    let (starts, _) = held_starts(&fixture).await;
+    assert_eq!(starts.len(), 2);
+    for start in &starts {
+        let invocation = match &start.request {
+            rakka_agent::AgentRunEffectRequest::WorkflowStart { invocation } => {
+                invocation.invocation.clone()
+            }
+            other => panic!("not a start: {other:?}"),
+        };
+        deliver_start_receipt(
+            &fixture,
+            start,
+            rakka_agent::AgentWorkflowStartReceipt {
+                child_run: child_workflow_run_id(&invocation),
+                invocation,
+                adopted: false,
+            },
+        )
+        .await
+        .expect("the receipt applies");
+    }
+    // An evaluation is committed beside turn two's model call, and sent.
+    apply_to_run(&fixture, evaluate_goal(false)).await;
+
+    // Turn two proposes, and the task accepts with the evaluation out.
+    drive_model_turn_only(&fixture).await;
+    settle(&fixture).await;
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let record = state.run().expect("the run exists");
+    assert_eq!(
+        (
+            record.status,
+            record
+                .terminal_reason
+                .as_ref()
+                .map(|reason| reason.code().to_string())
+        ),
+        (
+            AgentRunStatus::Cancelling,
+            Some("result-accepted".to_string())
+        ),
+        "the run waits for its evaluation"
+    );
+    let loop_state = state.loop_state().expect("the loop is started");
+    assert_eq!(
+        loop_state
+            .effects()
+            .iter()
+            .filter(|effect| effect.is_outstanding())
+            .map(|effect| effect.kind())
+            .collect::<Vec<_>>(),
+        vec![rakka_agent::AgentRunEffectKind::GoalEvaluationCall],
+        "and for nothing else: no cancel is sent to a child"
+    );
+    for (invocation, cell) in loop_state.workflow_invocations() {
+        assert!(
+            cell.cancel.is_none(),
+            "{invocation}: the child is not chased"
+        );
+    }
+}
+
+/// The same for a child the run delegated to. A waiting run owes it no
+/// delegation cancel: not while it waits, not after an operator's `Cancel`,
+/// which changes neither the run's reason nor what it does to its children,
+/// and not at its `Completed` end. From the second review's probe.
+#[tokio::test]
+async fn an_accepted_run_that_waits_leaves_a_delegated_child_alone() {
+    use rakka_persistence::DurableStateStore;
+
+    let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Delegating and awaiting nothing.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-1").expect("call id should be valid"),
+                delegation_tool_id(),
+                json!({ "skill": SKILL, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first_turn)
+                .with_turn(proposing_turn()),
+        )
+        .with_a2a_send_executor(sending_executor()),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_workflow_tools(workflow_config());
+    create_workflow_task(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+
+    // Answer the delegation send, so the child exists.
+    let send = {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .effects()
+            .iter()
+            .find(|effect| {
+                effect.kind() == rakka_agent::AgentRunEffectKind::A2aSendCall
+                    && effect.is_outstanding()
+            })
+            .cloned()
+            .expect("the send is out")
+    };
+    let outcome = fixture.dispatcher.answer(&send).await;
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: send.result_operation_id(&run_scope()).expect("derives"),
+            effect_id: send.effect_id.clone(),
+            generation: send.generation,
+            attempt: send.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(outcome),
+        },
+    )
+    .await;
+
+    // An evaluation is committed beside turn two's model call, and sent.
+    apply_to_run(&fixture, evaluate_goal(false)).await;
+    // Turn two proposes, and the task accepts with the evaluation out.
+    drive_model_turn_only(&fixture).await;
+    settle(&fixture).await;
+    settle(&fixture).await;
+
+    /// Status, reason code, the delegation cell's status and cancel outcome,
+    /// and whether the stored record names the delegation-cancel operation.
+    async fn picture(fixture: &Fixture) -> (AgentRunStatus, Option<String>, String, String, bool) {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        let state = run.state().expect("state");
+        let record = state.run().expect("the run exists");
+        let loop_state = state.loop_state().expect("the loop is started");
+        let (delegation, cell) = loop_state
+            .delegations()
+            .iter()
+            .next()
+            .expect("the delegation cell exists");
+        let operation =
+            rakka_agent::delegation_cancel_operation_id(&TenantId::new(TENANT), delegation)
+                .expect("derives");
+        let stored = fixture
+            .runs
+            .load(&run_scope().persistence_id())
+            .await
+            .expect("loads")
+            .expect("exists");
+        let json = serde_json::to_string(&stored.state).expect("serializes");
+        (
+            record.status,
+            record
+                .terminal_reason
+                .as_ref()
+                .map(|reason| reason.code().to_string()),
+            format!("{:?}", cell.status).chars().take(40).collect(),
+            format!("{:?}", cell.cancel),
+            json.contains(operation.as_str()),
+        )
+    }
+
+    let waiting = picture(&fixture).await;
+
+    // An operator cancels the waiting run.
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::Cancel {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::Cancellation,
+                &common::agent_scope(),
+                "operator-cancel",
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+    )
+    .await;
+    settle(&fixture).await;
+    let cancelled = picture(&fixture).await;
+
+    land_the_evaluation(&fixture).await;
+    settle(&fixture).await;
+    let ended = picture(&fixture).await;
+
+    assert_eq!(
+        (waiting.0, waiting.1.as_deref(), waiting.4),
+        (AgentRunStatus::Cancelling, Some("result-accepted"), false),
+        "waiting, and no delegation cancel is owed: {waiting:?}"
+    );
+    assert!(waiting.2.starts_with("ChildCreated"), "{waiting:?}");
+    assert_eq!(waiting.3, "None");
+    assert_eq!(
+        (cancelled.0, cancelled.1.as_deref(), cancelled.4),
+        (AgentRunStatus::Cancelling, Some("result-accepted"), false)
+    );
+    assert_eq!(
+        (ended.0, ended.1.as_deref(), ended.4),
+        (AgentRunStatus::Completed, Some("result-accepted"), false)
+    );
+}
+
+/// A cancelling run waits for its children as well as its calls. Its
+/// proposal is rejected while a child it started has not reported. It used
+/// to end there, `Cancelled`, over a child whose outcome it did not know.
+/// It goes on winding down until the child reports.
+#[tokio::test]
+async fn a_cancelling_run_whose_proposal_is_rejected_waits_for_its_child() {
+    let executor = RecordingWorkflowExecutor::new(StartMode::Started);
+    let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Invoking one workflow and awaiting nothing.")
+        .with_tool_call(workflow_call("invoke-1"));
+    // The task's rule wants a non-empty answer, so this proposal is rejected.
+    let unacceptable = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Done.")
+        .with_proposal(
+            AgentTaskContent::inline(json!({ "answer": "" }))
+                .expect("the proposal is inline-bounded"),
+        );
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first_turn)
+                .with_turn(unacceptable),
+        )
+        .with_workflow_start_executor(executor),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_workflow_tools(
+        rakka_agent::AgentRunWorkflowConfig::new()
+            .with_descriptor(common::workflow_tool_descriptor().with_cancellation_support())
+            .expect("the workflow configuration should accept the descriptor"),
+    );
+    create_workflow_task(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+    let (starts, _) = held_starts(&fixture).await;
+    assert_eq!(starts.len(), 1);
+    let invocation = match &starts[0].request {
+        rakka_agent::AgentRunEffectRequest::WorkflowStart { invocation } => {
+            invocation.invocation.clone()
+        }
+        other => panic!("not a start: {other:?}"),
+    };
+    deliver_start_receipt(
+        &fixture,
+        &starts[0],
+        rakka_agent::AgentWorkflowStartReceipt {
+            child_run: child_workflow_run_id(&invocation),
+            invocation: invocation.clone(),
+            adopted: false,
+        },
+    )
+    .await
+    .expect("the receipt applies");
+
+    /// Applies `command` while the task cannot be reached.
+    async fn apply_out_of_reach(fixture: &Fixture, command: AgentRunEntityCommand) {
+        let nowhere = rakka_agent::AgentExchangeRouter::new();
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        run.apply(command, &nowhere, fixture.now())
+            .await
+            .expect("the command applies");
+    }
+    /// The outstanding effect of `kind`, with its result as a command.
+    async fn result_of(
+        fixture: &Fixture,
+        kind: rakka_agent::AgentRunEffectKind,
+    ) -> AgentRunEntityCommand {
+        let effect = {
+            let mut run = fixture.run();
+            run.recover(fixture.now()).await.expect("recover");
+            run.state()
+                .expect("state")
+                .loop_state()
+                .expect("the loop is started")
+                .effects()
+                .iter()
+                .find(|effect| effect.kind() == kind && effect.is_outstanding())
+                .cloned()
+                .expect("the effect is out")
+        };
+        let outcome = fixture.dispatcher.answer(&effect).await;
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect.result_operation_id(&run_scope()).expect("derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: effect.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(outcome),
+        }
+    }
+    /// The run's status, whether its proposal is pending, and how many
+    /// calls it has out.
+    async fn standing(fixture: &Fixture) -> (AgentRunStatus, bool, usize) {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        let state = run.state().expect("state");
+        let loop_state = state.loop_state().expect("the loop is started");
+        (
+            state.status().expect("the run exists"),
+            loop_state.proposal().is_some(),
+            loop_state.outstanding_effects().count(),
+        )
+    }
+
+    // Turn two proposes while the task cannot be reached, the run is
+    // cancelled, and the cancel it sends its child is settled. All it still
+    // waits for is its proposal's answer and its child.
+    let proposal = result_of(&fixture, rakka_agent::AgentRunEffectKind::ModelCall).await;
+    apply_out_of_reach(&fixture, proposal).await;
+    apply_out_of_reach(
+        &fixture,
+        AgentRunEntityCommand::Cancel {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::Cancellation,
+                &common::agent_scope(),
+                "operator-cancel",
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+    )
+    .await;
+    let chase = result_of(
+        &fixture,
+        rakka_agent::AgentRunEffectKind::WorkflowCancelCall,
+    )
+    .await;
+    apply_out_of_reach(&fixture, chase).await;
+    assert_eq!(
+        standing(&fixture).await,
+        (AgentRunStatus::Cancelling, true, 0),
+        "cancelling, its proposal unanswered, no call out"
+    );
+
+    // The rejection lands.
+    settle(&fixture).await;
+
+    assert_eq!(
+        standing(&fixture).await,
+        (AgentRunStatus::Cancelling, false, 0),
+        "the rejection is taken, and the run still waits for its child"
+    );
+
+    deliver_result(
+        &fixture,
+        &invocation,
+        child_workflow_run_id(&invocation),
+        AgentWorkflowTerminalStatus::Cancelled,
+    )
+    .await
+    .expect("the child's result records");
+
+    assert_eq!(
+        standing(&fixture).await,
+        (AgentRunStatus::Cancelled, false, 0),
+        "the child reported, and the run ends as cancelled"
+    );
+}
+
 /// A run with a straggler's workflow cancel out goes back to `Running` when
 /// a claim append's park is answered.
 ///

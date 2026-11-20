@@ -948,6 +948,36 @@ impl AgentLoopState {
         self.effects.iter().any(AgentRunEffect::blocks_settlement) || self.proposal.is_some()
     }
 
+    /// Whether the run holds a call of its own that an end must wait for: one
+    /// it sent and has not heard back from, one whose outcome is unknown, or
+    /// one the wind-down fence leaves for it to send.
+    ///
+    /// This is what holds a run whose end was decided for it (issues #123,
+    /// #172 and #173). It is narrower than [`Self::awaits_settlement`] in
+    /// three ways, each of which is what such an end already did:
+    ///
+    /// - a memory promotion and a claim append do not count. Each is owed
+    ///   after the run's end, where the ended run takes its result and
+    ///   answers its park;
+    /// - a call that was never sent does not count, but for the kinds the
+    ///   fence exempts. The end cancels it in place;
+    /// - the proposal does not count. The end was decided by its answer.
+    pub(crate) fn holds_call_an_end_waits_for(&self) -> bool {
+        self.effects.iter().any(|effect| {
+            let kind = effect.kind();
+            !kind.outside_the_turn()
+                && effect.blocks_settlement()
+                && (!effect.is_pending() || kind.exempt_from_wind_down_fence())
+        })
+    }
+
+    /// Whether a call of the run's own, one not outside the turn, has an
+    /// unknown outcome.
+    pub(crate) fn has_indeterminate_call_of_its_own(&self) -> bool {
+        self.indeterminate_effects()
+            .any(|effect| !effect.kind().outside_the_turn())
+    }
+
     /// Whether a child this run created has not yet recorded its terminal
     /// outcome: a delegation or workflow-invocation cell still pending, or
     /// settled with a live child and no result.
@@ -1064,7 +1094,7 @@ impl AgentLoopState {
         let mut fenced_sends = Vec::new();
         let mut fenced_starts = Vec::new();
         for effect in &mut self.effects {
-            if effect.is_pending() && !effect.kind().exempt_from_wind_down_fence() {
+            if fenced_by_wind_down(effect) {
                 effect.status = crate::effect::AgentRunEffectStatus::Cancelled;
                 self.budget.settle_effect(effect.max_attempts, 0);
                 match effect.kind() {
@@ -2186,9 +2216,36 @@ impl AgentLoopState {
         self.proposal = Some(proposal);
     }
 
+    /// Drops a proposal the task has answered, on a run that does not end in
+    /// the same transition. A wind-down waits for a proposal's answer
+    /// ([`Self::awaits_settlement`]), and one that has had it must not go on
+    /// waiting; and a run that waits for a call it sent must not report the
+    /// proposal as pending.
+    pub(crate) fn clear_answered_proposal(&mut self) {
+        self.proposal = None;
+    }
+
+    /// Whether the state holds a call [`Self::fence_unsent_effects`] would
+    /// cancel: one that was never handed to the sink, of a kind the
+    /// wind-down fence does not exempt.
+    ///
+    /// The fence and this question read one predicate, so what is asked and
+    /// what is done cannot drift apart.
+    pub(crate) fn holds_unsent_call_the_fence_cancels(&self) -> bool {
+        self.effects.iter().any(fenced_by_wind_down)
+    }
+
     pub(crate) fn set_accepted_result(&mut self, result: AgentAcceptedResult) {
         self.accepted_result = Some(Box::new(result));
     }
+}
+
+/// Whether the wind-down fence cancels `effect`: it is `Pending`, which the
+/// flush ordering guarantees was never handed to the sink, and its kind is
+/// not one the fence exempts
+/// ([`crate::effect::AgentRunEffectKind::exempt_from_wind_down_fence`]).
+fn fenced_by_wind_down(effect: &AgentRunEffect) -> bool {
+    effect.is_pending() && !effect.kind().exempt_from_wind_down_fence()
 }
 
 impl VersionedAgentRecord for AgentLoopState {

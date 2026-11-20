@@ -1360,10 +1360,15 @@ const FORGED_CALLS: [&str; 8] = [
 ///   not ask such a run.
 /// - A run that has ended is left with no waiting gate, and a call it never
 ///   sent is cancelled.
-/// - A run that is winding down has the gate closed unless its call is still
-///   `Pending` or is not held. No wind-down leaves a call `Pending` and no
-///   record drops a call and keeps its gate, so neither is a record a binary
-///   writes, and the pass leaves both as they are.
+/// - A run that is winding down has the gate closed unless its call is not
+///   held. No record drops a call and keeps its gate, so that is not a
+///   record a binary writes, and the pass leaves it as it is.
+/// - A run that is winding down and still holds the call `Pending` has the
+///   call cancelled and its gate closed. The call is one its wind-down never
+///   fenced and no flush would send, and the pass runs the fence it was owed
+///   (issues #123, #172 and #173). Until that repair the pass left this
+///   record as it was, on the ground that no wind-down leaves a call
+///   `Pending`; a binary before those issues left one.
 #[tokio::test]
 async fn no_forged_gate_is_closed_on_a_live_run_or_left_waiting_on_an_ended_one() {
     let mut forged = 0;
@@ -1420,17 +1425,24 @@ async fn no_forged_gate_is_closed_on_a_live_run_or_left_waiting_on_an_ended_one(
                             Some(AgentCheckpointStatus::Cancelled),
                             "{at}: a live run's gate is not closed for it"
                         ),
-                        Standing::WindingDown if matches!(call_status, "pending" | "missing") => {
+                        Standing::WindingDown if call_status == "missing" => {
                             assert!(
                                 gate_now.is_some_and(AgentCheckpointStatus::is_waiting),
                                 "{at}: left as it is, got {gate_now:?}"
                             );
                         }
-                        Standing::WindingDown => assert_eq!(
-                            gate_now,
-                            Some(AgentCheckpointStatus::Cancelled),
-                            "{at}: the gate gates nothing, and is closed"
-                        ),
+                        Standing::WindingDown => {
+                            assert_eq!(
+                                gate_now,
+                                Some(AgentCheckpointStatus::Cancelled),
+                                "{at}: the gate gates nothing, and is closed"
+                            );
+                            assert_ne!(
+                                call_now,
+                                Some(AgentRunEffectStatus::Pending),
+                                "{at}: a run that is winding down holds no unsent call"
+                            );
+                        }
                         Standing::Ended => {
                             assert_eq!(
                                 gate_now,
@@ -1503,4 +1515,163 @@ async fn the_step_that_closes_a_gate_measures_no_turn() {
         before,
         "no turn was measured"
     );
+}
+
+/// Nor is the step that fences a call a binary left unsent on a run that is
+/// winding down (issues #123, #172 and #173). The record is the one above
+/// with the gated call still `Pending`, so its gate is not stranded and the
+/// step is the fence's own.
+#[tokio::test]
+async fn the_step_that_fences_an_unsent_call_measures_no_turn() {
+    use rakka_core::InMemoryMetricsRecorder;
+
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let calls = [CHARGE, FLAKY, LOOKUP];
+    let (fx, _sink) = world(&calls, policies(&calls, Some((CHARGE, Gate::Approval))));
+    let fx = fx.with_metrics(metrics.clone());
+    start(&fx, None).await;
+    commit_the_turn(&fx).await;
+    land(&fx, &call_to(&fx, FLAKY).await).await;
+    reopen_the_approval_as_an_older_binary_left_it(&fx).await;
+    rewrite_loop_state(&fx, |loop_state| {
+        loop_state["phase"] = serde_json::json!("recording-turn");
+        let gated = loop_state["effects"]
+            .as_array_mut()
+            .expect("the effects are an array")
+            .iter_mut()
+            .find(|effect| effect["slot"].as_u64() == Some(1))
+            .expect("the gated call is the turn's first");
+        gated["status"] = serde_json::json!("pending");
+    })
+    .await;
+    let gated = |state: &rakka_agent::AgentLoopState| {
+        state
+            .effects()
+            .iter()
+            .find(|effect| effect.slot == 1 && effect.turn == 1)
+            .map(|effect| effect.status)
+    };
+    assert_eq!(
+        (
+            status(&fx).await,
+            loop_state(&fx).await.phase(),
+            gated(&loop_state(&fx).await),
+            waiting(&fx).await.len()
+        ),
+        (
+            AgentRunStatus::Cancelling,
+            rakka_agent::AgentLoopPhase::RecordingTurn,
+            Some(AgentRunEffectStatus::Pending),
+            1
+        ),
+        "winding down, its turn not folded, and holding a call it never sent"
+    );
+    assert!(
+        loop_state(&fx).await.pending_turn().is_some(),
+        "the turn is not folded"
+    );
+    let count = |name: &str| metrics.snapshot().observations_named(name).len();
+    let before = (
+        count(rakka_agent::METRIC_AGENT_TURN_DURATION),
+        count(rakka_agent::METRIC_AGENT_MODEL_TOKENS),
+    );
+
+    settle(&fx).await;
+
+    assert_eq!(
+        (gated(&loop_state(&fx).await), waiting(&fx).await),
+        (Some(AgentRunEffectStatus::Cancelled), Vec::new()),
+        "the pass cancelled the call and closed its gate"
+    );
+    assert_eq!(
+        (
+            count(rakka_agent::METRIC_AGENT_TURN_DURATION),
+            count(rakka_agent::METRIC_AGENT_MODEL_TOKENS),
+        ),
+        before,
+        "no turn was measured"
+    );
+}
+
+/// The fence is owed whatever the run rests on. A run that is winding down
+/// and holds a call it never sent is parked on another call's unknown
+/// outcome: `WaitingForReconciliation`, and not `Cancelling`. The pass
+/// cancels the unsent call and closes its gate all the same, and the run
+/// stays on its park.
+#[tokio::test]
+async fn a_parked_run_that_holds_an_unsent_call_is_fenced_too() {
+    let calls = [CHARGE, FLAKY, LOOKUP];
+    let (fx, _sink) = world(&calls, policies(&calls, Some((CHARGE, Gate::Approval))));
+    start(&fx, None).await;
+    commit_the_turn(&fx).await;
+    land(&fx, &call_to(&fx, FLAKY).await).await;
+    reopen_the_approval_as_an_older_binary_left_it(&fx).await;
+    rewrite_loop_state(&fx, |loop_state| {
+        let gated = loop_state["effects"]
+            .as_array_mut()
+            .expect("the effects are an array")
+            .iter_mut()
+            .find(|effect| effect["slot"].as_u64() == Some(1))
+            .expect("the gated call is the turn's first");
+        gated["status"] = serde_json::json!("pending");
+    })
+    .await;
+    let gated = |state: &rakka_agent::AgentLoopState| {
+        state
+            .effects()
+            .iter()
+            .find(|effect| effect.slot == 1 && effect.turn == 1)
+            .map(|effect| effect.status)
+    };
+    assert_eq!(
+        (status(&fx).await, gated(&loop_state(&fx).await)),
+        (
+            AgentRunStatus::Cancelling,
+            Some(AgentRunEffectStatus::Pending)
+        ),
+        "winding down, and holding a call it never sent"
+    );
+
+    // The call that is out ends unknown, in a command: the run parks before
+    // any pass has seen the unsent call.
+    let lookup = call_to(&fx, LOOKUP).await;
+    apply(
+        &fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: lookup
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: lookup.effect_id.clone(),
+            generation: lookup.generation,
+            attempt: 1,
+            fence: 1,
+            outcome: Box::new(AgentRunEffectOutcome::indeterminate(
+                "connection-lost",
+                "the tool host died",
+            )),
+        },
+    )
+    .await
+    .expect("the unknown outcome applies");
+
+    assert_eq!(
+        (
+            status(&fx).await,
+            gated(&loop_state(&fx).await),
+            waiting(&fx)
+                .await
+                .iter()
+                .filter(|checkpoint| checkpoint.kind == AgentCheckpointKind::Approval)
+                .count()
+        ),
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            Some(AgentRunEffectStatus::Cancelled),
+            0
+        ),
+        "parked, with the unsent call cancelled and its gate closed"
+    );
+    let rested = revision(&fx).await;
+    settle(&fx).await;
+    assert_eq!(revision(&fx).await, rested, "a further pass writes nothing");
 }

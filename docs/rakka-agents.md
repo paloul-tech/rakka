@@ -675,9 +675,17 @@ incorrectly.
   promotion or claim append, whether it was open when the run ended or a
   command opened it after, is answered and timed as on a live run. The run's
   status does not move. The decision events all of this records follow the
-  run's end event (see Observability below). A compensation or workflow
-  cancel parked on an ended run stays as it was (issue #123), and every
-  other resolution on an ended run is still refused `run-terminal`. A
+  run's end event (see Observability below). A run does not end while it
+  holds any other call it sent. When its end is decided for it (its result
+  accepted, its proposal refused or its rejections spent, a budget spent
+  that cannot be topped up) it records that reason and waits: `Cancelling`,
+  or `WaitingForReconciliation` while one of those calls has an unknown
+  outcome. It takes their results and answers their parks as any live run
+  does, and ends under the recorded reason when the last is known, so an
+  accepted result still ends `Completed` (issues #123, #172 and #173). Only
+  a record an earlier build ended can hold such a call. It stays as it was,
+  and every other resolution on an ended run is still refused
+  `run-terminal`. A
   model, compensation or workflow-cancel spec may not require a checkpoint
   or an authorization: the run opens no gate when it records any of the
   three, so the spec is refused where it is set (`effect-policy-invalid`,
