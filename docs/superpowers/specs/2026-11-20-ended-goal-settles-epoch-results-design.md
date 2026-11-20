@@ -102,6 +102,13 @@ Three whole-run tests in `crates/rakka-agent/tests/ended_goal_epoch_result.rs`
 One unit test in `wake.rs` holds `release_ended`. The first three whole-run
 tests fail on the commit below this one, with the reply `task-terminal`.
 
+Six breaks of the fix were run, one at a time, against the two test files and
+the controller's unit tests: the ended task refusing as before, any ended
+task taking the result, the place not released, the settlement skipped, the
+ended goal's release promoting like any other, and `release_ended` not
+counting the release. Each is caught by a test. The whole crate passes: 1,825
+tests.
+
 ## 7. Not done
 
 - Records already left with a refused result (call 6).
