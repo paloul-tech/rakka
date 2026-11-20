@@ -94,7 +94,7 @@ pub use semantic::{semantic_search, semantic_search_refused, ConceptEmbedder};
 
 pub use retention::{
     retention_ages_claims_by_trust_status, retention_is_bounded_and_resumable,
-    retention_leaves_a_claim_that_moved,
+    retention_leaves_a_claim_that_moved, retention_leaves_a_claim_that_moves_between_its_two_reads,
 };
 
 /// The two scopes a conformance clause works with: the scope under test, and
@@ -1372,6 +1372,11 @@ pub async fn check_knowledge_graph_contract(store: &dyn KnowledgeGraphStore) {
     retention_ages_claims_by_trust_status(store, ConformanceScopes::unique("retention-ages")).await;
     retention_is_bounded_and_resumable(store, ConformanceScopes::unique("retention-bounded")).await;
     retention_leaves_a_claim_that_moved(store, ConformanceScopes::unique("retention-moved")).await;
+    retention_leaves_a_claim_that_moves_between_its_two_reads(
+        store,
+        ConformanceScopes::unique("retention-between-reads"),
+    )
+    .await;
     // Keyword search is optional: its clause binds exactly the backends that
     // report it. One that does not is held to the refusal the trait's default
     // answers, which the capability report already implies.

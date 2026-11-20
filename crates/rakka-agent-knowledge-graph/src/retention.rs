@@ -230,11 +230,21 @@ pub struct KnowledgeSpaceRetentionReport {
     pub next: Option<ClaimCursor>,
 }
 
-/// A caller-supplied step run on each due claim immediately before its
-/// delete. Test support: it is how a conformance clause moves a claim under
-/// the sweep.
-pub(crate) type BeforeRetentionDelete<'h> =
+/// A caller-supplied step run on a claim inside the sweep. Test support: it
+/// is how a conformance clause moves a claim under the sweep.
+pub(crate) type RetentionHook<'h> =
     dyn Fn(&Claim) -> Pin<Box<dyn Future<Output = ()> + Send + 'h>> + Send + Sync + 'h;
+
+/// The steps a conformance clause can run inside the sweep, one for each
+/// place the sweep has read a claim and not yet acted on what it read.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RetentionHooks<'a, 'h> {
+    /// Run on each claim that is aged by its last transition, after the
+    /// query read the claim and before the sweep reads that transition.
+    pub(crate) between_reads: Option<&'a RetentionHook<'h>>,
+    /// Run on each due claim immediately before its delete.
+    pub(crate) before_delete: Option<&'a RetentionHook<'h>>,
+}
 
 /// Whether a claim that entered its state at `entered_at` has outlived
 /// `window` by `now`.
@@ -274,7 +284,16 @@ pub async fn discharge_knowledge_space_retention(
     cursor: Option<ClaimCursor>,
     max_batch: usize,
 ) -> ClaimResult<KnowledgeSpaceRetentionReport> {
-    discharge(store, scope, policy, now, cursor, max_batch, None).await
+    discharge(
+        store,
+        scope,
+        policy,
+        now,
+        cursor,
+        max_batch,
+        RetentionHooks::default(),
+    )
+    .await
 }
 
 /// [`discharge_knowledge_space_retention`], with a step run on each due claim
@@ -286,18 +305,27 @@ pub(crate) async fn discharge_knowledge_space_retention_with_hook(
     now: AgentTimestampMillis,
     cursor: Option<ClaimCursor>,
     max_batch: usize,
-    before_delete: &BeforeRetentionDelete<'_>,
+    before_delete: &RetentionHook<'_>,
 ) -> ClaimResult<KnowledgeSpaceRetentionReport> {
-    discharge(
-        store,
-        scope,
-        policy,
-        now,
-        cursor,
-        max_batch,
-        Some(before_delete),
-    )
-    .await
+    let hooks = RetentionHooks {
+        between_reads: None,
+        before_delete: Some(before_delete),
+    };
+    discharge(store, scope, policy, now, cursor, max_batch, hooks).await
+}
+
+/// [`discharge_knowledge_space_retention`], with the steps `hooks` names run
+/// inside it.
+pub(crate) async fn discharge_knowledge_space_retention_with_hooks(
+    store: &dyn KnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    policy: &KnowledgeSpaceRetentionPolicy,
+    now: AgentTimestampMillis,
+    cursor: Option<ClaimCursor>,
+    max_batch: usize,
+    hooks: RetentionHooks<'_, '_>,
+) -> ClaimResult<KnowledgeSpaceRetentionReport> {
+    discharge(store, scope, policy, now, cursor, max_batch, hooks).await
 }
 
 async fn discharge(
@@ -307,7 +335,7 @@ async fn discharge(
     now: AgentTimestampMillis,
     cursor: Option<ClaimCursor>,
     max_batch: usize,
-    before_delete: Option<&BeforeRetentionDelete<'_>>,
+    hooks: RetentionHooks<'_, '_>,
 ) -> ClaimResult<KnowledgeSpaceRetentionReport> {
     let mut report = KnowledgeSpaceRetentionReport::default();
     if policy.legal_hold() {
@@ -333,16 +361,7 @@ async fn discharge(
         for claim in page.claims.into_iter().take(remaining) {
             report.examined += 1;
             position = Some(claim.claim_id.clone());
-            examine(
-                store,
-                scope,
-                policy,
-                now,
-                &claim,
-                before_delete,
-                &mut report,
-            )
-            .await?;
+            examine(store, scope, policy, now, &claim, hooks, &mut report).await?;
         }
         if !more {
             // The space is exhausted: there is nowhere to resume.
@@ -363,7 +382,7 @@ async fn examine(
     policy: &KnowledgeSpaceRetentionPolicy,
     now: AgentTimestampMillis,
     claim: &Claim,
-    before_delete: Option<&BeforeRetentionDelete<'_>>,
+    hooks: RetentionHooks<'_, '_>,
     report: &mut KnowledgeSpaceRetentionReport,
 ) -> ClaimResult<()> {
     // The window and the instant the claim entered the state it applies to. A
@@ -386,6 +405,9 @@ async fn examine(
             // transition count. One bounded read: the entry after the one
             // before it, and nothing after that.
             let count = claim.transition_count();
+            if let Some(between_reads) = hooks.between_reads {
+                between_reads(claim).await;
+            }
             let page = store
                 .transitions(
                     scope,
@@ -409,7 +431,7 @@ async fn examine(
         return Ok(());
     }
 
-    if let Some(before_delete) = before_delete {
+    if let Some(before_delete) = hooks.before_delete {
         before_delete(claim).await;
     }
     let request = ClaimDeleteRequest {

@@ -209,6 +209,16 @@ async fn retention_keeps_a_claim_that_moved_under_the_sweep() {
 }
 
 #[tokio::test]
+async fn retention_keeps_a_claim_that_moves_between_the_sweeps_two_reads() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::retention_leaves_a_claim_that_moves_between_its_two_reads(
+        &store,
+        ConformanceScopes::unique("retention-between-reads"),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn the_whole_contract_passes_as_one_suite() {
     // Exactly what a slice 2.4 backend runs, unchanged.
     let store = InMemoryKnowledgeGraphStore::new();

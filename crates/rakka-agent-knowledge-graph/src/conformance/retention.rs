@@ -14,6 +14,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -25,8 +26,8 @@ use crate::claim::{Claim, ClaimId, ClaimOperationId, ClaimTrustStatus};
 use crate::promotion::ClaimPromotionPolicy;
 use crate::retention::{
     discharge_knowledge_space_retention, discharge_knowledge_space_retention_with_hook,
-    KnowledgeSpaceRetentionPolicy, KnowledgeSpaceRetentionReport,
-    KNOWLEDGE_SPACE_RETENTION_DEFAULT_MAX_BATCH,
+    discharge_knowledge_space_retention_with_hooks, KnowledgeSpaceRetentionPolicy,
+    KnowledgeSpaceRetentionReport, RetentionHooks, KNOWLEDGE_SPACE_RETENTION_DEFAULT_MAX_BATCH,
 };
 use crate::scope::KnowledgeSpaceScope;
 use crate::store::{ClaimFilter, KnowledgeGraphStore};
@@ -476,4 +477,85 @@ pub async fn retention_leaves_a_claim_that_moved(
         .delete(scope, &replay)
         .await
         .expect("the sweep's derived delete is the one that applied");
+}
+
+/// A claim whose trust moves between the sweep's two reads of it is counted
+/// as moved and kept, and the sweep attempts no delete for it.
+///
+/// A claim that is neither a stub nor `Proposed` is read twice before it is
+/// judged: the query returns it with its transition count, and a second read
+/// returns the transition of that ordinal, which dates the state it rests in.
+/// A transition that lands between the two leaves a later entry behind the
+/// one the sweep asked for. The sweep sees that and stops there: it does not
+/// age the claim by a transition that is no longer its last, and it does not
+/// send a delete that the claim's new state would refuse.
+pub async fn retention_leaves_a_claim_that_moves_between_its_two_reads(
+    store: &dyn KnowledgeGraphStore,
+    scopes: ConformanceScopes,
+) {
+    let scope = &scopes.primary;
+    // Disputed at 10, and due as a disputed claim from 110. Retracted at 10
+    // too, under the sweep, and due as a retracted claim only from 510.
+    let claim = claim_resting_in(store, scope, "rm-between", ClaimTrustStatus::Disputed).await;
+    let policy = KnowledgeSpaceRetentionPolicy::retain_all()
+        .with_window(ClaimTrustStatus::Disputed, 100)
+        .with_window(ClaimTrustStatus::Retracted, 500);
+
+    let claim_id = claim.claim_id.clone();
+    let between_reads = |read: &Claim| -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let read_id = read.claim_id.clone();
+        Box::pin(async move {
+            store
+                .transition(
+                    scope,
+                    &transition_request(scope, &read_id, "retract", ClaimTrustStatus::Retracted),
+                    &ClaimPromotionPolicy::ungated(),
+                    AgentTimestampMillis::new(10),
+                )
+                .await
+                .expect("the retraction lands between the sweep's two reads");
+        })
+    };
+    let deletes_attempted = AtomicUsize::new(0);
+    let before_delete = |_: &Claim| -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        deletes_attempted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {})
+    };
+    let report = discharge_knowledge_space_retention_with_hooks(
+        store,
+        scope,
+        &policy,
+        AgentTimestampMillis::new(200),
+        None,
+        KNOWLEDGE_SPACE_RETENTION_DEFAULT_MAX_BATCH,
+        RetentionHooks {
+            between_reads: Some(&between_reads),
+            before_delete: Some(&before_delete),
+        },
+    )
+    .await
+    .expect("the sweep answers");
+    assert_eq!(
+        (report.examined, report.moved, report.deleted),
+        (1, 1, 0),
+        "the claim the sweep read as disputed and due had moved by its second read"
+    );
+    assert_eq!(
+        deletes_attempted.load(Ordering::SeqCst),
+        0,
+        "the sweep saw the claim had moved, and attempted no delete"
+    );
+    let kept = store
+        .get(scope, &claim_id)
+        .await
+        .expect("the read answers")
+        .expect("a claim that moved is kept");
+    assert_eq!(kept.trust(), ClaimTrustStatus::Retracted);
+
+    // A later pass judges it as it now is: retracted at 10, due from 510.
+    let report = full_pass(store, scope, &policy, 509).await;
+    assert_eq!((report.not_yet_due, report.deleted), (1, 0));
+    let report = full_pass(store, scope, &policy, 510).await;
+    assert_eq!(report.deleted, 1);
+    assert!(!exists(store, scope, &claim_id).await);
 }
