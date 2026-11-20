@@ -133,10 +133,12 @@ proposal on the record, or skipped the wind-down's wait:
 6. **A cancelling run whose proposal is rejected waits for its children
    too.** It skipped that wait. Specification 8.7 does not let a run
    project `Cancelled` over a child that has not reported.
-7. **Two settle-pass repairs,** each unreachable under this build alone.
-   `AgentRun::needs_decided_end` is for mixed builds (section 6).
+7. **Three settle-pass repairs,** each unreachable under this build
+   alone. `AgentRun::needs_decided_end` is for mixed builds (section 6).
    `AgentRunState::needs_answered_proposal_drop` ends a wind-down an
    earlier build left waiting for a refused proposal (section 7).
+   `AgentRun::needs_wind_down_fence` ends one it left holding a call it
+   never sent (section 8).
 8. **Records an earlier build ended are not repaired.** None is known.
    Each would need its own ruling: what an ended run does with an
    evaluation it cannot know was invoked, and with a park it never offered.
@@ -197,10 +199,92 @@ unanswered goes on waiting through settle passes that cannot reach the
 task, and is then accepted. With the journal condition removed, that test
 and five others across the crate fail.
 
-## 8. Tests
+## 8. The turn begun on a cancelled run, repaired
 
-`crates/rakka-agent/tests/run_end_waits.rs`, new, seventeen tests; four in
-`workflow_tool.rs`; two unit tests in `run.rs`.
+Added at the owner's word, after the first repair.
+
+An earlier build read a task's rejection against the run's status alone
+(section 4, the second arm). A cancelled run parked on an unknown outcome
+is `WaitingForReconciliation`, not `Cancelling`, so the rejection began a
+new turn on it, and the build's next step committed that turn's model
+call. A run that is winding down hands the sink only the kinds the fence
+exempts, so the call was never sent. No fence ran after it, so it was
+never cancelled. The wind-down waited for it for good: `WaitingForEffect`
+while the park was open, `Cancelling` once a person had answered it.
+Section 4 stops new ones. This repairs the ones that exist.
+
+**The repair is the fence the wind-down owed.**
+`AgentRun::needs_wind_down_fence` asks whether a run that is winding down
+and has not ended holds a call the fence would cancel: one never handed to
+the sink, of a kind the fence does not exempt. The settle pass then runs
+the fence and re-runs the disposition. The call is cancelled and gives
+back the attempts it reserved, a gate it waited behind is closed, and the
+run rests on its park, or ends as cancelled if the call was all it waited
+for.
+
+**Nothing is lost by it.** The call is one no flush would send: the flush
+and the fence read the same exemption. The question and the fence read one
+predicate too, so what is asked and what is done cannot drift apart.
+
+My calls:
+
+1. **It asks every run that is winding down, not only the record that arm
+   left.** It reads what the fence acts on, and not the turn or the phase.
+   So it also takes a record no build is known to write: a gated call
+   still `Pending` on a run that is winding down. The sweep of forged
+   records added for issue #133 asserted that record was left as it was,
+   on the ground that no wind-down leaves a call `Pending`. An earlier
+   build did leave one, so that assertion is changed: the call is
+   cancelled and its gate closed. A grant could not have released such a
+   call, because the flush would not send it.
+2. **The crank is not stopped.** A record caught between the earlier
+   build's two writes has the turn begun and no model call yet. This build
+   commits the call, as that build's next step did, and fences it in the
+   step after. Both tests of the repair go that way. One model call is
+   counted against the run's budget that was never made, as it was under
+   the earlier build.
+3. **No door is added.** A decision can reach a gated one of these before
+   the pass does, and is applied as it always was. Only a forged record
+   has a gate there.
+4. **The run ends as cancelled, on the turn that build began.** The turn
+   number and the rejection's feedback stay on the record.
+
+Two tests build the earlier build's record. The two writes of its arm are
+made on a record this build wrote, and this build's next step commits the
+model call by code the two share. Run under that build's sources, the same
+world leaves the same record but for two clock values.
+
+- With the park open: the call is cancelled, its attempts are given back,
+  the run rests on its park, a further pass writes nothing, and the park's
+  answer ends the run `Cancelled`. It fails without the repair.
+- With the park answered while the run is stuck: the step that fences the
+  call ends the run, and the run settles its budget with its task. The
+  record is put back as the earlier build left it, by the three fields the
+  repair wrote, because this build's settle pass will not leave it so.
+
+The earlier build's own two records, dumped under its sources, were also
+run through this build. Both end as these do. Those runs are not kept.
+
+Two more tests hold what the repair must not do. A waiting run that holds
+a claim append behind its gate, which the fence exempts, is at rest, and
+the append outlives the run's end. And the step that fences a call
+measures no turn.
+
+Nine breaks of the repair were each run against the whole crate. Eight
+are caught, each by a named test: the repair removed, either condition of
+its question dropped, the fence's exemption ignored, the disposition not
+re-run, the end's exchanges not owed, and the question left out of either
+of the settle loop's two lists. The ninth cancels the call and leaves its
+gate to the repair of issue #133, one step later in the same pass. No test
+tells that from the fence closing it. Two of the eight survived the first
+tests, and the two tests of the last paragraph were written for them.
+
+## 9. Tests
+
+`crates/rakka-agent/tests/run_end_waits.rs`, new, twenty tests; four in
+`workflow_tool.rs`; two unit tests in `run.rs`; one more in
+`wind_down_fence.rs`, where one expectation of the forged sweep changed
+(section 8, call 1).
 
 - An accepted run waits for the evaluation it sent, takes the dispatcher's
   cancellation, and ends `Completed` (#172). It takes the evaluation's own
@@ -227,23 +311,27 @@ and five others across the crate fail.
 - A run that holds nothing, and one that holds only a call it never sent,
   end at once, and their record is as it was.
 - A waiting run an older build settled is ended by the next settle pass.
+- The two stuck records of sections 7 and 8 are repaired, and what each
+  repair must leave alone is left alone.
 - Unit: which reasons are decided ends; and the three end sites no whole
   run reaches easily (a refusal, an undecodable decision, a top-up
   answered with nothing) each wait.
 
-Of the twenty-one whole-run tests, seventeen fail on `main`: the
-stuck-record test of section 7 joins the sixteen, and its guard joins the
-three that pass there. The stuck-record test fails on `main` at its
-first step, which is the refusal `main` does not handle; it failed on this
-branch, at the repair's own assertion, until the repair was written. The three that
-pass there hold what must not change: a run that holds nothing, one that
+Of the twenty-four whole-run tests, twenty fail on `main`. The three
+stuck-record tests of sections 7 and 8 fail there at their first step,
+which is the answer `main` mishandles; each failed on this branch, at its
+repair's own assertion, until the repair was written. The four that pass
+on `main` hold what must not change: a run that holds nothing, one that
 holds only a call it never sent, and one that holds only a claim append
-each end at once. The two unit tests name functions `main` does not have.
+each end at once, and a cancelled run whose proposal is unanswered goes on
+waiting for it. In `wind_down_fence.rs` the new test and the sweep's
+changed expectation fail on `main` too. The two unit tests name functions
+`main` does not have.
 
 Nine breaks of the review's fixes and of the sites it found untested were
 each run, and each is caught by one test.
 
-## 9. The review
+## 10. The review
 
 A fresh reviewer read the first commit, with probes and twenty-two breaks
 of its own. It found:
@@ -271,10 +359,10 @@ A third reviewer read the repair. It found it sound: a run's pending
 exchange leaves the journal only by being settled, in the transition that
 applies its answer; the record the test rebuilds is byte for byte the one
 `main` leaves; and the repair writes once. It corrected two statements:
-how many tests the journal condition holds, and what the record of
-section 10's first item reports.
+how many tests the journal condition holds, and what the record that
+section 8 now repairs reports.
 
-## 10. Not done
+## 11. Not done
 
 - Records already ended in one of these states (call 8).
 - A run parked on an unknown outcome for a completed task waits for a
@@ -299,9 +387,6 @@ section 10's first item reports.
 - Two leads from the second review, read and not run, both on `main`
   already: a top-up grant sets a cancelled run parked on a top-up back to
   `Running`; and a run out of budget with children out never chases them.
-- **A cancelled run on which an earlier build began a new turn is not
-  repaired** (section 4, the second arm). It holds that turn's model call,
-  never sent. It is `WaitingForEffect` until its park is answered and
-  `Cancelling` after, and does not end. A further `Cancel` cancels the call
-  and ends the run; the third review ran both. I had not listed this
-  beside the stuck wind-down, and should have.
+- What this build's step does to a record caught between the earlier
+  build's two writes (section 8, call 2) when the turn it commits finds
+  the run's budget spent was not run.

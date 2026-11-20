@@ -1094,7 +1094,7 @@ impl AgentLoopState {
         let mut fenced_sends = Vec::new();
         let mut fenced_starts = Vec::new();
         for effect in &mut self.effects {
-            if effect.is_pending() && !effect.kind().exempt_from_wind_down_fence() {
+            if fenced_by_wind_down(effect) {
                 effect.status = crate::effect::AgentRunEffectStatus::Cancelled;
                 self.budget.settle_effect(effect.max_attempts, 0);
                 match effect.kind() {
@@ -2225,9 +2225,27 @@ impl AgentLoopState {
         self.proposal = None;
     }
 
+    /// Whether the state holds a call [`Self::fence_unsent_effects`] would
+    /// cancel: one that was never handed to the sink, of a kind the
+    /// wind-down fence does not exempt.
+    ///
+    /// The fence and this question read one predicate, so what is asked and
+    /// what is done cannot drift apart.
+    pub(crate) fn holds_unsent_call_the_fence_cancels(&self) -> bool {
+        self.effects.iter().any(fenced_by_wind_down)
+    }
+
     pub(crate) fn set_accepted_result(&mut self, result: AgentAcceptedResult) {
         self.accepted_result = Some(Box::new(result));
     }
+}
+
+/// Whether the wind-down fence cancels `effect`: it is `Pending`, which the
+/// flush ordering guarantees was never handed to the sink, and its kind is
+/// not one the fence exempts
+/// ([`crate::effect::AgentRunEffectKind::exempt_from_wind_down_fence`]).
+fn fenced_by_wind_down(effect: &AgentRunEffect) -> bool {
+    effect.is_pending() && !effect.kind().exempt_from_wind_down_fence()
 }
 
 impl VersionedAgentRecord for AgentLoopState {

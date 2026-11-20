@@ -894,6 +894,35 @@ impl AgentRun {
             && !self.loop_state.holds_call_an_end_waits_for()
     }
 
+    /// Whether the record is winding down, has not ended, and holds a call
+    /// it committed and never sent, which the wind-down fence cancels
+    /// ([`AgentLoopState::holds_unsent_call_the_fence_cancels`]).
+    ///
+    /// Every transition that begins a wind-down runs the fence, and a run
+    /// that is winding down commits no such call afterwards, so under this
+    /// binary the shape is unreachable. A binary before issues #123, #172
+    /// and #173 leaves it. It read a task's rejection against the status
+    /// alone, so a cancelled run parked on an unknown outcome, which is
+    /// `WaitingForReconciliation` and not `Cancelling`, began a new turn,
+    /// and the next step committed that turn's model call. No fence ran
+    /// after it. The flush hands a winding-down run's calls to the sink only
+    /// for the kinds the fence exempts, so the call stayed `Pending` for
+    /// good, and the wind-down waited for it for good: through its park, and
+    /// `Cancelling` after the park was answered.
+    ///
+    /// The settle pass runs the fence on the first pass that touches such a
+    /// record, and re-runs the disposition. Nothing is lost by it: the call
+    /// is one no flush would ever send.
+    ///
+    /// A live run that is not winding down is never asked: an unsent call is
+    /// its next dispatch, or waits behind its gate. Nor is a run that has
+    /// ended.
+    pub(crate) fn needs_wind_down_fence(&self) -> bool {
+        !self.status.is_terminal()
+            && self.winding_down()
+            && self.loop_state.holds_unsent_call_the_fence_cancels()
+    }
+
     /// Whether the record is on an approval or authorization wait that no
     /// waiting gate of that kind holds.
     ///
@@ -3116,6 +3145,17 @@ fn advance_once(
         // binary, and let the disposition end the wind-down if that was all
         // it waited for ([`AgentRunState::needs_answered_proposal_drop`]).
         state.run_mut()?.loop_state.clear_answered_proposal();
+        settle_run_disposition(state, now)?;
+        return owed_run_exchanges(state, now);
+    }
+    if run.needs_wind_down_fence() {
+        // A record a binary before issues #123, #172 and #173 left winding
+        // down with a call it committed after the wind-down began, and never
+        // sent: run the fence the wind-down owed, which cancels the call and
+        // closes its gate if it had one, and let the disposition end the
+        // wind-down if that was all it waited for
+        // ([`AgentRun::needs_wind_down_fence`]).
+        fence_unsent(state.run_mut()?, &scope, false, now);
         settle_run_disposition(state, now)?;
         return owed_run_exchanges(state, now);
     }
@@ -9448,7 +9488,9 @@ where
             // binary left waiting with no call out
             // ([`AgentRun::needs_decided_end`]), and a wind-down an older
             // binary left waiting for a proposal its task had answered
-            // ([`AgentRunState::needs_answered_proposal_drop`]).
+            // ([`AgentRunState::needs_answered_proposal_drop`]), and a call
+            // an older binary committed on a run that was winding down, and
+            // never sent ([`AgentRun::needs_wind_down_fence`]).
             let can_advance = self.state()?.needs_answered_proposal_drop()
                 || self.state()?.run().is_some_and(|run| {
                     run.can_advance()
@@ -9457,6 +9499,7 @@ where
                         || run.needs_unpark()
                         || run.needs_gate_wait_release()
                         || run.needs_decided_end()
+                        || run.needs_wind_down_fence()
                         || run.needs_gate_close()
                 });
             if !can_advance {
@@ -9486,6 +9529,7 @@ where
                         || run.needs_unpark()
                         || run.needs_gate_wait_release()
                         || run.needs_decided_end()
+                        || run.needs_wind_down_fence()
                         || run.needs_gate_close()
                         || run.needs_turn_rest()
                 });
