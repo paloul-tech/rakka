@@ -814,6 +814,7 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   - An agent-owned continuous goal whose own run is granted all of a bounded dimension cannot pay for an epoch while that run is out. Its wakes were admitted into epochs that never ran. They are now parked until that run returns its budget. Declaring a per-run allocation on the definition leaves room for epochs.
   - **An epoch's result that arrives after its wake was released by hand can now admit a parked occurrence.** That result returns the budget the occurrence waited for. Before, such a result promoted nothing.
   - The policy is asked where an occurrence arrives or a place comes free: a delivery, an epoch's result, an operator's release. A resume that leaves the ledger short admits nothing, and the next delivery or release asks the policy.
+  - A parked occurrence is retried by a delivery, an epoch's result, an operator's release and a resume. Budget that comes back another way, from the goal's own run on an agent-owned continuous goal, does not retry it; the next of those does.
 
   **API.** `AgentWakeControllerState` gains `admit_within`, `promote_admittable_within` and `release_within`, which take the dimension in which the goal's ledger cannot pay, and `holds_admittable`. `admit`, `promote_admittable` and `release` are unchanged and mean that the ledger can pay.
 

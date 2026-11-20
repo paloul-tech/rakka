@@ -136,6 +136,16 @@ admits it into an epoch with no budget, which is the defect this fixes.
 - An operator's resume of the gate, and a goal's activation, each promote
   nothing the goal cannot pay for (call 5).
 
+All eight fail on `main`'s `task.rs` and `wake.rs`. Fourteen breaks of the
+fix were then run, one at a time, against this file, the four tests of
+`waiting_end_task_side.rs` and the controller's unit tests: the controller
+never told, the policy never asked, every shortfall read as permanent, the
+policy asked whether or not an occurrence waits, the late result retrying
+nothing, the ledger not read again after a promotion, each of the five
+task-side sites passing "can pay", and the controller ignoring what it is
+told on admission, on promotion and on release, or charging the window
+first. Each is caught by a test.
+
 Two unit tests in `wake.rs` hold the controller's side: a ledger that cannot
 pay defers the occurrence and charges no window, and a release told so
 promotes nothing.
@@ -156,6 +166,13 @@ reverse.**
 
 - Records an earlier build left with a stuck epoch (call 9).
 - The policy is not asked inside a resume (call 5).
+- **Budget that comes back from the goal's own run retries nothing.** An
+  agent-owned continuous goal has a run of its own, whose budget is a child
+  of the same ledger. When that run returns budget and the task goes on (a
+  refused or failed generation), the transition is the ledger's, not one of
+  the six above, and it promotes nothing. An occurrence parked for that
+  budget waits for the next delivery, result, release or resume. I left it:
+  the next generation of that run usually takes the budget straight back.
 - `open_child` still narrows to zero without refusing. Admission no longer
   asks it for an epoch it cannot pay for, and the task's own run is refused
   before it is asked.
