@@ -43,10 +43,9 @@ handles both cases with the one question.
 
 An occurrence is admitted only when the goal's ledger can pay for its epoch.
 
-- **The question.** The ledger cannot pay where the goal has nothing left in
-  a dimension the epoch's run works in and the wake policy would have granted
-  some of. The epoch's grant would be empty there, and its task could never
-  escrow a run.
+- **The question.** The ledger cannot pay where the goal itself has nothing
+  left in a dimension the epoch's run works in. The epoch's grant would be
+  empty there, and its task could never escrow a run.
 - **An occurrence the goal cannot pay for is parked**, as one the goal window
   cannot pay for already is: disposition `Deferred`, naming the dimension. No
   epoch is created, no budget is debited, the goal window is not charged, and
@@ -195,9 +194,10 @@ The whole crate passes: 1,827 tests.
 **Existing tests whose worlds changed.** Thirteen tests in
 `wake_coalescing.rs`, `wake_fencing.rs`, `wake_scanner.rs` and
 `goal_window.rs` failed with the fix: an admission came back `Deferred`, the
-first in the three `wake_*` files and the second in `goal_window.rs`. Each admits occurrences and never runs their epochs. Their goal
-allowed three loop iterations, and either the goal's own run held all three
-(the agent-owned fixture) or the first epoch did. So every epoch those tests
+first in the three `wake_*` files and the second in `goal_window.rs`. Each
+admits occurrences and never runs their epochs. Their goal allowed three loop
+iterations, and either the goal's own run held all three (the agent-owned
+fixture) or the first epoch did. So every epoch those tests
 admitted was one that could never run. Their subjects are coalescing,
 fencing, the scanner and the goal window, not budgets. The agent-owned
 fixture and the windowed test now give the goal a ledger with no ceiling
