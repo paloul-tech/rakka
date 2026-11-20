@@ -7552,6 +7552,15 @@ fn owed_child_reports(
 /// settles and returns the epoch's escrow, releases the wake, and owes the
 /// promoted occurrence's epoch creation — all in this one accepted
 /// transition.
+///
+/// A control task that has ended still takes the result, as a settlement
+/// alone (issue #181). The epoch it admitted went on to its own end, and its
+/// result is the only thing that returns its budget: refused, the ended
+/// goal's ledger would hold that budget out for good and never count what the
+/// epoch spent. The budget is settled and returned and the wake's place is
+/// released. No status moves, nothing is promoted, and the outcome is not
+/// counted toward a failure streak or a stagnation the goal can no longer
+/// act on.
 fn apply_epoch_result(
     state: &mut AgentTaskState,
     envelope: &AgentExchangeEnvelope,
@@ -7606,7 +7615,15 @@ fn apply_epoch_result(
         Option<crate::wake::AgentWakeRelease>,
         Vec<AgentExchangeEnvelope>,
     )> {
-        let task = continuous_task_mut(state)?;
+        let ended = state
+            .task
+            .as_ref()
+            .is_some_and(|task| task.status.is_terminal() && task.goal_mode.is_continuous());
+        let task = if ended {
+            state.task_mut()?
+        } else {
+            continuous_task_mut(state)?
+        };
 
         // Settle and return the epoch's escrow, idempotently: a child the
         // ledger no longer knows was settled and returned by an earlier
@@ -7622,6 +7639,41 @@ fn apply_epoch_result(
             Err(error) => return Err(error.into()),
         }
 
+        let outcome_class = match result.status {
+            AgentTaskStatus::Completed => AgentEpochOutcomeClass::Completed,
+            AgentTaskStatus::Failed => AgentEpochOutcomeClass::Failed,
+            // Cancellation — and, defensively, anything that is not a
+            // terminal outcome — neither resets nor grows the streak.
+            _ => AgentEpochOutcomeClass::Cancelled,
+        };
+        if ended {
+            // The settlement above is all an ended goal takes from its
+            // epoch. The place is released without a promotion; a wake that
+            // is no longer active was released by hand, as below.
+            let release = match task
+                .wake_controller
+                .as_mut()
+                .map(|controller| controller.release_ended(&result.wake))
+            {
+                Some(Ok(release)) => Some(release),
+                Some(Err(AgentWakeError::NotActive { .. })) | None => None,
+                Some(Err(error)) => return Err(error.into()),
+            };
+            // The record only shrinks here but for one history entry, and an
+            // ended record has no growth to reserve for.
+            task.check_bounds(0)?;
+            state.updated_at = now;
+            record_wake_history_with_digest(
+                state,
+                AgentTaskHistoryKind::EpochSettled,
+                envelope.operation_id(),
+                format!("{} {}", outcome_class.as_label(), result.wake),
+                result.result_digest.clone(),
+                now,
+            );
+            return Ok((release, Vec::new()));
+        }
+
         // Account the epoch's outcome *before* the release attempt, so the
         // raced-CompleteWakeOccurrence path — where the release answers
         // NotActive — still counts a failure exactly as its settlement still
@@ -7634,13 +7686,6 @@ fn apply_epoch_result(
             .wake_policy
             .policy()
             .clone();
-        let outcome_class = match result.status {
-            AgentTaskStatus::Completed => AgentEpochOutcomeClass::Completed,
-            AgentTaskStatus::Failed => AgentEpochOutcomeClass::Failed,
-            // Cancellation — and, defensively, anything that is not a
-            // terminal outcome — neither resets nor grows the streak.
-            _ => AgentEpochOutcomeClass::Cancelled,
-        };
         // The stagnation facts, read before the controller borrow: the
         // detector always accounts, but an action fires only against a goal
         // that is authorized or parked — the exhaustion executor's guards.

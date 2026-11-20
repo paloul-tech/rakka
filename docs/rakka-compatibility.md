@@ -822,6 +822,25 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Not repaired.** An epoch an earlier build created with no budget still holds its wake.
 
+- Issue #181 ("a control task ended over an epoch refuses the epoch's result") changes what a continuous goal's control task does with an epoch's result once it has ended. **No durable field, status, disposition, error code or decision kind is added.**
+
+  **What was wrong.** A control task can end while an epoch it admitted is still out: a person submits its result, or a policy ends the goal. The epoch goes on to its own end and sends its `EpochResult`. The ended control task refused it `task-terminal`, and a refusal settles the exchange for good. Its ledger kept that epoch's budget out, it counted none of what the epoch spent, and its wake controller kept showing the occurrence as active.
+
+  | An epoch's result reaches a control task that has ended | Before | Now |
+  |---|---|---|
+  | The task is a continuous goal's control task | Refused `task-terminal` | Accepted as a settlement: the epoch's budget is settled and returned, the wake's place is released, and one `epoch-settled` history entry is recorded |
+  | The task is not one | Refused `task-terminal` | Unchanged |
+
+  **What the settlement does not do.** It moves no status. It promotes no parked occurrence into the freed place, though the gate of a control task a person completed is still open. It does not count the epoch's outcome toward a failure streak or a stagnation.
+
+  **What a deployment sees.** A control task that ended over an epoch now closes its ledger when that epoch's result comes, and its consumption then includes the epoch's. Before that result it still reports one child out and one active occurrence, which is true: the epoch is still running. The end of a goal does not cancel its epochs.
+
+  **API.** `AgentWakeControllerState` gains `release_ended`, a release that promotes nothing.
+
+  **Mixed builds and rollback.** An earlier build refuses the result as before.
+
+  **Not repaired.** A control task an earlier build left with a refused result keeps that child out: the result is not sent again.
+
 Run the default compatibility matrix:
 
 ```sh

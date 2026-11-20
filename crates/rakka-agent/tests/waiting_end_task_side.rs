@@ -678,3 +678,100 @@ async fn a_goal_cancelled_over_a_parked_accepted_epoch_ends_when_the_park_is_ans
     );
     assert_eq!(world.controller().await, (1, 1, 0, 0));
 }
+
+/// A person's result for the goal's control task, submitted as an operator.
+fn a_persons_result() -> AgentTaskEntityCommand {
+    AgentTaskEntityCommand::SubmitHumanResult {
+        operation_id: rakka_agent::human_result_operation_id(
+            &common::tenant(),
+            task_scope().task(),
+            "done",
+        )
+        .expect("the operation id derives"),
+        submission: Box::new(rakka_agent::AgentHumanResultSubmission {
+            principal: "user:operator".to_string(),
+            definition_id: common::task_definition_id(),
+            definition_version: AgentRevisionNumber::INITIAL,
+            result_schema: common::schema("ticket-result"),
+            content: AgentTaskContent::inline(serde_json::json!({ "answer": "closed by hand" }))
+                .expect("the content is inline-bounded"),
+            evidence: Vec::new(),
+            causation_id: rakka_agent_workflow::AgentCausationId::new("cause-done"),
+            submitted_at: rakka_agent_workflow::AgentTimestampMillis::new(0),
+        }),
+    }
+}
+
+/// The reply the epoch task holds to the result it sent its goal: the
+/// exchange's status, as the journal records it.
+async fn epoch_results_reply(fx: &Fixture, epoch: &AgentTaskScope) -> Option<String> {
+    let state = load_agent_task_state(&fx.tasks, epoch, &AgentSchemaPolicy::default())
+        .await
+        .expect("the epoch state loads")
+        .expect("the epoch exists");
+    let journal = serde_json::to_value(&state).expect("the state serializes")["journal"].take();
+    journal["settled"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["kind"] == "epoch-result")
+        .map(|entry| match &entry["result"]["status"] {
+            serde_json::Value::String(status) => status.clone(),
+            other => other.to_string(),
+        })
+}
+
+/// A person completes the goal's control task while an accepted epoch is
+/// parked on an unknown outcome (issue #181). The control task is ended, with
+/// that epoch's budget still out. When the park is answered and the epoch's
+/// result comes, the ended control task still takes it as a settlement: the
+/// budget returns, what the epoch spent is counted, and the wake's place is
+/// released. No status moves.
+#[tokio::test]
+async fn an_ended_goal_still_settles_the_result_of_a_parked_epoch() {
+    let world = accepted_epoch_with_an_evaluation_out(wake_policy()).await;
+    world.park_on_the_evaluation().await;
+
+    world
+        .fx
+        .apply_task_command(a_persons_result())
+        .await
+        .expect("the person's result applies");
+    settle_all(&world.fx, &world.epoch, &world.run).await;
+    assert_eq!(
+        task_at(&world.fx, &task_scope()).await,
+        Some((AgentTaskStatus::Completed, 1)),
+        "the control task is ended over the epoch's budget"
+    );
+    assert_eq!(world.controller().await, (1, 0, 1, 0));
+
+    world.answer_the_park().await;
+    world
+        .fx
+        .pump_epoch(&world.epoch, &world.run)
+        .await
+        .expect("the epoch converges");
+
+    assert_eq!(
+        epoch_results_reply(&world.fx, &world.epoch)
+            .await
+            .as_deref(),
+        Some("accepted"),
+        "the ended control task took the epoch's result"
+    );
+    assert_eq!(
+        task_at(&world.fx, &task_scope()).await,
+        Some((AgentTaskStatus::Completed, 0)),
+        "the budget is back, and the control task's status did not move"
+    );
+    assert_eq!(
+        world.goal_attempts_spent().await,
+        2,
+        "what the epoch spent is counted"
+    );
+    assert_eq!(
+        world.controller().await,
+        (1, 1, 0, 0),
+        "the wake's place is released"
+    );
+}
