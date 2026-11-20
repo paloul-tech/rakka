@@ -669,6 +669,39 @@ async fn a_cancelled_row_on_a_live_run_is_parked() {
     );
 }
 
+/// Issue #182: the fence's own cancellation, replayed from the row. A worker
+/// cancelled the ticket at the wind-down fence and was lost before it told
+/// the run. The next claim finds the cancelled row and tells the run
+/// `Cancelled` with the attempts the row counts: none, for a ticket that was
+/// never attempted. A run told by the replay records what a run told by the
+/// fence does.
+#[tokio::test]
+async fn a_fence_cancelled_row_is_replayed_with_the_attempts_the_row_counts() {
+    let (fx, _effect) = a_registered_ticket_with_a_finished_row(
+        &idempotent(3),
+        None,
+        OutboxStatus::Cancelled,
+        "cancelled",
+    )
+    .await;
+    cancel_the_run(&fx).await;
+
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    assert_eq!((pass.invoked, pass.delivered), (0, 1));
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.attempts),
+        (AgentRunEffectStatus::Cancelled, 0),
+        "the run is told the ticket was cancelled, with no attempt made"
+    );
+}
+
 /// An operator cancels the run, which stays `Cancelling` on its ready effect.
 async fn cancel_the_run(fx: &AuthorityFixture) {
     let mut run = fx.fx.run();

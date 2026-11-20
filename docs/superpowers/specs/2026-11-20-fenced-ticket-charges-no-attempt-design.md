@@ -75,7 +75,23 @@ call ends `Cancelled` with no attempt made, the run's spent effect attempts do
 not move, the reservation is given back, and the tool is never invoked. It
 fails on the commit below this one, with one attempt made and one more spent.
 
+`a_fence_cancelled_row_is_replayed_with_the_attempts_the_row_counts` in
+`dispatch_owed_outcome.rs` holds the replay: a row a lost worker left
+`Cancelled`, on a run that is winding down, is told `Cancelled` with no
+attempt made.
+
+Three breaks were run. The fence reporting the attempt it was about to make
+is caught by the first test, and the replay reporting one more than the row
+counts by the second. The whole crate passes: 1,827 tests.
+
+**One thing no test holds.** The third break made the read-only cancellation
+that follows a started attempt report one attempt fewer. It survived the
+whole crate. That code is not changed here, and section 3 says so, but
+nothing in the crate holds the number it reports.
+
 ## 7. Not done
 
 - Records already charged (call 4).
 - The double fault of call 3.
+- A test of the attempt number the two cancellations after a started attempt
+  report (section 6).
