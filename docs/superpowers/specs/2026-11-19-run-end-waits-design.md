@@ -538,4 +538,4 @@ code that decides it, and neither is changed.
 spent a budget dimension still admits its next wake. The epoch is created
 with nothing in that dimension, can never be assigned, and holds the wake
 for good; the goal's exhaustion policy is never asked. It is reproduced
-with no waiting run. A draft is in `tmp/`, not filed.
+with no waiting run. Filed as #179.
