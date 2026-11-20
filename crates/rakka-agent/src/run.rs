@@ -1197,6 +1197,41 @@ impl AgentRunState {
         self.run.as_ref().map(|run| &run.loop_state)
     }
 
+    /// Whether the run is winding down and still holds a proposal its task
+    /// has answered.
+    ///
+    /// A wind-down waits for a proposal's answer
+    /// ([`AgentLoopState::awaits_settlement`]), and every transition that
+    /// takes an answer on a run that goes on drops the proposal from the
+    /// record. Under this binary the shape is therefore unreachable. A
+    /// binary before issues #123, #172 and #173 leaves it: it took the
+    /// task's refusal of a proposal, made because the task was being
+    /// cancelled, as the run's own cancellation, and left the refused
+    /// proposal where it was. Its wind-down then waited for an answer that
+    /// had come, for good, and the task's cancellation never completed.
+    ///
+    /// The run's status and reason cannot tell that record from a cancelled
+    /// run whose proposal is still on its way, which must go on waiting: an
+    /// acceptance still wins the race with a cancel. The journal can. A
+    /// proposal is recorded in the transition that owes its exchange, and
+    /// the exchange stays owed until its answer settles it, so a proposal
+    /// whose exchange the journal no longer owes has been answered.
+    ///
+    /// The settle pass drops such a proposal on the first pass that touches
+    /// the record, and re-runs the disposition, which ends the wind-down if
+    /// the proposal was all it waited for.
+    pub(crate) fn needs_answered_proposal_drop(&self) -> bool {
+        self.run.as_ref().is_some_and(|run| {
+            !run.status.is_terminal()
+                && run.winding_down()
+                && run.loop_state.proposal().is_some_and(|proposal| {
+                    self.journal
+                        .pending_exchange(&proposal.proposal_id)
+                        .is_none()
+                })
+        })
+    }
+
     /// The bounded log of resolved operations.
     #[must_use]
     pub const fn applied_operations(&self) -> &AgentRunOperationLog {
@@ -3071,6 +3106,16 @@ fn advance_once(
         // And a record whose end was decided, which an older binary left
         // waiting with no call out: the same settle ends it
         // ([`AgentRun::needs_decided_end`]).
+        settle_run_disposition(state, now)?;
+        return owed_run_exchanges(state, now);
+    }
+    if state.needs_answered_proposal_drop() {
+        // A record a binary before issues #123, #172 and #173 left winding
+        // down over a proposal its task had already answered: drop the
+        // proposal, as the transition that takes the answer does under this
+        // binary, and let the disposition end the wind-down if that was all
+        // it waited for ([`AgentRunState::needs_answered_proposal_drop`]).
+        state.run_mut()?.loop_state.clear_answered_proposal();
         settle_run_disposition(state, now)?;
         return owed_run_exchanges(state, now);
     }
@@ -9401,16 +9446,19 @@ where
             // before issue #133 left waiting with nothing to gate
             // ([`AgentRun::needs_gate_close`]), and a decided end an older
             // binary left waiting with no call out
-            // ([`AgentRun::needs_decided_end`]).
-            let can_advance = self.state()?.run().is_some_and(|run| {
-                run.can_advance()
-                    || run.needs_turn_rest()
-                    || run.needs_park_repair()
-                    || run.needs_unpark()
-                    || run.needs_gate_wait_release()
-                    || run.needs_decided_end()
-                    || run.needs_gate_close()
-            });
+            // ([`AgentRun::needs_decided_end`]), and a wind-down an older
+            // binary left waiting for a proposal its task had answered
+            // ([`AgentRunState::needs_answered_proposal_drop`]).
+            let can_advance = self.state()?.needs_answered_proposal_drop()
+                || self.state()?.run().is_some_and(|run| {
+                    run.can_advance()
+                        || run.needs_turn_rest()
+                        || run.needs_park_repair()
+                        || run.needs_unpark()
+                        || run.needs_gate_wait_release()
+                        || run.needs_decided_end()
+                        || run.needs_gate_close()
+                });
             if !can_advance {
                 break;
             }
@@ -9432,14 +9480,15 @@ where
             // A repair step commits without folding the turn, so it is not
             // the step to measure: the fold that follows it is. Measuring
             // both counted a record healed at `RecordingTurn` twice.
-            let repairs = self.state()?.run().is_some_and(|run| {
-                run.needs_park_repair()
-                    || run.needs_unpark()
-                    || run.needs_gate_wait_release()
-                    || run.needs_decided_end()
-                    || run.needs_gate_close()
-                    || run.needs_turn_rest()
-            });
+            let repairs = self.state()?.needs_answered_proposal_drop()
+                || self.state()?.run().is_some_and(|run| {
+                    run.needs_park_repair()
+                        || run.needs_unpark()
+                        || run.needs_gate_wait_release()
+                        || run.needs_decided_end()
+                        || run.needs_gate_close()
+                        || run.needs_turn_rest()
+                });
             let turn_measurements = (!repairs && phase == AgentLoopPhase::RecordingTurn.as_label())
                 .then(|| {
                     self.state().ok().and_then(|state| {

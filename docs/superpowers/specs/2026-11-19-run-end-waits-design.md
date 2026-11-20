@@ -133,8 +133,10 @@ proposal on the record, or skipped the wind-down's wait:
 6. **A cancelling run whose proposal is rejected waits for its children
    too.** It skipped that wait. Specification 8.7 does not let a run
    project `Cancelled` over a child that has not reported.
-7. **One settle-pass repair,** `AgentRun::needs_decided_end`, for mixed
-   builds (section 6). It is unreachable under this build alone.
+7. **Two settle-pass repairs,** each unreachable under this build alone.
+   `AgentRun::needs_decided_end` is for mixed builds (section 6).
+   `AgentRunState::needs_answered_proposal_drop` ends a wind-down an
+   earlier build left waiting for a refused proposal (section 7).
 8. **Records an earlier build ended are not repaired.** None is known.
    Each would need its own ruling: what an ended run does with an
    evaluation it cannot know was invoked, and with a park it never offered.
@@ -161,9 +163,41 @@ one of those, this build's next settle pass ends it
 run stayed `Cancelling` under this build too, because a settle pass does
 not otherwise re-run the disposition of a run with nothing out.
 
-## 7. Tests
+## 7. The stuck wind-down, repaired
 
-`crates/rakka-agent/tests/run_end_waits.rs`, new, fifteen tests; four in
+Added at the owner's word, after the pull request was open.
+
+An earlier build took the task's refusal of a proposal, made because the
+task was being cancelled, as the run's own cancellation, and left the
+refused proposal on the record. Its wind-down waited for that proposal for
+good, and the task's cancellation never completed. Section 4 stops new
+ones. This repairs the ones that exist.
+
+**The record alone does not say the proposal was answered.** Its status is
+`Cancelling` and its reason a cancellation. So are those of a cancelled
+run whose proposal is still on its way, and that run must go on waiting:
+an acceptance still wins the race with a cancel. The reason's text does
+not settle it either. Where the task's own cancel reached the run before
+the refusal did, the reason is the canceller's, not the refusal's code.
+
+**The run's exchange journal does.** A proposal is recorded in the
+transition that owes its exchange, and the exchange stays owed, and
+re-driven, until its answer settles it. Nothing withdraws a run's
+proposal. So a proposal whose exchange the journal no longer owes has been
+answered. `AgentRunState::needs_answered_proposal_drop` asks that of a run
+that is winding down, and the settle pass drops the proposal and re-runs
+the disposition.
+
+Two tests. One builds the earlier build's record and sees the run end
+`Cancelled` and the task's cancellation complete; it fails without the
+repair. The other holds the condition: a cancelled run whose proposal is
+unanswered goes on waiting through settle passes that cannot reach the
+task, and is then accepted. With the journal condition removed, that test
+and two others fail.
+
+## 8. Tests
+
+`crates/rakka-agent/tests/run_end_waits.rs`, new, seventeen tests; four in
 `workflow_tool.rs`; two unit tests in `run.rs`.
 
 - An accepted run waits for the evaluation it sent, takes the dispatcher's
@@ -195,7 +229,9 @@ not otherwise re-run the disposition of a run with nothing out.
   run reaches easily (a refusal, an undecodable decision, a top-up
   answered with nothing) each wait.
 
-Of the nineteen whole-run tests, sixteen fail on `main`. The three that
+Of the twenty-one whole-run tests, seventeen fail on `main`: the
+stuck-record test of section 7 joins the sixteen, and its guard joins the
+three that pass there. The three that
 pass there hold what must not change: a run that holds nothing, one that
 holds only a call it never sent, and one that holds only a claim append
 each end at once. The two unit tests name functions `main` does not have.
@@ -203,7 +239,7 @@ each end at once. The two unit tests name functions `main` does not have.
 Nine breaks of the review's fixes and of the sites it found untested were
 each run, and each is caught by one test.
 
-## 8. The review
+## 9. The review
 
 A fresh reviewer read the first commit, with probes and twenty-two breaks
 of its own. It found:
@@ -225,9 +261,9 @@ of its own. It found:
 
 A second reviewer read the second commit. It found no defect in the four
 code changes and confirmed the test counts on `main`. It corrected four
-statements, and ran the last item of section 9.
+statements, and ran the record that section 7 now repairs.
 
-## 9. Not done
+## 10. Not done
 
 - Records already ended in one of these states (call 8).
 - A run parked on an unknown outcome for a completed task waits for a
@@ -252,8 +288,8 @@ statements, and ran the last item of section 9.
 - Two leads from the second review, read and not run, both on `main`
   already: a top-up grant sets a cancelled run parked on a top-up back to
   `Running`; and a run out of budget with children out never chases them.
-- **A run an earlier build left `Cancelling` over a refused proposal is not
-  ended.** The proposal is still on its record, and nothing there says it
-  was answered. The second review ran it. Where the recorded reason is the
-  task's own cancellation the answer is certain, so a repair is possible;
-  I did not add one unreviewed. It is the owner's to ask for.
+- **A cancelled run on which an earlier build began a new turn is not
+  repaired** (section 4, the second arm). It holds that turn's model call,
+  never sent, and stays `Cancelling`. The first review ran it. By reading,
+  a further `Cancel` fences the call and ends the run; I have not run that.
+  I had not listed this beside the stuck wind-down, and should have.

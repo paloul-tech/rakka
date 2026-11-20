@@ -1187,16 +1187,7 @@ async fn a_waiting_run_an_older_build_settled_is_ended_by_the_next_settle_pass()
 async fn a_proposal_refused_for_the_tasks_cancellation_does_not_hold_the_wind_down() {
     let (fx, _sink) = proposing_goal_world().await;
     propose_out_of_reach(&fx).await;
-    fx.apply_task_command(rakka_agent::AgentTaskEntityCommand::Cancel {
-        operation_id: AgentOperationId::new(
-            AgentOperationKind::Cancellation,
-            [TENANT, task_scope().task().as_str(), "root-cancel"],
-        )
-        .expect("the operation id derives"),
-        reason: "operator".to_string(),
-    })
-    .await
-    .expect("the task's cancellation is requested");
+    cancel_the_task(&fx).await;
 
     settle(&fx).await;
     fx.pump().await.expect("the pass runs");
@@ -1293,4 +1284,152 @@ async fn a_parked_claim_append_neither_holds_the_end_nor_parks_the_wait() {
         vec![park.checkpoint_id],
         "whose checkpoint the ended run still holds, to answer"
     );
+}
+
+/// Requests the task's cancellation, as an operator does.
+async fn cancel_the_task(fx: &Fixture) {
+    fx.apply_task_command(rakka_agent::AgentTaskEntityCommand::Cancel {
+        operation_id: AgentOperationId::new(
+            AgentOperationKind::Cancellation,
+            [TENANT, task_scope().task().as_str(), "root-cancel"],
+        )
+        .expect("the operation id derives"),
+        reason: "operator".to_string(),
+    })
+    .await
+    .expect("the task's cancellation is requested");
+}
+
+/// A record an earlier build left stuck is repaired. That build took the
+/// task's refusal of a proposal as the run's cancellation and left the
+/// refused proposal on the record, so its wind-down waited for an answer
+/// that had already come, for good, and the task's cancellation with it.
+/// The run's own journal says the proposal's exchange is no longer owed.
+/// The settle pass reads that, drops the proposal, and the wind-down ends.
+///
+/// The record is built with this build, which drops the proposal as it
+/// takes the refusal, and the proposal is then put back as the earlier
+/// build left it. An evaluation is out through the refusal, so the run is
+/// still winding down when the proposal is put back.
+#[tokio::test]
+async fn a_wind_down_an_earlier_build_left_waiting_for_a_refused_proposal_ends() {
+    let (fx, _sink) = proposing_goal_world().await;
+    let evaluation = send_an_evaluation(&fx).await;
+    propose_out_of_reach(&fx).await;
+    let refused = serde_json::to_value(
+        loop_state(&fx)
+            .await
+            .proposal()
+            .expect("the proposal is on the record"),
+    )
+    .expect("the proposal serializes");
+    cancel_the_task(&fx).await;
+    settle(&fx).await;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            loop_state(&fx).await.proposal().is_some()
+        ),
+        (
+            (
+                AgentRunStatus::Cancelling,
+                Some("cancellation-requested".to_string()),
+                false
+            ),
+            false
+        ),
+        "this build took the refusal, dropped the proposal, and waits for its evaluation"
+    );
+    rewrite_loop_state(&fx, |loop_state| {
+        loop_state.insert("proposal".to_string(), refused);
+    })
+    .await;
+    assert!(
+        loop_state(&fx).await.proposal().is_some(),
+        "the record is as the earlier build left it"
+    );
+
+    record(&fx, &evaluation, never_invoked()).await;
+    settle(&fx).await;
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            loop_state(&fx).await.proposal().is_some()
+        ),
+        (
+            (
+                AgentRunStatus::Cancelled,
+                Some("cancellation-requested".to_string()),
+                false
+            ),
+            false
+        ),
+        "the answered proposal is dropped, and the wind-down ends"
+    );
+    fx.pump().await.expect("the pass runs");
+    assert!(
+        fx.task_snapshot().await.status.is_terminal(),
+        "and the task's cancellation completes"
+    );
+}
+
+/// The repair reads the journal, and not the wind-down alone. A cancelled
+/// run whose proposal the task has not answered goes on waiting for the
+/// answer, through settle passes that cannot reach the task. When the task
+/// does answer, an acceptance still wins the race with the cancel.
+#[tokio::test]
+async fn a_wind_down_still_waits_for_a_proposal_the_task_has_not_answered() {
+    let (fx, sink) = proposing_goal_world().await;
+    propose_out_of_reach(&fx).await;
+    apply_out_of_reach(
+        &fx,
+        AgentRunEntityCommand::Cancel {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::Cancellation,
+                [TENANT, AGENT, "cancel-1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+    )
+    .await
+    .expect("the cancellation applies");
+    let nowhere = rakka_agent::AgentExchangeRouter::new();
+    for _ in 0..2 {
+        let mut run = fx.run();
+        let now = fx.now();
+        run.recover(now).await.expect("the run recovers");
+        run.settle_side_effects(&nowhere, now)
+            .await
+            .expect("the run settles");
+    }
+    assert_eq!(
+        (
+            standing(&fx).await,
+            loop_state(&fx).await.proposal().is_some()
+        ),
+        (
+            (
+                AgentRunStatus::Cancelling,
+                Some("cancellation-requested".to_string()),
+                false
+            ),
+            true
+        ),
+        "cancelled, and still waiting for the proposal's answer"
+    );
+
+    settle(&fx).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Completed,
+            Some("result-accepted".to_string()),
+            true
+        ),
+        "the task accepts, and acceptance wins the race with the cancel"
+    );
+    assert_at_rest(&fx, &sink).await;
 }
