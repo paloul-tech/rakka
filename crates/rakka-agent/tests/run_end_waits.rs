@@ -1473,10 +1473,10 @@ async fn model_call_of_turn(fx: &Fixture, turn: u64) -> Option<AgentRunEffect> {
 ///
 /// The record is built with this build, which takes the rejection and begins
 /// no turn. The two writes of the earlier build's arm are then made in its
-/// place: a turn begun with the rejection's feedback, and `Running`. The
-/// next settle pass commits the new turn's model call, as the earlier
-/// build's did, by code the two share. Run under that build's sources, the
-/// same world leaves the same record but for two clock values.
+/// place: a turn begun with the rejection's feedback, and `Running`. That is
+/// the record between that build's two writes: its next step, which
+/// committed the turn's model call, has not run
+/// ([`the_model_call_that_turn_never_sent`]).
 async fn a_turn_begun_on_a_cancelled_run() -> (Fixture, Arc<CountingDecisionSink>, AgentCheckpoint)
 {
     let (fx, sink) = goal_world_proposing("", task_definition()).await;
@@ -1803,22 +1803,22 @@ impl rakka_agent::AgentExchangeTransport for HoldTopUps {
     }
 }
 
-/// A top-up granted to a cancelled run does not resume it. The run is
-/// parked on a top-up request when it is cancelled, and holds an evaluation
-/// it sent, so it has not ended when the task's grant arrives.
-///
-/// The grant used to set the run `Running`, cancelled or not. The loop then
-/// took another step on the cancelled run and committed its next turn's
-/// model call, which a run that is winding down never sends: the record of
-/// [`the_model_call_that_turn_never_sent`], written through commands alone.
-/// The grant now clears the park and moves nothing else. No turn is taken,
-/// nothing more is charged, and the run ends as cancelled when the
-/// evaluation is settled. The review of the repair found this.
-#[tokio::test]
-async fn a_top_up_granted_to_a_cancelled_run_does_not_resume_it() {
+/// A goal-bearing world whose run is parked on a top-up request, returned
+/// with a router that will not carry the request and the evaluation the run
+/// sent. The task rejected the empty answer of turn one, the run began its
+/// second turn, and preparing it found the one iteration it was given
+/// spent. The task may spend `ceiling` iterations in all.
+async fn parked_on_a_top_up(
+    ceiling: u32,
+) -> (
+    Fixture,
+    Arc<CountingDecisionSink>,
+    rakka_agent::AgentExchangeRouter,
+    AgentRunEffect,
+) {
     let definition = task_definition()
         .with_budgets(rakka_agent::AgentBudgetCeilings {
-            max_loop_iterations: Some(4),
+            max_loop_iterations: Some(ceiling),
             ..rakka_agent::AgentBudgetCeilings::unbounded()
         })
         .with_run_allocation(rakka_agent::AgentBudgetAllocation {
@@ -1836,13 +1836,11 @@ async fn a_top_up_granted_to_a_cancelled_run_does_not_resume_it() {
             Arc::new(fx.run_transport.clone()),
         );
     let evaluation = send_an_evaluation(&fx).await;
-
-    // The task rejects the empty answer, the run begins its second turn,
-    // and preparing it finds the one iteration it was given spent. The run
-    // is then cancelled with its request for more still on its way.
     let model = model_call_of(&fx).await;
     let turn = fx.dispatcher.answer(&model).await;
-    for command in [
+    apply_holding(
+        &fx,
+        &holding,
         AgentRunEntityCommand::RecordEffectResult {
             operation_id: model
                 .result_operation_id(&run_scope())
@@ -1853,27 +1851,82 @@ async fn a_top_up_granted_to_a_cancelled_run_does_not_resume_it() {
             fence: 1,
             outcome: Box::new(turn),
         },
-        AgentRunEntityCommand::Cancel {
-            operation_id: AgentOperationId::new(
-                AgentOperationKind::Cancellation,
-                [TENANT, AGENT, "cancel-1"],
-            )
-            .expect("the operation id derives"),
-            reason: "operator stopped the work".to_string(),
-        },
-    ] {
-        let mut run = fx.run();
-        run.recover(fx.now()).await.expect("the run recovers");
-        run.apply(command, &holding, fx.now())
-            .await
-            .expect("the command applies");
-    }
+    )
+    .await;
     let parked = loop_state(&fx).await;
     assert_eq!(
         (
-            standing(&fx).await,
+            status(&fx).await,
             parked.turn(),
             parked.pending_top_up().is_some()
+        ),
+        (AgentRunStatus::Running, 2, true),
+        "parked on its top-up request, under `Running`"
+    );
+    (fx, sink, holding, evaluation)
+}
+
+/// Applies `command` through `router`, which holds the top-up request back.
+async fn apply_holding(
+    fx: &Fixture,
+    router: &rakka_agent::AgentExchangeRouter,
+    command: AgentRunEntityCommand,
+) {
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.apply(command, router, fx.now())
+        .await
+        .expect("the command applies");
+}
+
+/// What the run was given and has spent of its loop iterations and model
+/// calls, and how many top-ups it has taken.
+async fn iterations_and_top_ups(fx: &Fixture) -> (Option<u64>, u64, u64, u64) {
+    let budget = serde_json::to_value(loop_state(fx).await.budget()).expect("the budget encodes");
+    (
+        budget["allocation"]["loop_iterations"].as_u64(),
+        budget["consumed"]["loop_iterations"]
+            .as_u64()
+            .expect("the consumed iterations are counted"),
+        budget["consumed"]["model_calls"]
+            .as_u64()
+            .expect("the consumed model calls are counted"),
+        budget["top_ups"].as_u64().expect("the top-ups are counted"),
+    )
+}
+
+fn cancel_command() -> AgentRunEntityCommand {
+    AgentRunEntityCommand::Cancel {
+        operation_id: AgentOperationId::new(
+            AgentOperationKind::Cancellation,
+            [TENANT, AGENT, "cancel-1"],
+        )
+        .expect("the operation id derives"),
+        reason: "operator stopped the work".to_string(),
+    }
+}
+
+/// A top-up granted to a cancelled run does not resume it. The run is
+/// parked on a top-up request when it is cancelled, and holds an evaluation
+/// it sent, so it has not ended when the task's grant arrives.
+///
+/// The grant used to set the run `Running`, cancelled or not. The loop then
+/// took another step on the cancelled run and committed its next turn's
+/// model call, which a run that is winding down never sends: the record of
+/// [`the_model_call_that_turn_never_sent`], written through commands alone.
+/// The grant now clears the park and moves no status. It is credited, in one
+/// write; no turn is taken, the run spends nothing more, and it ends as
+/// cancelled when the evaluation is settled. The review of the repair found
+/// this.
+#[tokio::test]
+async fn a_top_up_granted_to_a_cancelled_run_does_not_resume_it() {
+    let (fx, sink, holding, evaluation) = parked_on_a_top_up(4).await;
+    apply_holding(&fx, &holding, cancel_command()).await;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            loop_state(&fx).await.pending_top_up().is_some(),
+            iterations_and_top_ups(&fx).await
         ),
         (
             (
@@ -1881,24 +1934,21 @@ async fn a_top_up_granted_to_a_cancelled_run_does_not_resume_it() {
                 Some("cancellation-requested".to_string()),
                 false
             ),
-            2,
-            true
+            true,
+            (Some(1), 1, 1, 0)
         ),
         "cancelled, waiting for its evaluation, and still parked on its top-up"
     );
-    let spent = fx.run_snapshot().await.expect("the run exists").budget;
-    let spent = (spent.loop_iterations(), spent.model_calls());
+    let cancelled = revision(&fx).await;
 
     settle(&fx).await;
 
-    let state = loop_state(&fx).await;
-    let after = fx.run_snapshot().await.expect("the run exists").budget;
     assert_eq!(
         (
             standing(&fx).await,
-            state.pending_top_up().is_some(),
+            loop_state(&fx).await.pending_top_up().is_some(),
             model_call_of_turn(&fx, 2).await.map(|call| call.status),
-            (after.loop_iterations(), after.model_calls())
+            iterations_and_top_ups(&fx).await
         ),
         (
             (
@@ -1908,9 +1958,14 @@ async fn a_top_up_granted_to_a_cancelled_run_does_not_resume_it() {
             ),
             false,
             None,
-            spent
+            (Some(2), 1, 1, 1)
         ),
-        "the grant clears the park, and the cancelled run takes no turn"
+        "the grant is credited and clears the park, and the cancelled run takes no turn"
+    );
+    assert_eq!(
+        revision(&fx).await.get(),
+        cancelled.get() + 1,
+        "in one write: the run was not set going and put back"
     );
 
     record(&fx, &evaluation, never_invoked()).await;
@@ -1925,6 +1980,131 @@ async fn a_top_up_granted_to_a_cancelled_run_does_not_resume_it() {
         "and it ends as cancelled when the evaluation is settled"
     );
     assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// A top-up granted to a run parked on an unknown outcome does not resume
+/// it either. The run is not winding down. Its evaluation came back unknown
+/// while it was parked on its top-up request, so it waits for a person, and
+/// a run that waits for reconciliation takes no step of the loop.
+///
+/// The grant used to set it `Running` all the same, and the loop went on
+/// past the unknown outcome: it committed the next turn's model call and
+/// sent it, with the reconciliation still open. The grant now clears the
+/// park and leaves the run where it waits. The run goes on, with the
+/// grant's credit, when its reconciliation is answered. The review of the
+/// grant's guard found this.
+#[tokio::test]
+async fn a_top_up_granted_to_a_run_parked_on_an_unknown_outcome_does_not_resume_it() {
+    let (fx, _sink, holding, evaluation) = parked_on_a_top_up(4).await;
+    apply_holding(&fx, &holding, unknown(&evaluation)).await;
+    let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            loop_state(&fx).await.pending_top_up().is_some()
+        ),
+        (
+            (AgentRunStatus::WaitingForReconciliation, None, false),
+            true
+        ),
+        "not winding down: parked on an unknown outcome, and on its top-up"
+    );
+    let sent = fx.dispatched_effects();
+
+    settle(&fx).await;
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            loop_state(&fx).await.pending_top_up().is_some(),
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            fx.dispatched_effects(),
+            iterations_and_top_ups(&fx).await
+        ),
+        (
+            (AgentRunStatus::WaitingForReconciliation, None, false),
+            false,
+            None,
+            sent,
+            (Some(2), 1, 1, 1)
+        ),
+        "the grant is credited and clears the park, and nothing is sent past the unknown outcome"
+    );
+
+    decide(
+        &fx,
+        &park.checkpoint_id,
+        "answer",
+        AgentCheckpointDecision::Reconciliation(AgentReconciliationDecision::AbandonAndFail),
+    )
+    .await
+    .expect("the parked run answers its checkpoint");
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            fx.dispatched_effects()
+        ),
+        (
+            (AgentRunStatus::WaitingForEffect, None, false),
+            Some(AgentRunEffectStatus::Ready),
+            sent + 1
+        ),
+        "the reconciliation's answer sets the run going, on the grant's credit"
+    );
+}
+
+/// A top-up answered with nothing ends a cancelled run as out of budget,
+/// and not as cancelled. The reason is as it always was: the task's answer
+/// is a decided end, and a decided end replaces a wind-down's reason. What
+/// is new is this file's rule: the run waits for the evaluation it sent
+/// before it ends, where it ended at once.
+#[tokio::test]
+async fn a_top_up_refused_to_a_cancelled_run_ends_it_as_out_of_budget() {
+    let (fx, sink, holding, evaluation) = parked_on_a_top_up(1).await;
+    apply_holding(&fx, &holding, cancel_command()).await;
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelling,
+            Some("cancellation-requested".to_string()),
+            false
+        )
+    );
+
+    settle(&fx).await;
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            loop_state(&fx).await.pending_top_up().is_some(),
+            model_call_of_turn(&fx, 2).await.map(|call| call.status)
+        ),
+        (
+            (
+                AgentRunStatus::Cancelling,
+                Some("budget-exhausted".to_string()),
+                false
+            ),
+            false,
+            None
+        ),
+        "the task has nothing to grant: the reason is the budget's, and the run waits"
+    );
+
+    record(&fx, &evaluation, never_invoked()).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Failed,
+            Some("budget-exhausted".to_string()),
+            false
+        ),
+        "and it ends as out of budget when the evaluation is settled"
+    );
     assert_at_rest(&fx, &sink).await;
 }
 

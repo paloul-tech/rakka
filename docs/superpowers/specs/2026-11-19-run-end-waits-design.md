@@ -227,14 +227,16 @@ park, or ends as cancelled if the call was all it waited for.
 and the fence read the same exemption. The question and the fence read one
 predicate too, so what is asked and what is done cannot drift apart.
 
-**The review found this build writing the same record.** A run parked on a
-top-up request, cancelled while the request was on its way, and holding a
-call it sent, has not ended when the task's grant arrives. The grant set
-the run `Running`, cancelled or not. The loop took a step, and the next
-turn's model call was committed and never sent. `main` does the same,
-through commands alone, and leaves the same stuck run. **A grant no longer
-resumes a run that is winding down** (`apply_top_up_grant`): it is credited
-and clears the park, and the status stays the wind-down's.
+**The review found `main` writing the same stuck run through commands
+alone, and my first version writing the record and then fencing it.** A
+run parked on a top-up request, cancelled while the request was on its
+way, and still waiting for a call it sent, has not ended when the task's
+grant arrives. The grant set the run `Running`, whatever it then waited
+on. The loop took a step, and the next turn's model call was committed and
+never sent. **A top-up's grant now moves no status** (`apply_top_up_grant`).
+A run parks under `Running` and takes no step while parked, so the write
+was either idle or wrong. The grant is credited and clears the park, and
+the run stays where it waits.
 
 My calls:
 
@@ -254,12 +256,17 @@ My calls:
    with its budget spent: the step asked the task for a top-up, and where
    the task had nothing to grant it ended the cancelled run as out of
    budget.
-3. **The grant's guard is in this change, though nobody asked for it.** It
-   was the one status write on a run that is winding down that nothing
-   guarded, it writes the record this repair is for, and the function's
-   own comment said such a grant was ignored. A grant of nothing is not
-   changed: it still ends a run that was cancelled while it waited as out
-   of budget, and not as cancelled.
+3. **The grant's change is here, though nobody asked for it.** It was the
+   one status write on a run that is winding down that nothing guarded, it
+   writes the record this repair is for, and the function's own comment
+   said such a grant was ignored. I first guarded it for a run that is
+   winding down. The next review ran the same write on a run that is not:
+   one parked on an unknown outcome, which the grant set going past its
+   open reconciliation, a model call sent. It also ran the whole crate
+   with the write removed, and nothing failed. So the write is removed,
+   and both runs stay where they wait. A grant of nothing is not changed
+   in its reason: it still ends a run that was cancelled while it waited
+   as out of budget, and not as cancelled.
 4. **No door is added.** A decision can reach a gated one of these before
    the pass does, and is applied as it always was. The review ran a grant,
    a denial and an expiry on such a record. None is worse than before, and
@@ -281,9 +288,13 @@ two clock values.
   writes nothing, and the park's answer ends the run `Cancelled`.
 - With the park answered while the run is stuck: the step that fences the
   call ends the run, and the run settles its budget with its task.
-- The grant: a whole run whose top-up is granted after it is cancelled
-  takes no turn and is charged nothing more; and a unit test of the guard
-  beside a run that is not winding down, which is resumed.
+- The grant, in three whole runs. A cancelled run whose top-up is granted
+  is credited, in one write, takes no turn and spends nothing more. A run
+  parked on an unknown outcome is credited and sends nothing until its
+  reconciliation is answered, and then goes on. A cancelled run whose
+  top-up is answered with nothing waits for the call it sent and ends as
+  out of budget. And a unit test of the grant on each of those two runs,
+  beside one nothing has moved, which is `Running` as it parked.
 - A parked run that holds an unsent call is fenced too.
 
 The earlier build's own two records, dumped under its sources, were also
@@ -300,15 +311,20 @@ repair removed; each condition of its question dropped, the status and the
 unsent call each on its own; a parked run not asked; the fence's exemption
 ignored, in whole and for the two kinds a wind-down schedules; the
 disposition not re-run; the end's exchanges not owed; the question left
-out of either of the settle loop's two lists; and the grant's guard
-removed, which only its unit test tells from the repair that follows it.
-The fourteenth cancels the call and leaves its gate to the repair of issue
-#133, one step later in the same pass. No test tells that from the fence
-closing it.
+out of either of the settle loop's two lists; and the grant setting a
+cancelled run `Running`. The fourteenth cancels the call and leaves its
+gate to the repair of issue #133, one step later in the same pass. No test
+tells that from the fence closing it.
+
+Four breaks of the grant as it now stands were run the same way, and each
+is caught: the grant sets `Running`, as on `main`; it sets `Running`
+unless the run is winding down, as in my first answer; a grant to a run
+that is winding down is not credited; and a grant of nothing leaves such a
+run on its wind-down.
 
 ## 9. Tests
 
-`crates/rakka-agent/tests/run_end_waits.rs`, new, twenty-two tests; four
+`crates/rakka-agent/tests/run_end_waits.rs`, new, twenty-four tests; four
 in `workflow_tool.rs`; four unit tests in `run.rs`; two more in
 `wind_down_fence.rs`, where one expectation of the forged sweep changed
 (section 8, call 1).
@@ -340,23 +356,27 @@ in `workflow_tool.rs`; four unit tests in `run.rs`; two more in
 - A waiting run an older build settled is ended by the next settle pass.
 - The two stuck records of sections 7 and 8 are repaired, and what each
   repair must leave alone is left alone.
-- A top-up granted to a cancelled run does not resume it.
+- A top-up's grant moves no status: not a cancelled run's, and not that of
+  a run parked on an unknown outcome. Answered with nothing, it ends a
+  cancelled run as out of budget, after the call it sent.
 - Unit: which reasons are decided ends; and the three end sites no whole
   run reaches easily (a refusal, an undecodable decision, a top-up
   answered with nothing) each wait.
 
-Of the twenty-six whole-run tests, twenty-two fail on `main`. The
+Of the twenty-eight whole-run tests, twenty-four fail on `main`. The
 stuck-record tests of sections 7 and 8 fail there at their first step,
 which is the answer `main` mishandles; each failed on this branch, at its
-repair's own assertion, until the repair was written. The test of the
-grant fails on `main` at its own assertion: `main` takes the turn. The
-four that pass on `main` hold what must not change: a run that holds
-nothing, one that holds only a call it never sent, and one that holds only
-a claim append each end at once, and a cancelled run whose proposal is
-unanswered goes on waiting for it. In `wind_down_fence.rs` the two new
-tests and the sweep's changed expectation fail on `main` too. Of the four
-unit tests, three name functions `main` does not have; the fourth, of the
-grant's guard, fails with the guard removed.
+repair's own assertion, until the repair was written. The three tests of
+the grant fail on `main` at their own assertions: `main` takes the turn on
+the cancelled run, sends a call past the unknown outcome, and ends the
+refused run at once over the call it sent. The four that pass on `main`
+hold what must not change: a run that holds nothing, one that holds only a
+call it never sent, and one that holds only a claim append each end at
+once, and a cancelled run whose proposal is unanswered goes on waiting for
+it. In `wind_down_fence.rs` the two new tests and the sweep's changed
+expectation fail on `main` too. Of the four unit tests, three name
+functions `main` does not have; the fourth, of the grant, fails with the
+grant's status write put back.
 
 Nine breaks of the review's fixes and of the sites it found untested were
 each run, and each is caught by one test.
@@ -404,6 +424,18 @@ step. And five statements were not true of the code, the largest that the
 repaired shape was unreachable under this build. It ran eight more breaks;
 the three that survived for want of a test have one each now.
 
+A fifth reviewer read that answer. It found no defect in its two changes.
+It put a panic on every write of a run that is winding down under a status
+that permits progress, and ran the whole crate: none. So no wind-down
+needs the loop, and the shape is unreachable under this build. It found
+the grant's guard too narrow, as section 8 call 3 says, and showed the
+fix. It found two of my statements held by no test, that the grant is
+credited and that a grant of nothing ends the run as out of budget, and a
+unit test whose last part did not test what it said; each has a test now.
+And it corrected five sentences. The last commit, which answers it, was
+read by no reviewer: its one code change is the break that review ran
+against the whole crate.
+
 ## 11. Not done
 
 - Records already ended in one of these states (call 8).
@@ -432,6 +464,13 @@ the three that survived for want of a test have one each now.
   review and is fixed (section 8).
 - A top-up answered with nothing still ends a run that was cancelled while
   it waited as out of budget, and not as cancelled (section 8, call 3).
+  The fifth review read two things downstream of that and did not run
+  them, both on `main`: what such an answer does to the task's goal when
+  the run that asked was already cancelled, and a cancelled run with a
+  child out that is ended as out of budget by one.
+- A run that is winding down still sends the top-up request it owed, which
+  is why an answer reaches it at all. A grant then holds task headroom for
+  a run that will not use it, until the run's return.
 - An earlier build's grant could resume a cancelled run at its tool turn
   too, where the step commits the turn's tool calls and opens a gated
   one's gate. By reading, the repair cancels those calls and closes the

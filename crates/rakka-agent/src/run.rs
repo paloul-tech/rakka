@@ -908,14 +908,15 @@ impl AgentRun {
     /// - It read a task's rejection against the status alone, so a cancelled
     ///   run parked on an unknown outcome, which is
     ///   `WaitingForReconciliation` and not `Cancelling`, began a new turn.
-    /// - It set a run `Running` when its top-up was granted, cancelled or
-    ///   not (`apply_top_up_grant`).
+    /// - It set a run `Running` when its top-up was granted, whatever the
+    ///   run then waited on (`apply_top_up_grant`).
     ///
-    /// Either way the loop's next step committed the turn's model call on a
-    /// run that was winding down. The flush hands such a run's calls to the
-    /// sink only for the kinds the fence exempts, and no fence ran after the
-    /// call was committed. So it stayed `Pending` for good, and the wind-down
-    /// waited for it for good: `WaitingForEffect`, and `Cancelling` once
+    /// Either way the loop's next step committed the turn's next calls on a
+    /// run that was winding down: its model call, or at its tool turn the
+    /// tool calls. The flush hands such a run's calls to the sink only for
+    /// the kinds the fence exempts, and no fence ran after they were
+    /// committed. So they stayed `Pending` for good, and the wind-down
+    /// waited for them for good: `WaitingForEffect`, and `Cancelling` once
     /// whatever else it waited for was known.
     ///
     /// The settle pass repairs such a record on the first pass that touches
@@ -3029,13 +3030,17 @@ fn settle_goal_evaluation_exchange(
 /// the park, and the task's escrow already recorded the grant and frees it on
 /// the run's return, so there is nothing for the run to do.
 ///
-/// A grant that arrives while the run is winding down does not resume it. Such
-/// a run was cancelled, or stopped, while its request was on its way, and
-/// holds a call it sent, so it has not ended. The grant is credited and the
-/// park cleared, and the status stays the wind-down's. `Running` would let
-/// the loop take another turn on it, and commit a model call that a run that
-/// is winding down never sends (issues #123, #172 and #173). A grant of
-/// nothing ends such a run as out of budget, as it ends any run.
+/// The grant moves no status. A run parks under `Running` and takes no step
+/// while it is parked, so it is `Running` still when the grant arrives unless
+/// something else has moved it: a cancel or a failed call began its
+/// wind-down, an outcome came back unknown, a gate opened. That wait is not
+/// the grant's to end. The grant is credited and the park cleared, and the
+/// run goes on from where it waits when that wait ends, or not at all if it
+/// is winding down. Setting `Running` here let the loop take another turn on
+/// a cancelled run, whose calls a run that is winding down never sends, and
+/// past an unknown outcome, whose reconciliation was still open (issues
+/// #123, #172 and #173). A grant of nothing ends a run that is winding down
+/// as out of budget, as it ends any run.
 fn apply_top_up_grant(
     state: &mut AgentRunState,
     result: &AgentExchangeResult,
@@ -3081,9 +3086,10 @@ fn apply_top_up_grant(
     }
 
     if relieved {
-        if let Some(run) = state.run.as_mut().filter(|run| !run.winding_down()) {
-            run.status = AgentRunStatus::Running;
-        }
+        // The grant relieves the park and moves no status. A run parks
+        // under `Running` (`park_for_top_up`) and is `Running` still unless
+        // something else has moved it since, and that wait is not the
+        // grant's to end.
         state.updated_at = now;
     } else {
         let _ended = end_when_settled(
@@ -14361,15 +14367,14 @@ mod tests {
         waits_under(&fx, "budget-exhausted");
     }
 
-    /// A top-up's grant does not resume a run that is winding down. The run
-    /// was cancelled while its request was on its way, and holds a send
-    /// whose outcome is unknown, so it has not ended. The grant is credited
-    /// and the park cleared, as on any run, and the status stays the
-    /// wind-down's: `Running` would let the loop take another turn on a
-    /// cancelled run, and commit a model call that is never sent. A run that
-    /// is not winding down is resumed, as it always was.
+    /// A top-up's grant clears the park and moves no status. A run parks
+    /// under `Running`, and is `Running` still when the grant arrives unless
+    /// something else has moved it. Where a cancel began its wind-down, or
+    /// an outcome came back unknown, the run stays where it waits: `Running`
+    /// would let the loop take another turn on a cancelled run, or past an
+    /// unknown outcome.
     #[test]
-    fn a_top_up_granted_to_a_run_that_is_winding_down_does_not_resume_it() {
+    fn a_top_up_grant_moves_no_status() {
         let relieving = || {
             AgentExchangeResult::accepted(
                 AgentExchangePayload::encode(
@@ -14392,8 +14397,15 @@ mod tests {
                 now,
             )
             .expect("the run parks on its top-up request");
+            assert_eq!(
+                fx.run().status,
+                AgentRunStatus::Running,
+                "a run parks under `Running`"
+            );
         };
 
+        // Cancelled while parked, and not ended: it holds a send whose
+        // outcome is unknown.
         let mut fx = parked();
         let now = fx.now;
         park(&mut fx);
@@ -14420,6 +14432,30 @@ mod tests {
             "the park is cleared, and the run stays on its wind-down's rest"
         );
 
+        // Not winding down: an outcome came back unknown while it was
+        // parked, and it waits for its reconciliation.
+        let mut fx = parked();
+        park(&mut fx);
+        settle_run_disposition(&mut fx.state, now).expect("the disposition settles");
+        assert!(
+            !fx.run().winding_down()
+                && fx.run().status == AgentRunStatus::WaitingForReconciliation
+                && fx.run().loop_state.pending_top_up().is_some(),
+            "live, parked on an unknown outcome, and on its top-up"
+        );
+        apply_top_up_grant(&mut fx.state, &relieving(), now);
+        assert_eq!(
+            (
+                fx.run().status,
+                fx.run().loop_state.pending_top_up().is_some(),
+                fx.run().terminal_reason.is_some()
+            ),
+            (AgentRunStatus::WaitingForReconciliation, false, false),
+            "the park is cleared, and the run stays on its reconciliation"
+        );
+
+        // Nothing moved it: it is `Running` as it parked, and with the park
+        // cleared the loop's next step takes it.
         let mut fx = parked();
         park(&mut fx);
         apply_top_up_grant(&mut fx.state, &relieving(), now);
@@ -14429,7 +14465,7 @@ mod tests {
                 fx.run().loop_state.pending_top_up().is_some()
             ),
             (AgentRunStatus::Running, false),
-            "a run that is not winding down is resumed"
+            "the park is cleared, and the run is `Running` as it parked"
         );
     }
 
