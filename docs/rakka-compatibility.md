@@ -875,6 +875,27 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   - A reconcileable call whose failed attempt is asked about is still over-charged by one attempt where the protocol answers "executed" or the outcome is parked, and its retry on a live run still records one failed attempt more than was made.
   - A dispatch refused before its attempt starts is still reported with one attempt.
 
+- Issue #186 ("a live run parked on an unknown outcome goes on to its next model call") makes a reconciliation park hold a live run through two transitions that lifted it. **No durable field, status, error code or decision kind is added.**
+
+  **What was wrong.** A live run that holds an effect whose outcome is unknown is parked `WaitingForReconciliation` until a person answers what the call did, and the loop takes no step there. Two transitions wrote `Running` over the park: the task's rejection of the run's proposal, and the deadline of a fan-in wait. The run's next step then prepared a turn and sent its model call, with the outcome unanswered and its checkpoint still waiting.
+
+  | A parked live run, not winding down | Before | Now |
+  |---|---|---|
+  | Its task rejects its proposal | `Running`; the next turn is prepared and its model call sent | Stays `WaitingForReconciliation`. The turn is counted and the feedback kept. The turn is prepared and sent when the park is answered |
+  | Its fan-in wait's deadline fires | `Running`; the turn is recorded and the next model call sent | Stays `WaitingForReconciliation`, on the resolved wait. The turn is recorded when the park is answered |
+  | A child's result resolves its fan-in wait | Stays parked | Unchanged |
+  | A top-up is granted | Stays parked, since #178 | Unchanged |
+
+  **What a deployment sees.**
+
+  - A run parked on an unknown outcome no longer shows `WaitingForEffect` or `Running` between a rejection or a deadline and the next effect result, and sends no model call in that window. It shows `WaitingForReconciliation` until the park is answered.
+  - A run that waits on a person for longer than before spends nothing while it waits. The task has already charged the rejected iteration.
+  - **The settle pass parks a live run that holds an unknown outcome and is not parked,** before the loop's step. That is a record an earlier build left between a rejection or a deadline and its next step. A call such a run has already sent stays sent, and its result is taken as on any parked run.
+
+  **The park still holds the loop for every kind of call.** A memory promotion or a claim append whose outcome is unknown parks a live run, as before. A run whose end was decided is the exception it already was (#178).
+
+  **Mixed builds and rollback.** An earlier build still steps past a park at these two transitions. This build parks such a record at its next settle pass.
+
 Run the default compatibility matrix:
 
 ```sh

@@ -1543,17 +1543,32 @@ async fn a_turn_begun_on_a_cancelled_run() -> (Fixture, Arc<CountingDecisionSink
 ///
 /// This build takes no step on a run that is winding down, so the run's
 /// reason is set aside for the one step that commits the call, and put
-/// back. A run with no reason also hands the call to the sink, which the
-/// earlier build's wind-down never did, so the call is put back as unsent
-/// too. The sink of this world then holds a ticket the record does not
-/// know of; nothing here claims it. Run under the earlier build's sources,
-/// the same world leaves the same record but for two clock values.
+/// back. Nor does it take one on a run that holds an unknown outcome
+/// (issue #186), which the run is with its reason aside, so the
+/// evaluation's unknown outcome is set aside for that step too, as a call
+/// still out, and put back. A run with no reason also hands the model call
+/// to the sink, which the earlier build's wind-down never did, so the call
+/// is put back as unsent too. The sink of this world then holds a ticket the
+/// record does not know of; nothing here claims it. Run under the earlier
+/// build's sources, the same world leaves the same record but for two clock
+/// values.
 async fn the_model_call_that_turn_never_sent(fx: &Fixture) -> AgentRunEffect {
     let mut reason = None;
+    let mut unknown = Vec::new();
     rewrite_run(fx, |run| {
         reason = run.insert("terminal_reason".to_string(), serde_json::Value::Null);
+        for effect in run["loop_state"]["effects"]
+            .as_array_mut()
+            .expect("the effects are an array")
+        {
+            if effect["status"].as_str() == Some("indeterminate") {
+                unknown.push(effect["effect_id"].clone());
+                effect["status"] = serde_json::json!("ready");
+            }
+        }
     })
     .await;
+    assert_eq!(unknown.len(), 1, "the run holds one unknown outcome");
     settle(fx).await;
     let call = model_call_of_turn(fx, 2)
         .await
@@ -1563,9 +1578,15 @@ async fn the_model_call_that_turn_never_sent(fx: &Fixture) -> AgentRunEffect {
             "terminal_reason".to_string(),
             reason.expect("the run recorded its reason"),
         );
-        let unsent = run["loop_state"]["effects"]
+        let effects = run["loop_state"]["effects"]
             .as_array_mut()
-            .expect("the effects are an array")
+            .expect("the effects are an array");
+        for effect in effects.iter_mut() {
+            if unknown.contains(&effect["effect_id"]) {
+                effect["status"] = serde_json::json!("indeterminate");
+            }
+        }
+        let unsent = effects
             .iter_mut()
             .find(|effect| effect["effect_id"].as_str() == Some(call.effect_id.as_str()))
             .expect("the record holds the call");
@@ -2053,6 +2074,281 @@ async fn a_top_up_granted_to_a_run_parked_on_an_unknown_outcome_does_not_resume_
             sent + 1
         ),
         "the reconciliation's answer sets the run going, on the grant's credit"
+    );
+}
+
+/// A task's rejection of the run's proposal does not resume a run parked on
+/// an unknown outcome either. The rejection is taken: its feedback is kept
+/// and its turn is counted. Nothing of that turn is prepared or sent until
+/// the reconciliation is answered, and the answer then sets the run going on
+/// it. The rejection used to write `Running` over the park, and the run
+/// prepared the turn and sent its model call with the outcome still unknown.
+#[tokio::test]
+async fn a_rejection_on_a_run_parked_on_an_unknown_outcome_does_not_resume_it() {
+    let (fx, _sink) = goal_world_proposing("", task_definition()).await;
+    let evaluation = send_an_evaluation(&fx).await;
+    propose_out_of_reach(&fx).await;
+    apply_out_of_reach(&fx, unknown(&evaluation))
+        .await
+        .expect("the unknown outcome applies");
+    let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+    let parked = loop_state(&fx).await;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            parked.proposal().is_some(),
+            parked.turn()
+        ),
+        (
+            (AgentRunStatus::WaitingForReconciliation, None, false),
+            true,
+            1
+        ),
+        "not winding down: parked on an unknown outcome, with its proposal unanswered"
+    );
+    let sent = fx.dispatched_effects();
+    let before = revision(&fx).await;
+
+    // The proposal reaches the task, whose rule refuses an empty answer, and
+    // the rejection comes back to the run.
+    settle(&fx).await;
+
+    let state = loop_state(&fx).await;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            state.proposal().is_some(),
+            state.turn(),
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            fx.dispatched_effects(),
+            waiting(&fx).await.len()
+        ),
+        (
+            (AgentRunStatus::WaitingForReconciliation, None, false),
+            false,
+            2,
+            None,
+            sent,
+            1
+        ),
+        "the rejection is taken, and nothing is prepared or sent past the unknown outcome"
+    );
+    assert_eq!(
+        revision(&fx).await,
+        before.next(),
+        "one write: the transition that takes the rejection leaves the run parked, and no \
+         later pass has to put it back"
+    );
+
+    decide(
+        &fx,
+        &park.checkpoint_id,
+        "answer",
+        AgentCheckpointDecision::Reconciliation(AgentReconciliationDecision::AbandonAndFail),
+    )
+    .await
+    .expect("the parked run answers its checkpoint");
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            fx.dispatched_effects()
+        ),
+        (
+            (AgentRunStatus::WaitingForEffect, None, false),
+            Some(AgentRunEffectStatus::Ready),
+            sent + 1
+        ),
+        "the reconciliation's answer sets the run going, on the turn the rejection began"
+    );
+}
+
+/// A record an earlier build left going past an unknown outcome is parked by
+/// the next settle pass, before the loop takes a step.
+///
+/// That build's rejection arm began the next turn and wrote `Running` over
+/// the park, and its next step prepared the turn and sent its model call.
+/// The record here is the one between those two: this build's own record
+/// after the rejection, with the one write that differs made in its place,
+/// the status. The settle pass puts the run back on its park. It prepares
+/// and sends nothing, and the answer to the reconciliation sets it going.
+#[tokio::test]
+async fn a_run_an_earlier_build_left_going_past_an_unknown_outcome_is_parked_again() {
+    let (fx, sink) = goal_world_proposing("", task_definition()).await;
+    let evaluation = send_an_evaluation(&fx).await;
+    propose_out_of_reach(&fx).await;
+    apply_out_of_reach(&fx, unknown(&evaluation))
+        .await
+        .expect("the unknown outcome applies");
+    let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+    settle(&fx).await;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            loop_state(&fx).await.turn(),
+            loop_state(&fx).await.phase()
+        ),
+        (
+            (AgentRunStatus::WaitingForReconciliation, None, false),
+            2,
+            rakka_agent::AgentLoopPhase::PreparingContext
+        ),
+        "this build took the rejection and left the run parked"
+    );
+    let sent = fx.dispatched_effects();
+    rewrite_run(&fx, |run| {
+        run.insert("status".to_string(), serde_json::json!("running"));
+    })
+    .await;
+    assert_eq!(status(&fx).await, AgentRunStatus::Running);
+
+    settle(&fx).await;
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            fx.dispatched_effects(),
+            waiting(&fx).await.len()
+        ),
+        (
+            (AgentRunStatus::WaitingForReconciliation, None, false),
+            None,
+            sent,
+            1
+        ),
+        "the settle pass parks the run, and prepares and sends nothing"
+    );
+    assert_at_rest(&fx, &sink).await;
+
+    decide(
+        &fx,
+        &park.checkpoint_id,
+        "answer",
+        AgentCheckpointDecision::Reconciliation(AgentReconciliationDecision::AbandonAndFail),
+    )
+    .await
+    .expect("the parked run answers its checkpoint");
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            fx.dispatched_effects()
+        ),
+        (
+            (AgentRunStatus::WaitingForEffect, None, false),
+            Some(AgentRunEffectStatus::Ready),
+            sent + 1
+        ),
+        "the reconciliation's answer sets the run going"
+    );
+}
+
+/// Writes the status of `effect` on the stored record, and the run's own
+/// status with it where one is given.
+async fn write_effect_status(
+    fx: &Fixture,
+    effect: &AgentRunEffect,
+    status: &str,
+    run_status: Option<&str>,
+) {
+    rewrite_run(fx, |run| {
+        if let Some(run_status) = run_status {
+            run.insert("status".to_string(), serde_json::json!(run_status));
+        }
+        let held = run["loop_state"]["effects"]
+            .as_array_mut()
+            .expect("the effects are an array")
+            .iter_mut()
+            .find(|held| held["effect_id"].as_str() == Some(effect.effect_id.as_str()))
+            .expect("the record holds the effect");
+        held["status"] = serde_json::json!(status);
+    })
+    .await;
+}
+
+/// The same record one step further on, as the earlier build left it at rest:
+/// its step has run, so the turn's model call is out past the unknown
+/// outcome and the run reads `WaitingForEffect`. No step is owed there, and
+/// the first settle pass still puts the run on its park, so that it reads as
+/// what it is: waiting for a person. The call it sent stays out.
+///
+/// The record is built by taking that step with this build, which refuses it
+/// on a run that holds an unknown outcome: the outcome is set aside for the
+/// step, as a call still out, and put back. Compared field by field with the
+/// record the unfixed transitions write for the same world, it differs in
+/// three clock values.
+#[tokio::test]
+async fn a_run_an_earlier_build_took_past_an_unknown_outcome_is_parked_with_its_call_out() {
+    let (fx, sink) = goal_world_proposing("", task_definition()).await;
+    let evaluation = send_an_evaluation(&fx).await;
+    propose_out_of_reach(&fx).await;
+    apply_out_of_reach(&fx, unknown(&evaluation))
+        .await
+        .expect("the unknown outcome applies");
+    let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+    settle(&fx).await;
+    write_effect_status(&fx, &evaluation, "ready", Some("running")).await;
+    settle(&fx).await;
+    write_effect_status(&fx, &evaluation, "indeterminate", None).await;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            waiting(&fx).await.len()
+        ),
+        (
+            (AgentRunStatus::WaitingForEffect, None, false),
+            Some(AgentRunEffectStatus::Ready),
+            1
+        ),
+        "the record as the earlier build left it: its next model call out, past the unknown \
+         outcome"
+    );
+    let sent = fx.dispatched_effects();
+
+    settle(&fx).await;
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            fx.dispatched_effects(),
+            waiting(&fx).await.len()
+        ),
+        (
+            (AgentRunStatus::WaitingForReconciliation, None, false),
+            Some(AgentRunEffectStatus::Ready),
+            sent,
+            1
+        ),
+        "the first pass parks the run, and the call it sent stays out"
+    );
+    assert_at_rest(&fx, &sink).await;
+
+    decide(
+        &fx,
+        &park.checkpoint_id,
+        "answer",
+        AgentCheckpointDecision::Reconciliation(AgentReconciliationDecision::AbandonAndFail),
+    )
+    .await
+    .expect("the parked run answers its checkpoint");
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            fx.dispatched_effects()
+        ),
+        (
+            (AgentRunStatus::WaitingForEffect, None, false),
+            Some(AgentRunEffectStatus::Ready),
+            sent
+        ),
+        "answered, the run waits on the call it had sent"
     );
 }
 

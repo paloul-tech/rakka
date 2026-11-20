@@ -936,6 +936,37 @@ impl AgentRun {
                 || self.loop_state.holds_unsent_call_the_fence_cancels())
     }
 
+    /// Whether the record is live, holds an effect whose outcome is unknown,
+    /// and is not parked on it.
+    ///
+    /// An effect whose outcome is unknown parks its run in
+    /// `WaitingForReconciliation` until the outcome is answered, and the loop
+    /// takes no step there (`settle_run_disposition`). Every transition
+    /// that can leave a run holding such an effect, or set going a run that
+    /// holds one, ends in that function, so under this binary the shape is
+    /// unreachable. A binary before issue #186 leaves it: a task's rejection
+    /// of the run's proposal and a fan-in wait's deadline each wrote
+    /// `Running` over the park, and the run's next step prepared a turn and
+    /// sent its model call.
+    ///
+    /// The settle pass parks such a record on the first pass that touches
+    /// it, before the loop's step, with `settle_run_disposition`. What the
+    /// run has already sent stays sent, and its result is taken as on any
+    /// parked run.
+    ///
+    /// A run whose end was decided is never asked. It waits under a status of
+    /// its own, which that function writes first, and a memory promotion or a
+    /// claim append whose outcome is unknown does not park it.
+    pub(crate) fn needs_park(&self) -> bool {
+        !self.status.is_terminal()
+            && self.status != AgentRunStatus::WaitingForReconciliation
+            && !self
+                .terminal_reason
+                .as_ref()
+                .is_some_and(AgentRunTerminalReason::is_decided_end)
+            && self.loop_state.has_indeterminate_effect()
+    }
+
     /// Whether the record is on an approval or authorization wait that no
     /// waiting gate of that kind holds.
     ///
@@ -3184,6 +3215,17 @@ fn advance_once(
         // comes before the loop's own step, which such a run must not take
         // ([`AgentRun::needs_wind_down_rest`]).
         fence_unsent(state.run_mut()?, &scope, false, now);
+        settle_run_disposition(state, now)?;
+        return owed_run_exchanges(state, now);
+    }
+    if run.needs_park() {
+        // A record a binary before issue #186 left going past an unknown
+        // outcome: its task's rejection, or its fan-in deadline, wrote
+        // `Running` over the reconciliation park. Put it back on the park,
+        // as the transition should have, before the loop's own step, which
+        // such a run must not take ([`AgentRun::needs_park`]). After the
+        // wind-down's repair above, which parks a run that is winding down
+        // once it has fenced what that run never sent.
         settle_run_disposition(state, now)?;
         return owed_run_exchanges(state, now);
     }
@@ -7481,7 +7523,9 @@ fn fire_checkpoint_timers(
 /// Idempotent and clock-fenced: a deadline not yet due, a group already
 /// resolved, an open group, or no group at all transitions nothing, so early,
 /// late, and duplicate deliveries all converge. A terminal or winding-down
-/// run records the resolution as evidence and resumes nothing.
+/// run records the resolution as evidence and resumes nothing, and neither
+/// does a run parked on an unknown outcome, which goes on from the resolved
+/// wait once its reconciliation is answered.
 fn fire_fan_in_deadline(
     state: &mut AgentRunState,
     now: AgentTimestampMillis,
@@ -7520,7 +7564,12 @@ fn fire_fan_in_deadline(
         run.status = AgentRunStatus::Running;
     }
     state.updated_at = now;
-    Ok(())
+    // The wait is resolved, and where the run stands is settled as it is
+    // after a child's result resolves it. A run parked on an unknown outcome
+    // stays parked: the `Running` above was written over the park, and the
+    // run went on to its next model call with the outcome unanswered
+    // (issue #186).
+    settle_run_disposition(state, now)
 }
 
 /// Records one child workflow run's terminal outcome on the invocation cell
@@ -7729,7 +7778,13 @@ fn settle_proposal(
             run.loop_state.begin_turn(Some(bounded_detail(feedback)));
             run.status = AgentRunStatus::Running;
             state.updated_at = now;
-            Ok(())
+            // The rejection is taken and its turn begun. A run parked on an
+            // unknown outcome stays parked: nothing of the turn is prepared
+            // or sent until the reconciliation is answered, and the answer
+            // then sets the run going on it. Left `Running`, the run sent
+            // the turn's model call past the unanswered outcome
+            // (issue #186).
+            settle_run_disposition(state, now)
         }
         AgentTaskDecision::Refused { code, status } => {
             // A refusal is not a validation decision: the task would not even
@@ -9519,7 +9574,9 @@ where
             // ([`AgentRunState::needs_answered_proposal_drop`]), and a call
             // an older binary committed on a run that was winding down, and
             // never sent, or a status it left such a run that permits the
-            // loop a step ([`AgentRun::needs_wind_down_rest`]).
+            // loop a step ([`AgentRun::needs_wind_down_rest`]), and a run a
+            // binary before issue #186 left going past an unknown outcome
+            // ([`AgentRun::needs_park`]).
             let can_advance = self.state()?.needs_answered_proposal_drop()
                 || self.state()?.run().is_some_and(|run| {
                     run.can_advance()
@@ -9529,6 +9586,7 @@ where
                         || run.needs_gate_wait_release()
                         || run.needs_decided_end()
                         || run.needs_wind_down_rest()
+                        || run.needs_park()
                         || run.needs_gate_close()
                 });
             if !can_advance {
@@ -9559,6 +9617,7 @@ where
                         || run.needs_gate_wait_release()
                         || run.needs_decided_end()
                         || run.needs_wind_down_rest()
+                        || run.needs_park()
                         || run.needs_gate_close()
                         || run.needs_turn_rest()
                 });
@@ -14249,6 +14308,70 @@ mod tests {
         assert!(
             fx.state.run().expect("run").needs_park_repair(),
             "a checkpoint-less promotion on an ended run needs the repair"
+        );
+    }
+
+    /// The settle pass's park guard asks only a live run that holds an
+    /// unknown outcome and is off its park (issue #186). A run that is
+    /// already parked, one that has ended, and one whose end was decided are
+    /// not asked: the disposition leaves each where it is, so asking would
+    /// only keep the settle loop turning.
+    #[test]
+    fn needs_park_asks_only_a_live_run_that_is_off_its_park() {
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Running,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Ready,
+        );
+        assert!(
+            !fx.state.run().expect("run").needs_park(),
+            "a run that holds no unknown outcome has nothing to park on"
+        );
+        park_a_promotion(&mut fx);
+        assert!(
+            fx.state.run().expect("run").needs_park(),
+            "live, holding an unknown outcome, and reading `Running`"
+        );
+
+        let set = |fx: &mut HandoffSendFixture,
+                   status: AgentRunStatus,
+                   reason: Option<AgentRunTerminalReason>| {
+            let run = fx.state.run_mut().expect("the run exists");
+            run.status = status;
+            run.terminal_reason = reason;
+        };
+        set(&mut fx, AgentRunStatus::WaitingForReconciliation, None);
+        assert!(!fx.state.run().expect("run").needs_park(), "already parked");
+        set(
+            &mut fx,
+            AgentRunStatus::Cancelled,
+            Some(AgentRunTerminalReason::CancellationRequested {
+                reason: "operator stopped the work".to_string(),
+            }),
+        );
+        assert!(
+            !fx.state.run().expect("run").needs_park(),
+            "ended, under a reason that is no decided end"
+        );
+        set(
+            &mut fx,
+            AgentRunStatus::Cancelling,
+            Some(AgentRunTerminalReason::ResultAccepted),
+        );
+        assert!(
+            !fx.state.run().expect("run").needs_park(),
+            "its end is decided, and it waits under a status of its own"
+        );
+        set(
+            &mut fx,
+            AgentRunStatus::Cancelling,
+            Some(AgentRunTerminalReason::CancellationRequested {
+                reason: "operator stopped the work".to_string(),
+            }),
+        );
+        assert!(
+            fx.state.run().expect("run").needs_park(),
+            "winding down with no end decided: an unknown outcome parks it"
         );
     }
 
