@@ -512,9 +512,9 @@ fn owed_by_finished_row(
                 };
             (verdict, counted)
         }
-        OutboxStatus::Cancelled if fence_applies => {
-            (RowVerdict::NeverStarted, counted.saturating_add(1))
-        }
+        // The fence cancels a ticket whose next attempt never started, so
+        // the attempts made are the ones the row counts (issue #182).
+        OutboxStatus::Cancelled if fence_applies => (RowVerdict::NeverStarted, counted),
         _ => (
             RowVerdict::Unknown {
                 code: TICKET_ROW_SETTLED,
@@ -3823,7 +3823,17 @@ where
             || (row.status() == OutboxStatus::Failed
                 && intent.safety.class() == AgentEffectSafetyClass::Reconcileable);
         let mut step = if ambiguous {
-            self.recover_ambiguous(scope, claim, &intent, attempt, winding_down, pass)
+            // What a cancellation of this recovery tells the run: the
+            // attempts that have started. A `Dispatching` row's lost attempt
+            // started, and the row has not counted it. A `Failed` row counted
+            // its last attempt when it ended, and the attempt this claim was
+            // about to make has not started (issue #182).
+            let started = if row.status() == OutboxStatus::Dispatching {
+                attempt
+            } else {
+                attempt.saturating_sub(1)
+            };
+            self.recover_ambiguous(scope, claim, &intent, attempt, started, winding_down, pass)
                 .await?
         } else if winding_down && !intent.kind().exempt_from_wind_down_fence() {
             // The fence: a ticket that provably never started is cancelled and
@@ -3833,12 +3843,16 @@ where
             // its ticket here would strand the wind-down on it forever — and
             // so is a promotion or claim append, which copies work already
             // recorded and may be accepted after the run has ended.
+            //
+            // The run is told the attempts the row counts, and not the one
+            // this claim was about to make: that attempt never started, and
+            // the run charges every attempt it is told of (issue #182).
             self.settle_ticket_cancelled(scope, &claim, "run-cancelled", pass)
                 .await?;
             self.deliver_outcome(
                 scope,
                 &intent,
-                attempt,
+                attempt.saturating_sub(1),
                 claim.fencing_token,
                 AgentRunEffectOutcome::Cancelled {
                     reason: "run-cancelled".to_string(),
@@ -4383,6 +4397,11 @@ where
     /// Recovery of an attempt that wrote durable `Started` and disappeared,
     /// per the intent's safety class
     /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// `started` is how many of the ticket's attempts have started, which a
+    /// cancellation tells the run. It is `attempt` where the row was left
+    /// `Dispatching`, and one fewer where a `Reconcileable` intent's row was
+    /// left `Failed`: that row already counted the attempt being asked about.
     #[allow(clippy::too_many_arguments)]
     async fn recover_ambiguous(
         &mut self,
@@ -4390,6 +4409,7 @@ where
         claim: AgentDispatchClaim,
         intent: &AgentRunEffect,
         attempt: u32,
+        started: u32,
         winding_down: bool,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimStep> {
@@ -4403,7 +4423,7 @@ where
                     self.deliver_outcome(
                         scope,
                         intent,
-                        attempt,
+                        started,
                         claim.fencing_token,
                         AgentRunEffectOutcome::Cancelled {
                             reason: "run-cancelled".to_string(),
@@ -4431,6 +4451,7 @@ where
                     claim,
                     intent,
                     attempt,
+                    started,
                     winding_down,
                     &WORKER_LOST,
                     pass,
@@ -4525,8 +4546,10 @@ where
                 };
                 // A finding of not executed hands the next attempt back
                 // ([`ClaimStep::Invoke`]); it is not made from here.
-                self.reconcile_ambiguous(scope, claim, intent, attempt, false, &ambiguity, pass)
-                    .await
+                self.reconcile_ambiguous(
+                    scope, claim, intent, attempt, attempt, false, &ambiguity, pass,
+                )
+                .await
             }
             AgentEffectSafetyClass::NonIdempotent => {
                 // Only the park records what the executor knew: a retried
@@ -4657,6 +4680,9 @@ where
     /// Queries the reconciliation protocol before any retry
     /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md):
     /// "retry only when proven absent").
+    ///
+    /// `started` is how many of the ticket's attempts have started: what a
+    /// cancellation tells the run ([`Self::recover_ambiguous`]).
     #[allow(clippy::too_many_arguments)]
     async fn reconcile_ambiguous(
         &mut self,
@@ -4664,6 +4690,7 @@ where
         claim: AgentDispatchClaim,
         intent: &AgentRunEffect,
         attempt: u32,
+        started: u32,
         winding_down: bool,
         ambiguity: &Ambiguity<'_>,
         pass: &mut AgentDispatchPass,
@@ -4757,12 +4784,17 @@ where
                     // cancelling one here left it `Cancelled` with budget
                     // unspent, for a worker lost after `Started` and for a
                     // claim that ran out of lease alike (issue #171).
+                    //
+                    // The run is told the attempts that started. Where the
+                    // row had already counted the attempt asked about, the
+                    // one this claim was about to make is not among them
+                    // (issue #182).
                     self.settle_ticket_cancelled(scope, &claim, "run-cancelled", pass)
                         .await?;
                     self.deliver_outcome(
                         scope,
                         intent,
-                        attempt,
+                        started,
                         claim.fencing_token,
                         AgentRunEffectOutcome::Cancelled {
                             reason: "run-cancelled".to_string(),
@@ -6130,10 +6162,15 @@ where
                         && row.status() == OutboxStatus::Cancelled
                         && entry.is_none_or(|entry| entry.may_never_have_started) =>
                 {
+                    // The fence's own answer, told again from the row, with
+                    // the count the claim's replay reads from it. The run's
+                    // own count knows only what it was told, and a failed
+                    // attempt that was retried was never told (issue #182).
+                    let (_, attempt) = owed_by_finished_row(&row, &intent, true);
                     self.deliver_outcome(
                         scope,
                         &intent,
-                        intent.attempts,
+                        attempt,
                         0,
                         AgentRunEffectOutcome::Cancelled {
                             reason: "run-cancelled".to_string(),

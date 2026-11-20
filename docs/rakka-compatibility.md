@@ -847,6 +847,34 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Not repaired.** A control task an earlier build left with a refused result keeps that child out: the result is not sent again.
 
+- Issue #182 ("a call cancelled before it starts is charged an attempt") changes the attempt number the dispatcher reports when it cancels a ticket for a run that is winding down. **No durable field, status, error code or decision kind is added.**
+
+  **What was wrong.** The wind-down fence cancels a ticket whose next attempt has not started, and tells the run `Cancelled`. It told the run with the number of the attempt its claim was about to make. The run keeps the largest attempt number it is told and charges that many when the call resolves. So a call that was sent, never claimed and then cancelled was recorded with one attempt made and charged one effect attempt, though its executor was never invoked.
+
+  **The rule.** A cancellation tells the run the attempts that started. A ticket's row counts an attempt when it ends in a failure, so that is the row's count, plus one where the row shows an attempt that started and was lost.
+
+  | The dispatcher cancels a ticket for a run that is winding down | Attempt reported before | Now |
+  |---|---|---|
+  | At the fence: the next attempt never started | The row's count plus one | The row's count: zero for a call never attempted |
+  | The same, told by the next claim from a row a lost worker left `Cancelled` | The row's count plus one | The row's count |
+  | The same, told by the per-run sweep, for a worker lost after it cancelled the ticket at the fleet | The run's own count | The row's count |
+  | A reconcileable call found not executed, where the attempt asked about had ended in a failure | The row's count plus one | The row's count |
+  | After an attempt that started and was lost: a read-only call, or a reconcileable call found not executed | That attempt's number | Unchanged: an attempt that reached a durable `Started` is charged |
+
+  **What a deployment sees.**
+
+  - A run that is cancelled with calls sent and not yet started spends one effect attempt fewer for each. Its effect records show `attempts: 0` for a call that was never attempted. The same is true of what the run settles to its task, and an epoch to its goal.
+  - In one case a run now spends more. The sweep told the run the run's own count, and a run is not told of a failed attempt that is retried. A call with failed attempts, cancelled by a worker that was lost before telling the run, was charged none of them. It is now charged what its row counts.
+
+  **Mixed builds and rollback.** A dispatcher of an earlier build reports the earlier numbers. A run of either build charges what it is told.
+
+  **Not changed.**
+
+  - A run already told keeps the attempt it was charged.
+  - A ticket cancelled after an attempt that started and was lost, whose second worker was then lost too before it told the run, is told with one attempt fewer than started: the row it left does not say which case it was.
+  - A reconcileable call whose failed attempt is asked about is still over-charged by one attempt where the protocol answers "executed" or the outcome is parked, and its retry on a live run still records one failed attempt more than was made.
+  - A dispatch refused before its attempt starts is still reported with one attempt.
+
 Run the default compatibility matrix:
 
 ```sh
