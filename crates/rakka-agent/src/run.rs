@@ -880,7 +880,8 @@ impl AgentRun {
     /// the shape is therefore unreachable. A binary before issues #123, #172
     /// and #173 leaves it, in a mixed deployment: it takes the call's result
     /// and then goes on waiting, as its wind-down waits, for the run's
-    /// children, which do not hold a decided end.
+    /// children, or for a memory promotion or a claim append that is still
+    /// out. None of those holds a decided end.
     ///
     /// The settle pass ends such a record on the first pass that touches it,
     /// with `settle_run_disposition`.
@@ -2533,7 +2534,8 @@ fn chase_reason(run: &AgentRun) -> String {
 /// A run that waits for a call it sent before a decided end is `Cancelling`
 /// too, and its scope is not cancelled: its result was accepted, or its
 /// proposal refused, and it does to its children what it did when it ended
-/// on the spot. So `Cancelling` is read as a cancelled scope only where the
+/// on the spot. It still chases a straggler, as any run that has not ended
+/// does. So `Cancelling` is read as a cancelled scope only where the
 /// recorded reason is not a decided end
 /// ([`AgentRunTerminalReason::is_decided_end`]; issues #123, #172 and #173).
 fn chase_context(run: &AgentRun) -> (bool, Vec<crate::fan_in::AgentFanInMemberId>) {
@@ -14246,8 +14248,9 @@ mod tests {
     /// Which reasons are an end decided for the run, and which a wind-down
     /// the run entered (issues #123, #172 and #173). The two wait
     /// differently: a decided end for the calls the run sent, a wind-down
-    /// for its proposal and its children as well. And only a wind-down under
-    /// `Cancelling` chases the run's children.
+    /// for its proposal and its children as well. And `Cancelling` is read
+    /// as a cancelled scope, whose every child is chased, only under a
+    /// reason that is not a decided end.
     #[test]
     fn the_decided_ends_are_the_six_the_run_does_not_enter_itself() {
         let effect_id = parked().effect_id;

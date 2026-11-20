@@ -116,7 +116,9 @@ proposal on the record, or skipped the wind-down's wait:
    every child it had. The chase now reads the reason too. An earlier
    build's chase does not (section 6).
 3. **A waiting run does to its children what an end at once did:** nothing,
-   until it is terminal. It neither waits for them nor cancels them.
+   until it is terminal. It neither waits for them nor cancels them. A
+   straggler of a resolved fan-in is the exception it always was for a run
+   that has not ended: it is chased, and the run waits for that cancel.
 4. **A decided end replaces a wind-down's reason,** as `terminate` did when
    it ended the run on the spot. A wind-down's reason does not replace a
    decided end's: `cancel`, a compensation and a failed effect each record
@@ -146,21 +148,22 @@ An earlier build that loads a waiting run:
 - **reads `Cancelling` as a cancelled scope, and sends a cancel to every
   child the run has**;
 - ends the run under its recorded reason once nothing is out, but waits
-  for the run's children first, where this build does not.
+  first for the run's children, and for a memory promotion or a claim
+  append still out, where this build waits for neither.
 
 So a waiting run an earlier build activates can have its children
 cancelled. A deployment that cannot accept that finishes the upgrade
 before it relies on this, or drains runs with live children first.
 
 Where an earlier build settled the last call and left the run waiting for
-a child, this build's next settle pass ends it
+one of those, this build's next settle pass ends it
 (`AgentRun::needs_decided_end`). A test holds that; without the repair the
 run stayed `Cancelling` under this build too, because a settle pass does
 not otherwise re-run the disposition of a run with nothing out.
 
 ## 7. Tests
 
-`crates/rakka-agent/tests/run_end_waits.rs`, new, fifteen tests; three in
+`crates/rakka-agent/tests/run_end_waits.rs`, new, fifteen tests; four in
 `workflow_tool.rs`; two unit tests in `run.rs`.
 
 - An accepted run waits for the evaluation it sent, takes the dispatcher's
@@ -173,7 +176,9 @@ not otherwise re-run the disposition of a run with nothing out.
 - An accepted run waits for a straggler's workflow cancel, and cancels a
   review it never sent at once. The cancel ends unknown, the park opens its
   checkpoint, a person answers, the run ends (#123).
-- An accepted run that waits leaves its children as one that does not.
+- An accepted run that waits leaves its children as one that does not:
+  workflow children, and a child it delegated to (the second review's
+  probe, kept).
 - A cancelling run whose proposal is rejected goes on winding down, for
   its call, and for its child. A parked one begins no turn.
 - A proposal refused for the task's cancellation does not hold the
@@ -190,7 +195,7 @@ not otherwise re-run the disposition of a run with nothing out.
   run reaches easily (a refusal, an undecodable decision, a top-up
   answered with nothing) each wait.
 
-Of the eighteen whole-run tests, fifteen fail on `main`. The three that
+Of the nineteen whole-run tests, sixteen fail on `main`. The three that
 pass there hold what must not change: a run that holds nothing, one that
 holds only a call it never sent, and one that holds only a claim append
 each end at once. The two unit tests name functions `main` does not have.
@@ -218,6 +223,10 @@ of its own. It found:
 - **A waiting run reported a pending proposal** beside its accepted result
   (call 5).
 
+A second reviewer read the second commit. It found no defect in the four
+code changes and confirmed the test counts on `main`. It corrected four
+statements, and ran the last item of section 9.
+
 ## 9. Not done
 
 - Records already ended in one of these states (call 8).
@@ -227,6 +236,24 @@ of its own. It found:
   terminal was not examined beyond the tests here: the wake controller's
   slot, the escrow's timing, the A2A projection. The reviewer listed it as
   not reached, and so do I.
-- A `Cancel` on a waiting run is accepted and changes nothing; the
-  operational snapshot's cancellation progress stays `NotRequested` for
-  it.
+- A `Cancel` on a waiting run changes neither its reason nor its wait. It
+  still does what a cancel does to gates: it closes a waiting approval or
+  authorization, and cancels a memory promotion or claim append that
+  waited behind one. Left alone, that append would have outlived the end
+  and been answerable on the ended run. The operational snapshot's cancellation progress is read
+  from the reason, so it stays `NotRequested` under an accepted result,
+  and reads as a cancellation under a refusal whose task was cancelled.
+- A straggler chased while the run waits is marked with the run's reason
+  (`result-accepted`), not `fan-in-straggler`. Found by the second review;
+  not changed.
+- A run that waits for an end that will be `Cancelled` (its task was
+  cancelled, and refused its proposal) sends its children their cancel
+  when it ends, not while it waits. The wait can be for a person.
+- Two leads from the second review, read and not run, both on `main`
+  already: a top-up grant sets a cancelled run parked on a top-up back to
+  `Running`; and a run out of budget with children out never chases them.
+- **A run an earlier build left `Cancelling` over a refused proposal is not
+  ended.** The proposal is still on its record, and nothing there says it
+  was answered. The second review ran it. Where the recorded reason is the
+  task's own cancellation the answer is certain, so a repair is possible;
+  I did not add one unreviewed. It is the owner's to ask for.

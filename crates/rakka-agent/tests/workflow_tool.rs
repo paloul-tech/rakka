@@ -2052,6 +2052,150 @@ async fn an_accepted_run_that_waits_leaves_its_children_as_one_that_does_not() {
     }
 }
 
+/// The same for a child the run delegated to. A waiting run owes it no
+/// delegation cancel: not while it waits, not after an operator's `Cancel`,
+/// which changes neither the run's reason nor what it does to its children,
+/// and not at its `Completed` end. From the second review's probe.
+#[tokio::test]
+async fn an_accepted_run_that_waits_leaves_a_delegated_child_alone() {
+    use rakka_persistence::DurableStateStore;
+
+    let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Delegating and awaiting nothing.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-1").expect("call id should be valid"),
+                delegation_tool_id(),
+                json!({ "skill": SKILL, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first_turn)
+                .with_turn(proposing_turn()),
+        )
+        .with_a2a_send_executor(sending_executor()),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_workflow_tools(workflow_config());
+    create_workflow_task(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+
+    // Answer the delegation send, so the child exists.
+    let send = {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .effects()
+            .iter()
+            .find(|effect| {
+                effect.kind() == rakka_agent::AgentRunEffectKind::A2aSendCall
+                    && effect.is_outstanding()
+            })
+            .cloned()
+            .expect("the send is out")
+    };
+    let outcome = fixture.dispatcher.answer(&send).await;
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: send.result_operation_id(&run_scope()).expect("derives"),
+            effect_id: send.effect_id.clone(),
+            generation: send.generation,
+            attempt: send.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(outcome),
+        },
+    )
+    .await;
+
+    // An evaluation is committed beside turn two's model call, and sent.
+    apply_to_run(&fixture, evaluate_goal(false)).await;
+    // Turn two proposes, and the task accepts with the evaluation out.
+    drive_model_turn_only(&fixture).await;
+    settle(&fixture).await;
+    settle(&fixture).await;
+
+    /// Status, reason code, the delegation cell's status and cancel outcome,
+    /// and whether the stored record names the delegation-cancel operation.
+    async fn picture(fixture: &Fixture) -> (AgentRunStatus, Option<String>, String, String, bool) {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        let state = run.state().expect("state");
+        let record = state.run().expect("the run exists");
+        let loop_state = state.loop_state().expect("the loop is started");
+        let (delegation, cell) = loop_state
+            .delegations()
+            .iter()
+            .next()
+            .expect("the delegation cell exists");
+        let operation =
+            rakka_agent::delegation_cancel_operation_id(&TenantId::new(TENANT), delegation)
+                .expect("derives");
+        let stored = fixture
+            .runs
+            .load(&run_scope().persistence_id())
+            .await
+            .expect("loads")
+            .expect("exists");
+        let json = serde_json::to_string(&stored.state).expect("serializes");
+        (
+            record.status,
+            record
+                .terminal_reason
+                .as_ref()
+                .map(|reason| reason.code().to_string()),
+            format!("{:?}", cell.status).chars().take(40).collect(),
+            format!("{:?}", cell.cancel),
+            json.contains(operation.as_str()),
+        )
+    }
+
+    let waiting = picture(&fixture).await;
+
+    // An operator cancels the waiting run.
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::Cancel {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::Cancellation,
+                &common::agent_scope(),
+                "operator-cancel",
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+    )
+    .await;
+    settle(&fixture).await;
+    let cancelled = picture(&fixture).await;
+
+    land_the_evaluation(&fixture).await;
+    settle(&fixture).await;
+    let ended = picture(&fixture).await;
+
+    assert_eq!(
+        (waiting.0, waiting.1.as_deref(), waiting.4),
+        (AgentRunStatus::Cancelling, Some("result-accepted"), false),
+        "waiting, and no delegation cancel is owed: {waiting:?}"
+    );
+    assert!(waiting.2.starts_with("ChildCreated"), "{waiting:?}");
+    assert_eq!(waiting.3, "None");
+    assert_eq!(
+        (cancelled.0, cancelled.1.as_deref(), cancelled.4),
+        (AgentRunStatus::Cancelling, Some("result-accepted"), false)
+    );
+    assert_eq!(
+        (ended.0, ended.1.as_deref(), ended.4),
+        (AgentRunStatus::Completed, Some("result-accepted"), false)
+    );
+}
+
 /// A cancelling run waits for its children as well as its calls. Its
 /// proposal is rejected while a child it started has not reported. It used
 /// to end there, `Cancelled`, over a child whose outcome it did not know.
