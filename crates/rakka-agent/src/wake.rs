@@ -1851,15 +1851,20 @@ pub enum AgentWakeDisposition {
         /// The skipped wake.
         wake: AgentWakeId,
     },
-    /// The occurrence was parked because the goal-window ceiling is
-    /// exhausted. It is retried — oldest parked first — by the next delivery
-    /// or release whose recorded transition observes a window able to pay,
-    /// and the controller owes itself a durable window-turn re-wake so a
-    /// quiet schedule cannot strand it.
+    /// The occurrence was parked because its epoch cannot be paid for: the
+    /// goal-window ceiling is exhausted, or the goal's own ledger has nothing
+    /// left in a dimension the epoch needs (issue #179). It is retried —
+    /// oldest parked first — by the next delivery, release or resume whose
+    /// recorded transition observes a window and a ledger able to pay. For
+    /// the window the controller owes itself a durable window-turn re-wake,
+    /// so a quiet schedule cannot strand it. For the ledger the retry comes
+    /// with the return of the epoch that holds the budget, or with the
+    /// resume that tops the goal up.
     Deferred {
         /// The parked wake.
         wake: AgentWakeId,
-        /// The dimension whose window ceiling refused the epoch.
+        /// The dimension in which the window ceiling or the goal's ledger
+        /// refused the epoch.
         dimension: AgentBudgetDimension,
     },
     /// The occurrence was parked because a failure backoff is in force; the
@@ -2600,8 +2605,12 @@ impl AgentWakeControllerState {
         Ok(())
     }
 
-    /// Admits the binding when the goal window can pay for its epoch, and
-    /// parks it as deferred otherwise.
+    /// Admits the binding when the goal's ledger and the goal window can
+    /// both pay for its epoch, and parks it as deferred otherwise.
+    ///
+    /// The ledger is asked first, and the window is charged only for an
+    /// epoch the ledger can pay for: a window charge for an occurrence that
+    /// is then parked would be spent on nothing.
     fn admit_or_defer(
         &mut self,
         policy: &AgentWakePolicy,
@@ -2609,30 +2618,59 @@ impl AgentWakeControllerState {
         now: AgentTimestampMillis,
         coalesced: bool,
         representative: bool,
+        ledger_shortfall: Option<AgentBudgetDimension>,
     ) -> AgentWakeDisposition {
+        if let Some(dimension) = ledger_shortfall {
+            return self.defer_binding(policy, binding, dimension);
+        }
         if let Some(ceiling) = &policy.goal_window {
             if let Err(dimension) = self.charge_goal_window(ceiling, &policy.epoch_budget, now) {
-                let wake = binding.wake_id().clone();
-                return match self.park_binding(policy, binding) {
-                    AgentWakeParked::Stored { replaced } => {
-                        // A deferral is one delivery and moves one primary
-                        // counter; a replaced occupant is the secondary fact.
-                        self.counters.deferred += 1;
-                        if replaced.is_some() {
-                            self.counters.superseded += 1;
-                        }
-                        AgentWakeDisposition::Deferred { wake, dimension }
-                    }
-                    // A full catch-up queue skips the overflow even when the
-                    // proximate cause was the window.
-                    AgentWakeParked::Overflow => {
-                        self.counters.missed += 1;
-                        AgentWakeDisposition::Skipped { wake }
-                    }
-                };
+                return self.defer_binding(policy, binding, dimension);
             }
         }
         self.admit_binding(binding, now, coalesced, representative)
+    }
+
+    /// Parks a binding whose epoch cannot be paid for in `dimension`.
+    fn defer_binding(
+        &mut self,
+        policy: &AgentWakePolicy,
+        binding: AgentWakeBinding,
+        dimension: AgentBudgetDimension,
+    ) -> AgentWakeDisposition {
+        let wake = binding.wake_id().clone();
+        match self.park_binding(policy, binding) {
+            AgentWakeParked::Stored { replaced } => {
+                // A deferral is one delivery and moves one primary
+                // counter; a replaced occupant is the secondary fact.
+                self.counters.deferred += 1;
+                if replaced.is_some() {
+                    self.counters.superseded += 1;
+                }
+                AgentWakeDisposition::Deferred { wake, dimension }
+            }
+            // A full catch-up queue skips the overflow even when the
+            // proximate cause was the budget.
+            AgentWakeParked::Overflow => {
+                self.counters.missed += 1;
+                AgentWakeDisposition::Skipped { wake }
+            }
+        }
+    }
+
+    /// Whether a parked occurrence could take a free place now, were its
+    /// epoch paid for: the gate permits admission, no backoff is in force,
+    /// an occurrence is parked and a place is free.
+    ///
+    /// This is what the goal's task asks before it applies the exhaustion
+    /// policy for a ledger that cannot pay: the policy speaks only when the
+    /// budget is what stands between an occurrence and its epoch.
+    #[must_use]
+    pub fn holds_admittable(&self, policy: &AgentWakePolicy, now: AgentTimestampMillis) -> bool {
+        self.lifecycle.status.permits_admission()
+            && !self.backoff_in_force(now)
+            && !self.pending.is_empty()
+            && self.active.len() < Self::active_capacity(policy)
     }
 
     /// Whether the controller already holds or recently dispositioned a wake.
@@ -2703,6 +2741,26 @@ impl AgentWakeControllerState {
         current_revision: ScheduleRevision,
         binding: AgentWakeBinding,
         now: AgentTimestampMillis,
+    ) -> AgentWakeResult<AgentWakeDisposition> {
+        self.admit_within(policy, current_revision, binding, now, None)
+    }
+
+    /// [`Self::admit`], told what the goal's own ledger can pay for.
+    ///
+    /// `ledger_shortfall` is the dimension in which the goal's ledger has
+    /// nothing left for one more epoch, if there is one. An occurrence that
+    /// would be admitted is then parked as
+    /// [`AgentWakeDisposition::Deferred`] on that dimension, and the goal
+    /// window is not charged for it. Every other disposition is unchanged.
+    /// The controller holds no ledger; the goal's task reads its own and
+    /// passes the answer with each admission (issue #179).
+    pub fn admit_within(
+        &mut self,
+        policy: &AgentWakePolicy,
+        current_revision: ScheduleRevision,
+        binding: AgentWakeBinding,
+        now: AgentTimestampMillis,
+        ledger_shortfall: Option<AgentBudgetDimension>,
     ) -> AgentWakeResult<AgentWakeDisposition> {
         let offered = binding.schedule_revision();
         if offered > current_revision {
@@ -2844,7 +2902,7 @@ impl AgentWakeControllerState {
             });
         }
         if Self::past_maximum_lateness(policy, &binding, now) {
-            return Ok(self.dispose_missed(policy, binding, now));
+            return Ok(self.dispose_missed(policy, binding, now, ledger_shortfall));
         }
         let lateness = binding
             .due_at()
@@ -2858,10 +2916,10 @@ impl AgentWakeControllerState {
             // past direct admission but not yet missed, so it coalesces — into
             // a free active slot when one exists, behind the active occurrence
             // otherwise.
-            return Ok(self.coalesce_or_admit(policy, binding, now));
+            return Ok(self.coalesce_or_admit(policy, binding, now, ledger_shortfall));
         }
         if self.active.len() < Self::active_capacity(policy) {
-            Ok(self.admit_or_defer(policy, binding, now, false, false))
+            Ok(self.admit_or_defer(policy, binding, now, false, false, ledger_shortfall))
         } else {
             Ok(self.coalesce(policy, binding))
         }
@@ -2881,6 +2939,20 @@ impl AgentWakeControllerState {
         wake: &AgentWakeId,
         now: AgentTimestampMillis,
     ) -> AgentWakeResult<AgentWakeRelease> {
+        self.release_within(policy, wake, now, None)
+    }
+
+    /// [`Self::release`], told what the goal's own ledger can pay for: with
+    /// a `ledger_shortfall` the occurrence is released and nothing is
+    /// promoted into its place. The caller reads its ledger after it has
+    /// settled what the released epoch returned. See [`Self::admit_within`].
+    pub fn release_within(
+        &mut self,
+        policy: &AgentWakePolicy,
+        wake: &AgentWakeId,
+        now: AgentTimestampMillis,
+        ledger_shortfall: Option<AgentBudgetDimension>,
+    ) -> AgentWakeResult<AgentWakeRelease> {
         let Some(index) = self
             .active
             .iter()
@@ -2890,7 +2962,7 @@ impl AgentWakeControllerState {
         };
         let released = self.active.remove(index);
         self.counters.released += 1;
-        let admitted_next = self.promote_admittable(policy, now);
+        let admitted_next = self.promote_admittable_within(policy, now, ledger_shortfall);
         Ok(AgentWakeRelease {
             released: wake.clone(),
             admitted_next,
@@ -2913,6 +2985,18 @@ impl AgentWakeControllerState {
         policy: &AgentWakePolicy,
         now: AgentTimestampMillis,
     ) -> Option<AgentWakeId> {
+        self.promote_admittable_within(policy, now, None)
+    }
+
+    /// [`Self::promote_admittable`], told what the goal's own ledger can pay
+    /// for: with a `ledger_shortfall` nothing is promoted, and the goal
+    /// window is not charged. See [`Self::admit_within`].
+    pub fn promote_admittable_within(
+        &mut self,
+        policy: &AgentWakePolicy,
+        now: AgentTimestampMillis,
+        ledger_shortfall: Option<AgentBudgetDimension>,
+    ) -> Option<AgentWakeId> {
         // The same lifecycle and backoff gates every admission passes: a
         // suspended, expired, retired, or backing-off goal promotes nothing,
         // through every path that promotes — release, resume, retry, and the
@@ -2921,6 +3005,9 @@ impl AgentWakeControllerState {
             return None;
         }
         if self.pending.is_empty() || self.active.len() >= Self::active_capacity(policy) {
+            return None;
+        }
+        if ledger_shortfall.is_some() {
             return None;
         }
         if let Some(ceiling) = &policy.goal_window {
@@ -2994,11 +3081,12 @@ impl AgentWakeControllerState {
         policy: &AgentWakePolicy,
         binding: AgentWakeBinding,
         now: AgentTimestampMillis,
+        ledger_shortfall: Option<AgentBudgetDimension>,
     ) -> AgentWakeDisposition {
         match policy.missed_occurrence {
             AgentMissedOccurrencePolicy::AdmitOneCoalesced => {
                 if self.active.len() < Self::active_capacity(policy) {
-                    self.admit_or_defer(policy, binding, now, true, true)
+                    self.admit_or_defer(policy, binding, now, true, true, ledger_shortfall)
                 } else if self.active.iter().any(AgentActiveWake::is_representative) {
                     // The active occurrence is already this downtime backlog's
                     // coalesced representative: later missed occurrences of
@@ -3024,7 +3112,7 @@ impl AgentWakeControllerState {
             }
             AgentMissedOccurrencePolicy::BoundedCatchUp { .. } => {
                 if self.active.len() < Self::active_capacity(policy) {
-                    self.admit_or_defer(policy, binding, now, true, false)
+                    self.admit_or_defer(policy, binding, now, true, false, ledger_shortfall)
                 } else {
                     self.coalesce(policy, binding)
                 }
@@ -3037,9 +3125,10 @@ impl AgentWakeControllerState {
         policy: &AgentWakePolicy,
         binding: AgentWakeBinding,
         now: AgentTimestampMillis,
+        ledger_shortfall: Option<AgentBudgetDimension>,
     ) -> AgentWakeDisposition {
         if self.active.len() < Self::active_capacity(policy) {
-            self.admit_or_defer(policy, binding, now, true, false)
+            self.admit_or_defer(policy, binding, now, true, false, ledger_shortfall)
         } else {
             self.coalesce(policy, binding)
         }
@@ -5451,5 +5540,108 @@ mod tests {
         let empty: AgentWakeControllerState =
             serde_json::from_value(serde_json::json!({})).expect("an empty record loads");
         assert_eq!(empty, AgentWakeControllerState::new());
+    }
+
+    /// Issue #179: an occurrence the goal's ledger cannot pay for is parked,
+    /// not admitted, and the goal window is not charged for it. Were it
+    /// charged, the 24-call window could not pay for the promotion that
+    /// follows.
+    #[test]
+    fn a_ledger_that_cannot_pay_defers_the_occurrence_and_charges_no_window() {
+        let policy = windowed_policy(3_600_000, 24);
+        let mut controller = AgentWakeControllerState::new();
+        let short = Some(AgentBudgetDimension::LoopIterations);
+
+        let deferred = controller
+            .admit_within(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+                short,
+            )
+            .expect("the occurrence is dispositioned");
+        assert!(
+            matches!(
+                deferred,
+                AgentWakeDisposition::Deferred {
+                    dimension: AgentBudgetDimension::LoopIterations,
+                    ..
+                }
+            ),
+            "the ledger's dimension is the one named, got {deferred:?}"
+        );
+        assert_eq!(controller.counters().deferred, 1);
+        assert_eq!(controller.counters().admitted, 0);
+        assert!(controller.active().is_empty());
+        assert_eq!(controller.pending().len(), 1);
+        assert!(controller.holds_admittable(&policy, now(1_000)));
+
+        assert_eq!(
+            controller.promote_admittable_within(&policy, now(1_500), short),
+            None,
+            "nothing is promoted while the ledger cannot pay"
+        );
+        assert_eq!(controller.pending().len(), 1);
+
+        let promoted = controller.promote_admittable_within(&policy, now(2_000), None);
+        assert!(
+            promoted.is_some(),
+            "the window was charged for neither the deferral nor the refused promotion"
+        );
+        assert_eq!(controller.counters().admitted, 1);
+        assert!(!controller.holds_admittable(&policy, now(2_000)));
+    }
+
+    /// Issue #179: a release told that the ledger cannot pay frees the place
+    /// and promotes nothing into it. The parked occurrence stays admittable
+    /// until the gate closes or a later promotion takes it.
+    #[test]
+    fn a_release_told_the_ledger_cannot_pay_promotes_nothing() {
+        let policy = windowed_policy(3_600_000, 1_000);
+        let mut controller = AgentWakeControllerState::new();
+        assert!(!controller.holds_admittable(&policy, now(1_000)));
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the first occurrence is admitted");
+        let wake = controller.active()[0].binding().wake_id().clone();
+        let second = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_000, ScheduleRevision::INITIAL),
+                now(2_000),
+            )
+            .expect("the second occurrence is dispositioned");
+        assert!(matches!(second, AgentWakeDisposition::Coalesced { .. }));
+        assert!(
+            !controller.holds_admittable(&policy, now(2_000)),
+            "no place is free"
+        );
+
+        let release = controller
+            .release_within(
+                &policy,
+                &wake,
+                now(3_000),
+                Some(AgentBudgetDimension::LoopIterations),
+            )
+            .expect("the first occurrence releases");
+        assert_eq!(release.admitted_next, None);
+        assert_eq!(controller.counters().released, 1);
+        assert!(controller.active().is_empty());
+        assert_eq!(controller.pending().len(), 1);
+        assert!(controller.holds_admittable(&policy, now(3_000)));
+
+        controller.suspend_by_policy("budget-exhausted");
+        assert!(
+            !controller.holds_admittable(&policy, now(3_000)),
+            "a closed gate admits nothing, whatever is parked"
+        );
     }
 }

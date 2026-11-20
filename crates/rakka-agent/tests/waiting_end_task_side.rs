@@ -528,7 +528,8 @@ async fn a_parked_accepted_epoch_holds_its_wake_until_the_park_is_answered() {
 ///
 /// The epochs here are each granted one loop iteration. Under a wake policy
 /// that leaves a dimension open, the parked epoch holds all the goal has in
-/// it, and the epoch admitted beside it is created with none (issue #179).
+/// it, and the next occurrence waits, parked, for that epoch's result (issue
+/// #179).
 #[tokio::test]
 async fn an_operator_can_release_the_wake_a_parked_epoch_holds() {
     let world = accepted_epoch_with_an_evaluation_out(one_iteration_epochs()).await;
