@@ -2219,7 +2219,8 @@ async fn a_waiting_run_that_holds_a_gated_claim_append_is_at_rest() {
 // ---------------------------------------------------------------------------
 
 /// A world like [`proposing_goal_world`], whose task is a delegated child: it
-/// is bound to its parent's goal and carries no goal contract of its own.
+/// carries a goal's id, so that its run can be asked for an evaluation, and no
+/// goal contract of its own.
 /// Nothing stands at the parent run's address, so the child's result can be
 /// sent and never answered.
 async fn delegated_child_world() -> Fixture {
@@ -2327,8 +2328,9 @@ async fn settle_task_and_run(fx: &Fixture) {
 
 /// A delegated child reports to its parent on its ledger, not on its status.
 /// While its accepted run waits for a call, the child is `Completed` and has
-/// told its parent nothing: the parent's fan-in goes on waiting for it. The
-/// result is sent when the run has ended and returned its budget.
+/// sent its parent nothing. The result is sent when the run has ended and
+/// returned its budget. No parent run stands in this world, so what a
+/// parent's fan-in does meanwhile is not held here.
 #[tokio::test]
 async fn a_delegated_child_whose_run_waits_reports_when_the_run_ends() {
     let fx = delegated_child_world().await;
@@ -2381,6 +2383,15 @@ async fn a_verdict_that_lands_after_acceptance_decides_nothing() {
     let model = model_call_of(&fx).await;
     let turn = fx.dispatcher.answer(&model).await;
     record(&fx, &model, turn).await;
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelling,
+            Some("result-accepted".to_string()),
+            true
+        ),
+        "the task accepted, and the run waits for its evaluation"
+    );
 
     let verdict = rakka_agent::AgentGoalEvaluationRecord::new(
         rakka_agent::goal_evaluation_record_id(
@@ -2453,4 +2464,251 @@ async fn a_verdict_that_lands_after_acceptance_decides_nothing() {
         "the goal is not decided"
     );
     assert_at_rest(&fx, &sink).await;
+}
+
+const TEAM: &str = "support-team";
+const MEMBER: &str = "worker-a";
+const DEPENDENT: &str = "dependent-1";
+
+fn team_scope() -> rakka_agent::AgentTeamScope {
+    rakka_agent::AgentTeamScope::new(
+        tenant(),
+        rakka_agent::AgentTeamId::new(TEAM).expect("the team id is valid"),
+    )
+    .expect("the team scope is valid")
+}
+
+fn dependent_scope() -> rakka_agent::AgentTaskScope {
+    rakka_agent::AgentTaskScope::new(
+        tenant(),
+        rakka_agent::AgentTaskId::new(DEPENDENT).expect("the task id is valid"),
+    )
+    .expect("the scope is valid")
+}
+
+fn team_operation(step: &str) -> AgentOperationId {
+    AgentOperationId::new(AgentOperationKind::TeamClaim, [TENANT, TEAM, step])
+        .expect("the operation id derives")
+}
+
+/// A world like [`proposing_goal_world`], whose task is governed by a team
+/// and posted on the team's board, with a second, human-owned task that
+/// declares it as a dependency.
+async fn governed_world_with_a_dependent() -> Fixture {
+    let fx = Fixture::with_sink(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new().with_turn_for(
+                1,
+                AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                    .with_text("Done.")
+                    .with_proposal(
+                        AgentTaskContent::inline(serde_json::json!({ "answer": "resolved" }))
+                            .expect("the proposal is inline-bounded"),
+                    )
+                    .with_usage(usage()),
+            ),
+        ),
+        InMemoryAgentRunEffectSink::new(),
+        AgentEffectPolicies::default(),
+        Arc::new(AtomicU64::new(1)),
+    );
+    fx.instantiate_agent().await;
+    let member = rakka_agent::AgentId::new(MEMBER).expect("the member id is valid");
+    fx.instantiate_team_member_at(
+        rakka_agent::AgentScope::new(tenant(), member.clone()).expect("the scope is valid"),
+    )
+    .await;
+    fx.apply_team_command_at(
+        &team_scope(),
+        rakka_agent::AgentTeamEntityCommand::Create {
+            operation_id: team_operation("create"),
+            creation: Box::new(rakka_agent::AgentTeamCreation {
+                leader: member.clone(),
+                root_goal: rakka_agent::AgentGoalId::new("quarterly-support")
+                    .expect("the goal id is valid"),
+                policy: rakka_agent::AgentTeamPolicy::new(AgentRevisionNumber::INITIAL),
+                members: [(member.clone(), Default::default())].into_iter().collect(),
+            }),
+        },
+    )
+    .await
+    .expect("the team is created");
+
+    let mut command = goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(goal_spec_with_evaluator(), true),
+    );
+    let rakka_agent::AgentTaskEntityCommand::Create { creation, .. } = &mut command else {
+        panic!("the helper builds a creation");
+    };
+    creation.team = Some(rakka_agent::AgentTeamId::new(TEAM).expect("the team id is valid"));
+    fx.apply_task_command(command)
+        .await
+        .expect("the governed task is created");
+    fx.apply_team_command_at(
+        &team_scope(),
+        rakka_agent::AgentTeamEntityCommand::PostTask {
+            operation_id: team_operation("post"),
+            task: task_scope().task().clone(),
+            posted_by: member,
+        },
+    )
+    .await
+    .expect("the task is posted");
+
+    fx.apply_task_command_at(
+        &dependent_scope(),
+        rakka_agent::AgentTaskEntityCommand::Create {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::TaskCreation,
+                [TENANT, DEPENDENT, "1"],
+            )
+            .expect("the operation id derives"),
+            creation: Box::new(rakka_agent::AgentTaskCreation {
+                definition: task_definition()
+                    .with_ownership(rakka_agent::AgentTaskOwnership::Human),
+                input: AgentTaskContent::inline(serde_json::json!({ "ticket": 2 }))
+                    .expect("the input is inline-bounded"),
+                assignee: None,
+                team: None,
+                goal: None,
+                goal_mode: Default::default(),
+                goal_spec: None,
+                parent: None,
+                dependencies: vec![rakka_agent::AgentTaskDependencyDeclaration::new(
+                    task_scope().task().clone(),
+                )],
+                escrow: None,
+                wake: None,
+                delegation: None,
+                telemetry: Default::default(),
+            }),
+        },
+    )
+    .await
+    .expect("the dependent is created");
+    settle_everyone(&fx).await;
+    fx
+}
+
+/// Settles the task, its run, the team and the dependent until each has
+/// heard what the others owe it.
+async fn settle_everyone(fx: &Fixture) {
+    for _round in 0..3 {
+        fx.settle_task_at(&task_scope())
+            .await
+            .expect("the task settles");
+        settle(fx).await;
+        fx.settle_team_at(&team_scope())
+            .await
+            .expect("the team settles");
+        fx.settle_task_at(&dependent_scope())
+            .await
+            .expect("the dependent settles");
+    }
+}
+
+/// The status of the task's entry on the team's board, and the code it
+/// closed under.
+async fn board_entry(fx: &Fixture) -> (rakka_agent::AgentTeamBoardEntryStatus, Option<String>) {
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = team
+        .board
+        .iter()
+        .find(|entry| &entry.task == task_scope().task())
+        .expect("the task is on the board");
+    (entry.status, entry.last_code.clone())
+}
+
+/// The dependent task's status, and what it has been told of the task it
+/// depends on.
+async fn dependent(
+    fx: &Fixture,
+) -> (
+    rakka_agent::AgentTaskStatus,
+    Option<rakka_agent::AgentTaskDependencyOutcome>,
+) {
+    let state = rakka_agent::load_agent_task_state(
+        &fx.tasks,
+        &dependent_scope(),
+        &AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the dependent loads")
+    .expect("the dependent exists");
+    let task = state.task().expect("the dependent is created");
+    let edge = task
+        .dependencies
+        .get(task_scope().task())
+        .expect("the dependent declared the edge");
+    (task.status, edge.outcome)
+}
+
+/// Not everything above a task waits for its ledger. The team's board and the
+/// tasks that depend on this one are told on the task's status, in the commit
+/// that decides it: the board entry closes and a dependent is unblocked while
+/// the accepted run still waits, and nothing changes for them when it parks.
+#[tokio::test]
+async fn a_decided_task_tells_its_board_and_its_dependents_at_once() {
+    let fx = governed_world_with_a_dependent().await;
+    assert_eq!(
+        board_entry(&fx).await,
+        (rakka_agent::AgentTeamBoardEntryStatus::Open, None)
+    );
+    assert_eq!(
+        dependent(&fx).await,
+        (rakka_agent::AgentTaskStatus::Blocked, None)
+    );
+    let evaluation = send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+
+    record(&fx, &model, turn).await;
+    settle_everyone(&fx).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelling,
+            Some("result-accepted".to_string()),
+            true
+        )
+    );
+    assert_eq!(
+        ledger_children_out(&fx).await,
+        1,
+        "the run holds its budget"
+    );
+    let told = (
+        (
+            rakka_agent::AgentTeamBoardEntryStatus::Done,
+            Some("result-accepted".to_string()),
+        ),
+        (
+            rakka_agent::AgentTaskStatus::WaitingForInput,
+            Some(rakka_agent::AgentTaskDependencyOutcome::Completed),
+        ),
+    );
+    assert_eq!(
+        (board_entry(&fx).await, dependent(&fx).await),
+        told,
+        "the board entry is closed and the dependent unblocked, over the open ledger"
+    );
+
+    record(
+        &fx,
+        &evaluation,
+        AgentRunEffectOutcome::indeterminate("connection-lost", "the evaluator died"),
+    )
+    .await;
+    settle_everyone(&fx).await;
+
+    assert_eq!(
+        standing(&fx).await.0,
+        AgentRunStatus::WaitingForReconciliation
+    );
+    assert_eq!((board_entry(&fx).await, dependent(&fx).await), told);
 }

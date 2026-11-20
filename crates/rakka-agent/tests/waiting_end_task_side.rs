@@ -6,9 +6,10 @@
 //! decided all the same, so for that while the task is terminal and its run
 //! is not.
 //!
-//! A task reports upward on its ledger, not on its status. The run returns
-//! its budget only when it ends, and until then the task tells nobody above it
-//! that it is done. These tests hold what a continuous goal sees in that
+//! A task sends what settles its budget upward on its ledger, not on its
+//! status: an epoch's result to its wake controller, and the end of its own
+//! cancellation. The run returns its budget only when it ends, and until then
+//! neither is sent. These tests hold what a continuous goal sees in that
 //! window: the wake that admitted the epoch stays held, a later occurrence
 //! waits behind it, an operator can still release it by hand, and a cancel of
 //! the goal completes only when the run has ended.
@@ -441,11 +442,6 @@ async fn an_accepted_epoch_holds_its_wake_until_its_run_ends() {
         (2, 1, 1, 0),
         "the result released the wake and the parked occurrence took its place"
     );
-    assert_eq!(
-        world.goal_attempts_spent().await,
-        2,
-        "the result carried the run's whole spend: the model call's attempt and the evaluation's"
-    );
 
     world
         .fx
@@ -519,19 +515,25 @@ async fn a_parked_accepted_epoch_holds_its_wake_until_the_park_is_answered() {
     assert_eq!(
         world.goal_attempts_spent().await,
         2,
-        "the result carried the run's whole spend: the model call's attempt and the evaluation's"
+        "the epoch's result carried the run's whole spend: the model call's attempt, and the \
+         evaluation's, which was still out when the epoch was accepted"
     );
 }
 
 /// An operator need not wait for the park. Releasing the wake by hand lets the
-/// next epoch run while the first is still parked, and the first epoch's
-/// result, when it comes at last, returns its budget and releases nothing a
-/// second time.
+/// next epoch run while the first is still parked. The first epoch's result
+/// comes at last when its park is answered: it returns the budget the goal
+/// gave that run, and it releases nothing, though by then another occurrence
+/// is active and one more is parked behind it.
+///
+/// The epochs here are each granted one loop iteration. Under a wake policy
+/// that leaves a dimension open, the parked epoch holds all the goal has in
+/// it, and the epoch admitted beside it is created with none (issue #179).
 #[tokio::test]
 async fn an_operator_can_release_the_wake_a_parked_epoch_holds() {
     let world = accepted_epoch_with_an_evaluation_out(one_iteration_epochs()).await;
     world.park_on_the_evaluation().await;
-    let (next_epoch, next_run, _) = world.a_later_occurrence(2_000_000).await;
+    let (second_epoch, second_run, _) = world.a_later_occurrence(2_000_000).await;
 
     world
         .fx
@@ -553,11 +555,11 @@ async fn an_operator_can_release_the_wake_a_parked_epoch_holds() {
 
     world
         .fx
-        .pump_epoch(&next_epoch, &next_run)
+        .pump_epoch(&second_epoch, &second_run)
         .await
         .expect("the second epoch converges");
     assert_eq!(
-        task_at(&world.fx, &next_epoch).await,
+        task_at(&world.fx, &second_epoch).await,
         Some((AgentTaskStatus::Completed, 0))
     );
     assert_eq!(world.controller().await, (2, 2, 0, 0));
@@ -572,21 +574,33 @@ async fn an_operator_can_release_the_wake_a_parked_epoch_holds() {
         "and the goal still holds the budget it gave that run"
     );
 
+    // A third occurrence is admitted and a fourth parked behind it, so a
+    // release the late result should not make would show.
+    world.a_later_occurrence(4_000_000).await;
+    world.a_later_occurrence(6_000_000).await;
+    assert_eq!(
+        world.controller().await,
+        (3, 2, 1, 1),
+        "the third occurrence is active and the fourth parked"
+    );
+    assert_eq!(world.goal_children_out().await, 2);
+
     world.answer_the_park().await;
     world
         .fx
         .pump_epoch(&world.epoch, &world.run)
         .await
         .expect("the first epoch converges");
+    assert_eq!(world.run_standing().await.0, AgentRunStatus::Completed);
     assert_eq!(
         world.goal_children_out().await,
-        0,
-        "the late result settled"
+        1,
+        "the late result returned the first epoch's budget"
     );
     assert_eq!(
         world.controller().await,
-        (2, 2, 0, 0),
-        "and released nothing a second time"
+        (3, 2, 1, 1),
+        "and released nothing: the third occurrence is still active, the fourth still parked"
     );
 }
 
