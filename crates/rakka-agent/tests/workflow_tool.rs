@@ -1754,6 +1754,189 @@ async fn an_answered_park_puts_a_run_resting_on_its_children_back_there() {
     }
 }
 
+/// Issue #123. An `Any` fan-in that resolves on its first child chases the
+/// other with a workflow cancel, and the run goes on to propose its result.
+/// The task accepts while the cancel is still out. The run used to end
+/// there; a cancel that then ended unknown parked on the ended run with no
+/// checkpoint, and nothing could answer it. The run now waits, accepted. The
+/// park opens its checkpoint as on any live run, a person answers it, and
+/// the run ends.
+#[tokio::test]
+async fn an_accepted_run_waits_for_the_stragglers_cancel_it_sent() {
+    let executor = RecordingWorkflowExecutor::new(StartMode::Started);
+    let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Invoking two workflows and awaiting any.")
+        .with_tool_call(workflow_call("invoke-1"))
+        .with_tool_call(workflow_call("invoke-2"))
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({}),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first_turn)
+                .with_turn(proposing_turn()),
+        )
+        .with_workflow_start_executor(executor),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_workflow_tools(
+        rakka_agent::AgentRunWorkflowConfig::new()
+            .with_descriptor(common::workflow_tool_descriptor().with_cancellation_support())
+            .expect("the workflow configuration should accept the descriptor"),
+    );
+    fixture.instantiate_agent().await;
+    fixture
+        .apply_task_command(goal_task_creation_command(
+            task_definition(),
+            goal_spec_draft(
+                goal_spec_with_workflow(Some(rakka_agent::AgentFanInPolicy::Any)),
+                true,
+            ),
+        ))
+        .await
+        .expect("the goal task should create");
+    fixture.pump().await.expect("the loop should converge");
+    let (_, cells) = held_starts(&fixture).await;
+    let first = cells.keys().next().expect("one").clone();
+    deliver_result(
+        &fixture,
+        &first,
+        child_workflow_run_id(&first),
+        AgentWorkflowTerminalStatus::Completed,
+    )
+    .await
+    .expect("the first child's result records");
+
+    /// The run's status, the code of its terminal reason, and its waiting
+    /// checkpoints.
+    async fn standing(
+        fixture: &Fixture,
+    ) -> (
+        AgentRunStatus,
+        Option<String>,
+        Vec<rakka_agent::AgentCheckpoint>,
+    ) {
+        let snapshot = fixture.run_snapshot().await.expect("the run exists");
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        let waiting = run
+            .state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .open_checkpoints()
+            .iter()
+            .filter(|checkpoint| checkpoint.status.is_waiting())
+            .cloned()
+            .collect();
+        (
+            snapshot.status,
+            snapshot
+                .terminal_reason
+                .as_ref()
+                .map(|reason| reason.code().to_string()),
+            waiting,
+        )
+    }
+
+    // The model proposes, and the task accepts, with the cancel out.
+    drive_model_turn_only(&fixture).await;
+    let (status, reason, waiting) = standing(&fixture).await;
+    assert_eq!(
+        (status, reason.as_deref(), waiting.len()),
+        (AgentRunStatus::Cancelling, Some("result-accepted"), 0),
+        "the result is accepted, and the run has not ended"
+    );
+    let cancel = {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .effects()
+            .iter()
+            .find(|effect| effect.kind() == rakka_agent::AgentRunEffectKind::WorkflowCancelCall)
+            .cloned()
+            .expect("the straggler's cancel is held")
+    };
+    assert_eq!(cancel.status, rakka_agent::AgentRunEffectStatus::Ready);
+
+    // The cancel's attempt ends unknown.
+    let reply = apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: cancel.result_operation_id(&run_scope()).expect("derives"),
+            effect_id: cancel.effect_id.clone(),
+            generation: cancel.generation,
+            attempt: cancel.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the recovery retry was refused",
+            )),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply, rakka_agent::AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    let (status, reason, waiting) = standing(&fixture).await;
+    assert_eq!(
+        (status, reason.as_deref()),
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            Some("result-accepted")
+        )
+    );
+    assert_eq!(waiting.len(), 1, "the park opened its checkpoint");
+    assert_eq!(
+        waiting[0].kind,
+        rakka_agent::AgentCheckpointKind::IndeterminateEffectReconciliation
+    );
+    assert_eq!(waiting[0].bound_effect.effect_id, cancel.effect_id);
+
+    // A person answers it, and the run ends as its accepted result says.
+    let reply = apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "the-stragglers-cancel",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id: waiting[0].checkpoint_id.clone(),
+            resolver: rakka_agent_workflow::PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(rakka_agent::AgentCheckpointDecision::Reconciliation(
+                rakka_agent::AgentReconciliationDecision::AbandonAndFail,
+            )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply, rakka_agent::AgentRunEntityReply::Applied { .. }),
+        "{reply:?}"
+    );
+    let (status, reason, waiting) = standing(&fixture).await;
+    assert_eq!(
+        (status, reason.as_deref(), waiting.len()),
+        (AgentRunStatus::Completed, Some("result-accepted"), 0)
+    );
+}
+
 /// A run with a straggler's workflow cancel out goes back to `Running` when
 /// a claim append's park is answered.
 ///

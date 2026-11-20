@@ -1,0 +1,888 @@
+//! What a run does when its end is decided while it still holds a call it
+//! sent.
+//!
+//! Specification: sections 8.7 and 11.5. A run must not become terminal over
+//! work whose outcome it does not know. A run that winds down waited for
+//! that already. A run whose end was decided for it did not: its result
+//! accepted, its proposal refused, its budget spent. It ended at once, and
+//! an ended run takes no result and answers no checkpoint for most kinds of
+//! call. Issues #172, #173 and #123 are what that left: a goal evaluation
+//! `Ready` for good, an evaluation's reconciliation checkpoint nothing could
+//! answer, and a compensation or workflow cancel that parked with no
+//! checkpoint at all.
+//!
+//! The end now waits. The run records the reason it was given, takes the
+//! results of the calls it sent and answers their parks as any live run
+//! does, and ends under that reason when the last of them is known.
+
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+
+use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
+use rakka_agent::{
+    agent_operational_snapshot, evaluation_operation_id, AgentCheckpoint, AgentCheckpointDecision,
+    AgentCheckpointKind, AgentCompensationRef, AgentDecisionEventVocabulary, AgentEffectPolicies,
+    AgentLoopState, AgentModelTurn, AgentModelUsage, AgentOperationId, AgentOperationKind,
+    AgentReconciliationDecision, AgentRevisionNumber, AgentRunEffect, AgentRunEffectKind,
+    AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunEntityReply,
+    AgentRunError, AgentRunStatus, AgentSchemaPolicy, AgentTaskContent, InMemoryAgentRunEffectSink,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+};
+use rakka_agent_workflow::{HumanCheckpointId, PrincipalRef};
+use rakka_persistence::DurableStateStore;
+
+mod common;
+
+use common::*;
+
+/// The compensation an operator schedules for a call whose outcome is
+/// unknown.
+const COMPENSATION: &str = "refund-charge";
+
+fn usage() -> AgentModelUsage {
+    AgentModelUsage {
+        input_tokens: 8,
+        output_tokens: 4,
+        cost_micros: 2,
+        ..Default::default()
+    }
+}
+
+/// The run's durable loop state, read exactly as recovery reads it.
+async fn loop_state(fx: &Fixture) -> AgentLoopState {
+    rakka_agent::load_agent_run_state(&fx.runs, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .expect("the run state exists")
+        .loop_state()
+        .expect("the loop state exists")
+        .clone()
+}
+
+async fn status(fx: &Fixture) -> AgentRunStatus {
+    fx.run_snapshot().await.expect("the run exists").status
+}
+
+/// The run's stored revision.
+async fn revision(fx: &Fixture) -> rakka_persistence::Revision {
+    fx.runs
+        .load(&run_scope().persistence_id())
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists")
+        .revision
+}
+
+async fn apply(
+    fx: &Fixture,
+    command: AgentRunEntityCommand,
+) -> Result<AgentRunEntityReply, AgentRunError> {
+    let mut run = fx.run();
+    run.recover(fx.now()).await?;
+    run.apply(command, &fx.router, fx.now()).await
+}
+
+/// Runs the run's settle pass from durable state.
+async fn settle(fx: &Fixture) {
+    let mut run = fx.run();
+    let now = fx.now();
+    run.recover(now).await.expect("the run recovers");
+    run.settle_side_effects(&fx.router, now)
+        .await
+        .expect("the run settles");
+}
+
+async fn record(fx: &Fixture, effect: &AgentRunEffect, outcome: AgentRunEffectOutcome) {
+    apply(
+        fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: 1,
+            fence: 1,
+            outcome: Box::new(outcome),
+        },
+    )
+    .await
+    .expect("the result applies");
+}
+
+fn resolver() -> PrincipalRef {
+    PrincipalRef {
+        principal_type: "user".to_string(),
+        principal_id: "operator".to_string(),
+        display_name: None,
+    }
+}
+
+fn decision_key(discriminator: &str) -> AgentOperationId {
+    AgentOperationId::for_agent(
+        AgentOperationKind::CheckpointResolution,
+        &agent_scope(),
+        discriminator,
+    )
+    .expect("the decision key derives")
+}
+
+async fn decide(
+    fx: &Fixture,
+    checkpoint_id: &HumanCheckpointId,
+    key: &str,
+    decision: AgentCheckpointDecision,
+) -> Result<AgentRunEntityReply, AgentRunError> {
+    apply(
+        fx,
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: decision_key(key),
+            checkpoint_id: checkpoint_id.clone(),
+            resolver: resolver(),
+            decision: Box::new(decision),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await
+}
+
+fn compensate() -> AgentCheckpointDecision {
+    AgentCheckpointDecision::Reconciliation(AgentReconciliationDecision::Compensate {
+        compensation: AgentCompensationRef::new(COMPENSATION)
+            .expect("the compensation ref is valid"),
+    })
+}
+
+/// The checkpoints the run holds that still wait for a decision.
+async fn waiting(fx: &Fixture) -> Vec<AgentCheckpoint> {
+    loop_state(fx)
+        .await
+        .open_checkpoints()
+        .iter()
+        .filter(|checkpoint| checkpoint.status.is_waiting())
+        .cloned()
+        .collect()
+}
+
+/// The one checkpoint of `kind` the run holds, whatever its status.
+async fn held(fx: &Fixture, kind: AgentCheckpointKind) -> AgentCheckpoint {
+    let held: Vec<AgentCheckpoint> = loop_state(fx)
+        .await
+        .open_checkpoints()
+        .iter()
+        .filter(|checkpoint| checkpoint.kind == kind)
+        .cloned()
+        .collect();
+    assert_eq!(held.len(), 1, "one {kind} checkpoint is held: {held:?}");
+    held.into_iter().next().expect("one checkpoint")
+}
+
+/// The attempts the run holds reserved are those of the calls it still waits
+/// on: a call that has an outcome, or was cancelled before it was sent, holds
+/// none.
+async fn assert_only_what_is_out_is_reserved(fx: &Fixture, at: &str) {
+    let state = loop_state(fx).await;
+    let out: u64 = state
+        .outstanding_effects()
+        .map(|effect| u64::from(effect.max_attempts))
+        .sum();
+    assert_eq!(
+        state.budget().reserved_attempts(),
+        out,
+        "{at}: the attempts reserved are those of the calls still out: {:?}",
+        state
+            .effects()
+            .iter()
+            .map(|effect| (effect.kind(), effect.status, effect.max_attempts))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The checkpoints the run's operational snapshot lists as open.
+async fn listed_open(fx: &Fixture) -> usize {
+    agent_operational_snapshot(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists")
+    .open_checkpoints
+    .len()
+}
+
+/// Two more settle passes write nothing and record nothing.
+async fn assert_at_rest(fx: &Fixture, sink: &CountingDecisionSink) {
+    settle(fx).await;
+    let rested = (revision(fx).await, sink.events(&run_scope()));
+    settle(fx).await;
+    assert_eq!(
+        (revision(fx).await, sink.events(&run_scope())),
+        rested,
+        "a further settle pass writes nothing"
+    );
+    assert_decision_stream_whole(sink, &run_scope());
+}
+
+/// A goal-bearing world whose turn one proposes a result and calls nothing,
+/// returned with the model call out. Its decisions reach the returned sink.
+async fn proposing_goal_world() -> (Fixture, Arc<CountingDecisionSink>) {
+    goal_world_proposing("resolved", task_definition()).await
+}
+
+/// [`proposing_goal_world`], with the answer every turn proposes and the
+/// task's definition chosen. The task's rule wants a non-empty answer, so an
+/// empty one is rejected.
+async fn goal_world_proposing(
+    answer: &str,
+    definition: rakka_agent::AgentTaskDefinition,
+) -> (Fixture, Arc<CountingDecisionSink>) {
+    let proposing = || {
+        AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+            .with_text("Done.")
+            .with_proposal(
+                AgentTaskContent::inline(serde_json::json!({ "answer": answer }))
+                    .expect("the proposal is inline-bounded"),
+            )
+            .with_usage(usage())
+    };
+    let sink = CountingDecisionSink::new();
+    let fx = Fixture::with_sink(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn_for(1, proposing())
+                .with_turn_for(2, proposing()),
+        ),
+        InMemoryAgentRunEffectSink::new(),
+        AgentEffectPolicies::default(),
+        Arc::new(AtomicU64::new(1)),
+    )
+    .with_decision_events(sink.clone())
+    .with_decision_event_vocabulary(AgentDecisionEventVocabulary::Version2);
+    fx.instantiate_agent().await;
+    fx.apply_task_command(goal_task_creation_command(
+        definition,
+        goal_spec_draft(goal_spec_with_evaluator(), true),
+    ))
+    .await
+    .expect("the goal-bearing creation applies");
+    settle(&fx).await;
+    (fx, sink)
+}
+
+/// The goal evaluation the run holds.
+async fn evaluation_of(fx: &Fixture) -> AgentRunEffect {
+    loop_state(fx)
+        .await
+        .effects()
+        .iter()
+        .find(|effect| effect.kind() == AgentRunEffectKind::GoalEvaluationCall)
+        .cloned()
+        .expect("the run holds its goal evaluation")
+}
+
+// ---------------------------------------------------------------------------
+// The tests
+// ---------------------------------------------------------------------------
+
+/// The run's status, the code of the reason it will end or has ended under,
+/// and whether its result was accepted.
+async fn standing(fx: &Fixture) -> (AgentRunStatus, Option<String>, bool) {
+    let snapshot = fx.run_snapshot().await.expect("the run exists");
+    (
+        snapshot.status,
+        snapshot
+            .terminal_reason
+            .as_ref()
+            .map(|reason| reason.code().to_string()),
+        loop_state(fx).await.accepted_result().is_some(),
+    )
+}
+
+/// Commands an evaluation the spec does not gate, which is sent at once.
+async fn send_an_evaluation(fx: &Fixture) -> AgentRunEffect {
+    apply(
+        fx,
+        AgentRunEntityCommand::EvaluateGoal {
+            operation_id: evaluation_operation_id(&run_scope(), "1")
+                .expect("the operation id derives"),
+            evaluation: Box::new(goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+        },
+    )
+    .await
+    .expect("the evaluation commits");
+    let evaluation = evaluation_of(fx).await;
+    assert_eq!(
+        evaluation.status,
+        AgentRunEffectStatus::Ready,
+        "the ungated evaluation was sent"
+    );
+    evaluation
+}
+
+/// The model call the run holds.
+async fn model_call_of(fx: &Fixture) -> AgentRunEffect {
+    loop_state(fx)
+        .await
+        .effects()
+        .iter()
+        .find(|effect| effect.kind() == AgentRunEffectKind::ModelCall)
+        .cloned()
+        .expect("the run holds its model call")
+}
+
+/// Issue #172. A run awaits its model call with a goal evaluation out. The
+/// model proposes a result and calls nothing, and the task accepts. The run
+/// used to end `Completed` there, holding the evaluation `Ready` for good:
+/// the dispatcher cancels an ended run's ticket and the ended run refused to
+/// hear so. It now waits, accepted, takes the cancellation, and ends.
+#[tokio::test]
+async fn an_accepted_run_waits_for_the_evaluation_it_sent() {
+    let (fx, sink) = proposing_goal_world().await;
+    let evaluation = send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+
+    record(&fx, &model, turn).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelling,
+            Some("result-accepted".to_string()),
+            true
+        ),
+        "the result is accepted, and the run has not ended"
+    );
+    assert_eq!(evaluation_of(&fx).await.status, AgentRunEffectStatus::Ready);
+    assert_only_what_is_out_is_reserved(&fx, "while the evaluation is out").await;
+
+    // What the dispatcher reports for a ticket of a run that is winding down.
+    record(
+        &fx,
+        &evaluation,
+        AgentRunEffectOutcome::Cancelled {
+            reason: "run-cancelled".to_string(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Completed,
+            Some("result-accepted".to_string()),
+            true
+        ),
+        "the run ends as its accepted result says"
+    );
+    assert_eq!(
+        evaluation_of(&fx).await.status,
+        AgentRunEffectStatus::Cancelled
+    );
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// Issue #173. The evaluation's result lands unknown while the run's
+/// proposal is with the task, and the task then accepts. The run used to end
+/// `Completed` holding the reconciliation checkpoint, which an ended run
+/// answers for no goal evaluation. It now stays parked, accepted, until a
+/// person answers, and then ends.
+#[tokio::test]
+async fn an_accepted_run_parked_on_an_unknown_outcome_is_answered_before_it_ends() {
+    let (fx, sink) = proposing_goal_world().await;
+    let evaluation = send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    // The task cannot be reached, so the proposal stays with the courier.
+    let nowhere = rakka_agent::AgentExchangeRouter::new();
+    for (effect, outcome) in [
+        (&model, turn),
+        (
+            &evaluation,
+            AgentRunEffectOutcome::indeterminate("connection-lost", "the evaluator died"),
+        ),
+    ] {
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("the run recovers");
+        run.apply(
+            AgentRunEntityCommand::RecordEffectResult {
+                operation_id: effect
+                    .result_operation_id(&run_scope())
+                    .expect("the result operation id derives"),
+                effect_id: effect.effect_id.clone(),
+                generation: effect.generation,
+                attempt: 1,
+                fence: 1,
+                outcome: Box::new(outcome),
+            },
+            &nowhere,
+            fx.now(),
+        )
+        .await
+        .expect("the result applies");
+    }
+    assert_eq!(status(&fx).await, AgentRunStatus::WaitingForReconciliation);
+    let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+
+    fx.pump().await.expect("the task accepts the result");
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            Some("result-accepted".to_string()),
+            true
+        ),
+        "the result is accepted, and the run is still parked"
+    );
+    assert_eq!(
+        waiting(&fx)
+            .await
+            .iter()
+            .map(|checkpoint| checkpoint.checkpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![park.checkpoint_id.clone()]
+    );
+
+    decide(
+        &fx,
+        &park.checkpoint_id,
+        "answer",
+        AgentCheckpointDecision::Reconciliation(AgentReconciliationDecision::AbandonAndFail),
+    )
+    .await
+    .expect("the parked run answers its checkpoint");
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Completed,
+            Some("result-accepted".to_string()),
+            true
+        ),
+        "the answer ends the run as its accepted result says"
+    );
+    assert_eq!(
+        evaluation_of(&fx).await.status,
+        AgentRunEffectStatus::Failed
+    );
+    assert_eq!(waiting(&fx).await, Vec::new());
+    assert_eq!(listed_open(&fx).await, 0);
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// The evaluation's own result lands after the acceptance. The waiting run
+/// takes it, as a run that is winding down takes the result of any call it
+/// sent, and ends. This world wires no evaluator, so the result is a
+/// failure, which a run survives for a goal evaluation.
+#[tokio::test]
+async fn an_accepted_run_takes_the_result_of_the_evaluation_it_sent() {
+    let (fx, sink) = proposing_goal_world().await;
+    let evaluation = send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    record(&fx, &model, turn).await;
+    assert_eq!(status(&fx).await, AgentRunStatus::Cancelling);
+
+    let result = fx.dispatcher.answer(&evaluation).await;
+    let settles_as = result.resolved_status();
+    assert_eq!(settles_as, AgentRunEffectStatus::Failed);
+    record(&fx, &evaluation, result).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Completed,
+            Some("result-accepted".to_string()),
+            true
+        ),
+        "a failed evaluation does not take the accepted result away"
+    );
+    assert_eq!(evaluation_of(&fx).await.status, settles_as);
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// A run that holds nothing it sent ends at once, as it always did.
+#[tokio::test]
+async fn an_accepted_run_that_holds_nothing_ends_at_once() {
+    let (fx, sink) = proposing_goal_world().await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+
+    record(&fx, &model, turn).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Completed,
+            Some("result-accepted".to_string()),
+            true
+        )
+    );
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// Answers the model call while the task cannot be reached, so the run's
+/// proposal stays with the courier until a settle pass delivers it.
+async fn propose_out_of_reach(fx: &Fixture) {
+    let model = model_call_of(fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    let nowhere = rakka_agent::AgentExchangeRouter::new();
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: model
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: model.effect_id.clone(),
+            generation: model.generation,
+            attempt: 1,
+            fence: 1,
+            outcome: Box::new(turn),
+        },
+        &nowhere,
+        fx.now(),
+    )
+    .await
+    .expect("the model's answer applies");
+    assert!(
+        loop_state(fx).await.proposal().is_some(),
+        "the proposal is with the courier"
+    );
+}
+
+/// What the dispatcher reports for the ticket of a run that is winding
+/// down: the call was never invoked.
+fn never_invoked() -> AgentRunEffectOutcome {
+    AgentRunEffectOutcome::Cancelled {
+        reason: "run-cancelled".to_string(),
+    }
+}
+
+/// Cancels the run, as an operator does.
+async fn cancel_the_run(fx: &Fixture) {
+    apply(
+        fx,
+        AgentRunEntityCommand::Cancel {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::Cancellation,
+                [TENANT, AGENT, "cancel-1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+    )
+    .await
+    .expect("the cancellation applies");
+}
+
+/// Issue #123. A run is winding down for a compensation it has sent when the
+/// task accepts its result. Acceptance wins the race, and the run used to
+/// end there with the compensation in flight. It now waits for it, and ends
+/// as accepted when the compensation is known.
+#[tokio::test]
+async fn an_accepted_run_waits_for_the_compensation_it_sent() {
+    let (fx, sink) = proposing_goal_world().await;
+    let evaluation = send_an_evaluation(&fx).await;
+    propose_out_of_reach(&fx).await;
+    record(
+        &fx,
+        &evaluation,
+        AgentRunEffectOutcome::indeterminate("connection-lost", "the evaluator died"),
+    )
+    .await;
+    let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+    decide(&fx, &park.checkpoint_id, "compensate", compensate())
+        .await
+        .expect("the compensation is scheduled");
+    let compensation = loop_state(&fx)
+        .await
+        .effects()
+        .iter()
+        .find(|effect| effect.kind() == AgentRunEffectKind::CompensationCall)
+        .cloned()
+        .expect("the run holds its compensation");
+    assert_eq!(compensation.status, AgentRunEffectStatus::Ready);
+    let accepted = standing(&fx).await;
+    assert_eq!(
+        accepted,
+        (
+            AgentRunStatus::Cancelling,
+            Some("result-accepted".to_string()),
+            true
+        ),
+        "the decision's own settle delivered the proposal, and the task accepted"
+    );
+
+    let result = fx.dispatcher.answer(&compensation).await;
+    record(&fx, &compensation, result).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Completed,
+            Some("result-accepted".to_string()),
+            true
+        )
+    );
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// A run that is cancelling holds a proposal and a call it sent. The task
+/// rejects the proposal. A cancelling run takes no further turn, and it used
+/// to end there, with the call still out. It now goes on winding down,
+/// without the proposal the task has answered, and ends as cancelled when
+/// the call is known.
+#[tokio::test]
+async fn a_cancelling_run_whose_proposal_is_rejected_goes_on_winding_down() {
+    let (fx, sink) = goal_world_proposing("", task_definition()).await;
+    let evaluation = send_an_evaluation(&fx).await;
+    propose_out_of_reach(&fx).await;
+    cancel_the_run(&fx).await;
+
+    settle(&fx).await;
+
+    let state = loop_state(&fx).await;
+    assert_eq!(
+        (
+            standing(&fx).await,
+            state.proposal().is_some(),
+            state.turn()
+        ),
+        (
+            (
+                AgentRunStatus::Cancelling,
+                Some("cancellation-requested".to_string()),
+                false
+            ),
+            false,
+            1
+        ),
+        "the rejection is taken, no turn begins, and the run still waits"
+    );
+    assert_eq!(evaluation_of(&fx).await.status, AgentRunEffectStatus::Ready);
+
+    record(&fx, &evaluation, never_invoked()).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelled,
+            Some("cancellation-requested".to_string()),
+            false
+        )
+    );
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// The task's last rejection ends a run. One that still holds a call it sent
+/// waits for it, and then ends as the rejection says.
+#[tokio::test]
+async fn a_run_out_of_rejections_waits_for_the_evaluation_it_sent() {
+    let definition = task_definition()
+        .with_limits(rakka_agent::AgentTaskLimits::new().with_max_result_rejections(1));
+    let (fx, sink) = goal_world_proposing("", definition).await;
+    let evaluation = send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+
+    record(&fx, &model, turn).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelling,
+            Some("result-rejections-exhausted".to_string()),
+            false
+        )
+    );
+
+    record(&fx, &evaluation, never_invoked()).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Failed,
+            Some("result-rejections-exhausted".to_string()),
+            false
+        )
+    );
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// A budget that cannot be topped up ends a run. Here the next turn would
+/// put a second call out beside the evaluation, past the ceiling. The run
+/// waits for the evaluation it sent, and then ends as the budget says.
+#[tokio::test]
+async fn a_run_out_of_budget_waits_for_the_evaluation_it_sent() {
+    let definition = task_definition().with_budgets(rakka_agent::AgentBudgetCeilings {
+        max_concurrent_effects: Some(1),
+        ..rakka_agent::AgentBudgetCeilings::unbounded()
+    });
+    let (fx, sink) = goal_world_proposing("", definition).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    let nowhere = rakka_agent::AgentExchangeRouter::new();
+    {
+        // The model answers while the task cannot be reached, so the
+        // evaluation below is the only call out when the rejection lands.
+        let mut run = fx.run();
+        run.recover(fx.now()).await.expect("the run recovers");
+        run.apply(
+            AgentRunEntityCommand::RecordEffectResult {
+                operation_id: model
+                    .result_operation_id(&run_scope())
+                    .expect("the result operation id derives"),
+                effect_id: model.effect_id.clone(),
+                generation: model.generation,
+                attempt: 1,
+                fence: 1,
+                outcome: Box::new(turn),
+            },
+            &nowhere,
+            fx.now(),
+        )
+        .await
+        .expect("the model's answer applies");
+    }
+    let evaluation = send_an_evaluation(&fx).await;
+
+    settle(&fx).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelling,
+            Some("budget-exhausted".to_string()),
+            false
+        ),
+        "the rejection began a turn the budget refused, and the run waits"
+    );
+    assert_eq!(evaluation_of(&fx).await.status, AgentRunEffectStatus::Ready);
+
+    record(&fx, &evaluation, never_invoked()).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Failed,
+            Some("budget-exhausted".to_string()),
+            false
+        )
+    );
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// Nothing is fed to the run by hand here. The dispatcher finds the ticket of
+/// a run that is winding down, settles it, and tells the run, which ends.
+#[tokio::test]
+async fn the_dispatcher_settles_what_an_accepted_run_waits_for() {
+    let (fx, sink) = proposing_goal_world().await;
+    send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    record(&fx, &model, turn).await;
+    assert_eq!(status(&fx).await, AgentRunStatus::Cancelling);
+
+    fx.pump().await.expect("the pass runs");
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Completed,
+            Some("result-accepted".to_string()),
+            true
+        )
+    );
+    assert!(
+        !evaluation_of(&fx).await.is_outstanding(),
+        "the evaluation is settled"
+    );
+    assert_only_what_is_out_is_reserved(&fx, "after the end").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
+/// Rewrites the stored run record's loop state through `edit`, as JSON.
+async fn rewrite_loop_state(
+    fx: &Fixture,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let id = run_scope().persistence_id();
+    let record = fx
+        .runs
+        .load(&id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    edit(
+        value["run"]["loop_state"]
+            .as_object_mut()
+            .expect("the loop state is an object"),
+    );
+    let rewritten = serde_json::from_value(value).expect("the rewritten record deserializes");
+    fx.runs
+        .compare_and_set(&id, record.revision, rewritten)
+        .await
+        .expect("the rewritten record persists");
+}
+
+/// Mixed builds. An older build can load a run this build left waiting. It
+/// takes the call's result, and then does not end the run: its wind-down
+/// still waits for the proposal, which stays on the record. The record it
+/// leaves is `Cancelling` with nothing out. This build's next settle pass
+/// ends it.
+#[tokio::test]
+async fn a_waiting_run_an_older_build_settled_is_ended_by_the_next_settle_pass() {
+    let (fx, sink) = proposing_goal_world().await;
+    send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    record(&fx, &model, turn).await;
+    assert_eq!(status(&fx).await, AgentRunStatus::Cancelling);
+    // What the older build's result transition leaves: the call settled and
+    // its attempts released, the run still `Cancelling`.
+    let released = evaluation_of(&fx).await.max_attempts;
+    rewrite_loop_state(&fx, |loop_state| {
+        let mut settled = 0;
+        for effect in loop_state["effects"]
+            .as_array_mut()
+            .expect("the effects are an array")
+        {
+            if effect["status"].as_str() == Some("ready") {
+                effect["status"] = serde_json::json!("cancelled");
+                settled += 1;
+            }
+        }
+        assert_eq!(settled, 1, "the record holds one call that is out");
+        let reserved = &mut loop_state["budget"]["reserved_attempts"];
+        let held = reserved.as_u64().expect("the reservation is a number");
+        *reserved = serde_json::json!(held - u64::from(released));
+    })
+    .await;
+    assert_eq!(status(&fx).await, AgentRunStatus::Cancelling);
+    assert_only_what_is_out_is_reserved(&fx, "as the older build left it").await;
+
+    settle(&fx).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Completed,
+            Some("result-accepted".to_string()),
+            true
+        )
+    );
+    assert_at_rest(&fx, &sink).await;
+}
