@@ -538,7 +538,7 @@ itself. Failure backs the goal off through durable re-wakes and escalates into
 suspension; an exhausted goal window defers to the window boundary. An
 occurrence whose epoch the goal's own ledger cannot pay for is deferred too,
 and no epoch is created for it: it is admitted when an epoch still out returns
-the budget, and where nothing can, the goal's exhaustion policy decides. Between
+the budget, and where no epoch holds any, the goal's exhaustion policy decides. Between
 every wake, admission, epoch, and result the controller, task, and run may
 passivate. Three things reactivate them, and nothing else: the wake scanner
 over the durable timer index for a scheduled occurrence, an `AdmitWake` command
