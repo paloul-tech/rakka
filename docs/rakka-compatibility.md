@@ -797,24 +797,25 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **What was wrong.** An epoch's budget is debited from the goal's ledger when its wake is admitted, narrowed to what the goal has left. A goal with nothing left in a dimension still admitted its next wake. The epoch was created with zero in that dimension: its task was refused its run `budget-unavailable` on every pass, stayed `Created`, and held the wake that admitted it. The goal stayed `active` with its gate open, and its exhaustion policy was never asked. The same epoch was created with budget left, where a second epoch was admitted while the first still held all the goal had in a dimension the wake policy leaves open.
 
-  **The rule.** An occurrence is admitted only when the goal's own ledger can pay for its epoch: the wake policy's epoch budget, narrowed to what the goal has left, must not be empty in a dimension the epoch's run works in.
+  **The rule.** An occurrence is admitted only when the goal's own ledger can pay for its epoch. The ledger cannot pay where the goal itself has nothing left in a dimension the epoch's run works in.
 
   | The goal cannot pay for the occurrence's epoch | Before | Now |
   |---|---|---|
   | An epoch still out holds that dimension | Admitted. The epoch was created with none, never ran, and held the wake | Parked, disposition `Deferred` naming the dimension. Admitted when that epoch's result returns its budget |
-  | Nothing still out holds it, and the goal has a contract | The same, with the goal left `active` | Parked, and the goal's exhaustion policy decides in the same transition: it parks the goal and closes the gate, or escalates, or ends the goal and its control task. A `ResumeGoal` that tops the goal up admits the occurrence |
-  | Nothing still out holds it, and the control task has no goal record | The same | Parked. There is no policy to ask |
+  | No epoch still out holds it, and the goal is authorized under a contract | The same, with the goal left `active` | Parked, and the goal's exhaustion policy decides: it parks the goal and closes the gate, or escalates, or ends the goal and its control task. A `ResumeGoal` that tops up every dimension the epoch is short in admits the occurrence |
+  | No epoch still out holds it, and the control task has no goal record or its goal is only proposed | The same | Parked. There is no policy to ask |
 
   A parked occurrence creates no epoch, debits nothing, is not charged to the goal window and holds no place.
 
   **What a deployment sees.**
 
-  - A wake that was reported `admitted` into an epoch that never ran is now reported `deferred`, and the controller's `deferred` count moves in place of `admitted`. `Deferred` already meant an occurrence the goal window could not pay for. The disposition does not say which refused; the dimension and the goal's wait reason do.
-  - A goal that runs out now reports it: `Waiting` with a `budget-exhausted` reason and a suspended gate, or terminal, as its policy says.
-  - An agent-owned continuous goal whose own run is granted all of a bounded dimension cannot pay for an epoch while that run is out. Its wakes were admitted into epochs that never ran. They are now parked until that run returns its budget. Declaring a per-run allocation on the definition leaves room for epochs.
+  - A wake that was reported `admitted` into an epoch that never ran is now reported `deferred`, and the controller's `deferred` count moves in place of `admitted`. `Deferred` already meant an occurrence the goal window could not pay for, and the disposition does not say which refused. Where the goal's policy was asked, the goal's wait reason says it was the ledger.
+  - A goal that runs out now reports it. Under a park policy it is `Waiting` with the reason `budget-exhausted` and a suspended gate; under an escalate policy the reason is `escalated`; under a terminate policy the goal and its control task end. The delivery that ends a goal is itself reported `deferred`.
+  - **The policy is asked at a delivery and at an epoch's result,** where an occurrence is parked, a place is free and the gate is open. During a failure backoff that is the backoff's retry. It is not asked inside a resume, an activation or an operator's release: there the occurrence stays parked and the next delivery or result asks. So after a resume that tops up one dimension and leaves another empty, the goal reads `Active` over a parked occurrence until then.
+  - **An agent-owned continuous goal whose own run holds all of a bounded dimension cannot pay for an epoch,** and that run's budget comes back only when the task ends. Its wakes were admitted into epochs that never ran. Its policy is now asked at the first of them. Declaring a per-run allocation on the definition leaves room for epochs.
   - **An epoch's result that arrives after its wake was released by hand can now admit a parked occurrence.** That result returns the budget the occurrence waited for. Before, such a result promoted nothing.
-  - The policy is asked where an occurrence arrives or a place comes free: a delivery, an epoch's result, an operator's release. A resume that leaves the ledger short admits nothing, and the next delivery or release asks the policy.
   - A parked occurrence is retried by a delivery, an epoch's result, an operator's release and a resume. Budget that comes back another way, from the goal's own run on an agent-owned continuous goal, does not retry it; the next of those does.
+  - A wake policy whose own epoch budget is zero in a dimension the epoch's run asks for, on a goal that still has budget there, is the policy's contradiction and not the goal's exhaustion. It still admits an epoch that cannot run, as before.
 
   **API.** `AgentWakeControllerState` gains `admit_within`, `promote_admittable_within` and `release_within`, which take the dimension in which the goal's ledger cannot pay, and `holds_admittable`. `admit`, `promote_admittable` and `release` are unchanged and mean that the ledger can pay.
 
