@@ -687,3 +687,334 @@ async fn activating_a_goal_admits_nothing_it_cannot_pay_for() {
         .expect("the control task settles");
     assert_eq!(task_at(&fx, &first.epoch).await, None);
 }
+
+/// An epoch whose wake was released by hand returns its budget with its
+/// result, and that result retries the occurrence that waited. It promotes it
+/// only if the goal can now pay. Here the epoch spent the goal's one
+/// iteration, so its result returns nothing: the occurrence stays parked, no
+/// epoch is created, and the goal parks.
+#[tokio::test]
+async fn a_late_result_that_returns_nothing_promotes_nothing() {
+    let fx = fixture(1);
+    goal_with(&fx, 1, AgentGoalExhaustionAction::Park).await;
+    let first = deliver(&fx, 5).await;
+    assert!(first.disposition.is_admission());
+    run_until_its_model_call_is_out(&fx, &first).await;
+    let second = deliver(&fx, 1_000_005).await;
+    fx.apply_task_command(AgentTaskEntityCommand::CompleteWakeOccurrence {
+        operation_id: operation("manual-release"),
+        wake: first.wake.clone(),
+    })
+    .await
+    .expect("the manual release applies");
+    assert_eq!(
+        (controller(&fx).await, goal_record(&fx).await.status()),
+        ((1, 1, 0, 1), AgentGoalStatus::Active),
+        "the occurrence waits for the budget the released epoch still holds"
+    );
+
+    fx.pump_epoch(&first.epoch, &first.run)
+        .await
+        .expect("the first epoch converges");
+
+    assert_eq!(
+        controller(&fx).await,
+        (1, 1, 0, 1),
+        "the late result returned nothing, and promoted nothing"
+    );
+    assert_eq!(task_at(&fx, &second.epoch).await, None);
+    assert_eq!(goal_record(&fx).await.status(), AgentGoalStatus::Waiting);
+    assert_eq!(
+        gate(&fx).await,
+        (
+            AgentGoalLifecycleStatus::Suspended,
+            Some("budget-exhausted".to_string())
+        )
+    );
+}
+
+/// A resume that tops up the dimension the goal parked on, and leaves
+/// another one empty, admits nothing: the occurrence that waited is not
+/// promoted into an epoch with no model calls. The policy is not asked again
+/// inside the resume, so the goal reads `Active` until the next delivery or
+/// result asks.
+#[tokio::test]
+async fn a_resume_that_relieves_one_dimension_admits_nothing() {
+    let fx = fixture(2);
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec();
+    spec.allocation = AgentBudgetAllocation {
+        loop_iterations: Some(1),
+        model_calls: Some(1),
+        ..AgentBudgetAllocation::unbounded()
+    };
+    spec.exhaustion.default = AgentGoalExhaustionAction::Park;
+    fx.apply_task_command(continuous_goal_control_creation_command(
+        continuous_goal_mode(wake_policy()),
+        goal_spec_draft(spec, true),
+    ))
+    .await
+    .expect("the goal's control task is created");
+    run_an_epoch(&fx, 5).await;
+    let second = deliver(&fx, 1_000_005).await;
+    let goal = goal_record(&fx).await;
+    let Some(AgentGoalWaitReason::BudgetExhausted { exhaustion }) = goal.wait() else {
+        panic!("expected a budget park, got {:?}", goal.wait());
+    };
+    let mut top_up = AgentBudgetAllocation::unbounded();
+    for dimension in AgentBudgetDimension::CONSERVED {
+        top_up.set(dimension, Some(0));
+    }
+    top_up.set(exhaustion.dimension, Some(1));
+
+    fx.apply_task_command(AgentTaskEntityCommand::ResumeGoal {
+        operation_id: operation("resume"),
+        expected_status_revision: goal.status_revision(),
+        top_up: Some(Box::new(top_up)),
+        provenance: Box::new(provenance(91)),
+    })
+    .await
+    .expect("the resume applies");
+
+    assert_eq!(goal_record(&fx).await.status(), AgentGoalStatus::Active);
+    assert_eq!(
+        controller(&fx).await,
+        (1, 1, 0, 1),
+        "one dimension is relieved and another is still empty: nothing is admitted"
+    );
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("the control task settles");
+    assert_eq!(task_at(&fx, &second.epoch).await, None);
+}
+
+/// A wake policy that itself grants nothing in a dimension is not the goal's
+/// exhaustion: the goal's ledger can pay all the policy asks of it. The goal
+/// is not ended for it, and admission goes on as it did.
+#[tokio::test]
+async fn a_wake_policys_own_zero_is_not_read_as_the_goals_exhaustion() {
+    let fx = fixture(1);
+    fx.instantiate_agent().await;
+    let mut budget = AgentBudgetAllocation::unbounded();
+    budget.set(AgentBudgetDimension::ModelCalls, Some(8));
+    budget.set(AgentBudgetDimension::ToolCalls, Some(0));
+    let policy = rakka_agent::AgentWakePolicy::new(
+        [rakka_agent::AgentWakeTriggerKind::DurableTimer],
+        budget,
+        Some(60_000),
+    )
+    .expect("the wake policy is valid");
+    let mut spec = goal_spec();
+    spec.allocation = AgentBudgetAllocation {
+        loop_iterations: Some(3),
+        ..AgentBudgetAllocation::unbounded()
+    };
+    spec.exhaustion.default = AgentGoalExhaustionAction::Terminate;
+    fx.apply_task_command(continuous_goal_control_creation_command(
+        continuous_goal_mode(policy),
+        goal_spec_draft(spec, true),
+    ))
+    .await
+    .expect("the goal's control task is created");
+
+    let first = deliver(&fx, 5).await;
+
+    assert!(
+        first.disposition.is_admission(),
+        "the goal can pay what the policy asks, got {:?}",
+        first.disposition
+    );
+    assert_eq!(goal_record(&fx).await.status(), AgentGoalStatus::Active);
+    assert_eq!(
+        task_at(&fx, &task_scope()).await.map(|(status, _)| status),
+        Some(AgentTaskStatus::WaitingForInput)
+    );
+}
+
+/// An agent-owned continuous goal has a run of its own, whose budget is a
+/// child of the same ledger. Where that run holds all of a dimension, the
+/// goal cannot pay for an epoch, and its own run is no relief: its budget
+/// comes back only when the task ends. So the policy is asked at the first
+/// occurrence.
+#[tokio::test]
+async fn an_agent_owned_goal_whose_own_run_holds_the_budget_asks_its_policy() {
+    let fx = fixture(1);
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec();
+    spec.allocation = AgentBudgetAllocation {
+        loop_iterations: Some(3),
+        ..AgentBudgetAllocation::unbounded()
+    };
+    spec.exhaustion.default = AgentGoalExhaustionAction::Park;
+    fx.apply_task_command(AgentTaskEntityCommand::Create {
+        operation_id: AgentOperationId::new(AgentOperationKind::TaskCreation, [TENANT, TASK, "1"])
+            .expect("the operation id derives"),
+        creation: Box::new(rakka_agent::AgentTaskCreation {
+            definition: common::task_definition(),
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: Some(common::agent_id()),
+            team: None,
+            goal: Some(common::goal_id()),
+            goal_mode: continuous_goal_mode(wake_policy()),
+            goal_spec: Some(Box::new(goal_spec_draft(spec, true))),
+            parent: None,
+            dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
+            delegation: None,
+            telemetry: Default::default(),
+        }),
+    })
+    .await
+    .expect("the agent-owned goal is created");
+    assert_eq!(
+        task_at(&fx, &task_scope()).await.map(|(_, out)| out),
+        Some(1),
+        "the goal's own run holds its budget"
+    );
+
+    let first = deliver(&fx, 5).await;
+
+    assert!(
+        matches!(
+            first.disposition,
+            AgentWakeDisposition::Deferred {
+                dimension: AgentBudgetDimension::LoopIterations,
+                ..
+            }
+        ),
+        "got {:?}",
+        first.disposition
+    );
+    assert_eq!(task_at(&fx, &first.epoch).await, None);
+    assert_eq!(goal_record(&fx).await.status(), AgentGoalStatus::Waiting);
+    assert_eq!(
+        gate(&fx).await,
+        (
+            AgentGoalLifecycleStatus::Suspended,
+            Some("budget-exhausted".to_string())
+        )
+    );
+}
+
+/// A goal that is only proposed cannot be ended or parked for budget. Where
+/// an operator opened its gate, the occurrence it cannot pay for is parked
+/// and the policy is not asked: the delivery is answered, not refused.
+#[tokio::test]
+async fn a_proposed_goal_whose_gate_was_opened_is_not_asked_its_policy() {
+    let fx = fixture(1);
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec();
+    spec.allocation = AgentBudgetAllocation {
+        loop_iterations: Some(0),
+        ..AgentBudgetAllocation::unbounded()
+    };
+    spec.exhaustion.default = AgentGoalExhaustionAction::Terminate;
+    fx.apply_task_command(continuous_goal_control_creation_command(
+        continuous_goal_mode(wake_policy()),
+        goal_spec_draft(spec, false),
+    ))
+    .await
+    .expect("the proposed goal's control task is created");
+    fx.apply_task_command(AgentTaskEntityCommand::ResumeContinuousGoal {
+        operation_id: operation("open-gate"),
+        expected_lifecycle_revision: gate_revision(&fx).await,
+        provenance: Box::new(provenance(90)),
+    })
+    .await
+    .expect("the operator opens the gate");
+    assert_eq!(gate(&fx).await.0, AgentGoalLifecycleStatus::Active);
+
+    let first = deliver(&fx, 5).await;
+
+    assert!(
+        matches!(
+            first.disposition,
+            AgentWakeDisposition::Deferred {
+                dimension: AgentBudgetDimension::LoopIterations,
+                ..
+            }
+        ),
+        "got {:?}",
+        first.disposition
+    );
+    assert_eq!(task_at(&fx, &first.epoch).await, None);
+    assert_eq!(
+        goal_record(&fx).await.status(),
+        AgentGoalStatus::Proposed,
+        "the goal is not decided"
+    );
+    assert_eq!(
+        task_at(&fx, &task_scope()).await.map(|(status, _)| status),
+        Some(AgentTaskStatus::WaitingForInput)
+    );
+}
+
+/// Where the policy allows two epochs at once and leaves a dimension open,
+/// the first epoch holds all the goal has in it. The second occurrence finds
+/// a free place and a ledger that cannot pay, and waits. The goal is not
+/// parked for it: the budget is on its way back with the first epoch's
+/// result, which admits the occurrence.
+#[tokio::test]
+async fn a_second_parallel_epoch_waits_for_the_first_without_parking_the_goal() {
+    let fx = fixture(2);
+    fx.instantiate_agent().await;
+    let mut spec = goal_spec();
+    spec.allocation = AgentBudgetAllocation {
+        loop_iterations: Some(3),
+        ..AgentBudgetAllocation::unbounded()
+    };
+    spec.exhaustion.default = AgentGoalExhaustionAction::Park;
+    let policy = wake_policy()
+        .with_parallel_epochs(
+            2,
+            rakka_agent::AgentPolicyRef::new("first-result-wins").expect("the ref is valid"),
+        )
+        .expect("the parallel policy is valid");
+    fx.apply_task_command(continuous_goal_control_creation_command(
+        continuous_goal_mode(policy),
+        goal_spec_draft(spec, true),
+    ))
+    .await
+    .expect("the goal's control task is created");
+    let first = deliver(&fx, 5).await;
+    assert!(first.disposition.is_admission());
+    run_until_its_model_call_is_out(&fx, &first).await;
+
+    let second = deliver(&fx, 1_000_005).await;
+
+    assert!(
+        matches!(
+            second.disposition,
+            AgentWakeDisposition::Deferred {
+                dimension: AgentBudgetDimension::LoopIterations,
+                ..
+            }
+        ),
+        "a place is free and the ledger cannot pay, got {:?}",
+        second.disposition
+    );
+    assert_eq!(controller(&fx).await, (1, 0, 1, 1));
+    assert_eq!(
+        (goal_record(&fx).await.status(), gate(&fx).await.0),
+        (AgentGoalStatus::Active, AgentGoalLifecycleStatus::Active),
+        "the goal is not parked for a budget the first epoch will return"
+    );
+
+    fx.pump_epoch(&first.epoch, &first.run)
+        .await
+        .expect("the first epoch converges");
+    assert_eq!(
+        controller(&fx).await,
+        (2, 1, 1, 0),
+        "the first epoch's result admitted the occurrence that waited"
+    );
+    fx.pump_epoch(&second.epoch, &second.run)
+        .await
+        .expect("the second epoch converges");
+    assert_eq!(
+        task_at(&fx, &second.epoch).await,
+        Some((AgentTaskStatus::Completed, 0))
+    );
+}
