@@ -2216,10 +2216,11 @@ impl AgentLoopState {
         self.proposal = Some(proposal);
     }
 
-    /// Drops a proposal the task has answered, on a run that goes on winding
-    /// down. A wind-down waits for a proposal's answer
+    /// Drops a proposal the task has answered, on a run that does not end in
+    /// the same transition. A wind-down waits for a proposal's answer
     /// ([`Self::awaits_settlement`]), and one that has had it must not go on
-    /// waiting.
+    /// waiting; and a run that waits for a call it sent must not report the
+    /// proposal as pending.
     pub(crate) fn clear_answered_proposal(&mut self) {
         self.proposal = None;
     }
