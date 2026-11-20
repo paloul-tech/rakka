@@ -2921,54 +2921,39 @@ async fn a_post_terminal_claim_append_survives_the_wind_down_fence() {
     assert_eq!(after.terminal_at, before.terminal_at);
 }
 
-/// Issue #182: a call the dispatcher cancels before it starts is charged no
-/// attempt.
-///
-/// The run's turn commits a tool call, and the run is cancelled while the
-/// call's ticket is out and unclaimed. The dispatcher's next pass claims the
-/// ticket, finds the run winding down and cancels it at the fence: the tool
-/// is never invoked. The cancellation used to carry the number of the attempt
-/// the claim was about to make, and the run recorded that as an attempt made
-/// and counted it as spent.
-#[tokio::test]
-async fn a_call_the_fence_cancels_before_it_starts_is_charged_no_attempt() {
-    let fx = DispatchFixture::new(
-        DeterministicModelAdapter::new()
-            .with_turn_for(1, tool_calling_turn(TOOL))
-            .with_turn_for(2, proposing_turn("unused")),
-        default_registry(),
-        None,
-        RecordingToolExecutor::new(),
-        ScriptedReconciler::new(),
-    );
-    fx.start().await;
-    fx.pump_until_tool_ticket().await;
-    /// The tool call's status and attempts made, the effect attempts the run
-    /// counts as spent, and the attempts it still holds reserved.
-    async fn accounts(fx: &DispatchFixture) -> (AgentRunEffectStatus, u32, u64, u64) {
-        let state = rakka_agent::load_agent_run_state(
-            &fx.fx.runs,
-            &run_scope(),
-            &rakka_agent::AgentSchemaPolicy::default(),
-        )
-        .await
-        .expect("the run state loads")
-        .expect("the run exists");
-        let held = state.loop_state().expect("the loop state exists");
-        let tool = held
-            .effects()
-            .iter()
-            .find(|effect| effect.kind() == rakka_agent::AgentRunEffectKind::ToolCall)
-            .expect("the run holds its tool call");
-        (
-            tool.status,
-            tool.attempts,
-            held.budget()
-                .consumption()
-                .get(rakka_agent::AgentBudgetDimension::EffectAttempts),
-            held.budget().reserved_attempts(),
-        )
-    }
+// ---------------------------------------------------------------------------
+// Issue #182: a cancellation tells the run the attempts that started.
+// ---------------------------------------------------------------------------
+
+/// The tool call's status and attempts made, the effect attempts the run
+/// counts as spent, and the attempts it still holds reserved.
+async fn tool_call_accounts(fx: &DispatchFixture) -> (AgentRunEffectStatus, u32, u64, u64) {
+    let state = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    let held = state.loop_state().expect("the loop state exists");
+    let tool = held
+        .effects()
+        .iter()
+        .find(|effect| effect.kind() == rakka_agent::AgentRunEffectKind::ToolCall)
+        .expect("the run holds its tool call");
+    (
+        tool.status,
+        tool.attempts,
+        held.budget()
+            .consumption()
+            .get(rakka_agent::AgentBudgetDimension::EffectAttempts),
+        held.budget().reserved_attempts(),
+    )
+}
+
+/// An operator cancels the run.
+async fn cancel_the_run(fx: &DispatchFixture) {
     let mut run = fx.fx.run();
     run.recover(fx.fx.now()).await.expect("the run recovers");
     run.apply(
@@ -2985,13 +2970,64 @@ async fn a_call_the_fence_cancels_before_it_starts_is_charged_no_attempt() {
     )
     .await
     .expect("the cancellation applies");
-    let (status, made, spent, reserved) = accounts(&fx).await;
+}
+
+/// A run whose first turn calls the tool, under `spec`, with its ticket out.
+/// Returns the effect attempts the run counts as spent so far.
+async fn a_tool_ticket_out(
+    spec: AgentEffectSpec,
+    tools: RecordingToolExecutor,
+    reconciler: ScriptedReconciler,
+) -> (DispatchFixture, u64) {
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("unused")),
+        tool_registry(spec),
+        None,
+        tools,
+        reconciler,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let (status, made, spent, _) = tool_call_accounts(&fx).await;
     assert_eq!(
         (status, made),
         (AgentRunEffectStatus::Ready, 0),
         "the ticket is out, and no attempt has been made"
     );
-    assert_eq!(reserved, 1, "the call's one attempt is reserved");
+    (fx, spent)
+}
+
+/// The tool ticket's outbox row: its status, and the attempts it counts.
+async fn tool_row(fx: &DispatchFixture) -> (rakka_agent_workflow::substrate::OutboxStatus, u32) {
+    let effect = fx.effect_at(1).await;
+    let row = fx.outbox_row(&effect).await;
+    (row.status(), row.attempts().attempts())
+}
+
+/// A call the dispatcher cancels before it starts is charged no attempt.
+///
+/// The run's turn commits a tool call, and the run is cancelled while the
+/// call's ticket is out and unclaimed. The dispatcher then claims the ticket,
+/// finds the run winding down and cancels it at the fence: the tool is never
+/// invoked. The cancellation used to carry the number of the attempt the
+/// claim was about to make, and the run recorded that as an attempt made and
+/// counted it as spent.
+#[tokio::test]
+async fn a_call_the_fence_cancels_before_it_starts_is_charged_no_attempt() {
+    let (fx, spent) = a_tool_ticket_out(
+        AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .await;
+    cancel_the_run(&fx).await;
+    assert_eq!(
+        tool_call_accounts(&fx).await,
+        (AgentRunEffectStatus::Ready, 0, spent, 3),
+        "the call's three attempts are reserved, and none is spent"
+    );
 
     fx.pump().await;
 
@@ -3001,9 +3037,163 @@ async fn a_call_the_fence_cancels_before_it_starts_is_charged_no_attempt() {
         "the tool was never invoked"
     );
     assert_eq!(
-        accounts(&fx).await,
+        tool_call_accounts(&fx).await,
         (AgentRunEffectStatus::Cancelled, 0, spent, 0),
         "the call is cancelled with no attempt made, nothing more is spent, and the \
          reservation is given back"
+    );
+}
+
+/// The fence tells the run the attempts the ticket's row counts, which is not
+/// always none. A call whose first attempt ran and failed is cancelled before
+/// its retry: one attempt started, and one is charged.
+#[tokio::test]
+async fn a_call_the_fence_cancels_before_its_retry_is_charged_the_attempt_it_made() {
+    let (fx, spent) = a_tool_ticket_out(
+        AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+        RecordingToolExecutor::new().with_failure(TOOL, "upstream-unavailable", "try again later"),
+        ScriptedReconciler::new(),
+    )
+    .await;
+    fx.pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert_eq!(
+        tool_row(&fx).await,
+        (rakka_agent_workflow::substrate::OutboxStatus::Failed, 1),
+        "the first attempt ran and failed, and the row counts it"
+    );
+    cancel_the_run(&fx).await;
+
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "the retry never started"
+    );
+    assert_eq!(
+        tool_call_accounts(&fx).await,
+        (AgentRunEffectStatus::Cancelled, 1, spent + 1, 0)
+    );
+}
+
+/// A cancellation that follows an attempt which did start charges that
+/// attempt. A read-only call's attempt wrote its durable `Started` and its
+/// worker was lost; the run is then cancelled, and the recovery cancels the
+/// ticket. The row never counted the lost attempt, and the run is told of it.
+#[tokio::test]
+async fn a_read_only_call_cancelled_after_its_attempt_started_is_charged_that_attempt() {
+    let (fx, spent) = a_tool_ticket_out(
+        AgentEffectSpec::read_only()
+            .with_max_attempts(3)
+            .expect("the spec is valid"),
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .await;
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert!(pass.died, "the worker is lost after the durable Started");
+    assert_eq!(
+        tool_row(&fx).await,
+        (
+            rakka_agent_workflow::substrate::OutboxStatus::Dispatching,
+            0
+        ),
+        "the row marks the attempt as started and has not counted it"
+    );
+    cancel_the_run(&fx).await;
+
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(fx.tools.invocation_count(TOOL), 0, "nothing is invoked");
+    assert_eq!(
+        tool_call_accounts(&fx).await,
+        (AgentRunEffectStatus::Cancelled, 1, spent + 1, 0),
+        "the attempt that reached a durable Started is the one attempt charged"
+    );
+}
+
+/// The same for a reconcileable call: its attempt wrote `Started` and was
+/// lost, the run is cancelled, and the protocol finds the call not executed.
+/// The ticket is cancelled, and the attempt that started is charged.
+#[tokio::test]
+async fn a_reconcileable_call_found_not_executed_after_its_attempt_started_is_charged_that_attempt()
+{
+    let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
+    let (fx, spent) = a_tool_ticket_out(
+        AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid"),
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted),
+    )
+    .await;
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert!(pass.died, "the worker is lost after the durable Started");
+    cancel_the_run(&fx).await;
+
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(fx.reconciler.queries(), 1, "the protocol is asked once");
+    assert_eq!(fx.tools.invocation_count(TOOL), 0, "nothing is invoked");
+    assert_eq!(
+        tool_call_accounts(&fx).await,
+        (AgentRunEffectStatus::Cancelled, 1, spent + 1, 0),
+        "the attempt that reached a durable Started is the one attempt charged"
+    );
+}
+
+/// A reconcileable call's failed attempt is asked about before any retry. Its
+/// first attempt ran and failed, and the row counted it. The run is then
+/// cancelled, the protocol finds the call not executed, and the ticket is
+/// cancelled before a second attempt starts. One attempt started, and one is
+/// charged: the cancellation used to report the attempt the claim was about
+/// to make, which charged two.
+#[tokio::test]
+async fn a_reconcileable_call_cancelled_after_a_failed_attempt_is_charged_that_attempt_alone() {
+    let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
+    let (fx, spent) = a_tool_ticket_out(
+        AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid"),
+        RecordingToolExecutor::new().with_failure(TOOL, "upstream-unavailable", "try again later"),
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted),
+    )
+    .await;
+    fx.pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert_eq!(
+        tool_row(&fx).await,
+        (rakka_agent_workflow::substrate::OutboxStatus::Failed, 1),
+        "the first attempt ran and failed, and the row counts it"
+    );
+    cancel_the_run(&fx).await;
+
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(fx.reconciler.queries(), 1, "the protocol is asked once");
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "no second attempt starts"
+    );
+    assert_eq!(
+        tool_call_accounts(&fx).await,
+        (AgentRunEffectStatus::Cancelled, 1, spent + 1, 0),
+        "one attempt started, so one attempt is charged"
     );
 }

@@ -23,75 +23,142 @@ zero attempts and so consumes none".
 
 ## 2. Approaches
 
-1. **The dispatcher reports the attempts that were made.** The fence passes
-   the row's own count.
+1. **The dispatcher reports the attempts that started.** Each place that
+   cancels a ticket for a run that is winding down tells the run that count.
 2. **The run does not charge a `Cancelled` outcome's attempt.**
 
 I chose the first. The run cannot tell from `Cancelled` alone whether the
 attempt it is told of started: the dispatcher also cancels a call after an
-attempt that did start and was lost (a read-only call on a run that is
-winding down, or one a reconciler found not executed), and that attempt is
-charged on purpose. The dispatcher knows which case it is in. The fix is one
-number at the place that knows.
+attempt that did start and was lost, and that attempt is charged on purpose.
+The claim can tell, from the status its row was left in. The fix is one number
+at each place that knows.
 
 ## 3. The change
 
-- **The fence** (`dispatch_claimed`, the branch for a ticket that provably
-  never started) delivers `Cancelled` with the row's count of attempts, not
-  the claim's next attempt.
-- **The replay of that fence** (`owed_by_finished_row`, for a row a lost
-  worker left `Cancelled` under a fence) reports the same count, so a run
-  told by the replay records what a run told by the fence does.
+The dispatcher cancels a ticket for a winding-down run in three places, and
+replays the first of them in two more. Each now tells the run the attempts
+that started.
 
-The two cancellations that follow an attempt that started keep the claim's
-attempt number. Nothing in the run changes.
+| Where (`dispatch.rs`) | The row it finds | Told before | Told now |
+|---|---|---|---|
+| The fence, in `execute_claim` | `Pending`, or `Failed` with a retry due | The row's count plus one | The row's count |
+| The fence replayed by the next claim (`owed_by_finished_row`): the worker was lost before its fleet write | `Cancelled` | The row's count plus one | The row's count |
+| The fence replayed by the per-run sweep: the worker was lost after its fleet write | `Cancelled` | The run's own count | The row's count |
+| A reconcileable call found not executed (`reconcile_ambiguous`) | `Failed`: the attempt asked about ended and was counted | The row's count plus one | The row's count |
+| The same, and a read-only call (`recover_ambiguous`) | `Dispatching`: an attempt started and was lost, uncounted | The row's count plus one | Unchanged: that is the attempt that started |
+
+The row counts an attempt when it ends, in a failure. So a `Failed` row has
+counted every attempt that started, and a `Dispatching` row has one more that
+it has not. `execute_claim` works that out once (`started`) and hands it to
+the recovery.
+
+The sweep's replay now reads its count from `owed_by_finished_row`, the same
+function the claim's replay uses, so the two cannot drift.
+
+Nothing in the run changes.
 
 ## 4. My calls
 
 1. **Fixed in the dispatcher** (section 2). Yours to reverse.
 2. **The comment was right and the number was wrong.** The issue left open
-   which. The run's budget rule, that every attempt which reached a durable
-   `Started` is charged and no other, is stated in the same comment, and a
-   ticket the fence cancels never reached `Started`.
-3. **The replay takes the fence's count.** A row left `Cancelled` does not
-   say whether its last attempt started. Most such rows are the plain
-   fence's. The cost: a ticket cancelled after an attempt that started and
-   was lost, whose second worker was then lost too before it told the run,
-   is told with one attempt fewer than started.
-4. **Records are not repaired.** A run that was already told keeps the
+   which. The run's budget rule is that an attempt which reached a durable
+   `Started` is charged, and a ticket the fence cancels has no such attempt
+   beyond those its row counts.
+3. **The replay takes the row's count.** A row left `Cancelled` does not say
+   whether its last attempt started. Most such rows are the plain fence's.
+   The cost, which the reviewer reproduced: a ticket cancelled after an
+   attempt that started and was lost, whose second worker was then lost too
+   before it told the run, is told with one attempt fewer than started.
+4. **The sweep's replay can now charge more than it did.** It told the run
+   the run's own count, and the run is never told of a failed attempt that
+   is retried. So a call with failed attempts, cancelled by a worker that
+   died before telling the run, was charged none of them. It is now charged
+   what its row counts.
+5. **The cancellation after a failed attempt of a reconcileable call is in.**
+   The reviewer reproduced it: one attempt made, two charged. It is the
+   symptom this issue names. **The other outcomes of that same recovery are
+   not in.** A finding of "executed", a park, and the retry on a live run
+   are each handed the same number, one more than the attempts made, and the
+   live retry also records a failed attempt on the row. That is the cause an
+   earlier unfiled draft describes, and what it needs is a decision about the
+   retry's accounting, not a number. Yours to decide.
+6. **Records are not repaired.** A run that was already told keeps the
    attempt it was charged.
 
 ## 5. Mixed builds and rollback
 
-Nothing durable is added. A dispatcher of an earlier build reports the larger
-number, and a run of either build charges what it is told.
+Nothing durable is added. A dispatcher of an earlier build reports the earlier
+numbers, and a run of either build charges what it is told.
 
 ## 6. Tests
 
-`a_call_the_fence_cancels_before_it_starts_is_charged_no_attempt` in
-`crates/rakka-agent/tests/effect_dispatch.rs`, with the real dispatcher: a
-tool call sent and never claimed, the run cancelled, one dispatcher pass. The
-call ends `Cancelled` with no attempt made, the run's spent effect attempts do
-not move, the reservation is given back, and the tool is never invoked. It
-fails on the commit below this one, with one attempt made and one more spent.
+In `crates/rakka-agent/tests/effect_dispatch.rs`, with the real dispatcher and
+a tool call whose ticket is out when the run is cancelled. Each reads the
+call's status and attempts, the run's spent effect attempts and its reserved
+attempts, and how often the tool was invoked.
 
-`a_fence_cancelled_row_is_replayed_with_the_attempts_the_row_counts` in
-`dispatch_owed_outcome.rs` holds the replay: a row a lost worker left
-`Cancelled`, on a run that is winding down, is told `Cancelled` with no
-attempt made.
+- A call the fence cancels before it starts is charged no attempt.
+- A call the fence cancels before its retry is charged the one attempt it
+  made.
+- A read-only call cancelled after its attempt started and was lost is
+  charged that attempt.
+- A reconcileable call found not executed after its attempt started and was
+  lost is charged that attempt.
+- A reconcileable call cancelled after a failed attempt is charged that
+  attempt alone.
 
-Three breaks were run. The fence reporting the attempt it was about to make
-is caught by the first test, and the replay reporting one more than the row
-counts by the second. The whole crate passes: 1,827 tests.
+In `dispatch_owed_outcome.rs`, with a call whose first attempt failed, so that
+the row counts one attempt and the run was told of none:
 
-**One thing no test holds.** The third break made the read-only cancellation
-that follows a started attempt report one attempt fewer. It survived the
-whole crate. That code is not changed here, and section 3 says so, but
-nothing in the crate holds the number it reports.
+- The fence tells the run the row's count.
+- A fence lost before its fleet write is replayed by the next claim, with the
+  same count.
+- A fence lost before it told the run is replayed by the sweep, with the same
+  count.
 
-## 7. Not done
+The first, the fifth and the last fail on the commits below their fixes.
 
-- Records already charged (call 4).
+Nine breaks of the fix as it now stands were run, one at a time, against the
+two test files. Each is caught by a test:
+
+- the fence reporting the attempt it was about to make, and reporting none
+  at all;
+- the claim's replay reporting one more than the row counts, and reporting
+  the run's own count;
+- the sweep's replay reporting the run's own count;
+- a failed row's recovery counting the next attempt as started, and a lost
+  attempt not counted as started;
+- the read-only cancellation reporting one attempt fewer, and the reconciled
+  cancellation reporting the claim's next attempt.
+
+The whole crate passes: 1,845 tests.
+
+## 7. The review
+
+A fresh reviewer read the first two commits and ran probes and breaks of its
+own. What changed in answer:
+
+- **The sweep's replay** told the run's own count. Reproduced; fixed (call 4).
+- **The cancellation after a failed attempt of a reconcileable call** charged
+  an attempt that never started. Reproduced; fixed (call 5). The record had
+  called that path "unchanged and right".
+- **No test held the number the two cancellations after a started attempt
+  report.** The record declared it; the reviewer wrote the tests, and they
+  are kept.
+- **The fence's test could not tell the row's count from zero,** and the
+  replay's could not tell it from the run's count. Both now run over a row
+  that counts one attempt.
+- **Sentences corrected:** the fence is in `execute_claim`; the test pumps
+  the dispatcher rather than running one pass; "and no other" overstated the
+  budget rule, which a refused dispatch also departs from.
+
+## 8. Not done
+
+- Records already charged (call 6).
 - The double fault of call 3.
-- A test of the attempt number the two cancellations after a started attempt
-  report (section 6).
+- The other outcomes of a reconcileable call's recovery from a failed
+  attempt (call 5). Drafted as an issue with the earlier draft, not filed.
+- **A dispatch refused before its attempt starts is charged one attempt.**
+  Found by the reviewer and reproduced. It is not a cancellation, and the
+  number is a public field of the run's `EffectFailed` reason. Drafted as an
+  issue, not filed.

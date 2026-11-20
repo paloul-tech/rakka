@@ -669,39 +669,6 @@ async fn a_cancelled_row_on_a_live_run_is_parked() {
     );
 }
 
-/// Issue #182: the fence's own cancellation, replayed from the row. A worker
-/// cancelled the ticket at the wind-down fence and was lost before it told
-/// the run. The next claim finds the cancelled row and tells the run
-/// `Cancelled` with the attempts the row counts: none, for a ticket that was
-/// never attempted. A run told by the replay records what a run told by the
-/// fence does.
-#[tokio::test]
-async fn a_fence_cancelled_row_is_replayed_with_the_attempts_the_row_counts() {
-    let (fx, _effect) = a_registered_ticket_with_a_finished_row(
-        &idempotent(3),
-        None,
-        OutboxStatus::Cancelled,
-        "cancelled",
-    )
-    .await;
-    cancel_the_run(&fx).await;
-
-    let pass = fx
-        .pipeline()
-        .claim_and_execute()
-        .await
-        .expect("the pass runs");
-
-    assert_eq!((pass.invoked, pass.delivered), (0, 1));
-    assert_eq!(fx.tools.invocation_count(TOOL), 0);
-    let told = recorded(&fx).await.0;
-    assert_eq!(
-        (told.status, told.attempts),
-        (AgentRunEffectStatus::Cancelled, 0),
-        "the run is told the ticket was cancelled, with no attempt made"
-    );
-}
-
 /// An operator cancels the run, which stays `Cancelling` on its ready effect.
 async fn cancel_the_run(fx: &AuthorityFixture) {
     let mut run = fx.fx.run();
@@ -724,6 +691,164 @@ async fn cancel_the_run(fx: &AuthorityFixture) {
         fx.fx.run_snapshot().await.expect("the run exists").status,
         AgentRunStatus::Cancelling
     );
+}
+
+/// A tool that always fails with a failure a retry may clear, and counts its
+/// calls.
+#[derive(Default)]
+struct CountingRetryable {
+    calls: AtomicUsize,
+}
+
+impl AgentDispatchToolExecutor for CountingRetryable {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Err(AgentDispatchError::collaborator(
+                "upstream-unavailable",
+                "try again later",
+            ))
+        })
+    }
+}
+
+/// An idempotent three-attempt call whose first attempt ran and failed: the
+/// row is `Failed` and counts one attempt, and the run was told of none. The
+/// run is then cancelled, and the retry is due.
+async fn one_failed_attempt_then_a_cancel(
+) -> (AuthorityFixture, AgentRunEffect, Arc<CountingRetryable>) {
+    let tool = Arc::new(CountingRetryable::default());
+    let (fx, effect) = ticket(&idempotent(3), Some(tool.clone()), None).await;
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert_eq!((pass.invoked, pass.failed_attempts), (1, 1));
+    let row = fx.outbox_row(&effect).await.expect("the row exists");
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (OutboxStatus::Failed, 1)
+    );
+    assert_eq!(
+        recorded(&fx).await.0.attempts,
+        0,
+        "the run was told of none"
+    );
+    cancel_the_run(&fx).await;
+    fx.expire_lease();
+    (fx, effect, tool)
+}
+
+/// Issue #182: the fence tells the run the attempts the ticket's row counts,
+/// and so does each replay of the fence. Here nobody is lost: the fence
+/// cancels a ticket whose first attempt failed, and tells the run of one.
+#[tokio::test]
+async fn the_fence_tells_the_run_the_attempts_the_row_counts() {
+    let (fx, _effect, tool) = one_failed_attempt_then_a_cancel().await;
+
+    fx.pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.attempts),
+        (AgentRunEffectStatus::Cancelled, 1)
+    );
+    assert_eq!(
+        tool.calls.load(Ordering::SeqCst),
+        1,
+        "the retry never started"
+    );
+}
+
+/// The worker cancelled the row at the fence and was lost before its fleet
+/// write. The next claim finds the cancelled row and tells the run from it:
+/// the same status and the same count the fence would have told.
+#[tokio::test]
+async fn a_fence_lost_before_its_fleet_write_is_replayed_by_the_next_claim() {
+    let (fx, effect, tool) = one_failed_attempt_then_a_cancel().await;
+    let mut pipeline = fx.pipeline();
+    pipeline
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    fx.fleet_store.crash_at(2, CrashPoint::BeforeWrite);
+    pipeline
+        .claim_and_execute()
+        .await
+        .expect_err("the settle's fleet write is refused");
+    fx.fleet_store
+        .assert_crash_fired(2, CrashPoint::BeforeWrite);
+    fx.fleet_store.survive();
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Cancelled)
+    );
+    assert_eq!(
+        recorded(&fx).await.0.status,
+        AgentRunEffectStatus::Ready,
+        "the run was not told"
+    );
+
+    fx.expire_lease();
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.attempts),
+        (AgentRunEffectStatus::Cancelled, 1)
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+}
+
+/// The worker cancelled the ticket at the row and at the fleet, and was lost
+/// before it told the run. No claim will come for a finished entry, so the
+/// per-run sweep tells the run. It used to tell the run's own count, which
+/// knew of no attempt: the attempt that was made went uncharged.
+#[tokio::test]
+async fn a_fence_lost_before_it_told_the_run_is_replayed_by_the_sweep() {
+    let (fx, effect, tool) = one_failed_attempt_then_a_cancel().await;
+    fx.fx.runs.crash_at(1, CrashPoint::BeforeWrite);
+    fx.pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect_err("the fence's delivery is refused");
+    fx.fx.runs.assert_crash_fired(1, CrashPoint::BeforeWrite);
+    fx.fx.runs.survive();
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Cancelled)
+    );
+    assert_eq!(
+        recorded(&fx).await.0.status,
+        AgentRunEffectStatus::Ready,
+        "the run was not told"
+    );
+
+    fx.pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+
+    let told = recorded(&fx).await.0;
+    assert_eq!(
+        (told.status, told.attempts),
+        (AgentRunEffectStatus::Cancelled, 1),
+        "the sweep tells the run what the fence would have"
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
 }
 
 /// The wind-down branch cancels a ticket that provably never started. An
