@@ -2352,6 +2352,174 @@ async fn a_run_an_earlier_build_took_past_an_unknown_outcome_is_parked_with_its_
     );
 }
 
+/// The park holds the loop and recalls nothing. The record an earlier build
+/// left between committing the turn's model call and handing it over: the
+/// call is `pending` and never sent, past the unknown outcome. The first
+/// settle pass parks the run, and the call it finds committed is sent, as
+/// any committed call of a run that is not winding down is. Its result is
+/// taken when it comes, and the run takes no step of its own until the
+/// outcome is answered.
+///
+/// This is the edge of what the repair does. It does not withdraw a call
+/// the earlier build had already decided to make.
+#[tokio::test]
+async fn a_call_an_earlier_build_committed_past_an_unknown_outcome_is_sent_from_the_park() {
+    let (fx, sink) = goal_world_proposing("", task_definition()).await;
+    let evaluation = send_an_evaluation(&fx).await;
+    propose_out_of_reach(&fx).await;
+    apply_out_of_reach(&fx, unknown(&evaluation))
+        .await
+        .expect("the unknown outcome applies");
+    let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+    settle(&fx).await;
+    write_effect_status(&fx, &evaluation, "ready", Some("running")).await;
+    settle(&fx).await;
+    let call = model_call_of_turn(&fx, 2)
+        .await
+        .expect("the step sent turn two's call");
+    rewrite_run(&fx, |run| {
+        let effects = run["loop_state"]["effects"]
+            .as_array_mut()
+            .expect("the effects are an array");
+        for effect in effects.iter_mut() {
+            if effect["effect_id"].as_str() == Some(evaluation.effect_id.as_str()) {
+                effect["status"] = serde_json::json!("indeterminate");
+            }
+            if effect["effect_id"].as_str() == Some(call.effect_id.as_str()) {
+                effect["status"] = serde_json::json!("pending");
+                effect["dispatched_at"] = serde_json::Value::Null;
+            }
+        }
+    })
+    .await;
+    let committed = model_call_of_turn(&fx, 2).await.expect("the call");
+    assert_eq!(
+        (
+            standing(&fx).await,
+            committed.status,
+            committed.dispatched_at.is_some()
+        ),
+        (
+            (AgentRunStatus::WaitingForEffect, None, false),
+            AgentRunEffectStatus::Pending,
+            false
+        ),
+        "the record as the earlier build left it: turn two's call committed and not sent"
+    );
+
+    settle(&fx).await;
+
+    let sent = model_call_of_turn(&fx, 2).await.expect("the call");
+    assert_eq!(
+        (
+            standing(&fx).await,
+            sent.status,
+            sent.dispatched_at.is_some(),
+            waiting(&fx).await.len()
+        ),
+        (
+            (AgentRunStatus::WaitingForReconciliation, None, false),
+            AgentRunEffectStatus::Ready,
+            true,
+            1
+        ),
+        "the first pass parks the run, and sends the call it found committed"
+    );
+    assert_at_rest(&fx, &sink).await;
+
+    decide(
+        &fx,
+        &park.checkpoint_id,
+        "answer",
+        AgentCheckpointDecision::Reconciliation(AgentReconciliationDecision::AbandonAndFail),
+    )
+    .await
+    .expect("the parked run answers its checkpoint");
+    assert_eq!(
+        (
+            standing(&fx).await,
+            model_call_of_turn(&fx, 2).await.map(|call| call.status)
+        ),
+        (
+            (AgentRunStatus::WaitingForEffect, None, false),
+            Some(AgentRunEffectStatus::Ready)
+        ),
+        "answered, the run waits on that call"
+    );
+}
+
+/// A parked run that has taken a rejection is on a turn it has not prepared:
+/// the turn is counted, and the status says parked. A cancellation that
+/// reaches it there leaves it parked, under the cancellation's reason, and
+/// sends nothing: the turn is never prepared. The answer ends it cancelled.
+#[tokio::test]
+async fn a_cancel_after_a_rejection_on_a_parked_run_keeps_it_parked_until_answered() {
+    let (fx, sink) = goal_world_proposing("", task_definition()).await;
+    let evaluation = send_an_evaluation(&fx).await;
+    propose_out_of_reach(&fx).await;
+    apply_out_of_reach(&fx, unknown(&evaluation))
+        .await
+        .expect("the unknown outcome applies");
+    let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+    settle(&fx).await;
+    assert_eq!(
+        (standing(&fx).await, loop_state(&fx).await.turn()),
+        ((AgentRunStatus::WaitingForReconciliation, None, false), 2),
+        "parked, on the turn the rejection began"
+    );
+    let sent = fx.dispatched_effects();
+
+    cancel_the_run(&fx).await;
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            fx.dispatched_effects()
+        ),
+        (
+            (
+                AgentRunStatus::WaitingForReconciliation,
+                Some("cancellation-requested".to_string()),
+                false
+            ),
+            None,
+            sent
+        ),
+        "cancelled where it stands: still parked, and nothing of the turn is prepared or sent"
+    );
+    assert_at_rest(&fx, &sink).await;
+
+    decide(
+        &fx,
+        &park.checkpoint_id,
+        "answer",
+        AgentCheckpointDecision::Reconciliation(AgentReconciliationDecision::AbandonAndFail),
+    )
+    .await
+    .expect("the parked run answers its checkpoint");
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            model_call_of_turn(&fx, 2).await.map(|call| call.status),
+            fx.dispatched_effects()
+        ),
+        (
+            (
+                AgentRunStatus::Cancelled,
+                Some("cancellation-requested".to_string()),
+                false
+            ),
+            None,
+            sent
+        ),
+        "answered, the run ends cancelled, and the turn was never prepared"
+    );
+    assert_only_what_is_out_is_reserved(&fx, "the cancelled run").await;
+    assert_at_rest(&fx, &sink).await;
+}
+
 /// A top-up answered with nothing ends a cancelled run as out of budget,
 /// and not as cancelled. The reason is as it always was: the task's answer
 /// is a decided end, and a decided end replaces a wind-down's reason. What

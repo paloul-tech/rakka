@@ -950,20 +950,21 @@ impl AgentRun {
     /// sent its model call.
     ///
     /// The settle pass parks such a record on the first pass that touches
-    /// it, before the loop's step, with `settle_run_disposition`. What the
-    /// run has already sent stays sent, and its result is taken as on any
-    /// parked run.
+    /// it, before the loop's step, with `settle_run_disposition`. The park
+    /// holds the loop and recalls nothing: a call that binary committed past
+    /// the park is sent if it was not yet, a call it sent stays sent, and
+    /// the result of either is taken as on any parked run.
     ///
-    /// A run whose end was decided is never asked. It waits under a status of
-    /// its own, which that function writes first, and a memory promotion or a
-    /// claim append whose outcome is unknown does not park it.
+    /// A run that is winding down is never asked. Where its status permits
+    /// the loop a step it has a repair of its own
+    /// ([`Self::needs_wind_down_rest`]), and where it does not the loop takes
+    /// none. Under which status it then waits is the disposition's to say:
+    /// a run whose end was decided is not parked by a memory promotion or a
+    /// claim append whose outcome is unknown.
     pub(crate) fn needs_park(&self) -> bool {
         !self.status.is_terminal()
+            && !self.winding_down()
             && self.status != AgentRunStatus::WaitingForReconciliation
-            && !self
-                .terminal_reason
-                .as_ref()
-                .is_some_and(AgentRunTerminalReason::is_decided_end)
             && self.loop_state.has_indeterminate_effect()
     }
 
@@ -3223,9 +3224,9 @@ fn advance_once(
         // outcome: its task's rejection, or its fan-in deadline, wrote
         // `Running` over the reconciliation park. Put it back on the park,
         // as the transition should have, before the loop's own step, which
-        // such a run must not take ([`AgentRun::needs_park`]). After the
-        // wind-down's repair above, which parks a run that is winding down
-        // once it has fenced what that run never sent.
+        // such a run must not take ([`AgentRun::needs_park`]). It asks no
+        // run the wind-down's repair above asks, so the order of the two
+        // decides nothing.
         settle_run_disposition(state, now)?;
         return owed_run_exchanges(state, now);
     }
@@ -7522,10 +7523,10 @@ fn fire_checkpoint_timers(
 ///
 /// Idempotent and clock-fenced: a deadline not yet due, a group already
 /// resolved, an open group, or no group at all transitions nothing, so early,
-/// late, and duplicate deliveries all converge. A terminal or winding-down
-/// run records the resolution as evidence and resumes nothing, and neither
-/// does a run parked on an unknown outcome, which goes on from the resolved
-/// wait once its reconciliation is answered.
+/// late, and duplicate deliveries all converge. A terminal run is left as
+/// it is. A winding-down run records the resolution as evidence and resumes
+/// nothing, and neither does a run parked on an unknown outcome, which goes
+/// on from the resolved wait once its reconciliation is answered.
 fn fire_fan_in_deadline(
     state: &mut AgentRunState,
     now: AgentTimestampMillis,
@@ -14311,11 +14312,12 @@ mod tests {
         );
     }
 
-    /// The settle pass's park guard asks only a live run that holds an
-    /// unknown outcome and is off its park (issue #186). A run that is
-    /// already parked, one that has ended, and one whose end was decided are
-    /// not asked: the disposition leaves each where it is, so asking would
-    /// only keep the settle loop turning.
+    /// The settle pass's park guard asks only a live run that is not winding
+    /// down, holds an unknown outcome and is off its park (issue #186). A run
+    /// that is already parked and one that has ended are not asked: the
+    /// disposition leaves each where it is, so asking would only keep the
+    /// settle loop turning. Nor is a run that is winding down, on any
+    /// status: that one is the wind-down repair's.
     #[test]
     fn needs_park_asks_only_a_live_run_that_is_off_its_park() {
         let mut fx = handoff_send_fixture(
@@ -14353,6 +14355,11 @@ mod tests {
             !fx.state.run().expect("run").needs_park(),
             "ended, under a reason that is no decided end"
         );
+        set(&mut fx, AgentRunStatus::Failed, None);
+        assert!(
+            !fx.state.run().expect("run").needs_park(),
+            "ended, whatever reason the record carries"
+        );
         set(
             &mut fx,
             AgentRunStatus::Cancelling,
@@ -14362,16 +14369,23 @@ mod tests {
             !fx.state.run().expect("run").needs_park(),
             "its end is decided, and it waits under a status of its own"
         );
-        set(
-            &mut fx,
-            AgentRunStatus::Cancelling,
-            Some(AgentRunTerminalReason::CancellationRequested {
-                reason: "operator stopped the work".to_string(),
-            }),
-        );
+        for status in [AgentRunStatus::Cancelling, AgentRunStatus::Running] {
+            set(
+                &mut fx,
+                status,
+                Some(AgentRunTerminalReason::CancellationRequested {
+                    reason: "operator stopped the work".to_string(),
+                }),
+            );
+            assert!(
+                !fx.state.run().expect("run").needs_park(),
+                "winding down and reading {status:?}: the wind-down's repair is the one that asks"
+            );
+        }
+        set(&mut fx, AgentRunStatus::Cancelling, None);
         assert!(
-            fx.state.run().expect("run").needs_park(),
-            "winding down with no end decided: an unknown outcome parks it"
+            !fx.state.run().expect("run").needs_park(),
+            "a cancellation in progress is a wind-down with or without its reason"
         );
     }
 

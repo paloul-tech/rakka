@@ -889,8 +889,8 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   **What a deployment sees.**
 
   - A run parked on an unknown outcome no longer shows `WaitingForEffect` or `Running` between a rejection or a deadline and the next effect result, and sends no model call in that window. It shows `WaitingForReconciliation` until the park is answered.
-  - A run that waits on a person for longer than before spends nothing while it waits. The task has already charged the rejected iteration.
-  - **The settle pass parks a live run that holds an unknown outcome and is not parked,** before the loop's step. That is a record an earlier build left between a rejection or a deadline and its next step. A call such a run has already sent stays sent, and its result is taken as on any parked run.
+  - While such a run waits, its loop takes no step and charges nothing. The task has already charged the rejected iteration. The park holds the loop and not what is owed outside it: a child that a fan-in deadline timed out is still sent its cancellation, parked run or not.
+  - **The settle pass parks a live run that is not winding down, holds an unknown outcome and is not parked,** before the loop's step. That is a record an earlier build left between a rejection or a deadline and its next step. The park recalls nothing: a call such a run had committed and not yet sent is sent, a call it had sent stays sent, and the result of either is taken as on any parked run. A run that is winding down is left to the wind-down's own repair, as before.
 
   **The park still holds the loop for every kind of call.** A memory promotion or a claim append whose outcome is unknown parks a live run, as before. A run whose end was decided is the exception it already was (#178).
 

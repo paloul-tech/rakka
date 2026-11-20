@@ -1754,11 +1754,36 @@ async fn an_answered_park_puts_a_run_resting_on_its_children_back_there() {
     }
 }
 
+/// [`workflow_fixture`], for a workflow whose descriptor says a started run
+/// can be cancelled: the run chases a child its fan-in wait timed out.
+fn cancellable_workflow_fixture(
+    executor: Arc<dyn AgentWorkflowStartExecutor + Send + Sync>,
+    first_turn: AgentModelTurn,
+) -> Fixture {
+    Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first_turn)
+                .with_turn(proposing_turn()),
+        )
+        .with_workflow_start_executor(executor),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_workflow_tools(
+        rakka_agent::AgentRunWorkflowConfig::new()
+            .with_descriptor(common::workflow_tool_descriptor().with_cancellation_support())
+            .expect("the workflow configuration should accept the descriptor"),
+    )
+}
+
 /// A run resting on a child workflow under a deadline, parked on a claim
 /// append whose outcome is unknown: the fixture, and the append. Its metrics
-/// go to `metrics` where one is given.
+/// go to `metrics` where one is given. The child can be cancelled where
+/// `cancellable` says so; where it cannot, a deadline that times it out
+/// sends nothing after it.
 async fn parked_beside_a_fan_in_wait(
     metrics: Option<Arc<rakka_core::InMemoryMetricsRecorder>>,
+    cancellable: bool,
 ) -> (Fixture, AgentRunEffect) {
     let executor = RecordingWorkflowExecutor::new(StartMode::Started);
     let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
@@ -1772,7 +1797,11 @@ async fn parked_beside_a_fan_in_wait(
             )
             .expect("the tool call is bounded"),
         );
-    let mut fixture = workflow_fixture(executor, first_turn);
+    let mut fixture = if cancellable {
+        cancellable_workflow_fixture(executor, first_turn)
+    } else {
+        workflow_fixture(executor, first_turn)
+    };
     if let Some(metrics) = metrics {
         fixture = fixture.with_metrics(metrics);
     }
@@ -1905,13 +1934,17 @@ async fn answer_the_append(fixture: &Fixture, append: &AgentRunEffect) {
 /// outcome. The run rests on its child under a deadline, and a claim append
 /// it holds beside the wait ends unknown: the run parks. The deadline then
 /// fires. The wait is resolved, with the child timed out, and the run stays
-/// parked: it records no turn and sends nothing until the reconciliation is
-/// answered. The deadline used to write `Running` over the park, and the run
-/// went on to its next model call with the outcome still unknown. A child's
-/// result that resolves the wait already left the park standing.
+/// parked: it records no turn and sends no model call until the
+/// reconciliation is answered. The deadline used to write `Running` over the
+/// park, and the run went on to its next model call with the outcome still
+/// unknown. A child's result that resolves the wait already left the park
+/// standing.
+///
+/// This child cannot be cancelled, so the deadline sends nothing at all. One
+/// that can is chased, parked or not: the next test.
 #[tokio::test]
 async fn a_fan_in_deadline_does_not_resume_a_run_parked_on_an_unknown_outcome() {
-    let (fixture, append) = parked_beside_a_fan_in_wait(None).await;
+    let (fixture, append) = parked_beside_a_fan_in_wait(None, false).await;
     let sent = fixture.dispatched_effects();
 
     let reply = fire_the_deadline(&fixture).await;
@@ -1937,7 +1970,8 @@ async fn a_fan_in_deadline_does_not_resume_a_run_parked_on_an_unknown_outcome() 
             1,
             sent
         ),
-        "the wait is resolved, and the run stays parked: no turn is recorded and nothing is sent"
+        "the wait is resolved, and the run stays parked: no turn is recorded, and with a child \
+         that cannot be cancelled nothing is sent"
     );
 
     answer_the_append(&fixture, &append).await;
@@ -1954,17 +1988,122 @@ async fn a_fan_in_deadline_does_not_resume_a_run_parked_on_an_unknown_outcome() 
     );
 }
 
+/// The park holds the loop. It does not hold the chase a deadline sets off:
+/// a child the deadline timed out, and that can be cancelled, is sent its
+/// cancellation while the run is parked, as it is on a run that is not. That
+/// cancellation is no step of the loop, and a child left running until a
+/// person answers an unrelated outcome would run on for as long as that
+/// takes. The run stays parked, records no turn, and sends no model call.
+#[tokio::test]
+async fn a_fan_in_deadline_on_a_parked_run_still_cancels_the_child_it_timed_out() {
+    let (fixture, append) = parked_beside_a_fan_in_wait(None, true).await;
+    let sent = fixture.dispatched_effects();
+
+    fire_the_deadline(&fixture).await;
+
+    let fired = run_picture(&fixture).await;
+    assert_eq!(
+        (fired.0, fired.1, fired.2, fixture.dispatched_effects()),
+        (
+            AgentLoopPhase::RecordingTurn,
+            Some(AgentRunStatus::WaitingForReconciliation),
+            1,
+            sent + 1
+        ),
+        "the run stays parked on its turn, and one call is sent"
+    );
+    let out: Vec<(&str, &str)> = fired
+        .3
+        .iter()
+        .map(|(kind, status)| (kind.as_str(), status.as_str()))
+        .filter(|(_, status)| *status == "ready")
+        .collect();
+    assert_eq!(
+        out,
+        [("workflow-cancel-call", "ready")],
+        "the one call out is the timed-out child's cancellation: {:?}",
+        fired.3
+    );
+    let rested = run_revision(&fixture).await;
+    settle(&fixture).await;
+    assert_eq!(
+        (run_revision(&fixture).await, fixture.dispatched_effects()),
+        (rested, sent + 1),
+        "and the run is at rest there: a further pass writes and sends nothing"
+    );
+
+    answer_the_append(&fixture, &append).await;
+
+    let answered = run_picture(&fixture).await;
+    assert_eq!(
+        (answered.0, answered.1, answered.2),
+        (
+            AgentLoopPhase::AwaitingModel,
+            Some(AgentRunStatus::WaitingForEffect),
+            2
+        ),
+        "the answer sets the run going: it records the turn and sends the next model call"
+    );
+}
+
+/// On a parked run that is winding down, the deadline resumes nothing: the
+/// wait is resolved as evidence, and the run stays where its wind-down rests,
+/// on the phase it had. The settle at the deadline's end changes nothing
+/// there.
+#[tokio::test]
+async fn a_fan_in_deadline_resumes_nothing_on_a_parked_run_that_is_winding_down() {
+    let (fixture, _append) = parked_beside_a_fan_in_wait(None, false).await;
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::Cancel {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Cancellation,
+                [TENANT, "cancel", "beside-the-wait"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+    )
+    .await;
+    let cancelled = run_picture(&fixture).await;
+    assert_eq!(
+        (cancelled.0, cancelled.1),
+        (
+            AgentLoopPhase::AwaitingChildren,
+            Some(AgentRunStatus::WaitingForReconciliation)
+        ),
+        "cancelled where it stands: parked, on its wait"
+    );
+    let sent = fixture.dispatched_effects();
+
+    let reply = fire_the_deadline(&fixture).await;
+
+    let rakka_agent::AgentRunEntityReply::Applied { outcome } = reply else {
+        panic!("the deadline resolves the wait, got {reply:?}");
+    };
+    assert_eq!(
+        (outcome.status, outcome.phase, fixture.dispatched_effects()),
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            AgentLoopPhase::AwaitingChildren,
+            sent
+        ),
+        "the wait is resolved and nothing resumes: the status and the phase are as they were"
+    );
+}
+
 /// A record an earlier build left between a deadline and its next step is
 /// parked by the settle pass, whatever kind of call the unknown outcome
 /// belongs to. Here it is a claim append, which is no call of the turn. The
 /// record is this build's own after the deadline, with its status written
 /// `Running` as the earlier transition left it. The settle pass parks it
-/// before the loop records the turn, and sends nothing. The pass that parks
+/// before the loop records the turn, and sends nothing: this child cannot be
+/// cancelled, so nothing is owed after its deadline. The pass that parks
 /// it is no turn: the turn is measured once, when it is recorded.
 #[tokio::test]
 async fn a_run_an_earlier_build_left_going_past_a_parked_append_is_parked_again() {
     let metrics = Arc::new(rakka_core::InMemoryMetricsRecorder::new());
-    let (fixture, append) = parked_beside_a_fan_in_wait(Some(metrics.clone())).await;
+    let (fixture, append) = parked_beside_a_fan_in_wait(Some(metrics.clone()), false).await;
     fire_the_deadline(&fixture).await;
     let sent = fixture.dispatched_effects();
     let turns_measured = || {
