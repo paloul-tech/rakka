@@ -1313,7 +1313,7 @@ async fn cancel_the_task(fx: &Fixture) {
 /// still winding down when the proposal is put back.
 #[tokio::test]
 async fn a_wind_down_an_earlier_build_left_waiting_for_a_refused_proposal_ends() {
-    let (fx, _sink) = proposing_goal_world().await;
+    let (fx, sink) = proposing_goal_world().await;
     let evaluation = send_an_evaluation(&fx).await;
     propose_out_of_reach(&fx).await;
     let refused = serde_json::to_value(
@@ -1372,6 +1372,7 @@ async fn a_wind_down_an_earlier_build_left_waiting_for_a_refused_proposal_ends()
         fx.task_snapshot().await.status.is_terminal(),
         "and the task's cancellation completes"
     );
+    assert_at_rest(&fx, &sink).await;
 }
 
 /// The repair reads the journal, and not the wind-down alone. A cancelled

@@ -174,7 +174,9 @@ good, and the task's cancellation never completed. Section 4 stops new
 ones. This repairs the ones that exist.
 
 **The record alone does not say the proposal was answered.** Its status is
-`Cancelling` and its reason a cancellation. So are those of a cancelled
+`Cancelling`, or `WaitingForReconciliation` where a call of the run was
+parked, and its reason the one its wind-down recorded, most often a
+cancellation. So are those of a cancelled
 run whose proposal is still on its way, and that run must go on waiting:
 an acceptance still wins the race with a cancel. The reason's text does
 not settle it either. Where the task's own cancel reached the run before
@@ -193,7 +195,7 @@ Two tests. One builds the earlier build's record and sees the run end
 repair. The other holds the condition: a cancelled run whose proposal is
 unanswered goes on waiting through settle passes that cannot reach the
 task, and is then accepted. With the journal condition removed, that test
-and two others fail.
+and five others across the crate fail.
 
 ## 8. Tests
 
@@ -231,7 +233,9 @@ and two others fail.
 
 Of the twenty-one whole-run tests, seventeen fail on `main`: the
 stuck-record test of section 7 joins the sixteen, and its guard joins the
-three that pass there. The three that
+three that pass there. The stuck-record test fails on `main` at its
+first step, which is the refusal `main` does not handle; it failed on this
+branch, at the repair's own assertion, until the repair was written. The three that
 pass there hold what must not change: a run that holds nothing, one that
 holds only a call it never sent, and one that holds only a claim append
 each end at once. The two unit tests name functions `main` does not have.
@@ -263,6 +267,13 @@ A second reviewer read the second commit. It found no defect in the four
 code changes and confirmed the test counts on `main`. It corrected four
 statements, and ran the record that section 7 now repairs.
 
+A third reviewer read the repair. It found it sound: a run's pending
+exchange leaves the journal only by being settled, in the transition that
+applies its answer; the record the test rebuilds is byte for byte the one
+`main` leaves; and the repair writes once. It corrected two statements:
+how many tests the journal condition holds, and what the record of
+section 10's first item reports.
+
 ## 10. Not done
 
 - Records already ended in one of these states (call 8).
@@ -290,6 +301,7 @@ statements, and ran the record that section 7 now repairs.
   `Running`; and a run out of budget with children out never chases them.
 - **A cancelled run on which an earlier build began a new turn is not
   repaired** (section 4, the second arm). It holds that turn's model call,
-  never sent, and stays `Cancelling`. The first review ran it. By reading,
-  a further `Cancel` fences the call and ends the run; I have not run that.
-  I had not listed this beside the stuck wind-down, and should have.
+  never sent. It is `WaitingForEffect` until its park is answered and
+  `Cancelling` after, and does not end. A further `Cancel` cancels the call
+  and ends the run; the third review ran both. I had not listed this
+  beside the stuck wind-down, and should have.
