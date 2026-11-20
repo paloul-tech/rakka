@@ -441,10 +441,8 @@ against the whole crate.
 - Records already ended in one of these states (call 8).
 - A run parked on an unknown outcome for a completed task waits for a
   person. That is the rule's cost, and what the owner chose.
-- What a task or an agent that has decided does while its run is not yet
-  terminal was not examined beyond the tests here: the wake controller's
-  slot, the escrow's timing, the A2A projection. The reviewer listed it as
-  not reached, and so do I.
+- What stands above a task while its run is not yet terminal was not
+  examined when this was merged. It was examined afterwards: section 12.
 - A `Cancel` on a waiting run changes neither its reason nor its wait. It
   still does what a cancel does to gates: it closes a waiting approval or
   authorization, and cancels a memory promotion or claim append that
@@ -475,3 +473,69 @@ against the whole crate.
   too, where the step commits the turn's tool calls and opens a gated
   one's gate. By reading, the repair cancels those calls and closes the
   gate, as for the forged sweep's record. Not run.
+
+## 12. Above the task, examined
+
+Done on 2026-11-20, after the merge, at the owner's word. It changes no
+code. It adds six tests and the paragraph "Above the task, while its run
+waits" in `docs/rakka-compatibility.md`.
+
+**The one fact everything follows from.** A task reports upward on its
+ledger, not on its status. `owed_epoch_result`, `owed_delegation_result`
+and `finalize_task_cancellation` each return nothing while a child of the
+task's ledger is out, and a run returns its budget only when it ends. None
+of the three changed in this work. A cancelled run parked on an unknown
+outcome already held its task's ledger open; the new thing is a task that
+is `Completed` in that state.
+
+**Measured, and held by a test each.**
+
+| What | Result | Test |
+|---|---|---|
+| The wake of an accepted epoch whose run waits | Active until the run ends. A later occurrence is coalesced behind it and admitted when the epoch's result releases the wake | `an_accepted_epoch_holds_its_wake_until_its_run_ends` |
+| The same, the run parked on an unknown outcome | Held until a person answers the park. Later occurrences share the one parking place | `a_parked_accepted_epoch_holds_its_wake_until_the_park_is_answered` |
+| An operator's `CompleteWakeOccurrence` on the held wake | The next epoch runs beside the parked one. The first epoch's late result returns its budget and releases nothing twice | `an_operator_can_release_the_wake_a_parked_epoch_holds` |
+| A goal cancelled over a parked accepted epoch | `Propagating` until the park is answered, then `Cancelled`. A `Cancel` on the run changes nothing | `a_goal_cancelled_over_a_parked_accepted_epoch_ends_when_the_park_is_answered` |
+| A delegated child whose run waits | `Completed`, and its `DelegationResult` is not sent until the run ends | `a_delegated_child_whose_run_waits_reports_when_the_run_ends` |
+| A verdict that lands after the acceptance | Recorded on the run, reported, refused `task-goal-evaluation-forged` by the task's door. The goal stays undecided | `a_verdict_that_lands_after_acceptance_decides_nothing` |
+
+The first four are in `crates/rakka-agent/tests/waiting_end_task_side.rs`,
+the last two in `run_end_waits.rs`, which now holds twenty-six. The first
+two also hold what the goal's ledger counts as spent when the epoch's
+result arrives: two effect attempts, the model call's and the
+evaluation's. That is the count whether the evaluation's outcome was
+unknown or the dispatcher gave it up; I expected one in the second case
+and did not look into why it is two. Each passed when it was written, since
+it holds behaviour that already existed. Four breaks were then run, one at
+a time: each of the three ledger gates switched off, and the door's check
+of the sender switched off. Each is caught by the test that names it.
+
+**Read, not run.**
+
+- `rakka-a2a` reads `rakka-agent-workflow` runs. It reads no `rakka-agent`
+  task or run, so it is not a consumer.
+- The agent entity keeps no list of its live runs.
+- The host, at its pin `2a43cbb`, which is before this work. I read its
+  fleet-index derivation, its settle sweep and its task page, and changed
+  nothing there. A task's row closes on the task's status and a run's row
+  on the run's, each from its own record. A waiting run stays on the active
+  roster, so its task is settled on every pass, and the result the task
+  owes when the run ends is delivered by the same sweep that delivered it
+  before. I did not read the whole host.
+
+**Two things a caller may not expect.** Neither is new behaviour of the
+code that decides it, and neither is changed.
+
+- A verdict from a run whose task has completed is called `forged` by the
+  door, though the run is the one the task assigned. The goal stayed
+  undecided before this work too: the ended run refused the result.
+- A run that waits after its last rejection still reports
+  `RepeatedIterationFailure`, since struggle signals are derived for every
+  run that is not terminal. One that waits after an acceptance does not.
+  Run once with the threshold at one turn; held by no test.
+
+**Found beside it, and not part of this work.** A continuous goal that has
+spent a budget dimension still admits its next wake. The epoch is created
+with nothing in that dimension, can never be assigned, and holds the wake
+for good; the goal's exhaustion policy is never asked. It is reproduced
+with no waiting run. A draft is in `tmp/`, not filed.
