@@ -1730,4 +1730,17 @@ mod tests {
         assert_eq!(ClaimTombstoneReason::Withdrawn.as_label(), "withdrawn");
         assert_eq!(ClaimTombstoneReason::Policy.as_label(), "policy");
     }
+
+    #[test]
+    fn the_damaged_history_code_is_stable() {
+        let claim = claim();
+        let damaged = ClaimError::HistoryDamaged {
+            claim_id: claim.claim_id.clone(),
+        };
+        assert_eq!(damaged.code(), "claim-history-damaged");
+        assert!(
+            damaged.to_string().contains(claim.claim_id.as_str()),
+            "the message names the claim: {damaged}"
+        );
+    }
 }

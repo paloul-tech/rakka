@@ -41,6 +41,30 @@
 //! nothing, so a later pass deletes the claim under the same derived operation
 //! id once it is due in its new state.
 //!
+//! The sweep also stops short of the delete when it can see the claim moved.
+//! A claim aged by its last transition is read twice: the query returns it
+//! with its transition count, and a second read returns the transition of
+//! that ordinal. When that read answers anything else, the sweep reads the
+//! claim once more. A claim that is gone or at a higher count moved, and is
+//! counted so.
+//!
+//! # A claim whose history is damaged is counted and left
+//!
+//! A store writes a claim and its history together. Rows edited by hand, or
+//! tables restored to different moments, can leave a claim whose stored
+//! transitions are not the ones its record counts. The sweep meets such a
+//! claim in two ways, and counts it as `damaged` in both:
+//!
+//! - It cannot read the claim's last transition cleanly, and the claim read
+//!   again still counts the transitions the query read. It has no instant to
+//!   age the claim by, and attempts no delete.
+//! - It ages the claim, and the store refuses the delete
+//!   `claim-history-damaged`.
+//!
+//! The claim is left as it is and the pass goes on to the claims behind it.
+//! Every pass that reaches the claim counts it again, until an operator
+//! erases or repairs it.
+//!
 //! # No resident sweeper, no registry
 //!
 //! The sweep is called by the application on its own schedule, like the
@@ -206,7 +230,7 @@ impl KnowledgeSpaceRetentionPolicy {
 /// What one sweep call did.
 ///
 /// Every examined claim lands in exactly one of `deleted`, `not_yet_due`,
-/// `retained` and `moved`, so the four sum to `examined`.
+/// `retained`, `moved` and `damaged`, so the five sum to `examined`.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub struct KnowledgeSpaceRetentionReport {
@@ -223,6 +247,11 @@ pub struct KnowledgeSpaceRetentionReport {
     /// moved, tombstoned, or already gone. They are left alone; a later pass
     /// judges them in the state they are then in.
     pub moved: usize,
+    /// Claims whose stored history disagrees with their record
+    /// (`claim-history-damaged`). The sweep cannot age or delete one, leaves
+    /// it as it is, and goes on. It is counted on every pass that reaches it
+    /// until an operator repairs it.
+    pub damaged: usize,
     /// The space is under a legal hold: nothing was read or deleted.
     pub held: bool,
     /// Where the next call resumes, when claims remain past this call's batch.
@@ -417,10 +446,29 @@ async fn examine(
                 .await?;
             match (page.transitions.first(), page.next) {
                 (Some(last), None) if last.ordinal == count => last.occurred_at,
-                // No such transition, a different ordinal, or a later one
-                // behind it: the claim moved since the query read it.
+                // Not the claim's last transition and nothing behind it. A
+                // later entry lies behind the one asked for, or there is no
+                // entry of that ordinal. A claim that moved since the query
+                // read it answers so, and so does one whose stored history
+                // is damaged. The claim says which: a transition raises its
+                // count, and a delete removes it.
+                //
+                // Either way the sweep stops here. It does not age the claim
+                // by a transition that is not its last, and it does not send
+                // a delete that would be refused.
                 _ => {
-                    report.moved += 1;
+                    let at_the_count_read = store
+                        .get(scope, &claim.claim_id)
+                        .await?
+                        .is_some_and(|reread| reread.transition_count() == count);
+                    if at_the_count_read {
+                        // Still there, with the transitions the query
+                        // counted: nothing moved. The store does not hold
+                        // the history the record counts.
+                        report.damaged += 1;
+                    } else {
+                        report.moved += 1;
+                    }
                     return Ok(());
                 }
             }
@@ -454,6 +502,10 @@ async fn examine(
         // Moved, tombstoned, or deleted by someone else since the read. The
         // refusal spent nothing; a later pass judges the claim as it then is.
         Err(ClaimError::DeleteStale { .. } | ClaimError::NotFound { .. }) => report.moved += 1,
+        // The store will not erase a claim whose history it does not hold.
+        // Nothing was written. The claim is one for an operator, and it must
+        // not end the pass for the claims behind it.
+        Err(ClaimError::HistoryDamaged { .. }) => report.damaged += 1,
         Err(error) => return Err(error),
     }
     Ok(())

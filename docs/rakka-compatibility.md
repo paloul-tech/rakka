@@ -875,6 +875,41 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   - A reconcileable call whose failed attempt is asked about is still over-charged by one attempt where the protocol answers "executed" or the outcome is parked, and its retry on a live run still records one failed attempt more than was made.
   - A dispatch refused before its attempt starts is still reported with one attempt.
 
+- Issues #138 and #137 ("a claim whose transition rows disagree with its record cannot be tombstoned or deleted in PostgreSQL, and reports lost races", "no clause reaches the sweep's moved answer for a transition between its two reads") change what `PostgresKnowledgeGraphStore` answers for a claim whose stored history is damaged, and what the retention sweep reports for one. They add one stable refusal code, one field on the sweep's report, one store option and one conformance clause. No durable field, no schema change, no migration, no new metric.
+
+  **What was wrong.** A store writes a claim and its transition history in one statement. Rows edited by hand, or tables restored to different moments, can leave a claim whose transition rows are not the ones its record counts. A `tombstone` or a `delete` of such a claim read the mismatch as a transition that had raced it, read again eight times, and answered `claim-backend-failed`, "lost 8 compare-and-set races; retry". Nothing had raced and a retry answered the same. The retention sweep returned that error, so every pass ended at that claim. A claim missing only its last transition was counted `moved` on every pass and never reported. A claim that had lost one transition and gained another held the right number of rows, and was erased with the lost transition's stored result left in the ledger.
+
+  | A claim whose stored history is damaged | Before | Now |
+  |---|---|---|
+  | `tombstone` or `delete`, PostgreSQL | `claim-backend-failed`, "lost 8 compare-and-set races; retry", after eight attempts | `claim-history-damaged`, on the first. Nothing is written and no operation id is spent |
+  | The same, in a store built `with_damaged_history_erasure()` | The option did not exist | The claim is erased. The stored results of its operations are cleared, those of transitions with no row among them |
+  | The retention sweep reaches one it can age | The pass ended with the store's error | Counted in `damaged`, left, and the pass goes on. Deleted instead when the store opted in |
+  | The retention sweep reaches one it cannot age: its last transition is gone, or an entry lies behind it | Counted in `moved` on every pass | Counted in `damaged` on every pass, and no delete is attempted |
+  | A claim with the right number of rows that are not the ordinals its record counts | Erased, with one stored result left behind | Damaged, as above |
+
+  **How damage is told from a race.** The history is read together with the claim row's fence column, in one statement. A transition raises the fence and adds its row together, so a history one ahead of the claim the erasure read shows a fence that is no longer the one it read: a race, read again as before, and answered `claim-backend-failed` only after eight real ones. The fence it read beside rows that are not the ordinals one to the record's count is damage. It is decided by that one read and not by counting attempts.
+
+  **Who sees the change.**
+
+  - A caller that matched `claim-backend-failed` to retry an erasure no longer retries one that could never succeed. A caller that maps unknown codes to a failure is where it was.
+  - **`KnowledgeSpaceRetentionReport` gains `damaged`**, and every examined claim now lands in exactly one of five counts where it was four: `deleted`, `not_yet_due`, `retained`, `moved`, `damaged`. A deployment that alerts on a pass that returns an error will stop seeing one for a damaged claim; alert on `damaged` above zero instead. It is counted on every pass until the claim is erased or repaired.
+  - On a claim it reads twice and does not find as expected, the sweep now reads the claim a third time, to tell a claim that moved from one that is damaged. A claim that moved is still counted `moved`.
+  - A backend other than Rakka's that is held to `the_whole_contract` runs one more clause, `retention_leaves_a_claim_that_moves_between_its_two_reads`. It holds the sweep, which is Rakka's; a backend whose `transitions` pages are right passes it.
+
+  **The store option.** `with_damaged_history_erasure()` is off by default. A store that opted in finds the stored results no row names by reading every transition row of the tenant and space in the operation ledger. That read is not bounded by an index and takes time in proportion to that ledger, once for each damaged claim erased; the sweep run through such a store pays it for each damaged claim it deletes. A stored result there that mentions the claim and cannot be parsed fails the erasure with `claim-backend-failed`. A claim whose history is whole is erased exactly as before, by either store.
+
+  **Additive.** In `rakka-agent-knowledge-graph`: `ClaimError::HistoryDamaged` (`claim-history-damaged`), `KnowledgeSpaceRetentionReport::damaged`, `conformance::retention_leaves_a_claim_that_moves_between_its_two_reads`. In `rakka-agent-knowledge-graph-postgres`: `with_damaged_history_erasure`, `damaged_history_erasure`. `ClaimError` and the report are `#[non_exhaustive]`.
+
+  **Mixed builds and rollback.** Nothing durable changes, so builds mix freely and rolling back needs nothing. An earlier build answers a damaged claim as before.
+
+  **Not changed.**
+
+  - Reads do not look for damage: `get`, `query` and `transitions` answer what is stored.
+  - Nothing repairs a damaged history. The store erases the claim, on request, or leaves it.
+  - A transition row that cannot be parsed still fails an erasure with `claim-backend-failed`, in either store.
+  - A trust transition of a damaged claim is not examined here.
+  - The in-memory store keeps a claim and its history in one value and cannot be damaged this way; it never answers the new code.
+
 Run the default compatibility matrix:
 
 ```sh

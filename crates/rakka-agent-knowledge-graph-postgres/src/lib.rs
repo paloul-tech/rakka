@@ -35,6 +35,16 @@
 //!   erased row keeps its operation id, which is what stops a replayed append
 //!   from restoring the claim: the statement finds the row before it would
 //!   insert anything. Erased and deleted ledger rows are kept for good.
+//! - **A claim whose stored history is damaged is refused its erasure, unless
+//!   the store opted in.** The ledger rows to erase are named by the claim
+//!   and by its transition rows, so a claim whose rows are not the
+//!   transitions its record counts cannot be erased whole: the stored result
+//!   of a transition with no row holds the claim, and nothing names it. A
+//!   tombstone or a delete of such a claim answers `claim-history-damaged`
+//!   and writes nothing. A store built
+//!   [`with_damaged_history_erasure`](PostgresKnowledgeGraphStore::with_damaged_history_erasure)
+//!   erases it, and finds those stored results by reading every transition
+//!   row of the tenant and space in the ledger.
 //! - **A stub row's `transition_count` column holds a fence value**
 //!   ([`TOMBSTONE_FENCE_TRANSITION_COUNT`]), not the count, so a transition
 //!   statement from a binary that predates tombstones cannot match a stub and
@@ -752,6 +762,8 @@ pub struct PostgresKnowledgeGraphStore {
     migration_lock_wait: Duration,
     /// Whether this store opted in to meaning-based search.
     semantic_search: bool,
+    /// Whether this store erases a claim whose stored history is damaged.
+    damaged_history_erasure: bool,
 }
 
 impl PostgresKnowledgeGraphStore {
@@ -768,6 +780,7 @@ impl PostgresKnowledgeGraphStore {
             client,
             migration_lock_wait: DEFAULT_MIGRATION_LOCK_WAIT,
             semantic_search: false,
+            damaged_history_erasure: false,
         }
     }
 
@@ -808,6 +821,45 @@ impl PostgresKnowledgeGraphStore {
     pub fn with_migration_lock_wait(mut self, wait: Duration) -> Self {
         self.migration_lock_wait = wait;
         self
+    }
+
+    /// Lets this store tombstone and delete a claim whose stored history is
+    /// damaged.
+    ///
+    /// A claim's history is damaged when the transition rows the store holds
+    /// for it are not the ordinals one to its record's transition count. The
+    /// store never leaves a claim so; rows edited by hand, or tables restored
+    /// to different moments, do. A store that has not opted in refuses the
+    /// tombstone and the delete of such a claim `claim-history-damaged`,
+    /// writes nothing and spends no operation id.
+    ///
+    /// A store that opted in erases it as it erases any claim, in one fenced
+    /// statement. It clears the stored results of the operations the claim
+    /// and its stored transitions name. It then reads **every transition row
+    /// of the tenant and space in the operation ledger** for stored results
+    /// that belong to the claim, and clears those too: the result of a
+    /// transition with no row holds the whole claim as it stood, and only the
+    /// ledger still has it. That read is not bounded by an index. It takes
+    /// time in proportion to the space's ledger, once for each damaged claim
+    /// erased, which is why it is a choice. A claim whose history is whole
+    /// is erased exactly as by a store that did not opt in.
+    ///
+    /// What it cannot do: a stored result in that ledger that mentions the
+    /// claim and cannot be parsed fails the erasure with
+    /// `claim-backend-failed`, as an unreadable transition row does.
+    ///
+    /// The retention sweep run through an opted-in store deletes a damaged
+    /// claim it can age, and so pays that read for each one.
+    #[must_use]
+    pub const fn with_damaged_history_erasure(mut self) -> Self {
+        self.damaged_history_erasure = true;
+        self
+    }
+
+    /// Whether this store erases a claim whose stored history is damaged.
+    #[must_use]
+    pub const fn damaged_history_erasure(&self) -> bool {
+        self.damaged_history_erasure
     }
 
     /// How long [`Self::migrate`] waits for another migrator's lock.

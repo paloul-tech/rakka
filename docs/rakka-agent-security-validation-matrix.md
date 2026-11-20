@@ -381,6 +381,7 @@ backend with tighter declared limits, and PostgreSQL all run unchanged
 | Retention purge | Ignores a legal hold, purges before the window elapses, ages a claim from its creation instead of its last transition, or judges a stub by its trust status | `retention_ages_claims_by_trust_status` |
 | Retention is bounded | Examines more than its batch, or skips or repeats a claim across a cursor | `retention_is_bounded_and_resumable` |
 | Retention leaves a claim that moved | Deletes a claim whose trust moved, or that was tombstoned, between the sweep's read and its delete | `retention_leaves_a_claim_that_moved` |
+| Retention leaves a claim that moves between its two reads | Ages a claim by a transition that is no longer its last, or sends a delete for a claim it has seen move (issue #137) | `retention_leaves_a_claim_that_moves_between_its_two_reads` |
 
 What only a live database can prove is in
 `crates/rakka-agent-knowledge-graph-postgres/tests/postgres_erasure_proofs.rs`.
@@ -422,9 +423,33 @@ live-database proofs,
 | The search reads the word index rather than scanning the scope | `postgres_search_uses_the_word_index_when_dsn_is_set` |
 | A migrator that finds the migration lock held stops after the store's lock wait and names the holder's backend, without its application name, its query or the connection string; a waiter that cannot read the holder still says the lock was not acquired; a wait of zero is one try; it migrates once the holder's connection closes (issue #143; a test file of its own, `postgres_migration_lock_proofs.rs`, because the lock is one per database) | `postgres_a_migrator_stops_waiting_and_names_the_holder_when_dsn_is_set` |
 
-Verified against PostgreSQL 17.5 on 2026-11-16: the graph crate's five test
-files pass with no skips (8 backend proofs, 28 conformance clauses, 16 erasure
-proofs, 27 search-index proofs, 1 migration-lock proof).
+A claim whose stored history is damaged (issue #138) has a third file of
+live-database proofs,
+`crates/rakka-agent-knowledge-graph-postgres/tests/postgres_damaged_history_proofs.rs`.
+Each proof damages a claim's transition rows with a statement of its own:
+
+| Property | Proven by |
+| --- | --- |
+| A tombstone and a delete of a claim missing a transition, the last or an earlier one, are refused `claim-history-damaged` on every attempt, and nothing is written | `postgres_a_claim_missing_its_last_transition_is_refused_as_damaged_when_dsn_is_set`, `postgres_a_claim_missing_an_earlier_transition_is_refused_as_damaged_when_dsn_is_set` |
+| The same for a claim with a transition too many, and for one with the right number of rows that are not the ones its record counts | `postgres_a_claim_with_a_transition_too_many_is_refused_as_damaged_when_dsn_is_set`, `postgres_a_claim_with_the_right_number_of_wrong_transitions_is_damaged_when_dsn_is_set` |
+| The retention sweep counts each damaged claim and deletes the healthy claim behind them | `postgres_the_sweep_counts_damaged_claims_and_goes_on_when_dsn_is_set` |
+| A store that opted in deletes a damaged claim and clears the stored result of the transition it has no row for, and leaves a neighbour's stored result that mentions the claim | `postgres_an_opted_in_store_deletes_a_damaged_claim_whole_when_dsn_is_set` |
+| A store that opted in tombstones a damaged claim and deletes the stub; a store that did not refuses the stub's delete | `postgres_an_opted_in_store_tombstones_a_damaged_claim_when_dsn_is_set` |
+| A stored result that mentions the claim and cannot be parsed stops the opted-in erasure, and nothing is written | `postgres_an_unreadable_stored_result_stops_the_opted_in_erasure_when_dsn_is_set` |
+| The sweep through an opted-in store deletes the damaged claim whose last transition it reads cleanly, and counts the two it does not | `postgres_the_sweep_through_an_opted_in_store_deletes_what_it_can_age_when_dsn_is_set` |
+| Opting in changes nothing for a claim whose history is whole | `postgres_an_opted_in_store_passes_the_erasure_clauses_when_dsn_is_set` |
+
+The sweep's own handling of a damaged claim is held on the in-memory store
+by `crates/rakka-agent-knowledge-graph/tests/retention_damaged_history.rs`,
+through a store that answers as a damaged backend does.
+
+Verified on 2026-11-20 against PostgreSQL 16.14 with pgvector 0.8.5, with
+`RAKKA_POSTGRES_PGVECTOR_REQUIRED=1`: the graph crate's seven test files pass
+with no skips (8 backend proofs, 32 conformance clauses, 10 damaged-history
+proofs, 16 erasure proofs, 1 migration-lock proof, 27 search-index proofs, 12
+semantic-search proofs). Against PostgreSQL 17.5, which has no pgvector, the
+same files pass, and eleven tests of meaning-based search announce that they
+did not run: nine semantic-search proofs and two conformance clauses.
 
 ## Repeatable commands
 
