@@ -834,7 +834,12 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **What the settlement does not do.** It moves no status. It promotes no parked occurrence into the freed place, though the gate of a control task a person completed is still open. It does not count the epoch's outcome toward a failure streak or a stagnation.
 
-  **What a deployment sees.** A control task that ended over an epoch now closes its ledger when that epoch's result comes, and its consumption then includes the epoch's. Before that result it still reports one child out and one active occurrence, which is true: the epoch is still running. The end of a goal does not cancel its epochs.
+  **What a deployment sees.**
+
+  - A control task that ended over an epoch now closes its ledger when that epoch's result comes, and its consumption then includes the epoch's. Before that result it still reports one child out and one active occurrence, which is true: the epoch is still running. The end of a goal does not cancel its epochs.
+  - The settlement is a change to the ended record. Its `updated_at` moves, which is the timestamp an A2A task status carries, and the `rakka.agent.epochs` metric counts the epoch's outcome.
+  - **An ended control task that is a delegated child reports to its parent when the settlement closes its ledger.** A delegation result waits for the child's ledger to close, and before this change that ledger never closed.
+  - **A result for a wake the ended task never admitted is accepted,** where it was refused `task-terminal`. It settles nothing and releases nothing, and one history entry records it. A control task that has not ended answers the same way.
 
   **API.** `AgentWakeControllerState` gains `release_ended`, a release that promotes nothing.
 

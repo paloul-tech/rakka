@@ -7659,8 +7659,10 @@ fn apply_epoch_result(
                 Some(Err(AgentWakeError::NotActive { .. })) | None => None,
                 Some(Err(error)) => return Err(error.into()),
             };
-            // The record only shrinks here but for one history entry, and an
-            // ended record has no growth to reserve for.
+            // The settlement takes a ledger child and an active occurrence
+            // off the record and adds nothing to it; the history entry is
+            // kept beside the record. An ended record has no growth to
+            // reserve for.
             task.check_bounds(0)?;
             state.updated_at = now;
             record_wake_history_with_digest(
@@ -7671,7 +7673,21 @@ fn apply_epoch_result(
                 result.result_digest.clone(),
                 now,
             );
-            return Ok((release, Vec::new()));
+            // This settlement may have closed the ended task's ledger, the
+            // gate its own reports upward wait behind: a control task that
+            // is a delegated child owes its parent run a result once it has
+            // ended and holds no budget out. Owed here, in the transition
+            // that closes the ledger, as the ledger exchanges owe it. A
+            // construction failure must not refuse the settlement, which
+            // would leave the ledger open for good.
+            let owed = match owed_child_reports(state, now, 0) {
+                Ok(owed) => owed,
+                Err(error) => {
+                    debug_assert!(false, "child-report construction failed: {error}");
+                    Vec::new()
+                }
+            };
+            return Ok((release, owed));
         }
 
         // Account the epoch's outcome *before* the release attempt, so the
