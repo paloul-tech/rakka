@@ -381,7 +381,7 @@ backend with tighter declared limits, and PostgreSQL all run unchanged
 | Retention purge | Ignores a legal hold, purges before the window elapses, ages a claim from its creation instead of its last transition, or judges a stub by its trust status | `retention_ages_claims_by_trust_status` |
 | Retention is bounded | Examines more than its batch, or skips or repeats a claim across a cursor | `retention_is_bounded_and_resumable` |
 | Retention leaves a claim that moved | Deletes a claim whose trust moved, or that was tombstoned, between the sweep's read and its delete | `retention_leaves_a_claim_that_moved` |
-| Retention leaves a claim that moves between its two reads | Ages a claim by a transition that is no longer its last, or sends a delete for a claim it has seen move (issue #137) | `retention_leaves_a_claim_that_moves_between_its_two_reads` |
+| Retention leaves a claim that moves between its two reads | Ages a claim by a transition that is no longer its last, sends a delete for a claim it has seen move, or counts a claim that was retracted, deleted or promoted under it as damaged (issue #137) | `retention_leaves_a_claim_that_moves_between_its_two_reads` |
 
 What only a live database can prove is in
 `crates/rakka-agent-knowledge-graph-postgres/tests/postgres_erasure_proofs.rs`.
@@ -431,12 +431,17 @@ Each proof damages a claim's transition rows with a statement of its own:
 | Property | Proven by |
 | --- | --- |
 | A tombstone and a delete of a claim missing a transition, the last or an earlier one, are refused `claim-history-damaged` on every attempt, and nothing is written | `postgres_a_claim_missing_its_last_transition_is_refused_as_damaged_when_dsn_is_set`, `postgres_a_claim_missing_an_earlier_transition_is_refused_as_damaged_when_dsn_is_set` |
-| The same for a claim with a transition too many, and for one with the right number of rows that are not the ones its record counts | `postgres_a_claim_with_a_transition_too_many_is_refused_as_damaged_when_dsn_is_set`, `postgres_a_claim_with_the_right_number_of_wrong_transitions_is_damaged_when_dsn_is_set` |
+| The same for a claim with a transition too many, for one with the right number of rows that are not the ones its record counts, and for one that counts no transition and has one | `postgres_a_claim_with_a_transition_too_many_is_refused_as_damaged_when_dsn_is_set`, `postgres_a_claim_with_the_right_number_of_wrong_transitions_is_damaged_when_dsn_is_set`, `postgres_a_claim_that_counts_no_transition_and_has_one_is_damaged_when_dsn_is_set` |
+| The right ordinals are not enough: a row that is another claim's transition, the claim's own transition of another ordinal, or unreadable is damage, and the other claim is untouched | `postgres_a_row_that_is_not_the_claims_own_transition_is_damage_when_dsn_is_set` |
+| A row from a schema newer than the binary reads is refused with the schema's code and not called damage, in a store that opted in too | `postgres_a_transition_from_a_newer_schema_is_not_called_damage_when_dsn_is_set` |
+| A transition that lands between an erasure's two reads is a race and never damage, without a pause: the history read waits on a table lock whose holder lands the transition | `postgres_a_transition_between_an_erasures_two_reads_is_a_race_when_dsn_is_set` |
 | The retention sweep counts each damaged claim and deletes the healthy claim behind them | `postgres_the_sweep_counts_damaged_claims_and_goes_on_when_dsn_is_set` |
 | A store that opted in deletes a damaged claim and clears the stored result of the transition it has no row for, and leaves a neighbour's stored result that mentions the claim | `postgres_an_opted_in_store_deletes_a_damaged_claim_whole_when_dsn_is_set` |
+| A store that opted in clears no stored result that a stray row names and that is another claim's | `postgres_an_opted_in_erasure_clears_no_other_claims_stored_result_when_dsn_is_set` |
 | A store that opted in tombstones a damaged claim and deletes the stub; a store that did not refuses the stub's delete | `postgres_an_opted_in_store_tombstones_a_damaged_claim_when_dsn_is_set` |
-| A stored result that mentions the claim and cannot be parsed stops the opted-in erasure, and nothing is written | `postgres_an_unreadable_stored_result_stops_the_opted_in_erasure_when_dsn_is_set` |
-| The sweep through an opted-in store deletes the damaged claim whose last transition it reads cleanly, and counts the two it does not | `postgres_the_sweep_through_an_opted_in_store_deletes_what_it_can_age_when_dsn_is_set` |
+| A transition that lands after the opted-in erasure read the ledger is not missed: the fence stops the statement and the next attempt clears its stored result | `postgres_a_transition_after_the_ledger_read_is_not_missed_when_dsn_is_set` |
+| A stored result that mentions the claim and cannot be parsed stops the opted-in erasure, by the name of its operation, and nothing is written | `postgres_an_unreadable_stored_result_stops_the_opted_in_erasure_when_dsn_is_set` |
+| The sweep through an opted-in store deletes a damaged claim whose history ends where its record says, and only counts the rest: a missing last transition, and a claim, a stub and a proposed claim with entries behind their history | `postgres_the_sweep_through_an_opted_in_store_deletes_what_it_can_age_when_dsn_is_set` |
 | Opting in changes nothing for a claim whose history is whole | `postgres_an_opted_in_store_passes_the_erasure_clauses_when_dsn_is_set` |
 
 The sweep's own handling of a damaged claim is held on the in-memory store
@@ -445,7 +450,7 @@ through a store that answers as a damaged backend does.
 
 Verified on 2026-11-20 against PostgreSQL 16.14 with pgvector 0.8.5, with
 `RAKKA_POSTGRES_PGVECTOR_REQUIRED=1`: the graph crate's seven test files pass
-with no skips (8 backend proofs, 32 conformance clauses, 10 damaged-history
+with no skips (8 backend proofs, 32 conformance clauses, 16 damaged-history
 proofs, 16 erasure proofs, 1 migration-lock proof, 27 search-index proofs, 12
 semantic-search proofs). Against PostgreSQL 17.5, which has no pgvector, the
 same files pass, and eleven tests of meaning-based search announce that they

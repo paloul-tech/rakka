@@ -42,28 +42,39 @@
 //! id once it is due in its new state.
 //!
 //! The sweep also stops short of the delete when it can see the claim moved.
-//! A claim aged by its last transition is read twice: the query returns it
-//! with its transition count, and a second read returns the transition of
-//! that ordinal. When that read answers anything else, the sweep reads the
-//! claim once more. A claim that is gone or at a higher count moved, and is
-//! counted so.
+//! It reads the end of a claim's history before it acts on what the query
+//! returned: the entry of the claim's transition count, and nothing behind
+//! it. A claim past `Proposed` is read so to date the state it rests in; a
+//! stub or a proposed claim, which its own record dates, is read so once it
+//! is due. When that read answers anything else, the sweep reads the claim
+//! once more. A claim that is gone or at a higher count moved, and is counted
+//! so.
 //!
 //! # A claim whose history is damaged is counted and left
 //!
 //! A store writes a claim and its history together. Rows edited by hand, or
 //! tables restored to different moments, can leave a claim whose stored
-//! transitions are not the ones its record counts. The sweep meets such a
-//! claim in two ways, and counts it as `damaged` in both:
+//! transitions are not the ones its record counts. The sweep counts such a
+//! claim as `damaged` where it meets the damage:
 //!
-//! - It cannot read the claim's last transition cleanly, and the claim read
-//!   again still counts the transitions the query read. It has no instant to
-//!   age the claim by, and attempts no delete.
-//! - It ages the claim, and the store refuses the delete
-//!   `claim-history-damaged`.
+//! - The end of the claim's history is not where its count says, and the
+//!   claim read again still counts the transitions the query read. The sweep
+//!   attempts no delete. A missing last transition leaves it nothing to age
+//!   the claim by. Entries behind the last may be the claim's real, later
+//!   history under a record restored to an earlier state, and the sweep does
+//!   not delete on a record its own history contradicts, whatever the store
+//!   would do with the delete.
+//! - The history ends where it should, the claim is due, and the store
+//!   refuses the delete `claim-history-damaged`.
 //!
 //! The claim is left as it is and the pass goes on to the claims behind it.
-//! Every pass that reaches the claim counts it again, until an operator
-//! erases or repairs it.
+//! A later pass that meets the damage counts it again, until an operator
+//! erases or repairs the claim.
+//!
+//! **The sweep is no scan for damage.** A claim in a status with no window is
+//! retained unread. A claim that is not yet due, and whose history ends
+//! where it should, is counted `not_yet_due` whatever else its history has
+//! lost. A `damaged` of zero does not say the space holds no damaged claim.
 //!
 //! # No resident sweeper, no registry
 //!
@@ -123,7 +134,10 @@
 //!
 //! Each pass walks the space in claim-id order through `query`, and makes one
 //! bounded `transitions` read per candidate that has left `Proposed` and whose
-//! status has a window. On a backend whose `query` filters after decoding
+//! status has a window, and one per stub or proposed claim that is due,
+//! before its delete. A read that does not find the end of the history where
+//! the claim's count says is followed by one `get` of that claim. On a
+//! backend whose `query` filters after decoding
 //! rows, a pass is linear in the space. That is an accepted cost; a "status
 //! since" stamp on the claim is the remedy if it ever matters.
 
@@ -247,10 +261,11 @@ pub struct KnowledgeSpaceRetentionReport {
     /// moved, tombstoned, or already gone. They are left alone; a later pass
     /// judges them in the state they are then in.
     pub moved: usize,
-    /// Claims whose stored history disagrees with their record
-    /// (`claim-history-damaged`). The sweep cannot age or delete one, leaves
-    /// it as it is, and goes on. It is counted on every pass that reaches it
-    /// until an operator repairs it.
+    /// Claims the sweep found with a stored history that disagrees with
+    /// their record: the history does not end where the record's count says,
+    /// or the store refused the delete `claim-history-damaged`. Each is left
+    /// as it is and the pass goes on. Zero does not say the space holds none:
+    /// the sweep reads a history only to age a claim or before deleting one.
     pub damaged: usize,
     /// The space is under a legal hold: nothing was read or deleted.
     pub held: bool,
@@ -268,8 +283,9 @@ pub(crate) type RetentionHook<'h> =
 /// place the sweep has read a claim and not yet acted on what it read.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RetentionHooks<'a, 'h> {
-    /// Run on each claim that is aged by its last transition, after the
-    /// query read the claim and before the sweep reads that transition.
+    /// Run on each claim whose history the sweep reads, after the query
+    /// read the claim and immediately before that read: a claim past
+    /// `Proposed` with a window, and a stub or a proposed claim that is due.
     pub(crate) between_reads: Option<&'a RetentionHook<'h>>,
     /// Run on each due claim immediately before its delete.
     pub(crate) before_delete: Option<&'a RetentionHook<'h>>,
@@ -404,6 +420,60 @@ async fn discharge(
     Ok(report)
 }
 
+/// What the store holds at the end of one claim's history, against the
+/// transition count the query read with the claim.
+enum HistoryEnd {
+    /// The transition of the claim's count with nothing behind it, and when
+    /// it occurred; `None` for a claim that counts no transition and has
+    /// none stored.
+    Clean(Option<AgentTimestampMillis>),
+    /// The claim is gone, or counts more transitions than the query read.
+    Moved,
+    /// The claim is as the query read it, and its history does not end where
+    /// its count says.
+    Damaged,
+}
+
+/// Reads the end of one claim's stored history: one bounded read of the
+/// entry after the one before its last, and nothing after that.
+///
+/// When that is not the claim's last transition with nothing behind it, a
+/// claim that moved since the query read it answers so, and so does one
+/// whose stored history is damaged. The claim says which, in one more read:
+/// a transition raises its count, and a delete removes it.
+async fn history_end(
+    store: &dyn KnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    claim: &Claim,
+) -> ClaimResult<HistoryEnd> {
+    let count = claim.transition_count();
+    let page = store
+        .transitions(
+            scope,
+            &claim.claim_id,
+            ClaimTransitionCursor::after_ordinal(count.saturating_sub(1)).with_limit(1),
+        )
+        .await?;
+    match (page.transitions.first(), page.next) {
+        (None, None) if count == 0 => return Ok(HistoryEnd::Clean(None)),
+        (Some(last), None) if count > 0 && last.ordinal == count => {
+            return Ok(HistoryEnd::Clean(Some(last.occurred_at)));
+        }
+        _ => {}
+    }
+    let at_the_count_read = store
+        .get(scope, &claim.claim_id)
+        .await?
+        .is_some_and(|reread| reread.transition_count() == count);
+    Ok(if at_the_count_read {
+        // Still there, with the transitions the query counted: nothing
+        // moved. The store does not hold the history the record counts.
+        HistoryEnd::Damaged
+    } else {
+        HistoryEnd::Moved
+    })
+}
+
 /// Judges one claim against the policy and deletes it when it is due.
 async fn examine(
     store: &dyn KnowledgeGraphStore,
@@ -416,7 +486,7 @@ async fn examine(
 ) -> ClaimResult<()> {
     // The window and the instant the claim entered the state it applies to. A
     // stub is judged by the tombstone window alone, whatever its trust.
-    let (window, entered_at) = if let Some(tombstone) = claim.tombstone() {
+    let (window, on_record) = if let Some(tombstone) = claim.tombstone() {
         (policy.tombstone_window(), Some(tombstone.tombstoned_at))
     } else if claim.trust() == ClaimTrustStatus::Proposed {
         (policy.window(claim.trust()), Some(claim.created_at))
@@ -427,48 +497,25 @@ async fn examine(
         report.retained += 1;
         return Ok(());
     };
-    let entered_at = match entered_at {
+    // A claim that has left `Proposed` is aged by its last transition, which
+    // is read here. A stub or a proposed claim is aged by its own record,
+    // and its history is read below, once it is due.
+    let entered_at = match on_record {
         Some(entered_at) => entered_at,
         None => {
-            // The last transition is the one whose ordinal equals the claim's
-            // transition count. One bounded read: the entry after the one
-            // before it, and nothing after that.
-            let count = claim.transition_count();
             if let Some(between_reads) = hooks.between_reads {
                 between_reads(claim).await;
             }
-            let page = store
-                .transitions(
-                    scope,
-                    &claim.claim_id,
-                    ClaimTransitionCursor::after_ordinal(count.saturating_sub(1)).with_limit(1),
-                )
-                .await?;
-            match (page.transitions.first(), page.next) {
-                (Some(last), None) if last.ordinal == count => last.occurred_at,
-                // Not the claim's last transition and nothing behind it. A
-                // later entry lies behind the one asked for, or there is no
-                // entry of that ordinal. A claim that moved since the query
-                // read it answers so, and so does one whose stored history
-                // is damaged. The claim says which: a transition raises its
-                // count, and a delete removes it.
-                //
-                // Either way the sweep stops here. It does not age the claim
-                // by a transition that is not its last, and it does not send
-                // a delete that would be refused.
-                _ => {
-                    let at_the_count_read = store
-                        .get(scope, &claim.claim_id)
-                        .await?
-                        .is_some_and(|reread| reread.transition_count() == count);
-                    if at_the_count_read {
-                        // Still there, with the transitions the query
-                        // counted: nothing moved. The store does not hold
-                        // the history the record counts.
-                        report.damaged += 1;
-                    } else {
-                        report.moved += 1;
-                    }
+            match history_end(store, scope, claim).await? {
+                HistoryEnd::Clean(Some(occurred_at)) => occurred_at,
+                HistoryEnd::Moved => {
+                    report.moved += 1;
+                    return Ok(());
+                }
+                // A claim past `Proposed` counts a transition, so a history
+                // with none to end on is no clean one for it.
+                HistoryEnd::Damaged | HistoryEnd::Clean(None) => {
+                    report.damaged += 1;
                     return Ok(());
                 }
             }
@@ -477,6 +524,28 @@ async fn examine(
     if !is_due(entered_at, window, now) {
         report.not_yet_due += 1;
         return Ok(());
+    }
+    if on_record.is_some() {
+        // Due on its record's word alone. Before it is deleted on that word,
+        // the end of its history is read as it is for every other claim. A
+        // history that runs past the record may be the claim's real, later
+        // one, under a claim row that was restored to an earlier state; the
+        // sweep does not delete on a record its own history contradicts,
+        // whatever the store would do with the delete.
+        if let Some(between_reads) = hooks.between_reads {
+            between_reads(claim).await;
+        }
+        match history_end(store, scope, claim).await? {
+            HistoryEnd::Clean(_) => {}
+            HistoryEnd::Moved => {
+                report.moved += 1;
+                return Ok(());
+            }
+            HistoryEnd::Damaged => {
+                report.damaged += 1;
+                return Ok(());
+            }
+        }
     }
 
     if let Some(before_delete) = hooks.before_delete {

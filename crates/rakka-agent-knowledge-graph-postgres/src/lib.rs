@@ -38,13 +38,14 @@
 //! - **A claim whose stored history is damaged is refused its erasure, unless
 //!   the store opted in.** The ledger rows to erase are named by the claim
 //!   and by its transition rows, so a claim whose rows are not the
-//!   transitions its record counts cannot be erased whole: the stored result
-//!   of a transition with no row holds the claim, and nothing names it. A
-//!   tombstone or a delete of such a claim answers `claim-history-damaged`
-//!   and writes nothing. A store built
+//!   transitions its record counts cannot be erased whole by them: the
+//!   stored result of a transition with no row holds the claim, and nothing
+//!   names it, and a row that is not the claim's own names another claim's
+//!   operation. A tombstone or a delete of such a claim answers
+//!   `claim-history-damaged` and writes nothing. A store built
 //!   [`with_damaged_history_erasure`](PostgresKnowledgeGraphStore::with_damaged_history_erasure)
-//!   erases it, and finds those stored results by reading every transition
-//!   row of the tenant and space in the ledger.
+//!   erases it, and finds the claim's stored results by reading every
+//!   transition row of the tenant and space in the ledger.
 //! - **A stub row's `transition_count` column holds a fence value**
 //!   ([`TOMBSTONE_FENCE_TRANSITION_COUNT`]), not the count, so a transition
 //!   statement from a binary that predates tombstones cannot match a stub and
@@ -826,30 +827,38 @@ impl PostgresKnowledgeGraphStore {
     /// Lets this store tombstone and delete a claim whose stored history is
     /// damaged.
     ///
-    /// A claim's history is damaged when the transition rows the store holds
-    /// for it are not the ordinals one to its record's transition count. The
-    /// store never leaves a claim so; rows edited by hand, or tables restored
-    /// to different moments, do. A store that has not opted in refuses the
-    /// tombstone and the delete of such a claim `claim-history-damaged`,
-    /// writes nothing and spends no operation id.
+    /// A claim's history is whole when, for each ordinal from one to its
+    /// record's transition count, the store holds one row whose record is
+    /// that claim's transition of that ordinal, and no other row. Anything
+    /// else is damage: a row missing, a row too many, a row that is another
+    /// claim's, or a row that cannot be read. The store never leaves a claim
+    /// so; rows edited by hand, or tables restored to different moments, do.
+    /// A store that has not opted in refuses the tombstone and the delete of
+    /// such a claim `claim-history-damaged`, writes nothing and spends no
+    /// operation id.
     ///
     /// A store that opted in erases it as it erases any claim, in one fenced
     /// statement. It clears the stored results of the operations the claim
-    /// and its stored transitions name. It then reads **every transition row
-    /// of the tenant and space in the operation ledger** for stored results
-    /// that belong to the claim, and clears those too: the result of a
-    /// transition with no row holds the whole claim as it stood, and only the
-    /// ledger still has it. That read is not bounded by an index. It takes
-    /// time in proportion to the space's ledger, once for each damaged claim
-    /// erased, which is why it is a choice. A claim whose history is whole
-    /// is erased exactly as by a store that did not opt in.
+    /// itself names, its append and its tombstone. For its transitions it
+    /// asks no stored row, and reads **every transition row of the tenant
+    /// and space in the operation ledger** for stored results that belong to
+    /// the claim: the result of a transition holds the whole claim as it
+    /// stood, and for one with no row only the ledger still has it. That
+    /// read is not keyed. It takes time in proportion to the space's ledger,
+    /// once for each attempt to erase a damaged claim, and an attempt that
+    /// loses a race reads it again, which is why it is a choice. A claim
+    /// whose history is whole is erased exactly as by a store that did not
+    /// opt in.
     ///
     /// What it cannot do: a stored result in that ledger that mentions the
     /// claim and cannot be parsed fails the erasure with
-    /// `claim-backend-failed`, as an unreadable transition row does.
+    /// `claim-backend-failed`, in a message that names the result's
+    /// operation.
     ///
     /// The retention sweep run through an opted-in store deletes a damaged
-    /// claim it can age, and so pays that read for each one.
+    /// claim whose history ends where its record says, and so pays that read
+    /// for each one. It still only counts the rest
+    /// ([`rakka_agent_knowledge_graph::retention`]).
     #[must_use]
     pub const fn with_damaged_history_erasure(mut self) -> Self {
         self.damaged_history_erasure = true;

@@ -288,9 +288,10 @@ pub enum ClaimError {
         claim_id: ClaimId,
     },
     /// The claim's stored history disagrees with its record: the store does
-    /// not hold exactly the transitions the record counts. A store writes a
-    /// claim and its history together, so this is damage from outside it, a
-    /// manual edit or a partial restore.
+    /// not hold exactly the transitions the record counts, each a readable
+    /// transition of that claim. A store writes a claim and its history
+    /// together, so this is damage from outside it, a manual edit or a
+    /// partial restore.
     ///
     /// A tombstone or a delete of such a claim is refused, and nothing is
     /// written and no operation id is spent. Erasing a claim means clearing

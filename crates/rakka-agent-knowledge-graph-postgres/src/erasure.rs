@@ -24,17 +24,19 @@
 //!
 //! - the fence is no longer the one read, or the claim row is gone: the claim
 //!   moved, a race, and the loop reads again;
-//! - the fence is the one read and the rows are the ordinals one to the
-//!   record's count: the history is whole, and its operations are named;
+//! - the fence is the one read, and for each ordinal from one to the record's
+//!   count there is one row whose record is that claim's transition of that
+//!   ordinal: the history is whole, and its rows name its operations;
 //! - the fence is the one read and the rows are anything else: the history is
 //!   damaged. Nothing raced, and reading again answers the same.
 //!
 //! A damaged claim is refused `claim-history-damaged` and nothing is written.
 //! A store that opted in
 //! ([`with_damaged_history_erasure`](PostgresKnowledgeGraphStore::with_damaged_history_erasure))
-//! erases it: the stored results that no row names are found by reading the
-//! scope's transition rows in the ledger, each one checked against its own
-//! claim id.
+//! erases it. It takes no operation's name from a row of a damaged history: a
+//! row that is not the claim's own names another claim's operation. The
+//! claim's transition results are found in the ledger instead, by reading the
+//! scope's transition rows there and comparing each one's own claim id.
 //!
 //! # An operation id belongs to one claim
 //!
@@ -88,9 +90,9 @@ ORDER BY tr.ordinal
 /// mentions one claim id.
 ///
 /// The ledger has no `claim_id` column, so this is a read of every transition
-/// row of the scope: the one read in this crate that is not bounded by an
-/// index on what it looks for. It runs only for a claim whose history is
-/// damaged, and only in a store that opted in to erasing one.
+/// row of the scope's ledger, where every other read an erasure makes is
+/// keyed. It runs only for a claim whose history is damaged, and only in a
+/// store that opted in to erasing one.
 ///
 /// A match on the id is a nomination. The id also appears in the stored
 /// result of another claim whose statement points at this one, so each
@@ -118,35 +120,82 @@ enum HistoryState {
     Damaged,
 }
 
+/// One stored transition row, as far as it can be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredTransition {
+    /// The row's ordinal column.
+    ordinal: i32,
+    /// What the row's record says it is. `None` for a record that cannot be
+    /// read.
+    record: Option<RecordedTransition>,
+}
+
+/// What a stored transition record says of itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedTransition {
+    /// The claim the record says it belongs to.
+    claim_id: String,
+    /// The ordinal the record says it has.
+    ordinal: u32,
+    /// The operation that wrote it.
+    operation_id: String,
+}
+
 /// Judges one history read.
 ///
 /// `read_fence` is the fence the caller read with the claim, `stored_fence`
-/// the one this read found (`None` when the claim row is gone), `ordinals`
-/// the stored transitions' ordinals in ascending order, and `count` the
-/// transitions the claim's record counts.
+/// the one this read found (`None` when the claim row is gone), `claim_id`
+/// and `count` the claim and the transitions its record counts, and `stored`
+/// the transition rows in ascending ordinal order.
 ///
-/// A whole history is the ordinals one to `count`, each once. The number of
-/// rows alone is not enough: a claim that lost one transition and gained
-/// another holds the right number, and the lost one's operation could not be
-/// named.
+/// A whole history is one row for each ordinal from one to `count`, whose
+/// record is that claim's transition of that ordinal. The number of rows
+/// alone is not enough: a claim that lost one transition and gained another
+/// holds the right number, and the lost one's operation could not be named.
+/// Nor are the ordinals alone: a row under the claim's key whose record is
+/// another claim's transition names that claim's operation.
 fn history_state(
     read_fence: i32,
     stored_fence: Option<i32>,
-    ordinals: &[i32],
+    claim_id: &str,
     count: u32,
+    stored: &[StoredTransition],
 ) -> HistoryState {
     if stored_fence != Some(read_fence) {
         return HistoryState::Moved;
     }
-    let whole = u32::try_from(ordinals.len()).ok() == Some(count)
-        && ordinals
-            .iter()
-            .zip(1_i32..)
-            .all(|(ordinal, expected)| *ordinal == expected);
+    let whole = u32::try_from(stored.len()).ok() == Some(count)
+        && stored.iter().zip(1_u32..).all(|(row, expected)| {
+            u32::try_from(row.ordinal).ok() == Some(expected)
+                && row
+                    .record
+                    .as_ref()
+                    .is_some_and(|record| record.claim_id == claim_id && record.ordinal == expected)
+        });
     if whole {
         HistoryState::Whole
     } else {
         HistoryState::Damaged
+    }
+}
+
+/// Reads what one stored transition record says of itself.
+///
+/// A record this binary must not judge, one from a schema newer or older
+/// than it reads, is refused as it always was. Any other record that does
+/// not restore is unreadable, which is damage: `None`.
+fn recorded_transition(record: &[u8]) -> ClaimResult<Option<RecordedTransition>> {
+    match decode_transition(record) {
+        Ok(transition) => Ok(Some(RecordedTransition {
+            claim_id: transition.claim_id.as_str().to_string(),
+            ordinal: transition.ordinal,
+            operation_id: transition.operation_id.as_str().to_string(),
+        })),
+        Err(
+            error
+            @ (ClaimError::SchemaVersionAhead { .. } | ClaimError::SchemaVersionTooOld { .. }),
+        ) => Err(error),
+        Err(_) => Ok(None),
     }
 }
 
@@ -157,8 +206,8 @@ pub(crate) enum ErasableHistory {
     /// The claim moved since the caller read it; the caller reads again.
     Moved,
     /// The claim's stored history is damaged. The operation ids are the ones
-    /// the claim and the transitions that are stored still name: its append,
-    /// its tombstone when it is a stub, and each stored transition.
+    /// the claim itself names: its append, and its tombstone when it is a
+    /// stub. No stored row is asked for a name.
     Damaged(Vec<String>),
 }
 
@@ -265,40 +314,50 @@ impl PostgresKnowledgeGraphStore {
             .await
             .map_err(map_error)?;
         let stored_fence = rows.first().map(|row| row.get::<_, i32>("fence"));
-        let stored: Vec<(i32, Vec<u8>)> = rows
-            .iter()
-            .filter_map(|row| {
-                let ordinal: Option<i32> = row.get("ordinal");
-                let record: Option<Vec<u8>> = row.get("record");
-                ordinal.zip(record)
-            })
-            .collect();
-        let ordinals: Vec<i32> = stored.iter().map(|(ordinal, _)| *ordinal).collect();
-        let state = history_state(fence, stored_fence, &ordinals, claim.transition_count());
-        if state == HistoryState::Moved {
-            return Ok(ErasableHistory::Moved);
+        let mut stored = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let ordinal: Option<i32> = row.get("ordinal");
+            let record: Option<Vec<u8>> = row.get("record");
+            if let Some((ordinal, record)) = ordinal.zip(record) {
+                stored.push(StoredTransition {
+                    ordinal,
+                    record: recorded_transition(&record)?,
+                });
+            }
         }
         let mut operations = vec![claim.operation_id.as_str().to_string()];
         if let Some(tombstone) = claim.tombstone() {
             operations.push(tombstone.operation_id.as_str().to_string());
         }
-        for (_, record) in &stored {
-            operations.push(decode_transition(record)?.operation_id.as_str().to_string());
+        match history_state(
+            fence,
+            stored_fence,
+            claim.claim_id.as_str(),
+            claim.transition_count(),
+            &stored,
+        ) {
+            HistoryState::Moved => Ok(ErasableHistory::Moved),
+            HistoryState::Damaged => Ok(ErasableHistory::Damaged(operations)),
+            HistoryState::Whole => {
+                operations.extend(
+                    stored
+                        .into_iter()
+                        .filter_map(|row| row.record)
+                        .map(|record| record.operation_id),
+                );
+                Ok(ErasableHistory::Whole(operations))
+            }
         }
-        Ok(if state == HistoryState::Whole {
-            ErasableHistory::Whole(operations)
-        } else {
-            ErasableHistory::Damaged(operations)
-        })
     }
 
     /// The operation ids to clear when erasing a claim whose stored history
     /// is damaged, or the refusal of a store that did not opt in.
     ///
-    /// `named` holds the operations the claim and its stored transitions
-    /// name. A transition with no row names nothing, and its stored result
-    /// holds the whole claim as it stood after it. Those are found in the
-    /// ledger itself ([`CLAIM_LEDGER_OUTCOMES_SQL`]) and added.
+    /// `named` holds the operations the claim itself names. Its transitions'
+    /// stored results, each of which holds the whole claim as it stood after
+    /// that transition, are found in the ledger itself
+    /// ([`CLAIM_LEDGER_OUTCOMES_SQL`]) and added, whether or not a row is
+    /// stored for them.
     ///
     /// The statement that follows is fenced like any other erasure, so a
     /// transition that lands after this read is not missed: it moves the
@@ -328,9 +387,10 @@ impl PostgresKnowledgeGraphStore {
             .await
             .map_err(map_error)?;
         for row in rows {
+            let operation_id: String = row.get("operation_id");
             let result: Vec<u8> = row.get("result");
-            if outcome_claim_id(&result)? == claim_id.as_str() {
-                named.push(row.get("operation_id"));
+            if outcome_claim_id(&operation_id, &result)? == claim_id.as_str() {
+                named.push(operation_id);
             }
         }
         Ok(named)
@@ -517,10 +577,15 @@ fn not_found(claim_id: &ClaimId) -> ClaimError {
 ///
 /// Only the id is read, and nothing of the outcome is validated: the result
 /// may be another claim's, which this erasure has no business refusing over.
-fn outcome_claim_id(result: &[u8]) -> ClaimResult<String> {
+/// A result that cannot be read is refused by the name of its operation,
+/// which is the ledger row an operator has to look at.
+fn outcome_claim_id(operation_id: &str, result: &[u8]) -> ClaimResult<String> {
     let unreadable = |detail: String| ClaimError::Backend {
         backend: BACKEND_NAME.to_string(),
-        message: format!("a stored transition outcome could not be parsed: {detail}"),
+        message: format!(
+            "the stored transition outcome of operation {operation_id} could not be parsed: \
+             {detail}"
+        ),
     };
     let outcome: serde_json::Value =
         serde_json::from_slice(result).map_err(|error| unreadable(error.to_string()))?;
@@ -543,17 +608,52 @@ fn lost_races(operation: &str) -> ClaimError {
 
 #[cfg(test)]
 mod tests {
-    use super::{history_state, outcome_claim_id, HistoryState};
+    use super::{
+        history_state, outcome_claim_id, recorded_transition, HistoryState, RecordedTransition,
+        StoredTransition,
+    };
     use crate::TOMBSTONE_FENCE_TRANSITION_COUNT as STUB;
 
+    const CLAIM: &str = "claim-a";
+
+    /// The claim's own transition of `ordinal`, stored under that ordinal.
+    fn own(ordinal: u32) -> StoredTransition {
+        stored(ordinal, CLAIM, ordinal)
+    }
+
+    /// A row under `ordinal` whose record says it is `claim_id`'s transition
+    /// `recorded`.
+    fn stored(ordinal: u32, claim_id: &str, recorded: u32) -> StoredTransition {
+        StoredTransition {
+            ordinal: i32::try_from(ordinal).expect("a small ordinal"),
+            record: Some(RecordedTransition {
+                claim_id: claim_id.to_string(),
+                ordinal: recorded,
+                operation_id: format!("op-{claim_id}-{recorded}"),
+            }),
+        }
+    }
+
+    fn judged(
+        read: i32,
+        found: Option<i32>,
+        count: u32,
+        rows: &[StoredTransition],
+    ) -> HistoryState {
+        history_state(read, found, CLAIM, count, rows)
+    }
+
     #[test]
-    fn a_history_of_exactly_the_counted_ordinals_is_whole() {
-        assert_eq!(history_state(0, Some(0), &[], 0), HistoryState::Whole);
-        assert_eq!(history_state(2, Some(2), &[1, 2], 2), HistoryState::Whole);
+    fn a_history_of_exactly_the_counted_transitions_is_whole() {
+        assert_eq!(judged(0, Some(0), 0, &[]), HistoryState::Whole);
+        assert_eq!(
+            judged(2, Some(2), 2, &[own(1), own(2)]),
+            HistoryState::Whole
+        );
         // A stub's fence is not its count: its record still counts its
         // transitions.
         assert_eq!(
-            history_state(STUB, Some(STUB), &[1, 2, 3], 3),
+            judged(STUB, Some(STUB), 3, &[own(1), own(2), own(3)]),
             HistoryState::Whole
         );
     }
@@ -565,39 +665,84 @@ mod tests {
     #[test]
     fn a_fence_that_is_no_longer_the_callers_is_a_claim_that_moved() {
         assert_eq!(
-            history_state(2, Some(3), &[1, 2, 3], 2),
+            judged(2, Some(3), 2, &[own(1), own(2), own(3)]),
             HistoryState::Moved
         );
         // Tombstoned since: the fence is the stub's.
         assert_eq!(
-            history_state(2, Some(STUB), &[1, 2], 2),
+            judged(2, Some(STUB), 2, &[own(1), own(2)]),
             HistoryState::Moved
         );
         // Deleted since: no claim row.
-        assert_eq!(history_state(2, None, &[], 2), HistoryState::Moved);
+        assert_eq!(judged(2, None, 2, &[]), HistoryState::Moved);
         // Moved, whatever the history then holds.
-        assert_eq!(history_state(2, Some(3), &[1], 2), HistoryState::Moved);
+        assert_eq!(judged(2, Some(3), 2, &[own(1)]), HistoryState::Moved);
     }
 
     #[test]
     fn the_callers_fence_beside_another_history_is_damage() {
         // A transition lost, the last and an earlier one.
-        assert_eq!(history_state(2, Some(2), &[1], 2), HistoryState::Damaged);
-        assert_eq!(history_state(2, Some(2), &[2], 2), HistoryState::Damaged);
-        assert_eq!(history_state(1, Some(1), &[], 1), HistoryState::Damaged);
+        assert_eq!(judged(2, Some(2), 2, &[own(1)]), HistoryState::Damaged);
+        assert_eq!(judged(2, Some(2), 2, &[own(2)]), HistoryState::Damaged);
+        assert_eq!(judged(1, Some(1), 1, &[]), HistoryState::Damaged);
         // One too many.
         assert_eq!(
-            history_state(2, Some(2), &[1, 2, 3], 2),
+            judged(2, Some(2), 2, &[own(1), own(2), own(3)]),
             HistoryState::Damaged
         );
-        assert_eq!(history_state(0, Some(0), &[1], 0), HistoryState::Damaged);
+        assert_eq!(judged(0, Some(0), 0, &[own(1)]), HistoryState::Damaged);
         // The right number, and not the ones the record counts.
-        assert_eq!(history_state(2, Some(2), &[2, 3], 2), HistoryState::Damaged);
+        assert_eq!(
+            judged(2, Some(2), 2, &[own(2), own(3)]),
+            HistoryState::Damaged
+        );
         // A stub's history is held to its record's count too.
         assert_eq!(
-            history_state(STUB, Some(STUB), &[1], 2),
+            judged(STUB, Some(STUB), 2, &[own(1)]),
             HistoryState::Damaged
         );
+    }
+
+    /// The right ordinals are not enough either. A row whose record is
+    /// another claim's transition, or this claim's transition of another
+    /// ordinal, or cannot be read, is not the transition the record counts,
+    /// and would name an operation that is not it. Nor is the right record
+    /// enough, under an ordinal that is not its own.
+    #[test]
+    fn a_row_that_is_not_the_claims_own_transition_of_its_ordinal_is_damage() {
+        assert_eq!(
+            judged(2, Some(2), 2, &[own(1), stored(2, "claim-b", 2)]),
+            HistoryState::Damaged
+        );
+        assert_eq!(
+            judged(2, Some(2), 2, &[own(1), stored(2, CLAIM, 1)]),
+            HistoryState::Damaged
+        );
+        let unreadable = StoredTransition {
+            ordinal: 2,
+            record: None,
+        };
+        assert_eq!(
+            judged(2, Some(2), 2, &[own(1), unreadable]),
+            HistoryState::Damaged
+        );
+        // The claim's own second transition, stored under another ordinal:
+        // the record is right and the row is not where a read by ordinal
+        // finds it.
+        assert_eq!(
+            judged(2, Some(2), 2, &[own(1), stored(5, CLAIM, 2)]),
+            HistoryState::Damaged
+        );
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_is_none_and_not_an_error() {
+        for unreadable in [&b"not json"[..], br#"{"claim_id":"claim-a"}"#] {
+            assert_eq!(
+                recorded_transition(unreadable).expect("an unreadable record is damage"),
+                None
+            );
+        }
     }
 
     #[test]
@@ -607,20 +752,22 @@ mod tests {
         let outcome = br#"{"claim":{"schema_version":1,"claim_id":"claim-a",
             "object":{"node":"claim-b"},"a_later_field":true},"transition":{"ordinal":1}}"#;
         assert_eq!(
-            outcome_claim_id(outcome).expect("the outcome names its claim"),
+            outcome_claim_id("op-1", outcome).expect("the outcome names its claim"),
             "claim-a"
         );
     }
 
     #[test]
-    fn a_stored_outcome_that_names_no_claim_is_refused() {
+    fn a_stored_outcome_that_names_no_claim_is_refused_by_its_operation() {
         for unreadable in [
             &b"not json"[..],
             br#"{"transition":{}}"#,
             br#"{"claim":{}}"#,
         ] {
-            let error = outcome_claim_id(unreadable).expect_err("the outcome is unreadable");
+            let error = outcome_claim_id("op-unreadable", unreadable)
+                .expect_err("the outcome is unreadable");
             assert_eq!(error.code(), "claim-backend-failed", "{error}");
+            assert!(error.to_string().contains("op-unreadable"), "{error}");
         }
     }
 }

@@ -815,9 +815,9 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
     /// the claim's append and of every earlier transition are erased in the
     /// same step, so a replay of any of them answers `claim-operation-erased`.
     ///
-    /// A backend that finds the claim's stored history damaged answers
-    /// `claim-history-damaged` and writes nothing
-    /// ([`ClaimError::HistoryDamaged`](crate::error::ClaimError::HistoryDamaged)).
+    /// A backend that finds the claim's stored history damaged, and has not
+    /// been told to erase such a claim, answers `claim-history-damaged` and
+    /// writes nothing ([`ClaimError::HistoryDamaged`]).
     fn tombstone<'a>(
         &'a self,
         scope: &'a KnowledgeSpaceScope,
@@ -843,9 +843,9 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
     /// answers `claim-delete-stale`, changes nothing, and records nothing —
     /// the same operation id may be tried again.
     ///
-    /// A backend that finds the claim's stored history damaged answers
-    /// `claim-history-damaged`, and likewise changes and records nothing
-    /// ([`ClaimError::HistoryDamaged`](crate::error::ClaimError::HistoryDamaged)).
+    /// A backend that finds the claim's stored history damaged, and has not
+    /// been told to erase such a claim, answers `claim-history-damaged`, and
+    /// likewise changes and records nothing ([`ClaimError::HistoryDamaged`]).
     fn delete<'a>(
         &'a self,
         scope: &'a KnowledgeSpaceScope,

@@ -26,6 +26,8 @@ use rakka_agent_knowledge_graph::{
 };
 use rakka_agent_knowledge_graph_postgres::PostgresKnowledgeGraphStore;
 use rakka_agent_workflow::AgentTimestampMillis;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
 
 const NOW: AgentTimestampMillis = AgentTimestampMillis::new(10);
@@ -39,6 +41,11 @@ const ADD_TRANSITION: &str = "INSERT INTO rakka_agent_knowledge_claim_transition
          (tenant, space, claim_id, ordinal, record) \
      SELECT tenant, space, claim_id, ordinal + 1, record \
      FROM rakka_agent_knowledge_claim_transition \
+     WHERE tenant = $1 AND space = $2 AND claim_id = $3 AND ordinal = $4";
+
+/// Overwrites one transition of the claim with bytes that are no record.
+const GARBLE_TRANSITION: &str = "UPDATE rakka_agent_knowledge_claim_transition \
+     SET record = 'not a transition record'::BYTEA \
      WHERE tenant = $1 AND space = $2 AND claim_id = $3 AND ordinal = $4";
 
 async fn connect(dsn: &str) -> Client {
@@ -112,26 +119,24 @@ fn delete_request(scope: &KnowledgeSpaceScope, claim_id: &ClaimId) -> ClaimDelet
     }
 }
 
-/// Appends a claim and walks it proposed, disputed, retracted: two
-/// transitions, ordinals 1 and 2.
-async fn retracted_claim(
+/// Appends a claim and walks it through `walk`, one transition each. The
+/// transition of each step is named by the status it reaches.
+async fn walked_claim(
     store: &PostgresKnowledgeGraphStore,
     scope: &KnowledgeSpaceScope,
     name: &str,
+    walk: &[ClaimTrustStatus],
 ) -> Claim {
     let claim = conformance_claim(scope, name, "subject", name);
     store
         .append(scope, &claim)
         .await
         .expect("the claim appends");
-    for (discriminator, to) in [
-        ("dispute", ClaimTrustStatus::Disputed),
-        ("retract", ClaimTrustStatus::Retracted),
-    ] {
+    for to in walk {
         store
             .transition(
                 scope,
-                &transition_request(scope, &claim.claim_id, discriminator, to),
+                &transition_request(scope, &claim.claim_id, step(*to), *to),
                 &ClaimPromotionPolicy::ungated(),
                 NOW,
             )
@@ -139,6 +144,80 @@ async fn retracted_claim(
             .expect("the transition applies");
     }
     claim
+}
+
+/// The discriminator of the transition that reaches `to`.
+fn step(to: ClaimTrustStatus) -> &'static str {
+    match to {
+        ClaimTrustStatus::Disputed => "dispute",
+        ClaimTrustStatus::Retracted => "retract",
+        ClaimTrustStatus::Verified => "verify",
+        _ => "propose",
+    }
+}
+
+/// Appends a claim and walks it proposed, disputed, retracted: two
+/// transitions, ordinals 1 and 2.
+async fn retracted_claim(
+    store: &PostgresKnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    name: &str,
+) -> Claim {
+    walked_claim(
+        store,
+        scope,
+        name,
+        &[ClaimTrustStatus::Disputed, ClaimTrustStatus::Retracted],
+    )
+    .await
+}
+
+/// `count` retracted claims, made alike, in the order the sweep reaches
+/// them: claim-id order. A claim's id derives from a scope that is new on
+/// every run, so a proof that needs a healthy claim *behind* a damaged one
+/// gives its roles out by this order.
+async fn retracted_claims_in_sweep_order(
+    store: &PostgresKnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    count: usize,
+) -> Vec<Claim> {
+    let mut claims = Vec::new();
+    for index in 0..count {
+        claims.push(retracted_claim(store, scope, &format!("claim-{index}")).await);
+    }
+    claims.sort_by(|a, b| a.claim_id.as_str().cmp(b.claim_id.as_str()));
+    claims
+}
+
+/// Stores, under `claim`'s key at `ordinal`, a copy of `donor`'s transition
+/// `donor_ordinal`: a row that is not that claim's transition of that
+/// ordinal.
+async fn give_a_transition_of(
+    raw: &Client,
+    scope: &KnowledgeSpaceScope,
+    (donor, donor_ordinal): (&ClaimId, i32),
+    claim: &ClaimId,
+    ordinal: i32,
+) {
+    let changed = raw
+        .execute(
+            "INSERT INTO rakka_agent_knowledge_claim_transition \
+                 (tenant, space, claim_id, ordinal, record) \
+             SELECT tenant, space, $4, $5, record \
+             FROM rakka_agent_knowledge_claim_transition \
+             WHERE tenant = $1 AND space = $2 AND claim_id = $3 AND ordinal = $6",
+            &[
+                &scope.tenant().as_str(),
+                &scope.space().as_str(),
+                &donor.as_str(),
+                &claim.as_str(),
+                &ordinal,
+                &donor_ordinal,
+            ],
+        )
+        .await
+        .expect("the stray row is stored");
+    assert_eq!(changed, 1, "exactly one stray row is stored");
 }
 
 /// Runs one damaging statement against one transition of the claim.
@@ -350,24 +429,138 @@ async fn postgres_a_claim_with_the_right_number_of_wrong_transitions_is_damaged_
     assert_nothing_was_written(&store, &raw, &scope, &claim, &[2, 3]).await;
 }
 
+/// The right ordinals are not enough. Each of three claims holds a row for
+/// every ordinal its record counts, and one of those rows is not its
+/// transition of that ordinal: it is another claim's transition of the same
+/// ordinal, or the claim's own transition of another, or cannot be read. All
+/// three are refused, and nothing is written: the first would name the other
+/// claim's operation, the second names one operation twice and one never,
+/// and the third names none. A fourth holds the right records, one of them
+/// under an ordinal that is not its own, and is refused too.
+#[tokio::test]
+async fn postgres_a_row_that_is_not_the_claims_own_transition_is_damage_when_dsn_is_set() {
+    let Some((store, raw)) = store_and_raw().await else {
+        return;
+    };
+    let scope = scope("pg-damaged-foreign");
+    let donor = retracted_claim(&store, &scope, "donor").await;
+    let stray = retracted_claim(&store, &scope, "stray").await;
+    damage(&raw, &scope, &stray.claim_id, LOSE_TRANSITION, 2).await;
+    give_a_transition_of(&raw, &scope, (&donor.claim_id, 2), &stray.claim_id, 2).await;
+    assert_both_erasures_are_refused_as_damaged(&store, &scope, &stray).await;
+    assert_nothing_was_written(&store, &raw, &scope, &stray, &[1, 2]).await;
+    assert_eq!(
+        ledger_kinds_of(&raw, &scope, &donor).await,
+        kinds(["append", "transition", "transition"]),
+        "the claim the stray row belongs to is untouched"
+    );
+
+    let repeated = retracted_claim(&store, &scope, "repeated").await;
+    damage(&raw, &scope, &repeated.claim_id, LOSE_TRANSITION, 2).await;
+    give_a_transition_of(&raw, &scope, (&repeated.claim_id, 1), &repeated.claim_id, 2).await;
+    assert_both_erasures_are_refused_as_damaged(&store, &scope, &repeated).await;
+    assert_nothing_was_written(&store, &raw, &scope, &repeated, &[1, 2]).await;
+
+    let unreadable = retracted_claim(&store, &scope, "unreadable").await;
+    damage(&raw, &scope, &unreadable.claim_id, GARBLE_TRANSITION, 1).await;
+    assert_both_erasures_are_refused_as_damaged(&store, &scope, &unreadable).await;
+    assert_nothing_was_written(&store, &raw, &scope, &unreadable, &[1, 2]).await;
+
+    // And the right record is not enough under an ordinal that is not its
+    // own: the claim's second transition, moved to ordinal five.
+    let misplaced = retracted_claim(&store, &scope, "misplaced").await;
+    damage(
+        &raw,
+        &scope,
+        &misplaced.claim_id,
+        "UPDATE rakka_agent_knowledge_claim_transition SET ordinal = 5 \
+         WHERE tenant = $1 AND space = $2 AND claim_id = $3 AND ordinal = $4",
+        2,
+    )
+    .await;
+    assert_both_erasures_are_refused_as_damaged(&store, &scope, &misplaced).await;
+    assert_nothing_was_written(&store, &raw, &scope, &misplaced, &[1, 5]).await;
+}
+
+/// A row from a schema newer than this binary reads is not called damage. It
+/// is refused with the schema's own code, as it always was: a binary that
+/// cannot read a record must not judge it, and an opted-in store must not
+/// erase around it.
+#[tokio::test]
+async fn postgres_a_transition_from_a_newer_schema_is_not_called_damage_when_dsn_is_set() {
+    let Some((store, raw)) = erasing_store_and_raw().await else {
+        return;
+    };
+    let scope = scope("pg-damaged-newer-schema");
+    let claim = retracted_claim(&store, &scope, "newer").await;
+    damage(
+        &raw,
+        &scope,
+        &claim.claim_id,
+        "UPDATE rakka_agent_knowledge_claim_transition \
+         SET record = convert_to(jsonb_set(convert_from(record, 'UTF8')::jsonb, \
+             '{schema_version}', '999999')::text, 'UTF8') \
+         WHERE tenant = $1 AND space = $2 AND claim_id = $3 AND ordinal = $4",
+        1,
+    )
+    .await;
+
+    let refused = store
+        .delete(&scope, &delete_request(&scope, &claim.claim_id))
+        .await
+        .expect_err("a record this binary cannot read is not erased around");
+    assert_eq!(refused.code(), "schema-version-ahead", "{refused}");
+    assert_nothing_was_written(&store, &raw, &scope, &claim, &[1, 2]).await;
+}
+
+/// A claim that counts no transition and has one stored is damaged too.
+#[tokio::test]
+async fn postgres_a_claim_that_counts_no_transition_and_has_one_is_damaged_when_dsn_is_set() {
+    let Some((store, raw)) = store_and_raw().await else {
+        return;
+    };
+    let scope = scope("pg-damaged-proposed");
+    let donor = retracted_claim(&store, &scope, "donor").await;
+    let proposed = walked_claim(&store, &scope, "proposed", &[]).await;
+    give_a_transition_of(&raw, &scope, (&donor.claim_id, 1), &proposed.claim_id, 1).await;
+
+    for attempt in 1..=2 {
+        let refused = store
+            .delete(&scope, &delete_request(&scope, &proposed.claim_id))
+            .await
+            .expect_err("a damaged claim is not deleted");
+        assert_eq!(refused.code(), "claim-history-damaged", "attempt {attempt}");
+    }
+    assert_eq!(
+        ledger_kind(&raw, &scope, &proposed.operation_id)
+            .await
+            .as_deref(),
+        Some("append")
+    );
+}
+
 /// The retention sweep counts each damaged claim and goes on to the healthy
-/// claims behind it. The pass used to end on the first refused delete, on
+/// claim behind them. The pass used to end on the first refused delete, on
 /// every pass, and to count a claim missing its last transition as moved.
+///
+/// The healthy claim is the last the sweep reaches, whatever ids the run
+/// gave out, so that "behind them" is what the proof holds.
 #[tokio::test]
 async fn postgres_the_sweep_counts_damaged_claims_and_goes_on_when_dsn_is_set() {
     let Some((store, raw)) = store_and_raw().await else {
         return;
     };
     let scope = scope("pg-damaged-sweep");
-    // The sweep cannot age the first, and the store refuses to delete the
-    // other two.
-    let missing_last = retracted_claim(&store, &scope, "missing-last").await;
-    let missing_earlier = retracted_claim(&store, &scope, "missing-earlier").await;
-    let one_too_many = retracted_claim(&store, &scope, "one-too-many").await;
-    let healthy = retracted_claim(&store, &scope, "healthy").await;
+    let claims = retracted_claims_in_sweep_order(&store, &scope, 5).await;
+    let [missing_last, missing_earlier, one_too_many, unreadable, healthy] = &claims[..] else {
+        panic!("five claims");
+    };
+    // The sweep cannot read the first's last transition, finds an entry
+    // behind the third's, and has its delete of the other two refused.
     damage(&raw, &scope, &missing_last.claim_id, LOSE_TRANSITION, 2).await;
     damage(&raw, &scope, &missing_earlier.claim_id, LOSE_TRANSITION, 1).await;
     damage(&raw, &scope, &one_too_many.claim_id, ADD_TRANSITION, 2).await;
+    damage(&raw, &scope, &unreadable.claim_id, GARBLE_TRANSITION, 1).await;
 
     let policy =
         KnowledgeSpaceRetentionPolicy::retain_all().with_window(ClaimTrustStatus::Retracted, 0);
@@ -390,11 +583,11 @@ async fn postgres_the_sweep_counts_damaged_claims_and_goes_on_when_dsn_is_set() 
                 report.deleted,
                 report.moved
             ),
-            (3 + healthy_deleted, 3, healthy_deleted, 0),
+            (4 + healthy_deleted, 4, healthy_deleted, 0),
             "pass {pass}"
         );
     }
-    for damaged in [&missing_last, &missing_earlier, &one_too_many] {
+    for damaged in [missing_last, missing_earlier, one_too_many, unreadable] {
         assert!(
             store
                 .get(&scope, &damaged.claim_id)
@@ -649,8 +842,9 @@ async fn postgres_an_unreadable_stored_result_stops_the_opted_in_erasure_when_ds
         .expect_err("the erasure cannot tell whose the unreadable result is");
     assert_eq!(refused.code(), "claim-backend-failed");
     assert!(
-        refused.to_string().contains("could not be parsed"),
-        "{refused}"
+        refused.to_string().contains("could not be parsed")
+            && refused.to_string().contains("an-unreadable-operation"),
+        "the refusal names the ledger row to look at: {refused}"
     );
     assert_nothing_was_written(&store, &raw, &scope, &claim, &[2]).await;
 
@@ -672,10 +866,16 @@ async fn postgres_an_unreadable_stored_result_stops_the_opted_in_erasure_when_ds
 }
 
 /// Run through an opted-in store, the sweep deletes a damaged claim whose
-/// last transition it reads cleanly, and still counts the two it does not:
-/// one whose last transition is gone, and one with an entry behind its last.
-/// The sweep ages a claim only by what it can read without doubt, whatever
-/// the store would then do with the delete.
+/// record its history does not contradict: one that lost an earlier
+/// transition, or holds one that cannot be read. It still only counts the
+/// rest, and asks for no delete, which that store would carry out:
+///
+/// - a claim whose last transition is gone, which it cannot age;
+/// - a claim, a stub, or a proposed claim with an entry behind the history
+///   its record counts. Those rows may be the claim's real, later history,
+///   under a claim row restored to an earlier state.
+///
+/// The explicit erasure is the way out for each of them.
 #[tokio::test]
 async fn postgres_the_sweep_through_an_opted_in_store_deletes_what_it_can_age_when_dsn_is_set() {
     let Some((store, raw)) = erasing_store_and_raw().await else {
@@ -684,13 +884,32 @@ async fn postgres_the_sweep_through_an_opted_in_store_deletes_what_it_can_age_wh
     let scope = scope("pg-damaged-sweep-erasing");
     let missing_last = retracted_claim(&store, &scope, "missing-last").await;
     let missing_earlier = retracted_claim(&store, &scope, "missing-earlier").await;
+    let unreadable = retracted_claim(&store, &scope, "unreadable").await;
     let one_too_many = retracted_claim(&store, &scope, "one-too-many").await;
+    let stub = retracted_claim(&store, &scope, "stub").await;
+    let proposed = walked_claim(&store, &scope, "proposed", &[]).await;
+    store
+        .tombstone(&scope, &tombstone_request(&scope, &stub.claim_id))
+        .await
+        .expect("the healthy claim is tombstoned");
     damage(&raw, &scope, &missing_last.claim_id, LOSE_TRANSITION, 2).await;
     damage(&raw, &scope, &missing_earlier.claim_id, LOSE_TRANSITION, 1).await;
+    damage(&raw, &scope, &unreadable.claim_id, GARBLE_TRANSITION, 1).await;
     damage(&raw, &scope, &one_too_many.claim_id, ADD_TRANSITION, 2).await;
+    damage(&raw, &scope, &stub.claim_id, ADD_TRANSITION, 2).await;
+    give_a_transition_of(
+        &raw,
+        &scope,
+        (&one_too_many.claim_id, 1),
+        &proposed.claim_id,
+        1,
+    )
+    .await;
 
-    let policy =
-        KnowledgeSpaceRetentionPolicy::retain_all().with_window(ClaimTrustStatus::Retracted, 0);
+    let policy = KnowledgeSpaceRetentionPolicy::retain_all()
+        .with_window(ClaimTrustStatus::Retracted, 0)
+        .with_window(ClaimTrustStatus::Proposed, 0)
+        .with_tombstone_window(0);
     let report = discharge_knowledge_space_retention(
         &store,
         &scope,
@@ -709,15 +928,25 @@ async fn postgres_the_sweep_through_an_opted_in_store_deletes_what_it_can_age_wh
             report.deleted,
             report.moved
         ),
-        (3, 2, 1, 0)
+        (6, 4, 2, 0)
     );
-    assert!(store
-        .get(&scope, &missing_earlier.claim_id)
-        .await
-        .expect("the read answers")
-        .is_none());
-    // The explicit delete is the way out for the other two.
-    for left in [&missing_last, &one_too_many] {
+    for deleted in [&missing_earlier, &unreadable] {
+        assert!(store
+            .get(&scope, &deleted.claim_id)
+            .await
+            .expect("the read answers")
+            .is_none());
+    }
+    // The explicit delete is the way out for the other four.
+    for left in [&missing_last, &one_too_many, &stub, &proposed] {
+        assert!(
+            store
+                .get(&scope, &left.claim_id)
+                .await
+                .expect("the read answers")
+                .is_some(),
+            "the sweep left it"
+        );
         store
             .delete(&scope, &delete_request(&scope, &left.claim_id))
             .await
@@ -725,6 +954,308 @@ async fn postgres_the_sweep_through_an_opted_in_store_deletes_what_it_can_age_wh
         assert!(stored_ordinals(&raw, &scope, &left.claim_id)
             .await
             .is_empty());
+    }
+}
+
+/// An opted-in store takes no operation's name from a row of a damaged
+/// history. A row under the claim's key that is another claim's transition
+/// names that claim's operation, and clearing it would erase a stored result
+/// that is not the claim's. The bystander's operation still answers.
+#[tokio::test]
+async fn postgres_an_opted_in_erasure_clears_no_other_claims_stored_result_when_dsn_is_set() {
+    let Some((store, raw)) = erasing_store_and_raw().await else {
+        return;
+    };
+    let scope = scope("pg-damaged-bystander");
+    let bystander = walked_claim(&store, &scope, "bystander", &[ClaimTrustStatus::Disputed]).await;
+    let claim = retracted_claim(&store, &scope, "pg-damaged-bystander-subject").await;
+    give_a_transition_of(&raw, &scope, (&bystander.claim_id, 1), &claim.claim_id, 3).await;
+
+    store
+        .delete(&scope, &delete_request(&scope, &claim.claim_id))
+        .await
+        .expect("an opted-in store deletes the damaged claim");
+
+    assert_eq!(
+        ledger_kinds_of(&raw, &scope, &claim).await,
+        kinds(["erased", "erased", "erased"]),
+        "the claim's own stored results are cleared, found in the ledger"
+    );
+    assert!(stored_ordinals(&raw, &scope, &claim.claim_id)
+        .await
+        .is_empty());
+    let bystanders_dispute =
+        ClaimOperationId::derive_transition(&scope, &bystander.claim_id, "dispute")
+            .expect("the operation id derives");
+    assert_eq!(
+        ledger_kind(&raw, &scope, &bystanders_dispute)
+            .await
+            .as_deref(),
+        Some("transition"),
+        "the stored result the stray row names is the bystander's, and is kept"
+    );
+    let replay = store
+        .transition(
+            &scope,
+            &transition_request(
+                &scope,
+                &bystander.claim_id,
+                "dispute",
+                ClaimTrustStatus::Disputed,
+            ),
+            &ClaimPromotionPolicy::ungated(),
+            NOW,
+        )
+        .await
+        .expect("the bystander's transition still answers from the ledger");
+    assert_eq!(replay.claim.claim_id, bystander.claim_id);
+}
+
+/// A private schema, for a proof that locks a table: a store on its own
+/// session with that session's backend id, a second session that holds the
+/// lock and a store on it, and a third for looking.
+struct PrivateWorld {
+    schema: String,
+    store: PostgresKnowledgeGraphStore,
+    store_pid: i32,
+    holder: Arc<Client>,
+    holder_store: PostgresKnowledgeGraphStore,
+    raw: Client,
+}
+
+async fn client_in(dsn: &str, schema: &str) -> Client {
+    let client = connect(dsn).await;
+    client
+        .batch_execute(&format!("SET search_path TO {schema}"))
+        .await
+        .expect("the session targets the private schema");
+    client
+}
+
+async fn private_world(dsn: &str, label: &str) -> PrivateWorld {
+    let schema = format!(
+        "rakka_knowledge_graph_{label}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos()
+    );
+    connect(dsn)
+        .await
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("the private schema is created");
+    let session = Arc::new(client_in(dsn, &schema).await);
+    let store_pid: i32 = session
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("the session answers its backend id")
+        .get(0);
+    let store = PostgresKnowledgeGraphStore::from_shared_client(session);
+    store.migrate().await.expect("the schema applies");
+    let holder = Arc::new(client_in(dsn, &schema).await);
+    let holder_store = PostgresKnowledgeGraphStore::from_shared_client(holder.clone());
+    let raw = client_in(dsn, &schema).await;
+    PrivateWorld {
+        schema,
+        store,
+        store_pid,
+        holder,
+        holder_store,
+        raw,
+    }
+}
+
+async fn drop_schema(dsn: &str, schema: &str) {
+    connect(dsn)
+        .await
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .expect("the private schema is dropped");
+}
+
+/// Waits until the session `pid` is waiting for a lock. The proof goes on
+/// only from there, so it does not depend on how long anything takes.
+async fn until_waiting_for_a_lock(raw: &Client, pid: i32) {
+    for _ in 0..1_000 {
+        let waiting: bool = raw
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)",
+                &[&pid],
+            )
+            .await
+            .expect("the lock view reads")
+            .get(0);
+        if waiting {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the session never waited for a lock");
+}
+
+/// Starts one erasure of the claim on the store's own session.
+fn erase(
+    erasure: &'static str,
+    store: &PostgresKnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    claim_id: &ClaimId,
+) -> tokio::task::JoinHandle<Result<(), ClaimError>> {
+    let (store, scope, claim_id) = (store.clone(), scope.clone(), claim_id.clone());
+    tokio::spawn(async move {
+        if erasure == "tombstone" {
+            store
+                .tombstone(&scope, &tombstone_request(&scope, &claim_id))
+                .await
+                .map(|_| ())
+        } else {
+            store
+                .delete(&scope, &delete_request(&scope, &claim_id))
+                .await
+        }
+    })
+}
+
+/// A transition that lands between an erasure's two reads is a race and
+/// never damage, held at the database and without a pause.
+///
+/// The transition table is locked. The erasure's first read, of the ledger
+/// and the claim, does not touch that table and answers: one transition. Its
+/// second, of the history, waits for the lock. The lock's holder then lands
+/// a second transition and commits. The history the erasure now reads is one
+/// ahead of the claim it read, and the fence it reads with it says why. It
+/// reads again and erases the claim, the transition that raced it included.
+///
+/// Read without the fence, that history is two rows for a claim that counts
+/// one, which is what damage looks like.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_transition_between_an_erasures_two_reads_is_a_race_when_dsn_is_set() {
+    let Some(dsn) = dsn() else { return };
+    for erasure in ["tombstone", "delete"] {
+        let world = private_world(&dsn, "damaged_race").await;
+        let scope = scope("pg-damaged-race");
+        let claim = walked_claim(&world.store, &scope, "race", &[ClaimTrustStatus::Disputed]).await;
+
+        world
+            .holder
+            .batch_execute(
+                "BEGIN; LOCK TABLE rakka_agent_knowledge_claim_transition \
+                 IN ACCESS EXCLUSIVE MODE",
+            )
+            .await
+            .expect("the transition table is locked");
+        let erasing = erase(erasure, &world.store, &scope, &claim.claim_id);
+        until_waiting_for_a_lock(&world.raw, world.store_pid).await;
+        world
+            .holder_store
+            .transition(
+                &scope,
+                &transition_request(
+                    &scope,
+                    &claim.claim_id,
+                    "retract",
+                    ClaimTrustStatus::Retracted,
+                ),
+                &ClaimPromotionPolicy::ungated(),
+                NOW,
+            )
+            .await
+            .expect("the transition lands inside the lock holder's transaction");
+        world
+            .holder
+            .batch_execute("COMMIT")
+            .await
+            .expect("the lock holder commits");
+
+        erasing
+            .await
+            .expect("the erasure does not panic")
+            .unwrap_or_else(|error| {
+                panic!("{erasure}: a transition between the two reads is a race: {error}")
+            });
+        assert_eq!(
+            ledger_kinds_of(&world.raw, &scope, &claim).await,
+            kinds(["erased", "erased", "erased"]),
+            "{erasure}: the transition that landed between the reads is erased too"
+        );
+        drop_schema(&dsn, &world.schema).await;
+    }
+}
+
+/// A transition that lands after an opted-in erasure has read the ledger is
+/// not missed. The erasure of a damaged claim reads the ledger for the
+/// claim's stored results and then runs its statement. A transition is
+/// applied and not yet committed: the erasure sees none of it, and its
+/// statement waits on the claim row. On the commit the statement finds the
+/// fence moved and applies nothing. The next attempt reads the ledger again,
+/// and clears the new transition's stored result with the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_transition_after_the_ledger_read_is_not_missed_when_dsn_is_set() {
+    let Some(dsn) = dsn() else { return };
+    for erasure in ["tombstone", "delete"] {
+        let world = private_world(&dsn, "damaged_late").await;
+        let store = world.store.clone().with_damaged_history_erasure();
+        let scope = scope("pg-damaged-late");
+        let claim = walked_claim(
+            &store,
+            &scope,
+            "pg-damaged-late-subject",
+            &[ClaimTrustStatus::Disputed, ClaimTrustStatus::Verified],
+        )
+        .await;
+        damage(&world.raw, &scope, &claim.claim_id, LOSE_TRANSITION, 1).await;
+
+        world
+            .holder
+            .batch_execute("BEGIN")
+            .await
+            .expect("the transaction opens");
+        world
+            .holder_store
+            .transition(
+                &scope,
+                &transition_request(
+                    &scope,
+                    &claim.claim_id,
+                    "retract",
+                    ClaimTrustStatus::Retracted,
+                ),
+                &ClaimPromotionPolicy::ungated(),
+                NOW,
+            )
+            .await
+            .expect("the transition applies, uncommitted");
+        let erasing = erase(erasure, &store, &scope, &claim.claim_id);
+        until_waiting_for_a_lock(&world.raw, world.store_pid).await;
+        world
+            .holder
+            .batch_execute("COMMIT")
+            .await
+            .expect("the transition commits");
+
+        erasing
+            .await
+            .expect("the erasure does not panic")
+            .unwrap_or_else(|error| panic!("{erasure}: the next attempt erases it: {error}"));
+        let verify = ClaimOperationId::derive_transition(&scope, &claim.claim_id, "verify")
+            .expect("the operation id derives");
+        assert_eq!(
+            ledger_kinds_of(&world.raw, &scope, &claim).await,
+            kinds(["erased", "erased", "erased"]),
+            "{erasure}: the append, the transition with no row, and the one that landed after \
+             the ledger read"
+        );
+        assert_eq!(
+            ledger_kind(&world.raw, &scope, &verify).await.as_deref(),
+            Some("erased"),
+            "{erasure}: the transition whose row is stored"
+        );
+        assert_eq!(
+            ledger_payloads_holding(&world.raw, &scope, "pg-damaged-late-subject").await,
+            Vec::<String>::new(),
+            "{erasure}: no stored result still holds the statement"
+        );
+        drop_schema(&dsn, &world.schema).await;
     }
 }
 
