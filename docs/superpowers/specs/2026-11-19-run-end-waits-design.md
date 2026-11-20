@@ -441,10 +441,8 @@ against the whole crate.
 - Records already ended in one of these states (call 8).
 - A run parked on an unknown outcome for a completed task waits for a
   person. That is the rule's cost, and what the owner chose.
-- What a task or an agent that has decided does while its run is not yet
-  terminal was not examined beyond the tests here: the wake controller's
-  slot, the escrow's timing, the A2A projection. The reviewer listed it as
-  not reached, and so do I.
+- What stands above a task while its run is not yet terminal was not
+  examined when this was merged. It was examined afterwards: section 12.
 - A `Cancel` on a waiting run changes neither its reason nor its wait. It
   still does what a cancel does to gates: it closes a waiting approval or
   authorization, and cancels a memory promotion or claim append that
@@ -475,3 +473,113 @@ against the whole crate.
   too, where the step commits the turn's tool calls and opens a gated
   one's gate. By reading, the repair cancels those calls and closes the
   gate, as for the forged sweep's record. Not run.
+
+## 12. Above the task, examined
+
+Done on 2026-11-20, after the merge, at the owner's word. It changes no
+code. It adds seven tests and the paragraph "Above the task, while its run
+waits" in `docs/rakka-compatibility.md`.
+
+**What decides most of it.** What settles a task's budget goes upward on
+its ledger, not on its status. `owed_epoch_result`,
+`owed_delegation_result` and `finalize_task_cancellation` each return
+nothing while a child of the task's ledger is out, and a run returns its
+budget only when it ends. None of the three changed in this work. A
+cancelled run parked on an unknown outcome already held its task's ledger
+open; the new thing is a task that is `Completed` or `Failed` in that
+state.
+
+**What does not wait.** `owed_team_terminal_notice` and
+`owed_dependent_outcomes` read the task's status alone. The team's board
+and a task's dependents are told in the commit that decides the task. My
+first pass missed both, and said the task told nobody; the review found
+them.
+
+**Measured, and held by a test each.**
+
+| What | Result | Test |
+|---|---|---|
+| The wake of an accepted epoch whose run waits | Active until the run ends. A later occurrence is coalesced behind it and admitted when the epoch's result releases the wake | `an_accepted_epoch_holds_its_wake_until_its_run_ends` |
+| The same, the run parked on an unknown outcome | Held until a person answers the park. Later occurrences share the one parking place. The result carries two effect attempts: the model call's and the evaluation's | `a_parked_accepted_epoch_holds_its_wake_until_the_park_is_answered` |
+| An operator's `CompleteWakeOccurrence` on the held wake | Under a policy that bounds each epoch, the next epoch runs beside the parked one. The first epoch's late result returns its budget and releases nothing, with another occurrence active and one parked | `an_operator_can_release_the_wake_a_parked_epoch_holds` |
+| A goal cancelled over a parked accepted epoch | `Propagating` until the park is answered, then `Cancelled`. A `Cancel` on the run changes nothing | `a_goal_cancelled_over_a_parked_accepted_epoch_ends_when_the_park_is_answered` |
+| A delegated child whose run waits | `Completed`, and its `DelegationResult` is not sent until the run ends | `a_delegated_child_whose_run_waits_reports_when_the_run_ends` |
+| A verdict that lands after the acceptance | Recorded on the run, reported, refused `task-goal-evaluation-forged` by the task's door. The goal stays undecided | `a_verdict_that_lands_after_acceptance_decides_nothing` |
+| The team's board and a dependent task | The board entry closes and the dependent is unblocked while the run waits, and both stay so while it is parked | `a_decided_task_tells_its_board_and_its_dependents_at_once` |
+
+The first four are in `crates/rakka-agent/tests/waiting_end_task_side.rs`,
+the last three in `run_end_waits.rs`, which now holds twenty-seven. Each
+passed when it was written, since it holds behaviour that already existed.
+Seven breaks were then run against them, one at a time: each of the three
+ledger gates switched off, the door's check of the sender switched off, a
+ledger gate added to the team's notice and to a dependent's outcome, and a
+release of a wake that is not active made to release the one that is. Each
+is caught by the test that names it.
+
+**Read, not run.**
+
+- `rakka-a2a`, with its `agents` feature, projects the task's status
+  (`crates/rakka-a2a/src/agents/projection.rs`) and reads a run only
+  through the task's assignment (`agents/service.rs`). A decided task has
+  none, so the public task is terminal when the task is decided, as before.
+  My first pass looked only at the crate's top-level sources and said it
+  read no agent task or run. That was false; the review found it.
+- The agent entity keeps no list of its live runs.
+- A parent's fan-in over a real child whose run waits. The child's side is
+  held by the test above, and the fan-in's deadline by its own existing
+  test; no one world joins them.
+- The host, at its pin `2a43cbb`, which is before this work. I read its
+  fleet-index derivation, its settle sweep and its task page, and changed
+  nothing there. A task's row closes on the task's status and a run's row
+  on the run's, each from its own record. A waiting run stays on the active
+  roster, so its task is settled on every pass, and the result the task
+  owes when the run ends is delivered by the same sweep that delivered it
+  before. I did not read the whole host.
+
+**Two things a caller may not expect.** Neither is new behaviour of the
+code that decides it, and neither is changed.
+
+- A verdict from a run whose task is decided is called `forged` by the
+  door, though the run is the one the task assigned. The goal stayed
+  undecided before this work too: the ended run refused the result.
+- A run that waits after its last rejection still reports
+  `RepeatedIterationFailure`, since struggle signals are derived for every
+  run that is not terminal. One that waits after an acceptance does not.
+  Run by me and again by the reviewer, with the threshold at one turn;
+  held by no test.
+
+**The review.** A fresh reviewer read the first commit, re-ran its four
+breaks, and ran probes of its own. The answer is the third commit.
+
+- Two statements of mine were false: that `rakka-a2a` reads no agent task
+  or run, and that a task tells nobody above it that it is done until its
+  ledger is closed. Both are corrected above, and the second has a test.
+- "The next epoch runs beside the parked one" holds only under a policy
+  that bounds each epoch. Under the fixture's own policy the next epoch is
+  created with no budget (#179). The docs now say which.
+- The test of the operator's release did not test "releases nothing a
+  second time": nothing was active when the late result came. It now has
+  an occurrence active and one parked, and the reviewer's break is caught.
+- An assertion of two effect attempts, where the test reported the
+  evaluation as never invoked, measured the attempt number the test's own
+  helper reports. It is removed. The real dispatcher reports the same
+  number for a call it never made, which is the second draft below.
+- "A task that is `Completed` in that state" left out `Failed`. "The
+  budget reported" is true of an epoch's result, not of a delegated
+  child's. Three comments in the tests said more than the tests hold.
+
+**Found beside it, and not part of this work.**
+
+- A continuous goal that has spent a budget dimension still admits its
+  next wake. The epoch is created with nothing in that dimension, can
+  never be assigned, and holds the wake for good; the goal's exhaustion
+  policy is never asked. Reproduced with no waiting run. Filed as #179.
+- A person's result on a continuous goal's control task completes it over
+  an epoch that is still out. The epoch's result is then refused
+  `task-terminal`, and the goal's ledger keeps that child out for good.
+  Found by the reviewer; I re-ran its probe. A draft is in `tmp/`, not
+  filed.
+- A call the dispatcher cancels before invoking it is charged one effect
+  attempt, against the comment where the run settles attempts. Found by
+  the reviewer with the real dispatcher; I re-ran its probe. A draft is in
+  `tmp/`, not filed.

@@ -2213,3 +2213,502 @@ async fn a_waiting_run_that_holds_a_gated_claim_append_is_at_rest() {
     );
     assert_at_rest(&fx, &sink).await;
 }
+
+// ---------------------------------------------------------------------------
+// What stands above the task while its run waits
+// ---------------------------------------------------------------------------
+
+/// A world like [`proposing_goal_world`], whose task is a delegated child: it
+/// carries a goal's id, so that its run can be asked for an evaluation, and no
+/// goal contract of its own.
+/// Nothing stands at the parent run's address, so the child's result can be
+/// sent and never answered.
+async fn delegated_child_world() -> Fixture {
+    let fx = Fixture::with_sink(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new().with_turn_for(
+                1,
+                AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                    .with_text("Done.")
+                    .with_proposal(
+                        AgentTaskContent::inline(serde_json::json!({ "answer": "resolved" }))
+                            .expect("the proposal is inline-bounded"),
+                    )
+                    .with_usage(usage()),
+            ),
+        ),
+        InMemoryAgentRunEffectSink::new(),
+        AgentEffectPolicies::default(),
+        Arc::new(AtomicU64::new(1)),
+    );
+    fx.instantiate_agent().await;
+
+    let parent_task = rakka_agent::AgentTaskId::new("parent-task").expect("the id is valid");
+    let provenance = rakka_agent::AgentTaskDelegationProvenance {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
+        read_capabilities: Default::default(),
+        delegation: rakka_agent::AgentDelegationId::new("delegation-1").expect("the id is valid"),
+        parent_task: parent_task.clone(),
+        parent_run: rakka_agent::AgentRunScope::new(
+            tenant(),
+            rakka_agent::AgentId::new("coordinator").expect("the id is valid"),
+            rakka_agent::AgentRunId::new("parent-task-gen-1").expect("the id is valid"),
+        )
+        .expect("the scope is valid"),
+        lineage: Vec::new(),
+        ancestors: Vec::new(),
+        depth: 1,
+        requested_skill: rakka_agent::AgentCapabilityId::new("billing").expect("the id is valid"),
+        capability_scopes: Default::default(),
+        credential_bindings: Vec::new(),
+        result_schema: None,
+        budget: None,
+        deadline: None,
+    };
+    let mut command = goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(goal_spec_with_evaluator(), true),
+    );
+    let rakka_agent::AgentTaskEntityCommand::Create { creation, .. } = &mut command else {
+        panic!("the helper builds a creation");
+    };
+    creation.delegation = Some(Box::new(provenance));
+    creation.parent = Some(parent_task);
+    // A delegated child may not institute a goal. It is bound to the goal its
+    // run will be asked to evaluate, and carries no contract for it.
+    creation.goal_spec = None;
+    creation.goal = Some(rakka_agent::AgentGoalId::for_root_task(task_scope().task()));
+    fx.apply_task_command(command)
+        .await
+        .expect("the delegated child is created");
+    settle(&fx).await;
+    fx
+}
+
+/// Whether the task has sent an exchange of `kind`, answered or not.
+async fn task_has_sent(fx: &Fixture, kind: &str) -> bool {
+    let state =
+        rakka_agent::load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+            .await
+            .expect("the task state loads")
+            .expect("the task exists");
+    let journal = serde_json::to_value(&state).expect("the state serializes")["journal"].take();
+    let sent = |list: &str, pointer: &str| {
+        journal[list].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.pointer(pointer).and_then(|found| found.as_str()) == Some(kind))
+        })
+    };
+    sent("pending", "/envelope/kind") || sent("settled", "/kind")
+}
+
+/// How many children of the task's ledger are out.
+async fn ledger_children_out(fx: &Fixture) -> usize {
+    rakka_agent::load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the task state loads")
+        .expect("the task exists")
+        .task()
+        .expect("the task is created")
+        .escrow
+        .outstanding()
+        .count()
+}
+
+async fn settle_task_and_run(fx: &Fixture) {
+    for _round in 0..3 {
+        fx.settle_task_at(&task_scope())
+            .await
+            .expect("the task settles");
+        settle(fx).await;
+    }
+}
+
+/// A delegated child reports to its parent on its ledger, not on its status.
+/// While its accepted run waits for a call, the child is `Completed` and has
+/// sent its parent nothing. The result is sent when the run has ended and
+/// returned its budget. No parent run stands in this world, so what a
+/// parent's fan-in does meanwhile is not held here.
+#[tokio::test]
+async fn a_delegated_child_whose_run_waits_reports_when_the_run_ends() {
+    let fx = delegated_child_world().await;
+    let evaluation = send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+
+    record(&fx, &model, turn).await;
+    settle_task_and_run(&fx).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelling,
+            Some("result-accepted".to_string()),
+            true
+        )
+    );
+    assert_eq!(
+        fx.task_snapshot().await.status,
+        rakka_agent::AgentTaskStatus::Completed
+    );
+    assert_eq!(ledger_children_out(&fx).await, 1);
+    assert!(
+        !task_has_sent(&fx, "delegation-result").await,
+        "the child's ledger is open, so its parent is not told yet"
+    );
+
+    record(&fx, &evaluation, never_invoked()).await;
+    settle_task_and_run(&fx).await;
+
+    assert_eq!(standing(&fx).await.0, AgentRunStatus::Completed);
+    assert_eq!(ledger_children_out(&fx).await, 0);
+    assert!(
+        task_has_sent(&fx, "delegation-result").await,
+        "the run returned its budget, and the child reports"
+    );
+}
+
+/// A verdict that comes back after the task accepted the run's result is
+/// recorded on the run and reported to the task, as it is from any run. The
+/// task's decision door takes a verdict only from the run its assignment
+/// names, and a completed task names none, so the verdict is refused and the
+/// goal stays as it was: only a verdict that lands before the proposal is
+/// accepted can decide the goal. The run ends as accepted either way.
+#[tokio::test]
+async fn a_verdict_that_lands_after_acceptance_decides_nothing() {
+    let (fx, sink) = proposing_goal_world().await;
+    let evaluation = send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    record(&fx, &model, turn).await;
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelling,
+            Some("result-accepted".to_string()),
+            true
+        ),
+        "the task accepted, and the run waits for its evaluation"
+    );
+
+    let verdict = rakka_agent::AgentGoalEvaluationRecord::new(
+        rakka_agent::goal_evaluation_record_id(
+            &run_scope(),
+            evaluation.turn,
+            evaluation.slot,
+            evaluation.generation,
+        )
+        .expect("the record id derives"),
+        rakka_agent::AgentGoalId::for_root_task(task_scope().task()),
+        rakka_agent::AgentPolicyRef::new("ticket-evaluator").expect("the policy ref is valid"),
+        rakka_agent::AgentGoalEvaluationMethodKind::DeterministicAssertion,
+        AgentRevisionNumber::INITIAL,
+        rakka_agent::AgentGoalEvaluationOutcome::Satisfied,
+        "criteria-met",
+        vec![rakka_agent::AgentGoalEvidenceRef {
+            class: "artifact".to_string(),
+            artifact: None,
+            digest: None,
+        }],
+        None,
+        evaluation.effect_id.clone(),
+        evaluation.generation,
+        fx.now(),
+    )
+    .expect("the record is valid");
+    record(
+        &fx,
+        &evaluation,
+        AgentRunEffectOutcome::Evaluation {
+            record: Box::new(verdict),
+        },
+    )
+    .await;
+    settle_task_and_run(&fx).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Completed,
+            Some("result-accepted".to_string()),
+            true
+        )
+    );
+    let held = loop_state(&fx).await;
+    let cell = held
+        .goal_evaluation()
+        .expect("the run recorded the verdict");
+    assert_eq!(
+        cell.record.outcome,
+        rakka_agent::AgentGoalEvaluationOutcome::Satisfied
+    );
+    assert!(cell.reported, "the verdict was reported to the task");
+    assert_eq!(
+        cell.refusal.as_deref(),
+        Some("task-goal-evaluation-forged"),
+        "a completed task names no run, so its door refuses the report"
+    );
+    let state =
+        rakka_agent::load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+            .await
+            .expect("the task state loads")
+            .expect("the task exists");
+    assert_eq!(
+        state
+            .task()
+            .and_then(|task| task.goal_state.as_deref())
+            .map(rakka_agent::AgentGoalState::status),
+        Some(rakka_agent::AgentGoalStatus::Active),
+        "the goal is not decided"
+    );
+    assert_at_rest(&fx, &sink).await;
+}
+
+const TEAM: &str = "support-team";
+const MEMBER: &str = "worker-a";
+const DEPENDENT: &str = "dependent-1";
+
+fn team_scope() -> rakka_agent::AgentTeamScope {
+    rakka_agent::AgentTeamScope::new(
+        tenant(),
+        rakka_agent::AgentTeamId::new(TEAM).expect("the team id is valid"),
+    )
+    .expect("the team scope is valid")
+}
+
+fn dependent_scope() -> rakka_agent::AgentTaskScope {
+    rakka_agent::AgentTaskScope::new(
+        tenant(),
+        rakka_agent::AgentTaskId::new(DEPENDENT).expect("the task id is valid"),
+    )
+    .expect("the scope is valid")
+}
+
+fn team_operation(step: &str) -> AgentOperationId {
+    AgentOperationId::new(AgentOperationKind::TeamClaim, [TENANT, TEAM, step])
+        .expect("the operation id derives")
+}
+
+/// A world like [`proposing_goal_world`], whose task is governed by a team
+/// and posted on the team's board, with a second, human-owned task that
+/// declares it as a dependency.
+async fn governed_world_with_a_dependent() -> Fixture {
+    let fx = Fixture::with_sink(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new().with_turn_for(
+                1,
+                AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                    .with_text("Done.")
+                    .with_proposal(
+                        AgentTaskContent::inline(serde_json::json!({ "answer": "resolved" }))
+                            .expect("the proposal is inline-bounded"),
+                    )
+                    .with_usage(usage()),
+            ),
+        ),
+        InMemoryAgentRunEffectSink::new(),
+        AgentEffectPolicies::default(),
+        Arc::new(AtomicU64::new(1)),
+    );
+    fx.instantiate_agent().await;
+    let member = rakka_agent::AgentId::new(MEMBER).expect("the member id is valid");
+    fx.instantiate_team_member_at(
+        rakka_agent::AgentScope::new(tenant(), member.clone()).expect("the scope is valid"),
+    )
+    .await;
+    fx.apply_team_command_at(
+        &team_scope(),
+        rakka_agent::AgentTeamEntityCommand::Create {
+            operation_id: team_operation("create"),
+            creation: Box::new(rakka_agent::AgentTeamCreation {
+                leader: member.clone(),
+                root_goal: rakka_agent::AgentGoalId::new("quarterly-support")
+                    .expect("the goal id is valid"),
+                policy: rakka_agent::AgentTeamPolicy::new(AgentRevisionNumber::INITIAL),
+                members: [(member.clone(), Default::default())].into_iter().collect(),
+            }),
+        },
+    )
+    .await
+    .expect("the team is created");
+
+    let mut command = goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(goal_spec_with_evaluator(), true),
+    );
+    let rakka_agent::AgentTaskEntityCommand::Create { creation, .. } = &mut command else {
+        panic!("the helper builds a creation");
+    };
+    creation.team = Some(rakka_agent::AgentTeamId::new(TEAM).expect("the team id is valid"));
+    fx.apply_task_command(command)
+        .await
+        .expect("the governed task is created");
+    fx.apply_team_command_at(
+        &team_scope(),
+        rakka_agent::AgentTeamEntityCommand::PostTask {
+            operation_id: team_operation("post"),
+            task: task_scope().task().clone(),
+            posted_by: member,
+        },
+    )
+    .await
+    .expect("the task is posted");
+
+    fx.apply_task_command_at(
+        &dependent_scope(),
+        rakka_agent::AgentTaskEntityCommand::Create {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::TaskCreation,
+                [TENANT, DEPENDENT, "1"],
+            )
+            .expect("the operation id derives"),
+            creation: Box::new(rakka_agent::AgentTaskCreation {
+                definition: task_definition()
+                    .with_ownership(rakka_agent::AgentTaskOwnership::Human),
+                input: AgentTaskContent::inline(serde_json::json!({ "ticket": 2 }))
+                    .expect("the input is inline-bounded"),
+                assignee: None,
+                team: None,
+                goal: None,
+                goal_mode: Default::default(),
+                goal_spec: None,
+                parent: None,
+                dependencies: vec![rakka_agent::AgentTaskDependencyDeclaration::new(
+                    task_scope().task().clone(),
+                )],
+                escrow: None,
+                wake: None,
+                delegation: None,
+                telemetry: Default::default(),
+            }),
+        },
+    )
+    .await
+    .expect("the dependent is created");
+    settle_everyone(&fx).await;
+    fx
+}
+
+/// Settles the task, its run, the team and the dependent until each has
+/// heard what the others owe it.
+async fn settle_everyone(fx: &Fixture) {
+    for _round in 0..3 {
+        fx.settle_task_at(&task_scope())
+            .await
+            .expect("the task settles");
+        settle(fx).await;
+        fx.settle_team_at(&team_scope())
+            .await
+            .expect("the team settles");
+        fx.settle_task_at(&dependent_scope())
+            .await
+            .expect("the dependent settles");
+    }
+}
+
+/// The status of the task's entry on the team's board, and the code it
+/// closed under.
+async fn board_entry(fx: &Fixture) -> (rakka_agent::AgentTeamBoardEntryStatus, Option<String>) {
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = team
+        .board
+        .iter()
+        .find(|entry| &entry.task == task_scope().task())
+        .expect("the task is on the board");
+    (entry.status, entry.last_code.clone())
+}
+
+/// The dependent task's status, and what it has been told of the task it
+/// depends on.
+async fn dependent(
+    fx: &Fixture,
+) -> (
+    rakka_agent::AgentTaskStatus,
+    Option<rakka_agent::AgentTaskDependencyOutcome>,
+) {
+    let state = rakka_agent::load_agent_task_state(
+        &fx.tasks,
+        &dependent_scope(),
+        &AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the dependent loads")
+    .expect("the dependent exists");
+    let task = state.task().expect("the dependent is created");
+    let edge = task
+        .dependencies
+        .get(task_scope().task())
+        .expect("the dependent declared the edge");
+    (task.status, edge.outcome)
+}
+
+/// Not everything above a task waits for its ledger. The team's board and the
+/// tasks that depend on this one are told on the task's status, in the commit
+/// that decides it: the board entry closes and a dependent is unblocked while
+/// the accepted run still waits, and nothing changes for them when it parks.
+#[tokio::test]
+async fn a_decided_task_tells_its_board_and_its_dependents_at_once() {
+    let fx = governed_world_with_a_dependent().await;
+    assert_eq!(
+        board_entry(&fx).await,
+        (rakka_agent::AgentTeamBoardEntryStatus::Open, None)
+    );
+    assert_eq!(
+        dependent(&fx).await,
+        (rakka_agent::AgentTaskStatus::Blocked, None)
+    );
+    let evaluation = send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+
+    record(&fx, &model, turn).await;
+    settle_everyone(&fx).await;
+
+    assert_eq!(
+        standing(&fx).await,
+        (
+            AgentRunStatus::Cancelling,
+            Some("result-accepted".to_string()),
+            true
+        )
+    );
+    assert_eq!(
+        ledger_children_out(&fx).await,
+        1,
+        "the run holds its budget"
+    );
+    let told = (
+        (
+            rakka_agent::AgentTeamBoardEntryStatus::Done,
+            Some("result-accepted".to_string()),
+        ),
+        (
+            rakka_agent::AgentTaskStatus::WaitingForInput,
+            Some(rakka_agent::AgentTaskDependencyOutcome::Completed),
+        ),
+    );
+    assert_eq!(
+        (board_entry(&fx).await, dependent(&fx).await),
+        told,
+        "the board entry is closed and the dependent unblocked, over the open ledger"
+    );
+
+    record(
+        &fx,
+        &evaluation,
+        AgentRunEffectOutcome::indeterminate("connection-lost", "the evaluator died"),
+    )
+    .await;
+    settle_everyone(&fx).await;
+
+    assert_eq!(
+        standing(&fx).await.0,
+        AgentRunStatus::WaitingForReconciliation
+    );
+    assert_eq!((board_entry(&fx).await, dependent(&fx).await), told);
+}
