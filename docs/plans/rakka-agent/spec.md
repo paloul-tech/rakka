@@ -884,11 +884,18 @@ enum AgentLoopPhase {
 }
 ```
 
-A turn rests on the turn's own effects. `AwaitingTools` holds exactly while an
-effect of the turn is outstanding — every outstanding effect except a memory
-promotion or a communal claim append (Sections 13.3 and 13.4) — and the last
-such result rests the turn whatever else the run holds: complete, or awaiting
-a closed fan-in group's children. A promotion or a claim append is outside
+A turn rests on the turn's own effects. A turn at `AwaitingTools` stays there
+while an effect of the turn is outstanding or ambiguous — every such effect
+except a memory promotion or a communal claim append (Sections 13.3 and 13.4)
+— and the last of them to come back rests the turn whatever else the run
+holds: complete, or awaiting a closed fan-in group's children. An ambiguous
+effect (Section 11.5) has not come back: it rests the turn when its
+reconciliation decision establishes its outcome, or, where the decision
+authorizes a new generation, when that generation returns, so whether a turn
+has rested never depends on the order in which the outcomes of two of its
+effects arrive. An effect committed beside a turn already at rest (a goal
+evaluation, a workflow cancel) does not open that turn again. A promotion or
+a claim append is outside
 the turn: committed by a command beside the turn's in-flight work, it is
 never among the effects a turn waits on, it never holds a turn open, and its
 own outcome never rests one. An implementation MUST NOT leave a run parked in

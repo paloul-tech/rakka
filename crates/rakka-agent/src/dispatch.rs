@@ -3469,7 +3469,7 @@ where
     /// Such a claim has spent lease and written no settle, so the claims
     /// behind it were not renewed. The batch ends with it, and the pass
     /// gives those claims back as a failed pass does
-    /// ([`Self::release_unstarted`]): each whose lease still stands is
+    /// (`release_unstarted`): each whose lease still stands is
     /// claimable at once, under a full lease, and one whose lease has
     /// lapsed is left as it is, which is anyone's. They are counted in
     /// [`AgentDispatchPass::claimed`] and in nothing else.

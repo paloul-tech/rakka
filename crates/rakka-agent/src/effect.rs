@@ -1156,8 +1156,9 @@ impl AgentRunEffectKind {
     /// a promotion outstanding declined to rest the turn, the promotion's
     /// own outcome rested nothing, and the run parked `AwaitingTools` with
     /// zero outstanding effects and no wake. Every turn-completing site
-    /// decides the rest through [`crate::AgentLoopState::awaits_turn_effect`],
-    /// which excludes exactly this set.
+    /// decides the rest over the kinds
+    /// [`crate::AgentLoopState::awaits_turn_effect`] counts, which exclude
+    /// exactly this set.
     ///
     /// The set is deliberately *not* [`Self::exempt_from_wind_down_fence`].
     /// A compensation and a workflow cancel are exempt because the wind-down
