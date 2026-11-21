@@ -961,6 +961,27 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Mixed builds and rollback.** An earlier build writes the record this build now writes whenever the unknown outcome is the last to arrive. Where that call is all the turn waits for, an earlier build that takes such a record back takes the answer as this build does. Where another call of the turn is still out or unknown, it rests the turn at the next result or answer, which is the defect. A turn it rested itself it still records too early.
 
+- Issue #191 ("a run-resume segment is closed for a command that leaves the run parked") decides whether a `run-resume` segment closes on what holds the run, and no longer on its phase alone. **No durable field, status, error code, decision kind or segment class is added.** Segments are observability: no state and no decision reads them.
+
+  **What was wrong.** A command applied to a run closes `run-resume` when it finds the run on a wait of its phase (`AwaitingModel`, `AwaitingTools`, `AwaitingChildren`) and leaves it off one. Only the phase was asked afterwards, and a run can be held at a phase that is no wait: parked on an unknown outcome, parked on a top-up request, or winding down. A command that moved the phase off a wait and left the run held reported a resume that did not happen.
+
+  **The rule.** The segment's timer starts as it did: when the command finds the run on a wait of its phase. The segment closes when the command's pass leaves the run ended, or leaves nothing holding it. Four things hold a live run: a phase that is a wait; a status that is one (`WaitingForEffect`, `WaitingForApproval`, `WaitingForAuthorization`, `WaitingForReconciliation`, `WaitingForTimer`); a top-up request; and a wind-down the command found the run in (it was `Cancelling`, or a terminal reason was already recorded for it, as for a run parked on an unknown outcome after it was cancelled). A proposal that awaits its task's decision is no hold, as before. A wind-down the command itself brought on is none either: a run whose end is decided within the command's pass while it still holds a call it sent keeps its segment.
+
+  | A command that finds the run on a wait of its phase | Before | Now |
+  |---|---|---|
+  | Resolves the fan-in wait of a run parked on an unknown outcome (the deadline, or a child's result) | Closes `run-resume` | Closes none |
+  | Lands the last tool result of a turn on a run parked on an effect outside that turn | Closes `run-resume` | Closes none |
+  | Lands the model's result on a run parked at its model call | Closes `run-resume` | Closes none |
+  | Leaves the run parked on a top-up request | Closes `run-resume` | Closes none |
+  | Lands the model's result on a run it found winding down, which still holds a call | Closes `run-resume` | Closes none |
+  | Ends the run, however it found it | Closes `run-resume` | Unchanged |
+  | Leaves a run it did not find winding down on its proposal, or at its decided end with a call still out | Closes `run-resume` | Unchanged |
+  | Leaves the run on its next model call, its tools or its children | Closes none | Unchanged |
+
+  A command that finds the run at a phase that is no wait closes no `run-resume`, whatever it does, as before. The answer to a park on such a run is one.
+
+  **What a deployment sees.** Fewer `rakka.agent.run.resume` spans, and none on a command that did not close one before. The turn of a run that was parked at its model call, or cancelled there with another call still out, closes none where it closed one on the model's result. A run whose every hold showed in its phase closes the segments it closed. The segment is decided on where the command's own pass leaves the run, and that pass also carries the exchanges the run itself sent and takes their replies (its task's decision on a proposal, a top-up's answer), so what a reply decides within the pass is counted. An exchange delivered to the run (a delegation's result, a handoff's result, a cancellation) closes none.
+
 Run the default compatibility matrix:
 
 ```sh

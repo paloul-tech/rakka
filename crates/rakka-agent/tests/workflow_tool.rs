@@ -1785,6 +1785,16 @@ async fn parked_beside_a_fan_in_wait(
     metrics: Option<Arc<rakka_core::InMemoryMetricsRecorder>>,
     cancellable: bool,
 ) -> (Fixture, AgentRunEffect) {
+    parked_beside_a_fan_in_wait_observed(metrics, None, cancellable).await
+}
+
+/// [`parked_beside_a_fan_in_wait`], with the run's segments going to
+/// `segments` where one is given.
+async fn parked_beside_a_fan_in_wait_observed(
+    metrics: Option<Arc<rakka_core::InMemoryMetricsRecorder>>,
+    segments: Option<Arc<rakka_agent::InMemoryAgentSegmentSink>>,
+    cancellable: bool,
+) -> (Fixture, AgentRunEffect) {
     let executor = RecordingWorkflowExecutor::new(StartMode::Started);
     let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
         .with_text("Invoking the workflow and awaiting it, with a deadline.")
@@ -1804,6 +1814,9 @@ async fn parked_beside_a_fan_in_wait(
     };
     if let Some(metrics) = metrics {
         fixture = fixture.with_metrics(metrics);
+    }
+    if let Some(segments) = segments {
+        fixture = fixture.with_segments(segments);
     }
     fixture.instantiate_agent().await;
     let space = rakka_agent::KnowledgeSpaceId::new("space-alpha").expect("the space id is valid");
@@ -4296,5 +4309,179 @@ async fn a_members_grant_recomputes_the_wait_and_its_denial_keeps_a_wait_that_st
         (rest_of(&fixture).await, run_revision(&fixture).await),
         standing,
         "a settle pass writes nothing"
+    );
+}
+
+/// The labels of the segments `sink` has closed since it held `since`.
+fn closed_since(sink: &rakka_agent::InMemoryAgentSegmentSink, since: usize) -> Vec<&'static str> {
+    sink.operations().split_off(since)
+}
+
+/// A command that resolves the fan-in wait of a parked run has not resumed
+/// it (issue #191). The run rests on its child, parked on a claim append
+/// whose outcome is unknown. The deadline, or the child's report, resolves
+/// the wait: the phase moves off the wait and the run stays parked, so it
+/// records no turn until a person answers. That command used to close a
+/// `run-resume` segment, because only the phase was asked. The answer then
+/// takes the run on to its next model call, which is its next wait, and
+/// closes none either, as no command that leaves a run on a wait does.
+#[tokio::test]
+async fn a_wait_resolved_on_a_parked_run_closes_no_resume_segment() {
+    for resolver in ["the deadline", "the child's report"] {
+        let sink = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+        let (fixture, append) =
+            parked_beside_a_fan_in_wait_observed(None, Some(sink.clone()), false).await;
+        let before = sink.operations().len();
+
+        if resolver == "the deadline" {
+            fire_the_deadline(&fixture).await;
+        } else {
+            the_child_reports(&fixture).await;
+        }
+
+        let closed = closed_since(&sink, before);
+        assert_eq!(
+            (rest_of(&fixture).await, closed.contains(&"run-resume")),
+            (
+                (
+                    AgentLoopPhase::RecordingTurn,
+                    Some(AgentRunStatus::WaitingForReconciliation),
+                    1
+                ),
+                false
+            ),
+            "{resolver} resolves the wait and the run stays parked: nothing resumed: {closed:?}"
+        );
+
+        let before = sink.operations().len();
+        answer_the_append(&fixture, &append).await;
+
+        let closed = closed_since(&sink, before);
+        assert_eq!(
+            (rest_of(&fixture).await, closed.contains(&"run-resume")),
+            (
+                (
+                    AgentLoopPhase::AwaitingModel,
+                    Some(AgentRunStatus::WaitingForEffect),
+                    2
+                ),
+                false
+            ),
+            "the answer takes the run on to its next wait: {closed:?}"
+        );
+    }
+}
+
+/// What the change leaves as it was: a run resting on its children is on a
+/// wait by its phase, under `Running`. The start receipt that rests the turn
+/// there closes no `run-resume` segment, and neither does the child's
+/// report, which takes the run on to its next model call.
+#[tokio::test]
+async fn a_command_that_rests_the_run_on_its_children_closes_no_resume_segment() {
+    let sink = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fixture = workflow_fixture(
+        RecordingWorkflowExecutor::new(StartMode::Started),
+        workflow_await_turn(),
+    )
+    .with_segments(sink.clone());
+    create_workflow_task(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    assert_eq!(
+        (
+            rest_of(&fixture).await,
+            sink.operations().contains(&"run-resume")
+        ),
+        (
+            (
+                AgentLoopPhase::AwaitingChildren,
+                Some(AgentRunStatus::Running),
+                1
+            ),
+            false
+        ),
+        "the run rests on its child, and nothing has resumed: {:?}",
+        sink.operations()
+    );
+
+    the_child_reports(&fixture).await;
+
+    assert_eq!(
+        (
+            rest_of(&fixture).await,
+            sink.operations().contains(&"run-resume")
+        ),
+        (
+            (
+                AgentLoopPhase::AwaitingModel,
+                Some(AgentRunStatus::WaitingForEffect),
+                2
+            ),
+            false
+        ),
+        "the child's report takes the run on to its next wait: {:?}",
+        sink.operations()
+    );
+}
+
+/// What the change leaves as it was: a wait on its children is a wait of
+/// the run's phase, and the segment's timer starts on it. The run rests on
+/// its child and is cancelled there, which ends nothing. The child's report
+/// then ends the run, and closes its `run-resume` segment.
+#[tokio::test]
+async fn the_childs_report_that_ends_a_cancelled_run_resting_on_its_children_closes_its_resume_segment(
+) {
+    let sink = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fixture = workflow_fixture(
+        RecordingWorkflowExecutor::new(StartMode::Started),
+        workflow_await_turn(),
+    )
+    .with_segments(sink.clone());
+    create_workflow_task(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::Cancel {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Cancellation,
+                [TENANT, "parent-cancel", "1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator-cancelled".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(
+        (
+            rest_of(&fixture).await,
+            sink.operations().contains(&"run-resume")
+        ),
+        (
+            (
+                AgentLoopPhase::AwaitingChildren,
+                Some(AgentRunStatus::Cancelling),
+                1
+            ),
+            false
+        ),
+        "cancelled while it rests on its child, which it still waits for: {:?}",
+        sink.operations()
+    );
+
+    let before = sink.operations().len();
+    the_child_reports(&fixture).await;
+
+    let closed = closed_since(&sink, before);
+    assert_eq!(
+        (
+            fixture.run_snapshot().await.expect("the run exists").status,
+            closed
+                .iter()
+                .filter(|operation| **operation == "run-resume")
+                .count()
+        ),
+        (AgentRunStatus::Cancelled, 1),
+        "the child's report ends the run, from a wait of its phase: {closed:?}"
     );
 }

@@ -734,6 +734,42 @@ impl AgentRun {
         self.terminal_reason.is_some() || self.status == AgentRunStatus::Cancelling
     }
 
+    /// Whether a command that found the run on a wait of its phase has
+    /// resumed it. It is asked of the run as the command's settle pass left
+    /// it, and it is what a `run-resume` segment closes on.
+    ///
+    /// A run that has ended has left its wait. A live run has resumed when
+    /// nothing holds it, and any of four things does:
+    ///
+    /// - its phase is a wait on an effect or on its children;
+    /// - its status is a wait: a dispatch wait, an approval or an
+    ///   authorization, a reconciliation park;
+    /// - it is parked on a top-up request;
+    /// - the command found it winding down: a terminal reason was recorded
+    ///   for it, or it was `Cancelling`. A run that is winding down commits
+    ///   no new work, so nothing short of its end resumes it.
+    ///
+    /// The phase alone used to be asked (issue #191). A fan-in wait resolved
+    /// on a parked run moves the phase off its wait and leaves the run
+    /// parked, and so does a model's result on one. A turn that ends on a
+    /// top-up request is at a phase that is no wait, under `Running`. A
+    /// model's result taken by a cancelled run moves its phase and nothing
+    /// else. The phase called each of those a resume.
+    ///
+    /// Two things are no hold. A proposal that awaits its task's decision
+    /// never was one. And a wind-down the command itself brought on is none:
+    /// a run whose end is decided while it still holds a call went on to
+    /// that end, and waits only to reach it.
+    pub(crate) fn has_resumed(&self, was_winding_down: bool) -> bool {
+        if self.status.is_terminal() {
+            return true;
+        }
+        !(was_winding_down
+            || self.loop_state.phase().is_waiting()
+            || self.status.is_waiting()
+            || self.loop_state.pending_top_up().is_some())
+    }
+
     /// Whether the run may perform another bounded loop transition right now.
     ///
     /// This is the authoritative crank condition, and it is deliberately a
@@ -8675,9 +8711,14 @@ where
         let resume_timer = self
             .state()
             .ok()
-            .and_then(|state| state.loop_state().map(AgentLoopState::phase))
-            .filter(|phase| phase.is_waiting())
+            .and_then(AgentRunState::run)
+            .filter(|run| run.loop_state.phase().is_waiting())
             .map(|_| AgentSegmentTimer::start(now));
+        // Whether the command finds the run winding down, which
+        // [`AgentRun::has_resumed`] asks. It is read again below, where the
+        // command is answered again against a re-read record: the cache may
+        // be behind a cancellation the other writer committed.
+        let mut found_winding_down = self.shows_winding_down();
         // A resolution's segment: read before the transition drops the
         // checkpoint record, closed only once the transition committed.
         let resolving = self.resolving_checkpoint(&command);
@@ -8712,7 +8753,10 @@ where
             // pass failed, and the segments below are decided on what
             // committed, not on how the call ended.
             Err(error) if run_refusal_may_be_stale(&error) => match self.rematerialize(now).await {
-                Ok(()) => self.apply_command(reverify, router, now).await,
+                Ok(()) => {
+                    found_winding_down |= self.shows_winding_down();
+                    self.apply_command(reverify, router, now).await
+                }
                 Err(reread) => Err(reread),
             },
             // A timer that found nothing due writes nothing either, so it is
@@ -8720,7 +8764,10 @@ where
             // may be missing the very checkpoint or fan-in group now due, and
             // an `Unchanged` from it would hold for the whole residency.
             Ok(AgentRunEntityReply::Unchanged { .. }) => match self.rematerialize(now).await {
-                Ok(()) => self.apply_command(reverify, router, now).await,
+                Ok(()) => {
+                    found_winding_down |= self.shows_winding_down();
+                    self.apply_command(reverify, router, now).await
+                }
                 Err(reread) => Err(reread),
             },
             other => other,
@@ -8755,10 +8802,13 @@ where
         // partial fan-in — discharged nothing, and a resume segment for it
         // would claim a transition that did not happen.
         //
-        // Where the record survived the call, the phase after the settle pass
-        // answers, and nothing about the commit enters it. Where the settle
-        // pass lost a write and dropped the record, the segment closes only
-        // if the run was terminal once the transition committed: a terminal
+        // Where the record survived the call, where the run stands after the
+        // settle pass answers ([`AgentRun::has_resumed`]: its phase, its
+        // status and its top-up request, and whether the command found it
+        // winding down, so a run the command left held has not resumed),
+        // and nothing about the commit enters it. Where the settle pass
+        // lost a write and dropped the record, the segment closes only if
+        // the run was terminal once the transition committed: a terminal
         // run cannot wait again, so the commit decides what the clean call
         // would have answered. A run that was not terminal at the commit
         // closes nothing on that call, because what its settle pass would
@@ -8768,9 +8818,10 @@ where
             let after = self
                 .state()
                 .ok()
-                .and_then(|state| state.loop_state().map(AgentLoopState::phase));
+                .and_then(AgentRunState::run)
+                .map(|run| run.has_resumed(found_winding_down));
             let (resumed, context) = match after {
-                Some(phase) => (!phase.is_waiting(), self.loop_telemetry()),
+                Some(resumed) => (resumed, self.loop_telemetry()),
                 None => (committed.terminal, context_before),
             };
             if resumed {
@@ -9151,6 +9202,15 @@ where
         self.record_fan_in_resolution(resolution_before);
         progress?;
         Ok(reply)
+    }
+
+    /// Whether the cached record shows the run winding down. A facade with
+    /// no record cached shows none.
+    fn shows_winding_down(&self) -> bool {
+        self.state()
+            .ok()
+            .and_then(AgentRunState::run)
+            .is_some_and(AgentRun::winding_down)
     }
 
     /// The identity of the fan-in resolution the run currently holds: the
@@ -14455,6 +14515,116 @@ mod tests {
             !fx.state.run().expect("run").needs_park(),
             "a cancellation in progress is a wind-down with or without its reason"
         );
+    }
+
+    /// What a `run-resume` segment closes on (issue #191). A command that
+    /// found the run on a wait of its phase has resumed it when the run has
+    /// ended, or when nothing holds it: not its phase, not its status, not a
+    /// top-up request, and not a wind-down the command found it in. The
+    /// phase alone was asked.
+    #[test]
+    fn a_run_has_resumed_when_it_has_ended_or_nothing_holds_it() {
+        let fixture = |phase: AgentLoopPhase, status: AgentRunStatus| {
+            let mut fx = handoff_send_fixture(
+                status,
+                AgentHandoffStatus::Pending,
+                AgentRunEffectStatus::Succeeded,
+            );
+            fx.state
+                .run_mut()
+                .expect("the run exists")
+                .loop_state
+                .set_phase(phase);
+            fx
+        };
+        let top_up = || {
+            crate::budget::AgentBudgetExhaustion::new(
+                crate::budget::AgentBudgetDimension::LoopIterations,
+                1,
+                1,
+            )
+        };
+
+        for phase in [
+            AgentLoopPhase::AwaitingModel,
+            AgentLoopPhase::AwaitingTools,
+            AgentLoopPhase::AwaitingChildren,
+        ] {
+            assert!(
+                !fixture(phase, AgentRunStatus::Running)
+                    .run()
+                    .has_resumed(false),
+                "{phase:?} is a wait by itself, under `Running`"
+            );
+        }
+        for phase in [
+            AgentLoopPhase::PreparingContext,
+            AgentLoopPhase::EvaluatingModelOutput,
+            AgentLoopPhase::RecordingTurn,
+            AgentLoopPhase::DecidingContinuation,
+        ] {
+            assert!(
+                fixture(phase, AgentRunStatus::Running)
+                    .run()
+                    .has_resumed(false),
+                "{phase:?} under `Running`, with nothing that holds the run"
+            );
+            for status in [
+                AgentRunStatus::WaitingForReconciliation,
+                AgentRunStatus::WaitingForApproval,
+                AgentRunStatus::WaitingForAuthorization,
+                AgentRunStatus::WaitingForEffect,
+                AgentRunStatus::WaitingForTimer,
+            ] {
+                assert!(
+                    !fixture(phase, status).run().has_resumed(false),
+                    "{phase:?} under {status:?}: the status is the wait"
+                );
+            }
+
+            let mut fx = fixture(phase, AgentRunStatus::Running);
+            fx.state
+                .run_mut()
+                .expect("the run exists")
+                .loop_state
+                .park_for_top_up(top_up());
+            assert!(
+                !fx.run().has_resumed(false),
+                "{phase:?} under `Running`, parked on a top-up request"
+            );
+
+            assert!(
+                !fixture(phase, AgentRunStatus::Running)
+                    .run()
+                    .has_resumed(true),
+                "{phase:?}: the command found the run winding down, and it has not ended"
+            );
+            let mut fx = fixture(phase, AgentRunStatus::Cancelling);
+            fx.state.run_mut().expect("the run exists").terminal_reason =
+                Some(AgentRunTerminalReason::ResultAccepted);
+            assert!(
+                fx.run().has_resumed(false),
+                "{phase:?}: a wind-down the command itself brought on is no hold"
+            );
+        }
+
+        for status in [
+            AgentRunStatus::Completed,
+            AgentRunStatus::Failed,
+            AgentRunStatus::Cancelled,
+            AgentRunStatus::HandedOff,
+            AgentRunStatus::Superseded,
+        ] {
+            let mut fx = fixture(AgentLoopPhase::AwaitingTools, status);
+            let run = fx.state.run_mut().expect("the run exists");
+            run.terminal_reason = Some(AgentRunTerminalReason::ResultAccepted);
+            run.loop_state.park_for_top_up(top_up());
+            assert!(
+                fx.run().has_resumed(true),
+                "{status:?}: a run that has ended has left its wait, whatever its record \
+                 still holds and however the command found it"
+            );
+        }
     }
 
     /// A turn rests when none of its own effects is out or unknown (issue
