@@ -3204,18 +3204,48 @@ fn resumes(segments: &rakka_agent::InMemoryAgentSegmentSink) -> usize {
         .count()
 }
 
+/// How many `run-resume` segments `segments` has closed since it held
+/// `since` segments.
+fn resumes_since(segments: &rakka_agent::InMemoryAgentSegmentSink, since: usize) -> usize {
+    segments
+        .operations()
+        .split_off(since)
+        .iter()
+        .filter(|operation| **operation == "run-resume")
+        .count()
+}
+
+/// Answers `checkpoint` with `decision`, through a router that reaches no
+/// one, so that what the run proposes stays with the courier.
+async fn answer_out_of_reach(
+    fx: &Fixture,
+    checkpoint: &AgentCheckpoint,
+    decision: AgentReconciliationDecision,
+) {
+    apply_holding(
+        fx,
+        &rakka_agent::AgentExchangeRouter::new(),
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: decision_key("answer"),
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            resolver: resolver(),
+            decision: Box::new(AgentCheckpointDecision::Reconciliation(decision)),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await;
+}
+
 /// A command that leaves the run parked on a top-up request has not resumed
 /// it (issue #191). The model's result lands, the turn is recorded, its
 /// proposal is rejected, and the next turn finds the run's one iteration
 /// spent: the run ends that command parked on its request, at a phase that
 /// is no wait and under `Running`. The command used to close a `run-resume`
-/// segment, because only the phase was asked. The grant then takes the run
-/// on to its next model call, which is its next wait, and closes none
-/// either, as no command that leaves a run on a wait does.
+/// segment, because only the phase was asked.
 #[tokio::test]
 async fn a_command_that_parks_the_run_on_a_top_up_closes_no_resume_segment() {
     let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
-    let (fx, _sink, _holding, _evaluation) =
+    let (_fx, _sink, _holding, _evaluation) =
         parked_on_a_top_up_observed(3, Some(segments.clone())).await;
 
     assert_eq!(
@@ -3224,45 +3254,61 @@ async fn a_command_that_parks_the_run_on_a_top_up_closes_no_resume_segment() {
         "the run is parked on its top-up request, and nothing has resumed: {:?}",
         segments.operations()
     );
+}
 
-    settle(&fx).await;
+/// What the change leaves as it was: a command that finds the run parked on
+/// a top-up request, at a phase that is no wait, closes no `run-resume`
+/// segment, whatever its pass does. Here the result of the evaluation the
+/// run sent lands. Its pass carries the top-up request, the task has
+/// nothing left to grant, and the run, which now holds nothing, ends out of
+/// budget.
+///
+/// The segment's timer starts on the phase, as it did. Started on the
+/// top-up request as well, it would close a segment here, and on any other
+/// command whose pass happened to carry the request, a replay included.
+#[tokio::test]
+async fn a_command_that_finds_the_run_parked_on_a_top_up_closes_no_resume_segment() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let (fx, _sink, _holding, evaluation) =
+        parked_on_a_top_up_observed(1, Some(segments.clone())).await;
+    let before = segments.operations().len();
 
-    let granted = loop_state(&fx).await;
+    let result = fx.dispatcher.answer(&evaluation).await;
+    record(&fx, &evaluation, result).await;
+
     assert_eq!(
+        (standing(&fx).await, resumes_since(&segments, before)),
         (
-            status(&fx).await,
-            granted.phase(),
-            granted.pending_top_up().is_some(),
-            resumes(&segments)
-        ),
-        (
-            AgentRunStatus::WaitingForEffect,
-            rakka_agent::AgentLoopPhase::AwaitingModel,
-            false,
+            (
+                AgentRunStatus::Failed,
+                Some("budget-exhausted".to_string()),
+                false
+            ),
             0
         ),
-        "the grant takes the run on to its next model call, which is its next wait: {:?}",
-        segments.operations()
+        "the top-up is refused within the command's pass and the run ends: {:?}",
+        segments.operations().split_off(before)
     );
 }
 
-/// The resume of a run parked at its model call belongs to the answer, and
-/// not to the model's result. The result lands on a run parked on an unknown
-/// outcome: the phase moves off the wait and the run stays parked, since it
-/// cannot evaluate what the model said until a person answers. That command
-/// used to close a `run-resume` segment. The answer then takes the run off
-/// its park and on to its proposal, and used to close none, because the
-/// phase it found was no wait. The segment now closes on the answer, beside
-/// the answer's own `checkpoint-resolve`.
+/// The model's result on a run parked at its model call has not resumed it.
+/// The run is parked on an evaluation whose outcome is unknown. The model's
+/// result moves the phase off the wait and the run stays parked: it cannot
+/// evaluate what the model said until a person answers. That command used
+/// to close a `run-resume` segment.
 ///
-/// The task cannot be reached here, so the run is left standing on its
-/// proposal.
+/// The answer then takes the run off its park and on to its proposal. It
+/// closes its own `checkpoint-resolve` and no `run-resume`, as before: it
+/// found the run at a phase that is no wait, and the segment's timer starts
+/// on the phase. So this turn closes none, where it closed one on the wrong
+/// command.
+///
+/// The task cannot be reached, so the run is left standing on its proposal.
 #[tokio::test]
-async fn the_resume_of_a_run_parked_at_its_model_call_belongs_to_the_answer() {
+async fn a_model_result_on_a_parked_run_closes_no_resume_segment() {
     let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
     let (fx, _sink) = proposing_goal_world().await;
     let fx = fx.with_segments(segments.clone());
-    let nowhere = rakka_agent::AgentExchangeRouter::new();
     let evaluation = send_an_evaluation(&fx).await;
     apply(&fx, unknown(&evaluation))
         .await
@@ -3297,18 +3343,10 @@ async fn the_resume_of_a_run_parked_at_its_model_call_belongs_to_the_answer() {
 
     let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
     let before = segments.operations().len();
-    apply_holding(
+    answer_out_of_reach(
         &fx,
-        &nowhere,
-        AgentRunEntityCommand::ResolveCheckpoint {
-            operation_id: decision_key("answer"),
-            checkpoint_id: park.checkpoint_id.clone(),
-            resolver: resolver(),
-            decision: Box::new(AgentCheckpointDecision::Reconciliation(
-                AgentReconciliationDecision::ConfirmedNotExecuted,
-            )),
-            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
-        },
+        &park,
+        AgentReconciliationDecision::ConfirmedNotExecuted,
     )
     .await;
 
@@ -3319,88 +3357,31 @@ async fn the_resume_of_a_run_parked_at_its_model_call_belongs_to_the_answer() {
             status(&fx).await,
             answered.phase(),
             answered.proposal().is_some(),
-            closed
-                .iter()
-                .filter(|operation| **operation == "run-resume")
-                .count(),
-            closed.contains(&"checkpoint-resolve")
+            closed.contains(&"checkpoint-resolve"),
+            closed.contains(&"run-resume")
         ),
         (
             AgentRunStatus::Running,
             rakka_agent::AgentLoopPhase::DecidingContinuation,
             true,
-            1,
-            true
+            true,
+            false
         ),
-        "the answer takes the run off its park and on to its proposal: that is the resume, and \
-         the answer closes it: {closed:?}"
+        "the answer takes the run on to its proposal, and closes what it closed: {closed:?}"
     );
 }
 
-/// A run that is winding down waits for what it still holds, whatever its
-/// phase. Here the run is cancelled with its model call and an evaluation
-/// out. The model's result lands: the phase moves off the wait, and the run
-/// goes on waiting, cancelled, for the evaluation. That command used to
-/// close a `run-resume` segment. The evaluation's outcome then ends the run,
-/// and used to close none, because the phase it found was no wait. The
-/// segment now closes on the command that ended the wait.
-#[tokio::test]
-async fn the_resume_of_a_cancelled_run_belongs_to_the_command_that_ends_its_wait() {
-    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
-    let (fx, _sink) = proposing_goal_world().await;
-    let fx = fx.with_segments(segments.clone());
-    let evaluation = send_an_evaluation(&fx).await;
-    cancel_the_run(&fx).await;
-    assert_eq!(
-        (status(&fx).await, loop_state(&fx).await.phase()),
-        (
-            AgentRunStatus::Cancelling,
-            rakka_agent::AgentLoopPhase::AwaitingModel
-        ),
-        "cancelled, with its model call and its evaluation out"
-    );
-
-    let model = model_call_of(&fx).await;
-    let turn = fx.dispatcher.answer(&model).await;
-    record(&fx, &model, turn).await;
-
-    assert_eq!(
-        (
-            status(&fx).await,
-            loop_state(&fx).await.phase(),
-            resumes(&segments)
-        ),
-        (
-            AgentRunStatus::Cancelling,
-            rakka_agent::AgentLoopPhase::EvaluatingModelOutput,
-            0
-        ),
-        "the model's result is taken and the run still waits for its evaluation: nothing \
-         resumed: {:?}",
-        segments.operations()
-    );
-
-    record(&fx, &evaluation, never_invoked()).await;
-
-    assert_eq!(
-        (status(&fx).await, resumes(&segments)),
-        (AgentRunStatus::Cancelled, 1),
-        "the evaluation's outcome ends the wait and the run: {:?}",
-        segments.operations()
-    );
-}
-
-/// A run parked while it stands on its proposal is on a wait, and the answer
-/// to the park discharges it. The model's result leaves the run on its
-/// proposal and closes the one resume an ordinary run closes. The
-/// evaluation's outcome then lands unknown and parks the run where it
-/// stands. The answer used to close no `run-resume`, because the phase it
-/// found was no wait. It now closes one, beside its own
-/// `checkpoint-resolve`: such a run shows two resumes where it showed one.
+/// What the change leaves as it was: the answer to a park on a run that
+/// stands on its proposal closes no `run-resume` segment. The model's result
+/// leaves the run on its proposal and closes the one resume an ordinary run
+/// closes. The evaluation's outcome then lands unknown and parks the run
+/// where it stands, and the answer takes the park away.
 ///
-/// The task cannot be reached here, so the proposal stays with the courier.
+/// Started on the run's status as well as its phase, the timer would close
+/// a second segment here, for an answer that leaves the run where it does
+/// nothing until its task decides.
 #[tokio::test]
-async fn a_park_answered_on_a_run_that_stands_on_its_proposal_closes_a_resume_segment() {
+async fn a_park_answered_on_a_run_that_stands_on_its_proposal_closes_no_resume_segment() {
     let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
     let (fx, _sink) = proposing_goal_world().await;
     let fx = fx.with_segments(segments.clone());
@@ -3451,20 +3432,7 @@ async fn a_park_answered_on_a_run_that_stands_on_its_proposal_closes_a_resume_se
 
     let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
     let before = segments.operations().len();
-    apply_holding(
-        &fx,
-        &nowhere,
-        AgentRunEntityCommand::ResolveCheckpoint {
-            operation_id: decision_key("answer"),
-            checkpoint_id: park.checkpoint_id.clone(),
-            resolver: resolver(),
-            decision: Box::new(AgentCheckpointDecision::Reconciliation(
-                AgentReconciliationDecision::AbandonAndFail,
-            )),
-            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
-        },
-    )
-    .await;
+    answer_out_of_reach(&fx, &park, AgentReconciliationDecision::AbandonAndFail).await;
 
     let answered = loop_state(&fx).await;
     let closed = segments.operations().split_off(before);
@@ -3473,19 +3441,149 @@ async fn a_park_answered_on_a_run_that_stands_on_its_proposal_closes_a_resume_se
             status(&fx).await,
             answered.phase(),
             answered.proposal().is_some(),
-            closed
-                .iter()
-                .filter(|operation| **operation == "run-resume")
-                .count(),
-            closed.contains(&"checkpoint-resolve")
+            closed.contains(&"checkpoint-resolve"),
+            closed.contains(&"run-resume")
         ),
         (
             AgentRunStatus::Running,
             rakka_agent::AgentLoopPhase::DecidingContinuation,
             true,
-            1,
-            true
+            true,
+            false
         ),
-        "the answer takes the run off its park, back to its proposal: {closed:?}"
+        "the answer takes the park away and the run stands on its proposal as before: \
+         {closed:?}"
+    );
+}
+
+/// The model's result on a cancelled run has not resumed it. The run is
+/// cancelled with its model call and an evaluation out. The model's result
+/// moves the phase off the wait and nothing else: a run that is winding down
+/// commits no new work, and this one goes on waiting for its evaluation.
+/// That command used to close a `run-resume` segment.
+///
+/// The evaluation's outcome then ends the run, and closes none, as before:
+/// it found the run at a phase that is no wait.
+#[tokio::test]
+async fn a_model_result_on_a_cancelled_run_closes_no_resume_segment() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let (fx, _sink) = proposing_goal_world().await;
+    let fx = fx.with_segments(segments.clone());
+    let evaluation = send_an_evaluation(&fx).await;
+    cancel_the_run(&fx).await;
+    assert_eq!(
+        (status(&fx).await, loop_state(&fx).await.phase()),
+        (
+            AgentRunStatus::Cancelling,
+            rakka_agent::AgentLoopPhase::AwaitingModel
+        ),
+        "cancelled, with its model call and its evaluation out"
+    );
+
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    record(&fx, &model, turn).await;
+
+    assert_eq!(
+        (
+            status(&fx).await,
+            loop_state(&fx).await.phase(),
+            resumes(&segments)
+        ),
+        (
+            AgentRunStatus::Cancelling,
+            rakka_agent::AgentLoopPhase::EvaluatingModelOutput,
+            0
+        ),
+        "the model's result is taken and the run still waits for its evaluation: nothing \
+         resumed: {:?}",
+        segments.operations()
+    );
+
+    record(&fx, &evaluation, never_invoked()).await;
+
+    assert_eq!(
+        (status(&fx).await, resumes(&segments)),
+        (AgentRunStatus::Cancelled, 0),
+        "the evaluation's outcome ends the run, from a phase that is no wait: {:?}",
+        segments.operations()
+    );
+}
+
+/// What the change leaves as it was: the command that ends a cancelled run
+/// from a wait of its phase closes its `run-resume` segment. The run is
+/// cancelled with only its model call out, and the dispatcher reports the
+/// ticket as never invoked. A run the command found winding down is held
+/// until it ends, and here it ends.
+#[tokio::test]
+async fn the_command_that_ends_a_cancelled_run_closes_its_resume_segment() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let (fx, _sink) = proposing_goal_world().await;
+    let fx = fx.with_segments(segments.clone());
+    cancel_the_run(&fx).await;
+    assert_eq!(
+        (
+            status(&fx).await,
+            loop_state(&fx).await.phase(),
+            resumes(&segments)
+        ),
+        (
+            AgentRunStatus::Cancelling,
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            0
+        ),
+        "cancelled, with its model call out"
+    );
+
+    let model = model_call_of(&fx).await;
+    record(&fx, &model, never_invoked()).await;
+
+    assert_eq!(
+        (status(&fx).await, resumes(&segments)),
+        (AgentRunStatus::Cancelled, 1),
+        "the last call it held is known, and the run ends: {:?}",
+        segments.operations()
+    );
+}
+
+/// What the change leaves as it was: a wind-down the command itself brought
+/// on is no hold. The run awaits its model call with an evaluation out. The
+/// model proposes, the task accepts within the same pass, and the run waits,
+/// accepted, for the evaluation it sent. It went on to its decided end, and
+/// the model's result closes the `run-resume` segment it always closed.
+///
+/// The evaluation's outcome then ends the run and closes none, as before.
+#[tokio::test]
+async fn a_run_accepted_while_it_holds_a_call_closes_its_resume_segment() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let (fx, _sink) = proposing_goal_world().await;
+    let fx = fx.with_segments(segments.clone());
+    let evaluation = send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+
+    record(&fx, &model, turn).await;
+
+    assert_eq!(
+        (standing(&fx).await, resumes(&segments)),
+        (
+            (
+                AgentRunStatus::Cancelling,
+                Some("result-accepted".to_string()),
+                true
+            ),
+            1
+        ),
+        "accepted, and waiting only to end: the model's result resumed the run: {:?}",
+        segments.operations()
+    );
+
+    record(&fx, &evaluation, never_invoked()).await;
+
+    assert_eq!(
+        (status(&fx).await, resumes(&segments)),
+        (AgentRunStatus::Completed, 1),
+        "the evaluation's outcome ends the run, from a phase that is no wait: {:?}",
+        segments.operations()
     );
 }

@@ -961,24 +961,26 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Mixed builds and rollback.** An earlier build writes the record this build now writes whenever the unknown outcome is the last to arrive. Where that call is all the turn waits for, an earlier build that takes such a record back takes the answer as this build does. Where another call of the turn is still out or unknown, it rests the turn at the next result or answer, which is the defect. A turn it rested itself it still records too early.
 
-- Issue #191 ("a run-resume segment is closed for a command that leaves the run parked") decides the `run-resume` segment on whether the run is on a durable wait, and no longer on its phase alone. **No durable field, status, error code, decision kind or segment class is added.** Segments are observability: no state and no decision reads them.
+- Issue #191 ("a run-resume segment is closed for a command that leaves the run parked") decides whether a `run-resume` segment closes on what holds the run, and no longer on its phase alone. **No durable field, status, error code, decision kind or segment class is added.** Segments are observability: no state and no decision reads them.
 
-  **What was wrong.** A command applied to a run closes `run-resume` when it finds the run on a wait and leaves it off one. Both halves read the loop's phase, and a run can be held at a phase that is no wait: parked on an unknown outcome, parked on a top-up request, or winding down. A command that moved the phase off a wait and left the run held reported a resume that did not happen, and a command that found the run held at such a phase closed nothing, whatever it did.
+  **What was wrong.** A command applied to a run closes `run-resume` when it finds the run on a wait of its phase (`AwaitingModel`, `AwaitingTools`, `AwaitingChildren`) and leaves it off one. Only the phase was asked afterwards, and a run can be held at a phase that is no wait: parked on an unknown outcome, parked on a top-up request, or winding down. A command that moved the phase off a wait and left the run held reported a resume that did not happen.
 
-  **The rule.** A run is on a durable wait when it has not ended and its phase is a wait (`AwaitingModel`, `AwaitingTools`, `AwaitingChildren`), or its status is one (`WaitingForEffect`, `WaitingForApproval`, `WaitingForAuthorization`, `WaitingForReconciliation`, `WaitingForTimer`), or it is parked on a top-up request, or it is winding down. A command that finds the run there and leaves it on none closes `run-resume`. A proposal awaiting its task's decision is no wait, as before.
+  **The rule.** The segment's timer starts as it did: when the command finds the run on a wait of its phase. The segment closes when the command's pass leaves the run ended, or leaves nothing holding it. Four things hold a live run: a phase that is a wait; a status that is one (`WaitingForEffect`, `WaitingForApproval`, `WaitingForAuthorization`, `WaitingForReconciliation`, `WaitingForTimer`); a top-up request; and a wind-down the command found the run in (`Cancelling`, or its end decided and not yet reached). A proposal that awaits its task's decision is no hold, as before. A wind-down the command itself brought on is none either: a run whose end is decided within the command's pass while it still holds a call it sent keeps its segment.
 
-  | A command applied to a run | Before | Now |
+  | A command that finds the run on a wait of its phase | Before | Now |
   |---|---|---|
   | Resolves the fan-in wait of a run parked on an unknown outcome (the deadline, or a child's result) | Closes `run-resume` | Closes none |
+  | Lands the last tool result of a turn on a run parked on an effect outside that turn | Closes `run-resume` | Closes none |
   | Lands the model's result on a run parked at its model call | Closes `run-resume` | Closes none |
   | Leaves the run parked on a top-up request | Closes `run-resume` | Closes none |
-  | Lands the model's result on a run that is winding down and still holds a call | Closes `run-resume` | Closes none |
-  | Takes a run off a park it held at a phase that is no wait, and leaves it on its proposal | Closes none | Closes `run-resume` |
-  | Ends a run that was held at a phase that is no wait | Closes none | Closes `run-resume` |
+  | Lands the model's result on a run it found winding down, which still holds a call | Closes `run-resume` | Closes none |
+  | Ends the run, however it found it | Closes `run-resume` | Unchanged |
+  | Leaves a run it did not find winding down on its proposal, or at its decided end with a call still out | Closes `run-resume` | Unchanged |
   | Leaves the run on its next model call, its tools or its children | Closes none | Unchanged |
-  | Lands the model's result that leaves an unheld run on its proposal | Closes `run-resume` | Unchanged |
 
-  **What a deployment sees.** A run that was parked on an unknown outcome, parked on a top-up request, or winding down, at a phase that is no wait, may show a different number of `rakka.agent.run.resume` spans, on different commands. One case adds a span: a run parked while it stands on its proposal closes one on the model's result that put it there, as before, and now one more on the answer to the park. A run whose every wait showed in its phase closes the segments it closed. An exchange delivered to the run (a task's decision, a top-up's grant or refusal, a delegation's result) closes no `run-resume`, as before: only a command does.
+  A command that finds the run at a phase that is no wait closes no `run-resume`, whatever it does, as before. The answer to a park on such a run is one.
+
+  **What a deployment sees.** Fewer `rakka.agent.run.resume` spans, and none on a command that did not close one before. The turn of a run that was parked at its model call, or cancelled there with another call still out, closes none where it closed one on the model's result. A run whose every hold showed in its phase closes the segments it closed. The segment is decided on where the command's own pass leaves the run, and that pass also carries the exchanges the run itself sent and takes their replies (its task's decision on a proposal, a top-up's answer), so what a reply decides within the pass is counted. An exchange delivered to the run (a delegation's result, a handoff's result, a cancellation) closes none.
 
 Run the default compatibility matrix:
 

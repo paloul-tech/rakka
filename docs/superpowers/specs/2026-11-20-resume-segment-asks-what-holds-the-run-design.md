@@ -1,7 +1,8 @@
-# The `run-resume` segment is decided on what holds the run (issue #191)
+# The `run-resume` segment closes on what holds the run (issue #191)
 
 2026-11-20. Short design, with my calls listed. The owner reviews at the pull
-request.
+request. Section 9 says what the review of the first build changed: the
+approach itself.
 
 ## 1. What was wrong
 
@@ -22,96 +23,123 @@ Measured on `main` at `49feccf`. Each row is one command.
 | The model's result lands and the turns that follow end on a top-up request | `Running` at `PreparingContext`, top-up pending | `run-resume` |
 | The model's result lands on a cancelled run that still holds an evaluation | `Cancelling` at `EvaluatingModelOutput` | `run-resume` |
 
-The other side of the same reading: a command that found the run held at a
-phase that is no wait started no segment, whatever it did. The answer that
-takes a parked run from `EvaluatingModelOutput` on to its proposal closed
-none, and neither did the outcome that ends the cancelled run of the last
-row.
+The crate's tests reach one more of the same kind: the last tool result of a
+turn, on a run parked on an effect outside that turn, leaves it
+`WaitingForReconciliation` at `RecordingTurn`.
 
-The draft this issue came from counted "the answer to a park closes none" as
-wrong in general. It is not. A command that leaves the run on its next wait
-closes no `run-resume` anywhere, by a rule two existing tests pin: an
-ordinary run closes one, on the model result that leaves it on its proposal.
-The difference shows only where the command leaves the run off every wait.
-
-Runtime events are observability. No state and no decision reads this.
+Segments are observability. No state and no decision reads them.
 
 ## 2. Approaches
 
-1. **One answer to "is the run on a durable wait", asked before the command
-   and after it.** The phase, the status, a top-up request, and a wind-down.
-2. **Ask it only after the command.** That removes every false segment and
-   adds none. A command that takes a run off a park it held at a phase that
-   is no wait would still close nothing.
-3. **Only the reconciliation park**, after the command: the two rows the
-   draft named.
+1. **Ask what holds the run after the command, and leave the timer where it
+   is.** The segment's timer still starts when the command finds the run on
+   a wait of its phase. Whether the segment closes is decided on the phase,
+   the status, a top-up request and a wind-down. This can only take
+   segments away.
+2. **Ask the same question before the command and after it.** A command
+   that finds the run held at a phase that is no wait, and leaves it on its
+   proposal or ended, would close a segment too.
+3. **Only the reconciliation park**, after the command.
 
-I chose the first. The second leaves the answer and the model's result
-disagreeing about the same wait; the third leaves three measured rows.
+I built the second first, and the review measured what it did (section 9).
+This is the first. The third leaves two measured rows.
 
 ## 3. The rule
 
-A `run-resume` segment is closed by a command that finds the run on a durable
-wait and leaves it on none.
+A command applied to a run closes `run-resume` when it finds the run on a
+wait of its phase and its pass leaves the run resumed
+(`AgentRun::has_resumed`).
 
-A run is on a durable wait (`AgentRun::is_waiting`) when any of these holds,
-and it has not ended:
+A run that has ended has left its wait. A live run has resumed when nothing
+holds it, and any of four things does:
 
 - its phase is a wait on an effect or on its children;
 - its status is a wait: a dispatch wait, an approval or an authorization, a
   reconciliation park;
 - it is parked on a top-up request;
-- it is winding down, and so waits for what it still holds.
+- the command found it winding down. A run that is winding down commits no
+  new work, so nothing short of its end resumes it.
 
-A live run on none of the four either stands on its proposal or can still
-take a step by itself. A proposal that awaits its task's decision is no
-wait: that is the convention the segment already had.
+Two things are no hold. A proposal that awaits its task's decision never was
+one. And a wind-down the command itself brought on is none: a run whose end
+is decided within the command's pass, while it still holds a call it sent,
+went on to that end and waits only to reach it.
 
-**Where the two readings differ.** I logged every command of the crate's
-tests on which this answer differs from the phase's, before the command or
-after it. There are 191, and they are three kinds of run, each at a phase
-that is no wait: one parked on an unknown outcome
-(`WaitingForReconciliation`), one that is winding down (`Cancelling`, or
-parked with its end decided), and one parked on a top-up request under
-`Running`. No test world puts an approval, an authorization, a dispatch or a
-timer wait at a phase that is no wait. The most common of them is a run
-parked while it stands on its proposal.
+"Winding down" is `AgentRun::winding_down`: the run is `Cancelling`, or its
+end is decided and not yet reached.
+
+**Measured over the crate's tests**, the tests of this change included. I
+logged, for every command that finds the run on a wait of its phase, what
+the phase alone answers and what this rule answers.
+
+| | Commands |
+|---|---|
+| Find the run on a wait of its phase | 6,457 |
+| Closed `run-resume` under the phase alone | 1,622 |
+| Close it under this rule | 1,591 |
+| Close it under this rule and not under the phase | 0 |
+
+The 31 that no longer close one:
+
+| The command left the run | Commands |
+|---|---|
+| Parked on a top-up request, `Running` at `PreparingContext` | 12 |
+| Parked on an unknown outcome at `RecordingTurn`, from `AwaitingTools` | 9 |
+| Parked on an unknown outcome at `RecordingTurn`, from `AwaitingChildren` | 5 |
+| Winding down as it was found, `Cancelling` at `EvaluatingModelOutput` | 3 |
+| Parked on an unknown outcome at `EvaluatingModelOutput` | 2 |
+
+Of the 1,591 that still close one, 1,203 leave the run ended, 127 leave it
+on its proposal, 241 leave it `Running` at a phase from which it can take a
+step, 19 leave it at its decided end with a call still out, and one lost
+its record after the run had ended. No command in the crate's tests leaves a
+run on an approval, an authorization, a dispatch or a timer wait at a phase
+that is no wait.
 
 ## 4. The change
 
-`AgentRun::is_waiting`, and its two uses in `AgentRunEntityStore::apply`:
-where the resume timer starts, and where the segment is closed. Where the
-settle pass lost a write and the record is gone, the segment still closes
-only if the run was terminal at the commit, as before.
+`AgentRun::has_resumed`, and `AgentRunEntityStore::apply_unboxed`, which
+reads whether the run is winding down where it starts the resume timer and
+asks `has_resumed` where it closes the segment. Where the settle pass lost a
+write and the record is gone, the segment still closes only if the run was
+terminal at the commit, as before.
 
 Nothing durable is added: no field, status, error code, decision kind or
 segment class.
 
 ## 5. My calls
 
-1. **The same question on both sides.** It adds `run-resume` segments where
-   there were none: on the command that takes a run off a hold at a phase
-   that is no wait and leaves it on its proposal or ended. Those are
-   resumes by the rule. Yours to reverse to the second approach, which only
-   removes segments.
+1. **Only the close changes; the timer starts on the phase, as it did.** So
+   no command closes a segment it did not close before, and a replay closes
+   what it closed.
 
-   **What it costs.** A run parked while it stands on its proposal now
-   closes two: one on the model's result that put it on its proposal, as
-   before, and one on the answer that takes it off the park and back to
-   that proposal. The second is a resume by the rule and still leaves the
-   run where it does nothing until its task decides. That follows from
-   call 3.
-2. **A top-up request and a wind-down are holds too.** The issue named the
-   park. Both are measured rows, and with either left out the rule would
-   still call a held run resumed. A wind-down had to be in for call 1 to be
-   safe: without it, the answer to a park on a cancelled run that still
-   holds another call would have closed a new false segment.
-3. **A proposal awaiting its task's decision is still no wait.** Counting it
-   would move the one segment an ordinary run closes from the model's result
-   to the task's decision, which arrives as an exchange and closes none.
-4. **Only a command closes the segment, as before.** An exchange delivered to
-   the run (a task's decision, a top-up's grant or refusal, a delegation's
-   result) closes none. Read, not changed.
+   **What it costs.** A command that finds the run held at a phase that is
+   no wait closes none, whatever it does, as before. The answer that takes
+   a parked run from `EvaluatingModelOutput` on to its proposal is one. So
+   the turn of a run parked at its model call closes no `run-resume`, where
+   it closed one on the wrong command. Section 10 says what closing it on
+   the right command would take.
+2. **A wind-down the command found the run in is a hold too.** The issue
+   named the park and the top-up request. The cancelled run is the same
+   defect, measured.
+3. **A wind-down counts only where the command found the run in it.** The
+   model's result on an unheld run whose task accepts within the same pass,
+   while the run holds an evaluation it sent, leaves the run winding down.
+   That run went on: it evaluated, proposed and was accepted. It keeps its
+   segment. Counting every wind-down would take the segment from those 19
+   commands and close it nowhere.
+4. **A proposal that awaits its task's decision is still no hold.** Where
+   the task answers within the pass of the model's result, the run has
+   ended by the time it is asked (885 of the crate's commands), and this
+   call changes nothing. Where the task is not reached in that pass, the
+   run is left on its proposal (127), and counting the proposal would take
+   the segment from them: the task's decision is the reply to an exchange
+   the run sent, taken in whichever later pass carries it, and that pass
+   starts no timer.
+5. **The status is asked by its own definition of a wait**
+   (`AgentRunStatus::is_waiting`), and not only for the park. A run under
+   an approval or an authorization wait cannot take a step either. Only the
+   park reaches a whole-run test; the others are held by the unit test.
 
 ## 6. Mixed builds and rollback
 
@@ -119,70 +147,118 @@ Nothing is stored. An earlier build closes the segments it closed.
 
 ## 7. Tests
 
-Six whole-run tests and one unit test. Each whole-run test reads the
+Nine whole-run tests and one unit test. Each whole-run test reads the
 segments the run closed from an in-memory sink.
 
-In `crates/rakka-agent/tests/workflow_tool.rs`:
+**The four that fail on `main` at `49feccf`**, each at the assertion it is
+named for:
 
-- **A wait resolved on a parked run closes no resume segment.** The run
-  rests on its child, parked on a claim append whose outcome is unknown.
-  The deadline, and in a second pass the child's report, resolves the wait
-  and leaves the run parked at `RecordingTurn`: no `run-resume`. The answer
-  then takes the run on to its next model call and closes none either.
-- **A command that rests the run on its children closes no resume
-  segment.** What the change leaves as it was: `AwaitingChildren` under
-  `Running` is a wait by its phase.
+- `workflow_tool.rs`, **a wait resolved on a parked run closes no resume
+  segment.** The run rests on its child, parked on a claim append whose
+  outcome is unknown. The deadline, and in a second pass the child's
+  report, resolves the wait and leaves the run parked at `RecordingTurn`.
+  The answer then takes the run on to its next model call and closes none
+  either.
+- `run_end_waits.rs`, **a command that parks the run on a top-up closes no
+  resume segment.**
+- **A model result on a parked run closes no resume segment.** The answer
+  then takes the run on to its proposal, with the task out of reach. It
+  closes its `checkpoint-resolve` and no `run-resume`: the cost of call 1,
+  held.
+- **A model result on a cancelled run closes no resume segment.** The
+  evaluation's outcome then ends the run and closes none, as before.
 
-In `run_end_waits.rs`:
+**The five that hold what the change leaves as it was**, and pass on
+`main`:
 
-- **A command that parks the run on a top-up closes no resume segment**, and
-  neither does the grant, which takes the run to its next model call.
-- **The resume of a run parked at its model call belongs to the answer.**
-  The model's result on the parked run closes none. The answer takes the run
-  on to its proposal and closes one, beside its own `checkpoint-resolve`.
-  The task is out of reach in this test, so the run is left standing on its
-  proposal.
-- **The resume of a cancelled run belongs to the command that ends its
-  wait.** The model's result on a cancelled run that still holds an
-  evaluation closes none. The evaluation's outcome ends the run and closes
-  one.
-- **A park answered on a run that stands on its proposal closes a resume
-  segment.** The cost of call 1, held: one resume on the model's result,
-  none on the outcome that parks the run, one on the answer.
+- `workflow_tool.rs`, **a command that rests the run on its children closes
+  no resume segment**: `AwaitingChildren` under `Running` is a wait by its
+  phase.
+- `run_end_waits.rs`, **a command that finds the run parked on a top-up
+  closes no resume segment.** The evaluation's result lands, its pass
+  carries the top-up request, the task refuses, and the run ends. Holds the
+  timer to the phase against a top-up request.
+- **A park answered on a run that stands on its proposal closes no resume
+  segment.** Holds the timer to the phase against the status.
+- **The command that ends a cancelled run closes its resume segment.** A
+  run found winding down is held until it ends, and here it ends.
+- **A run accepted while it holds a call closes its resume segment.** Call
+  3.
 
-One unit test in `run.rs` holds `AgentRun::is_waiting` over every phase that
-is a wait, every phase that is not under each status that is a wait, a
-top-up request, a wind-down by status and by reason, and every ended status.
-
-**On `main` at `49feccf`** five of the six whole-run tests fail, each at
-the assertion it is named for, and the sixth (a run resting on its
-children) holds what was already right. For the two tests of a resume that
-moved, both commands were measured there: the model's result closes one
-segment and the answer, or the outcome that ends the run, closes none. With
-the change it is none and then one.
+One unit test in `run.rs` holds `AgentRun::has_resumed` over every phase
+that is a wait, every phase that is not under each status that is a wait, a
+top-up request, a wind-down found and one brought on, and every ended
+status.
 
 ## 8. Breaks
 
-Ten breaks were run one at a time, each against the unit tests and five
-test files, and a survivor again against the whole crate. All ten are
-caught.
+Thirteen breaks were run one at a time, each against the unit tests and
+five test files, with a survivor to be run again against the whole crate.
+All thirteen are caught, and none needed the whole crate.
 
-- **What counts as a wait.** The status not asked, a top-up request not
-  asked, a wind-down not asked: each by a whole-run test of its own and by
-  the unit test. The phase not asked: by the unit test alone when the breaks
-  were run; the test of a run resting on its children was added for it, and
-  fails under that break. The status asked only for a reconciliation park:
-  the unit test alone. An approval or an authorization wait at a phase that
-  is no wait is not a state any whole-run test builds.
-- **An ended run asked**: five tests, three of them existing tests of the
-  segment.
-- **A proposal with its task counted as a wait**: the answer's test.
-- **The timer started on the phase alone**: the two tests of a resume that
-  moved. **The segment closed on the phase alone**: every test of a run
-  left held. **Both, which is the defect**: the same four.
+- **What holds a run.** The phase not asked after the command: three
+  whole-run tests. The status not asked: the two tests of a parked run. A
+  top-up request not asked: its test. A wind-down the command found not
+  asked: the cancelled run's test. Each is caught by the unit test as well.
+  The status asked only for a reconciliation park: the unit test alone
+  (call 5).
+- **What does not.** Every wind-down asked, found or brought on: the
+  accepted run's test and the unit test. A proposal counted as a hold: the
+  test of a park answered on a run that stands on its proposal, whose
+  model's result is taken with the task out of reach.
+- **An ended run not let through**: the test of the command that ends a
+  cancelled run, and the unit test.
+- **The timer.** Started on the status too: two tests. On a top-up request
+  too: one. On a wind-down too: three, one of them an existing test. The
+  wind-down never read before the command: the cancelled run's test.
+- **The close asking the phase alone, which is the defect**: the four tests
+  that fail on `main`.
 
-The test of a park answered on a run that stands on its proposal was
-written after the breaks were run. It fails on `main`, so it fails under the
-last break, which is `main`'s code.
+The whole crate passes: 1,887 tests.
 
-The whole crate passes: 1,884 tests.
+## 9. What the review found
+
+A fresh reviewer read the first build, which asked the same question on
+both sides (approach 2), with a log of every command in the crate's tests,
+probes of its own and a mutation run.
+
+- **A segment closed on a command that did nothing to the hold.** A top-up
+  park, and a wind-down on a proposal, are ended by the reply to an exchange
+  the run itself sent. Whichever pass carries that exchange takes the reply,
+  and every committing command and every replay runs one. So a `Duplicate`
+  replay closed a `run-resume`, and so did the grant of an unrelated gate.
+  `main` cannot do this: no wait of the phase is ended by such a reply.
+- **It changed 100 commands of the crate's tests**: 52 gained a segment and
+  48 lost one. I had written "one case adds a span".
+- **The largest change was in neither of my tables**: the run accepted
+  while it holds a call (call 3) lost its segment on the model's result and
+  gained it on the outcome that ends the run.
+- **My reason for leaving the proposal out was false.** I wrote that
+  counting it would move an ordinary run's segment. Where the task answers
+  within the pass the run has ended, and nothing moves. Call 4 has the
+  true trade.
+- **A sentence was wrong about exchanges.** A task's decision and a
+  top-up's answer are not delivered to the run. They are replies to
+  exchanges the run sent.
+- **Three parts of the predicate were held by the unit test alone**, and
+  half of one test held nothing: a grant taken by a sweep, which closes no
+  segment under any rule.
+- **A product doc still stated the phase rule**, and two test comments.
+
+This build is the answer to the first two: approach 1 adds no segment, so
+it has no command to get wrong. The table of section 3 is my own log of this
+build, taken the way the reviewer took theirs. The rest are corrected where
+they stood.
+
+## 10. Not done
+
+- **The command that sets a held run going from a phase that is no wait
+  closes no `run-resume`**, as before. Closing it there means starting the
+  timer on more than the phase, and the review shows what that needs: a
+  hold that only a command can end. A reconciliation park is close to one,
+  but a settle pass also ends a stale park, and the answer to a park on a
+  run that stands on its proposal would close a second segment for a run
+  that still does nothing until its task decides.
+- **A non-terminal run whose settle pass ends a wait and then loses a later
+  write** closes no `run-resume` on either call, as the validation matrix
+  already records under "Owed".
