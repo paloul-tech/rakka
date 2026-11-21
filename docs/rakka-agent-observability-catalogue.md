@@ -234,6 +234,15 @@ a resume link back to the operation that parked.
 | `checkpoint-resolve` | Checkpoint resolution — the transition an incoming human or service decision commits (17.11's resolution span) |
 | `run-resume`, `run-recover` | Run resume/recovery |
 
+A `run-resume` segment is closed by a command applied to a run that finds it
+on a durable wait and leaves it on none. A run is on a durable wait when it
+has not ended and its phase is a wait on an effect or on its children, or its
+status is a wait, or it is parked on a top-up request, or it is winding down.
+A command that leaves the run on its next wait closes none, so a run closes
+fewer of these segments than it discharges waits: an ordinary run closes one,
+on the model result that leaves it on its proposal. An exchange delivered to
+the run closes none.
+
 Two rows of 17.6 are absent because the operations do not exist: `embeddings
 {model}` and `plan {agent.name}`. 17.6 asks for the planning span "only when
 planning is reliably distinguishable", and it is not.

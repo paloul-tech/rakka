@@ -1837,6 +1837,20 @@ async fn parked_on_a_top_up(
     rakka_agent::AgentExchangeRouter,
     AgentRunEffect,
 ) {
+    parked_on_a_top_up_observed(ceiling, None).await
+}
+
+/// [`parked_on_a_top_up`], with the run's segments going to `segments` where
+/// one is given.
+async fn parked_on_a_top_up_observed(
+    ceiling: u32,
+    segments: Option<Arc<rakka_agent::InMemoryAgentSegmentSink>>,
+) -> (
+    Fixture,
+    Arc<CountingDecisionSink>,
+    rakka_agent::AgentExchangeRouter,
+    AgentRunEffect,
+) {
     let definition = task_definition()
         .with_budgets(rakka_agent::AgentBudgetCeilings {
             max_loop_iterations: Some(ceiling),
@@ -1847,6 +1861,10 @@ async fn parked_on_a_top_up(
             ..rakka_agent::AgentBudgetAllocation::unbounded()
         });
     let (fx, sink) = goal_world("", definition, goal_spec_with_evaluator()).await;
+    let fx = match segments {
+        Some(segments) => fx.with_segments(segments),
+        None => fx,
+    };
     let holding = rakka_agent::AgentExchangeRouter::new()
         .with_route(
             rakka_agent::AgentEntityClass::Task,
@@ -3175,4 +3193,299 @@ async fn a_decided_task_tells_its_board_and_its_dependents_at_once() {
         AgentRunStatus::WaitingForReconciliation
     );
     assert_eq!((board_entry(&fx).await, dependent(&fx).await), told);
+}
+
+/// How many `run-resume` segments `segments` has closed.
+fn resumes(segments: &rakka_agent::InMemoryAgentSegmentSink) -> usize {
+    segments
+        .operations()
+        .iter()
+        .filter(|operation| **operation == "run-resume")
+        .count()
+}
+
+/// A command that leaves the run parked on a top-up request has not resumed
+/// it (issue #191). The model's result lands, the turn is recorded, its
+/// proposal is rejected, and the next turn finds the run's one iteration
+/// spent: the run ends that command parked on its request, at a phase that
+/// is no wait and under `Running`. The command used to close a `run-resume`
+/// segment, because only the phase was asked. The grant then takes the run
+/// on to its next model call, which is its next wait, and closes none
+/// either, as no command that leaves a run on a wait does.
+#[tokio::test]
+async fn a_command_that_parks_the_run_on_a_top_up_closes_no_resume_segment() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let (fx, _sink, _holding, _evaluation) =
+        parked_on_a_top_up_observed(3, Some(segments.clone())).await;
+
+    assert_eq!(
+        resumes(&segments),
+        0,
+        "the run is parked on its top-up request, and nothing has resumed: {:?}",
+        segments.operations()
+    );
+
+    settle(&fx).await;
+
+    let granted = loop_state(&fx).await;
+    assert_eq!(
+        (
+            status(&fx).await,
+            granted.phase(),
+            granted.pending_top_up().is_some(),
+            resumes(&segments)
+        ),
+        (
+            AgentRunStatus::WaitingForEffect,
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            false,
+            0
+        ),
+        "the grant takes the run on to its next model call, which is its next wait: {:?}",
+        segments.operations()
+    );
+}
+
+/// The resume of a run parked at its model call belongs to the answer, and
+/// not to the model's result. The result lands on a run parked on an unknown
+/// outcome: the phase moves off the wait and the run stays parked, since it
+/// cannot evaluate what the model said until a person answers. That command
+/// used to close a `run-resume` segment. The answer then takes the run off
+/// its park and on to its proposal, and used to close none, because the
+/// phase it found was no wait. The segment now closes on the answer, beside
+/// the answer's own `checkpoint-resolve`.
+///
+/// The task cannot be reached here, so the run is left standing on its
+/// proposal.
+#[tokio::test]
+async fn the_resume_of_a_run_parked_at_its_model_call_belongs_to_the_answer() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let (fx, _sink) = proposing_goal_world().await;
+    let fx = fx.with_segments(segments.clone());
+    let nowhere = rakka_agent::AgentExchangeRouter::new();
+    let evaluation = send_an_evaluation(&fx).await;
+    apply(&fx, unknown(&evaluation))
+        .await
+        .expect("the unknown outcome records");
+    assert_eq!(
+        (status(&fx).await, loop_state(&fx).await.phase()),
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            rakka_agent::AgentLoopPhase::AwaitingModel
+        ),
+        "parked on the evaluation, with the model call out"
+    );
+
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    record(&fx, &model, turn).await;
+
+    assert_eq!(
+        (
+            status(&fx).await,
+            loop_state(&fx).await.phase(),
+            resumes(&segments)
+        ),
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            rakka_agent::AgentLoopPhase::EvaluatingModelOutput,
+            0
+        ),
+        "the model's result is taken and the run stays parked: nothing resumed: {:?}",
+        segments.operations()
+    );
+
+    let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+    let before = segments.operations().len();
+    apply_holding(
+        &fx,
+        &nowhere,
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: decision_key("answer"),
+            checkpoint_id: park.checkpoint_id.clone(),
+            resolver: resolver(),
+            decision: Box::new(AgentCheckpointDecision::Reconciliation(
+                AgentReconciliationDecision::ConfirmedNotExecuted,
+            )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await;
+
+    let answered = loop_state(&fx).await;
+    let closed = segments.operations().split_off(before);
+    assert_eq!(
+        (
+            status(&fx).await,
+            answered.phase(),
+            answered.proposal().is_some(),
+            closed
+                .iter()
+                .filter(|operation| **operation == "run-resume")
+                .count(),
+            closed.contains(&"checkpoint-resolve")
+        ),
+        (
+            AgentRunStatus::Running,
+            rakka_agent::AgentLoopPhase::DecidingContinuation,
+            true,
+            1,
+            true
+        ),
+        "the answer takes the run off its park and on to its proposal: that is the resume, and \
+         the answer closes it: {closed:?}"
+    );
+}
+
+/// A run that is winding down waits for what it still holds, whatever its
+/// phase. Here the run is cancelled with its model call and an evaluation
+/// out. The model's result lands: the phase moves off the wait, and the run
+/// goes on waiting, cancelled, for the evaluation. That command used to
+/// close a `run-resume` segment. The evaluation's outcome then ends the run,
+/// and used to close none, because the phase it found was no wait. The
+/// segment now closes on the command that ended the wait.
+#[tokio::test]
+async fn the_resume_of_a_cancelled_run_belongs_to_the_command_that_ends_its_wait() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let (fx, _sink) = proposing_goal_world().await;
+    let fx = fx.with_segments(segments.clone());
+    let evaluation = send_an_evaluation(&fx).await;
+    cancel_the_run(&fx).await;
+    assert_eq!(
+        (status(&fx).await, loop_state(&fx).await.phase()),
+        (
+            AgentRunStatus::Cancelling,
+            rakka_agent::AgentLoopPhase::AwaitingModel
+        ),
+        "cancelled, with its model call and its evaluation out"
+    );
+
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    record(&fx, &model, turn).await;
+
+    assert_eq!(
+        (
+            status(&fx).await,
+            loop_state(&fx).await.phase(),
+            resumes(&segments)
+        ),
+        (
+            AgentRunStatus::Cancelling,
+            rakka_agent::AgentLoopPhase::EvaluatingModelOutput,
+            0
+        ),
+        "the model's result is taken and the run still waits for its evaluation: nothing \
+         resumed: {:?}",
+        segments.operations()
+    );
+
+    record(&fx, &evaluation, never_invoked()).await;
+
+    assert_eq!(
+        (status(&fx).await, resumes(&segments)),
+        (AgentRunStatus::Cancelled, 1),
+        "the evaluation's outcome ends the wait and the run: {:?}",
+        segments.operations()
+    );
+}
+
+/// A run parked while it stands on its proposal is on a wait, and the answer
+/// to the park discharges it. The model's result leaves the run on its
+/// proposal and closes the one resume an ordinary run closes. The
+/// evaluation's outcome then lands unknown and parks the run where it
+/// stands. The answer used to close no `run-resume`, because the phase it
+/// found was no wait. It now closes one, beside its own
+/// `checkpoint-resolve`: such a run shows two resumes where it showed one.
+///
+/// The task cannot be reached here, so the proposal stays with the courier.
+#[tokio::test]
+async fn a_park_answered_on_a_run_that_stands_on_its_proposal_closes_a_resume_segment() {
+    let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let (fx, _sink) = proposing_goal_world().await;
+    let fx = fx.with_segments(segments.clone());
+    let nowhere = rakka_agent::AgentExchangeRouter::new();
+    let evaluation = send_an_evaluation(&fx).await;
+    let model = model_call_of(&fx).await;
+    let turn = fx.dispatcher.answer(&model).await;
+    for (effect, outcome) in [
+        (&model, turn),
+        (
+            &evaluation,
+            AgentRunEffectOutcome::indeterminate("connection-lost", "the evaluator died"),
+        ),
+    ] {
+        apply_holding(
+            &fx,
+            &nowhere,
+            AgentRunEntityCommand::RecordEffectResult {
+                operation_id: effect
+                    .result_operation_id(&run_scope())
+                    .expect("the result operation id derives"),
+                effect_id: effect.effect_id.clone(),
+                generation: effect.generation,
+                attempt: 1,
+                fence: 1,
+                outcome: Box::new(outcome),
+            },
+        )
+        .await;
+    }
+    let parked = loop_state(&fx).await;
+    assert_eq!(
+        (
+            status(&fx).await,
+            parked.phase(),
+            parked.proposal().is_some(),
+            resumes(&segments)
+        ),
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            rakka_agent::AgentLoopPhase::DecidingContinuation,
+            true,
+            1
+        ),
+        "parked on its proposal, after the one resume of its model call: {:?}",
+        segments.operations()
+    );
+
+    let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+    let before = segments.operations().len();
+    apply_holding(
+        &fx,
+        &nowhere,
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: decision_key("answer"),
+            checkpoint_id: park.checkpoint_id.clone(),
+            resolver: resolver(),
+            decision: Box::new(AgentCheckpointDecision::Reconciliation(
+                AgentReconciliationDecision::AbandonAndFail,
+            )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await;
+
+    let answered = loop_state(&fx).await;
+    let closed = segments.operations().split_off(before);
+    assert_eq!(
+        (
+            status(&fx).await,
+            answered.phase(),
+            answered.proposal().is_some(),
+            closed
+                .iter()
+                .filter(|operation| **operation == "run-resume")
+                .count(),
+            closed.contains(&"checkpoint-resolve")
+        ),
+        (
+            AgentRunStatus::Running,
+            rakka_agent::AgentLoopPhase::DecidingContinuation,
+            true,
+            1,
+            true
+        ),
+        "the answer takes the run off its park, back to its proposal: {closed:?}"
+    );
 }
