@@ -765,6 +765,11 @@ pub enum AgentWorkflowCancelDisposition {
     /// The cancel effect was committed; its delivery settles independently,
     /// and the child's terminal outcome still returns through the result
     /// relay.
+    ///
+    /// Delivery is read from the effect this names. A delivery that failed,
+    /// or spent its retries, leaves that effect `failed` or `exhausted` with
+    /// its code, and this disposition stands: the run is not wound down by
+    /// it, and the child is left to report on its own (issue #197).
     Committed {
         /// The effect carrying the request.
         effect: AgentEffectId,

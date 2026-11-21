@@ -5648,6 +5648,21 @@ fn apply_effect_outcome(
             // or unwired evaluation so the goal stays decidable — the failure
             // stays on the effect record and the caller re-evaluates
             // ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+            //
+            // A failed workflow cancel is the fourth (issue #197). A cancel is
+            // a request with an observable outcome, not the run's work
+            // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+            // On a live run every cancel is a fan-in straggler's, and the
+            // fan-in it serves has already decided what it waited for. A
+            // cancel that did not reach its child leaves that child to report
+            // on its own, as an `Unsupported` disposition does and as
+            // `AgentWorkflowCancelFinding::Refused` promises. So the failure
+            // stays on the effect record, the cell keeps `Committed`, and the
+            // run goes on, as it does when the cancel succeeds. A run already
+            // winding down has its reason recorded, and its own fence ran
+            // when the wind-down began; a cancelled one still waits for the
+            // child's result through `awaits_children`.
+            //
             // A definitively failed send settles its delegation cell in this
             // same compare-and-set — as an explicit conflict when the peer
             // reported one, else as a failure.
@@ -5782,6 +5797,7 @@ fn apply_effect_outcome(
             if failed_kind != AgentRunEffectKind::MemoryPromotionCall
                 && failed_kind != AgentRunEffectKind::GoalEvaluationCall
                 && failed_kind != AgentRunEffectKind::ClaimAppendCall
+                && failed_kind != AgentRunEffectKind::WorkflowCancelCall
                 && !group_member_send
             {
                 let run = state.run_mut()?;
