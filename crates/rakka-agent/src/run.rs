@@ -734,12 +734,14 @@ impl AgentRun {
         self.terminal_reason.is_some() || self.status == AgentRunStatus::Cancelling
     }
 
-    /// Whether a command that found the run on a wait of its phase has
-    /// resumed it. It is asked of the run as the command's settle pass left
-    /// it, and it is what a `run-resume` segment closes on.
+    /// Whether a command that found the run on a wait it can be resumed
+    /// from has resumed it: a wait of its phase, or a park that alone held
+    /// it ([`Self::held_by_its_park_alone`]). It is asked of the run as the
+    /// command's settle pass left it. A `run-resume` segment closes on it,
+    /// and from a park on what the command resolved as well.
     ///
     /// A run that has ended has left its wait. A live run has resumed when
-    /// nothing holds it, and any of four things does:
+    /// nothing holds it, and any of five things does:
     ///
     /// - its phase is a wait on an effect or on its children;
     /// - its status is a wait: a dispatch wait, an approval or an
@@ -747,7 +749,10 @@ impl AgentRun {
     /// - it is parked on a top-up request;
     /// - the command found it winding down: a terminal reason was recorded
     ///   for it, or it was `Cancelling`. A run that is winding down commits
-    ///   no new work, so nothing short of its end resumes it.
+    ///   no new work, so nothing short of its end resumes it;
+    /// - the command began its wind-down: a cancellation, a failed effect
+    ///   or a compensation. That run went nowhere, and waits for what it
+    ///   holds.
     ///
     /// The phase alone used to be asked (issue #191). A fan-in wait resolved
     /// on a parked run moves the phase off its wait and leaves the run
@@ -757,14 +762,26 @@ impl AgentRun {
     /// else. The phase called each of those a resume.
     ///
     /// Two things are no hold. A proposal that awaits its task's decision
-    /// never was one. And a wind-down the command itself brought on is none:
-    /// a run whose end is decided while it still holds a call went on to
-    /// that end, and waits only to reach it.
+    /// never was one. And an end decided for the run within the command's
+    /// pass is none ([`AgentRunTerminalReason::is_decided_end`]): a run
+    /// whose result is accepted while it still holds a call went on to that
+    /// end, and waits only to reach it.
+    ///
+    /// From a wait of the phase the fifth hold changes nothing a test can
+    /// build: a wind-down's own reasons leave the phase on its wait. It is
+    /// the answer to a park at a phase that is no wait that reaches it, when
+    /// the answer schedules a compensation (issue #193).
     pub(crate) fn has_resumed(&self, was_winding_down: bool) -> bool {
         if self.status.is_terminal() {
             return true;
         }
+        let began_a_wind_down = self.winding_down()
+            && !self
+                .terminal_reason
+                .as_ref()
+                .is_some_and(AgentRunTerminalReason::is_decided_end);
         !(was_winding_down
+            || began_a_wind_down
             || self.loop_state.phase().is_waiting()
             || self.status.is_waiting()
             || self.loop_state.pending_top_up().is_some())
@@ -8736,7 +8753,7 @@ where
         // A reconciliation park that alone holds the run is such a wait at a
         // phase that is none ([`AgentRun::held_by_its_park_alone`]). The
         // timer starts on it too, and closes only for the command that
-        // resolved a checkpoint, which is asked below.
+        // answered a park, which is asked below.
         let from_a_park = self
             .state()
             .ok()
@@ -8757,6 +8774,12 @@ where
         // checkpoint record, closed only once the transition committed.
         let resolving = self.resolving_checkpoint(&command);
         let resolve_timer = resolving.as_ref().map(|_| AgentSegmentTimer::start(now));
+        // Whether the checkpoint the command names is a park's. A gate
+        // granted or denied on a parked run resolves a checkpoint too, and
+        // answers no park.
+        let names_a_park = resolving.as_ref().is_some_and(|resolving| {
+            resolving.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
+        });
         // Read now, for a segment that may close after the cached record is
         // gone.
         let context_before = self.loop_telemetry();
@@ -8839,15 +8862,15 @@ where
         // Where the record survived the call, where the run stands after the
         // settle pass answers ([`AgentRun::has_resumed`]: its phase, its
         // status and its top-up request, and whether the command found it
-        // winding down, so a run the command left held has not resumed),
-        // and nothing about the commit enters it. Where the settle pass
-        // lost a write and dropped the record, the segment closes only if
-        // the run was terminal once the transition committed: a terminal
-        // run cannot wait again, so the commit decides what the clean call
-        // would have answered. A run that was not terminal at the commit
-        // closes nothing on that call, because what its settle pass would
-        // have left is unknown here. The context is the one read before the
-        // command.
+        // winding down, so a run the command left held has not resumed).
+        // From a wait of the phase nothing about the commit enters it.
+        // Where the settle pass lost a write and dropped the record, the
+        // segment closes only if the run was terminal once the transition
+        // committed: a terminal run cannot wait again, so the commit decides
+        // what the clean call would have answered. A run that was not
+        // terminal at the commit closes nothing on that call, because what
+        // its settle pass would have left is unknown here. The context is
+        // the one read before the command.
         if let Some(timer) = resume_timer {
             let after = self
                 .state()
@@ -8858,11 +8881,15 @@ where
                 Some(resumed) => (resumed, self.loop_telemetry()),
                 None => (committed.terminal, context_before),
             };
-            // From a park, the resume is the answer's: the command resolved
-            // a checkpoint. A settle pass also takes away a park an earlier
-            // build left with nothing to reconcile, on whatever command runs
-            // it, and that command resumed nothing.
-            let resumed = resumed && (!from_a_park || committed.resolved);
+            // From a park, the resume is the answer's: the command named a
+            // park's checkpoint and resolved it. A park an earlier build
+            // left with nothing to reconcile is taken away on whatever
+            // command touches the record first, a gate's grant among them,
+            // and that command resumed nothing. Nor did the answer to a run
+            // the record read again shows winding down: it found the run
+            // held by more than its park, and can only have ended it.
+            let answered_a_park = committed.resolved && names_a_park && !found_winding_down;
+            let resumed = resumed && (!from_a_park || answered_a_park);
             if resumed {
                 self.close_segment_under(
                     timer.close(AgentSegmentOperation::RunResume).ok(),
@@ -14559,8 +14586,8 @@ mod tests {
     /// What a `run-resume` segment closes on (issue #191). A command that
     /// found the run on a wait of its phase has resumed it when the run has
     /// ended, or when nothing holds it: not its phase, not its status, not a
-    /// top-up request, and not a wind-down the command found it in. The
-    /// phase alone was asked.
+    /// top-up request, not a wind-down the command found it in, and not one
+    /// the command began (issue #193). The phase alone was asked.
     #[test]
     fn a_run_has_resumed_when_it_has_ended_or_nothing_holds_it() {
         let fixture = |phase: AgentLoopPhase, status: AgentRunStatus| {
@@ -14643,7 +14670,23 @@ mod tests {
                 Some(AgentRunTerminalReason::ResultAccepted);
             assert!(
                 fx.run().has_resumed(false),
-                "{phase:?}: a wind-down the command itself brought on is no hold"
+                "{phase:?}: an end decided for the run within the command's pass is no hold"
+            );
+
+            assert!(
+                !fixture(phase, AgentRunStatus::Cancelling)
+                    .run()
+                    .has_resumed(false),
+                "{phase:?}: `Cancelling` under no reason is a wind-down the command began"
+            );
+            let mut fx = fixture(phase, AgentRunStatus::Cancelling);
+            fx.state.run_mut().expect("the run exists").terminal_reason =
+                Some(AgentRunTerminalReason::CancellationRequested {
+                    reason: "operator stopped the work".to_string(),
+                });
+            assert!(
+                !fx.run().has_resumed(false),
+                "{phase:?}: a cancellation the command began set nothing going"
             );
         }
 
@@ -14709,12 +14752,20 @@ mod tests {
                 "{phase:?}, not parked: the loop steps"
             );
             for status in [
+                AgentRunStatus::Accepted,
                 AgentRunStatus::Running,
+                AgentRunStatus::WaitingForTimer,
+                AgentRunStatus::WaitingForEffect,
                 AgentRunStatus::WaitingForApproval,
                 AgentRunStatus::WaitingForAuthorization,
-                AgentRunStatus::WaitingForEffect,
-                AgentRunStatus::WaitingForTimer,
+                AgentRunStatus::Suspended,
                 AgentRunStatus::Cancelling,
+                AgentRunStatus::Compensating,
+                AgentRunStatus::HandedOff,
+                AgentRunStatus::Superseded,
+                AgentRunStatus::Completed,
+                AgentRunStatus::Failed,
+                AgentRunStatus::Cancelled,
             ] {
                 assert!(
                     !fixture(phase, status).run().held_by_its_park_alone(),
