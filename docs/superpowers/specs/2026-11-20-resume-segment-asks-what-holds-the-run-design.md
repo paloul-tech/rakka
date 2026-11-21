@@ -1,8 +1,8 @@
 # The `run-resume` segment closes on what holds the run (issue #191)
 
 2026-11-20. Short design, with my calls listed. The owner reviews at the pull
-request. Section 9 says what the review of the first build changed: the
-approach itself.
+request. Section 9 says what the two passes of review changed: the first,
+the approach itself.
 
 ## 1. What was wrong
 
@@ -57,16 +57,15 @@ holds it, and any of four things does:
 - its status is a wait: a dispatch wait, an approval or an authorization, a
   reconciliation park;
 - it is parked on a top-up request;
-- the command found it winding down. A run that is winding down commits no
-  new work, so nothing short of its end resumes it.
+- the command found it winding down: it was `Cancelling`, or a terminal
+  reason was already recorded for it, as for a run parked on an unknown
+  outcome after it was cancelled (`AgentRun::winding_down`). A run that is
+  winding down commits no new work, so nothing short of its end resumes it.
 
 Two things are no hold. A proposal that awaits its task's decision never was
 one. And a wind-down the command itself brought on is none: a run whose end
 is decided within the command's pass, while it still holds a call it sent,
 went on to that end and waits only to reach it.
-
-"Winding down" is `AgentRun::winding_down`: the run is `Cancelling`, or its
-end is decided and not yet reached.
 
 **Measured over the crate's tests**, the tests of this change included. I
 logged, for every command that finds the run on a wait of its phase, what
@@ -74,22 +73,26 @@ the phase alone answers and what this rule answers.
 
 | | Commands |
 |---|---|
-| Find the run on a wait of its phase | 6,457 |
-| Closed `run-resume` under the phase alone | 1,622 |
-| Close it under this rule | 1,591 |
+| Find the run on a wait of its phase | 6,470 |
+| Closed `run-resume` under the phase alone | 1,625 |
+| Close it under this rule | 1,592 |
 | Close it under this rule and not under the phase | 0 |
 
-The 31 that no longer close one:
+The 33 that no longer close one:
 
 | The command left the run | Commands |
 |---|---|
 | Parked on a top-up request, `Running` at `PreparingContext` | 12 |
 | Parked on an unknown outcome at `RecordingTurn`, from `AwaitingTools` | 9 |
 | Parked on an unknown outcome at `RecordingTurn`, from `AwaitingChildren` | 5 |
-| Winding down as it was found, `Cancelling` at `EvaluatingModelOutput` | 3 |
+| Winding down as it was found, `Cancelling` at `EvaluatingModelOutput` | 5 |
 | Parked on an unknown outcome at `EvaluatingModelOutput` | 2 |
 
-Of the 1,591 that still close one, 1,203 leave the run ended, 127 leave it
+Of the five found winding down, three were `Cancelling`, one was parked
+under the reason of its cancellation, and one was cancelled behind the
+facade's cache and found so on the re-read (section 4).
+
+Of the 1,592 that still close one, 1,204 leave the run ended, 127 leave it
 on its proposal, 241 leave it `Running` at a phase from which it can take a
 step, 19 leave it at its decided end with a call still out, and one lost
 its record after the run had ended. No command in the crate's tests leaves a
@@ -103,6 +106,15 @@ reads whether the run is winding down where it starts the resume timer and
 asks `has_resumed` where it closes the segment. Where the settle pass lost a
 write and the record is gone, the segment still closes only if the run was
 terminal at the commit, as before.
+
+**The wind-down is read again where the command is answered again.** A
+resident facade answers from a cached record, and a refusal from that cache
+is answered a second time against the record re-read: the courier writes the
+same record through its own handle, so the cache can be behind a
+cancellation. The wind-down the command found is then the one the re-read
+record shows. The timer is not decided again: it stays as the first read
+decided it, as on `main`, so that no command closes a segment it did not
+close before.
 
 Nothing durable is added: no field, status, error code, decision kind or
 segment class.
@@ -147,10 +159,10 @@ Nothing is stored. An earlier build closes the segments it closed.
 
 ## 7. Tests
 
-Nine whole-run tests and one unit test. Each whole-run test reads the
+Twelve whole-run tests and one unit test. Each whole-run test reads the
 segments the run closed from an in-memory sink.
 
-**The four that fail on `main` at `49feccf`**, each at the assertion it is
+**The six that fail on `main` at `49feccf`**, each at the assertion it is
 named for:
 
 - `workflow_tool.rs`, **a wait resolved on a parked run closes no resume
@@ -167,8 +179,13 @@ named for:
   held.
 - **A model result on a cancelled run closes no resume segment.** The
   evaluation's outcome then ends the run and closes none, as before.
+- **An answer that lands the model's result on a cancelled parked run
+  closes no resume segment.** The run is found winding down by its reason
+  alone: it is `WaitingForReconciliation`, not `Cancelling`.
+- **A result answered again against a run cancelled behind the cache closes
+  no resume segment.** The re-read of section 4.
 
-**The five that hold what the change leaves as it was**, and pass on
+**The six that hold what the change leaves as it was**, and pass on
 `main`:
 
 - `workflow_tool.rs`, **a command that rests the run on its children closes
@@ -184,6 +201,9 @@ named for:
   run found winding down is held until it ends, and here it ends.
 - **A run accepted while it holds a call closes its resume segment.** Call
   3.
+- `workflow_tool.rs`, **the child's report that ends a cancelled run resting
+  on its children closes its resume segment.** Holds the timer on a wait
+  for children, which nothing held.
 
 One unit test in `run.rs` holds `AgentRun::has_resumed` over every phase
 that is a wait, every phase that is not under each status that is a wait, a
@@ -192,29 +212,39 @@ status.
 
 ## 8. Breaks
 
-Thirteen breaks were run one at a time, each against the unit tests and
-five test files, with a survivor to be run again against the whole crate.
-All thirteen are caught, and none needed the whole crate.
+Seventeen breaks were run one at a time, each against the unit tests and
+five test files, and a survivor again against the whole crate. Sixteen are
+caught, none of them only by the whole crate.
 
-- **What holds a run.** The phase not asked after the command: three
-  whole-run tests. The status not asked: the two tests of a parked run. A
-  top-up request not asked: its test. A wind-down the command found not
-  asked: the cancelled run's test. Each is caught by the unit test as well.
-  The status asked only for a reconciliation park: the unit test alone
-  (call 5).
+- **What holds a run.** The phase not asked after the command, the status
+  not asked, a top-up request not asked, a wind-down the command found not
+  asked: each by at least one whole-run test and by the unit test. The
+  status asked only for a reconciliation park: the unit test alone (call
+  5).
 - **What does not.** Every wind-down asked, found or brought on: the
   accepted run's test and the unit test. A proposal counted as a hold: the
   test of a park answered on a run that stands on its proposal, whose
   model's result is taken with the task out of reach.
-- **An ended run not let through**: the test of the command that ends a
-  cancelled run, and the unit test.
+- **An ended run not let through**: two tests of a cancelled run that ends,
+  and the unit test.
 - **The timer.** Started on the status too: two tests. On a top-up request
-  too: one. On a wind-down too: three, one of them an existing test. The
-  wind-down never read before the command: the cancelled run's test.
-- **The close asking the phase alone, which is the defect**: the four tests
+  too: one. On a wind-down too: three, one of them an existing test. Not
+  started on a wait for children: the test of the child's report.
+- **The wind-down the command finds.** Not read before the command: two
+  tests. Read from the status alone: the test of the cancelled parked run.
+  Not read again after a refusal is answered again: the test of the run
+  cancelled behind the cache.
+- **The close asking the phase alone, which is the defect**: the six tests
   that fail on `main`.
 
-The whole crate passes: 1,887 tests.
+**Not caught: the wind-down not read again after an `Unchanged` is answered
+again.** That reply is a timer's that found nothing due: the checkpoint
+timers, or a fan-in deadline. The deadline's own guard moves the phase of
+no run that is winding down, and by the review's reading of the arms only a
+model's result does. So the read changes no verdict a test can build. It is
+kept so that both answers given again read the record alike.
+
+The whole crate passes: 1,890 tests.
 
 ## 9. What the review found
 
@@ -240,15 +270,33 @@ probes of its own and a mutation run.
 - **A sentence was wrong about exchanges.** A task's decision and a
   top-up's answer are not delivered to the run. They are replies to
   exchanges the run sent.
-- **Three parts of the predicate were held by the unit test alone**, and
-  half of one test held nothing: a grant taken by a sweep, which closes no
-  segment under any rule.
+- **Three parts of the predicate were held by the unit test alone, and one
+  by no test at all**: the top-up request on the side of the command that
+  finds the run. Half of one test held nothing: a grant taken by a sweep,
+  which closes no segment under any rule.
 - **A product doc still stated the phase rule**, and two test comments.
 
-This build is the answer to the first two: approach 1 adds no segment, so
-it has no command to get wrong. The table of section 3 is my own log of this
-build, taken the way the reviewer took theirs. The rest are corrected where
-they stood.
+The second commit is the answer to the first two: approach 1 adds no
+segment, so it has no command to get wrong. The table of section 3 is my own
+log of this build, taken the way the reviewer took theirs. The rest are
+corrected where they stood.
+
+**The second pass** read that commit. It took the table of section 3 again
+with its own log and found the same numbers, found no test world that closes
+more `run-resume` than under the phase alone, and found no wind-down kept
+or dropped wrongly. It left four things, which the third commit answers:
+
+- **A command answered again against a re-read record was judged by the
+  wind-down its stale cache showed.** A result taken by a run cancelled
+  behind the cache still closed a segment, as on `main`. The wind-down is
+  now read again (section 4), and a test holds it.
+- **Two things were held by no test**: the reason half of the wind-down the
+  command finds, and the timer on a wait for children. Each has a test.
+- **"Winding down" was glossed too narrowly**, as `Cancelling` or an end
+  decided. A run parked after its cancellation is neither, and is found
+  winding down all the same.
+- **That a live run which can still take a step has resumed** is held by
+  the unit test alone. It still is.
 
 ## 10. Not done
 
@@ -262,3 +310,6 @@ they stood.
 - **A non-terminal run whose settle pass ends a wait and then loses a later
   write** closes no `run-resume` on either call, as the validation matrix
   already records under "Owed".
+- **The timer is decided on the facade's first read.** A command refused on
+  a stale cache and answered again against the re-read record keeps the
+  timer the cache gave it, or the lack of one, as on `main`.

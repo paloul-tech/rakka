@@ -745,8 +745,9 @@ impl AgentRun {
     /// - its status is a wait: a dispatch wait, an approval or an
     ///   authorization, a reconciliation park;
     /// - it is parked on a top-up request;
-    /// - the command found it winding down. A run that is winding down
-    ///   commits no new work, so nothing short of its end resumes it.
+    /// - the command found it winding down: a terminal reason was recorded
+    ///   for it, or it was `Cancelling`. A run that is winding down commits
+    ///   no new work, so nothing short of its end resumes it.
     ///
     /// The phase alone used to be asked (issue #191). A fan-in wait resolved
     /// on a parked run moves the phase off its wait and leaves the run
@@ -8706,14 +8707,18 @@ where
         // command arriving at a run whose phase does not advance on its own
         // ([specification 17.11]: the resume segment links the parked
         // operation to the request that triggered it, and no span object was
-        // held across the wait in between). Whether the run was already
-        // winding down is read with it: [`AgentRun::has_resumed`] asks.
+        // held across the wait in between).
         let resume_timer = self
             .state()
             .ok()
             .and_then(AgentRunState::run)
             .filter(|run| run.loop_state.phase().is_waiting())
-            .map(|run| (AgentSegmentTimer::start(now), run.winding_down()));
+            .map(|_| AgentSegmentTimer::start(now));
+        // Whether the command finds the run winding down, which
+        // [`AgentRun::has_resumed`] asks. It is read again below, where the
+        // command is answered again against a re-read record: the cache may
+        // be behind a cancellation the other writer committed.
+        let mut found_winding_down = self.shows_winding_down();
         // A resolution's segment: read before the transition drops the
         // checkpoint record, closed only once the transition committed.
         let resolving = self.resolving_checkpoint(&command);
@@ -8748,7 +8753,10 @@ where
             // pass failed, and the segments below are decided on what
             // committed, not on how the call ended.
             Err(error) if run_refusal_may_be_stale(&error) => match self.rematerialize(now).await {
-                Ok(()) => self.apply_command(reverify, router, now).await,
+                Ok(()) => {
+                    found_winding_down |= self.shows_winding_down();
+                    self.apply_command(reverify, router, now).await
+                }
                 Err(reread) => Err(reread),
             },
             // A timer that found nothing due writes nothing either, so it is
@@ -8756,7 +8764,10 @@ where
             // may be missing the very checkpoint or fan-in group now due, and
             // an `Unchanged` from it would hold for the whole residency.
             Ok(AgentRunEntityReply::Unchanged { .. }) => match self.rematerialize(now).await {
-                Ok(()) => self.apply_command(reverify, router, now).await,
+                Ok(()) => {
+                    found_winding_down |= self.shows_winding_down();
+                    self.apply_command(reverify, router, now).await
+                }
                 Err(reread) => Err(reread),
             },
             other => other,
@@ -8803,12 +8814,12 @@ where
         // closes nothing on that call, because what its settle pass would
         // have left is unknown here. The context is the one read before the
         // command.
-        if let Some((timer, was_winding_down)) = resume_timer {
+        if let Some(timer) = resume_timer {
             let after = self
                 .state()
                 .ok()
                 .and_then(AgentRunState::run)
-                .map(|run| run.has_resumed(was_winding_down));
+                .map(|run| run.has_resumed(found_winding_down));
             let (resumed, context) = match after {
                 Some(resumed) => (resumed, self.loop_telemetry()),
                 None => (committed.terminal, context_before),
@@ -9191,6 +9202,15 @@ where
         self.record_fan_in_resolution(resolution_before);
         progress?;
         Ok(reply)
+    }
+
+    /// Whether the cached record shows the run winding down. A facade with
+    /// no record cached shows none.
+    fn shows_winding_down(&self) -> bool {
+        self.state()
+            .ok()
+            .and_then(AgentRunState::run)
+            .is_some_and(AgentRun::winding_down)
     }
 
     /// The identity of the fan-in resolution the run currently holds: the

@@ -4423,3 +4423,65 @@ async fn a_command_that_rests_the_run_on_its_children_closes_no_resume_segment()
         sink.operations()
     );
 }
+
+/// What the change leaves as it was: a wait on its children is a wait of
+/// the run's phase, and the segment's timer starts on it. The run rests on
+/// its child and is cancelled there, which ends nothing. The child's report
+/// then ends the run, and closes its `run-resume` segment.
+#[tokio::test]
+async fn the_childs_report_that_ends_a_cancelled_run_resting_on_its_children_closes_its_resume_segment(
+) {
+    let sink = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fixture = workflow_fixture(
+        RecordingWorkflowExecutor::new(StartMode::Started),
+        workflow_await_turn(),
+    )
+    .with_segments(sink.clone());
+    create_workflow_task(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::Cancel {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Cancellation,
+                [TENANT, "parent-cancel", "1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator-cancelled".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(
+        (
+            rest_of(&fixture).await,
+            sink.operations().contains(&"run-resume")
+        ),
+        (
+            (
+                AgentLoopPhase::AwaitingChildren,
+                Some(AgentRunStatus::Cancelling),
+                1
+            ),
+            false
+        ),
+        "cancelled while it rests on its child, which it still waits for: {:?}",
+        sink.operations()
+    );
+
+    let before = sink.operations().len();
+    the_child_reports(&fixture).await;
+
+    let closed = closed_since(&sink, before);
+    assert_eq!(
+        (
+            fixture.run_snapshot().await.expect("the run exists").status,
+            closed
+                .iter()
+                .filter(|operation| **operation == "run-resume")
+                .count()
+        ),
+        (AgentRunStatus::Cancelled, 1),
+        "the child's report ends the run, from a wait of its phase: {closed:?}"
+    );
+}
