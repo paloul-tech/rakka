@@ -250,8 +250,9 @@ park's checkpoint and resolves it) and leaves that run ended or held by
 nothing closes the segment, with the two links of the table below. A run
 parked while it stands on its proposal, one that also asks for a top-up, and
 one that is winding down are held by more than the park. A wind-down the
-command itself began holds the run as well, so an answer that schedules a
-compensation closes none. An exchange delivered to the run closes none.
+command's own transition began holds the run as well, so an answer that
+schedules a compensation closes none. An exchange delivered to the run
+closes none.
 
 Two rows of 17.6 are absent because the operations do not exist: `embeddings
 {model}` and `plan {agent.name}`. 17.6 asks for the planning span "only when

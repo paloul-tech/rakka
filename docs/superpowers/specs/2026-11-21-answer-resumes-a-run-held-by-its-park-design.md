@@ -2,8 +2,8 @@
 
 2026-11-21. Short design, with my calls listed. The owner reviews at the pull
 request. This is the second half of issue #191, and it is stacked on the fix
-for the first half (PR #192). Section 11 says what the review of the first
-build changed.
+for the first half (PR #192). Section 11 says what two passes of review
+changed.
 
 ## 1. What was wrong
 
@@ -70,11 +70,15 @@ closes only for the command that answered a park**: the command named a
 reconciliation checkpoint and resolved it, and the record did not show the
 run winding down.
 
-**`has_resumed` gains a fifth hold: a wind-down the command began.** A
-cancellation, a failed effect or a compensation winds the run down without
-its having gone anywhere. An end decided for the run within the pass is
-still no hold: a run whose result is accepted while it holds a call went on
-to that end.
+**A run that was winding down before the loop could step has not resumed,
+short of its end.** #191 asked whether the command found the run winding
+down. This change also asks whether the command's own transition began the
+wind-down, which is recorded at the commit
+(`CommittedTransition::winding_down`): a cancellation does, and so does an
+answer that schedules a compensation. A wind-down the run goes on to within
+the pass is neither, whatever its reason. Its result accepted while it
+holds a call is one. Its proposal refused because its task was cancelled is
+another.
 
 The standing rule is untouched: a command that leaves the run on its next
 wait closes none. An answer that takes a parked run from `RecordingTurn` to
@@ -86,26 +90,27 @@ rule and under this one.
 
 | | Commands |
 |---|---|
-| Start a timer | 6,539 |
-| From a wait of the phase | 6,509 |
-| From a park that alone holds the run | 30 |
+| Start a timer | 6,545 |
+| From a wait of the phase | 6,514 |
+| From a park that alone holds the run | 31 |
 | From a wait of the phase, with a different verdict than under the base | 0 |
 
-Of the 30 from a park:
+Of the 31 from a park:
 
 | The command | Commands | Closes `run-resume` |
 |---|---|---|
 | An answer that leaves the run on its next model call or its tools | 16 | No |
 | An answer that takes the run on to its proposal | 3 | Yes |
 | An answer that takes the run on to its end | 1 | Yes |
-| An answer that takes the run to an end decided for it, with a call still out | 1 | Yes |
+| An answer after which the run is accepted with a call still out | 1 | Yes |
+| An answer after which the run's proposal is refused for its task's cancellation | 1 | Yes |
 | An answer that schedules a compensation | 1 | No |
 | An answer given again against a run cancelled behind the cache | 1 | No |
 | A command that resolved nothing, on a stale park | 3 | No |
 | A gate's grant, on a stale park | 1 | No |
 | A cancellation | 3 | No |
 
-The five commands that close one are in tests of this change, one of which
+The six commands that close one are in tests of this change, one of which
 #191 wrote and this change amends. No earlier test world reaches the case.
 
 ## 5. The change
@@ -114,10 +119,12 @@ The five commands that close one are in tests of this change, one of which
 - `AgentRun::loop_would_step`, which is the half of `can_advance` that is
   not the status, taken out so that both can ask it. `can_advance` answers
   as it did.
-- `AgentRun::has_resumed`: the fifth hold.
+- `CommittedTransition::winding_down`, read where the command's transition
+  commits, beside the two facts already read there.
 - `AgentRunEntityStore::apply_unboxed`: where the timer starts, whether the
-  checkpoint the command names is a park's, and what the segment asks from
-  a park where it closes.
+  checkpoint the command names is a park's, and what the segment asks where
+  it closes. `AgentRun::has_resumed` is as #191 left it but for its
+  comment.
 
 The resume an answer closes carries the resolution's two links, to the span
 that parked the run and to the request. That code was already there for an
@@ -142,11 +149,13 @@ segment class.
    winding down as the cache shows it. Where the command is refused on the
    cache and answered again, the record read again may show a wind-down the
    cache did not, and an answer on that run closes none either.
-5. **A wind-down the command began is a hold for every command**, not only
-   from a park. It is in `has_resumed`, which now says what its comment
-   said. From a wait of the phase it changes no verdict in the crate's
-   tests: a wind-down's own reasons leave the phase on its wait.
-6. **The standing rule is kept.** Sixteen of the twenty-three answers leave
+5. **The wind-down a command's own transition began is asked at the commit,
+   for every command**, not only from a park. Asking the run afterwards
+   cannot tell that wind-down from one the run went on to, since both can
+   carry a cancellation's reason (section 11). From a wait of the phase it
+   changes no verdict in the crate's tests: every such transition there
+   leaves the phase on its wait or ends the run.
+6. **The standing rule is kept.** Sixteen of the twenty-four answers leave
    the run on its next wait and close none, as a tool result that leads to
    the next model call closes none.
 7. **`can_advance` is split in two.** A pure extraction, so that the new
@@ -158,12 +167,12 @@ Nothing is stored. An earlier build closes the segments it closed.
 
 ## 8. Tests
 
-Eleven whole-run tests in `run_end_waits.rs` and one unit test of each
-predicate. Two of the eleven were written for #191, and one of those is
+Twelve whole-run tests in `run_end_waits.rs` and one unit test of each
+predicate. Two of the twelve were written for #191, and one of those is
 amended here. Each whole-run test reads the segments the run closed from an
 in-memory sink.
 
-**The four that fail on the base** (PR #192 at `595a5048`):
+**The five that fail on the base** (PR #192 at `595a5048`):
 
 - **A model result on a parked run closes no resume segment**, which #191
   wrote. Its second half held the cost of #191's first call: the answer
@@ -179,9 +188,15 @@ in-memory sink.
   within the answer's pass. Answered "abandon", it then ends. Answered
   "never executed", the evaluation is sent again and the accepted run waits
   for it: an end decided and not yet reached, which is no hold.
+- **A run refused for its task's cancellation after it went on closes its
+  resume segment.** The task is cancelled and the run has not been told.
+  The run goes on to its proposal, which its task refuses for the
+  cancellation, and it is left `Cancelling` with a call still out. Set
+  going by its model's result, from a wait of the phase, it closes the
+  segment it always closed, which holds on the base. Set going by the
+  answer to its park, it closes one, which does not.
 
-**The seven that hold what closes none**, and pass on the base. The last
-three fail on this change's first build:
+**The seven that hold what closes none**, and pass on the base:
 
 - **A park answered on a run that stands on its proposal**, which #191
   wrote.
@@ -203,6 +218,9 @@ three fail on this change's first build:
 - **An answer given again against a run cancelled behind the cache.** A
   resident facade and a facade that reads the record, each closing none.
 
+The first three of those fail on this change's first build, and the test
+of the run refused for its task's cancellation fails on its second.
+
 The stale park is built from this build's parked record by settling the
 evaluation and dropping its checkpoint. The reviewer read the source of the
 build that leaves such a record and found it the same; neither of us ran
@@ -215,16 +233,17 @@ One unit test holds `held_by_its_park_alone` over every phase the loop
 steps from, a wait of the phase, each of the fourteen other statuses, a
 top-up request, a wind-down and a pending proposal, and that `can_advance`
 is false of the parked record and true of the same record under `Running`
-at those four phases. The unit test of `has_resumed` holds the fifth hold
-and the end decided within the pass.
+at those four phases. The unit test of `has_resumed` holds that a run
+winding down under either kind of reason has resumed where the wind-down
+came within the pass, and has not where it was there before.
 
 ## 9. Breaks
 
-Seventeen breaks were run one at a time, each against the unit tests and
+Eighteen breaks were run one at a time, each against the unit tests and
 five test files, and a survivor again against the whole crate. Fifteen are
 caught, none of them only by the whole crate.
 
-- **The timer not started from a park, which is the defect**: the four
+- **The timer not started from a park, which is the defect**: the five
   tests that fail on the base.
 - **What "answered a park" asks.** A command that applied counted as one
   that resolved: the stale park's test and the gate's. The checkpoint
@@ -232,10 +251,12 @@ caught, none of them only by the whole crate.
   read again shows not asked: the test of the run cancelled behind the
   cache. Only the checkpoint command counted: the effect command's test.
 - **Every resume needing an answered park, from a wait of the phase too**:
-  eight tests.
-- **What holds a run.** A wind-down the command began not a hold: the
-  compensation's test and the unit test. An end decided within the pass a
-  hold too: the accepted run's test and the unit test.
+  nine tests.
+- **The wind-down before the loop steps.** The one the command's own
+  transition began not asked: the compensation's test. The wind-down asked
+  of the run after the pass, and not at the commit: three tests, of the
+  accepted run, of the run refused for its task's cancellation, and of the
+  answer that takes a run to its end.
 - **What "alone" leaves out.** A run that asks for a top-up counted, one
   that stands on its proposal counted, the loop not asked at all: each by a
   whole-run test and the unit test.
@@ -247,7 +268,7 @@ caught, none of them only by the whole crate.
   approval or an authorization wait counted as a park, and any status
   counted as one (call 1).
 
-**Not caught, two.**
+**Not caught, three.**
 
 - **The command need not have resolved the checkpoint it names.** With the
   kind asked, this differs only for a command that names a park's
@@ -256,8 +277,16 @@ caught, none of them only by the whole crate.
   the condition: the segment's links come from the resolution.
 - **A lost record closing from a park on the run's end alone.** No test
   drops the record from a park (section 10).
+- **The wind-down the transition began asked only from a park.** From a
+  wait of the phase, every transition in the crate's tests that begins a
+  wind-down leaves the phase on its wait or ends the run, so no test tells
+  "every command" from "from a park only" (call 5).
 
-The whole crate passes: 1,900 tests.
+No test answers again, against a re-read record, an answer that should
+close a segment. The one answer the crate answers again from a park is the
+cancelled run's.
+
+The whole crate passes: 1,901 tests.
 
 ## 10. Not done
 
@@ -273,10 +302,13 @@ The whole crate passes: 1,900 tests.
   none on that call and none on its replay, unless the run had ended at the
   commit. The validation matrix already records this as owed for a wait of
   the phase.
-- **A park with no checkpoint**, as a build before issue #106 could leave
-  one, answered through the effect command: the run goes on and no segment
-  closes, because no checkpoint is resolved.
-- **The timer is decided on the facade's first read**, as #191 left it.
+- **The timer, and the checkpoint a command names, are read from the
+  facade's cache before the command**, as #191 left the first. A resident
+  facade whose cache has not seen a park refuses the answer that names it,
+  reads the record again, and applies it: the run goes on, and neither
+  `checkpoint-resolve` nor `run-resume` closes. A facade that reads the
+  record closes both. The missing `checkpoint-resolve` is the base's
+  behaviour, and reading the checkpoint again would change it too.
 
 ## 11. What the review found
 
@@ -308,3 +340,23 @@ passed the whole crate.
 
 It also found two things I leave as they are, in section 10: the errored
 pass and the lost record.
+
+**The second pass** read the answer to that. It confirmed the three fixes,
+the tables and the breaks, and found the first of them wrong in one case.
+
+- **A run refused for its task's cancellation, after it went on, lost a
+  true resume.** I had made a hold of any wind-down that is not an end
+  decided for the run, read from the reason after the pass. A run that
+  proposes and is refused because its task was cancelled is recorded as
+  cancelled, exactly as one stopped where it stood. From a wait of the
+  phase that took away a segment the base closes. I had written that this
+  hold changes nothing from a wait of the phase, and the reviewer built the
+  run that shows otherwise. Call 5 is the answer: the fact is read at the
+  commit, where the two cannot be confused, and the reason is not asked.
+- **Which reasons count as decided ends was held for one of six**, and a
+  failed effect as a hold by nothing. Neither is asked any longer.
+- **An answer naming a park the cache has not seen** closes nothing
+  (section 10).
+- A park with no checkpoint, which I had listed under "Not done" as an
+  earlier build's record, is one no build leaves at a phase that is no
+  wait. It is gone from that list.

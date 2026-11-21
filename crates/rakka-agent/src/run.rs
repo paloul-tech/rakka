@@ -741,18 +741,18 @@ impl AgentRun {
     /// and from a park on what the command resolved as well.
     ///
     /// A run that has ended has left its wait. A live run has resumed when
-    /// nothing holds it, and any of five things does:
+    /// nothing holds it, and any of four things does:
     ///
     /// - its phase is a wait on an effect or on its children;
     /// - its status is a wait: a dispatch wait, an approval or an
     ///   authorization, a reconciliation park;
     /// - it is parked on a top-up request;
-    /// - the command found it winding down: a terminal reason was recorded
-    ///   for it, or it was `Cancelling`. A run that is winding down commits
-    ///   no new work, so nothing short of its end resumes it;
-    /// - the command began its wind-down: a cancellation, a failed effect
-    ///   or a compensation. That run went nowhere, and waits for what it
-    ///   holds.
+    /// - it was winding down before the loop could take a step in this
+    ///   pass (`was_winding_down`): the command found it so, or the
+    ///   command's own transition began the wind-down, as a cancellation
+    ///   does and an answer that schedules a compensation. A run that is
+    ///   winding down commits no new work, so nothing short of its end
+    ///   resumes it.
     ///
     /// The phase alone used to be asked (issue #191). A fan-in wait resolved
     /// on a parked run moves the phase off its wait and leaves the run
@@ -762,26 +762,16 @@ impl AgentRun {
     /// else. The phase called each of those a resume.
     ///
     /// Two things are no hold. A proposal that awaits its task's decision
-    /// never was one. And an end decided for the run within the command's
-    /// pass is none ([`AgentRunTerminalReason::is_decided_end`]): a run
-    /// whose result is accepted while it still holds a call went on to that
-    /// end, and waits only to reach it.
-    ///
-    /// From a wait of the phase the fifth hold changes nothing a test can
-    /// build: a wind-down's own reasons leave the phase on its wait. It is
-    /// the answer to a park at a phase that is no wait that reaches it, when
-    /// the answer schedules a compensation (issue #193).
+    /// never was one. And a wind-down that came after the run went on
+    /// within the pass is none, whatever its reason: a run whose result is
+    /// accepted while it still holds a call, and one whose proposal its
+    /// task refuses because the task was cancelled, each went on to that
+    /// end and wait only to reach it.
     pub(crate) fn has_resumed(&self, was_winding_down: bool) -> bool {
         if self.status.is_terminal() {
             return true;
         }
-        let began_a_wind_down = self.winding_down()
-            && !self
-                .terminal_reason
-                .as_ref()
-                .is_some_and(AgentRunTerminalReason::is_decided_end);
         !(was_winding_down
-            || began_a_wind_down
             || self.loop_state.phase().is_waiting()
             || self.status.is_waiting()
             || self.loop_state.pending_top_up().is_some())
@@ -8861,9 +8851,12 @@ where
         //
         // Where the record survived the call, where the run stands after the
         // settle pass answers ([`AgentRun::has_resumed`]: its phase, its
-        // status and its top-up request, and whether the command found it
-        // winding down, so a run the command left held has not resumed).
-        // From a wait of the phase nothing about the commit enters it.
+        // status and its top-up request, so a run the command left held has
+        // not resumed), together with whether the run was winding down
+        // before the loop could step: as the command found it, or as its
+        // own transition left it at the commit. A wind-down the run went on
+        // to within the pass is neither. From a wait of the phase nothing
+        // else about the commit enters it.
         // Where the settle pass lost a write and dropped the record, the
         // segment closes only if the run was terminal once the transition
         // committed: a terminal run cannot wait again, so the commit decides
@@ -8876,7 +8869,7 @@ where
                 .state()
                 .ok()
                 .and_then(AgentRunState::run)
-                .map(|run| run.has_resumed(found_winding_down));
+                .map(|run| run.has_resumed(found_winding_down || committed.winding_down));
             let (resumed, context) = match after {
                 Some(resumed) => (resumed, self.loop_telemetry()),
                 None => (committed.terminal, context_before),
@@ -10003,6 +9996,7 @@ where
                         .any(|checkpoint| checkpoint.checkpoint_id == *checkpoint_id)
                 }),
                 terminal: state.status().is_some_and(AgentRunStatus::is_terminal),
+                winding_down: state.run().is_some_and(AgentRun::winding_down),
             })
         });
         self.committed = committed;
@@ -11684,7 +11678,7 @@ fn indeterminate_transition_links(
 /// The settle pass is the run's next piece of work, and a failure there is
 /// reported by the call's `Err`. It can also lose a compare-and-set, which
 /// drops the cached record — after which nothing about the transition can
-/// be read back. So the two facts a segment is decided on are read here,
+/// be read back. So the facts a segment is decided on are read here,
 /// while the record the transition wrote is still the cached one.
 #[derive(Debug, Clone, Copy, Default)]
 struct CommittedTransition {
@@ -11693,6 +11687,11 @@ struct CommittedTransition {
     resolved: bool,
     /// The run had reached a terminal status once the transition committed.
     terminal: bool,
+    /// The run was winding down once the transition committed: the command
+    /// found it so, or the transition itself began the wind-down. The settle
+    /// pass has not run, so a wind-down the run goes on to within the pass
+    /// is not in this.
+    winding_down: bool,
 }
 
 /// The checkpoint a resolution command names, read before the transition that
@@ -14586,8 +14585,8 @@ mod tests {
     /// What a `run-resume` segment closes on (issue #191). A command that
     /// found the run on a wait of its phase has resumed it when the run has
     /// ended, or when nothing holds it: not its phase, not its status, not a
-    /// top-up request, not a wind-down the command found it in, and not one
-    /// the command began (issue #193). The phase alone was asked.
+    /// top-up request, and not a wind-down it was in before the loop could
+    /// step. The phase alone was asked.
     #[test]
     fn a_run_has_resumed_when_it_has_ended_or_nothing_holds_it() {
         let fixture = |phase: AgentLoopPhase, status: AgentRunStatus| {
@@ -14665,29 +14664,27 @@ mod tests {
                     .has_resumed(true),
                 "{phase:?}: the command found the run winding down, and it has not ended"
             );
-            let mut fx = fixture(phase, AgentRunStatus::Cancelling);
-            fx.state.run_mut().expect("the run exists").terminal_reason =
-                Some(AgentRunTerminalReason::ResultAccepted);
-            assert!(
-                fx.run().has_resumed(false),
-                "{phase:?}: an end decided for the run within the command's pass is no hold"
-            );
-
-            assert!(
-                !fixture(phase, AgentRunStatus::Cancelling)
-                    .run()
-                    .has_resumed(false),
-                "{phase:?}: `Cancelling` under no reason is a wind-down the command began"
-            );
-            let mut fx = fixture(phase, AgentRunStatus::Cancelling);
-            fx.state.run_mut().expect("the run exists").terminal_reason =
-                Some(AgentRunTerminalReason::CancellationRequested {
-                    reason: "operator stopped the work".to_string(),
-                });
-            assert!(
-                !fx.run().has_resumed(false),
-                "{phase:?}: a cancellation the command began set nothing going"
-            );
+            for reason in [
+                AgentRunTerminalReason::ResultAccepted,
+                AgentRunTerminalReason::CancellationRequested {
+                    reason: "task-cancel-requested".to_string(),
+                },
+            ] {
+                let mut fx = fixture(phase, AgentRunStatus::Cancelling);
+                fx.state.run_mut().expect("the run exists").terminal_reason = Some(reason.clone());
+                assert!(
+                    fx.run().has_resumed(false),
+                    "{phase:?}, winding down under {}: a wind-down the run went on to within \
+                     the pass is no hold, whatever its reason",
+                    reason.code()
+                );
+                assert!(
+                    !fx.run().has_resumed(true),
+                    "{phase:?}, winding down under {}: the same record, where the run was \
+                     winding down before the loop could step",
+                    reason.code()
+                );
+            }
         }
 
         for status in [

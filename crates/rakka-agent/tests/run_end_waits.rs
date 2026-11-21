@@ -4037,7 +4037,7 @@ async fn a_compensation_answered_on_a_park_that_alone_holds_the_run_closes_no_re
 }
 
 /// A gate granted on a parked run answers no park. Here the park is a stale
-/// one, as [`a_stale_park`] builds it, beside a claim append that waits
+/// one, as [`make_the_park_stale`] builds it, beside a claim append that waits
 /// behind an approval. The grant is the first command to touch the record.
 /// It resolves a checkpoint, the stale park is taken away, and the run goes
 /// on to its proposal. The grant closes its own `checkpoint-resolve` and no
@@ -4564,6 +4564,103 @@ async fn the_answer_that_takes_a_parked_run_to_its_end_closes_a_resume_segment()
             (standing(&fx).await, resumes(&segments)),
             ((left, Some("result-accepted".to_string()), true), 1),
             "the answer set the run going, and it went on to its accepted end: {:?}",
+            segments.operations()
+        );
+    }
+}
+
+/// Requests the task's cancellation through a router that reaches no run:
+/// the task holds the request, and the run has not been told.
+async fn cancel_the_task_unheard(fx: &Fixture) {
+    let mut task = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    )
+    .with_wake_timers(fx.rewake_parker.clone());
+    task.recover(fx.now()).await.expect("the task recovers");
+    task.apply(
+        rakka_agent::AgentTaskEntityCommand::Cancel {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::Cancellation,
+                [TENANT, task_scope().task().as_str(), "root-cancel"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator".to_string(),
+        },
+        &rakka_agent::AgentExchangeRouter::new(),
+        fx.now(),
+    )
+    .await
+    .expect("the task's cancellation is requested");
+}
+
+/// A wind-down the run goes on to within the pass is no hold, whatever its
+/// reason. The task's cancellation is requested and the run has not been
+/// told. The run then goes on: it evaluates its model's result, proposes,
+/// and its task refuses the proposal because the task is cancelled, which
+/// the run takes as its own cancellation. It is left `Cancelling`, under the
+/// reason a cancellation it was told of would leave, waiting for the
+/// evaluation it holds.
+///
+/// It went on all the same, and the command that set it going closes the
+/// `run-resume` segment: the model's result from a wait of the phase, as it
+/// always did, and the answer from a park.
+#[tokio::test]
+async fn a_run_refused_for_its_tasks_cancellation_after_it_went_on_closes_its_resume_segment() {
+    for set_going_by in ["the model's result", "the answer to its park"] {
+        let segments = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+        let (fx, _sink) = proposing_goal_world().await;
+        let fx = fx.with_segments(segments.clone());
+        let evaluation = send_an_evaluation(&fx).await;
+        let model = model_call_of(&fx).await;
+        let turn = fx.dispatcher.answer(&model).await;
+
+        if set_going_by == "the model's result" {
+            cancel_the_task_unheard(&fx).await;
+            record(&fx, &model, turn).await;
+        } else {
+            apply(&fx, unknown(&evaluation))
+                .await
+                .expect("the unknown outcome records");
+            record(&fx, &model, turn).await;
+            cancel_the_task_unheard(&fx).await;
+            assert_eq!(
+                (status(&fx).await, resumes(&segments)),
+                (AgentRunStatus::WaitingForReconciliation, 0),
+                "parked, with its model's result taken"
+            );
+            let park = held(&fx, AgentCheckpointKind::IndeterminateEffectReconciliation).await;
+            decide(
+                &fx,
+                &park.checkpoint_id,
+                "answer",
+                AgentCheckpointDecision::Reconciliation(
+                    AgentReconciliationDecision::ConfirmedNotExecuted,
+                ),
+            )
+            .await
+            .expect("the answer applies");
+        }
+
+        assert_eq!(
+            (
+                standing(&fx).await,
+                loop_state(&fx).await.phase(),
+                resumes(&segments)
+            ),
+            (
+                (
+                    AgentRunStatus::Cancelling,
+                    Some("cancellation-requested".to_string()),
+                    false
+                ),
+                rakka_agent::AgentLoopPhase::DecidingContinuation,
+                1
+            ),
+            "{set_going_by}: the run went on to its proposal, and was refused for its task's \
+             cancellation: {:?}",
             segments.operations()
         );
     }
