@@ -202,7 +202,14 @@ leaves behind is the same either way.
    the run down, as that failure always does, `Compensate` winds it down
    behind the compensation, and `Escalate` keeps the park. A record an
    earlier binary left parked with nothing to reconcile is repaired by the
-   first settle pass that reaches it. A gate that closes without a grant
+   first settle pass that reaches it. While an outcome is unanswered the
+   loop takes no step. A rejection of the run's proposal, or the deadline of
+   a fan-in wait, that reaches a parked run that is not winding down is
+   taken, and the run goes on from it when the park is answered: it prepares
+   the turn the rejection began, or records the turn the wait closed. A child
+   the deadline timed out is sent its cancellation without waiting for that
+   answer. On a parked run that is winding down, the rejection begins no
+   turn and the deadline resumes nothing. A gate that closes without a grant
    (denied or expired) fails its effect. For a tool call that winds the run
    down. Where the run survives the failure, as it does for a goal
    evaluation and for the send or start of a fan-out member, a run that
