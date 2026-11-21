@@ -1002,6 +1002,14 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **What a deployment sees.** One more `rakka.agent.run.resume` span for a run that was parked at a phase that is no wait and whose answer took it on to its proposal or its end. In the crate's tests no command that finds the run on a wait of its phase closes a different segment than before.
 
+- Issue #197 ("a failed straggler cancel winds down a live run whose fan-in had resolved, and can lose its result") widens the wind-down exemption of the definitive-failure arm by one kind, as the second post-Phase-6 gap slice did for the claim append, above. **No durable field, status, error code or decision kind is added, and no record changes shape.**
+
+  **What was wrong.** A fan-in that resolves early (`Any`, a quorum, a fired deadline) chases a started workflow child it left behind with a `WorkflowCancelCall`, on a run that is still live. When that cancel failed, the run took `EffectFailed` for it and wound down. In two orders the run's result never reached its task: the cancel failed while the model call was out (the proposing turn was never evaluated), or the task rejected the proposal that was out (no new turn began). The task stayed `InProgress` with no result, and a straggler that never reported held the run `Cancelling`.
+
+  **The rule.** A definitively failed or exhausted `WorkflowCancelCall` now leaves the run it belongs to as it was, exactly as a failed memory promotion, goal evaluation or claim append already did. It records no `EffectFailed` terminal reason, fences nothing and writes no status. This holds however the cancel fails: no cancel executor (`workflow-cancel-executor-missing`), an executor that answers `Refused`, a spent retry budget, or a reconciliation answer (`ConfirmedExecuted`) that says the cancel ran and failed. The failure stays on the cancel's effect record under its code and reason, and the straggler's cell keeps `cancel = Committed { effect }`: delivery is read from the effect the disposition names. A turn the cancel held open is rested by the next settle pass, as after a cancel that succeeds. A run that was already winding down ends as before; a cancelled run still waits for the straggler's own result before it ends `Cancelled`, as `AgentWorkflowCancelFinding::Refused` says.
+
+  **What a deployment sees.** A run whose straggler could not be told to stop goes on to its result, and the child keeps running until it reports. A deployment that relied on a failed cancel to end a run must now cancel the run explicitly. Records an earlier build already wound down this way are not repaired: such a run keeps winding down, and ends `Failed` once the straggler reports unless the task accepts a proposal it already had out. In a mixed deployment the binary that applies the cancel's outcome decides, and an earlier one still winds the run down.
+
 Run the default compatibility matrix:
 
 ```sh
