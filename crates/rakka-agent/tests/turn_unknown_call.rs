@@ -196,6 +196,19 @@ async fn settle(fx: &Fixture) {
         .expect("the run settles");
 }
 
+/// When the run's record was last written, by its own clock.
+async fn stamped_at(fx: &Fixture) -> u64 {
+    let record = fx
+        .runs
+        .load(&run_scope().persistence_id())
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    serde_json::to_value(&record.state).expect("the run state serializes")["updated_at"]
+        .as_u64()
+        .expect("the record carries its time")
+}
+
 /// Asserts a further settle pass writes and sends nothing.
 async fn assert_at_rest(fx: &Fixture) {
     let rested = (revision(fx).await, fx.dispatched_effects());
@@ -676,7 +689,7 @@ async fn a_turn_an_earlier_build_rested_over_an_unknown_call_is_opened_again() {
             .len()
     };
     let measured = turns_measured();
-    let rested = revision(&fx).await;
+    let rested = (revision(&fx).await, stamped_at(&fx).await);
 
     settle(&fx).await;
 
@@ -699,8 +712,12 @@ async fn a_turn_an_earlier_build_rested_over_an_unknown_call_is_opened_again() {
     );
     assert_eq!(
         revision(&fx).await.get(),
-        rested.get() + 1,
+        rested.0.get() + 1,
         "in one write: the run was not taken off its park and put back"
+    );
+    assert!(
+        stamped_at(&fx).await > rested.1,
+        "the write carries the time of its pass"
     );
     assert_at_rest(&fx).await;
     assert_eq!(
@@ -750,4 +767,141 @@ async fn a_turn_an_earlier_build_rested_waits_for_a_call_its_first_command_sends
     assert_waiting_for_the_resend(&fx, &session, sent).await;
     land(&fx, &call_to(&fx, CHARGE).await).await;
     assert_recorded_with_both_results(&fx, &session).await;
+}
+
+/// Leaves the record of a run whose turn an earlier build had already
+/// recorded without the charge's result: answered "never executed", that
+/// build sent the charge again, recorded turn one with the look-up alone and
+/// sent turn two's model call. The run is on turn two with a call of turn
+/// one out.
+///
+/// It is built from this build's own record after the answer, where the turn
+/// is open on the charge. The charge is taken out of the record for the one
+/// pass in which the loop records the turn and begins the next, as the
+/// earlier build did with the charge in it, and is then put back. Compared
+/// field by field with the record the earlier build writes at this point,
+/// it differs in three clock values.
+async fn recorded_without_a_result_by_an_earlier_build(fx: &Fixture) {
+    let park = park_on_the_charge(fx).await;
+    land(fx, &call_to(fx, LOOKUP).await).await;
+    apply(
+        fx,
+        answer(
+            &park,
+            "answer",
+            AgentReconciliationDecision::ConfirmedNotExecuted,
+        ),
+    )
+    .await;
+    let mut charge = serde_json::Value::Null;
+    rewrite_run(fx, |state| {
+        let effects = state["run"]["loop_state"]["effects"]
+            .as_array_mut()
+            .expect("the effects are a list");
+        let at = effects
+            .iter()
+            .position(|effect| effect.to_string().contains(CHARGE))
+            .expect("the charge is held");
+        charge = effects.remove(at);
+        state["run"]["loop_state"]["phase"] = serde_json::json!("recording-turn");
+        state["run"]["status"] = serde_json::json!("running");
+        // The earlier build's replies to the look-up's result and to the
+        // answer, and its record of the decision, say the turn rested.
+        let replies = state["applied_operations"]
+            .as_array_mut()
+            .expect("the stored replies are a list");
+        let last_two = replies.len() - 2;
+        for reply in &mut replies[last_two..] {
+            reply["outcome"]["phase"] = serde_json::json!("recording-turn");
+        }
+        for decision in state["decision_ledger"]
+            .as_array_mut()
+            .expect("the decisions are a list")
+        {
+            decision["outcome"]["phase"] = serde_json::json!("recording-turn");
+        }
+    })
+    .await;
+    settle(fx).await;
+    rewrite_run(fx, |state| {
+        state["run"]["loop_state"]["effects"]
+            .as_array_mut()
+            .expect("the effects are a list")
+            .insert(0, charge);
+    })
+    .await;
+    assert_eq!(
+        (
+            standing(fx).await,
+            call_to(fx, CHARGE).await.status,
+            next_model_call(fx).await
+        ),
+        (
+            (
+                AgentRunStatus::WaitingForEffect,
+                AgentLoopPhase::AwaitingModel,
+                2
+            ),
+            AgentRunEffectStatus::Ready,
+            Some(AgentRunEffectStatus::Ready)
+        ),
+        "the record as the earlier build left it: on turn two, with turn one's charge out"
+    );
+}
+
+/// What is not repaired: a turn an earlier build had already recorded
+/// without a result. The run is on a later turn, and that turn is not held
+/// for the earlier turn's call. Turn two here makes no call, so it is
+/// recorded as soon as its model output lands, and the run proposes its
+/// result, as it did under the build that left the record. The earlier
+/// turn's record is not rewritten: the session memory holds turn one with
+/// the look-up alone, before and after the charge returns.
+#[tokio::test]
+async fn a_turn_an_earlier_build_recorded_without_a_result_is_left_as_it_was() {
+    let (fx, session) = world();
+    recorded_without_a_result_by_an_earlier_build(&fx).await;
+    assert_eq!(
+        recorded_results(&session).await,
+        vec![(1, LOOKUP.to_string())],
+        "turn one was recorded with the look-up alone"
+    );
+
+    let model_call = loop_state(&fx)
+        .await
+        .effects()
+        .iter()
+        .find(|effect| effect.turn == 2 && effect.request.tool_call().is_none())
+        .cloned()
+        .expect("turn two's model call is out");
+    land(&fx, &model_call).await;
+
+    assert_eq!(
+        (
+            standing(&fx).await,
+            call_to(&fx, CHARGE).await.status,
+            recorded_results(&session).await
+        ),
+        (
+            (
+                AgentRunStatus::Cancelling,
+                AgentLoopPhase::DecidingContinuation,
+                2
+            ),
+            AgentRunEffectStatus::Ready,
+            vec![(1, LOOKUP.to_string())]
+        ),
+        "turn two is recorded and its result proposed and accepted, with the charge still out: \
+         the run waits for that call to end, and not to record it"
+    );
+
+    land(&fx, &call_to(&fx, CHARGE).await).await;
+
+    assert_eq!(
+        (
+            fx.run_snapshot().await.expect("the run exists").status,
+            recorded_results(&session).await
+        ),
+        (AgentRunStatus::Completed, vec![(1, LOOKUP.to_string())]),
+        "the charge returned and the run ended: no turn's record carries its result"
+    );
 }

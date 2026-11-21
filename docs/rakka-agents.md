@@ -206,7 +206,8 @@ leaves behind is the same either way.
    loop takes no step. A rejection of the run's proposal, or the deadline of
    a fan-in wait, that reaches a parked run that is not winding down is
    taken, and the run goes on from it when the park is answered: it prepares
-   the turn the rejection began, or records the turn the wait closed. A child
+   the turn the rejection began, or records the turn the wait closed once
+   every call of that turn is back. A child
    the deadline timed out is sent its cancellation without waiting for that
    answer. On a parked run that is winding down, the rejection begins no
    turn and the deadline resumes nothing. A turn does not rest while one of
@@ -214,7 +215,9 @@ leaves behind is the same either way.
    or a wait resolved meanwhile, leaves it open at `AwaitingTools`. It rests
    when the answer says what the call returned, or, where the answer sends
    the call again, when that call returns, so a turn is recorded with the
-   result of every call it made (issue #189). A gate that closes without a grant
+   result of every call it made (issue #189). A goal evaluation or a
+   workflow cancel whose outcome is unknown holds a turn the same way, and
+   while the turn waits for one sent again the run reads `Running`. A gate that closes without a grant
    (denied or expired) fails its effect. For a tool call that winds the run
    down. Where the run survives the failure, as it does for a goal
    evaluation and for the send or start of a fan-out member, a run that

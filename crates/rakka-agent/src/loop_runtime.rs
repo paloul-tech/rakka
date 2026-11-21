@@ -908,7 +908,8 @@ impl AgentLoopState {
     ///
     /// Kind-blind by design, for a caller that needs "anything at all is
     /// outstanding". It is *not* the turn's rest condition: a turn rests on
-    /// the turn's own effects, which [`Self::awaits_turn_effect`] answers.
+    /// the turn's own effects, the kinds [`Self::awaits_turn_effect`]
+    /// counts.
     #[must_use]
     pub fn awaits_effect(&self) -> bool {
         self.outstanding_effects().next().is_some()
@@ -1277,18 +1278,23 @@ impl AgentLoopState {
             .any(|effect| effect.kind().moves_the_run())
     }
 
-    /// Whether an effect whose outcome moves the run is out, or has an
-    /// unknown outcome ([`crate::AgentRunEffectKind::moves_the_run`]).
+    /// Whether a call of the turn the run is on, of a kind whose outcome
+    /// moves the run ([`crate::AgentRunEffectKind::moves_the_run`]), is out
+    /// or has an unknown outcome.
     ///
     /// A turn at rest holds none. Its model call is back before it commits
     /// its tool calls, A2A sends and workflow starts, and the arm that takes
     /// the outcome of the last of those rests the turn. A record that shows
     /// one beside a rested turn was rested by a binary before issue #189.
+    ///
+    /// A call of an earlier turn is not asked. Such a call is out beside a
+    /// later turn only where that binary had already recorded the earlier
+    /// turn without it, and the later turn is not that call's to hold.
     #[must_use]
-    pub(crate) fn has_unsettled_effect_that_moves_the_run(&self) -> bool {
-        self.effects
-            .iter()
-            .any(|effect| effect.kind().moves_the_run() && effect.blocks_settlement())
+    pub(crate) fn has_unsettled_call_of_this_turn(&self) -> bool {
+        self.effects.iter().any(|effect| {
+            effect.turn == self.turn && effect.kind().moves_the_run() && effect.blocks_settlement()
+        })
     }
 
     /// The waiting checkpoints whose bound effect is of a kind `counts`

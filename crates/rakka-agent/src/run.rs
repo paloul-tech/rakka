@@ -811,8 +811,8 @@ impl AgentRun {
 
     /// Whether the record holds a turn that was rested over a call of its
     /// own: the phase says the turn is over, or waits only for its children,
-    /// yet a call whose outcome moves the run is out or has an unknown
-    /// outcome.
+    /// yet a call that turn made, whose outcome moves the run, is out or has
+    /// an unknown outcome.
     ///
     /// A binary before issue #189 rested a turn when the last call that was
     /// *out* came back, with another call of the turn still unknown. Such a
@@ -832,6 +832,11 @@ impl AgentRun {
     /// cancel may be committed at any rest, and one out or unknown there is
     /// no turn to open.
     ///
+    /// And it asks only a call of the turn the run is on. Where that binary
+    /// had already recorded a turn without one of its calls, the run is on a
+    /// later turn with the call out, and that turn is not held for it: the
+    /// record goes on as it did under the binary that left it.
+    ///
     /// A run that has ended or is winding down is not asked: neither records
     /// a turn.
     pub(crate) fn needs_turn_reopen(&self) -> bool {
@@ -841,7 +846,7 @@ impl AgentRun {
                 self.loop_state.phase(),
                 AgentLoopPhase::RecordingTurn | AgentLoopPhase::AwaitingChildren
             )
-            && self.loop_state.has_unsettled_effect_that_moves_the_run()
+            && self.loop_state.has_unsettled_call_of_this_turn()
     }
 
     /// Whether the loop state holds `effect_id` and the effect is one that
@@ -5845,10 +5850,11 @@ fn apply_effect_outcome(
 ///   overwrote its status, and the outcome that ended the park wrote one
 ///   back only if it rested the turn: a memory promotion's, a claim
 ///   append's, a goal evaluation's and a workflow cancel's never do, and a
-///   tool call's does not while another effect of the turn is out
-///   (issue #131). The status is read from what the run
+///   tool call's does not while another effect of the turn is out or
+///   unknown (issues #131 and #189). The status is read from what the run
 ///   holds now and not kept from before the park, because a run can move
-///   while it is parked: a tool result that lands then rests the turn;
+///   while it is parked: a tool result that lands then rests the turn,
+///   where the park is on an effect outside the turn;
 /// - a live run on an approval or authorization wait that no waiting gate
 ///   of that kind holds leaves it too (`AgentRun::needs_gate_wait_release`).
 ///   A grant recomputes the wait; a gate that closed any other way, on an
@@ -14460,7 +14466,7 @@ mod tests {
     #[test]
     fn a_turn_is_open_while_a_call_of_its_own_is_out_or_unknown() {
         use AgentRunEffectStatus::{
-            Cancelled, Compensated, Failed, Indeterminate, Pending, Ready, Succeeded,
+            Cancelled, Compensated, Exhausted, Failed, Indeterminate, Pending, Ready, Succeeded,
         };
 
         for (status, open) in [
@@ -14469,6 +14475,7 @@ mod tests {
             (Indeterminate, true),
             (Succeeded, false),
             (Failed, false),
+            (Exhausted, false),
             (Cancelled, false),
             (Compensated, false),
         ] {
@@ -14478,7 +14485,7 @@ mod tests {
             assert_eq!(
                 (
                     loop_state.has_unsettled_turn_effect(),
-                    loop_state.has_unsettled_effect_that_moves_the_run()
+                    loop_state.has_unsettled_call_of_this_turn()
                 ),
                 (open, open),
                 "a call of the turn that is {status:?}"
@@ -14500,7 +14507,7 @@ mod tests {
             assert_eq!(
                 (
                     loop_state.has_unsettled_turn_effect(),
-                    loop_state.has_unsettled_effect_that_moves_the_run()
+                    loop_state.has_unsettled_call_of_this_turn()
                 ),
                 (open, open),
                 "an unknown promotion beside it is outside the turn: {status:?}"
@@ -14571,6 +14578,33 @@ mod tests {
                     "at {phase:?} the turn is open, or was recorded, or there is none"
                 );
             }
+        }
+
+        // A call of an earlier turn, out or unknown beside a later turn that
+        // is at rest: the binary that left it had recorded the earlier turn
+        // without it, and the later turn is not held for it.
+        for effect in [
+            AgentRunEffectStatus::Indeterminate,
+            AgentRunEffectStatus::Ready,
+        ] {
+            let mut fx =
+                handoff_send_fixture(AgentRunStatus::Running, AgentHandoffStatus::Pending, effect);
+            fx.state
+                .run_mut()
+                .expect("the run exists")
+                .loop_state
+                .begin_turn(None);
+            for phase in rests {
+                at(&mut fx, phase);
+                assert!(
+                    !fx.run().needs_turn_reopen(),
+                    "at {phase:?} of a later turn, a call of the earlier one {effect:?}"
+                );
+            }
+            assert!(
+                fx.run().loop_state.has_unsettled_turn_effect(),
+                "the rest of a turn is asked of every effect the run holds, as it was"
+            );
         }
 
         // The call back: nothing of the turn's is out or unknown, with or

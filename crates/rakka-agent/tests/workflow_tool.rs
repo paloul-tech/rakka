@@ -2394,7 +2394,8 @@ async fn a_tool_call_sent_again_rests_its_turn_on_the_child_it_still_awaits() {
             AgentLoopPhase::AwaitingTools,
             Some(AgentRunStatus::WaitingForEffect),
             1
-        )
+        ),
+        "the look-up is out again, and the turn is open on it while the child runs"
     );
     let resent = turn_call_of(&fixture, rakka_agent::AgentRunEffectKind::ToolCall).await;
     land_result_of(&fixture, &resent).await;
@@ -2418,6 +2419,298 @@ async fn a_tool_call_sent_again_rests_its_turn_on_the_child_it_still_awaits() {
             Some(AgentRunStatus::WaitingForEffect),
             2
         )
+    );
+}
+
+/// A turn that looks something up, delegates, starts a workflow and awaits
+/// both under a deadline, with every one of its calls out.
+async fn a_mixed_turn_with_every_call_out(
+    mode: StartMode,
+    send: Arc<dyn rakka_agent::AgentA2aSendExecutor>,
+) -> Fixture {
+    let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Looking up, delegating, invoking, awaiting.")
+        .with_tool_call(common::tool_call("lookup"))
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-1").expect("call id should be valid"),
+                delegation_tool_id(),
+                json!({ "skill": SKILL, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_tool_call(workflow_call("invoke-1"))
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({ "deadline": 5_000 }),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first_turn)
+                .with_turn(proposing_turn()),
+        )
+        .with_workflow_start_executor(RecordingWorkflowExecutor::new(mode))
+        .with_a2a_send_executor(send),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_workflow_tools(workflow_config());
+    create_workflow_task(&fixture).await;
+    settle(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+    fixture
+}
+
+/// Reports the outcome of the run's call of `kind` as unknown.
+async fn lose_call_of(fixture: &Fixture, kind: rakka_agent::AgentRunEffectKind) -> AgentRunEffect {
+    let effect = turn_call_of(fixture, kind).await;
+    apply_to_run(
+        fixture,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect.result_operation_id(&run_scope()).expect("derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: effect.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the recovery retry was refused",
+            )),
+        },
+    )
+    .await;
+    effect
+}
+
+/// Lands what the executor of the run's call of `kind` answers, and returns
+/// where the reply to that command says the run stands. The reply is the
+/// transition's own account, written before any later pass.
+async fn the_reply_to_the_outcome_of(
+    fixture: &Fixture,
+    kind: rakka_agent::AgentRunEffectKind,
+) -> (AgentRunStatus, AgentLoopPhase) {
+    let effect = turn_call_of(fixture, kind).await;
+    let reply = land_result_of(fixture, &effect).await;
+    let rakka_agent::AgentRunEntityReply::Applied { outcome } = reply else {
+        panic!("the outcome of the {kind} applies, got {reply:?}");
+    };
+    (outcome.status, outcome.phase)
+}
+
+/// Where a run stands whose turn is open on a call with an unknown outcome.
+const OPEN_AND_PARKED: (AgentRunStatus, AgentLoopPhase) = (
+    AgentRunStatus::WaitingForReconciliation,
+    AgentLoopPhase::AwaitingTools,
+);
+
+/// The receipt of a delegation's send does not rest a turn whose tool call
+/// is unknown. It is the last of the turn's calls that was out, and the
+/// reply to it used to say the turn rested on its children.
+#[tokio::test]
+async fn a_send_receipt_does_not_rest_a_turn_whose_tool_call_is_unknown() {
+    use rakka_agent::AgentRunEffectKind as Kind;
+
+    let fixture = a_mixed_turn_with_every_call_out(StartMode::Started, sending_executor()).await;
+    lose_call_of(&fixture, Kind::ToolCall).await;
+    the_reply_to_the_outcome_of(&fixture, Kind::WorkflowStartCall).await;
+
+    assert_eq!(
+        the_reply_to_the_outcome_of(&fixture, Kind::A2aSendCall).await,
+        OPEN_AND_PARKED,
+        "the send's receipt is taken, and the turn stays open on the look-up"
+    );
+}
+
+/// Nor does the send of a fan-out member that fails. The failure is a
+/// disposition of the wait and not of the run, so the run goes on, and its
+/// turn stays open on the look-up.
+#[tokio::test]
+async fn a_members_failed_send_does_not_rest_a_turn_whose_tool_call_is_unknown() {
+    use rakka_agent::AgentRunEffectKind as Kind;
+
+    let fixture =
+        a_mixed_turn_with_every_call_out(StartMode::Started, failing_send_executor()).await;
+    lose_call_of(&fixture, Kind::ToolCall).await;
+    the_reply_to_the_outcome_of(&fixture, Kind::WorkflowStartCall).await;
+
+    assert_eq!(
+        the_reply_to_the_outcome_of(&fixture, Kind::A2aSendCall).await,
+        OPEN_AND_PARKED,
+        "the member's failed send is taken, and the turn stays open on the look-up"
+    );
+}
+
+/// Nor does the start of a fan-out member that is refused.
+#[tokio::test]
+async fn a_members_failed_start_does_not_rest_a_turn_whose_tool_call_is_unknown() {
+    use rakka_agent::AgentRunEffectKind as Kind;
+
+    let fixture = a_mixed_turn_with_every_call_out(StartMode::Refused, sending_executor()).await;
+    lose_call_of(&fixture, Kind::ToolCall).await;
+    the_reply_to_the_outcome_of(&fixture, Kind::A2aSendCall).await;
+
+    assert_eq!(
+        the_reply_to_the_outcome_of(&fixture, Kind::WorkflowStartCall).await,
+        OPEN_AND_PARKED,
+        "the member's refused start is taken, and the turn stays open on the look-up"
+    );
+}
+
+/// A turn is held for a delegation's send whose outcome is unknown, and for
+/// a workflow start whose outcome is unknown, as it is for a tool call: the
+/// look-up's result, the last call that was out, does not rest it.
+#[tokio::test]
+async fn a_tool_result_does_not_rest_a_turn_whose_send_or_start_is_unknown() {
+    use rakka_agent::AgentRunEffectKind as Kind;
+
+    for (unknown, beside) in [
+        (Kind::A2aSendCall, Kind::WorkflowStartCall),
+        (Kind::WorkflowStartCall, Kind::A2aSendCall),
+    ] {
+        let fixture =
+            a_mixed_turn_with_every_call_out(StartMode::Started, sending_executor()).await;
+        lose_call_of(&fixture, unknown).await;
+        the_reply_to_the_outcome_of(&fixture, beside).await;
+
+        assert_eq!(
+            the_reply_to_the_outcome_of(&fixture, Kind::ToolCall).await,
+            OPEN_AND_PARKED,
+            "the look-up's result is taken, and the turn stays open on the unknown {unknown}"
+        );
+    }
+}
+
+/// A run on its second turn, whose tool call is out, with a workflow cancel
+/// out beside it. Turn one started a workflow that can be cancelled and
+/// awaited it under a deadline; the deadline timed the child out, and the
+/// run chases it with a cancel.
+async fn a_workflow_cancel_out_beside_a_tool_call() -> Fixture {
+    let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Invoking the workflow and awaiting it, with a deadline.")
+        .with_tool_call(workflow_call("invoke-1"))
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({ "deadline": 5_000 }),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let second_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Looking it up.")
+        .with_tool_call(common::tool_call("lookup"));
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first_turn)
+                .with_turn(second_turn)
+                .with_turn(proposing_turn()),
+        )
+        .with_workflow_start_executor(RecordingWorkflowExecutor::new(StartMode::Started)),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_workflow_tools(
+        rakka_agent::AgentRunWorkflowConfig::new()
+            .with_descriptor(common::workflow_tool_descriptor().with_cancellation_support())
+            .expect("the workflow configuration should accept the descriptor"),
+    );
+    create_workflow_task(&fixture).await;
+    settle(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+    the_reply_to_the_outcome_of(&fixture, rakka_agent::AgentRunEffectKind::WorkflowStartCall).await;
+    fire_the_deadline(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+    assert_eq!(
+        (
+            rest_of(&fixture).await,
+            turn_call_of(
+                &fixture,
+                rakka_agent::AgentRunEffectKind::WorkflowCancelCall
+            )
+            .await
+            .status,
+            turn_call_of(&fixture, rakka_agent::AgentRunEffectKind::ToolCall)
+                .await
+                .status
+        ),
+        (
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForEffect),
+                2
+            ),
+            rakka_agent::AgentRunEffectStatus::Ready,
+            rakka_agent::AgentRunEffectStatus::Ready
+        ),
+        "turn two's look-up is out, and so is the cancel that chases the timed-out child"
+    );
+    fixture
+}
+
+/// A turn is held for a workflow cancel whose outcome is unknown, as it is
+/// for one that is out. The look-up's result does not rest the turn. It used
+/// to, parked. Answered "never executed", the cancel is sent again and the
+/// turn is held for it, and the pass that follows its return rests the turn.
+/// The run used to record the turn and send its next model call with the
+/// cancel out.
+#[tokio::test]
+async fn a_turn_is_held_for_a_workflow_cancel_whose_outcome_is_unknown() {
+    use rakka_agent::AgentRunEffectKind as Kind;
+
+    let fixture = a_workflow_cancel_out_beside_a_tool_call().await;
+    let cancel = lose_call_of(&fixture, Kind::WorkflowCancelCall).await;
+
+    assert_eq!(
+        the_reply_to_the_outcome_of(&fixture, Kind::ToolCall).await,
+        OPEN_AND_PARKED,
+        "the look-up's result is taken, and the turn is held for the cancel"
+    );
+    let sent = fixture.dispatched_effects();
+
+    answer_the_park_of(&fixture, &cancel, None).await;
+
+    assert_eq!(
+        (rest_of(&fixture).await, fixture.dispatched_effects()),
+        (
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::Running),
+                2
+            ),
+            sent + 1
+        ),
+        "the cancel is out again, and the turn is held for it: one call is sent, and it is not \
+         the next model call"
+    );
+
+    let resent = turn_call_of(&fixture, Kind::WorkflowCancelCall).await;
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: resent.result_operation_id(&run_scope()).expect("derives"),
+            effect_id: resent.effect_id.clone(),
+            generation: resent.generation,
+            attempt: resent.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::WorkflowCancel {
+                already_finished: false,
+            }),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingModel,
+            Some(AgentRunStatus::WaitingForEffect),
+            3
+        ),
+        "the cancel returned: the turn is recorded and the next model call is out"
     );
 }
 
