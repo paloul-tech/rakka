@@ -2172,6 +2172,547 @@ async fn a_run_an_earlier_build_left_going_past_a_parked_append_is_parked_again(
     );
 }
 
+/// A turn that looks something up, starts a workflow and awaits it under a
+/// deadline, at the point issue #189 is about: the look-up's outcome is
+/// unknown, so the run is parked, and the workflow's start receipt has just
+/// landed. Returns the fixture, the look-up, and the reply to the receipt.
+async fn a_tool_call_unknown_beside_a_fan_in_wait(
+) -> (Fixture, AgentRunEffect, rakka_agent::AgentRunEntityReply) {
+    let first_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Looking it up, invoking the workflow and awaiting it, with a deadline.")
+        .with_tool_call(common::tool_call("lookup"))
+        .with_tool_call(workflow_call("invoke-1"))
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({ "deadline": 5_000 }),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let fixture = workflow_fixture(
+        RecordingWorkflowExecutor::new(StartMode::Started),
+        first_turn,
+    );
+    create_workflow_task(&fixture).await;
+    settle(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+    let lookup = turn_call_of(&fixture, rakka_agent::AgentRunEffectKind::ToolCall).await;
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: lookup.result_operation_id(&run_scope()).expect("derives"),
+            effect_id: lookup.effect_id.clone(),
+            generation: lookup.generation,
+            attempt: lookup.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::indeterminate(
+                "dispatcher-lost-after-started",
+                "the recovery retry was refused",
+            )),
+        },
+    )
+    .await;
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingTools,
+            Some(AgentRunStatus::WaitingForReconciliation),
+            1
+        ),
+        "parked on the look-up, with the workflow start still out"
+    );
+    let start = turn_call_of(&fixture, rakka_agent::AgentRunEffectKind::WorkflowStartCall).await;
+    let receipt = land_result_of(&fixture, &start).await;
+    (fixture, lookup, receipt)
+}
+
+/// The run's effect of `kind`, as the run now holds it.
+async fn turn_call_of(fixture: &Fixture, kind: rakka_agent::AgentRunEffectKind) -> AgentRunEffect {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop is running")
+        .effects()
+        .iter()
+        .find(|effect| effect.kind() == kind)
+        .cloned()
+        .unwrap_or_else(|| panic!("the run holds a {kind}"))
+}
+
+/// Lands the result of one outstanding effect, as its executor answers it.
+async fn land_result_of(
+    fixture: &Fixture,
+    effect: &AgentRunEffect,
+) -> rakka_agent::AgentRunEntityReply {
+    let outcome = fixture.dispatcher.answer(effect).await;
+    apply_to_run(
+        fixture,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect.result_operation_id(&run_scope()).expect("derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: effect.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(outcome),
+        },
+    )
+    .await
+}
+
+/// Answers the park of `effect`: a person found it was never executed, or,
+/// where `returned` is given, that it ran and returned that.
+async fn answer_the_park_of(
+    fixture: &Fixture,
+    effect: &AgentRunEffect,
+    returned: Option<rakka_agent::AgentRunEffectOutcome>,
+) {
+    apply_to_run(
+        fixture,
+        AgentRunEntityCommand::ResolveIndeterminateEffect {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "park-answer",
+            )
+            .expect("the decision key derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            resolution: Box::new(match returned {
+                Some(outcome) => rakka_agent::AgentEffectResolution::ConfirmedExecuted {
+                    outcome: Box::new(outcome),
+                },
+                None => rakka_agent::AgentEffectResolution::ConfirmedNotExecuted,
+            }),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await;
+}
+
+/// Delivers the child workflow's completed result to the run.
+async fn the_child_reports(fixture: &Fixture) {
+    let (id, _) = committed_invocation(fixture).await;
+    deliver_result(
+        fixture,
+        &id,
+        child_workflow_run_id(&id),
+        AgentWorkflowTerminalStatus::Completed,
+    )
+    .await
+    .expect("the child's result is taken");
+}
+
+/// A workflow's start receipt does not rest a turn that holds a tool call
+/// with an unknown outcome (issue #189). The receipt is the last of the
+/// turn's calls that was out, and it used to rest the turn on its children,
+/// parked. The turn now stays open. Its wait is resolved under it, here by
+/// the deadline, and that moves nothing. Answered "never executed", the
+/// look-up is sent again and the run waits for it, where it used to record
+/// the turn without it and send the next model call. The turn is recorded
+/// when the look-up returns.
+#[tokio::test]
+async fn a_start_receipt_does_not_rest_a_turn_whose_tool_call_is_unknown() {
+    let (fixture, lookup, receipt) = a_tool_call_unknown_beside_a_fan_in_wait().await;
+
+    let rakka_agent::AgentRunEntityReply::Applied { outcome } = receipt else {
+        panic!("the receipt applies, got {receipt:?}");
+    };
+    assert_eq!(
+        (outcome.status, outcome.phase),
+        (
+            AgentRunStatus::WaitingForReconciliation,
+            AgentLoopPhase::AwaitingTools
+        ),
+        "the receipt is taken, and the turn stays open on the look-up"
+    );
+    let sent = fixture.dispatched_effects();
+
+    fire_the_deadline(&fixture).await;
+
+    assert_eq!(
+        (rest_of(&fixture).await, fixture.dispatched_effects()),
+        (
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForReconciliation),
+                1
+            ),
+            sent
+        ),
+        "the wait is resolved under the open turn, and nothing moves"
+    );
+
+    answer_the_park_of(&fixture, &lookup, None).await;
+
+    let resent = turn_call_of(&fixture, rakka_agent::AgentRunEffectKind::ToolCall).await;
+    assert_eq!(
+        (
+            rest_of(&fixture).await,
+            resent.status,
+            fixture.dispatched_effects()
+        ),
+        (
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForEffect),
+                1
+            ),
+            rakka_agent::AgentRunEffectStatus::Ready,
+            sent + 1
+        ),
+        "the look-up is out again, and the run waits for it: one call is sent, and the turn is \
+         not recorded"
+    );
+
+    land_result_of(&fixture, &resent).await;
+
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingModel,
+            Some(AgentRunStatus::WaitingForEffect),
+            2
+        ),
+        "the look-up returned: the turn is recorded and the next model call is out"
+    );
+}
+
+/// The look-up is answered "never executed" and returns while the child is
+/// still running. The turn then rests where a turn with a child out rests,
+/// and goes on when the child reports.
+#[tokio::test]
+async fn a_tool_call_sent_again_rests_its_turn_on_the_child_it_still_awaits() {
+    let (fixture, lookup, _) = a_tool_call_unknown_beside_a_fan_in_wait().await;
+
+    answer_the_park_of(&fixture, &lookup, None).await;
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingTools,
+            Some(AgentRunStatus::WaitingForEffect),
+            1
+        )
+    );
+    let resent = turn_call_of(&fixture, rakka_agent::AgentRunEffectKind::ToolCall).await;
+    land_result_of(&fixture, &resent).await;
+
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingChildren,
+            Some(AgentRunStatus::Running),
+            1
+        ),
+        "the last call of the turn is back, and the turn rests on its child"
+    );
+
+    the_child_reports(&fixture).await;
+
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingModel,
+            Some(AgentRunStatus::WaitingForEffect),
+            2
+        )
+    );
+}
+
+/// Leaves the record of [`a_tool_call_unknown_beside_a_fan_in_wait`] as a
+/// build before issue #189 left it: the start receipt rested the turn on its
+/// children over the unknown look-up. The record is this build's own with
+/// the two values the earlier build wrote differently: the phase, and the
+/// phase in the stored reply to the receipt.
+async fn rested_on_its_children_by_an_earlier_build() -> (Fixture, AgentRunEffect) {
+    let (fixture, lookup, _) = a_tool_call_unknown_beside_a_fan_in_wait().await;
+    let id = run_scope().persistence_id();
+    let record = rakka_persistence::DurableStateStore::load(&fixture.runs, &id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    value["run"]["loop_state"]["phase"] = json!("awaiting-children");
+    let replies = value["applied_operations"]
+        .as_array_mut()
+        .expect("the stored replies are a list");
+    let last = replies.last_mut().expect("the receipt's reply is stored");
+    let start = turn_call_of(&fixture, rakka_agent::AgentRunEffectKind::WorkflowStartCall).await;
+    assert_eq!(
+        last["operation_id"],
+        json!(start.result_operation_id(&run_scope()).expect("derives")),
+        "the last stored reply is the one to the start receipt"
+    );
+    last["outcome"]["phase"] = json!("awaiting-children");
+    rakka_persistence::DurableStateStore::compare_and_set(
+        &fixture.runs,
+        &id,
+        record.revision,
+        serde_json::from_value(value).expect("the rewritten record deserializes"),
+    )
+    .await
+    .expect("the rewritten record persists");
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingChildren,
+            Some(AgentRunStatus::WaitingForReconciliation),
+            1
+        ),
+        "the record as the earlier build left it: resting on its child, the look-up unknown"
+    );
+    (fixture, lookup)
+}
+
+/// The settle pass opens again a turn an earlier build rested on its
+/// children over an unknown call. One pass does it and the next writes
+/// nothing. The child's report then resolves the wait under the open turn,
+/// and the answer, here what the look-up returned, rests the turn.
+#[tokio::test]
+async fn a_turn_an_earlier_build_rested_on_its_children_over_an_unknown_call_is_opened_again() {
+    let (fixture, lookup) = rested_on_its_children_by_an_earlier_build().await;
+    let sent = fixture.dispatched_effects();
+
+    settle(&fixture).await;
+
+    assert_eq!(
+        (rest_of(&fixture).await, fixture.dispatched_effects()),
+        (
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForReconciliation),
+                1
+            ),
+            sent
+        ),
+        "the turn is open again, on the park it was under"
+    );
+    let opened = run_revision(&fixture).await;
+    settle(&fixture).await;
+    assert_eq!(
+        run_revision(&fixture).await,
+        opened,
+        "a further settle pass writes nothing"
+    );
+
+    the_child_reports(&fixture).await;
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingTools,
+            Some(AgentRunStatus::WaitingForReconciliation),
+            1
+        ),
+        "the child's report resolves the wait under the open turn"
+    );
+
+    let returned = fixture.dispatcher.answer(&lookup).await;
+    answer_the_park_of(&fixture, &lookup, Some(returned)).await;
+
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingModel,
+            Some(AgentRunStatus::WaitingForEffect),
+            2
+        ),
+        "the answer is the look-up's result: the turn rests, is recorded, and the next model \
+         call is out"
+    );
+}
+
+/// The child's report may be the first thing this build does to such a
+/// record. The report moves the resting turn on, as it moves any turn that
+/// rests on its children, and the pass that follows opens it before the loop
+/// can record it. The run stays parked throughout.
+#[tokio::test]
+async fn a_turn_an_earlier_build_rested_on_its_children_is_opened_when_its_child_reports_first() {
+    let (fixture, lookup) = rested_on_its_children_by_an_earlier_build().await;
+    let sent = fixture.dispatched_effects();
+
+    the_child_reports(&fixture).await;
+
+    assert_eq!(
+        (rest_of(&fixture).await, fixture.dispatched_effects()),
+        (
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForReconciliation),
+                1
+            ),
+            sent
+        ),
+        "the wait is resolved, and the turn is open on the look-up, parked"
+    );
+
+    answer_the_park_of(&fixture, &lookup, None).await;
+    let resent = turn_call_of(&fixture, rakka_agent::AgentRunEffectKind::ToolCall).await;
+    assert_eq!(
+        (
+            rest_of(&fixture).await,
+            resent.status,
+            fixture.dispatched_effects()
+        ),
+        (
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForEffect),
+                1
+            ),
+            rakka_agent::AgentRunEffectStatus::Ready,
+            sent + 1
+        ),
+        "the look-up is out again, and the run waits for it"
+    );
+    land_result_of(&fixture, &resent).await;
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingModel,
+            Some(AgentRunStatus::WaitingForEffect),
+            2
+        )
+    );
+}
+
+/// A record an earlier build left between two steps: the look-up was sent
+/// again while the turn rested on its child, the child then reported, and
+/// that report moved the turn on to be recorded, `Running`, with the look-up
+/// still out. The earlier build recorded the turn in its next step. A
+/// process that stopped between the two left this record.
+///
+/// The settle pass opens the turn before the loop records it, and puts the
+/// run on the wait of a turn with a call out. The record is this build's
+/// own at that point, with what the earlier report wrote: the phase and the
+/// status, on the run and in the stored reply to the report.
+#[tokio::test]
+async fn a_turn_an_earlier_build_moved_on_with_a_call_out_is_put_back_on_its_wait() {
+    let (fixture, lookup) = rested_on_its_children_by_an_earlier_build().await;
+    answer_the_park_of(&fixture, &lookup, None).await;
+    the_child_reports(&fixture).await;
+    let id = run_scope().persistence_id();
+    let record = rakka_persistence::DurableStateStore::load(&fixture.runs, &id)
+        .await
+        .expect("the run record loads")
+        .expect("the run record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the run state serializes");
+    value["run"]["loop_state"]["phase"] = json!("recording-turn");
+    value["run"]["status"] = json!("running");
+    let replies = value["applied_operations"]
+        .as_array_mut()
+        .expect("the stored replies are a list");
+    let last = replies.last_mut().expect("the report's reply is stored");
+    last["outcome"]["phase"] = json!("recording-turn");
+    last["outcome"]["status"] = json!("running");
+    rakka_persistence::DurableStateStore::compare_and_set(
+        &fixture.runs,
+        &id,
+        record.revision,
+        serde_json::from_value(value).expect("the rewritten record deserializes"),
+    )
+    .await
+    .expect("the rewritten record persists");
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::RecordingTurn,
+            Some(AgentRunStatus::Running),
+            1
+        ),
+        "the record as the earlier build left it, before its next step"
+    );
+    let sent = fixture.dispatched_effects();
+
+    settle(&fixture).await;
+
+    assert_eq!(
+        (rest_of(&fixture).await, fixture.dispatched_effects()),
+        (
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForEffect),
+                1
+            ),
+            sent
+        ),
+        "the turn is open again and the run waits on the look-up: no turn is recorded and no \
+         model call is sent"
+    );
+
+    let resent = turn_call_of(&fixture, rakka_agent::AgentRunEffectKind::ToolCall).await;
+    land_result_of(&fixture, &resent).await;
+
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingModel,
+            Some(AgentRunStatus::WaitingForEffect),
+            2
+        )
+    );
+}
+
+/// The answer may be the first thing this build does to such a record, and
+/// the child may report while the call it sent again is out. The pass that
+/// follows the answer opens the turn, so the child's report finds a turn
+/// that waits on a call and leaves it there. Left resting on its children,
+/// the report would have moved the turn on to be recorded with the look-up
+/// still out.
+#[tokio::test]
+async fn a_turn_an_earlier_build_rested_on_its_children_waits_for_a_call_sent_again() {
+    let (fixture, lookup) = rested_on_its_children_by_an_earlier_build().await;
+    let sent = fixture.dispatched_effects();
+
+    answer_the_park_of(&fixture, &lookup, None).await;
+
+    let resent = turn_call_of(&fixture, rakka_agent::AgentRunEffectKind::ToolCall).await;
+    assert_eq!(
+        (
+            rest_of(&fixture).await,
+            resent.status,
+            fixture.dispatched_effects()
+        ),
+        (
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForEffect),
+                1
+            ),
+            rakka_agent::AgentRunEffectStatus::Ready,
+            sent + 1
+        ),
+        "the look-up is out again, and the turn is open on it"
+    );
+
+    the_child_reports(&fixture).await;
+
+    assert_eq!(
+        (rest_of(&fixture).await, fixture.dispatched_effects()),
+        (
+            (
+                AgentLoopPhase::AwaitingTools,
+                Some(AgentRunStatus::WaitingForEffect),
+                1
+            ),
+            sent + 1
+        ),
+        "the child's report leaves the turn waiting on the look-up"
+    );
+
+    land_result_of(&fixture, &resent).await;
+
+    assert_eq!(
+        rest_of(&fixture).await,
+        (
+            AgentLoopPhase::AwaitingModel,
+            Some(AgentRunStatus::WaitingForEffect),
+            2
+        )
+    );
+}
+
 /// Issue #123. An `Any` fan-in that resolves on its first child chases the
 /// other with a workflow cancel, and the run goes on to propose its result.
 /// The task accepts while the cancel is still out. The run used to end

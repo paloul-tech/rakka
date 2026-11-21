@@ -920,16 +920,39 @@ impl AgentLoopState {
     /// evaluation — with a memory promotion and a claim append excluded
     /// ([`AgentRunEffectKind::outside_the_turn`](crate::AgentRunEffectKind::outside_the_turn)).
     ///
-    /// This is the one predicate every turn-completing site consults: the
-    /// last of the turn's effects to resolve rests the turn whatever else
-    /// the run holds, and an effect outside the turn — committed by a
-    /// command beside the turn's in-flight work — can neither hold the turn
-    /// open nor, when its own outcome lands, rest one
+    /// These are the kinds every turn-completing site counts: the last of the
+    /// turn's effects to come back rests the turn whatever else the run
+    /// holds, and an effect outside the turn — committed by a command beside
+    /// the turn's in-flight work — can neither hold the turn open nor, when
+    /// its own outcome lands, rest one
     /// ([specification 9.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// It asks only what is out. A turn also stays open while an effect of
+    /// one of these kinds has an unknown outcome, which this does not
+    /// answer: the turn rests when that effect's reconciliation decision
+    /// says what it returned, or when the generation the decision sends
+    /// again comes back (issue #189).
     #[must_use]
     pub fn awaits_turn_effect(&self) -> bool {
         self.outstanding_effects()
             .any(|effect| !effect.kind().outside_the_turn())
+    }
+
+    /// Whether the turn still has an effect of its own to hear from: one of
+    /// a kind inside the turn that is out, or whose outcome is unknown.
+    ///
+    /// This is the turn's rest condition. A turn rests when the last of its
+    /// effects has come back, and an effect whose outcome is unknown has not:
+    /// its answer may send it again, and the turn it belongs to has to be
+    /// open when that call returns. [`Self::awaits_turn_effect`] is the half
+    /// of this that asks only what is out, and a turn rested on that half
+    /// alone was recorded without the result of a call answered "never
+    /// executed" (issue #189).
+    #[must_use]
+    pub(crate) fn has_unsettled_turn_effect(&self) -> bool {
+        self.effects
+            .iter()
+            .any(|effect| !effect.kind().outside_the_turn() && effect.blocks_settlement())
     }
 
     /// Whether the run still has work in flight whose outcome must settle
@@ -1252,6 +1275,20 @@ impl AgentLoopState {
     pub(crate) fn awaits_effect_that_moves_the_run(&self) -> bool {
         self.outstanding_effects()
             .any(|effect| effect.kind().moves_the_run())
+    }
+
+    /// Whether an effect whose outcome moves the run is out, or has an
+    /// unknown outcome ([`crate::AgentRunEffectKind::moves_the_run`]).
+    ///
+    /// A turn at rest holds none. Its model call is back before it commits
+    /// its tool calls, A2A sends and workflow starts, and the arm that takes
+    /// the outcome of the last of those rests the turn. A record that shows
+    /// one beside a rested turn was rested by a binary before issue #189.
+    #[must_use]
+    pub(crate) fn has_unsettled_effect_that_moves_the_run(&self) -> bool {
+        self.effects
+            .iter()
+            .any(|effect| effect.kind().moves_the_run() && effect.blocks_settlement())
     }
 
     /// The waiting checkpoints whose bound effect is of a kind `counts`

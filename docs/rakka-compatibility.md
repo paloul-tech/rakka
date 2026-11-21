@@ -935,6 +935,32 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Mixed builds and rollback.** An earlier build still steps past a park at these two transitions. This build parks such a record at its next settle pass.
 
+- Issue #189 ("a turn rests while one of its own calls has an unknown outcome, and is recorded without that call's result when it is answered never executed") makes a turn wait for every call of its own. **No durable field, status, error code or decision kind is added.**
+
+  **What was wrong.** A turn rests when the last of its calls comes back, and the loop then records it with the results of its calls. The arms that rest a turn asked only whether a call was still out. A call whose outcome is unknown is not out, so the result of another call of the same turn rested the turn with that one unanswered. The run was parked and took no step. When the park was answered "never executed", the call was sent again and the run did not wait for it: it recorded the turn without that call's result and sent the next turn's model call. Where the turn stood depended on which of the two outcomes arrived first.
+
+  **The rule.** A turn rests when the last of its own effects has come back, and an effect whose outcome is unknown has not. The effects of a turn are every kind but a memory promotion and a claim append, as before.
+
+  | A live run, not winding down, with one call of its turn unknown | Before | Now |
+  |---|---|---|
+  | The result of the turn's last call that was out lands | The turn rests: `RecordingTurn`, or `AwaitingChildren` beside a fan-in wait. The run stays parked | The turn stays open at `AwaitingTools`. The run stays parked |
+  | A fan-in wait is resolved meanwhile, by its deadline or a child's report | The phase moves to `RecordingTurn` | The wait is resolved and the phase does not move |
+  | The park is answered with what the call returned | The turn rests and is recorded with that result | Unchanged |
+  | The park is answered "never executed" | The call is sent again, the turn is recorded without its result, and the next model call is sent | The call is sent again and the run waits for it, `WaitingForEffect` at `AwaitingTools`. The turn rests when it returns |
+  | The unknown outcome arrived after every other result | The turn stays open at `AwaitingTools`, and the answer is waited for | Unchanged |
+
+  **What a deployment sees.**
+
+  - A run parked on a call of its turn, with nothing else of the turn out, shows the phase `awaiting-tools` where it showed `recording-turn` or `awaiting-children`. Its status is `WaitingForReconciliation` as before.
+  - After "never executed", such a run shows `WaitingForEffect` on the same turn until the call returns, and sends one call, not two. The turn it then records carries the result of every call it made.
+  - **A goal evaluation or a workflow cancel whose outcome is unknown holds a turn as one that is out does.** A turn whose last tool result lands while one is unknown stays open, and after "never executed" it waits for the one sent again. It used to rest and go on with that call out. A memory promotion and a claim append hold no turn, out or unknown, as before.
+  - **The settle pass opens again a turn an earlier build rested over a call of its own.** A live run that is not winding down, at `RecordingTurn` or `AwaitingChildren`, holding a model call, tool call, A2A send or workflow start that is out or unknown, has its phase put back to `AwaitingTools` before the loop's step. A parked run stays parked; one that is not takes the dispatch wait. That pass sends nothing and is not measured as a turn.
+  - **Not repaired:** a record whose turn an earlier build had already recorded without the result. That run is on a later turn, and the earlier turn's record in the session memory is not rewritten.
+
+  **The public surface is unchanged.** `AgentLoopState::awaits_turn_effect` keeps its meaning, whether an effect of the turn is out. It is no longer the whole of what holds a turn open: a caller that asked it whether a turn was over must also ask whether an effect of the turn is `Indeterminate`.
+
+  **Mixed builds and rollback.** An earlier build writes the record this build now writes whenever the unknown outcome is the last to arrive, and takes its answer correctly. An earlier build that takes back a record with the turn open behaves as this build does. One that reads a record it rested itself still has the defect.
+
 Run the default compatibility matrix:
 
 ```sh

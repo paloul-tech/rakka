@@ -2258,6 +2258,116 @@ async fn a_turn_is_held_for_an_evaluation_that_is_out_and_goes_on_when_it_settle
     );
 }
 
+/// A turn is held for a goal evaluation whose outcome is unknown when its
+/// last tool result lands, as it is for one that is out (issue #189). What
+/// holds a turn while it is out holds it while it is unknown, so where the
+/// turn stands does not depend on which of the two outcomes arrived first.
+/// The tool's result used to rest the turn here, parked. Answered "never
+/// executed", the evaluation is sent again and the turn is held for it, and
+/// the run goes on when it settles. It used to record the turn and send its
+/// next model call with the evaluation out.
+#[tokio::test]
+async fn a_turn_is_held_for_an_evaluation_whose_outcome_is_unknown() {
+    let fx = tool_turn_world(rakka_agent::AgentEffectPolicies::default()).await;
+    apply_run(
+        &fx,
+        evaluate_command("1", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the evaluation commits");
+    let model_call = run_loop_state(&fx)
+        .await
+        .outstanding_effects()
+        .find(|effect| effect.kind() == AgentRunEffectKind::ModelCall)
+        .cloned()
+        .expect("the model call is out");
+    land_the_result_of(&fx, &model_call).await;
+    settle_run(&fx).await;
+    let evaluation = evaluation_effect(&fx).await;
+    apply_run(
+        &fx,
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: evaluation
+                .result_operation_id(&run_scope())
+                .expect("the operation id derives"),
+            effect_id: evaluation.effect_id.clone(),
+            generation: evaluation.generation,
+            attempt: evaluation.attempts.saturating_add(1),
+            fence: 1,
+            outcome: Box::new(rakka_agent::AgentRunEffectOutcome::indeterminate(
+                "connection-lost",
+                "the evaluator died mid-call",
+            )),
+        },
+    )
+    .await
+    .expect("the unknown outcome records");
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForReconciliation,
+            1
+        ),
+        "parked on the evaluation, with the tool call out"
+    );
+
+    land_the_tool_result(&fx).await;
+
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::WaitingForReconciliation,
+            1
+        ),
+        "the tool's result is taken, and the turn is held for the evaluation"
+    );
+
+    apply_run(
+        &fx,
+        AgentRunEntityCommand::ResolveIndeterminateEffect {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "park-answer",
+            )
+            .expect("the decision key derives"),
+            effect_id: evaluation.effect_id.clone(),
+            generation: evaluation.generation,
+            resolution: Box::new(rakka_agent::AgentEffectResolution::ConfirmedNotExecuted),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await
+    .expect("the answer applies");
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingTools,
+            1,
+            AgentRunStatus::Running,
+            0
+        ),
+        "the evaluation is out again, and the turn is held for it"
+    );
+
+    let resent = evaluation_effect(&fx).await;
+    land_the_result_of(&fx, &resent).await;
+    assert_eq!(
+        rest_of(&fx).await,
+        (
+            rakka_agent::AgentLoopPhase::AwaitingModel,
+            2,
+            AgentRunStatus::WaitingForEffect,
+            0
+        ),
+        "the run goes on to its next turn"
+    );
+}
+
 /// The grant of a review that held a turn puts the run on the dispatch wait,
 /// as it did: the evaluation is now what the turn is held for. Its result
 /// then lets the run go on.

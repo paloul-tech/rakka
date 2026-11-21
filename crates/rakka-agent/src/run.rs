@@ -794,22 +794,54 @@ impl AgentRun {
     /// does not, and one whose gate has closed is released before this is
     /// asked (issue #166).
     ///
-    /// The guard mirrors the tool arm's own and narrows it once: an
-    /// ambiguous effect of the turn is left to its reconciliation decision,
-    /// whose resolution runs the arm itself — resting the turn early and
-    /// then authorizing a new generation would leave a resting turn with an
-    /// effect in flight.
+    /// The guard is the arms' own (`rest_turn_if_settled`): an effect of
+    /// the turn that is out holds it, and so does an ambiguous one, which is
+    /// left to its reconciliation decision — resting the turn early and then
+    /// authorizing a new generation would leave a resting turn with an
+    /// effect in flight. The arms asked only the first half until issue
+    /// #189.
     #[must_use]
     pub fn needs_turn_rest(&self) -> bool {
         self.status.permits_progress()
             && self.terminal_reason.is_none()
             && self.loop_state.pending_top_up().is_none()
             && self.loop_state.phase() == AgentLoopPhase::AwaitingTools
-            && !self.loop_state.awaits_turn_effect()
-            && !self
-                .loop_state
-                .indeterminate_effects()
-                .any(|effect| !effect.kind().outside_the_turn())
+            && !self.loop_state.has_unsettled_turn_effect()
+    }
+
+    /// Whether the record holds a turn that was rested over a call of its
+    /// own: the phase says the turn is over, or waits only for its children,
+    /// yet a call whose outcome moves the run is out or has an unknown
+    /// outcome.
+    ///
+    /// A binary before issue #189 rested a turn when the last call that was
+    /// *out* came back, with another call of the turn still unknown. Such a
+    /// record stays as it is until a person answers the unknown call, so the
+    /// settle pass opens its turn again on the first pass that touches it
+    /// ([`reopen_rested_turn`]). Left rested, an answer of "never executed"
+    /// would send the call again and the loop would record the turn without
+    /// waiting for it.
+    ///
+    /// Under this binary the shape is not written. The turn commits every
+    /// call of these kinds it holds, and none of the arms that take their
+    /// outcomes rests the turn while another is out or unknown.
+    ///
+    /// It asks only the kinds whose own arm rests the turn when the call
+    /// comes back ([`AgentRunEffectKind::moves_the_run`]), so the turn it
+    /// opens is one that will be rested. A goal evaluation or a workflow
+    /// cancel may be committed at any rest, and one out or unknown there is
+    /// no turn to open.
+    ///
+    /// A run that has ended or is winding down is not asked: neither records
+    /// a turn.
+    pub(crate) fn needs_turn_reopen(&self) -> bool {
+        !self.status.is_terminal()
+            && !self.winding_down()
+            && matches!(
+                self.loop_state.phase(),
+                AgentLoopPhase::RecordingTurn | AgentLoopPhase::AwaitingChildren
+            )
+            && self.loop_state.has_unsettled_effect_that_moves_the_run()
     }
 
     /// Whether the loop state holds `effect_id` and the effect is one that
@@ -2595,12 +2627,11 @@ fn accept_handoff_result(
                     tool: None,
                     effect_id,
                 });
-                if !winding_down && !run.loop_state.awaits_turn_effect() {
+                if !winding_down {
                     // The fence released, so the turn rests where any other
-                    // resolved call leaves it and the model corrects course.
-                    let (phase, status) = turn_rest(&run.loop_state);
-                    run.loop_state.set_phase(phase);
-                    run.status = status;
+                    // resolved call leaves it, once the last of its effects
+                    // is back, and the model corrects course.
+                    rest_turn_if_settled(run);
                 }
                 Ok(())
             }
@@ -3229,6 +3260,14 @@ fn advance_once(
         // decides nothing.
         settle_run_disposition(state, now)?;
         return owed_run_exchanges(state, now);
+    }
+    if run.needs_turn_reopen() {
+        // A record a binary before issue #189 left with its turn rested over
+        // a call of its own that is out or unknown. Open the turn again,
+        // before the loop's own step, which would record it
+        // ([`AgentRun::needs_turn_reopen`]).
+        reopen_rested_turn(state, now)?;
+        return Ok(Vec::new());
     }
     if run.needs_gate_close() {
         // A record a binary before issue #133 left holding an approval or an
@@ -4624,6 +4663,24 @@ fn evaluate_model_output(
     Ok(())
 }
 
+/// Rests the turn if the last of its effects has come back. Every arm that
+/// takes an outcome of the turn on a run that is not winding down ends here.
+///
+/// A turn that still has an effect of its own to hear from stays open
+/// ([`AgentLoopState::has_unsettled_turn_effect`]). One that is out rests
+/// the turn when it returns. One whose outcome is unknown rests it when its
+/// answer says what it returned, or when the call that answer sends again
+/// returns: so the turn is recorded with the result of every call it made,
+/// whichever of two outcomes arrived first (issue #189).
+fn rest_turn_if_settled(run: &mut AgentRun) {
+    if run.loop_state.has_unsettled_turn_effect() {
+        return;
+    }
+    let (phase, status) = turn_rest(&run.loop_state);
+    run.loop_state.set_phase(phase);
+    run.status = status;
+}
+
 /// Rests a turn a record holds open with nothing left to rest it — the
 /// repair of [`AgentRun::needs_turn_rest`], and exactly the transition the
 /// tool arm makes when the turn's last effect resolves: the phase and status
@@ -4633,6 +4690,24 @@ fn rest_unrested_turn(state: &mut AgentRunState, now: AgentTimestampMillis) -> A
     let (phase, status) = turn_rest(&run.loop_state);
     run.loop_state.set_phase(phase);
     run.status = status;
+    state.updated_at = now;
+    Ok(())
+}
+
+/// Opens again a turn a record holds rested over a call of its own, which is
+/// the repair of [`AgentRun::needs_turn_reopen`]: the phase goes back to the
+/// turn's wait, where the arm that takes the call's outcome rests the turn
+/// as it rests any other.
+///
+/// A parked run stays parked, as the call is still unknown. A run that is
+/// not parked holds the call out, sent again by the answer to its park, and
+/// takes the dispatch wait a turn with a call out rests on.
+fn reopen_rested_turn(state: &mut AgentRunState, now: AgentTimestampMillis) -> AgentRunResult<()> {
+    let run = state.run_mut()?;
+    run.loop_state.set_phase(AgentLoopPhase::AwaitingTools);
+    if run.status != AgentRunStatus::WaitingForReconciliation {
+        run.status = checkpoint_wait_status(&run.loop_state);
+    }
     state.updated_at = now;
     Ok(())
 }
@@ -5156,10 +5231,8 @@ fn apply_effect_outcome(
         {
             effect.status = AgentRunEffectStatus::Succeeded;
             let run = state.run_mut()?;
-            if !winding_down && !run.loop_state.awaits_turn_effect() {
-                let (phase, status) = turn_rest(&run.loop_state);
-                run.loop_state.set_phase(phase);
-                run.status = status;
+            if !winding_down {
+                rest_turn_if_settled(run);
             }
         }
         AgentRunEffectOutcome::Model { turn } => {
@@ -5192,12 +5265,11 @@ fn apply_effect_outcome(
                 effect_id: Some(effect_id.clone()),
             };
             run.loop_state.record_tool_result(result);
-            if !winding_down && !run.loop_state.awaits_turn_effect() {
-                // The last tool of the turn came back, so the turn rests:
-                // complete, or awaiting a closed fan-in group's children.
-                let (phase, status) = turn_rest(&run.loop_state);
-                run.loop_state.set_phase(phase);
-                run.status = status;
+            if !winding_down {
+                // When this was the last effect of the turn to come back,
+                // the turn rests: complete, or awaiting a closed fan-in
+                // group's children.
+                rest_turn_if_settled(run);
             }
         }
         AgentRunEffectOutcome::MemoryPromotion { promoted } => {
@@ -5255,12 +5327,11 @@ fn apply_effect_outcome(
                 tool: None,
                 effect_id: Some(effect_id.clone()),
             });
-            if !winding_down && !run.loop_state.awaits_turn_effect() {
-                // The last effect of the turn came back, so the turn rests:
-                // complete, or awaiting a closed fan-in group's children.
-                let (phase, status) = turn_rest(&run.loop_state);
-                run.loop_state.set_phase(phase);
-                run.status = status;
+            if !winding_down {
+                // When this was the last effect of the turn to come back,
+                // the turn rests: complete, or awaiting a closed fan-in
+                // group's children.
+                rest_turn_if_settled(run);
             }
         }
         AgentRunEffectOutcome::A2aHandoff { receipt } => {
@@ -5286,10 +5357,8 @@ fn apply_effect_outcome(
             if let Some(cell) = run.loop_state.handoff_mut() {
                 cell.mark_sent(receipt.target_generation);
             }
-            if !winding_down && !run.loop_state.awaits_turn_effect() {
-                let (phase, status) = turn_rest(&run.loop_state);
-                run.loop_state.set_phase(phase);
-                run.status = status;
+            if !winding_down {
+                rest_turn_if_settled(run);
             }
         }
         AgentRunEffectOutcome::WorkflowStart { receipt } => {
@@ -5354,12 +5423,11 @@ fn apply_effect_outcome(
             // is refused, so its dispositions only change through paths that
             // already run the fan-in step.
             try_resolve_fan_in(run, now);
-            if !winding_down && !run.loop_state.awaits_turn_effect() {
-                // The last effect of the turn came back, so the turn rests:
-                // complete, or awaiting a closed fan-in group's children.
-                let (phase, status) = turn_rest(&run.loop_state);
-                run.loop_state.set_phase(phase);
-                run.status = status;
+            if !winding_down {
+                // When this was the last effect of the turn to come back,
+                // the turn rests: complete, or awaiting a closed fan-in
+                // group's children.
+                rest_turn_if_settled(run);
             }
         }
         AgentRunEffectOutcome::ClaimAppend { .. } => {
@@ -5465,10 +5533,8 @@ fn apply_effect_outcome(
                             effect_id: Some(effect_id.clone()),
                         });
                     }
-                    if !winding_down && !run.loop_state.awaits_turn_effect() {
-                        let (phase, status) = turn_rest(&run.loop_state);
-                        run.loop_state.set_phase(phase);
-                        run.status = status;
+                    if !winding_down {
+                        rest_turn_if_settled(run);
                     }
                 }
                 if first_resolution {
@@ -5580,11 +5646,7 @@ fn apply_effect_outcome(
                         // an `Any` with nothing left to succeed, a quorum no
                         // longer reachable — in this same compare-and-set.
                         try_resolve_fan_in(run, now);
-                        if !run.loop_state.awaits_turn_effect() {
-                            let (phase, status) = turn_rest(&run.loop_state);
-                            run.loop_state.set_phase(phase);
-                            run.status = status;
-                        }
+                        rest_turn_if_settled(run);
                     }
                 }
             }
@@ -5640,11 +5702,7 @@ fn apply_effect_outcome(
                             });
                         }
                         try_resolve_fan_in(run, now);
-                        if !run.loop_state.awaits_turn_effect() {
-                            let (phase, status) = turn_rest(&run.loop_state);
-                            run.loop_state.set_phase(phase);
-                            run.status = status;
-                        }
+                        rest_turn_if_settled(run);
                     }
                     group_member_send = group_member_send || group_member_start;
                 }
@@ -9577,7 +9635,9 @@ where
             // never sent, or a status it left such a run that permits the
             // loop a step ([`AgentRun::needs_wind_down_rest`]), and a run a
             // binary before issue #186 left going past an unknown outcome
-            // ([`AgentRun::needs_park`]).
+            // ([`AgentRun::needs_park`]), and a turn a binary before issue
+            // #189 rested over a call of its own
+            // ([`AgentRun::needs_turn_reopen`]).
             let can_advance = self.state()?.needs_answered_proposal_drop()
                 || self.state()?.run().is_some_and(|run| {
                     run.can_advance()
@@ -9588,6 +9648,7 @@ where
                         || run.needs_decided_end()
                         || run.needs_wind_down_rest()
                         || run.needs_park()
+                        || run.needs_turn_reopen()
                         || run.needs_gate_close()
                 });
             if !can_advance {
@@ -9619,6 +9680,7 @@ where
                         || run.needs_decided_end()
                         || run.needs_wind_down_rest()
                         || run.needs_park()
+                        || run.needs_turn_reopen()
                         || run.needs_gate_close()
                         || run.needs_turn_rest()
                 });
@@ -14387,6 +14449,187 @@ mod tests {
             !fx.state.run().expect("run").needs_park(),
             "a cancellation in progress is a wind-down with or without its reason"
         );
+    }
+
+    /// A turn rests when none of its own effects is out or unknown (issue
+    /// #189). The fixture's send is a call of the turn: out, it holds the
+    /// turn; unknown, it holds it too, which is the half the rest condition
+    /// did not ask; back, it does not. A memory promotion is outside the
+    /// turn and holds nothing, out or unknown. The settle pass's own rest
+    /// asks the same of a turn at `AwaitingTools`.
+    #[test]
+    fn a_turn_is_open_while_a_call_of_its_own_is_out_or_unknown() {
+        use AgentRunEffectStatus::{
+            Cancelled, Compensated, Failed, Indeterminate, Pending, Ready, Succeeded,
+        };
+
+        for (status, open) in [
+            (Pending, true),
+            (Ready, true),
+            (Indeterminate, true),
+            (Succeeded, false),
+            (Failed, false),
+            (Cancelled, false),
+            (Compensated, false),
+        ] {
+            let mut fx =
+                handoff_send_fixture(AgentRunStatus::Running, AgentHandoffStatus::Pending, status);
+            let loop_state = &fx.run().loop_state;
+            assert_eq!(
+                (
+                    loop_state.has_unsettled_turn_effect(),
+                    loop_state.has_unsettled_effect_that_moves_the_run()
+                ),
+                (open, open),
+                "a call of the turn that is {status:?}"
+            );
+            assert_eq!(
+                loop_state.awaits_turn_effect(),
+                open && status != Indeterminate,
+                "what is out is the half the turn's rest used to ask: {status:?}"
+            );
+            assert_eq!(
+                fx.run().needs_turn_rest(),
+                !open,
+                "the settle pass rests a turn at `AwaitingTools` only once it is not open: \
+                 {status:?}"
+            );
+
+            park_a_promotion(&mut fx);
+            let loop_state = &fx.run().loop_state;
+            assert_eq!(
+                (
+                    loop_state.has_unsettled_turn_effect(),
+                    loop_state.has_unsettled_effect_that_moves_the_run()
+                ),
+                (open, open),
+                "an unknown promotion beside it is outside the turn: {status:?}"
+            );
+        }
+    }
+
+    /// The settle pass opens a turn again only where a binary before issue
+    /// #189 could have rested it wrongly: a live run that is not winding
+    /// down, whose phase says the turn is over or waits only for its
+    /// children, and which holds a call whose outcome moves the run that is
+    /// out or unknown. Asked of any other record it would move a phase that
+    /// is right, or keep the settle loop turning.
+    #[test]
+    fn needs_turn_reopen_asks_only_a_live_run_resting_over_a_call_of_its_turn() {
+        let at = |fx: &mut HandoffSendFixture, phase: AgentLoopPhase| {
+            fx.state
+                .run_mut()
+                .expect("the run exists")
+                .loop_state
+                .set_phase(phase);
+        };
+        let set = |fx: &mut HandoffSendFixture,
+                   status: AgentRunStatus,
+                   reason: Option<AgentRunTerminalReason>| {
+            let run = fx.state.run_mut().expect("the run exists");
+            run.status = status;
+            run.terminal_reason = reason;
+        };
+        let rests = [
+            AgentLoopPhase::RecordingTurn,
+            AgentLoopPhase::AwaitingChildren,
+        ];
+
+        // The call unknown, parked: the record the earlier binary left. And
+        // the call out, sent again by the answer to its park.
+        for (status, effect) in [
+            (
+                AgentRunStatus::WaitingForReconciliation,
+                AgentRunEffectStatus::Indeterminate,
+            ),
+            (
+                AgentRunStatus::WaitingForEffect,
+                AgentRunEffectStatus::Ready,
+            ),
+            (AgentRunStatus::Running, AgentRunEffectStatus::Pending),
+        ] {
+            let mut fx = handoff_send_fixture(status, AgentHandoffStatus::Pending, effect);
+            for phase in rests {
+                at(&mut fx, phase);
+                assert!(
+                    fx.run().needs_turn_reopen(),
+                    "at {phase:?} with its call {effect:?}"
+                );
+            }
+            for phase in [
+                AgentLoopPhase::PreparingContext,
+                AgentLoopPhase::AwaitingModel,
+                AgentLoopPhase::EvaluatingModelOutput,
+                AgentLoopPhase::AwaitingTools,
+                AgentLoopPhase::DecidingContinuation,
+                AgentLoopPhase::Suspended,
+                AgentLoopPhase::Complete,
+            ] {
+                at(&mut fx, phase);
+                assert!(
+                    !fx.run().needs_turn_reopen(),
+                    "at {phase:?} the turn is open, or was recorded, or there is none"
+                );
+            }
+        }
+
+        // The call back: nothing of the turn's is out or unknown, with or
+        // without an unknown promotion beside it.
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::Running,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Succeeded,
+        );
+        for phase in rests {
+            at(&mut fx, phase);
+            assert!(!fx.run().needs_turn_reopen(), "at {phase:?}, its call back");
+        }
+        park_a_promotion(&mut fx);
+        set(&mut fx, AgentRunStatus::WaitingForReconciliation, None);
+        for phase in rests {
+            at(&mut fx, phase);
+            assert!(
+                !fx.run().needs_turn_reopen(),
+                "at {phase:?}, parked on a promotion, which is no call of the turn"
+            );
+        }
+
+        // Ended, or winding down: neither records a turn.
+        let mut fx = handoff_send_fixture(
+            AgentRunStatus::WaitingForReconciliation,
+            AgentHandoffStatus::Pending,
+            AgentRunEffectStatus::Indeterminate,
+        );
+        at(&mut fx, AgentLoopPhase::RecordingTurn);
+        assert!(fx.run().needs_turn_reopen());
+        let cancelled = || {
+            Some(AgentRunTerminalReason::CancellationRequested {
+                reason: "operator stopped the work".to_string(),
+            })
+        };
+        for (status, reason, why) in [
+            (AgentRunStatus::Cancelled, cancelled(), "ended"),
+            (AgentRunStatus::Failed, None, "ended, whatever its reason"),
+            (
+                AgentRunStatus::WaitingForReconciliation,
+                cancelled(),
+                "winding down, parked",
+            ),
+            (AgentRunStatus::Cancelling, cancelled(), "winding down"),
+            (
+                AgentRunStatus::Cancelling,
+                None,
+                "a cancellation in progress, with or without its reason",
+            ),
+            (
+                AgentRunStatus::WaitingForReconciliation,
+                Some(AgentRunTerminalReason::ResultAccepted),
+                "its end is decided",
+            ),
+        ] {
+            set(&mut fx, status, reason);
+            assert!(!fx.run().needs_turn_reopen(), "{why}");
+        }
     }
 
     /// The repair opens a checkpoint for an ended run's outside-the-turn park

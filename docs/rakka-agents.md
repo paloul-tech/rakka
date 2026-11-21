@@ -209,7 +209,12 @@ leaves behind is the same either way.
    the turn the rejection began, or records the turn the wait closed. A child
    the deadline timed out is sent its cancellation without waiting for that
    answer. On a parked run that is winding down, the rejection begins no
-   turn and the deadline resumes nothing. A gate that closes without a grant
+   turn and the deadline resumes nothing. A turn does not rest while one of
+   its own calls has an unknown outcome: the result of another of its calls,
+   or a wait resolved meanwhile, leaves it open at `AwaitingTools`. It rests
+   when the answer says what the call returned, or, where the answer sends
+   the call again, when that call returns, so a turn is recorded with the
+   result of every call it made (issue #189). A gate that closes without a grant
    (denied or expired) fails its effect. For a tool call that winds the run
    down. Where the run survives the failure, as it does for a goal
    evaluation and for the send or start of a fan-out member, a run that
