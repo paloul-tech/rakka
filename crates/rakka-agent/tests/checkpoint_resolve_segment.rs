@@ -586,8 +586,8 @@ async fn a_resolution_whose_re_read_fails_after_its_settle_pass_still_leaves_its
         sink.operations()
     );
     // A clean confirmation's settle pass parks the run on its next model
-    // call before the phase is read, so it closes no resume segment, and
-    // neither call here closes one either.
+    // call before the run is asked what holds it, so it closes no resume
+    // segment, and neither call here closes one either.
     assert_eq!(
         closed(&sink, "resume").len(),
         resumes_before,

@@ -545,7 +545,7 @@ async fn a_reconciliation_whose_settle_pass_loses_a_write_closes_what_a_clean_on
         clean,
         (1, 0),
         "the clean call resolved the checkpoint once, and its settle pass parked the run on \
-         its next model call before the phase was read: {:?}",
+         its next model call before the run was asked what holds it: {:?}",
         sink.operations()
     );
 
