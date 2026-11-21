@@ -978,9 +978,26 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   | Leaves a run it did not find winding down on its proposal, or at its decided end with a call still out | Closes `run-resume` | Unchanged |
   | Leaves the run on its next model call, its tools or its children | Closes none | Unchanged |
 
-  A command that finds the run at a phase that is no wait closes no `run-resume`, whatever it does, as before. The answer to a park on such a run is one.
+  A command that finds the run at a phase that is no wait closes no `run-resume`, whatever it does, as before. The answer to a park on such a run was one; issue #193, below, changes that for the answer.
 
-  **What a deployment sees.** Fewer `rakka.agent.run.resume` spans, and none on a command that did not close one before. The turn of a run that was parked at its model call, or cancelled there with another call still out, closes none where it closed one on the model's result. A run whose every hold showed in its phase closes the segments it closed. The segment is decided on where the command's own pass leaves the run, and that pass also carries the exchanges the run itself sent and takes their replies (its task's decision on a proposal, a top-up's answer), so what a reply decides within the pass is counted. An exchange delivered to the run (a delegation's result, a handoff's result, a cancellation) closes none.
+  **What a deployment sees.** Fewer `rakka.agent.run.resume` spans, and none on a command that did not close one before. The turn of a run that was parked at its model call, or cancelled there with another call still out, closes none where it closed one on the model's result (for the parked run, issue #193 closes it on the answer). A run whose every hold showed in its phase closes the segments it closed. The segment is decided on where the command's own pass leaves the run, and that pass also carries the exchanges the run itself sent and takes their replies (its task's decision on a proposal, a top-up's answer), so what a reply decides within the pass is counted. An exchange delivered to the run (a delegation's result, a handoff's result, a cancellation) closes none.
+
+- Issue #193 ("the answer that sets a parked run going from a phase that is no wait closes no run-resume segment") is the second half of issue #191, above. **No durable field, status, error code, decision kind or segment class is added.** Segments are observability: no state and no decision reads them.
+
+  **What was wrong.** The `run-resume` timer starts only when a command finds the run on a wait of its phase. A run parked on an unknown outcome can stand at a phase that is no wait: at `EvaluatingModelOutput`, where its model's result landed while it was parked, for one. The answer that takes the park away and takes that run on to its proposal closed `checkpoint-resolve` and no `run-resume`, so the turn showed no resume at all.
+
+  **The rule.** The timer also starts when a command finds the run held by a reconciliation park alone: it is `WaitingForReconciliation`, it is not winding down, and with the park taken away the loop would take a step (it is at `PreparingContext`, `EvaluatingModelOutput` or `RecordingTurn`, or at `DecidingContinuation` with no proposal pending, and asks for no top-up). From such a park the segment closes when the command resolved a checkpoint and its pass leaves the run ended or with nothing holding it. It carries the links a resolution carries: to the span that parked the run, and to the request.
+
+  | A command that finds the run parked at a phase that is no wait | Before | Now |
+  |---|---|---|
+  | The answer takes the run on to its proposal, or to its end | Closes none | Closes `run-resume` |
+  | The answer takes the run on to its next model call or its tools | Closes none | Unchanged, as for any command that leaves the run on its next wait |
+  | The answer finds the run standing on its proposal | Closes none | Unchanged |
+  | The answer finds the run asking for a top-up as well | Closes none | Unchanged |
+  | The answer finds the run winding down | Closes none | Unchanged |
+  | A command that resolved no checkpoint, whose settle pass takes away a park an earlier build left with nothing to reconcile | Closes none | Unchanged |
+
+  **What a deployment sees.** One more `rakka.agent.run.resume` span for a run that was parked at a phase that is no wait and whose answer took it to its proposal or its end. No command that finds the run on a wait of its phase closes a different segment than before.
 
 Run the default compatibility matrix:
 

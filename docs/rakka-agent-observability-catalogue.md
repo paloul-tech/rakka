@@ -242,8 +242,14 @@ wind-down the command found it in. A command that leaves the run on its next
 wait closes none, so a run closes fewer of these segments than it discharges
 waits: an ordinary run closes one, on the model result whose pass leaves it
 on its proposal or, where its task answers within that pass, ended. A
-command that finds the run at a phase that is no wait closes none, and
-neither does an exchange delivered to the run.
+command that finds the run at a phase that is no wait closes none, with one
+exception: the answer to a reconciliation park that alone holds the run. A
+run parked on an unknown outcome can stand at a phase from which the loop
+would take a step, and the command that resolves the checkpoint and leaves
+that run ended or held by nothing closes the segment, with the two links of
+the table below. A run parked while it stands on its proposal, one that also
+asks for a top-up, and one that is winding down are held by more than the
+park. An exchange delivered to the run closes none.
 
 Two rows of 17.6 are absent because the operations do not exist: `embeddings
 {model}` and `plan {agent.name}`. 17.6 asks for the planning span "only when
