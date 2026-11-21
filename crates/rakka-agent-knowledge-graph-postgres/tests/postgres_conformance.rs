@@ -233,6 +233,16 @@ async fn retention_keeps_a_claim_that_moved_under_the_sweep_when_dsn_is_set() {
 }
 
 #[tokio::test]
+async fn retention_keeps_a_claim_that_moves_between_the_sweeps_two_reads_when_dsn_is_set() {
+    let Some(store) = store().await else { return };
+    conformance::retention_leaves_a_claim_that_moves_between_its_two_reads(
+        &store,
+        ConformanceScopes::unique("pg-retention-between-reads"),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn keyword_search_ranks_admitted_claims_when_dsn_is_set() {
     // The same clause the in-memory reference passes: this backend answers
     // through its index, and must answer the same hits in the same order.

@@ -956,6 +956,30 @@ incorrectly.
   that reuses one request id across a batch of deletes is told, rather than
   being answered "done" for claims that are still there.
 
+  **A claim whose stored history is damaged** (issue #138). A store writes a
+  claim and its transition history together. Rows edited by hand, or tables
+  restored to different moments, can leave a claim whose stored transitions
+  are not the ones its record counts: a row missing, a row too many, a row
+  that is another claim's, or a row that cannot be read. On PostgreSQL a
+  `tombstone` or a `delete` of such a claim answers `claim-history-damaged`,
+  writes nothing and spends no operation id. It is not a lost race, and a
+  retry answers the same. The refusal is deliberate: the stored result of a
+  transition whose row is gone holds the whole claim as it stood, and no row
+  names it, so erasing only what the rows name would leave a copy behind and
+  report success.
+
+  A store built `with_damaged_history_erasure()` erases such a claim, and
+  clears those stored results too. To find them it reads every transition
+  row of the tenant and space in the operation ledger, on each attempt to
+  erase a damaged claim, which takes time in proportion to that ledger. Build
+  one for the operator's action that answers a `claim-history-damaged`.
+
+  The retention sweep counts such a claim in `damaged` where it meets the
+  damage, leaves it, and goes on to the claims behind it. It deletes no claim
+  whose history does not end where its record says, through either store. It
+  is no scan for damage: a `damaged` of zero does not say a space holds no
+  damaged claim. The in-memory store cannot be damaged this way.
+
   **Erasure reaches the search index.** On PostgreSQL a claim's search words
   are held beside its row. A tombstone clears them in its one statement, a
   delete removes the row, and a trigger on the table clears the words of any

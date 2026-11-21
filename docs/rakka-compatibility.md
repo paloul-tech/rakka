@@ -875,6 +875,45 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   - A reconcileable call whose failed attempt is asked about is still over-charged by one attempt where the protocol answers "executed" or the outcome is parked, and its retry on a live run still records one failed attempt more than was made.
   - A dispatch refused before its attempt starts is still reported with one attempt.
 
+- Issues #138 and #137 ("a claim whose transition rows disagree with its record cannot be tombstoned or deleted in PostgreSQL, and reports lost races", "no clause reaches the sweep's moved answer for a transition between its two reads") change what `PostgresKnowledgeGraphStore` answers for a claim whose stored history is damaged, and what the retention sweep does with one. They add one stable refusal code, one field on the sweep's report, one store option and one conformance clause. No durable field, no schema change, no migration, no new metric.
+
+  **What was wrong.** A store writes a claim and its transition history in one statement. Rows edited by hand, or tables restored to different moments, can leave a claim whose transition rows are not the ones its record counts. A `tombstone` or a `delete` of such a claim read the mismatch as a transition that had raced it, tried eight times, and answered `claim-backend-failed`, "lost 8 compare-and-set races; retry". Nothing had raced and a retry answered the same. The retention sweep returned that error, so every pass ended at that claim. A claim missing only its last transition was counted `moved` on every pass and never reported. Two shapes were erased with a wrong result. A claim that had lost one transition and gained another held the right number of rows, and was erased with the lost transition's stored result left in the ledger. A claim holding, in place of one of its own rows, a row that was another claim's transition had that other claim's stored result cleared with its own.
+
+  **What a damaged history is.** A claim's history is whole when, for each ordinal from one to its record's transition count, the store holds one row whose record is that claim's transition of that ordinal, and no other row. Anything else is damage: a row missing, a row too many, a row that is another claim's, a row that cannot be read.
+
+  | A claim whose stored history is damaged | Before | Now |
+  |---|---|---|
+  | `tombstone` or `delete`, PostgreSQL | `claim-backend-failed`, "lost 8 compare-and-set races; retry", after eight attempts | `claim-history-damaged`, on the first. Nothing is written and no operation id is spent |
+  | The same, in a store built `with_damaged_history_erasure()` | The option did not exist | The claim is erased, and every stored result of its own operations is cleared, those of transitions with no row among them |
+  | The right number of rows, not the ones the record counts | Erased, with one stored result left behind for each lost transition | Damaged, as above |
+  | A row that cannot be read | `claim-backend-failed`, "a stored transition record could not be parsed", and the sweep's pass ended there | Damaged, as above |
+  | The retention sweep reaches one whose history does not end where its count says: the last transition gone, or an entry behind it | Counted `moved` on every pass; for a stub or a proposed claim, the pass ended with the store's error | Counted in `damaged`, and no delete is attempted, with either store |
+  | The retention sweep reaches one whose history ends where it should, and that is due | The pass ended with the store's error | Counted in `damaged`, left, and the pass goes on. Deleted instead when the store opted in |
+
+  **How damage is told from a race.** The history is read together with the claim row's fence column, in one statement. A transition raises the fence and adds its row together, so a history one ahead of the claim the erasure read shows a fence that is no longer the one it read: a race, read again as before, and answered `claim-backend-failed` only after eight real ones. The fence it read beside a history that is not whole is damage. It is decided by that one read and not by counting attempts.
+
+  **Who sees the change.**
+
+  - A caller that matched `claim-backend-failed` to retry an erasure no longer retries one that could never succeed. A caller that maps unknown codes to a failure is where it was.
+  - **`KnowledgeSpaceRetentionReport` gains `damaged`**, and every examined claim now lands in exactly one of five counts where it was four: `deleted`, `not_yet_due`, `retained`, `moved`, `damaged`. A deployment that alerts on a pass that returns an error will stop seeing one for a damaged claim. A `damaged` above zero means claims to erase or repair. **Zero does not mean the space holds none:** the sweep reads a history only to age a claim or before deleting one, so a damaged claim in a status with no window is `retained`, and one that is not yet due can be `not_yet_due`.
+  - **The sweep makes more reads.** Before it deletes a stub or a proposed claim, which it ages by the claim's own record, it now reads the end of that claim's history: one bounded read for each such claim that is due. And where a history read does not find what the claim's count says, it reads the claim once more, to tell a claim that moved from one that is damaged. A claim that moved is still counted `moved`.
+  - **The sweep attempts no delete for a claim that has transitions stored past its record,** whether it is a stub, a proposed claim or neither, and through either store. Those rows may be the claim's real, later history under a claim row restored to an earlier state. The explicit erasure is the way to remove such a claim.
+  - A backend other than Rakka's that runs `conformance::check_knowledge_graph_contract` runs one more clause, `retention_leaves_a_claim_that_moves_between_its_two_reads`. It holds the sweep, which is Rakka's; a backend whose `transitions` pages are right passes it.
+
+  **The store option.** `with_damaged_history_erasure()` is off by default. A store that opted in asks no stored row of a damaged history for an operation's name. It clears the stored results the claim itself names, its append and its tombstone, and finds its transitions' results by reading every transition row of the tenant and space in the operation ledger, comparing each one's own claim id. That read is not keyed and takes time in proportion to that ledger, once for each attempt to erase a damaged claim: an attempt that loses a race reads it again, and a tombstone followed by a delete reads it for each. The sweep run through such a store pays it for each damaged claim it deletes. A stored result there that mentions the claim and cannot be parsed fails the erasure with `claim-backend-failed`, in a message that names the result's operation. A claim whose history is whole is erased exactly as before, by either store.
+
+  **Additive.** In `rakka-agent-knowledge-graph`: `ClaimError::HistoryDamaged` (`claim-history-damaged`), `KnowledgeSpaceRetentionReport::damaged`, `conformance::retention_leaves_a_claim_that_moves_between_its_two_reads`. In `rakka-agent-knowledge-graph-postgres`: `with_damaged_history_erasure`, `damaged_history_erasure`. `ClaimError` and the report are `#[non_exhaustive]`.
+
+  **Mixed builds and rollback.** Nothing durable changes, so builds mix freely and rolling back needs nothing. An earlier build answers a damaged claim as before.
+
+  **Not changed.**
+
+  - Reads do not look for damage: `get`, `query` and `transitions` answer what is stored.
+  - Nothing repairs a damaged history. The store erases the claim, on request, or leaves it.
+  - A stored result an earlier build left behind, when it erased a claim with the right number of wrong rows, is still in the ledger. Nothing in the store finds it: the claim that would name it is gone.
+  - A transition row from a schema newer or older than the binary reads is refused with the schema's own code, as before, and is not called damage.
+  - A trust transition of a damaged claim is not examined here.
+  - The in-memory store writes a claim and its history under one lock and has no rows to edit; it never answers the new code.
 - Issue #186 ("a live run parked on an unknown outcome goes on to its next model call") makes a reconciliation park hold a live run through two transitions that lifted it. **No durable field, status, error code or decision kind is added.**
 
   **What was wrong.** A live run that holds an effect whose outcome is unknown is parked `WaitingForReconciliation` until a person answers what the call did, and the loop takes no step there. Two transitions wrote `Running` over the park: the task's rejection of the run's proposal, and the deadline of a fan-in wait. The run's next step then prepared a turn and sent its model call, with the outcome unanswered and its checkpoint still waiting.

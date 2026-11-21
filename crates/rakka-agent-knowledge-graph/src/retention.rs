@@ -41,6 +41,41 @@
 //! nothing, so a later pass deletes the claim under the same derived operation
 //! id once it is due in its new state.
 //!
+//! The sweep also stops short of the delete when it can see the claim moved.
+//! It reads the end of a claim's history before it acts on what the query
+//! returned: the entry of the claim's transition count, and nothing behind
+//! it. A claim past `Proposed` is read so to date the state it rests in; a
+//! stub or a proposed claim, which its own record dates, is read so once it
+//! is due. When that read answers anything else, the sweep reads the claim
+//! once more. A claim that is gone or at a higher count moved, and is counted
+//! so.
+//!
+//! # A claim whose history is damaged is counted and left
+//!
+//! A store writes a claim and its history together. Rows edited by hand, or
+//! tables restored to different moments, can leave a claim whose stored
+//! transitions are not the ones its record counts. The sweep counts such a
+//! claim as `damaged` where it meets the damage:
+//!
+//! - The end of the claim's history is not where its count says, and the
+//!   claim read again still counts the transitions the query read. The sweep
+//!   attempts no delete. A missing last transition leaves it nothing to age
+//!   the claim by. Entries behind the last may be the claim's real, later
+//!   history under a record restored to an earlier state, and the sweep does
+//!   not delete on a record its own history contradicts, whatever the store
+//!   would do with the delete.
+//! - The history ends where it should, the claim is due, and the store
+//!   refuses the delete `claim-history-damaged`.
+//!
+//! The claim is left as it is and the pass goes on to the claims behind it.
+//! A later pass that meets the damage counts it again, until an operator
+//! erases or repairs the claim.
+//!
+//! **The sweep is no scan for damage.** A claim in a status with no window is
+//! retained unread. A claim that is not yet due, and whose history ends
+//! where it should, is counted `not_yet_due` whatever else its history has
+//! lost. A `damaged` of zero does not say the space holds no damaged claim.
+//!
 //! # No resident sweeper, no registry
 //!
 //! The sweep is called by the application on its own schedule, like the
@@ -99,7 +134,10 @@
 //!
 //! Each pass walks the space in claim-id order through `query`, and makes one
 //! bounded `transitions` read per candidate that has left `Proposed` and whose
-//! status has a window. On a backend whose `query` filters after decoding
+//! status has a window, and one per stub or proposed claim that is due,
+//! before its delete. A read that does not find the end of the history where
+//! the claim's count says is followed by one `get` of that claim. On a
+//! backend whose `query` filters after decoding
 //! rows, a pass is linear in the space. That is an accepted cost; a "status
 //! since" stamp on the claim is the remedy if it ever matters.
 
@@ -206,7 +244,7 @@ impl KnowledgeSpaceRetentionPolicy {
 /// What one sweep call did.
 ///
 /// Every examined claim lands in exactly one of `deleted`, `not_yet_due`,
-/// `retained` and `moved`, so the four sum to `examined`.
+/// `retained`, `moved` and `damaged`, so the five sum to `examined`.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub struct KnowledgeSpaceRetentionReport {
@@ -223,6 +261,12 @@ pub struct KnowledgeSpaceRetentionReport {
     /// moved, tombstoned, or already gone. They are left alone; a later pass
     /// judges them in the state they are then in.
     pub moved: usize,
+    /// Claims the sweep found with a stored history that disagrees with
+    /// their record: the history does not end where the record's count says,
+    /// or the store refused the delete `claim-history-damaged`. Each is left
+    /// as it is and the pass goes on. Zero does not say the space holds none:
+    /// the sweep reads a history only to age a claim or before deleting one.
+    pub damaged: usize,
     /// The space is under a legal hold: nothing was read or deleted.
     pub held: bool,
     /// Where the next call resumes, when claims remain past this call's batch.
@@ -230,11 +274,22 @@ pub struct KnowledgeSpaceRetentionReport {
     pub next: Option<ClaimCursor>,
 }
 
-/// A caller-supplied step run on each due claim immediately before its
-/// delete. Test support: it is how a conformance clause moves a claim under
-/// the sweep.
-pub(crate) type BeforeRetentionDelete<'h> =
+/// A caller-supplied step run on a claim inside the sweep. Test support: it
+/// is how a conformance clause moves a claim under the sweep.
+pub(crate) type RetentionHook<'h> =
     dyn Fn(&Claim) -> Pin<Box<dyn Future<Output = ()> + Send + 'h>> + Send + Sync + 'h;
+
+/// The steps a conformance clause can run inside the sweep, one for each
+/// place the sweep has read a claim and not yet acted on what it read.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RetentionHooks<'a, 'h> {
+    /// Run on each claim whose history the sweep reads, after the query
+    /// read the claim and immediately before that read: a claim past
+    /// `Proposed` with a window, and a stub or a proposed claim that is due.
+    pub(crate) between_reads: Option<&'a RetentionHook<'h>>,
+    /// Run on each due claim immediately before its delete.
+    pub(crate) before_delete: Option<&'a RetentionHook<'h>>,
+}
 
 /// Whether a claim that entered its state at `entered_at` has outlived
 /// `window` by `now`.
@@ -274,7 +329,16 @@ pub async fn discharge_knowledge_space_retention(
     cursor: Option<ClaimCursor>,
     max_batch: usize,
 ) -> ClaimResult<KnowledgeSpaceRetentionReport> {
-    discharge(store, scope, policy, now, cursor, max_batch, None).await
+    discharge(
+        store,
+        scope,
+        policy,
+        now,
+        cursor,
+        max_batch,
+        RetentionHooks::default(),
+    )
+    .await
 }
 
 /// [`discharge_knowledge_space_retention`], with a step run on each due claim
@@ -286,18 +350,27 @@ pub(crate) async fn discharge_knowledge_space_retention_with_hook(
     now: AgentTimestampMillis,
     cursor: Option<ClaimCursor>,
     max_batch: usize,
-    before_delete: &BeforeRetentionDelete<'_>,
+    before_delete: &RetentionHook<'_>,
 ) -> ClaimResult<KnowledgeSpaceRetentionReport> {
-    discharge(
-        store,
-        scope,
-        policy,
-        now,
-        cursor,
-        max_batch,
-        Some(before_delete),
-    )
-    .await
+    let hooks = RetentionHooks {
+        between_reads: None,
+        before_delete: Some(before_delete),
+    };
+    discharge(store, scope, policy, now, cursor, max_batch, hooks).await
+}
+
+/// [`discharge_knowledge_space_retention`], with the steps `hooks` names run
+/// inside it.
+pub(crate) async fn discharge_knowledge_space_retention_with_hooks(
+    store: &dyn KnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    policy: &KnowledgeSpaceRetentionPolicy,
+    now: AgentTimestampMillis,
+    cursor: Option<ClaimCursor>,
+    max_batch: usize,
+    hooks: RetentionHooks<'_, '_>,
+) -> ClaimResult<KnowledgeSpaceRetentionReport> {
+    discharge(store, scope, policy, now, cursor, max_batch, hooks).await
 }
 
 async fn discharge(
@@ -307,7 +380,7 @@ async fn discharge(
     now: AgentTimestampMillis,
     cursor: Option<ClaimCursor>,
     max_batch: usize,
-    before_delete: Option<&BeforeRetentionDelete<'_>>,
+    hooks: RetentionHooks<'_, '_>,
 ) -> ClaimResult<KnowledgeSpaceRetentionReport> {
     let mut report = KnowledgeSpaceRetentionReport::default();
     if policy.legal_hold() {
@@ -333,16 +406,7 @@ async fn discharge(
         for claim in page.claims.into_iter().take(remaining) {
             report.examined += 1;
             position = Some(claim.claim_id.clone());
-            examine(
-                store,
-                scope,
-                policy,
-                now,
-                &claim,
-                before_delete,
-                &mut report,
-            )
-            .await?;
+            examine(store, scope, policy, now, &claim, hooks, &mut report).await?;
         }
         if !more {
             // The space is exhausted: there is nowhere to resume.
@@ -356,6 +420,60 @@ async fn discharge(
     Ok(report)
 }
 
+/// What the store holds at the end of one claim's history, against the
+/// transition count the query read with the claim.
+enum HistoryEnd {
+    /// The transition of the claim's count with nothing behind it, and when
+    /// it occurred; `None` for a claim that counts no transition and has
+    /// none stored.
+    Clean(Option<AgentTimestampMillis>),
+    /// The claim is gone, or counts more transitions than the query read.
+    Moved,
+    /// The claim is as the query read it, and its history does not end where
+    /// its count says.
+    Damaged,
+}
+
+/// Reads the end of one claim's stored history: one bounded read of the
+/// entry after the one before its last, and nothing after that.
+///
+/// When that is not the claim's last transition with nothing behind it, a
+/// claim that moved since the query read it answers so, and so does one
+/// whose stored history is damaged. The claim says which, in one more read:
+/// a transition raises its count, and a delete removes it.
+async fn history_end(
+    store: &dyn KnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    claim: &Claim,
+) -> ClaimResult<HistoryEnd> {
+    let count = claim.transition_count();
+    let page = store
+        .transitions(
+            scope,
+            &claim.claim_id,
+            ClaimTransitionCursor::after_ordinal(count.saturating_sub(1)).with_limit(1),
+        )
+        .await?;
+    match (page.transitions.first(), page.next) {
+        (None, None) if count == 0 => return Ok(HistoryEnd::Clean(None)),
+        (Some(last), None) if count > 0 && last.ordinal == count => {
+            return Ok(HistoryEnd::Clean(Some(last.occurred_at)));
+        }
+        _ => {}
+    }
+    let at_the_count_read = store
+        .get(scope, &claim.claim_id)
+        .await?
+        .is_some_and(|reread| reread.transition_count() == count);
+    Ok(if at_the_count_read {
+        // Still there, with the transitions the query counted: nothing
+        // moved. The store does not hold the history the record counts.
+        HistoryEnd::Damaged
+    } else {
+        HistoryEnd::Moved
+    })
+}
+
 /// Judges one claim against the policy and deletes it when it is due.
 async fn examine(
     store: &dyn KnowledgeGraphStore,
@@ -363,12 +481,12 @@ async fn examine(
     policy: &KnowledgeSpaceRetentionPolicy,
     now: AgentTimestampMillis,
     claim: &Claim,
-    before_delete: Option<&BeforeRetentionDelete<'_>>,
+    hooks: RetentionHooks<'_, '_>,
     report: &mut KnowledgeSpaceRetentionReport,
 ) -> ClaimResult<()> {
     // The window and the instant the claim entered the state it applies to. A
     // stub is judged by the tombstone window alone, whatever its trust.
-    let (window, entered_at) = if let Some(tombstone) = claim.tombstone() {
+    let (window, on_record) = if let Some(tombstone) = claim.tombstone() {
         (policy.tombstone_window(), Some(tombstone.tombstoned_at))
     } else if claim.trust() == ClaimTrustStatus::Proposed {
         (policy.window(claim.trust()), Some(claim.created_at))
@@ -379,26 +497,25 @@ async fn examine(
         report.retained += 1;
         return Ok(());
     };
-    let entered_at = match entered_at {
+    // A claim that has left `Proposed` is aged by its last transition, which
+    // is read here. A stub or a proposed claim is aged by its own record,
+    // and its history is read below, once it is due.
+    let entered_at = match on_record {
         Some(entered_at) => entered_at,
         None => {
-            // The last transition is the one whose ordinal equals the claim's
-            // transition count. One bounded read: the entry after the one
-            // before it, and nothing after that.
-            let count = claim.transition_count();
-            let page = store
-                .transitions(
-                    scope,
-                    &claim.claim_id,
-                    ClaimTransitionCursor::after_ordinal(count.saturating_sub(1)).with_limit(1),
-                )
-                .await?;
-            match (page.transitions.first(), page.next) {
-                (Some(last), None) if last.ordinal == count => last.occurred_at,
-                // No such transition, a different ordinal, or a later one
-                // behind it: the claim moved since the query read it.
-                _ => {
+            if let Some(between_reads) = hooks.between_reads {
+                between_reads(claim).await;
+            }
+            match history_end(store, scope, claim).await? {
+                HistoryEnd::Clean(Some(occurred_at)) => occurred_at,
+                HistoryEnd::Moved => {
                     report.moved += 1;
+                    return Ok(());
+                }
+                // A claim past `Proposed` counts a transition, so a history
+                // with none to end on is no clean one for it.
+                HistoryEnd::Damaged | HistoryEnd::Clean(None) => {
+                    report.damaged += 1;
                     return Ok(());
                 }
             }
@@ -408,8 +525,30 @@ async fn examine(
         report.not_yet_due += 1;
         return Ok(());
     }
+    if on_record.is_some() {
+        // Due on its record's word alone. Before it is deleted on that word,
+        // the end of its history is read as it is for every other claim. A
+        // history that runs past the record may be the claim's real, later
+        // one, under a claim row that was restored to an earlier state; the
+        // sweep does not delete on a record its own history contradicts,
+        // whatever the store would do with the delete.
+        if let Some(between_reads) = hooks.between_reads {
+            between_reads(claim).await;
+        }
+        match history_end(store, scope, claim).await? {
+            HistoryEnd::Clean(_) => {}
+            HistoryEnd::Moved => {
+                report.moved += 1;
+                return Ok(());
+            }
+            HistoryEnd::Damaged => {
+                report.damaged += 1;
+                return Ok(());
+            }
+        }
+    }
 
-    if let Some(before_delete) = before_delete {
+    if let Some(before_delete) = hooks.before_delete {
         before_delete(claim).await;
     }
     let request = ClaimDeleteRequest {
@@ -432,6 +571,10 @@ async fn examine(
         // Moved, tombstoned, or deleted by someone else since the read. The
         // refusal spent nothing; a later pass judges the claim as it then is.
         Err(ClaimError::DeleteStale { .. } | ClaimError::NotFound { .. }) => report.moved += 1,
+        // The store will not erase a claim whose history it does not hold.
+        // Nothing was written. The claim is one for an operator, and it must
+        // not end the pass for the claims behind it.
+        Err(ClaimError::HistoryDamaged { .. }) => report.damaged += 1,
         Err(error) => return Err(error),
     }
     Ok(())

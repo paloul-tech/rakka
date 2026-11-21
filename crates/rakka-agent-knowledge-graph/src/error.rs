@@ -287,6 +287,23 @@ pub enum ClaimError {
         /// Claim that was addressed.
         claim_id: ClaimId,
     },
+    /// The claim's stored history disagrees with its record: the store does
+    /// not hold exactly the transitions the record counts, each a readable
+    /// transition of that claim. A store writes a claim and its history
+    /// together, so this is damage from outside it, a manual edit or a
+    /// partial restore.
+    ///
+    /// A tombstone or a delete of such a claim is refused, and nothing is
+    /// written and no operation id is spent. Erasing a claim means clearing
+    /// the stored result of every operation in its history, and the store
+    /// cannot name the operations of transitions it does not hold. This is
+    /// not a lost race: a retry answers the same. A backend may offer a way
+    /// to erase such a claim; the PostgreSQL backend's is a store built with
+    /// `with_damaged_history_erasure`.
+    HistoryDamaged {
+        /// Claim whose history is damaged.
+        claim_id: ClaimId,
+    },
 }
 
 impl ClaimError {
@@ -323,6 +340,7 @@ impl ClaimError {
             Self::OperationErased { .. } => "claim-operation-erased",
             Self::TombstoneCarriesContent { .. } => "claim-tombstone-content",
             Self::DeleteStale { .. } => "claim-delete-stale",
+            Self::HistoryDamaged { .. } => "claim-history-damaged",
         }
     }
 }
@@ -468,6 +486,11 @@ impl Display for ClaimError {
             Self::DeleteStale { claim_id } => write!(
                 f,
                 "claim {claim_id} is no longer in the state the delete expected"
+            ),
+            Self::HistoryDamaged { claim_id } => write!(
+                f,
+                "the stored history of claim {claim_id} disagrees with its record; the claim \
+                 was not tombstoned or deleted, and a retry answers the same"
             ),
         }
     }

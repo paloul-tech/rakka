@@ -14,6 +14,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -25,8 +26,8 @@ use crate::claim::{Claim, ClaimId, ClaimOperationId, ClaimTrustStatus};
 use crate::promotion::ClaimPromotionPolicy;
 use crate::retention::{
     discharge_knowledge_space_retention, discharge_knowledge_space_retention_with_hook,
-    KnowledgeSpaceRetentionPolicy, KnowledgeSpaceRetentionReport,
-    KNOWLEDGE_SPACE_RETENTION_DEFAULT_MAX_BATCH,
+    discharge_knowledge_space_retention_with_hooks, KnowledgeSpaceRetentionPolicy,
+    KnowledgeSpaceRetentionReport, RetentionHooks, KNOWLEDGE_SPACE_RETENTION_DEFAULT_MAX_BATCH,
 };
 use crate::scope::KnowledgeSpaceScope;
 use crate::store::{ClaimFilter, KnowledgeGraphStore};
@@ -476,4 +477,150 @@ pub async fn retention_leaves_a_claim_that_moved(
         .delete(scope, &replay)
         .await
         .expect("the sweep's derived delete is the one that applied");
+}
+
+/// A claim that moves between the sweep's reads of it is counted as moved
+/// and kept, and the sweep attempts no delete for it.
+///
+/// The sweep reads the end of a claim's history before it acts on what the
+/// query returned: for a claim past `Proposed`, to date the state it rests
+/// in; for a proposed claim that is due, to see that its record still
+/// stands. Three claims move in that gap, one each way a claim can:
+///
+/// - a disputed claim is retracted, which leaves a later entry behind the
+///   one the sweep asked for;
+/// - a disputed claim is deleted, which leaves no entry at all;
+/// - a proposed claim is promoted, which leaves an entry where its record
+///   counted none.
+///
+/// Each time the sweep reads the claim once more, finds it gone or at a
+/// higher count, and stops there: it does not age a claim by a transition
+/// that is no longer its last, and it does not send a delete that the
+/// claim's new state would refuse. A claim whose history is damaged answers
+/// the second read the same way and the third differently; this clause is
+/// what holds that a healthy claim under concurrent writes is never counted
+/// as damaged.
+pub async fn retention_leaves_a_claim_that_moves_between_its_two_reads(
+    store: &dyn KnowledgeGraphStore,
+    scopes: ConformanceScopes,
+) {
+    let scope = &scopes.primary;
+    // Disputed at 10, and due as disputed claims from 110. One is retracted
+    // at 10 under the sweep, and is due as a retracted claim only from 510.
+    let retracted = claim_resting_in(store, scope, "rm-retract", ClaimTrustStatus::Disputed).await;
+    let deleted = claim_resting_in(store, scope, "rm-delete", ClaimTrustStatus::Disputed).await;
+    // Created at 1, and due as a proposed claim at once. Verified under the
+    // sweep, it has no window.
+    let promoted = claim_resting_in(store, scope, "rm-promote", ClaimTrustStatus::Proposed).await;
+    let policy = KnowledgeSpaceRetentionPolicy::retain_all()
+        .with_window(ClaimTrustStatus::Proposed, 0)
+        .with_window(ClaimTrustStatus::Disputed, 100)
+        .with_window(ClaimTrustStatus::Retracted, 500);
+
+    let (retracted_id, deleted_id, promoted_id) = (
+        retracted.claim_id.clone(),
+        deleted.claim_id.clone(),
+        promoted.claim_id.clone(),
+    );
+    let ungated = ClaimPromotionPolicy::ungated();
+    let between_reads = |read: &Claim| -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let read = read.clone();
+        let (retracted_id, deleted_id) = (retracted_id.clone(), deleted_id.clone());
+        let ungated = &ungated;
+        Box::pin(async move {
+            let now = AgentTimestampMillis::new(10);
+            if read.claim_id == retracted_id {
+                store
+                    .transition(
+                        scope,
+                        &transition_request(
+                            scope,
+                            &read.claim_id,
+                            "retract",
+                            ClaimTrustStatus::Retracted,
+                        ),
+                        ungated,
+                        now,
+                    )
+                    .await
+                    .expect("the retraction lands between the sweep's two reads");
+            } else if read.claim_id == deleted_id {
+                store
+                    .delete(
+                        scope,
+                        &delete_request(scope, &read.claim_id, "under-the-sweep", None),
+                    )
+                    .await
+                    .expect("the delete lands between the sweep's two reads");
+            } else {
+                store
+                    .transition(
+                        scope,
+                        &promotion_request(scope, &read, "promote", None),
+                        ungated,
+                        now,
+                    )
+                    .await
+                    .expect("the promotion lands between the sweep's two reads");
+            }
+        })
+    };
+    let deletes_attempted = AtomicUsize::new(0);
+    let before_delete = |_: &Claim| -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        deletes_attempted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {})
+    };
+    let report = discharge_knowledge_space_retention_with_hooks(
+        store,
+        scope,
+        &policy,
+        AgentTimestampMillis::new(200),
+        None,
+        KNOWLEDGE_SPACE_RETENTION_DEFAULT_MAX_BATCH,
+        RetentionHooks {
+            between_reads: Some(&between_reads),
+            before_delete: Some(&before_delete),
+        },
+    )
+    .await
+    .expect("the sweep answers");
+    assert_eq!(
+        (
+            report.examined,
+            report.moved,
+            report.damaged,
+            report.deleted
+        ),
+        (3, 3, 0, 0),
+        "each claim the sweep read as due had moved by its next read, and none is damaged"
+    );
+    assert_eq!(
+        deletes_attempted.load(Ordering::SeqCst),
+        0,
+        "the sweep saw each claim had moved, and attempted no delete"
+    );
+    let kept = store
+        .get(scope, &retracted_id)
+        .await
+        .expect("the read answers")
+        .expect("a claim that moved is kept");
+    assert_eq!(kept.trust(), ClaimTrustStatus::Retracted);
+    let kept = store
+        .get(scope, &promoted_id)
+        .await
+        .expect("the read answers")
+        .expect("a claim that moved is kept");
+    assert_eq!(kept.trust(), ClaimTrustStatus::Verified);
+    assert!(!exists(store, scope, &deleted_id).await);
+
+    // A later pass judges each as it now is: the retracted claim is due from
+    // 510, and the verified one has no window.
+    let report = full_pass(store, scope, &policy, 509).await;
+    assert_eq!(
+        (report.not_yet_due, report.retained, report.deleted),
+        (1, 1, 0)
+    );
+    let report = full_pass(store, scope, &policy, 510).await;
+    assert_eq!((report.retained, report.deleted), (1, 1));
+    assert!(!exists(store, scope, &retracted_id).await);
 }
