@@ -571,9 +571,10 @@ pub enum AgentReconciliationDecision {
     Escalate,
     /// Abandon the ambiguous effect: its generation fails. The model call's
     /// or a tool call's failure winds the run down. A memory promotion's, a
-    /// claim append's or a goal evaluation's fails the generation only, and
-    /// a live run goes on. A handoff send's cell settles failed with it,
-    /// under `reconciliation-abandoned`.
+    /// claim append's, a goal evaluation's or a workflow cancel's fails the
+    /// generation only, and a live run goes on (issue #197 for the cancel).
+    /// A handoff send's cell settles failed with it, under
+    /// `reconciliation-abandoned`.
     AbandonAndFail,
 }
 

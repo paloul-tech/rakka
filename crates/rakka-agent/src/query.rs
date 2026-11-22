@@ -508,13 +508,38 @@ pub struct AgentGoalWorkflowInvocationView {
     pub cancel: Option<AgentWorkflowCancelDisposition>,
     /// The child's deadline, when one is in force.
     pub deadline: Option<AgentTimestampMillis>,
+    /// Where the cancel effect a `Committed` [`Self::cancel`] names stands:
+    /// `pending` or `ready` while it is out, `succeeded` once the request
+    /// reached the child's inbox or found the child finished, and `failed` or
+    /// `exhausted` when it did not. A cancel that failed told the child
+    /// nothing: the child runs on and reports on its own, and the run is not
+    /// wound down by it (issue #197). `None` for any other disposition, and
+    /// before one is decided. Views serialized before this field decode it
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_status: Option<AgentRunEffectStatus>,
+    /// Stable code of that cancel effect's last dispatch or execution
+    /// failure, when it records one: `workflow-cancel-executor-missing`, the
+    /// code a cancel executor refused with, or `reconciliation-abandoned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_error_code: Option<String>,
 }
 
 impl AgentGoalWorkflowInvocationView {
-    /// Derives the invocation view from one durable workflow-invocation cell.
+    /// Derives the invocation view from one durable workflow-invocation cell
+    /// and the run's effect records, which the cell's committed cancel is
+    /// read from.
     #[must_use]
-    pub fn derive(cell: &AgentWorkflowInvocationCell) -> Self {
+    pub fn derive(cell: &AgentWorkflowInvocationCell, effects: &[AgentRunEffect]) -> Self {
+        let cancel_effect = match &cell.cancel {
+            Some(AgentWorkflowCancelDisposition::Committed { effect }) => effects
+                .iter()
+                .find(|candidate| candidate.effect_id == *effect),
+            _ => None,
+        };
         Self {
+            cancel_status: cancel_effect.map(|effect| effect.status),
+            cancel_error_code: cancel_effect.and_then(|effect| effect.last_error_code.clone()),
             invocation: cell.record.invocation.clone(),
             workflow_tool: cell.record.workflow_tool.clone(),
             descriptor_version: cell.record.descriptor_version,
@@ -706,7 +731,7 @@ impl AgentRunCollaborationView {
             workflow_invocations: loop_state
                 .workflow_invocations()
                 .values()
-                .map(|cell| AgentGoalWorkflowInvocationView::derive(cell))
+                .map(|cell| AgentGoalWorkflowInvocationView::derive(cell, loop_state.effects()))
                 .collect(),
             evaluation: loop_state
                 .goal_evaluation()

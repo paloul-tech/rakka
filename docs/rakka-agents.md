@@ -198,9 +198,11 @@ leaves behind is the same either way.
    run is outstanding (the model call, a tool call, an A2A send, a workflow
    start), and `Running` otherwise. A memory promotion, a claim append, a
    goal evaluation and a workflow cancel are no part of that status. An
-   answer that fails the model call, a tool call or a workflow cancel winds
-   the run down, as that failure always does, `Compensate` winds it down
-   behind the compensation, and `Escalate` keeps the park. A record an
+   answer that fails the model call or a tool call winds the run down, as
+   that failure always does. One that fails a workflow cancel does not: the
+   failure stays on the cancel's effect record and the run goes on (issue
+   #197). `Compensate` winds the run down behind the compensation, and
+   `Escalate` keeps the park. A record an
    earlier binary left parked with nothing to reconcile is repaired by the
    first settle pass that reaches it. While an outcome is unanswered the
    loop takes no step. A rejection of the run's proposal, or the deadline of
@@ -600,7 +602,13 @@ its own lag, and is a projection, never a second state machine.
 - **Cancellation, deadlines, and revocation** propagate durably down the tree
   through cancel exchanges and effects, never claiming a started effect
   stopped: a child with an ambiguous consequential effect stays nonterminal in
-  reconciliation, and the root finalizes only after its ledger closed.
+  reconciliation, and the root finalizes only after its ledger closed. A
+  fan-in that resolves early chases the members it left behind with a
+  cancel. A straggler's workflow cancel that fails, because no executor is
+  wired, the executor refuses, its retries are spent or a person abandons
+  it, leaves the live run going: the child is left to report on its own,
+  and the goal view shows the cancel's status and error code beside the
+  invocation (`cancel_status`, `cancel_error_code`).
 - **Handoff** transfers the same `AgentTaskId` to another agent: the source run
   is fenced, one target run is created, `HandedOff` is recorded strictly after
   the target's durable acceptance, and no session or private memory travels.

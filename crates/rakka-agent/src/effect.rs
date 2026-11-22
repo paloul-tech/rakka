@@ -1183,8 +1183,9 @@ impl AgentRunEffectKind {
     /// The other four are not what a run rests on. A memory promotion, a
     /// claim append and a goal evaluation change their own effect and what
     /// belongs to it, and write nothing of the run's, whether they succeed
-    /// or fail. A workflow cancel that succeeds writes nothing either; one
-    /// that fails winds the run down, which is not a status to rest on.
+    /// or fail. A workflow cancel writes nothing of the run's either, whether
+    /// it succeeds or fails: a failed one stays on its effect record and the
+    /// run goes on (issue #197).
     ///
     /// This is narrower than the complement of [`Self::outside_the_turn`]. A
     /// goal evaluation and a workflow cancel are counted among the effects a

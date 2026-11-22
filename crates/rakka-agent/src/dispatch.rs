@@ -5686,8 +5686,10 @@ where
                 let Some(executor) = self.workflow_cancels.as_ref() else {
                     // Fail closed, definitively, the compensation precedent:
                     // nothing was invoked, and an absent executor will not
-                    // appear mid-generation. The parent's wind-down then
-                    // waits for the child's natural terminal result.
+                    // appear mid-generation. The child is left to report on
+                    // its own: a winding-down parent waits for that result,
+                    // and a live parent chasing a straggler goes on
+                    // (issue #197).
                     return Ok(AgentRunEffectOutcome::failed(
                         "workflow-cancel-executor-missing".to_string(),
                         "no workflow cancel executor is configured for this dispatcher".to_string(),
