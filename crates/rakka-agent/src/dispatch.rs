@@ -2224,8 +2224,8 @@ pub struct AgentDispatchPass {
     /// report zero with a class at its limit. Zero says the limit did not
     /// turn a ticket away before the batch filled, and nothing more.
     pub concurrency_limited: usize,
-    /// Claims this pass ended with their ticket unsettled, because they ran
-    /// out of lease.
+    /// Claims this pass ended with their ticket unsettled, mostly because
+    /// they ran out of lease.
     ///
     /// One kind is a claim the pass took and did not start, because its
     /// lease had lapsed by the time the pass reached it. A pass renews the
@@ -2244,13 +2244,17 @@ pub struct AgentDispatchPass {
     /// lease still stands is given back, claimable at once, and none is
     /// counted here. They are in [`Self::claimed`] and in nothing else.
     ///
-    /// A claim that finds its ticket moved by another worker is counted
-    /// with the second kind and ends its batch the same way (issue #195). A
-    /// reconcileable effect whose attempt failed is asked about before its
-    /// retry, and once the reconciler answers "not executed" the claim reads
-    /// the ticket's row again. A row that no longer stands where the claim
-    /// first read it was moved by another worker while the reconciler
-    /// answered, and the claim makes no attempt beside that worker's.
+    /// Two more are counted with the second kind and end their batch the
+    /// same way (issue #195). Both follow the reconciler's finding of "not
+    /// executed" about an attempt an earlier claim made, before the attempt
+    /// that would follow, which is the claim's first. One is a claim whose
+    /// lease lapsed while the reconciler answered: that attempt is made only
+    /// while the lease is still current. The other follows a failed attempt
+    /// and reads the ticket's row again: a row still unfinished and no longer
+    /// where the claim first read it was written meanwhile by a worker whose
+    /// own lease had lapsed, and the claim makes no attempt beside that
+    /// worker's. Such a claim can end with its own lease standing in full,
+    /// so neither of these says an effect's attempts outlast the lease.
     ///
     /// Nothing is written to the ticket of any of these as its claim ends:
     /// once the lease is over any worker can take it. A pass that ends in an
@@ -2286,10 +2290,12 @@ enum ClaimConclusion {
     /// The claim made an attempt that was found not executed, and could not
     /// make another in the time its lease covers (issue #171): the lease did
     /// not cover one, or the attempt's bound, counted from the instant the
-    /// claim asked, was spent before the attempt could start. Or another
-    /// worker moved its ticket's row while the reconciler answered a
-    /// question about a failed attempt (issue #195). Its ticket is
-    /// unsettled, and no settle renewed the claims its pass holds behind it.
+    /// claim asked, was spent before the attempt could start. Or, before its
+    /// first attempt, the reconciler answered about an attempt an earlier
+    /// claim made and the claim's lease had lapsed by then, or the ticket's
+    /// row had been moved meanwhile by a worker whose own lease had lapsed
+    /// (issue #195). Its ticket is unsettled, and no settle renewed the
+    /// claims its pass holds behind it.
     OutOfLease,
 }
 
@@ -3622,13 +3628,12 @@ where
                 Ok(ClaimConclusion::Settled) => {}
                 Ok(ClaimConclusion::Lapsed) => pass.lapsed += 1,
                 Ok(ClaimConclusion::OutOfLease) => {
-                    // The claim spent lease on its attempts and ended with
-                    // no settle, so nothing renewed the claims behind it:
-                    // they hold what is left of the lease this one ran out
-                    // of, and a claim's first attempt is not asked whether
-                    // its lease covers it. The batch ends here and those
-                    // claims are given back, to be claimed again under a
-                    // full lease.
+                    // The claim spent lease and ended with no settle, so
+                    // nothing renewed the claims behind it: they hold what
+                    // is left of the lease the batch was claimed under, and
+                    // a claim's first attempt is not asked whether its lease
+                    // covers it. The batch ends here and those claims are
+                    // given back, to be claimed again under a full lease.
                     pass.lapsed += 1;
                     stopped_short = true;
                     break;
@@ -3845,6 +3850,19 @@ where
             } else {
                 attempt.saturating_sub(1)
             };
+            // A failed attempt's claim that would retry on a finding of "not
+            // executed" asks the authority first, and a deferral goes no
+            // further. Where the fence applies, the finding decides with no
+            // attempt to authorize.
+            if started < attempt && !(winding_down && !intent.kind().exempt_from_wind_down_fence())
+            {
+                if let Some(conclusion) = self
+                    .defer_before_reconciling(scope, &claim, state, &intent, attempt, pass)
+                    .await?
+                {
+                    return Ok(conclusion);
+                }
+            }
             self.recover_ambiguous(scope, claim, &intent, attempt, started, winding_down, pass)
                 .await?
         } else if winding_down && !intent.kind().exempt_from_wind_down_fence() {
@@ -3898,6 +3916,73 @@ where
                         .await?;
                 }
             }
+        }
+    }
+
+    /// Asks the dispatch authority whether `attempt` may be made now, and
+    /// closes the `tool-authorize` segment of that question. Answers the
+    /// decision with the instant it was asked at, which a grant is validated
+    /// against.
+    async fn authorize_attempt(
+        &self,
+        scope: &AgentRunScope,
+        state: &AgentRunState,
+        intent: &AgentRunEffect,
+        attempt: u32,
+    ) -> AgentDispatchResult<(AgentDispatchDecision, AgentTimestampMillis)> {
+        let now = rakka_agent_workflow::AgentTimestampMillis::new(self.clock.now().as_millis());
+        // A distinct segment from the attempt, because it is a distinct
+        // interval with a distinct meaning: it ends before the durable
+        // `Started` write, so a refusal here provably invoked nothing.
+        let authorize_timer = AgentSegmentTimer::start(now);
+        let authorized = self
+            .authority
+            .authorize(scope, state, intent, attempt, now)
+            .await;
+        let authorize_segment = authorize_timer.close(AgentSegmentOperation::ToolAuthorize {
+            effect_kind: intent.kind().as_label(),
+        });
+        self.close_segment(
+            scope,
+            &intent.telemetry,
+            match &authorized {
+                Ok(AgentDispatchDecision::Granted(_)) => authorize_segment.ok(),
+                Ok(AgentDispatchDecision::Refused(refusal)) => {
+                    authorize_segment.failed("rakka.agent.authority", &refusal.code)
+                }
+                Err(error) => authorize_segment.failed("rakka.agent.authority", error.code()),
+            },
+        );
+        Ok((authorized?, now))
+    }
+
+    /// Asks the dispatch authority, before the reconciler, about the attempt
+    /// a claim would make on a reconcileable call whose last attempt failed
+    /// and was counted (issue #195). A transient refusal (a suspended agent,
+    /// say) defers the ticket there, as the attempt itself would, and the
+    /// reconciler is not asked: a finding of "not executed" spends nothing,
+    /// so asking on every claim while the retry is deferred cost a question
+    /// to the deployment's system of record on every pass. Any other
+    /// decision answers `None`, and the claim goes on to the reconciler; the
+    /// attempt it then makes asks the authority again.
+    async fn defer_before_reconciling(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: &AgentDispatchClaim,
+        state: &AgentRunState,
+        intent: &AgentRunEffect,
+        attempt: u32,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<Option<ClaimConclusion>> {
+        match self
+            .authorize_attempt(scope, state, intent, attempt)
+            .await?
+        {
+            (AgentDispatchDecision::Refused(refusal), _) if refusal.retryable => self
+                .defer_dispatch(claim, attempt, &refusal.code, &refusal.message, pass)
+                .await
+                .map(Some),
+            _ => Ok(None),
         }
     }
 
@@ -3979,30 +4064,9 @@ where
         // undeclared or revoked tool, a widened intent, a missing checkpoint,
         // an unroutable execution policy, a blocked guardrail — settles the
         // generation (scenario 54).
-        let now = rakka_agent_workflow::AgentTimestampMillis::new(self.clock.now().as_millis());
-        // A distinct segment from the attempt below, because it is a distinct
-        // interval with a distinct meaning: it ends before the durable
-        // `Started` write, so a refusal here provably invoked nothing.
-        let authorize_timer = AgentSegmentTimer::start(now);
-        let authorized = self
-            .authority
-            .authorize(scope, state, intent, attempt, now)
-            .await;
-        let authorize_segment = authorize_timer.close(AgentSegmentOperation::ToolAuthorize {
-            effect_kind: intent.kind().as_label(),
-        });
-        self.close_segment(
-            scope,
-            &intent.telemetry,
-            match &authorized {
-                Ok(AgentDispatchDecision::Granted(_)) => authorize_segment.ok(),
-                Ok(AgentDispatchDecision::Refused(refusal)) => {
-                    authorize_segment.failed("rakka.agent.authority", &refusal.code)
-                }
-                Err(error) => authorize_segment.failed("rakka.agent.authority", error.code()),
-            },
-        );
-        let decision = authorized?;
+        let (decision, now) = self
+            .authorize_attempt(scope, state, intent, attempt)
+            .await?;
         let granted = match decision {
             AgentDispatchDecision::Granted(granted) => {
                 if let Err(refusal) = granted.grant.validate_for(scope, intent, attempt, now) {
@@ -4691,25 +4755,75 @@ where
         })
     }
 
-    /// Whether the claim's ticket row is still `Failed` and counts the
-    /// `counted` attempts the claim read before it asked the reconciler
-    /// (issue #195).
-    async fn row_stands_as_read(
-        &self,
+    /// The next attempt of a reconcileable call whose last attempt failed and
+    /// was counted, once the reconciler has found the call not executed
+    /// (issue #195). Nothing is burned: the row counted the attempt asked
+    /// about, and `attempt` is the one after it, inside the budget because a
+    /// `Failed` row is one with a retry left.
+    ///
+    /// The row is read again first, since the reconciler can be slow and
+    /// others can write the row meanwhile: a worker on a lapsed lease of its
+    /// own, or the run putting a lost row back. What the row says now
+    /// decides, as it would for a claim that read it first:
+    ///
+    /// | The row | The claim |
+    /// |---|---|
+    /// | gone | [`Self::conclude_on_missing_row`] |
+    /// | put back in a lost row's place | [`Self::conclude_on_replaced_row`] |
+    /// | finished | [`Self::conclude_on_untold_row`], so a run nobody told is told now |
+    /// | `Failed`, counting the `counted` attempts the claim read | makes `attempt` |
+    /// | anything else | ends as out of lease and writes nothing |
+    ///
+    /// The last is a row another worker's attempt has moved: one in flight,
+    /// or one that failed after this claim read the row. Going on, the claim
+    /// made a second call beside it under the number that worker had used.
+    async fn retry_counted_attempt(
+        &mut self,
         scope: &AgentRunScope,
-        claim: &AgentDispatchClaim,
+        claim: AgentDispatchClaim,
+        intent: &AgentRunEffect,
         counted: u32,
-    ) -> AgentDispatchResult<bool> {
-        let mut inbox = self.inbox(scope);
-        inbox.recover().await?;
-        Ok(inbox
-            .inner()
-            .state()
-            .map_err(AgentInboxError::from)?
-            .outbox_entry(&OutboxMessageId::new(claim.effect_id.as_str()))
-            .is_some_and(|row| {
-                row.status() == OutboxStatus::Failed && row.attempts().attempts() == counted
-            }))
+        attempt: u32,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimStep> {
+        let row = {
+            let mut inbox = self.inbox(scope);
+            inbox.recover().await?;
+            inbox
+                .inner()
+                .state()
+                .map_err(AgentInboxError::from)?
+                .outbox_entry(&OutboxMessageId::new(claim.effect_id.as_str()))
+                .cloned()
+        };
+        let Some(row) = row else {
+            return self
+                .conclude_on_missing_row(scope, claim, pass)
+                .await
+                .map(ClaimStep::Concluded);
+        };
+        if !self.claim_indexes_row(&claim, &row) {
+            return self
+                .conclude_on_replaced_row(scope, claim, intent, pass)
+                .await
+                .map(ClaimStep::Concluded);
+        }
+        if row_is_finished(row.status()) {
+            // The wind-down fence does not apply here: a claim it applies to
+            // was cancelled on the finding, before the retry.
+            return self
+                .conclude_on_untold_row(scope, &claim, &row, intent, false, pass)
+                .await
+                .map(ClaimStep::Concluded);
+        }
+        if row.status() == OutboxStatus::Failed && row.attempts().attempts() == counted {
+            return Ok(ClaimStep::Invoke {
+                claim,
+                attempt,
+                bound_from: None,
+            });
+        }
+        Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease))
     }
 
     /// Queries the reconciliation protocol before any retry
@@ -4863,15 +4977,33 @@ where
                 // lease that is over, the row is still written `Exhausted`
                 // and the fleet answers the claim `claim-fenced`.
                 //
+                // The first attempt a claim makes after the reconciler
+                // answered about an attempt that was not its own needs the
+                // lease to be current still (issue #195). The answer can come
+                // after the lease lapsed, and by then another worker may have
+                // taken the ticket and be making that attempt. Only that the
+                // lease has not lapsed is asked, not that it covers the
+                // attempt: every claim on this path starts with the
+                // reconciler's question, so one whose lease could not cover
+                // the question and a whole attempt would never make one, and
+                // nothing would ever retry the effect. Where the row counted
+                // the attempt asked about, an attempt always follows; where it
+                // did not, one follows if the burn leaves budget.
+                //
                 // The next attempt's bound is counted from this instant, read
                 // before the fleet reads its own clock, so the deadline it is
                 // handed is inside the lease the fleet just answered for.
                 let asked_at = self.now();
                 let another_follows = ambiguity.under_this_claim && attempt < intent.max_attempts;
-                if another_follows
-                    && !self
-                        .fleet
-                        .is_current_claim_for(&claim, intent.timeout_ms.unwrap_or(0))?
+                let first_follows = !ambiguity.under_this_claim
+                    && (started < attempt || attempt < intent.max_attempts);
+                let covered_ms = if another_follows {
+                    intent.timeout_ms.unwrap_or(0)
+                } else {
+                    0
+                };
+                if (another_follows || first_follows)
+                    && !self.fleet.is_current_claim_for(&claim, covered_ms)?
                 {
                     return Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease));
                 }
@@ -4879,27 +5011,11 @@ where
                 // A row that counted the attempt asked about when it failed
                 // has nothing to burn, and the next attempt is made at once:
                 // burning it again charged that attempt twice and spent a
-                // budget of six in three calls (issue #195). The row's next
-                // attempt is inside its budget, since a `Failed` row is one
-                // with a retry left.
+                // budget of six in three calls (issue #195).
                 if started < attempt {
-                    // The row is read again first. The reconciler can take
-                    // longer than the claim's lease, and a worker that took
-                    // the ticket over meanwhile may have made the next
-                    // attempt itself, or finished the row. A claim that finds
-                    // the row moved from where it read it makes no attempt:
-                    // it ends as one out of lease does and writes nothing,
-                    // and the claim that follows takes the ticket up from
-                    // what the row then says. Going on, it made a second call
-                    // under the number the other worker had already used.
-                    if !self.row_stands_as_read(scope, &claim, started).await? {
-                        return Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease));
-                    }
-                    return Ok(ClaimStep::Invoke {
-                        claim,
-                        attempt,
-                        bound_from: another_follows.then_some(asked_at),
-                    });
+                    return self
+                        .retry_counted_attempt(scope, claim, intent, started, attempt, pass)
+                        .await;
                 }
                 // An attempt the row has not counted reached a durable
                 // `Started`, and is counted before the retry. Counting it is

@@ -40,6 +40,21 @@ lost.
    by side, and the run's record of the call where the run still holds it (a
    call that succeeded is gone from the run once its turn moves on).
 
+Two more, after the second review (section 7):
+
+3. **After a failed attempt, the dispatch authority is asked before the
+   reconciler.** A retry the authority defers then asks the reconciler
+   nothing. Without it, every dispatcher pass asked the reconciler while an
+   agent was suspended: the dispatcher's deferral backoff is 0.
+4. **The first attempt a claim makes after the reconciler's answer needs a
+   current lease.** As first approved, the lease had to cover the attempt, as
+   issue #171 asks of a later attempt. I then found that this never retries an
+   effect whose answer and call together outlast the lease, since every claim
+   on this path starts with the question (#171's
+   `a_bound_longer_than_the_lease_means_one_attempt_to_a_claim` is such an
+   effect). Asked again, the owner chose "the lease is still current", with
+   the docs saying this path's lease must cover the answer and the call.
+
 ## 3. The change
 
 All in `crates/rakka-agent/src/dispatch.rs`. Issue #182 had already computed
@@ -50,7 +65,9 @@ attempt reads it.
 
 | Where | Before | Now |
 |---|---|---|
-| `reconcile_ambiguous`, `NotExecuted` on a live run | `retry_ambiguous`: burn, then the next attempt | where `started < attempt` (the row counted the attempt asked about), the row is read again: still `Failed` at `started`, `ClaimStep::Invoke` with `attempt` and nothing written; moved, `ClaimConclusion::OutOfLease` and nothing written (added in answer to the review, section 7). Otherwise unchanged |
+| `execute_claim`, a `Failed` row of a reconcileable call the fence does not cancel | asks the reconciler | asks the authority first (`defer_before_reconciling`): a transient refusal defers there; anything else goes on to the reconciler (ruling 3) |
+| `reconcile_ambiguous`, `NotExecuted` on a live run, an attempt follows that is the claim's first | made whatever the lease | made only if `is_current_claim_for(claim, 0)`; otherwise `OutOfLease`, nothing written (ruling 4) |
+| `reconcile_ambiguous`, `NotExecuted` on a live run | `retry_ambiguous`: burn, then the next attempt | where `started < attempt` (the row counted the attempt asked about), `retry_counted_attempt`: the row is read again. Still `Failed` at `started`: `ClaimStep::Invoke` with `attempt`, nothing written. Gone, put back, or finished: the conclusion a claim that read it first reaches. Otherwise `OutOfLease`, nothing written. Where the row did not count it, unchanged |
 | `reconcile_ambiguous`, `Executed` | delivered with `attempt` | `started` |
 | `reconcile_ambiguous`, no reconciler wired | parked with `attempt` | `started` |
 | `reconcile_ambiguous`, no protocol on the record | parked with `attempt` | `started` (unreachable: the spec validation refuses such a record) |
@@ -64,10 +81,14 @@ what moves the row's count past an attempt it has not counted. A break of the
 fix that took the branch whenever the finding was "not executed" handed back
 the same attempt number, and a claim whose own attempt ended unknown made
 that attempt again without end inside its `ClaimStep` loop: a test of
-`dispatch_failure_outcomes.rs` spun for 27 minutes before I stopped it. The lease check of issue #171 runs only for an attempt
-made under the claim, which the row has not counted, so it never applies to
-the new branch. The next attempt after a `Failed` row is within the budget,
-since a `Failed` row is one with a retry left.
+`dispatch_failure_outcomes.rs` spun for 27 minutes before I stopped it. The
+next attempt after a `Failed` row is within the budget, since a `Failed` row
+is one with a retry left.
+
+The lease rule of ruling 4 asks length 0 of a claim's first attempt and keeps
+#171's cover check (`timeout_ms`) for a later one. A first attempt follows a
+finding about an attempt that was not this claim's: always where the row
+counted it, and where it did not, when the burn leaves budget.
 
 ## 4. My call
 
@@ -126,21 +147,53 @@ The one that survives is the park for a record with no reconciliation
 protocol, which the spec validation makes unreachable (section 8).
 
 In `crates/rakka-agent/tests/dispatch_failed_attempt_recovery.rs`, the cases
-the review found (section 7), on the shared `AuthorityFixture`:
+the two reviews found (section 7), on the shared `AuthorityFixture`:
 
-- A retry the authority defers after a failed call spends none of the
-  budget: five deferred claims, five questions, the row still `Failed` 1,
-  nothing charged; resumed, the budget of three buys three calls.
-- A claim whose ticket moved while the reconciler answered makes no attempt:
-  it ends out of lease, and the three calls carry attempts 1, 2 and 3.
+- A retry the authority defers after a failed call spends nothing and asks
+  nothing: five passes, four of them back to back, each deferred, the
+  reconciler asked nothing, the row still `Failed` 1, nothing charged;
+  resumed, the budget of three buys three calls and two questions.
+- A cancelled run's failed call is cancelled on the finding while its agent
+  is suspended: under the fence the authority is not asked first.
+- A claim whose ticket moved while the reconciler answered (a rival made
+  attempt two) makes no attempt, and the three calls carry attempts 1, 2, 3.
+- A claim whose lease lapsed while the reconciler answered makes no
+  attempt, though the row had not moved; the next claim makes it.
+- The same for a lost attempt: the late claim burns nothing, and the next
+  counts the lost attempt and makes the next.
+- Under a current lease, while a worker on a lapsed lease of its own writes
+  the row as the reconciler answers: a row in flight at the same count gets
+  no attempt beside it; a row failed again at a new count gets none; a row
+  exhausted is told to the run in the same pass.
 - A park after a failed call names attempt one and links its span, in the
   dispatcher's park segment and the run's `checkpoint-open`.
 
-All three fail on `main`'s dispatcher (`dispatch.rs` swapped in, the rest of
-the branch kept). Two breaks of the new row check were run: skipping it, and
-comparing the status without the count. The second test catches both.
+Against `main`'s `dispatch.rs` (swapped in, the rest of the branch kept) the
+first three of the first review's cases failed. Against the dispatcher of the
+answer to the first review (`fd0f662d`), four fail: the deferral, both lease
+cases and the exhausted row. The two moved-row cases pass there, as that
+version already read the row again.
 
-## 7. The review
+Ten breaks of the answer to the second review were run one at a time
+against `dispatch_failed_attempt_recovery.rs` and the five dispatch test
+files above (with `dispatch_finished_row.rs`). All ten are caught:
+
+| Break | Caught by |
+|---|---|
+| no authority before the reconciler | the deferral test |
+| the authority asked first under the fence too | the cancelled-run test |
+| no lease check at all | both lease tests here, and thirteen of #171's |
+| a first attempt follows only when the burn leaves budget | the failed-row lease test, once it ran on the call's last attempt (it first ran at a budget of six, where the break survived) |
+| a first attempt follows only where the row counted the attempt | the lost-attempt lease test |
+| a first attempt must be covered for its bound | #171's bound-longer-than-the-lease test |
+| a finished row ends out of lease | the exhausted-row test |
+| the row check without its status half | the in-flight test |
+| the row check without its count half | the failed-meanwhile test |
+| no row check | both of those |
+
+## 7. The reviews
+
+### The first review
 
 A fresh reviewer read the branch and ran six probes of its own, on the
 branch and on `main`. What changed in answer:
@@ -159,8 +212,9 @@ branch and on `main`. What changed in answer:
   second call too, under a later number. The claim now reads the row again
   and makes no attempt if the row moved: it ends out of lease, writes
   nothing, and the next claim takes the ticket up from the row. My call:
-  this goes further than restoring the number, since it removes the second
-  call in that race.
+  this goes further than restoring the number. I wrote that it removes the
+  second call in that race; the second review showed it does not where the
+  rival claims after the re-read, which ruling 4 closes.
 - **The park's telemetry changed** (it names and links the failed attempt,
   not a span no segment exported): documented and tested.
 - **Sentences corrected:** "called as many times as its budget allows" holds
@@ -172,18 +226,43 @@ branch and on `main`. What changed in answer:
   nothing; the test above holds that nothing is charged. That is issue
   #196's refusal path (`refuse_dispatch`), not the deferral.
 
+### The second review
+
+A second fresh reviewer read the answer to the first (`fd0f662d`) and ran
+seven probes. What changed in answer:
+
+- **The deferral asked the reconciler on every pass**, not on every backoff:
+  the dispatcher's deferral backoff is 0 and has no setter. Brought to the
+  owner (ruling 3).
+- **The re-read was a read, not a fence.** A rival that claimed after it,
+  while the late claim was being authorized, called beside it under the same
+  number; the late claim's lease had lapsed during the question. Brought to
+  the owner (ruling 4), with the correction about the cover rule.
+- **A finished row ended the claim out of lease**, so a run whose row a stale
+  worker exhausted heard only a lease later. A finished, missing or replaced
+  row now takes the path a claim that read it first would.
+- **The status half of the check had no test**, and my record said none
+  could tell; a row in flight at the same count does. Tested now.
+- **Sentences corrected:** "paced by the retry backoff"; "reads the row
+  again" without saying it is after a failed attempt only; "another worker
+  moved it" where a deleted or replaced row also fails the check; the
+  `lapsed` docs that said every such claim ran out of lease; "a reconciler
+  that cannot establish the outcome" where an `Unknown` one was meant.
+
 ## 8. Not done
 
 - The park for a record with no reconciliation protocol is unreachable and is
   held by no test.
-- The row check's status half (a row at the same count that is no longer
-  `Failed`, for instance one a rival's successful call finished) is held by
-  no test of its own: the late claim makes no call either way, and only
-  `AgentDispatchPass::lapsed` and the claim's ending tell the two apart.
+- The re-read's gone and put-back rows are held by no test; their paths
+  are the ones a claim that read them first takes, by reading.
 - A park after an `Unknown` burn that spends the budget still names the
   attempt the burn recorded, which no call made, and links that attempt's
   span. Unchanged, by reading; it follows from ruling 2.
-- A claim whose ticket another worker took over can still call beside it on
-  a `Dispatching` row, whose recovery burns before it invokes, as on `main`.
+- The lease is checked at the answer, not fenced: a lease that runs out
+  during the authority's answer or the call itself can still let a rival in,
+  as for any claim's first attempt.
+- A reconciler that answers with an error ends the pass and burns nothing,
+  so a reconciler that keeps failing is asked once per lease without bound,
+  as on `main` (by reading, from the second review).
 - Issue #196 (a dispatch refused before `Started` is charged one attempt) is
   a separate cause and needs its own ruling.

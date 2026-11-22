@@ -194,14 +194,14 @@ leaves behind is the same either way.
    park made at once (no reconciler wired, or an `Unknown` or mismatched
    finding on a winding-down run), are charged the attempts that started.
    On a live run an `Unknown` or mismatched finding still burns one attempt,
-   whichever attempt it was asked about, so a reconciler that cannot
-   establish the outcome is asked at most once for each attempt in the
-   budget. A finding of "not executed" spends nothing itself: while the
-   dispatch authority defers the retry (a suspended agent, say), the
-   reconciler is asked again on each claim, paced by the retry backoff, and
-   the budget is untouched. A claim told "not executed" reads the ticket's
-   row again before it makes the retry, and makes none if another worker
-   moved the row while the reconciler answered.
+   whichever attempt it was asked about, so a reconciler that keeps
+   answering `Unknown` is asked at most once for each attempt in the
+   budget. After a failed attempt the dispatch authority is asked before
+   the reconciler, and a retry it defers (a suspended agent, say) asks the
+   reconciler nothing and spends none of the budget. A claim told "not
+   executed" about a failed attempt reads the ticket's row again before it
+   makes the retry, and makes none if the row moved meanwhile; a row
+   another worker finished is told to the run at once.
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect
@@ -343,7 +343,7 @@ settle, a release and a prune. The loss after that is returned as
 
 **A batch and its leases** (issue #157). A claim pass leases every claim of
 its batch at one instant, and a worker runs the claims one after another.
-Three rules keep a claim from being taken by another worker while its pass
+Four rules keep a claim from being taken by another worker while its pass
 is still working on it, and from being run by two:
 
 - **Every settle renews what the pass still holds.** In the same write, each
@@ -374,12 +374,23 @@ is still working on it, and from being run by two:
   whose worker was lost. The lease has to cover one attempt, not a budget.
   An attempt that spends the budget has none after it, so its claim is not
   asked and settles it as before; a claim's first attempt is not asked
-  either. A claim's first attempt can follow a reconciler's answer about an
-  attempt that failed, and an answer can take longer than the lease. Such
-  a claim reads the ticket's row again once told "not executed": if the
-  row is no longer where the claim read it, another worker has moved it,
-  and the claim ends there as one out of lease does, writing nothing
-  (issue #195).
+  whether the lease covers it either.
+- **A claim's first attempt after the reconciler's answer needs a current
+  lease** (issue #195). A claim's first attempt can follow the
+  reconciler's answer about an attempt an earlier claim made: one whose
+  worker was lost, or one that failed. The answer can come after the lease
+  lapsed, so on a finding of "not executed" the claim makes that attempt
+  only if its lease is still current, and otherwise ends there and writes
+  nothing, as above; a lost attempt is then counted by the claim that
+  follows. Only that the lease is current is asked, not that it covers the
+  attempt: every such claim asks the reconciler first, so a rule that the
+  lease cover the attempt too would never retry an effect whose answer and
+  call together outlast the lease. On this path the lease has to cover the
+  reconciler's answer and the call. After a failed attempt the claim also
+  reads the ticket's row again, and makes no attempt if the row is no
+  longer where the claim read it: it ends as one out of lease does, unless
+  the row is finished, gone or put back in a lost row's place, which it
+  settles as a claim that read it first would.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,
