@@ -54,6 +54,15 @@ longer winds the run down. The failure stays on the effect record, the cell
 keeps `cancel = Committed { effect }`, and records an earlier build already
 wound down are not repaired.
 
+**Second ruling, after the review (2026-11-21).** I had told the owner the
+failed cancel shows in the run snapshot. The review showed it shows on no
+query surface: the operational snapshot lists only effects that are out or
+unknown, `AgentRunSnapshot` holds a count, and the goal view reads
+`cancel = Committed`. Asked again, the owner picked "Add it to the goal
+view": `AgentGoalWorkflowInvocationView` gains `cancel_status` and
+`cancel_error_code`, read from the effect a `Committed` disposition names.
+They are view fields, so no stored record changes.
+
 ## 3. Approaches
 
 1. **Add `WorkflowCancelCall` to the failure arm's exceptions.** A failed or
@@ -144,8 +153,13 @@ goes on fail, and the whole crate is run to count them.
   doors the issue names: they enter the same arm, and the ruling is about the
   cancel failing, not about how.
 - No metric and no decision record for a failed cancel. The effect record is
-  durable for the run's life (effect records are only ever appended) and is in
-  the run snapshot.
+  durable for the run's life (effect records are only ever appended).
+  **Corrected:** I first wrote that it "is in the run snapshot". It was not,
+  and the goal-view fields of section 2's second ruling are what make it
+  visible.
+- `AbandonAndFail` of a parked cancel and a refusal by the dispatch authority
+  enter the same failure arm, and are covered with the rest (the review's
+  probe; a test pins the first).
 
 ## 7. Not in scope
 

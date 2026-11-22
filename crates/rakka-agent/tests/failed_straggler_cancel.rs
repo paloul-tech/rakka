@@ -26,13 +26,14 @@ use common::{
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     child_workflow_run_id, AgentDispatchFuture, AgentEffectResolution, AgentExchangeRouter,
-    AgentLoopPhase, AgentModelTurn, AgentOperationId, AgentOperationKind, AgentRunEffect,
-    AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand,
-    AgentRunEntityReply, AgentRunError, AgentRunScope, AgentRunStatus, AgentTaskContent,
-    AgentTaskStatus, AgentToolCallId, AgentToolCallRequest, AgentWorkflowCancelDisposition,
-    AgentWorkflowCancelExecutor, AgentWorkflowCancelFinding, AgentWorkflowInvocationId,
-    AgentWorkflowInvocationRecord, AgentWorkflowStartExecutor, AgentWorkflowStartFinding,
-    AgentWorkflowTerminalStatus, TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentGoalWorkflowInvocationView, AgentLoopPhase, AgentModelTurn, AgentOperationId,
+    AgentOperationKind, AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome,
+    AgentRunEffectStatus, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError, AgentRunScope,
+    AgentRunStatus, AgentTaskContent, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest,
+    AgentWorkflowCancelDisposition, AgentWorkflowCancelExecutor, AgentWorkflowCancelFinding,
+    AgentWorkflowInvocationId, AgentWorkflowInvocationRecord, AgentWorkflowStartExecutor,
+    AgentWorkflowStartFinding, AgentWorkflowTerminalStatus, TenantId,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::AgentEphemeralCredential;
 use serde_json::json;
@@ -170,25 +171,34 @@ fn rejected_turn() -> AgentModelTurn {
         )
 }
 
+/// The straggler world for one door: [`world_answering`] with the cancel
+/// executor the door wires, which only `Door::Refused` does.
+async fn world(door: Door, turns: Vec<AgentModelTurn>) -> (Fixture, AgentWorkflowInvocationId) {
+    let finding = (door == Door::Refused).then(|| AgentWorkflowCancelFinding::Refused {
+        code: REFUSED_CODE.to_string(),
+        message: "the registry refused the cancel".to_string(),
+    });
+    world_answering(finding, turns).await
+}
+
 /// The straggler world: the goal task is created, both children are
 /// started, and the first child's `Completed` result is taken over a router
 /// that reaches nothing. The `Any` fan-in resolves, and turn two's model call
-/// and the straggler's cancel are both out. Returns the fixture and the
+/// and the straggler's cancel are both out. A cancel executor answering
+/// `finding` is wired where one is given. Returns the fixture and the
 /// straggler's invocation.
-async fn world(door: Door, turns: Vec<AgentModelTurn>) -> (Fixture, AgentWorkflowInvocationId) {
+async fn world_answering(
+    finding: Option<AgentWorkflowCancelFinding>,
+    turns: Vec<AgentModelTurn>,
+) -> (Fixture, AgentWorkflowInvocationId) {
     let mut adapter = DeterministicModelAdapter::new();
     for turn in turns {
         adapter = adapter.with_turn(turn);
     }
     let mut dispatcher = ScriptedDispatcher::with_adapter(adapter)
         .with_workflow_start_executor(Arc::new(StartingExecutor));
-    if door == Door::Refused {
-        dispatcher = dispatcher.with_workflow_cancel_executor(Arc::new(ScriptedCancel {
-            finding: AgentWorkflowCancelFinding::Refused {
-                code: REFUSED_CODE.to_string(),
-                message: "the registry refused the cancel".to_string(),
-            },
-        }));
+    if let Some(finding) = finding {
+        dispatcher = dispatcher.with_workflow_cancel_executor(Arc::new(ScriptedCancel { finding }));
     }
     let fixture = Fixture::new(dispatcher)
         .with_delegation(delegation_config_with_fan_in())
@@ -313,6 +323,28 @@ async fn straggler_cancel(
         .clone()
 }
 
+/// The straggler's entry in the goal view the run's operational snapshot
+/// carries.
+async fn invocation_view(
+    fixture: &Fixture,
+    straggler: &AgentWorkflowInvocationId,
+) -> AgentGoalWorkflowInvocationView {
+    rakka_agent::agent_operational_snapshot(
+        &fixture.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+        rakka_agent_workflow::AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists")
+    .collaboration
+    .workflow_invocations
+    .into_iter()
+    .find(|view| view.invocation == *straggler)
+    .expect("the goal view holds the straggler")
+}
+
 /// Records the outcome of the one ready effect of `kind` over `router`: the
 /// fixture's dispatcher answers it, or, where `outcome` is given, that.
 async fn answer_one(
@@ -428,6 +460,12 @@ async fn walk(door: Door, order: Order) {
             Some(AgentWorkflowCancelDisposition::Committed { .. })
         ),
         "the straggler's cell still reads committed"
+    );
+    let view = invocation_view(&fixture, &straggler).await;
+    assert_eq!(
+        (view.cancel_status, view.cancel_error_code.as_deref()),
+        (Some(door_status(door)), Some(door_code(door))),
+        "the goal view shows that the cancel failed, and why"
     );
 
     if order == Order::ModelCallOut {
@@ -607,6 +645,110 @@ async fn a_park_answered_with_a_failed_cancel_leaves_the_run_going() {
     answer_one(&fixture, &unreachable, AgentRunEffectKind::ModelCall, None).await;
     fixture.pump().await.expect("the loop should converge");
     assert_completed(&fixture, 2, 0).await;
+}
+
+/// A cancel whose outcome is unknown parks the live run, and a person
+/// abandons it through the park's checkpoint. The cancel fails under
+/// `reconciliation-abandoned`, the run is not wound down, and it completes.
+#[tokio::test]
+async fn a_park_on_the_cancel_abandoned_leaves_the_run_going() {
+    let (fixture, straggler) = world(Door::NoExecutor, vec![first_turn(), proposing_turn()]).await;
+    let unreachable = AgentExchangeRouter::new();
+
+    let cancel = cancel_effect(&fixture).await;
+    answer_one(
+        &fixture,
+        &unreachable,
+        AgentRunEffectKind::WorkflowCancelCall,
+        Some(AgentRunEffectOutcome::indeterminate(
+            "dispatcher-lost-after-started",
+            "the recovery retry was refused",
+        )),
+    )
+    .await;
+    let checkpoint_id = {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is started")
+            .open_checkpoints()
+            .iter()
+            .find(|checkpoint| checkpoint.bound_effect.effect_id == cancel.effect_id)
+            .expect("the park opened its reconciliation checkpoint")
+            .checkpoint_id
+            .clone()
+    };
+
+    apply(
+        &fixture,
+        &unreachable,
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "abandon-the-cancel",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id,
+            resolver: rakka_agent_workflow::PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(rakka_agent::AgentCheckpointDecision::Reconciliation(
+                rakka_agent::AgentReconciliationDecision::AbandonAndFail,
+            )),
+            telemetry: rakka_agent_workflow::AgentTelemetryContext::default(),
+        },
+    )
+    .await;
+    assert_live(&fixture, "after the park is abandoned").await;
+    let view = invocation_view(&fixture, &straggler).await;
+    assert_eq!(
+        (view.cancel_status, view.cancel_error_code.as_deref()),
+        (
+            Some(AgentRunEffectStatus::Failed),
+            Some("reconciliation-abandoned")
+        )
+    );
+
+    answer_one(&fixture, &unreachable, AgentRunEffectKind::ModelCall, None).await;
+    fixture.pump().await.expect("the loop should converge");
+    assert_completed(&fixture, 2, 0).await;
+}
+
+/// The goal view shows where the straggler's cancel stands: out while it is
+/// out, and succeeded, with no code, once the request reached the child.
+#[tokio::test]
+async fn the_goal_view_shows_a_cancel_out_and_then_delivered() {
+    let (fixture, straggler) = world_answering(
+        Some(AgentWorkflowCancelFinding::Requested),
+        vec![first_turn(), proposing_turn()],
+    )
+    .await;
+
+    let view = invocation_view(&fixture, &straggler).await;
+    assert_eq!(
+        (view.cancel_status, view.cancel_error_code),
+        (Some(AgentRunEffectStatus::Ready), None),
+        "the cancel is out"
+    );
+
+    answer_one(
+        &fixture,
+        &AgentExchangeRouter::new(),
+        AgentRunEffectKind::WorkflowCancelCall,
+        None,
+    )
+    .await;
+    let view = invocation_view(&fixture, &straggler).await;
+    assert_eq!(
+        (view.cancel_status, view.cancel_error_code),
+        (Some(AgentRunEffectStatus::Succeeded), None),
+        "the cancel reached the child"
+    );
 }
 
 /// Unchanged: a run whose result was accepted while the straggler's cancel
