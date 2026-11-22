@@ -1022,6 +1022,25 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Repaired.** A record an earlier build left cancelling with its gate open (or suspended) admits nothing. The first of the four transitions above that commits retires its gate; the lifecycle metric counts that `retired`, where the entity has a recorder, and no history entry is recorded for it. A transition that is refused saves nothing, the closing included: a resume on such a record is refused `wake-lifecycle-terminal` and leaves the stored gate suspended until one of the others commits. A second cancellation request does not close it either, since a request that finds the cancellation recorded is answered without a transition. **Not repaired.** A control task an earlier build let end `Cancelled` still has its gate `active`, and its task snapshot shows it so. Nothing acts on it: a terminal task refuses every wake command `task-terminal`, and an epoch's result reaching it settles without promoting anything (issue #181). **Mixed builds.** An earlier build that loads a record this build closed reads a retired gate and admits nothing either. A cancellation an earlier build records leaves the gate open, and that build goes on admitting on it as before; this build retires the gate when it next commits one of the four transitions on the record.
 
+- Issue #195 ("a reconcileable call's `Failed` row is recovered as if its last attempt were uncounted") changes how many attempts a reconcileable call's recovery records and charges after a failed attempt. **No durable field, status, error code or decision kind is added, and no record changes shape.**
+
+  **What was wrong.** A reconcileable call whose attempt fails with a retryable failure is asked about before its retry: the next claim asks the reconciler whether the call executed after all. That claim ran the recovery for an attempt whose worker was lost after its durable `Started`, which the outbox row has not counted. A failed attempt was counted when it failed, and the recovery counted it again. A finding of "not executed" recorded one more failed attempt, under the lost worker's line, before the retry. So each retry spent two attempts of the budget: a budget of six bought three calls, and the run failed under `dispatcher-lost-after-started` when that extra failure spent the budget, though no worker was lost. A finding of "executed", the park when no reconciler is wired, and the park of an `Unknown` or mismatched finding on a winding-down run each told the run one attempt more than had started, and the run charged it.
+
+  **The rule.** After a failed attempt, the reconciler's finding is about an attempt the row has counted:
+
+  | The reconciler's answer | Before | Now |
+  |---|---|---|
+  | Not executed | one more failed attempt recorded, then the retry | the retry, with nothing recorded |
+  | Executed | delivered with the row's count plus one | the row's count |
+  | `Unknown` or mismatched, on a winding-down run; or no reconciler wired | parked with the row's count plus one | the row's count |
+  | `Unknown` or mismatched, on a live run | one attempt burned, and a park at a spent budget charged what the row then counts | unchanged |
+
+  An attempt whose worker was lost after its durable `Started` is still counted before its retry, as before. The live run's `Unknown` burn is what keeps the queries inside the budget.
+
+  **What a deployment sees.** A reconcileable call that keeps failing is called as many times as its budget allows, and the run then fails under the call's own code (`dispatch-collaborator-failed` with the tool's reason, for a tool) with `attempts` equal to the calls made. The reconciler is still asked once before each retry. Each such retry charges the run one effect attempt, where it charged two, and a call found executed after a failed attempt, or parked at once after one, is charged one attempt fewer than before.
+
+  **Not repaired.** An outbox row or a run an earlier build charged this way keeps its count. The row keeps only its last failure line, so an extra recorded failure cannot be told from a failed call after the fact. A row still waiting for its retry goes on from the count it has, with that much less budget left. **Mixed builds.** The binary that runs the claim decides; an earlier one counts as before.
+
 Run the default compatibility matrix:
 
 ```sh

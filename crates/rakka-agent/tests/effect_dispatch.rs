@@ -96,6 +96,7 @@ struct DispatchFixture {
     segments: Option<Arc<dyn rakka_agent::AgentSegmentSink>>,
     relabel_calls: bool,
     session_memory: Option<rakka_agent::AgentRunMemory>,
+    without_reconciler: bool,
 }
 
 impl DispatchFixture {
@@ -144,7 +145,14 @@ impl DispatchFixture {
             segments: None,
             relabel_calls: false,
             session_memory: None,
+            without_reconciler: false,
         }
+    }
+
+    /// Builds every worker from here on with no reconciler wired.
+    fn without_reconciler(mut self) -> Self {
+        self.without_reconciler = true;
+        self
     }
 
     /// Wires the dispatch pipeline with a segment sink, so what the worker
@@ -259,8 +267,10 @@ impl DispatchFixture {
         )
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
         .with_probe(Arc::new(self.probe.clone()))
-        .with_reconciler(Arc::new(self.reconciler.clone()))
         .with_credential_resolver(Arc::new(self.credentials.clone()));
+        if !self.without_reconciler {
+            pipeline = pipeline.with_reconciler(Arc::new(self.reconciler.clone()));
+        }
         if let Some(promotions) = &self.promotions {
             pipeline = pipeline.with_memory_promotion_executor(promotions.clone());
         }
@@ -3195,5 +3205,393 @@ async fn a_reconcileable_call_cancelled_after_a_failed_attempt_is_charged_that_a
         tool_call_accounts(&fx).await,
         (AgentRunEffectStatus::Cancelled, 1, spent + 1, 0),
         "one attempt started, so one attempt is charged"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #195: a reconcileable call's failed attempt is counted once. A failed
+// attempt's row counted that attempt when it failed, so the reconciler's
+// finding on it is about an attempt already counted: "not executed" goes
+// straight to the next attempt, and "executed" or a park is charged the
+// attempts that started. Each test reads the ticket's row, the run's record of
+// the call and what the run charged side by side.
+// ---------------------------------------------------------------------------
+
+/// A reconcileable tool spec of `attempts` attempts.
+fn reconcileable_spec(attempts: u32) -> AgentEffectSpec {
+    AgentEffectSpec::reconcileable(
+        AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid"),
+        attempts,
+    )
+    .expect("the spec is valid")
+}
+
+/// A tool whose every call fails with a retryable failure.
+fn a_tool_that_always_fails() -> RecordingToolExecutor {
+    RecordingToolExecutor::new().with_failure(TOOL, "upstream-unavailable", "try again later")
+}
+
+/// The tool's result the reconciler establishes.
+fn the_tools_receipt() -> AgentRunEffectOutcome {
+    AgentRunEffectOutcome::Tool {
+        call_id: AgentToolCallId::new("call-1").expect("call id should be valid"),
+        content: AgentTaskContent::inline(serde_json::json!({ "receipt": "r-195" }))
+            .expect("the content is inline-bounded"),
+    }
+}
+
+/// The effect attempts the run counts as spent, read when the turn may have
+/// moved on and no longer holds the tool call.
+async fn spent_effect_attempts(fx: &DispatchFixture) -> u64 {
+    loop_state(fx)
+        .await
+        .budget()
+        .consumption()
+        .get(rakka_agent::AgentBudgetDimension::EffectAttempts)
+}
+
+impl DispatchFixture {
+    /// One claim of the tool's ticket: expires the lease and the retry's
+    /// backoff, settles the entities and runs one pass on a fresh worker.
+    async fn claim_round(&self) {
+        self.expire_lease();
+        self.settle().await;
+        self.pipeline()
+            .pump_run(&run_scope())
+            .await
+            .expect("the pass runs");
+    }
+}
+
+/// A failed call found not executed is retried at once, with no failure
+/// recorded for the finding. Every call fails and the reconciler always
+/// answers "not executed", under a budget of six: each claim makes one call
+/// and counts one attempt, and the sixth call spends the budget under the
+/// tool's own failure. The finding used to record a failed attempt of its own
+/// before each retry, as for an attempt whose worker was lost, so three calls
+/// spent the budget and the run failed under `dispatcher-lost-after-started`.
+#[tokio::test]
+async fn a_failed_call_found_not_executed_is_retried_without_another_failed_attempt() {
+    use rakka_agent_workflow::substrate::OutboxStatus::{Exhausted, Failed};
+    let (fx, spent) = a_tool_ticket_out(
+        reconcileable_spec(6),
+        a_tool_that_always_fails(),
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted),
+    )
+    .await;
+
+    let mut claims = Vec::new();
+    for _claim in 0..8 {
+        fx.claim_round().await;
+        let row = tool_row(&fx).await;
+        claims.push((
+            fx.tools.invocation_count(TOOL),
+            fx.reconciler.queries(),
+            row,
+        ));
+        if row.0 == Exhausted {
+            break;
+        }
+    }
+
+    assert_eq!(
+        claims,
+        vec![
+            (1, 0, (Failed, 1)),
+            (2, 1, (Failed, 2)),
+            (3, 2, (Failed, 3)),
+            (4, 3, (Failed, 4)),
+            (5, 4, (Failed, 5)),
+            (6, 5, (Exhausted, 6)),
+        ],
+        "(calls, queries, row) after each claim: one call and one attempt each"
+    );
+    assert_eq!(
+        tool_call_accounts(&fx).await,
+        (AgentRunEffectStatus::Exhausted, 6, spent + 6, 0),
+        "six attempts made, six charged"
+    );
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    match run.terminal_reason {
+        Some(AgentRunTerminalReason::EffectFailed {
+            code,
+            reason,
+            attempts,
+            max_attempts,
+            ..
+        }) => {
+            assert_eq!(
+                code, "dispatch-collaborator-failed",
+                "the tool's own failure spent the budget, not a lost worker"
+            );
+            assert_eq!(
+                reason.as_ref().map(|reason| reason.code()),
+                Some("upstream-unavailable")
+            );
+            assert_eq!((attempts, max_attempts), (Some(6), Some(6)));
+        }
+        other => panic!("the run fails on the call, not {other:?}"),
+    }
+}
+
+/// A call whose worker was lost after it invoked the tool, found `Unknown`
+/// and then not executed, is charged one attempt for each call. The `Unknown`
+/// finding counts the lost attempt, which the row had not counted, and the
+/// claim after it goes straight to the retry. The second finding used to
+/// record another failed attempt first: two calls, three charged.
+#[tokio::test]
+async fn a_lost_call_found_unknown_then_not_executed_is_charged_one_attempt_per_call() {
+    use rakka_agent_workflow::substrate::OutboxStatus::{Dispatched, Failed};
+    let (fx, spent) = a_tool_ticket_out(
+        reconcileable_spec(6),
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new()
+            .with_finding(AgentReconciliationFinding::Unknown)
+            .with_finding(AgentReconciliationFinding::NotExecuted),
+    )
+    .await;
+    let effect = fx.effect_at(1).await;
+    fx.probe.arm(AgentDispatchWindow::AfterInvocation);
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert!(pass.died, "the worker is lost after it invoked the tool");
+
+    fx.claim_round().await;
+    assert_eq!(
+        (fx.tools.invocation_count(TOOL), fx.reconciler.queries()),
+        (1, 1)
+    );
+    assert_eq!(
+        tool_row(&fx).await,
+        (Failed, 1),
+        "the unknown finding counts the lost attempt"
+    );
+
+    fx.claim_round().await;
+    assert_eq!(
+        (fx.tools.invocation_count(TOOL), fx.reconciler.queries()),
+        (2, 2),
+        "proven absent, the call is made again"
+    );
+    let row = fx.outbox_row(&effect).await;
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (Dispatched, 1),
+        "the retry succeeded, and the row still counts the one failed attempt"
+    );
+    assert_eq!(
+        spent_effect_attempts(&fx).await,
+        spent + 2,
+        "two calls, two attempts charged"
+    );
+}
+
+/// An attempt that started and was lost, found not executed, is still counted
+/// before its retry: the row had not counted it, and it reached a durable
+/// `Started`. One call, two attempts charged.
+#[tokio::test]
+async fn a_lost_attempt_found_not_executed_is_counted_before_its_retry() {
+    use rakka_agent_workflow::substrate::OutboxStatus::{Dispatched, Dispatching};
+    let (fx, spent) = a_tool_ticket_out(
+        reconcileable_spec(3),
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted),
+    )
+    .await;
+    let effect = fx.effect_at(1).await;
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert!(pass.died, "the worker is lost after the durable Started");
+    assert_eq!(
+        tool_row(&fx).await,
+        (Dispatching, 0),
+        "the row marks the attempt as started and has not counted it"
+    );
+
+    fx.claim_round().await;
+
+    assert_eq!(
+        (fx.tools.invocation_count(TOOL), fx.reconciler.queries()),
+        (1, 1)
+    );
+    let row = fx.outbox_row(&effect).await;
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (Dispatched, 1),
+        "the lost attempt is counted, and the retry succeeded"
+    );
+    assert_eq!(
+        spent_effect_attempts(&fx).await,
+        spent + 2,
+        "the lost attempt and the retry are charged"
+    );
+}
+
+/// A failed call the reconciler finds executed is charged the attempt it
+/// made. The finding used to be delivered with the number of the attempt the
+/// claim was about to make, and the run charged two for one call.
+#[tokio::test]
+async fn a_failed_call_found_executed_is_charged_the_attempt_it_made() {
+    use rakka_agent_workflow::substrate::OutboxStatus::{Dispatched, Failed};
+    let (fx, spent) = a_tool_ticket_out(
+        reconcileable_spec(3),
+        a_tool_that_always_fails(),
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::Executed {
+            outcome: Box::new(the_tools_receipt()),
+        }),
+    )
+    .await;
+    let effect = fx.effect_at(1).await;
+    fx.claim_round().await;
+    assert_eq!(tool_row(&fx).await, (Failed, 1));
+
+    fx.claim_round().await;
+
+    assert_eq!(
+        (fx.tools.invocation_count(TOOL), fx.reconciler.queries()),
+        (1, 1),
+        "the outcome is reconciled, not invoked again"
+    );
+    let row = fx.outbox_row(&effect).await;
+    assert_eq!((row.status(), row.attempts().attempts()), (Dispatched, 1));
+    assert_eq!(
+        spent_effect_attempts(&fx).await,
+        spent + 1,
+        "one attempt made, one charged"
+    );
+    fx.pump().await;
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::Completed
+    );
+}
+
+/// The parks a failed call can come to at once, before any attempt more is
+/// made, are each charged the attempt it made, and leave the row counting it.
+async fn assert_failed_call_parked_with_its_attempt(fx: &DispatchFixture, spent: u64, code: &str) {
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+    assert_eq!(
+        tool_call_accounts(fx).await,
+        (AgentRunEffectStatus::Indeterminate, 1, spent + 1, 0),
+        "one attempt made, one charged"
+    );
+    assert_eq!(fx.effect_at(1).await.last_error_code.as_deref(), Some(code));
+    assert_eq!(
+        tool_row(fx).await,
+        (rakka_agent_workflow::substrate::OutboxStatus::Cancelled, 1),
+        "the park ends the row, which counts the one attempt"
+    );
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::WaitingForReconciliation
+    );
+}
+
+/// A failed call with no reconciler wired parks, charged the attempt it made.
+/// The park used to carry the number of the attempt the claim was about to
+/// make.
+#[tokio::test]
+async fn a_failed_call_parked_for_a_missing_reconciler_is_charged_the_attempt_it_made() {
+    let (fx, spent) = a_tool_ticket_out(
+        reconcileable_spec(3),
+        a_tool_that_always_fails(),
+        ScriptedReconciler::new(),
+    )
+    .await;
+    let fx = fx.without_reconciler();
+    fx.claim_round().await;
+    assert_eq!(
+        tool_row(&fx).await,
+        (rakka_agent_workflow::substrate::OutboxStatus::Failed, 1)
+    );
+
+    fx.claim_round().await;
+
+    assert_failed_call_parked_with_its_attempt(&fx, spent, "reconciler-missing").await;
+}
+
+/// A failed call found `Unknown` on a cancelled run parks at once, charged
+/// the attempt it made.
+#[tokio::test]
+async fn a_failed_call_found_unknown_on_a_cancelled_run_is_charged_the_attempt_it_made() {
+    let (fx, spent) = a_tool_ticket_out(
+        reconcileable_spec(3),
+        a_tool_that_always_fails(),
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::Unknown),
+    )
+    .await;
+    fx.claim_round().await;
+    cancel_the_run(&fx).await;
+
+    fx.claim_round().await;
+
+    assert_eq!(fx.reconciler.queries(), 1);
+    assert_failed_call_parked_with_its_attempt(&fx, spent, "reconciliation-unknown").await;
+}
+
+/// The same for a finding of "executed" whose outcome does not fit the call,
+/// which is handled as `Unknown` and comes to its park by another call site.
+#[tokio::test]
+async fn a_failed_call_with_a_mismatched_finding_on_a_cancelled_run_is_charged_the_attempt_it_made()
+{
+    let (fx, spent) = a_tool_ticket_out(
+        reconcileable_spec(3),
+        a_tool_that_always_fails(),
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::Executed {
+            outcome: Box::new(AgentRunEffectOutcome::Model {
+                turn: Box::new(proposing_turn("charged")),
+            }),
+        }),
+    )
+    .await;
+    fx.claim_round().await;
+    cancel_the_run(&fx).await;
+
+    fx.claim_round().await;
+
+    assert_eq!(fx.reconciler.queries(), 1);
+    assert_failed_call_parked_with_its_attempt(&fx, spent, "effect-outcome-mismatch").await;
+}
+
+/// On a live run an `Unknown` finding still counts one attempt, whatever row
+/// it is asked about: that keeps the queries inside the budget. A failed
+/// call's finding at a budget of two spends the budget, and the park is
+/// charged the two attempts the row counts.
+#[tokio::test]
+async fn an_unknown_finding_on_a_failed_call_still_counts_an_attempt() {
+    let (fx, spent) = a_tool_ticket_out(
+        reconcileable_spec(2),
+        a_tool_that_always_fails(),
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::Unknown),
+    )
+    .await;
+    fx.claim_round().await;
+
+    fx.claim_round().await;
+
+    assert_eq!(
+        (fx.tools.invocation_count(TOOL), fx.reconciler.queries()),
+        (1, 1)
+    );
+    assert_eq!(
+        tool_row(&fx).await,
+        (rakka_agent_workflow::substrate::OutboxStatus::Exhausted, 2),
+        "the finding counted an attempt, and that spent the budget"
+    );
+    assert_eq!(
+        tool_call_accounts(&fx).await,
+        (AgentRunEffectStatus::Indeterminate, 2, spent + 2, 0),
+        "the park is charged what the row counts"
+    );
+    assert_eq!(
+        fx.effect_at(1).await.last_error_code.as_deref(),
+        Some("reconciliation-exhausted")
     );
 }

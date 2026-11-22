@@ -186,6 +186,16 @@ leaves behind is the same either way.
    on a live run it burns one attempt and asks again on a later claim, and a
    spent budget parks the generation; a winding-down run parks it at once.
    The failed attempt's line and the park carry `effect-outcome-mismatch`.
+   A reconcileable call is asked about before every retry, and each of its
+   attempts is counted once (issue #195). After an attempt that failed, and
+   was counted when it failed, a finding of "not executed" goes straight to
+   the next attempt. An attempt whose worker was lost after its durable
+   `Started` is counted before its retry. A finding of "executed", and a
+   park made at once (no reconciler wired, or an `Unknown` or mismatched
+   finding on a winding-down run), are charged the attempts that started.
+   On a live run an `Unknown` or mismatched finding still burns one attempt,
+   whichever attempt it was asked about, so the queries stay inside the
+   budget.
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect

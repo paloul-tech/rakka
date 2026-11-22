@@ -3823,11 +3823,13 @@ where
             || (row.status() == OutboxStatus::Failed
                 && intent.safety.class() == AgentEffectSafetyClass::Reconcileable);
         let mut step = if ambiguous {
-            // What a cancellation of this recovery tells the run: the
-            // attempts that have started. A `Dispatching` row's lost attempt
-            // started, and the row has not counted it. A `Failed` row counted
-            // its last attempt when it ended, and the attempt this claim was
-            // about to make has not started (issue #182).
+            // What the run is told when this recovery ends without another
+            // attempt (a cancellation, a reconciled outcome, a park at
+            // once): the attempts that have started. A `Dispatching` row's
+            // lost attempt started, and the row has not counted it. A
+            // `Failed` row counted its last attempt when it ended, and the
+            // attempt this claim was about to make has not started (issues
+            // #182 and #195).
             let started = if row.status() == OutboxStatus::Dispatching {
                 attempt
             } else {
@@ -4398,10 +4400,12 @@ where
     /// per the intent's safety class
     /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
     ///
-    /// `started` is how many of the ticket's attempts have started, which a
-    /// cancellation tells the run. It is `attempt` where the row was left
-    /// `Dispatching`, and one fewer where a `Reconcileable` intent's row was
-    /// left `Failed`: that row already counted the attempt being asked about.
+    /// `started` is how many of the ticket's attempts have started, which the
+    /// run is told when the recovery ends without another attempt. It is
+    /// `attempt` where the row was left `Dispatching`, and one fewer where a
+    /// `Reconcileable` intent's row was left `Failed`: that row already
+    /// counted the attempt being asked about, and a finding of "not executed"
+    /// on it goes straight to the next attempt (issue #195).
     #[allow(clippy::too_many_arguments)]
     async fn recover_ambiguous(
         &mut self,
@@ -4681,8 +4685,14 @@ where
     /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md):
     /// "retry only when proven absent").
     ///
-    /// `started` is how many of the ticket's attempts have started: what a
-    /// cancellation tells the run ([`Self::recover_ambiguous`]).
+    /// `attempt` is one more than the attempts the ticket's row counts: the
+    /// attempt a burned finding is recorded as, and the next attempt when
+    /// there is nothing to burn. `started` is how many of the ticket's
+    /// attempts have started, and is what the run is told when the recovery
+    /// ends without another attempt: a finding of "executed", a park at once,
+    /// a cancellation. The two are equal where the row has not counted the
+    /// attempt asked about. `started` is one fewer where the row counted it
+    /// when it failed ([`Self::recover_ambiguous`], issue #195).
     #[allow(clippy::too_many_arguments)]
     async fn reconcile_ambiguous(
         &mut self,
@@ -4703,7 +4713,7 @@ where
                     scope,
                     claim,
                     intent,
-                    attempt,
+                    started,
                     "reconciliation-protocol-missing",
                     INDETERMINATE_OUTCOME_MESSAGE,
                     pass,
@@ -4717,7 +4727,7 @@ where
                     scope,
                     claim,
                     intent,
-                    attempt,
+                    started,
                     "reconciler-missing",
                     INDETERMINATE_OUTCOME_MESSAGE,
                     pass,
@@ -4750,6 +4760,7 @@ where
                             claim,
                             intent,
                             attempt,
+                            started,
                             winding_down,
                             &OUTCOME_MISMATCH,
                             pass,
@@ -4757,8 +4768,9 @@ where
                         .await
                         .map(ClaimStep::Concluded);
                 }
-                // The authoritative outcome, recorded without re-invocation.
-                self.deliver_outcome(scope, intent, attempt, claim.fencing_token, *outcome, pass)
+                // The authoritative outcome, recorded without re-invocation,
+                // for the attempts that started: the claim makes none.
+                self.deliver_outcome(scope, intent, started, claim.fencing_token, *outcome, pass)
                     .await?;
                 let message_id = OutboxMessageId::new(claim.effect_id.as_str());
                 if let Err(row) = self
@@ -4833,6 +4845,24 @@ where
                     return Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease));
                 }
                 // Proven absent: a retry is a fresh invocation, under budget.
+                // A row that counted the attempt asked about when it failed
+                // has nothing to burn, and the next attempt is made at once:
+                // burning it again charged that attempt twice and spent a
+                // budget of six in three calls (issue #195). The row's next
+                // attempt is inside its budget, since a `Failed` row is one
+                // with a retry left.
+                if started < attempt {
+                    return Ok(ClaimStep::Invoke {
+                        claim,
+                        attempt,
+                        bound_from: another_follows.then_some(asked_at),
+                    });
+                }
+                // An attempt the row has not counted reached a durable
+                // `Started`, and is counted before the retry. Counting it is
+                // also what moves the retry past it: handed back uncounted,
+                // a claim whose own attempt ended unknown would make that
+                // same attempt again, without end.
                 self.retry_ambiguous(
                     scope,
                     claim,
@@ -4849,6 +4879,7 @@ where
                     claim,
                     intent,
                     attempt,
+                    started,
                     winding_down,
                     &RECONCILIATION_UNKNOWN,
                     pass,
@@ -4870,6 +4901,13 @@ where
     /// does, so the spent-budget branch records nothing for the claim before
     /// it. A second record of the same claim is fenced, and the pass that
     /// parked would answer an error.
+    ///
+    /// `attempt` and `started` are [`Self::reconcile_ambiguous`]'s. A
+    /// winding-down run's park is made at once and charged `started`. On a
+    /// live run the finding burns an attempt whatever row it was asked about,
+    /// which is what keeps the queries inside the budget, and a park after a
+    /// burn that spent the budget is charged what the row then counts:
+    /// `attempt`.
     #[allow(clippy::too_many_arguments)]
     async fn settle_unknown_finding(
         &mut self,
@@ -4877,6 +4915,7 @@ where
         claim: AgentDispatchClaim,
         intent: &AgentRunEffect,
         attempt: u32,
+        started: u32,
         winding_down: bool,
         finding: &UnknownFinding,
         pass: &mut AgentDispatchPass,
@@ -4889,13 +4928,14 @@ where
         if winding_down {
             // A cancelled run cannot wait for a better answer forever; the
             // outcome is unknown and consequential, so it parks for the
-            // explicit decision (scenario 57).
+            // explicit decision (scenario 57), charged the attempts that
+            // started (issue #195).
             return self
                 .park_indeterminate(
                     scope,
                     claim,
                     intent,
-                    attempt,
+                    started,
                     winding_down_code,
                     INDETERMINATE_OUTCOME_MESSAGE,
                     pass,
