@@ -170,8 +170,8 @@ while A holds its budget, so a release by hand or a resume promotes nothing
 there anyway. The tests of those two doors use a control task with no
 ceiling, on which, before this change, both admitted B.
 
-On `main`'s `task.rs`, twelve of the fifteen fail, each on the defect; the
-goal-record control and the two cases above pass.
+On `main`'s `task.rs`, thirteen of the sixteen fail, each on the defect;
+the goal-record control and the two cases above pass.
 
 Nine breaks of the fix were run one at a time against the whole crate
 (1,929 tests at the time). Each is caught:
