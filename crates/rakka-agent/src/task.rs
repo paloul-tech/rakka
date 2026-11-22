@@ -5785,10 +5785,11 @@ fn project_goal_decision(
 /// the exchanges it owes now.
 ///
 /// In one compare-and-set: the absorbing marker is set with the terminal
-/// reason finalization will record, the goal the task holds is decided and
-/// its admission closed, and the propagation the current state permits is
-/// owed — the run-cancel exchange when a run has durably accepted, or the
-/// immediate finalization when no generation is live. An offered assignment
+/// reason finalization will record, the goal the task holds is decided, the
+/// wake gate is retired whether or not the task holds a goal record
+/// ([`close_admission_on_cancellation`]), and the propagation the current
+/// state permits is owed — the run-cancel exchange when a run has durably
+/// accepted, or the immediate finalization when no generation is live. An offered assignment
 /// owes its run-cancel at the acceptance settle instead, so a cancellation
 /// can never definitively refuse ahead of an in-flight assignment.
 ///
@@ -5815,8 +5816,11 @@ fn request_task_cancellation(
         requested_at: now,
     }));
     // The goal decision and admission close at request time: acceptance of a
-    // cancellation request immediately fences new dispatch for the scope.
+    // cancellation request immediately fences new dispatch for the scope. The
+    // decision retires the gate of a task with a goal record; one without a
+    // record has only the close below to retire it (issue #198).
     let goal_row = project_goal_decision(task, &reason, now)?;
+    close_admission_on_cancellation(task);
 
     let status = task.status;
     state.updated_at = now;
@@ -5881,6 +5885,34 @@ fn request_task_cancellation(
     owed.extend(owed_run_cancel(state, now)?);
     owed.extend(finalize_task_cancellation(state, operation_id, now)?);
     Ok(owed)
+}
+
+/// Retires the wake gate of a task whose cancellation is recorded, so that it
+/// admits no further epoch (issue #198).
+///
+/// Acceptance of a cancellation request fences new dispatch for its scope at
+/// once ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)), and
+/// an epoch's run is new dispatch. The gate is the fence every admission
+/// asks. The request closes it whether or not the task holds a goal record:
+/// for a task with one, the goal decision has already retired it, and a task
+/// without one has nothing else to retire it. Every transition that can
+/// admit on a cancelling task — an epoch's result, a delivery, an operator's
+/// release and an operator's resume — runs this too, before it reads the
+/// gate. So a record an earlier build left cancelling with its gate open
+/// admits nothing: the first of them that commits retires its gate, and one
+/// that is refused (a resume always is, on a retired gate) saves nothing,
+/// the close included, and admits nothing either.
+///
+/// Idempotent, and a gate that has already ended (an expired one) is left
+/// as it is. It records no history entry: the request's own entry stands
+/// for it, as the goal decision's does for a task with a goal record.
+fn close_admission_on_cancellation(task: &mut AgentTask) {
+    if task.cancellation.is_none() {
+        return;
+    }
+    if let Some(controller) = task.wake_controller.as_mut() {
+        controller.retire_by_policy();
+    }
 }
 
 /// The run-cancel exchange the task owes its accepted assignment, when it
@@ -7690,6 +7722,10 @@ fn apply_epoch_result(
             return Ok((release, owed));
         }
 
+        // A cancelling task's result releases and admits nothing: its gate
+        // is closed before the lifecycle is read below (issue #198).
+        close_admission_on_cancellation(task);
+
         // Account the epoch's outcome *before* the release attempt, so the
         // raced-CompleteWakeOccurrence path — where the release answers
         // NotActive — still counts a failure exactly as its settlement still
@@ -8166,6 +8202,9 @@ fn admit_wake(
             offered: binding.goal().clone(),
         });
     }
+    // A delivery to a cancelling task is barred by its closed gate
+    // (issue #198).
+    close_admission_on_cancellation(task);
     let spec = task
         .goal_mode
         .continuous()
@@ -8261,6 +8300,8 @@ fn complete_wake_occurrence(
 ) -> AgentTaskResult<(AgentWakeOutcome, Vec<AgentExchangeEnvelope>)> {
     let scope = state.scope.clone();
     let task = continuous_task_mut(state)?;
+    // A cancelling task's release admits nothing (issue #198).
+    close_admission_on_cancellation(task);
     let policy = task
         .goal_mode
         .continuous()
@@ -8434,6 +8475,9 @@ fn resume_continuous_goal(
 ) -> AgentTaskResult<(AgentWakeOutcome, Vec<AgentExchangeEnvelope>)> {
     let scope = state.scope.clone();
     let task = continuous_task_mut(state)?;
+    // A cancelling task's gate is closed, and the resume is refused on it
+    // (issue #198).
+    close_admission_on_cancellation(task);
     // Any wait the gate door does not own fences this resume: a budget park
     // or a stagnation park is the goal door's wait, and resuming the gate
     // under it would re-admit spending the contract says is parked. The goal
