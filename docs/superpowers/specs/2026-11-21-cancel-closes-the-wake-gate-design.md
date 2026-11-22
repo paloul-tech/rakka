@@ -113,7 +113,7 @@ left cancelling with the gate open is closed by this build (call 2).
 
 ## 6. Tests
 
-`crates/rakka-agent/tests/cancel_closes_the_wake_gate.rs`, new, thirteen
+`crates/rakka-agent/tests/cancel_closes_the_wake_gate.rs`, new, fifteen
 tests. The issue's reproduction runs with real epochs: the scanner's
 delivery, an epoch task and its run, the model call answered.
 
@@ -140,6 +140,12 @@ delivery, an epoch task and its run, the model call answered.
 - A control task with a goal record, measured the same way: gate retired,
   goal `Cancelled` under `root-task-cancelled`, A's result admits nothing.
   It passed before the change too; it holds the contrast the issue draws.
+- The two cases the issue did not run, both right before this change and
+  held as they are: a goal record that is `Proposed` when the cancel
+  arrives (nothing is out, so the task ends at once, its goal decided
+  `root-task-cancelled` and its gate retired), and a goal record decided
+  before the cancel (the decision retired the gate, and A's result admits
+  nothing).
 - One test per admitting transition of call 2 (an epoch's result, a
   delivery, `CompleteWakeOccurrence`, `ResumeContinuousGoal`), over a
   record an earlier build left cancelling with the gate open (or suspended,
@@ -152,5 +158,19 @@ while A holds its budget, so a release by hand or a resume promotes nothing
 there anyway. The tests of those two doors use a control task with no
 ceiling, on which, before this change, both admitted B.
 
-On `main` before the change, twelve of the thirteen fail, each on the
-defect; the goal-record control passes.
+On `main`'s `task.rs`, twelve of the fifteen fail, each on the defect; the
+goal-record control and the two cases above pass.
+
+Nine breaks of the fix were run one at a time against the whole crate
+(1,929 tests at the time). Each is caught:
+
+- the request's close removed: five tests fail. The tests that drive an
+  admitting transition still pass, because that transition closes the
+  gate itself;
+- each of the four admitting transitions' close removed, one at a time:
+  exactly one test fails each time, the matching earlier-build test;
+- the close made unconditional (every gate retired, cancelled or not):
+  82 tests fail;
+- the close moved after the lifecycle read, in a delivery, an epoch's
+  result and a release by hand: exactly one test fails each time, on the
+  `goal-retired` history entry the move records.

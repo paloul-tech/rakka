@@ -898,6 +898,91 @@ async fn a_control_task_with_a_goal_record_is_unchanged() {
     assert_eq!(task_line(&fx).await, (AgentTaskStatus::Cancelled, true, 0));
 }
 
+/// The issue's first case it did not run: a goal record that is `Proposed`
+/// when the cancel arrives. A proposed goal parks admission, so nothing is
+/// out and the cancel ends the task at once; the goal is decided and the
+/// gate retired. Unchanged by this fix, which the decision already covered.
+#[tokio::test]
+async fn a_proposed_goal_record_is_decided_and_its_gate_retired_by_the_cancel() {
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    fx.apply_task_command(continuous_goal_control_creation_command(
+        continuous_goal_mode(wake_policy()),
+        goal_spec_draft(goal_spec(), false),
+    ))
+    .await
+    .expect("the goal's control task is created");
+    let a = deliver(&fx, 5).await;
+    assert!(
+        matches!(a.disposition, AgentWakeDisposition::SuspendedParked { .. }),
+        "a proposed goal parks admission, got {:?}",
+        a.disposition
+    );
+
+    fx.apply_task_command(cancel_command())
+        .await
+        .expect("the cancel applies");
+
+    assert_eq!(gate(&fx).await.0, AgentGoalLifecycleStatus::Retired);
+    let state = root(&fx).await;
+    let goal = state
+        .task()
+        .and_then(|task| task.goal_state.as_deref())
+        .expect("the goal record exists");
+    assert_eq!(
+        goal.terminal().map(|decision| decision.reason.code()),
+        Some("root-task-cancelled")
+    );
+    assert_eq!(task_line(&fx).await, (AgentTaskStatus::Cancelled, true, 0));
+    assert_eq!(controller(&fx).await.0, 0, "nothing was ever admitted");
+}
+
+/// The issue's second case it did not run: a goal record already decided
+/// when the cancel arrives. The decision retired the gate, so A's result
+/// admits nothing whatever the cancel does. Unchanged by this fix.
+#[tokio::test]
+async fn a_goal_record_decided_before_the_cancel_already_closed_the_gate() {
+    let fx = fixture();
+    let (a, b) = an_epoch_out_and_one_parked(&fx, ControlTask::GoalRecord).await;
+    let expected_status_revision = root(&fx)
+        .await
+        .task()
+        .and_then(|task| task.goal_state.as_deref())
+        .expect("the goal record exists")
+        .status_revision();
+    fx.apply_task_command(AgentTaskEntityCommand::RecordGoalDecision {
+        operation_id: operation(AgentOperationKind::Command, "goal-cancel"),
+        decision: Box::new(rakka_agent::AgentGoalDecision {
+            reason: rakka_agent::AgentGoalTerminalReason::CancellationRequested {
+                reason: "operator".to_string(),
+            },
+            evaluation: None,
+            provenance: Some(Box::new(provenance(20))),
+            expected_status_revision,
+        }),
+    })
+    .await
+    .expect("the goal decision applies");
+    assert_eq!(gate(&fx).await.0, AgentGoalLifecycleStatus::Retired);
+
+    fx.apply_task_command(cancel_command())
+        .await
+        .expect("the cancel applies");
+    fx.pump_epoch(&a.epoch, &a.run)
+        .await
+        .expect("epoch A converges");
+
+    assert_eq!(
+        reply_to_the_result_of(&fx, &a.epoch).await,
+        (a.binding.wake_id().to_string(), None)
+    );
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("the root settles");
+    assert!(!exists(&fx, &b.epoch).await);
+    assert_eq!(task_line(&fx).await, (AgentTaskStatus::Cancelled, true, 0));
+}
+
 /// A record an earlier build left cancelling with its gate open is closed by
 /// the epoch's result that reaches it first: A's result admits nothing, and
 /// the task ends `Cancelled`. The closing is not recorded as an observed
