@@ -312,19 +312,23 @@ async fn history_from_the_request(fx: &Fixture) -> Vec<(AgentTaskHistoryKind, St
         let page = rakka_agent::AgentTaskHistoryStore::read(&fx.history, &task_scope(), position)
             .await
             .expect("the history reads");
-        entries.extend(page.entries.iter().filter_map(|entry| {
-            matches!(
-                entry.kind,
-                AgentTaskHistoryKind::CancellationRequested
-                    | AgentTaskHistoryKind::EpochAdmitted
-                    | AgentTaskHistoryKind::EpochSettled
-                    | AgentTaskHistoryKind::WakeDispositioned
-                    | AgentTaskHistoryKind::GoalDecided
-                    | AgentTaskHistoryKind::GoalRetired
-                    | AgentTaskHistoryKind::GoalSuspended
-            )
-            .then(|| (entry.kind, entry.detail.clone()))
-        }));
+        entries.extend(
+            page.entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.kind,
+                        AgentTaskHistoryKind::CancellationRequested
+                            | AgentTaskHistoryKind::EpochAdmitted
+                            | AgentTaskHistoryKind::EpochSettled
+                            | AgentTaskHistoryKind::WakeDispositioned
+                            | AgentTaskHistoryKind::GoalDecided
+                            | AgentTaskHistoryKind::GoalRetired
+                            | AgentTaskHistoryKind::GoalSuspended
+                    )
+                })
+                .map(|entry| (entry.kind, entry.detail.clone())),
+        );
         cursor = page.next;
     }
     let start = entries
