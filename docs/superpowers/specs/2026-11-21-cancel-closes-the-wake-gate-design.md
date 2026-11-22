@@ -34,11 +34,11 @@ A cancellation request closes the task's wake gate. The gate is retired
 whether or not the task holds a goal record, in the compare-and-set that
 records the request.
 
-Every way a task is asked to cancel takes `request_task_cancellation`: the
-`Cancel` command, a parent run's `DelegationCancel`, a failed dependency, a
-proposal refused because the task is being cancelled, the unclaimed-expiry
-sweep, and the settle pass's cancellation of a goal that ended. So the rule
-holds for all of them. A delegated control task is the case that matters
+Every way a task is asked to cancel takes `request_task_cancellation`, the
+only place that sets the marker: the `Cancel` command, a parent run's
+`DelegationCancel`, a failed dependency, the unclaimed-expiry sweep, and the
+settle pass's cancellation of a goal that ended. So the rule holds for all
+of them. A delegated control task is the case that matters
 most here: creation refuses a delegated child a goal contract, not a
 continuous mode, so every delegated control task has no goal record, and its
 parent's cancel reaches it as a `DelegationCancel`.
@@ -59,8 +59,10 @@ once the last of them has settled.
 ## 3. My calls
 
 1. **The request retires the gate whenever the task has one** (the issue's
-   first question). It runs after the goal decision, so a task with a goal
-   record keeps its goal reason `root-task-cancelled` and is unchanged.
+   first question). A task with a goal record is unchanged: its goal
+   decision has already retired the gate, the close finds it retired, and
+   the decision does not read the gate, so its reason is still
+   `root-task-cancelled`.
 2. **Every transition that can admit closes the gate first when the
    cancellation is recorded** (the issue's second question). These are the
    four that can admit on a cancelling task: an epoch's result, a delivery,
@@ -111,24 +113,44 @@ left cancelling with the gate open is closed by this build (call 2).
 
 ## 6. Tests
 
-`crates/rakka-agent/tests/cancel_closes_the_wake_gate.rs`, new. The issue's
-reproduction runs with real epochs: the scanner's delivery, an epoch task and
-its run, the model call answered.
+`crates/rakka-agent/tests/cancel_closes_the_wake_gate.rs`, new, thirteen
+tests. The issue's reproduction runs with real epochs: the scanner's
+delivery, an epoch task and its run, the model call answered.
 
-- The issue's measurement, inverted: with A out and B parked, the cancel
-  retires the gate; A's result admits nothing; B's epoch is never created;
-  the task is `Cancelled` once A has settled; the history has no
-  `epoch-admitted` after the request.
+- The cancel retires the gate of a control task with no goal record, moves
+  its lifecycle revision by one and nothing else on the controller, and adds
+  no history entry beyond the request's.
+- The issue's measurement, reversed: A's result releases A and admits
+  nothing; B's epoch is never created; the task is `Cancelled` once A has
+  settled, with B still parked; the history has no `epoch-admitted` after
+  the request.
 - An occurrence delivered while the cancelling task waits for its epoch is
-  `barred`.
+  `barred` (`retired`), and its timer entry is marked terminal.
 - `CompleteWakeOccurrence` on the cancelling task releases and admits
   nothing.
 - A cancel that finds the gate suspended retires it, and the operator's
-  `ResumeContinuousGoal` is refused.
-- The lifecycle metric counts one `retired`.
-- A delegated control task told to cancel by its parent run admits nothing
-  further, and tells its parent once its epoch has settled.
-- A control task with a goal record, measured the same way, as the control
-  case: the same answers, and its goal reason unchanged.
-- One test per admitting transition of call 2, over a record an earlier
-  build left cancelling with the gate open.
+  `ResumeContinuousGoal` is refused `wake-lifecycle-terminal`.
+- `SuspendContinuousGoal`, `RenewContinuousGoal` and `RetireContinuousGoal`
+  are refused `wake-lifecycle-terminal` after the cancel.
+- The lifecycle metric counts one `retired`, at the cancel, and no second
+  one by the time the task is `Cancelled`.
+- A delegated control task told to cancel by its parent run's
+  `DelegationCancel` retires its gate, admits nothing on A's result, and
+  owes its parent its `DelegationResult` once A has settled.
+- A control task with a goal record, measured the same way: gate retired,
+  goal `Cancelled` under `root-task-cancelled`, A's result admits nothing.
+  It passed before the change too; it holds the contrast the issue draws.
+- One test per admitting transition of call 2 (an epoch's result, a
+  delivery, `CompleteWakeOccurrence`, `ResumeContinuousGoal`), over a
+  record an earlier build left cancelling with the gate open (or suspended,
+  for the resume). The record is made by this build and then given back the
+  gate it had before the cancel, which is the only thing an earlier build's
+  cancel did not change on the controller.
+
+Under the fixture's bounded definition the goal's ledger cannot pay for B
+while A holds its budget, so a release by hand or a resume promotes nothing
+there anyway. The tests of those two doors use a control task with no
+ceiling, on which, before this change, both admitted B.
+
+On `main` before the change, twelve of the thirteen fail, each on the
+defect; the goal-record control passes.
