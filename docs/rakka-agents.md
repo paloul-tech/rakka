@@ -186,6 +186,26 @@ leaves behind is the same either way.
    on a live run it burns one attempt and asks again on a later claim, and a
    spent budget parks the generation; a winding-down run parks it at once.
    The failed attempt's line and the park carry `effect-outcome-mismatch`.
+   A reconcileable call is asked about before every retry, and each of its
+   attempts is counted once (issue #195). After an attempt that failed, and
+   was counted when it failed, a finding of "not executed" goes straight to
+   the next attempt. An attempt whose worker was lost after its durable
+   `Started` is counted before its retry. A finding of "executed", and a
+   park made at once (no reconciler wired, or an `Unknown` or mismatched
+   finding on a winding-down run), are charged the attempts that started.
+   On a live run an `Unknown` or mismatched finding still burns one attempt,
+   whichever attempt it was asked about, so a reconciler that keeps
+   answering `Unknown` is asked at most once for each attempt in the
+   budget. After a failed attempt the dispatch authority is asked before
+   the reconciler, unless the wind-down fence applies to the call or no
+   reconciler is wired, and a retry it defers (a suspended agent, say) asks
+   the reconciler nothing and spends none of the budget. So while it is
+   deferred, a finding that would need no attempt, such as "executed",
+   waits too. A claim told "not executed" about a failed attempt reads the
+   ticket's row and the run again before it makes the retry, and makes none
+   if the row moved meanwhile; a row another worker finished is settled
+   against the run as it now stands, so the run is told if nobody has told
+   it.
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect
@@ -327,7 +347,7 @@ settle, a release and a prune. The loss after that is returned as
 
 **A batch and its leases** (issue #157). A claim pass leases every claim of
 its batch at one instant, and a worker runs the claims one after another.
-Three rules keep a claim from being taken by another worker while its pass
+Four rules keep a claim from being taken by another worker while its pass
 is still working on it, and from being run by two:
 
 - **Every settle renews what the pass still holds.** In the same write, each
@@ -358,7 +378,25 @@ is still working on it, and from being run by two:
   whose worker was lost. The lease has to cover one attempt, not a budget.
   An attempt that spends the budget has none after it, so its claim is not
   asked and settles it as before; a claim's first attempt is not asked
-  either.
+  whether the lease covers it either.
+- **A claim's first attempt after the reconciler's answer needs a current
+  lease** (issue #195). A claim's first attempt can follow the
+  reconciler's answer about an attempt an earlier claim made: one whose
+  worker was lost, or one that failed. The answer can come after the lease
+  lapsed, so on a finding of "not executed" the claim makes that attempt
+  only if its lease is still current, and otherwise ends there and writes
+  nothing, as above; a lost attempt is then counted by the claim that
+  follows. Only that the lease is current is asked, not that it covers the
+  attempt: every such claim asks the reconciler first, so a rule that the
+  lease cover the attempt too would never retry an effect whose answer and
+  call together outlast the lease. On this path the lease has to cover the
+  reconciler's answer and the call, and after a failed attempt the
+  authority's answer before the question too. After a failed attempt the
+  claim also reads the ticket's row and the run again, and makes no attempt
+  if the row is no longer where the claim read it: it ends as one out of
+  lease does, unless what it reads is what a claim settles with no attempt
+  (the row finished, gone or put back in a lost row's place, or the call
+  resolved), which it settles as a claim that read it first would.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,
