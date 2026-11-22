@@ -167,7 +167,11 @@ leaves behind is the same either way.
    over never left, and fails like any other failure before the send.
    It settles `Exhausted`, as a spent budget does, and its failure reason is
    marked definitive; a run that fails on an effect records how many attempts
-   it made and was allowed.
+   it made and was allowed. An attempt counts once it reaches its durable
+   `Started`, so a dispatch refused before that (a policy conflict, the
+   dispatch authority's refusal, a grant that fails its check, a guardrail
+   revision mismatch) reports the attempts before it, and one refused on its
+   first claim reports none (issue #196).
    An outcome settles only the effect it belongs to: the success variant of
    the effect's own request, naming the effect's own call, cell or
    generation, or a failure outcome (`Failed`, `Exhausted`, `Indeterminate`

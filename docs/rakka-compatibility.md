@@ -1047,6 +1047,16 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Not repaired.** An outbox row or a run an earlier build charged this way keeps its count. The row keeps only its last failure line, so an extra recorded failure cannot be told from a failed call after the fact. A row still waiting for its retry goes on from the count it has, with that much less budget left. **Mixed builds.** The binary that runs the claim decides; an earlier one counts as before.
 
+- Issue #196 ("a dispatch refused before its attempt starts is charged one effect attempt") changes the attempt number a refused dispatch reports. **No durable field, status, error code or decision kind is added, and no record changes shape.**
+
+  **What was wrong.** The dispatcher refuses a dispatch before it writes `Started` in four places: a model call whose effect policy is weaker than its adapter's declaration (`model-policy-conflict`), a definitive refusal by the dispatch authority (`tool-revoked`, for one), a grant that fails the dispatcher's check (`grant-expired`, for one), and a tool call pinned to another guardrail chain revision (`guardrail-revision-mismatch`). Each told the run the attempt it was about to make. The run records the largest attempt it is told and charges that many effect attempts, so a call refused on its first claim was recorded with one attempt made and charged one, though nothing was invoked. A call refused on a later claim was charged one attempt more than it made, and so was an idempotent call refused on its retry, which parks for a reconciliation decision because its first attempt may have executed.
+
+  **The rule.** A refusal before `Started` tells the run the attempts that started, which is what the ticket's outbox row counts, as the wind-down fence has since issue #182. A refusal after `Started` still tells the run the attempt it refused, because that attempt started: `credential-resolver-missing`, when no credential resolver is wired for the call's binding. A transient refusal still defers the ticket and tells the run nothing.
+
+  **What a deployment sees.** `AgentRunTerminalReason::EffectFailed.attempts` reads `Some(0)` for a call refused on its first claim, where it read `Some(1)`, and one fewer than before for a call refused after failed attempts. The run spends one effect attempt fewer for each such refusal, and an idempotent call parked after a refused retry records and is charged one attempt fewer. A reader that took `attempts` for the number of the attempt the call failed on now sees 0 for a call that never started.
+
+  **Not repaired.** A run an earlier build already told keeps the attempt it was charged. **Mixed builds.** The dispatcher that refuses decides; an earlier one reports as before.
+
 Run the default compatibility matrix:
 
 ```sh

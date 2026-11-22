@@ -4103,12 +4103,14 @@ where
                         declared.max_attempts
                     ),
                 );
+                // Refused before `Started`: the run is told the attempts that
+                // started, which the row counts (issue #196).
                 return self
                     .settle_undispatchable(
                         scope,
                         &claim,
                         intent,
-                        attempt,
+                        attempt.saturating_sub(1),
                         &refusal,
                         possibly_executed,
                         pass,
@@ -4331,6 +4333,8 @@ where
                         "credential-resolver-missing",
                         format!("no credential resolver is configured for binding {binding}"),
                     );
+                    // Refused after `Started`: this attempt started, and the
+                    // run is told of it (issue #196).
                     return self
                         .settle_undispatchable(
                             scope,
@@ -5361,6 +5365,10 @@ where
     /// refusal defers the ticket without spending anything durable; a
     /// definitive one settles the generation per
     /// [`Self::settle_undispatchable`].
+    ///
+    /// Every refusal routed here comes before `Started`, so `attempt`, the
+    /// attempt about to be made, did not start: a definitive one tells the
+    /// run the attempts before it, which the row counts (issue #196).
     #[allow(clippy::too_many_arguments)]
     async fn settle_refusal(
         &mut self,
@@ -5381,7 +5389,7 @@ where
             scope,
             claim,
             intent,
-            attempt,
+            attempt.saturating_sub(1),
             refusal,
             possibly_executed,
             pass,
@@ -5398,13 +5406,19 @@ where
     /// truth-finding retry, so "failed, nothing invoked" would erase exactly
     /// the ambiguity [specification 11.5](../../../docs/plans/rakka-agent/spec.md)
     /// preserves, and the explicit reconciliation decision stays owed.
+    ///
+    /// `started` is how many of the generation's attempts have started, which
+    /// is what the run is told and charges: a refusal before `Started` does
+    /// not count the attempt it refused, and one after it does (issue #196).
+    /// A park's `ambiguous-attempt` link is to the last of them, the attempt
+    /// that may have executed.
     #[allow(clippy::too_many_arguments)]
     async fn settle_undispatchable(
         &mut self,
         scope: &AgentRunScope,
         claim: &AgentDispatchClaim,
         intent: &AgentRunEffect,
-        attempt: u32,
+        started: u32,
         refusal: &AgentAuthorityRefusal,
         possibly_executed: bool,
         pass: &mut AgentDispatchPass,
@@ -5420,14 +5434,14 @@ where
                     scope,
                     claim.clone(),
                     intent,
-                    attempt,
+                    started,
                     &refusal.code,
                     &message,
                     pass,
                 )
                 .await;
         }
-        self.refuse_dispatch(scope, claim, intent, attempt, refusal, pass)
+        self.refuse_dispatch(scope, claim, intent, started, refusal, pass)
             .await
     }
 
@@ -6105,20 +6119,21 @@ where
 
     /// Settles one definitively refused dispatch: the generation fails with
     /// the refusal's stable code, and the ticket is cancelled so it can never
-    /// be claimed again. Nothing was invoked.
+    /// be claimed again. Nothing was invoked by the refused attempt. The run
+    /// is told the `started` attempts ([`Self::settle_undispatchable`]).
     async fn refuse_dispatch(
         &mut self,
         scope: &AgentRunScope,
         claim: &AgentDispatchClaim,
         intent: &AgentRunEffect,
-        attempt: u32,
+        started: u32,
         refusal: &AgentAuthorityRefusal,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         self.deliver_outcome(
             scope,
             intent,
-            attempt,
+            started,
             claim.fencing_token,
             // The refusal is authored by an application-implemented
             // [`AgentDispatchAuthority`], and this outcome is durable run
