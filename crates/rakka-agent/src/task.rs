@@ -5898,10 +5898,13 @@ fn request_task_cancellation(
 /// without one has nothing else to retire it. Every transition that can
 /// admit on a cancelling task — an epoch's result, a delivery, an operator's
 /// release and an operator's resume — runs this too, before it reads the
-/// gate. So a record an earlier build left cancelling with its gate open is
-/// closed by the first of them and admits nothing.
+/// gate. So a record an earlier build left cancelling with its gate open
+/// admits nothing: the first of them that commits retires its gate, and one
+/// that is refused (a resume always is, on a retired gate) saves nothing,
+/// the close included, and admits nothing either.
 ///
-/// Idempotent. It records no history entry: the request's own entry stands
+/// Idempotent, and a gate that has already ended (an expired one) is left
+/// as it is. It records no history entry: the request's own entry stands
 /// for it, as the goal decision's does for a task with a goal record.
 fn close_admission_on_cancellation(task: &mut AgentTask) {
     if task.cancellation.is_none() {

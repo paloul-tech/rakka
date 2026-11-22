@@ -652,7 +652,8 @@ async fn the_gate_commands_are_refused_once_the_cancel_retired_the_gate() {
 }
 
 /// The lifecycle metric counts the retirement once, from the transition
-/// that recorded the request, and nothing after it counts another.
+/// that recorded the request. A's result, handed to an entity that counts,
+/// finds the gate already retired and counts nothing more.
 #[tokio::test]
 async fn the_lifecycle_metric_counts_the_retirement_once() {
     let metrics = Arc::new(InMemoryMetricsRecorder::new());
@@ -665,11 +666,40 @@ async fn the_lifecycle_metric_counts_the_retirement_once() {
         .expect("the cancel applies");
     assert_eq!(retirements(&metrics), 1);
 
-    fx.pump_epoch(&a.epoch, &a.run)
-        .await
-        .expect("epoch A converges");
-    assert_eq!(task_line(&fx).await.0, AgentTaskStatus::Cancelled);
+    let reply =
+        hand_the_counted_root(&fx, &epoch_result_for(&a.binding), Some(metrics.clone())).await;
+    assert!(reply.result().is_accepted(), "got {:?}", reply.result());
     assert_eq!(retirements(&metrics), 1);
+}
+
+/// A record an earlier build left cancelling with its gate open is counted
+/// once, by the transition that retires its gate: here A's result, handed to
+/// an entity that counts. That transition records no history entry for it.
+#[tokio::test]
+async fn an_earlier_builds_repair_is_counted_once_by_the_lifecycle_metric() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let fx = fixture();
+    let (a, _) = an_epoch_out_and_one_parked(&fx, ControlTask::NoGoalRecord).await;
+    let before = stored_gate(&fx).await;
+    an_earlier_builds_cancelling_record(&fx, before).await;
+
+    let reply =
+        hand_the_counted_root(&fx, &epoch_result_for(&a.binding), Some(metrics.clone())).await;
+
+    assert!(reply.result().is_accepted(), "got {:?}", reply.result());
+    assert_eq!(
+        released_in(reply.result().payload()),
+        (a.binding.wake_id().to_string(), None)
+    );
+    assert_eq!(gate(&fx).await.0, AgentGoalLifecycleStatus::Retired);
+    assert_eq!(retirements(&metrics), 1);
+    assert_eq!(
+        kinds(&history_from_the_request(&fx).await),
+        vec![
+            AgentTaskHistoryKind::CancellationRequested,
+            AgentTaskHistoryKind::EpochSettled,
+        ]
+    );
 }
 
 /// How many lifecycle transitions to `retired` the metric counted.
@@ -831,6 +861,17 @@ fn epoch_result_for(binding: &AgentWakeBinding) -> AgentExchangeEnvelope {
 
 /// Hands the control task an exchange, and returns its reply.
 async fn hand_the_root(fx: &Fixture, envelope: &AgentExchangeEnvelope) -> AgentExchangeReply {
+    hand_the_counted_root(fx, envelope, None).await
+}
+
+/// [`hand_the_root`], through an entity that counts its metrics on
+/// `metrics`. The in-process courier builds its entities with no recorder,
+/// so a result it delivers is never counted.
+async fn hand_the_counted_root(
+    fx: &Fixture,
+    envelope: &AgentExchangeEnvelope,
+    metrics: Option<Arc<InMemoryMetricsRecorder>>,
+) -> AgentExchangeReply {
     let mut root = rakka_agent::AgentTaskEntityStore::new(
         task_scope(),
         fx.tasks.clone(),
@@ -838,6 +879,9 @@ async fn hand_the_root(fx: &Fixture, envelope: &AgentExchangeEnvelope) -> AgentE
         fx.history.clone(),
     )
     .with_wake_timers(fx.rewake_parker.clone());
+    if let Some(metrics) = metrics {
+        root = root.with_metrics(metrics);
+    }
     root.recover(fx.now()).await.expect("the root recovers");
     root.accept(envelope, &fx.router, fx.now())
         .await
@@ -1084,18 +1128,22 @@ async fn an_earlier_builds_open_gate_is_closed_by_an_operators_release() {
 
 /// A record an earlier build left cancelling with its gate suspended: the
 /// operator's resume, the first to reach it, is refused rather than
-/// admitting the occurrence the suspension parked.
+/// admitting the occurrence the suspension parked. A refusal saves nothing,
+/// so the stored gate is still the suspended one; the next transition of
+/// the four that commits retires it.
 #[tokio::test]
-async fn an_earlier_builds_suspended_gate_is_closed_by_a_resume() {
+async fn an_earlier_builds_suspended_gate_refuses_the_resume() {
     let fx = fixture();
     let b = a_suspended_gate_with_an_epoch_out_and_one_parked(&fx).await;
     let before = stored_gate(&fx).await;
     an_earlier_builds_cancelling_record(&fx, before).await;
-    assert_eq!(gate(&fx).await.0, AgentGoalLifecycleStatus::Suspended);
+    let suspended = gate(&fx).await;
+    assert_eq!(suspended.0, AgentGoalLifecycleStatus::Suspended);
 
     let refused = refusal(fx.apply_task_command(resume_command(&fx).await).await);
 
     assert_eq!(refused.as_deref(), Some("wake-lifecycle-terminal"));
+    assert_eq!(gate(&fx).await, suspended, "the refusal saved nothing");
     assert_eq!(controller(&fx).await, (1, 0, 1, 1), "B is not admitted");
     fx.settle_task_at(&task_scope())
         .await

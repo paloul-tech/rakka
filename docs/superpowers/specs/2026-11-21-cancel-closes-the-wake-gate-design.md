@@ -53,8 +53,9 @@ do for a task with a goal record:
 - `ResumeContinuousGoal`, `SuspendContinuousGoal`, `RenewContinuousGoal` and
   `RetireContinuousGoal` are refused `wake-lifecycle-terminal`.
 
-The epochs already out run to their own ends, and the cancellation finalizes
-once the last of them has settled.
+The epochs already admitted run to their own ends, including one whose
+creation was still on its way to its task when the request came, and the
+cancellation finalizes once the last of them has settled.
 
 ## 3. My calls
 
@@ -69,8 +70,10 @@ once the last of them has settled.
    `CompleteWakeOccurrence` and `ResumeContinuousGoal`. The gate stays the
    one fence, but it no longer rests on the request having closed it. This
    is what stops a record an earlier build left cancelling with its gate
-   open: the first of these to touch it after the upgrade retires the gate
-   before it asks it. `ActivateGoal` and `ResumeGoal` also promote, but both
+   open: each of these retires the gate before it asks it, so none admits.
+   The first that commits saves the retirement. One that is refused saves
+   nothing, the close included: a resume on such a record is always refused,
+   and leaves the stored gate as it was. `ActivateGoal` and `ResumeGoal` also promote, but both
    need a goal record, and a cancelling task's goal record was decided at the
    request, so both refuse before they could promote. They are left alone.
    Yours to reverse: the alternative is to fix only the request and leave
@@ -82,11 +85,13 @@ once the last of them has settled.
    its lifecycle, so it is never recorded as an observed lifecycle change.
    The `rakka.agent.goal.lifecycle` metric counts `retired` once, from the
    status difference across the transition that closed the gate, as it does
-   today for a task with a goal record.
+   today for a task with a goal record. The two requests the settle pass
+   makes (unclaimed expiry, an ended goal's cancellation) count no lifecycle
+   change; that is so already for a task with a goal record, and I left it.
 4. **Ended records are not repaired** (the issue's third question). A
-   control task that an earlier build let end `Cancelled` still reads its
-   gate `Active`. Nothing reads that gate: a terminal task refuses every wake
-   command `task-terminal`, and an epoch's result reaching it is taken as a
+   control task that an earlier build let end `Cancelled` still has its
+   gate `Active`, and its task snapshot shows it so. Nothing acts on that
+   gate: a terminal task refuses every wake command `task-terminal`, and an epoch's result reaching it is taken as a
    settlement that promotes nothing (issue #181).
 5. **The cancel still does not cancel the epochs out.** That is the existing
    rule ("the end of a goal does not cancel its epochs"); this change does
@@ -97,8 +102,9 @@ once the last of them has settled.
 A control task with no goal record stops admitting when it is asked to
 cancel. An occurrence delivered while its epochs finish is `barred` rather
 than admitted or coalesced. Its gate reads `retired` from the request on,
-with its lifecycle revision moved by one, and the lifecycle metric counts the
-retirement. The operator's workaround the issue names (`RetireContinuousGoal`
+with its lifecycle revision moved by one (a gate that had already expired
+stays `expired`), and the lifecycle metric counts the retirement when the
+request comes by a command or an exchange. The operator's workaround the issue names (`RetireContinuousGoal`
 on the cancelling task) is no longer needed, and is refused
 `wake-lifecycle-terminal` because the gate is already retired. An occurrence
 left parked behind the last epoch stays parked, as it does for a task with a
@@ -108,13 +114,17 @@ goal record.
 
 Nothing durable is added and no record changes shape. An earlier build that
 loads a record this build closed reads a retired gate, and its own admission
-paths fence on it, so it admits nothing either. A record an earlier build
-left cancelling with the gate open is closed by this build (call 2).
+paths fence on it, so it admits nothing either. A cancellation an earlier
+build records leaves the gate open, and that build goes on admitting on it;
+this build retires the gate when it next commits one of the four
+transitions of call 2 on the record. A second cancellation request does not
+retire it: a request that finds the cancellation recorded is answered
+without a transition, and I left that contract alone.
 
 ## 6. Tests
 
-`crates/rakka-agent/tests/cancel_closes_the_wake_gate.rs`, new, fifteen
-tests. The issue's reproduction runs with real epochs: the scanner's
+`crates/rakka-agent/tests/cancel_closes_the_wake_gate.rs`, new, sixteen
+tests (fifteen before the review, section 7). The issue's reproduction runs with real epochs: the scanner's
 delivery, an epoch task and its run, the model call answered.
 
 - The cancel retires the gate of a control task with no goal record, moves
@@ -132,8 +142,10 @@ delivery, an epoch task and its run, the model call answered.
   `ResumeContinuousGoal` is refused `wake-lifecycle-terminal`.
 - `SuspendContinuousGoal`, `RenewContinuousGoal` and `RetireContinuousGoal`
   are refused `wake-lifecycle-terminal` after the cancel.
-- The lifecycle metric counts one `retired`, at the cancel, and no second
-  one by the time the task is `Cancelled`.
+- The lifecycle metric counts one `retired`, at the cancel, and A's result
+  handed to an entity that counts adds no second one. A record an earlier
+  build left open is counted once, by the epoch result that retires its
+  gate, and that result records no history entry for it.
 - A delegated control task told to cancel by its parent run's
   `DelegationCancel` retires its gate, admits nothing on A's result, and
   owes its parent its `DelegationResult` once A has settled.
@@ -149,7 +161,7 @@ delivery, an epoch task and its run, the model call answered.
 - One test per admitting transition of call 2 (an epoch's result, a
   delivery, `CompleteWakeOccurrence`, `ResumeContinuousGoal`), over a
   record an earlier build left cancelling with the gate open (or suspended,
-  for the resume). The record is made by this build and then given back the
+  for the resume; the refused resume leaves the stored gate suspended). The record is made by this build and then given back the
   gate it had before the cancel, which is the only thing an earlier build's
   cancel did not change on the controller.
 
@@ -174,3 +186,47 @@ Nine breaks of the fix were run one at a time against the whole crate
 - the close moved after the lifecycle read, in a delivery, an epoch's
   result and a release by hand: exactly one test fails each time, on the
   `goal-retired` history entry the move records.
+
+## 7. The review
+
+A fresh reviewer read the change at `403094d5` and ran probes. It found no
+path that still admits or creates an epoch after the request. What changed
+in answer:
+
+- **A clippy failure** in the new test file (`filter_map_bool_then`), which
+  `scripts/validate.sh` had also caught. Fixed.
+- **"Closed by the first of the four transitions that touches it" was
+  false.** A command or exchange runs on a copy of the record, so one that
+  is refused saves nothing of the close. A resume on a cancelling task is
+  always refused. The doc comment, the compatibility entry and call 2 now
+  say that the first that commits saves it. The resume test is renamed
+  (`an_earlier_builds_suspended_gate_refuses_the_resume`) and now asserts
+  the stored gate is still suspended after the refusal.
+- **The metric test's "no second retirement" could not fail.** The
+  in-process courier builds its entities with no recorder, so A's result
+  was never counted. The test now hands the result to an entity that
+  counts, and a new test holds that the repair of an earlier build's
+  record is counted once. Breaking the epoch result's close fails both
+  that test and the earlier-build epoch-result test.
+- **Sentences made true:** the metric counts the request only when it
+  comes by a command or an exchange; a gate that had already expired stays
+  expired; the task snapshot does show an ended record's gate `active`;
+  an earlier build still admits on a cancellation it recorded; a second
+  cancellation request closes nothing; and "the epochs already out" now
+  reads "already admitted", since an epoch admitted before the request
+  whose creation was still on its way is created and run after it. The
+  overview sentence in `docs/rakka-agents.md` moved after the straggler
+  sentence it had split.
+
+## 8. Not done
+
+- **An epoch admitted before the request is still created and run after
+  it.** The reviewer showed it: A's result admits B and owes B's creation,
+  the cancel then retires the gate, and the cancel's own settle pass
+  delivers B's creation, whose run sends its model call. The same happens
+  for a task with a goal record, so it is not from this change, but
+  specification 8.7 reads as fencing that dispatch. Not filed.
+- A second cancellation request on a record an earlier build left open does
+  not retire its gate (section 5).
+- The settle pass's two cancellation requests count no lifecycle change
+  (call 3).

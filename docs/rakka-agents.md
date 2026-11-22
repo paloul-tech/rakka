@@ -604,14 +604,14 @@ its own lag, and is a projection, never a second state machine.
   stopped: a child with an ambiguous consequential effect stays nonterminal in
   reconciliation, and the root finalizes only after its ledger closed. A
   fan-in that resolves early chases the members it left behind with a
-  cancel. A cancel closes a continuous goal's wake gate at the request,
-  whether or not its control task holds a goal contract: the epochs already
-  out run to their ends, and no further one is admitted. A straggler's
-  workflow cancel that fails, because no executor is
+  cancel. A straggler's workflow cancel that fails, because no executor is
   wired, the executor refuses, its retries are spent or a person abandons
   it, leaves the live run going: the child is left to report on its own,
   and the goal view shows the cancel's status and error code beside the
-  invocation (`cancel_status`, `cancel_error_code`).
+  invocation (`cancel_status`, `cancel_error_code`). A cancel closes a
+  continuous goal's wake gate at the request, whether or not its control
+  task holds a goal contract: the epochs already admitted run to their
+  ends, and no further one is admitted.
 - **Handoff** transfers the same `AgentTaskId` to another agent: the source run
   is fenced, one target run is created, `HandedOff` is recorded strictly after
   the target's durable acceptance, and no session or private memory travels.
