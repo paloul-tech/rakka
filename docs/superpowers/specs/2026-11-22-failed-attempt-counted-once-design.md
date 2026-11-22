@@ -36,8 +36,9 @@ lost.
 2. **The run's charged attempts and the row's count are checked in tests
    only.** They differ by design: the row counts failures (a success adds
    nothing, a burn adds one), and they sit in two stores written in different
-   orders. Every new test reads the row's count, the run's record of the call
-   and what the run charged side by side.
+   orders. Every new test reads the row's count and what the run charged side
+   by side, and the run's record of the call where the run still holds it (a
+   call that succeeded is gone from the run once its turn moves on).
 
 ## 3. The change
 
@@ -49,7 +50,7 @@ attempt reads it.
 
 | Where | Before | Now |
 |---|---|---|
-| `reconcile_ambiguous`, `NotExecuted` on a live run | `retry_ambiguous`: burn, then the next attempt | where `started < attempt` (the row counted the attempt asked about), `ClaimStep::Invoke` with `attempt` and nothing written; otherwise unchanged |
+| `reconcile_ambiguous`, `NotExecuted` on a live run | `retry_ambiguous`: burn, then the next attempt | where `started < attempt` (the row counted the attempt asked about), the row is read again: still `Failed` at `started`, `ClaimStep::Invoke` with `attempt` and nothing written; moved, `ClaimConclusion::OutOfLease` and nothing written (added in answer to the review, section 7). Otherwise unchanged |
 | `reconcile_ambiguous`, `Executed` | delivered with `attempt` | `started` |
 | `reconcile_ambiguous`, no reconciler wired | parked with `attempt` | `started` |
 | `reconcile_ambiguous`, no protocol on the record | parked with `attempt` | `started` (unreachable: the spec validation refuses such a record) |
@@ -122,11 +123,67 @@ Twelve breaks of the fix were run one at a time against `effect_dispatch.rs`,
 | a `Dispatching` row's lost attempt not counted as started | the lost-attempt guard, two of #182's, four lease tests |
 
 The one that survives is the park for a record with no reconciliation
-protocol, which the spec validation makes unreachable (section 7).
+protocol, which the spec validation makes unreachable (section 8).
 
-## 7. Not done
+In `crates/rakka-agent/tests/dispatch_failed_attempt_recovery.rs`, the cases
+the review found (section 7), on the shared `AuthorityFixture`:
+
+- A retry the authority defers after a failed call spends none of the
+  budget: five deferred claims, five questions, the row still `Failed` 1,
+  nothing charged; resumed, the budget of three buys three calls.
+- A claim whose ticket moved while the reconciler answered makes no attempt:
+  it ends out of lease, and the three calls carry attempts 1, 2 and 3.
+- A park after a failed call names attempt one and links its span, in the
+  dispatcher's park segment and the run's `checkpoint-open`.
+
+All three fail on `main`'s dispatcher (`dispatch.rs` swapped in, the rest of
+the branch kept). Two breaks of the new row check were run: skipping it, and
+comparing the status without the count. The second test catches both.
+
+## 7. The review
+
+A fresh reviewer read the branch and ran six probes of its own, on the
+branch and on `main`. What changed in answer:
+
+- **A retry the authority defers** (a suspended agent) spent the budget on
+  `main`: each claim burned an attempt for the finding before the deferral,
+  and the run failed under `dispatcher-lost-after-started` after one call.
+  The fix ends that, which nothing had said or held. The reconciler is now
+  asked on every claim while the retry is deferred, bounded by the claims
+  and not the budget, so my sentence "the queries stay inside the budget"
+  was true only of `Unknown`. Documented and tested; flagged to the owner.
+- **The no-burn branch handed back the attempt number of the claim's first
+  read.** A reconciler slower than the lease let a rival worker take the
+  ticket and make attempt two, and the late claim then made a second call
+  as attempt two, under the same derived span identity. `main` made the
+  second call too, under a later number. The claim now reads the row again
+  and makes no attempt if the row moved: it ends out of lease, writes
+  nothing, and the next claim takes the ticket up from the row. My call:
+  this goes further than restoring the number, since it removes the second
+  call in that race.
+- **The park's telemetry changed** (it names and links the failed attempt,
+  not a span no segment exported): documented and tested.
+- **Sentences corrected:** "called as many times as its budget allows" holds
+  only when every finding is "not executed"; "asked once before each retry"
+  is "on every claim that would make a retry"; the tests do not all read the
+  run's record of the call.
+- The reviewer also said a deferral charges the attempt that never started.
+  By reading, `defer_dispatch` writes only the fleet entry and tells the run
+  nothing; the test above holds that nothing is charged. That is issue
+  #196's refusal path (`refuse_dispatch`), not the deferral.
+
+## 8. Not done
 
 - The park for a record with no reconciliation protocol is unreachable and is
   held by no test.
+- The row check's status half (a row at the same count that is no longer
+  `Failed`, for instance one a rival's successful call finished) is held by
+  no test of its own: the late claim makes no call either way, and only
+  `AgentDispatchPass::lapsed` and the claim's ending tell the two apart.
+- A park after an `Unknown` burn that spends the budget still names the
+  attempt the burn recorded, which no call made, and links that attempt's
+  span. Unchanged, by reading; it follows from ruling 2.
+- A claim whose ticket another worker took over can still call beside it on
+  a `Dispatching` row, whose recovery burns before it invokes, as on `main`.
 - Issue #196 (a dispatch refused before `Started` is charged one attempt) is
   a separate cause and needs its own ruling.

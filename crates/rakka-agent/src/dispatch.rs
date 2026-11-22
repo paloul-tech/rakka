@@ -2244,8 +2244,16 @@ pub struct AgentDispatchPass {
     /// lease still stands is given back, claimable at once, and none is
     /// counted here. They are in [`Self::claimed`] and in nothing else.
     ///
-    /// Nothing is written to either kind's ticket as its claim ends: once
-    /// the lease is over any worker can take it. A pass that ends in an
+    /// A claim that finds its ticket moved by another worker is counted
+    /// with the second kind and ends its batch the same way (issue #195). A
+    /// reconcileable effect whose attempt failed is asked about before its
+    /// retry, and once the reconciler answers "not executed" the claim reads
+    /// the ticket's row again. A row that no longer stands where the claim
+    /// first read it was moved by another worker while the reconciler
+    /// answered, and the claim makes no attempt beside that worker's.
+    ///
+    /// Nothing is written to the ticket of any of these as its claim ends:
+    /// once the lease is over any worker can take it. A pass that ends in an
     /// error returns no report, and the claims it passed over are then
     /// counted nowhere.
     pub lapsed: usize,
@@ -2278,7 +2286,9 @@ enum ClaimConclusion {
     /// The claim made an attempt that was found not executed, and could not
     /// make another in the time its lease covers (issue #171): the lease did
     /// not cover one, or the attempt's bound, counted from the instant the
-    /// claim asked, was spent before the attempt could start. Its ticket is
+    /// claim asked, was spent before the attempt could start. Or another
+    /// worker moved its ticket's row while the reconciler answered a
+    /// question about a failed attempt (issue #195). Its ticket is
     /// unsettled, and no settle renewed the claims its pass holds behind it.
     OutOfLease,
 }
@@ -4681,6 +4691,27 @@ where
         })
     }
 
+    /// Whether the claim's ticket row is still `Failed` and counts the
+    /// `counted` attempts the claim read before it asked the reconciler
+    /// (issue #195).
+    async fn row_stands_as_read(
+        &self,
+        scope: &AgentRunScope,
+        claim: &AgentDispatchClaim,
+        counted: u32,
+    ) -> AgentDispatchResult<bool> {
+        let mut inbox = self.inbox(scope);
+        inbox.recover().await?;
+        Ok(inbox
+            .inner()
+            .state()
+            .map_err(AgentInboxError::from)?
+            .outbox_entry(&OutboxMessageId::new(claim.effect_id.as_str()))
+            .is_some_and(|row| {
+                row.status() == OutboxStatus::Failed && row.attempts().attempts() == counted
+            }))
+    }
+
     /// Queries the reconciliation protocol before any retry
     /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md):
     /// "retry only when proven absent").
@@ -4852,6 +4883,18 @@ where
                 // attempt is inside its budget, since a `Failed` row is one
                 // with a retry left.
                 if started < attempt {
+                    // The row is read again first. The reconciler can take
+                    // longer than the claim's lease, and a worker that took
+                    // the ticket over meanwhile may have made the next
+                    // attempt itself, or finished the row. A claim that finds
+                    // the row moved from where it read it makes no attempt:
+                    // it ends as one out of lease does and writes nothing,
+                    // and the claim that follows takes the ticket up from
+                    // what the row then says. Going on, it made a second call
+                    // under the number the other worker had already used.
+                    if !self.row_stands_as_read(scope, &claim, started).await? {
+                        return Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease));
+                    }
                     return Ok(ClaimStep::Invoke {
                         claim,
                         attempt,

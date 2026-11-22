@@ -194,8 +194,14 @@ leaves behind is the same either way.
    park made at once (no reconciler wired, or an `Unknown` or mismatched
    finding on a winding-down run), are charged the attempts that started.
    On a live run an `Unknown` or mismatched finding still burns one attempt,
-   whichever attempt it was asked about, so the queries stay inside the
-   budget.
+   whichever attempt it was asked about, so a reconciler that cannot
+   establish the outcome is asked at most once for each attempt in the
+   budget. A finding of "not executed" spends nothing itself: while the
+   dispatch authority defers the retry (a suspended agent, say), the
+   reconciler is asked again on each claim, paced by the retry backoff, and
+   the budget is untouched. A claim told "not executed" reads the ticket's
+   row again before it makes the retry, and makes none if another worker
+   moved the row while the reconciler answered.
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect
@@ -368,7 +374,12 @@ is still working on it, and from being run by two:
   whose worker was lost. The lease has to cover one attempt, not a budget.
   An attempt that spends the budget has none after it, so its claim is not
   asked and settles it as before; a claim's first attempt is not asked
-  either.
+  either. A claim's first attempt can follow a reconciler's answer about an
+  attempt that failed, and an answer can take longer than the lease. Such
+  a claim reads the ticket's row again once told "not executed": if the
+  row is no longer where the claim read it, another worker has moved it,
+  and the claim ends there as one out of lease does, writing nothing
+  (issue #195).
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,

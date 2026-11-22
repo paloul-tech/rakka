@@ -3213,8 +3213,10 @@ async fn a_reconcileable_call_cancelled_after_a_failed_attempt_is_charged_that_a
 // attempt's row counted that attempt when it failed, so the reconciler's
 // finding on it is about an attempt already counted: "not executed" goes
 // straight to the next attempt, and "executed" or a park is charged the
-// attempts that started. Each test reads the ticket's row, the run's record of
-// the call and what the run charged side by side.
+// attempts that started. Each test reads the ticket's row and what the run
+// charged side by side, and the run's record of the call where the run still
+// holds it: a call that succeeded is gone from the run once its turn moves on.
+// `dispatch_failed_attempt_recovery.rs` holds the cases the fix's review found.
 // ---------------------------------------------------------------------------
 
 /// A reconcileable tool spec of `attempts` attempts.
