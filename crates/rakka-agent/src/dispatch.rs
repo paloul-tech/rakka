@@ -2345,6 +2345,26 @@ enum ClaimStep {
     },
 }
 
+/// What [`AgentRunEffectDispatcher::read_claim`] found of a claim's ticket.
+enum ClaimRead {
+    /// The claim is over, with nothing to attempt.
+    Concluded(ClaimConclusion),
+    /// The ticket's row is unfinished and the ticket's own, under an intent
+    /// the run still waits on.
+    Live {
+        /// The claim.
+        claim: AgentDispatchClaim,
+        /// The ticket's row, as read.
+        row: Box<OutboxEntry>,
+        /// The run's intent for the ticket.
+        intent: Box<AgentRunEffect>,
+        /// The run's state the intent was read from.
+        run_state: Box<AgentRunState>,
+        /// Whether the run is winding down.
+        winding_down: bool,
+    },
+}
+
 /// How a park ends its claim's ticket.
 enum ParkedTicket {
     /// The outbox row and the fleet entry, as every park but one does.
@@ -3727,13 +3747,21 @@ where
         }
     }
 
-    /// Executes one claimed dispatch ticket to a settled conclusion.
-    async fn execute_claim(
+    /// Reads a claim's ticket row and its run, and settles what needs no
+    /// attempt: a row gone, a ticket the run has moved past, an intent
+    /// already resolved, a row put back in a lost row's place, and a finished
+    /// row the run may not have heard of. Anything else is answered live, for
+    /// the claim to go on with.
+    ///
+    /// A claim reads these once as it starts, and again after the reconciler
+    /// has answered about a failed attempt, when other workers may have
+    /// written the row and told the run meanwhile (issue #195).
+    async fn read_claim(
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
         pass: &mut AgentDispatchPass,
-    ) -> AgentDispatchResult<ClaimConclusion> {
+    ) -> AgentDispatchResult<ClaimRead> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
         let mut inbox = self.inbox(scope);
         inbox.recover().await?;
@@ -3749,9 +3777,11 @@ where
             // there is no row to write a cancellation to. The entry is
             // settled at the fleet alone, so it is never claimed again, and
             // a run still waiting on the effect is told.
-            return self.conclude_on_missing_row(scope, claim, pass).await;
+            return self
+                .conclude_on_missing_row(scope, claim, pass)
+                .await
+                .map(ClaimRead::Concluded);
         };
-        let attempt = row.attempts().attempts().saturating_add(1);
 
         // The run's durable intent is the source of truth for what this ticket
         // is and what its policy permits.
@@ -3785,15 +3815,14 @@ where
         let Some(intent) = intent else {
             self.settle_ticket_cancelled(scope, &claim, "ticket-stale", pass)
                 .await?;
-            return Ok(ClaimConclusion::Settled);
+            return Ok(ClaimRead::Concluded(ClaimConclusion::Settled));
         };
-        let state = run_state
-            .as_ref()
-            .expect("a resolved intent implies the run state it was read from");
+        let run_state =
+            run_state.expect("a resolved intent implies the run state it was read from");
         if intent.status.is_resolved() {
             self.settle_ticket_cancelled(scope, &claim, "intent-already-resolved", pass)
                 .await?;
-            return Ok(ClaimConclusion::Settled);
+            return Ok(ClaimRead::Concluded(ClaimConclusion::Settled));
         }
 
         // A row the run put back in a lost row's place is not the ticket's
@@ -3803,12 +3832,12 @@ where
         if !self.claim_indexes_row(&claim, &row) {
             return self
                 .conclude_on_replaced_row(scope, claim, &intent, pass)
-                .await;
+                .await
+                .map(ClaimRead::Concluded);
         }
 
         let winding_down = run_state
-            .as_ref()
-            .and_then(AgentRunState::run)
+            .run()
             .is_some_and(|run| run.terminal_reason.is_some() || run.status.is_terminal());
 
         // A finished row under an effect the run still waits on is never
@@ -3821,8 +3850,38 @@ where
             let fence_applies = winding_down && !intent.kind().exempt_from_wind_down_fence();
             return self
                 .conclude_on_untold_row(scope, &claim, &row, &intent, fence_applies, pass)
-                .await;
+                .await
+                .map(ClaimRead::Concluded);
         }
+        Ok(ClaimRead::Live {
+            claim,
+            row: Box::new(row),
+            intent: Box::new(intent),
+            run_state: Box::new(run_state),
+            winding_down,
+        })
+    }
+
+    /// Executes one claimed dispatch ticket to a settled conclusion.
+    async fn execute_claim(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: AgentDispatchClaim,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        let (claim, row, intent, run_state, winding_down) =
+            match self.read_claim(scope, claim, pass).await? {
+                ClaimRead::Concluded(conclusion) => return Ok(conclusion),
+                ClaimRead::Live {
+                    claim,
+                    row,
+                    intent,
+                    run_state,
+                    winding_down,
+                } => (claim, *row, *intent, *run_state, winding_down),
+            };
+        let state: &AgentRunState = &run_state;
+        let attempt = row.attempts().attempts().saturating_add(1);
 
         // `Dispatching` is the durable ambiguity marker: a previous attempt
         // wrote its `Started` and disappeared, so the invocation may have
@@ -3850,11 +3909,14 @@ where
             } else {
                 attempt.saturating_sub(1)
             };
-            // A failed attempt's claim that would retry on a finding of "not
-            // executed" asks the authority first, and a deferral goes no
-            // further. Where the fence applies, the finding decides with no
-            // attempt to authorize.
-            if started < attempt && !(winding_down && !intent.kind().exempt_from_wind_down_fence())
+            // A failed attempt's claim asks the authority before the
+            // reconciler, and a deferral goes no further. Not where the fence
+            // applies, as the finding then decides with no attempt to
+            // authorize, and not with no reconciler wired, as the claim then
+            // parks with no question to save.
+            if started < attempt
+                && self.reconciler.is_some()
+                && !(winding_down && !intent.kind().exempt_from_wind_down_fence())
             {
                 if let Some(conclusion) = self
                     .defer_before_reconciling(scope, &claim, state, &intent, attempt, pass)
@@ -3965,6 +4027,11 @@ where
     /// to the deployment's system of record on every pass. Any other
     /// decision answers `None`, and the claim goes on to the reconciler; the
     /// attempt it then makes asks the authority again.
+    ///
+    /// The question only saves the reconciler one, so an error from the
+    /// authority answers `None` too, and is left for the attempt to meet: a
+    /// finding that needs no attempt, such as "executed", is not withheld
+    /// for it.
     async fn defer_before_reconciling(
         &mut self,
         scope: &AgentRunScope,
@@ -3974,11 +4041,8 @@ where
         attempt: u32,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<Option<ClaimConclusion>> {
-        match self
-            .authorize_attempt(scope, state, intent, attempt)
-            .await?
-        {
-            (AgentDispatchDecision::Refused(refusal), _) if refusal.retryable => self
+        match self.authorize_attempt(scope, state, intent, attempt).await {
+            Ok((AgentDispatchDecision::Refused(refusal), _)) if refusal.retryable => self
                 .defer_dispatch(claim, attempt, &refusal.code, &refusal.message, pass)
                 .await
                 .map(Some),
@@ -4761,16 +4825,14 @@ where
     /// about, and `attempt` is the one after it, inside the budget because a
     /// `Failed` row is one with a retry left.
     ///
-    /// The row is read again first, since the reconciler can be slow and
-    /// others can write the row meanwhile: a worker on a lapsed lease of its
-    /// own, or the run putting a lost row back. What the row says now
-    /// decides, as it would for a claim that read it first:
+    /// The row and the run are read again first ([`Self::read_claim`]),
+    /// since the reconciler can be slow and others can write both meanwhile:
+    /// a worker on a lapsed lease of its own, which may also have told the
+    /// run, or the run putting a lost row back. What they say now decides:
     ///
-    /// | The row | The claim |
+    /// | The row and the run | The claim |
     /// |---|---|
-    /// | gone | [`Self::conclude_on_missing_row`] |
-    /// | put back in a lost row's place | [`Self::conclude_on_replaced_row`] |
-    /// | finished | [`Self::conclude_on_untold_row`], so a run nobody told is told now |
+    /// | what a claim that read them first settles with no attempt: a row gone, the ticket moved past, its intent resolved, a row put back, a finished row | settles it so |
     /// | `Failed`, counting the `counted` attempts the claim read | makes `attempt` |
     /// | anything else | ends as out of lease and writes nothing |
     ///
@@ -4781,49 +4843,26 @@ where
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
-        intent: &AgentRunEffect,
         counted: u32,
         attempt: u32,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimStep> {
-        let row = {
-            let mut inbox = self.inbox(scope);
-            inbox.recover().await?;
-            inbox
-                .inner()
-                .state()
-                .map_err(AgentInboxError::from)?
-                .outbox_entry(&OutboxMessageId::new(claim.effect_id.as_str()))
-                .cloned()
-        };
-        let Some(row) = row else {
-            return self
-                .conclude_on_missing_row(scope, claim, pass)
-                .await
-                .map(ClaimStep::Concluded);
-        };
-        if !self.claim_indexes_row(&claim, &row) {
-            return self
-                .conclude_on_replaced_row(scope, claim, intent, pass)
-                .await
-                .map(ClaimStep::Concluded);
+        // Boxed: this is awaited inside the recovery, which every attempt of
+        // a claim holds, and the read holds each of the conclusions above.
+        match Box::pin(self.read_claim(scope, claim, pass)).await? {
+            ClaimRead::Concluded(conclusion) => Ok(ClaimStep::Concluded(conclusion)),
+            ClaimRead::Live { claim, row, .. } => {
+                if row.status() == OutboxStatus::Failed && row.attempts().attempts() == counted {
+                    Ok(ClaimStep::Invoke {
+                        claim,
+                        attempt,
+                        bound_from: None,
+                    })
+                } else {
+                    Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease))
+                }
+            }
         }
-        if row_is_finished(row.status()) {
-            // The wind-down fence does not apply here: a claim it applies to
-            // was cancelled on the finding, before the retry.
-            return self
-                .conclude_on_untold_row(scope, &claim, &row, intent, false, pass)
-                .await
-                .map(ClaimStep::Concluded);
-        }
-        if row.status() == OutboxStatus::Failed && row.attempts().attempts() == counted {
-            return Ok(ClaimStep::Invoke {
-                claim,
-                attempt,
-                bound_from: None,
-            });
-        }
-        Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease))
     }
 
     /// Queries the reconciliation protocol before any retry
@@ -4987,8 +5026,9 @@ where
                 // reconciler's question, so one whose lease could not cover
                 // the question and a whole attempt would never make one, and
                 // nothing would ever retry the effect. Where the row counted
-                // the attempt asked about, an attempt always follows; where it
-                // did not, one follows if the burn leaves budget.
+                // the attempt asked about, an attempt follows unless the row
+                // has moved meanwhile; where it did not, one follows if the
+                // burn leaves budget.
                 //
                 // The next attempt's bound is counted from this instant, read
                 // before the fleet reads its own clock, so the deadline it is
@@ -5014,7 +5054,7 @@ where
                 // budget of six in three calls (issue #195).
                 if started < attempt {
                     return self
-                        .retry_counted_attempt(scope, claim, intent, started, attempt, pass)
+                        .retry_counted_attempt(scope, claim, started, attempt, pass)
                         .await;
                 }
                 // An attempt the row has not counted reached a durable

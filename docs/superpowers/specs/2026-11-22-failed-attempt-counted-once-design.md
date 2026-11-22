@@ -65,9 +65,9 @@ attempt reads it.
 
 | Where | Before | Now |
 |---|---|---|
-| `execute_claim`, a `Failed` row of a reconcileable call the fence does not cancel | asks the reconciler | asks the authority first (`defer_before_reconciling`): a transient refusal defers there; anything else goes on to the reconciler (ruling 3) |
+| `execute_claim`, a `Failed` row of a reconcileable call the fence does not cancel, with a reconciler wired | asks the reconciler | asks the authority first (`defer_before_reconciling`): a transient refusal defers there; any other answer, an error included, goes on to the reconciler (ruling 3) |
 | `reconcile_ambiguous`, `NotExecuted` on a live run, an attempt follows that is the claim's first | made whatever the lease | made only if `is_current_claim_for(claim, 0)`; otherwise `OutOfLease`, nothing written (ruling 4) |
-| `reconcile_ambiguous`, `NotExecuted` on a live run | `retry_ambiguous`: burn, then the next attempt | where `started < attempt` (the row counted the attempt asked about), `retry_counted_attempt`: the row is read again. Still `Failed` at `started`: `ClaimStep::Invoke` with `attempt`, nothing written. Gone, put back, or finished: the conclusion a claim that read it first reaches. Otherwise `OutOfLease`, nothing written. Where the row did not count it, unchanged |
+| `reconcile_ambiguous`, `NotExecuted` on a live run | `retry_ambiguous`: burn, then the next attempt | where `started < attempt` (the row counted the attempt asked about), `retry_counted_attempt`: the row and the run are read again through `read_claim`, the opening `execute_claim` now shares. What a fresh claim settles with no attempt (a row gone, put back or finished, the ticket moved past, the intent resolved) is settled so. Still `Failed` at `started`: `ClaimStep::Invoke` with `attempt`, nothing written. Otherwise `OutOfLease`, nothing written. Where the row did not count it, unchanged |
 | `reconcile_ambiguous`, `Executed` | delivered with `attempt` | `started` |
 | `reconcile_ambiguous`, no reconciler wired | parked with `attempt` | `started` |
 | `reconcile_ambiguous`, no protocol on the record | parked with `attempt` | `started` (unreachable: the spec validation refuses such a record) |
@@ -167,6 +167,17 @@ the two reviews found (section 7), on the shared `AuthorityFixture`:
   exhausted is told to the run in the same pass.
 - A park after a failed call names attempt one and links its span, in the
   dispatcher's park segment and the run's `checkpoint-open`.
+- The third review's, with workers run at once (`tokio::join!`), a scripted
+  authority and a reconciler that hands off while it is asked: the claim
+  after a failed call asks the authority first and its attempt asks again
+  (two questions about attempt two, two `tool-authorize` segments; one if
+  found executed); an authority error before the question does not withhold
+  a reconciled outcome; a failed call with no reconciler parks at once while
+  its agent is suspended; a suspension that lands during the question is
+  honoured by the attempt's own question; and a row another worker finished
+  after it told the run, with a success or after a refusal, is not parked.
+  The four that changed behaviour failed on `60f25185`'s dispatcher, each for
+  the reason it names; the two that hold the double question passed there.
 
 Against `main`'s `dispatch.rs` (swapped in, the rest of the branch kept) the
 first three of the first review's cases failed. Against the dispatcher of the
@@ -249,12 +260,49 @@ seven probes. What changed in answer:
   `lapsed` docs that said every such claim ran out of lease; "a reconciler
   that cannot establish the outcome" where an `Unknown` one was meant.
 
+### The third review
+
+A third fresh reviewer read `60f25185` and ran twelve probes. What changed in
+answer:
+
+- **The re-read settled a finished row against the run as read before the
+  question.** A worker whose lease lapsed during the authority's answer
+  made the retry and told the run while a second claim asked the
+  reconciler; the second claim then parked a call that had succeeded (a
+  spurious indeterminate segment and `parked_indeterminate`). The opening of
+  `execute_claim` is now `read_claim`, and the re-read goes through it, so
+  the run is read again too. Boxed there, by issue #162's rule.
+- **The question to the authority came first even where it saves nothing.**
+  With no reconciler wired it held the park for as long as an agent was
+  suspended, and an authority error ended every pass before a reconciler
+  that would have said "executed" was asked. Now it is skipped with no
+  reconciler, and an error from it is left for the attempt. That a deferral
+  also holds back an "executed" finding follows from ruling 3, and is
+  written down.
+- **The double question was held by no test**, nor the suspension that
+  lands during the reconciler's answer, which only the second question
+  honours. Tested now, and the compatibility entry's telemetry paragraph
+  names the extra `tool-authorize` segment.
+- **Sentences corrected:** the CHANGELOG's unscoped "moved the row"; "asked
+  before the reconciler" without the fence's exception; "the lease has to
+  cover the reconciler's answer and the call" without the authority's; a
+  comment's "an attempt always follows".
+
 ## 8. Not done
 
 - The park for a record with no reconciliation protocol is unreachable and is
   held by no test.
-- The re-read's gone and put-back rows are held by no test; their paths
-  are the ones a claim that read them first takes, by reading.
+- The re-read's gone and put-back rows are held by no test; they go through
+  `read_claim`, the paths a claim that read them first takes.
+- `attempt_invocation`'s own finished-row guard on the `Dispatching` mark
+  reads a finished row against the run as the claim read it, as on `main`;
+  the third review found it has the re-read's old blind spot.
+- A lost attempt's row is not read again: a worker on a lapsed lease that
+  moved it during the question can still be called beside, as on `main`.
+- A run that starts winding down while the reconciler answers about an
+  unmoved failed row still gets the retry: the fence was decided when the
+  claim started, as on `main`. The re-read reads the wind-down too and could
+  apply the fence; no test drives it, so it is left.
 - A park after an `Unknown` burn that spends the budget still names the
   attempt the burn recorded, which no call made, and links that attempt's
   span. Unchanged, by reading; it follows from ruling 2.

@@ -197,11 +197,15 @@ leaves behind is the same either way.
    whichever attempt it was asked about, so a reconciler that keeps
    answering `Unknown` is asked at most once for each attempt in the
    budget. After a failed attempt the dispatch authority is asked before
-   the reconciler, and a retry it defers (a suspended agent, say) asks the
-   reconciler nothing and spends none of the budget. A claim told "not
-   executed" about a failed attempt reads the ticket's row again before it
-   makes the retry, and makes none if the row moved meanwhile; a row
-   another worker finished is told to the run at once.
+   the reconciler, unless the wind-down fence applies to the call or no
+   reconciler is wired, and a retry it defers (a suspended agent, say) asks
+   the reconciler nothing and spends none of the budget. So while it is
+   deferred, a finding that would need no attempt, such as "executed",
+   waits too. A claim told "not executed" about a failed attempt reads the
+   ticket's row and the run again before it makes the retry, and makes none
+   if the row moved meanwhile; a row another worker finished is settled
+   against the run as it now stands, so the run is told if nobody has told
+   it.
 5. **Waiting.** A consequential effect parks the run `WaitingForApproval` on a
    durable checkpoint whose grant is bound to the exact intent digest; a
    changed argument invalidates it. A worker lost after a non-idempotent effect
@@ -386,11 +390,13 @@ is still working on it, and from being run by two:
   attempt: every such claim asks the reconciler first, so a rule that the
   lease cover the attempt too would never retry an effect whose answer and
   call together outlast the lease. On this path the lease has to cover the
-  reconciler's answer and the call. After a failed attempt the claim also
-  reads the ticket's row again, and makes no attempt if the row is no
-  longer where the claim read it: it ends as one out of lease does, unless
-  the row is finished, gone or put back in a lost row's place, which it
-  settles as a claim that read it first would.
+  reconciler's answer and the call, and after a failed attempt the
+  authority's answer before the question too. After a failed attempt the
+  claim also reads the ticket's row and the run again, and makes no attempt
+  if the row is no longer where the claim read it: it ends as one out of
+  lease does, unless what it reads is what a claim settles with no attempt
+  (the row finished, gone or put back in a lost row's place, or the call
+  resolved), which it settles as a claim that read it first would.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,

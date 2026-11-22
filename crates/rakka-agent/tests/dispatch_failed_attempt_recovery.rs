@@ -8,29 +8,42 @@
 //! question:
 //!
 //! - it asks the dispatch authority first, so a retry the authority defers
-//!   spends nothing and asks the reconciler nothing;
+//!   spends nothing and asks the reconciler nothing, except under the
+//!   wind-down fence or with no reconciler wired; an error from that first
+//!   question is left for the attempt;
 //! - after the answer, a claim makes its first attempt only while its lease
 //!   is still current, on this path and on a lost attempt's;
-//! - it reads the row again, and makes no attempt when another worker has
-//!   moved it, telling the run at once of a row that worker finished;
+//! - it reads the row and the run again, and makes no attempt when another
+//!   worker has moved the row; a row that worker finished is settled
+//!   against the run as it now stands;
 //! - a park made at once names and links the attempt that failed.
 //!
 //! `effect_dispatch.rs` holds the rest of the issue's cases.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rakka_agent::testkit::{
-    DeterministicModelAdapter, RecordingToolExecutor, ScriptedReconciler, SharedAtomicWorkflowClock,
+    DeterministicModelAdapter, InProcessRunResultDelivery, RecordingToolExecutor,
+    ScriptedReconciler, SharedAtomicWorkflowClock,
 };
 use rakka_agent::{
-    AgentDispatchFuture, AgentDispatchPass, AgentDispatchWindow, AgentEffectReconciler,
-    AgentEffectSpec, AgentModelTurn, AgentReconciliationFinding, AgentReconciliationProtocolRef,
-    AgentRunEffect, AgentRunEffectStatus, AgentRunScope, AgentRunStatus, AgentRunTerminalReason,
-    AgentSegmentOperation, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    InMemoryAgentSegmentSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentAuthorityRefusal, AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchError,
+    AgentDispatchFuture, AgentDispatchPass, AgentDispatchToolExecutor, AgentDispatchWindow,
+    AgentEffectReconciler, AgentEffectSpec, AgentEntityAuthority, AgentModelTurn,
+    AgentReconciliationFinding, AgentReconciliationProtocolRef, AgentRunEffect,
+    AgentRunEffectDispatcher, AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunScope,
+    AgentRunState, AgentRunStatus, AgentRunTerminalReason, AgentSegmentOperation, AgentTaskContent,
+    AgentToolCallId, AgentToolCallRequest, AgentToolId, InMemoryAgentSegmentSink,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::OutboxMessageId;
 use rakka_agent_workflow::substrate::OutboxStatus::{self, Dispatching, Exhausted, Failed};
+use rakka_agent_workflow::{
+    AgentDispatcherFleetSettings, AgentDispatcherWorkerId, AgentEphemeralCredential,
+    AgentTimestampMillis,
+};
+use tokio::sync::oneshot;
 
 mod common;
 
@@ -650,4 +663,578 @@ async fn a_cancelled_runs_failed_call_is_cancelled_on_the_finding_while_its_agen
         (AgentRunEffectStatus::Cancelled, 1)
     );
     assert_eq!(tool_row(&fx).await, (OutboxStatus::Cancelled, 1));
+}
+
+// ---------------------------------------------------------------------------
+// The third review's cases: workers that run at once, an authority that
+// answers per call, and a reconciler that hands off while it is asked.
+// ---------------------------------------------------------------------------
+
+/// A tool that fails its first `fail_first` calls and then succeeds.
+#[derive(Clone)]
+struct FlakyTool {
+    calls: Arc<AtomicUsize>,
+    fail_first: usize,
+}
+
+impl FlakyTool {
+    fn failing_first(fail_first: usize) -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail_first,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl AgentDispatchToolExecutor for FlakyTool {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        Box::pin(async move {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.fail_first {
+                Err(AgentDispatchError::collaborator(
+                    "upstream-unavailable",
+                    "later",
+                ))
+            } else {
+                Ok(
+                    AgentTaskContent::inline(serde_json::json!({ "receipt": "r-195" }))
+                        .expect("the content is inline-bounded"),
+                )
+            }
+        })
+    }
+}
+
+/// What one `authorize` call of a [`ScriptedAuthority`] answers.
+#[derive(Clone)]
+enum Answer {
+    /// The agent entity authority's own answer.
+    Inner,
+    /// An error from the authority itself.
+    Fail,
+}
+
+/// A hold on a [`ScriptedAuthority`]: its first call made once `armed` is
+/// set moves the clock past the lease, says so on `held`, and waits for
+/// `release`, then answers `refusal` if there is one.
+struct AuthorityHold {
+    armed: Arc<AtomicBool>,
+    clock: SharedAtomicWorkflowClock,
+    held: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+    refusal: Option<AgentAuthorityRefusal>,
+}
+
+/// The agent entity authority, scripted per call, recording the attempt each
+/// call was about.
+struct ScriptedAuthority {
+    inner: Arc<dyn AgentDispatchAuthority>,
+    script: Vec<Answer>,
+    asked: Mutex<Vec<u32>>,
+    hold: Mutex<Option<AuthorityHold>>,
+}
+
+impl ScriptedAuthority {
+    fn new(fx: &AuthorityFixture, script: Vec<Answer>) -> Self {
+        Self {
+            inner: Arc::new(AgentEntityAuthority::new(
+                fx.fx.agents.clone(),
+                fx.authority.clone(),
+            )),
+            script,
+            asked: Mutex::new(Vec::new()),
+            hold: Mutex::new(None),
+        }
+    }
+
+    /// The attempt each call so far was about.
+    fn asked(&self) -> Vec<u32> {
+        self.asked.lock().expect("the lock is not poisoned").clone()
+    }
+}
+
+impl AgentDispatchAuthority for ScriptedAuthority {
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        Box::pin(async move {
+            let call = {
+                let mut asked = self.asked.lock().expect("the lock is not poisoned");
+                asked.push(attempt);
+                asked.len() - 1
+            };
+            let hold = {
+                let mut hold = self.hold.lock().expect("the lock is not poisoned");
+                if hold
+                    .as_ref()
+                    .is_some_and(|hold| hold.armed.load(Ordering::SeqCst))
+                {
+                    hold.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(hold) = hold {
+                hold.clock.advance(LEASE_MS + 1);
+                let _ = hold.held.send(());
+                let _ = hold.release.await;
+                if let Some(refusal) = hold.refusal {
+                    return Ok(AgentDispatchDecision::Refused(refusal));
+                }
+            }
+            match self.script.get(call).cloned().unwrap_or(Answer::Inner) {
+                Answer::Inner => self.inner.authorize(scope, run, intent, attempt, now).await,
+                Answer::Fail => Err(AgentDispatchError::collaborator(
+                    "authority-unavailable",
+                    "the agent store did not answer",
+                )),
+            }
+        })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentToolResponseDecision> {
+        self.inner
+            .review_tool_response(scope, intent, tool, content)
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentModelResponseDecision> {
+        self.inner.review_model_response(scope, intent, turn)
+    }
+}
+
+/// A reconciler answering as `answers` does. When asked, it sets `asked` if
+/// there is one, and the first time, if a hand-off is set, says so on its
+/// sender and waits on its receiver before it answers.
+struct HandingOffReconciler {
+    answers: ScriptedReconciler,
+    asked: Option<Arc<AtomicBool>>,
+    handoff: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+}
+
+impl HandingOffReconciler {
+    fn new(answers: &ScriptedReconciler) -> Self {
+        Self {
+            answers: answers.clone(),
+            asked: None,
+            handoff: Mutex::new(None),
+        }
+    }
+
+    /// Hands off on the first question: answers the receiver that says the
+    /// question was asked, and the sender that lets it answer.
+    fn handing_off(
+        answers: &ScriptedReconciler,
+    ) -> (Self, oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (asked_tx, asked_rx) = oneshot::channel();
+        let (answer_tx, answer_rx) = oneshot::channel();
+        let reconciler = Self::new(answers);
+        *reconciler.handoff.lock().expect("the lock is not poisoned") = Some((asked_tx, answer_rx));
+        (reconciler, asked_rx, answer_tx)
+    }
+}
+
+impl AgentEffectReconciler for HandingOffReconciler {
+    fn reconcile<'a>(
+        &'a self,
+        protocol: &'a AgentReconciliationProtocolRef,
+        scope: &'a AgentRunScope,
+        effect: &'a AgentRunEffect,
+    ) -> AgentDispatchFuture<'a, AgentReconciliationFinding> {
+        Box::pin(async move {
+            if let Some(flag) = &self.asked {
+                flag.store(true, Ordering::SeqCst);
+            }
+            let handoff = self
+                .handoff
+                .lock()
+                .expect("the lock is not poisoned")
+                .take();
+            if let Some((asked, answer)) = handoff {
+                let _ = asked.send(());
+                let _ = answer.await;
+            }
+            self.answers.reconcile(protocol, scope, effect).await
+        })
+    }
+}
+
+/// A worker over the fixture's stores with the caller's authority, tool,
+/// reconciler and segment sink.
+fn worker(
+    fx: &AuthorityFixture,
+    worker_id: &str,
+    authority: Arc<dyn AgentDispatchAuthority>,
+    tools: Arc<dyn AgentDispatchToolExecutor>,
+    reconciler: Arc<dyn AgentEffectReconciler>,
+    segments: Option<Arc<InMemoryAgentSegmentSink>>,
+) -> Pipeline {
+    let delivery = InProcessRunResultDelivery::new(
+        fx.fx.runs.clone(),
+        fx.fx.effects.clone(),
+        fx.fx.router.clone(),
+        fx.fx.clock.clone(),
+    )
+    .with_effect_policies(fx.fx.policies.clone());
+    let mut pipeline = AgentRunEffectDispatcher::new(
+        AgentDispatcherWorkerId::new(worker_id),
+        fx.workflow_store.clone(),
+        fx.fleet_store.clone(),
+        fx.fx.runs.clone(),
+        fx.wf_clock.clone(),
+        Arc::new(fx.adapter.clone()),
+        tools,
+        authority,
+        Arc::new(delivery),
+    )
+    .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
+    .with_probe(Arc::new(fx.probe.clone()))
+    .with_reconciler(reconciler);
+    if let Some(segments) = segments {
+        pipeline = pipeline.with_segments(segments);
+    }
+    pipeline
+}
+
+/// One claim by `pipeline`: expires the lease, settles the entities, runs one
+/// pass.
+async fn claim_with(
+    fx: &AuthorityFixture,
+    pipeline: &mut Pipeline,
+) -> rakka_agent::AgentDispatchResult<AgentDispatchPass> {
+    fx.expire_lease();
+    fx.settle().await;
+    pipeline.pump_run(&run_scope()).await
+}
+
+/// A fixture whose run calls a reconcileable tool of three attempts, its
+/// ticket out and no attempt made.
+async fn a_reconcileable_call_out() -> AuthorityFixture {
+    let fx = failing_reconcileable_call(3);
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    fx
+}
+
+/// The tool's result the reconciler establishes.
+fn executed() -> AgentReconciliationFinding {
+    AgentReconciliationFinding::Executed {
+        outcome: Box::new(AgentRunEffectOutcome::Tool {
+            call_id: AgentToolCallId::new("call-1").expect("call id should be valid"),
+            content: AgentTaskContent::inline(serde_json::json!({ "receipt": "r-195" }))
+                .expect("the content is inline-bounded"),
+        }),
+    }
+}
+
+/// How many `tool-authorize` segments have closed.
+fn authorize_segments(segments: &InMemoryAgentSegmentSink) -> usize {
+    segments
+        .segments()
+        .iter()
+        .filter(|segment| {
+            matches!(
+                segment.operation,
+                AgentSegmentOperation::ToolAuthorize { .. }
+            )
+        })
+        .count()
+}
+
+/// The claim after a failed call asks the authority before the reconciler,
+/// and the attempt it then makes asks it again: two questions about attempt
+/// two, and two `tool-authorize` segments, where there was one. Found
+/// executed, the claim makes no attempt, and the one question is the one it
+/// asked first.
+#[tokio::test]
+async fn the_claim_after_a_failed_call_asks_the_authority_first_and_its_attempt_asks_again() {
+    for (finding, asked, invoked) in [
+        (AgentReconciliationFinding::NotExecuted, vec![2, 2], 1),
+        (executed(), vec![2], 0),
+    ] {
+        let fx = a_reconcileable_call_out().await;
+        let authority = Arc::new(ScriptedAuthority::new(&fx, Vec::new()));
+        let segments = Arc::new(InMemoryAgentSegmentSink::new());
+        let mut pipeline = worker(
+            &fx,
+            "worker-1",
+            authority.clone(),
+            Arc::new(FlakyTool::failing_first(99)),
+            Arc::new(ScriptedReconciler::new().with_finding(finding)),
+            Some(segments.clone()),
+        );
+        claim_with(&fx, &mut pipeline)
+            .await
+            .expect("the first claim's pass runs");
+        assert_eq!(tool_row(&fx).await, (Failed, 1));
+        let (before, segments_before) = (authority.asked().len(), authorize_segments(&segments));
+
+        let pass = claim_with(&fx, &mut pipeline)
+            .await
+            .expect("the claim's pass runs");
+
+        assert_eq!(pass.invoked, invoked);
+        assert_eq!(authority.asked()[before..], asked[..]);
+        assert_eq!(
+            authorize_segments(&segments) - segments_before,
+            asked.len(),
+            "one tool-authorize segment for each question"
+        );
+    }
+}
+
+/// An authority that fails before the reconciler is asked does not withhold
+/// a reconciled outcome. The question to the authority is only there to save
+/// the reconciler a question while a retry would be deferred, so its error
+/// is left for the attempt to meet: found executed, the claim makes no
+/// attempt, and the run takes the outcome.
+#[tokio::test]
+async fn an_authority_error_before_the_question_does_not_withhold_a_reconciled_outcome() {
+    let fx = a_reconcileable_call_out().await;
+    let answers = ScriptedReconciler::new().with_finding(executed());
+    let mut pipeline = worker(
+        &fx,
+        "worker-1",
+        Arc::new(ScriptedAuthority::new(
+            &fx,
+            vec![Answer::Inner, Answer::Fail, Answer::Fail],
+        )),
+        Arc::new(FlakyTool::failing_first(99)),
+        Arc::new(answers.clone()),
+        None,
+    );
+    claim_with(&fx, &mut pipeline)
+        .await
+        .expect("the first claim's pass runs");
+    assert_eq!(tool_row(&fx).await, (Failed, 1));
+
+    let pass = claim_with(&fx, &mut pipeline)
+        .await
+        .expect("the authority's error does not end the pass");
+
+    assert_eq!((pass.invoked, pass.delivered), (0, 1));
+    assert_eq!(answers.queries(), 1);
+    assert!(
+        fx.effect_at(1).await.is_none(),
+        "the reconciled result moved the turn on"
+    );
+}
+
+/// A failed call with no reconciler wired parks at once, though its agent is
+/// suspended. With no reconciler there is no question to save, so the
+/// authority is not asked first, and the park is not held for the length of
+/// the suspension.
+#[tokio::test]
+async fn a_failed_call_with_no_reconciler_parks_at_once_while_its_agent_is_suspended() {
+    let fx = a_reconcileable_call_out().await;
+    claim_round(&fx).await;
+    assert_eq!(tool_row(&fx).await, (Failed, 1));
+    fx.set_suspended(true, "suspend-1").await;
+
+    let pass = claim_round(&fx).await;
+
+    assert_eq!((pass.deferred, pass.parked_indeterminate), (0, 1));
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+    assert_eq!(
+        (
+            effect.status,
+            effect.attempts,
+            effect.last_error_code.as_deref()
+        ),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            1,
+            Some("reconciler-missing")
+        )
+    );
+}
+
+/// A suspension that lands while the reconciler answers is honoured by the
+/// attempt's own question to the authority: the first question was granted,
+/// and the attempt that follows the finding is deferred, not made.
+#[tokio::test]
+async fn a_suspension_during_the_question_is_honoured_by_the_attempts_own_question() {
+    let fx = a_reconcileable_call_out().await;
+    let tool = FlakyTool::failing_first(99);
+    let answers = not_executed();
+    let mut first = worker(
+        &fx,
+        "worker-1",
+        Arc::new(ScriptedAuthority::new(&fx, Vec::new())),
+        Arc::new(tool.clone()),
+        Arc::new(answers.clone()),
+        None,
+    );
+    claim_with(&fx, &mut first)
+        .await
+        .expect("the first claim's pass runs");
+    let (reconciler, asked, answer) = HandingOffReconciler::handing_off(&answers);
+    let mut second = worker(
+        &fx,
+        "worker-2",
+        Arc::new(ScriptedAuthority::new(&fx, Vec::new())),
+        Arc::new(tool.clone()),
+        Arc::new(reconciler),
+        None,
+    );
+
+    let (pass, ()) = tokio::join!(claim_with(&fx, &mut second), async {
+        let _ = asked.await;
+        fx.set_suspended(true, "suspend-1").await;
+        let _ = answer.send(());
+    });
+
+    let pass = pass.expect("the claim's pass runs");
+    assert_eq!((pass.deferred, pass.invoked), (1, 0));
+    assert_eq!(tool.calls(), 1);
+    assert_eq!(tool_row(&fx).await, (Failed, 1));
+}
+
+/// A row another worker finished, after it had told the run, is not parked
+/// by a claim that read it again. Worker one is told "not executed" about a
+/// failed call and its lease lapses while the authority answers for the
+/// retry. Worker two claims the ticket, and while its reconciler answers,
+/// worker one makes the retry: it tells the run, then finishes the row.
+/// Worker two, told "not executed" under a current lease, reads the row again
+/// and the run with it, finds the call resolved, and settles its ticket; it
+/// used to read the finished row against the run as it read it before the
+/// question, and parked the call as unknown.
+async fn a_row_finished_after_the_run_was_told(refusal: Option<AgentAuthorityRefusal>) {
+    let fx = a_reconcileable_call_out().await;
+    let tool = FlakyTool::failing_first(1);
+    let segments = Arc::new(InMemoryAgentSegmentSink::new());
+    let mut failing = worker(
+        &fx,
+        "worker-0",
+        Arc::new(ScriptedAuthority::new(&fx, Vec::new())),
+        Arc::new(tool.clone()),
+        Arc::new(not_executed()),
+        Some(segments.clone()),
+    );
+    claim_with(&fx, &mut failing)
+        .await
+        .expect("the first claim's pass runs");
+    assert_eq!(tool_row(&fx).await, (Failed, 1));
+
+    let one_asked = Arc::new(AtomicBool::new(false));
+    let (held_tx, held) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    let held_authority = ScriptedAuthority::new(&fx, Vec::new());
+    *held_authority
+        .hold
+        .lock()
+        .expect("the lock is not poisoned") = Some(AuthorityHold {
+        armed: one_asked.clone(),
+        clock: fx.wf_clock.clone(),
+        held: held_tx,
+        release: release_rx,
+        refusal,
+    });
+    let mut one_reconciler = HandingOffReconciler::new(&not_executed());
+    one_reconciler.asked = Some(one_asked);
+    let mut one = worker(
+        &fx,
+        "worker-1",
+        Arc::new(held_authority),
+        Arc::new(tool.clone()),
+        Arc::new(one_reconciler),
+        Some(segments.clone()),
+    );
+    let (two_reconciler, two_asked, two_answer) =
+        HandingOffReconciler::handing_off(&not_executed());
+    let mut two = worker(
+        &fx,
+        "worker-2",
+        Arc::new(ScriptedAuthority::new(&fx, Vec::new())),
+        Arc::new(tool.clone()),
+        Arc::new(two_reconciler),
+        Some(segments.clone()),
+    );
+    let (one_done_tx, one_done) = oneshot::channel::<()>();
+
+    fx.expire_lease();
+    fx.settle().await;
+    let (_one, two, ()) = tokio::join!(
+        async {
+            let pass = one.pump_run(&run_scope()).await;
+            let _ = one_done_tx.send(());
+            pass
+        },
+        async {
+            let _ = held.await;
+            two.pump_run(&run_scope()).await
+        },
+        async {
+            let _ = two_asked.await;
+            let _ = release.send(());
+            let _ = one_done.await;
+            let _ = two_answer.send(());
+        }
+    );
+
+    let two = two.expect("worker two's pass runs");
+    assert_eq!(
+        (two.invoked, two.parked_indeterminate),
+        (0, 0),
+        "worker two made no attempt and parked nothing"
+    );
+    let parked: Vec<_> = segments
+        .segments()
+        .iter()
+        .filter(|segment| {
+            segment
+                .attributes
+                .get("rakka.agent.effect.status")
+                .map(String::as_str)
+                == Some("indeterminate")
+        })
+        .map(|segment| segment.operation.as_label())
+        .collect();
+    assert_eq!(
+        parked,
+        Vec::<&str>::new(),
+        "no segment says the call is unknown"
+    );
+    assert_ne!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::WaitingForReconciliation
+    );
+}
+
+#[tokio::test]
+async fn a_row_another_worker_finished_with_a_success_it_delivered_is_not_parked() {
+    a_row_finished_after_the_run_was_told(None).await;
+}
+
+#[tokio::test]
+async fn a_row_another_worker_cancelled_after_a_refusal_it_delivered_is_not_parked() {
+    a_row_finished_after_the_run_was_told(Some(AgentAuthorityRefusal::of(
+        "tool-revoked",
+        "the tool was revoked",
+    )))
+    .await;
 }
