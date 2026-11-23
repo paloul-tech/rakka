@@ -718,13 +718,21 @@ impl AgentDispatchToolExecutor for CountingRetryable {
     }
 }
 
-/// An idempotent three-attempt call whose first attempt ran and failed: the
-/// row is `Failed` and counts one attempt, and the run was told of none. The
-/// run is then cancelled, and the retry is due.
+/// A read-only three-attempt call whose first attempt ran and failed: the row
+/// is `Failed` and counts one attempt, and the run was told of none. The run
+/// is then cancelled, and the retry is due.
+///
+/// Read-only, because that is a call the fence cancels after a failed
+/// attempt. An idempotent call's failed attempt may have reached its target,
+/// and the fence parks it instead, the replays of a lost fence included
+/// (issue #206, `wind_down_possibly_executed.rs`).
 async fn one_failed_attempt_then_a_cancel(
 ) -> (AuthorityFixture, AgentRunEffect, Arc<CountingRetryable>) {
     let tool = Arc::new(CountingRetryable::default());
-    let (fx, effect) = ticket(&idempotent(3), Some(tool.clone()), None).await;
+    let read_only = AgentEffectSpec::read_only()
+        .with_max_attempts(3)
+        .expect("the spec is valid");
+    let (fx, effect) = ticket(&read_only, Some(tool.clone()), None).await;
     let pass = fx
         .pipeline()
         .pump_run(&run_scope())
