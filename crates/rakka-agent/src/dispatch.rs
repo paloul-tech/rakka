@@ -2339,16 +2339,20 @@ pub struct AgentDispatchPass {
     /// worker's. Such a claim can end with its own lease standing in full,
     /// so neither of these says an effect's attempts outlast the lease.
     ///
-    /// One more is counted with them and ends its batch the same way (issue
-    /// #196): a claim whose dispatch was refused definitively before its
-    /// `Started` (for a policy conflict, by the authority, for a grant that
-    /// fails its check or for a guardrail revision mismatch) once its lease
-    /// had lapsed, which is most often during the authority's answer. The
-    /// refusal is not delivered, and the ticket is left to the claim that
-    /// follows. A value that stays above zero can say the authority answers
-    /// slower than the lease: its refusals are then never delivered, and the
-    /// run
-    /// waits, spending nothing.
+    /// One more is counted with them and ends its batch the same way (issues
+    /// #196 and #207): a claim whose lease lapsed while the dispatch
+    /// authority answered. Whatever the answer, a grant, a refusal
+    /// definitive or transient, or an answer to the question asked before
+    /// the reconciler after a failed attempt, it is not acted on: no attempt
+    /// is made, no refusal is delivered, the reconciler is not asked, and
+    /// the ticket is left to the claim that follows. A model call's policy
+    /// conflict, which the dispatcher decides without asking the authority,
+    /// is counted here too when the lease has lapsed before it is delivered.
+    /// Such a claim used to end its pass in a `claim-fenced` error after a
+    /// late grant or a late transient refusal; it ends here now, and the
+    /// pass returns its report. A value that stays above zero can say the
+    /// authority answers slower than the lease: its answers are then never
+    /// acted on, grants included, and the run waits, spending nothing.
     ///
     /// Nothing is written to the ticket of any of these as its claim ends:
     /// once the lease is over any worker can take it. A pass that ends in an
@@ -2388,10 +2392,11 @@ enum ClaimConclusion {
     /// first attempt, the reconciler answered about an attempt an earlier
     /// claim made and the claim's lease had lapsed by then, or the ticket's
     /// row had been moved meanwhile by a worker whose own lease had lapsed
-    /// (issue #195). Or its dispatch was refused definitively before its
-    /// `Started` once its lease had lapsed, and the refusal was not
-    /// delivered (issue #196). Its ticket is unsettled, and no settle renewed
-    /// the claims its pass holds behind it.
+    /// (issue #195). Or the dispatch authority answered once its lease had
+    /// lapsed, and the answer, whatever it was, was not acted on (issues
+    /// #196 and #207), or a model call's policy conflict was met on a lease
+    /// that had lapsed. Its ticket is unsettled, and no settle renewed the
+    /// claims its pass holds behind it.
     OutOfLease,
 }
 
@@ -2439,6 +2444,22 @@ enum ClaimStep {
         /// attempt, whose bound is counted from its own start.
         bound_from: Option<AgentTimestampMillis>,
     },
+}
+
+/// What a claim learned from the dispatch authority
+/// ([`AgentRunEffectDispatcher::authorize_attempt`], issue #207).
+enum Authorized {
+    /// The authority answered while the claim's lease was still current.
+    Answered {
+        /// The authority's decision.
+        decision: AgentDispatchDecision,
+        /// The instant the authority was asked, which a grant is validated
+        /// against.
+        asked_at: AgentTimestampMillis,
+    },
+    /// The claim's lease lapsed while the authority answered: the answer is
+    /// not acted on, and the claim ends out of lease.
+    OutOfLease,
 }
 
 /// What [`AgentRunEffectDispatcher::read_claim`] found of a claim's ticket.
@@ -4108,13 +4129,27 @@ where
     /// closes the `tool-authorize` segment of that question. Answers the
     /// decision with the instant it was asked at, which a grant is validated
     /// against.
+    ///
+    /// The decision is answered only while `claim`'s lease is still current
+    /// (issue #207). The authority can answer after the lease lapsed, and by
+    /// then another worker may hold the ticket and have the attempt out.
+    /// Acted on, a late grant made a second call beside it, of a
+    /// non-idempotent tool too, and a late refusal failed the run beside it
+    /// (issue #196). So whatever the answer, a lapsed lease answers
+    /// [`Authorized::OutOfLease`], and the claim ends there and leaves the
+    /// ticket to the claim that follows. Only that the lease is current is
+    /// asked, not that it covers the call: the lease has to cover the
+    /// authority's answer, and an authority that always answers slower than
+    /// the lease leaves the call waiting, spending nothing. An error from the
+    /// authority is not an answer and is returned as it is.
     async fn authorize_attempt(
         &self,
         scope: &AgentRunScope,
+        claim: &AgentDispatchClaim,
         state: &AgentRunState,
         intent: &AgentRunEffect,
         attempt: u32,
-    ) -> AgentDispatchResult<(AgentDispatchDecision, AgentTimestampMillis)> {
+    ) -> AgentDispatchResult<Authorized> {
         let now = rakka_agent_workflow::AgentTimestampMillis::new(self.clock.now().as_millis());
         // A distinct segment from the attempt, because it is a distinct
         // interval with a distinct meaning: it ends before the durable
@@ -4138,7 +4173,14 @@ where
                 Err(error) => authorize_segment.failed("rakka.agent.authority", error.code()),
             },
         );
-        Ok((authorized?, now))
+        let decision = authorized?;
+        if !self.fleet.is_current_claim_for(claim, 0)? {
+            return Ok(Authorized::OutOfLease);
+        }
+        Ok(Authorized::Answered {
+            decision,
+            asked_at: now,
+        })
     }
 
     /// Asks the dispatch authority, before the reconciler, about the attempt
@@ -4155,6 +4197,10 @@ where
     /// authority answers `None` too, and is left for the attempt to meet: a
     /// finding that needs no attempt, such as "executed", is not withheld
     /// for it.
+    ///
+    /// An answer that comes after the claim's lease lapsed ends the claim
+    /// out of lease, and the reconciler is not asked (issue #207): another
+    /// worker may hold the ticket by then.
     async fn defer_before_reconciling(
         &mut self,
         scope: &AgentRunScope,
@@ -4164,8 +4210,15 @@ where
         attempt: u32,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<Option<ClaimConclusion>> {
-        match self.authorize_attempt(scope, state, intent, attempt).await {
-            Ok((AgentDispatchDecision::Refused(refusal), _)) if refusal.retryable => self
+        match self
+            .authorize_attempt(scope, claim, state, intent, attempt)
+            .await
+        {
+            Ok(Authorized::OutOfLease) => Ok(Some(ClaimConclusion::OutOfLease)),
+            Ok(Authorized::Answered {
+                decision: AgentDispatchDecision::Refused(refusal),
+                ..
+            }) if refusal.retryable => self
                 .defer_dispatch(claim, attempt, &refusal.code, &refusal.message, pass)
                 .await
                 .map(Some),
@@ -4248,9 +4301,18 @@ where
         // undeclared or revoked tool, a widened intent, a missing checkpoint,
         // an unroutable execution policy, a blocked guardrail — settles the
         // generation (scenario 54).
-        let (decision, now) = self
-            .authorize_attempt(scope, state, intent, attempt)
-            .await?;
+        //
+        // An answer that comes after the claim's lease lapsed ends the claim
+        // here, before anything is written, whatever the answer (issue #207).
+        let (decision, now) = match self
+            .authorize_attempt(scope, &claim, state, intent, attempt)
+            .await?
+        {
+            Authorized::Answered { decision, asked_at } => (decision, asked_at),
+            Authorized::OutOfLease => {
+                return Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease));
+            }
+        };
         let granted = match decision {
             AgentDispatchDecision::Granted(granted) => {
                 if let Err(refusal) = granted.grant.validate_for(scope, intent, attempt, now) {
@@ -5528,6 +5590,13 @@ where
     /// and the ticket is left to the claim that follows.
     /// A worker that stalls between this check and the delivery can still
     /// deliver.
+    ///
+    /// Since issue #207 the authority's refusals arrive here already checked,
+    /// right after the authority answered
+    /// ([`AgentRunEffectDispatcher::authorize_attempt`]), and nothing is
+    /// written or called in between, so this check reads the same lease
+    /// again. It is the model-policy conflict's own check: that refusal is
+    /// decided before any authority is asked.
     #[allow(clippy::too_many_arguments)]
     async fn settle_refused_before_started(
         &mut self,

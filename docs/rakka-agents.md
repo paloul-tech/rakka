@@ -409,21 +409,26 @@ is still working on it, and from being run by two:
   lease does, unless what it reads is what a claim settles with no attempt
   (the row finished, gone or put back in a lost row's place, or the call
   resolved), which it settles as a claim that read it first would.
-- **A refusal before `Started` is told to the run only under a current
-  lease** (issue #196). The dispatch authority can answer after the
+- **The dispatch authority's answer is acted on only under a current
+  lease** (issues #196 and #207). The authority can answer after the
   claim's lease lapsed, and by then another worker may hold the ticket and
-  have made the attempt the answer refuses, or have it out. So a
-  definitive refusal before `Started` (a policy conflict, the authority's
-  refusal, a grant that fails its check, a guardrail revision mismatch) is
-  delivered, or parked, only while the claim's lease is still current.
-  Otherwise the claim ends there, as above, writing nothing more (a lost
-  attempt it counted first stays counted), and the ticket is left to the
-  claim that follows. The lease has to cover the authority's answer: a
-  refusing authority that always answers slower than the lease leaves the
-  run waiting, spending nothing. A transient refusal is not asked, since it
-  tells the run nothing, and neither is a refusal after `Started`
-  (`credential-resolver-missing`). A worker that stalls between the check
-  and the delivery can still deliver.
+  have the attempt out. So right after the authority answers, whatever the
+  answer, the claim asks whether its lease is still current, and otherwise
+  ends there, as above, writing nothing more (a lost attempt it counted
+  first stays counted); the ticket is left to the claim that follows. A
+  late grant makes no attempt, so it calls no tool beside another worker's
+  call and never reaches `credential-resolver-missing`; a late refusal,
+  definitive or transient, tells the run nothing. The same holds for the
+  question asked before the reconciler after a failed attempt (issue #195):
+  a late answer there ends the claim before the reconciler is asked. A
+  definitive refusal the dispatcher makes without asking the authority (a
+  model call's policy conflict) is checked the same way before it is
+  delivered. Only that the lease is current is asked. The lease has to
+  cover the authority's answer: an authority that always answers slower
+  than the lease, granting or refusing, leaves the run waiting, spending
+  nothing. An error from the authority is not an answer and keeps its
+  handling. A worker that stalls between the check and what follows it
+  can still act.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,
@@ -574,14 +579,17 @@ sooner and closer together. The two writes of a cancellation through
 `AgentDispatcherWorker` are still one try each and are not counted.
 
 `AgentRunEffectDispatcher` checks a claim's lease when its pass reaches the
-claim, and not again before it marks the ticket's row `Dispatching`. A
-finished row is protected at both ends: the mark and a settle each leave a
-row that is `Dispatched`, `Exhausted` or `Cancelled` as it is. What is left
-concerns a row that is not finished:
+claim, and again right after the dispatch authority answers (issue #207),
+and not again before it marks the ticket's row `Dispatching`. A finished
+row is protected at both ends: the mark and a settle each leave a row that
+is `Dispatched`, `Exhausted` or `Cancelled` as it is. What is left concerns
+a row that is not finished:
 
-- A worker that stalls past its lease between that check and its durable
-  `Started` can still start an attempt on a ticket another worker has since
-  claimed and is running.
+- A worker that stalls past its lease between the check after the
+  authority's answer and its durable `Started` can still start an attempt
+  on a ticket another worker has since claimed and is running. Between the
+  two the dispatcher only checks the grant against the intent; it writes
+  nothing and calls nothing.
 - Nothing renews a lease during a call. A call that outlives its lease loses
   its claim, and the next claim recovers the ticket as an attempt that
   disappeared, by its safety class, while that call may still be out. The

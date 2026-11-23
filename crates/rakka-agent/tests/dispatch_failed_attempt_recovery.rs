@@ -252,6 +252,16 @@ enum BeforeTheAnswer {
         clock: SharedAtomicWorkflowClock,
         fails: bool,
     },
+    /// A worker on a lapsed lease of its own makes the attempt and it
+    /// succeeds: it marks the row `Dispatching`, tells the run the call's
+    /// result, and finishes the row as `Dispatched`, the order a worker
+    /// keeps. Since issue #207 a worker can be there only by stalling between
+    /// its lease check after the authority's answer and its `Started`.
+    AStaleWorkerSucceeds {
+        store: WorkflowStore,
+        clock: SharedAtomicWorkflowClock,
+        delivery: Arc<dyn rakka_agent::AgentRunResultDelivery>,
+    },
 }
 
 /// A reconciler whose first answer comes after [`BeforeTheAnswer`].
@@ -321,6 +331,55 @@ impl AgentEffectReconciler for HookedReconciler {
                             .await
                             .expect("the stale worker records its failure");
                     }
+                }
+                Some(BeforeTheAnswer::AStaleWorkerSucceeds {
+                    store,
+                    clock,
+                    delivery,
+                }) => {
+                    let row = OutboxMessageId::new(effect.dispatch_ticket_id().as_str());
+                    let mut inbox = rakka_agent_workflow::AgentRunInbox::with_clock(
+                        rakka_agent::workflow_run_id(scope),
+                        store,
+                        clock,
+                    );
+                    inbox.recover().await.expect("the inbox recovers");
+                    inbox
+                        .inner_mut()
+                        .mark_outbox_dispatching(&row)
+                        .await
+                        .expect("the stale worker marks the row");
+                    let rakka_agent::AgentRunEffectRequest::Tool { call } = &effect.request else {
+                        panic!("the ticket is a tool call");
+                    };
+                    delivery
+                        .deliver(
+                            scope,
+                            rakka_agent::AgentRunEntityCommand::RecordEffectResult {
+                                operation_id: effect
+                                    .result_operation_id(scope)
+                                    .expect("the operation id derives"),
+                                effect_id: effect.effect_id.clone(),
+                                generation: effect.generation,
+                                attempt: 2,
+                                fence: 0,
+                                outcome: Box::new(AgentRunEffectOutcome::Tool {
+                                    call_id: call.call_id.clone(),
+                                    content: AgentTaskContent::inline(
+                                        serde_json::json!({ "charged": true }),
+                                    )
+                                    .expect("the result is inline-bounded"),
+                                }),
+                            },
+                        )
+                        .await
+                        .expect("the stale worker tells the run");
+                    inbox.recover().await.expect("the inbox recovers");
+                    inbox
+                        .inner_mut()
+                        .record_outbox_success(&row)
+                        .await
+                        .expect("the stale worker finishes the row");
                 }
             }
             self.answers.reconcile(protocol, scope, effect).await
@@ -1117,14 +1176,12 @@ async fn a_suspension_during_the_question_is_honoured_by_the_attempts_own_questi
 }
 
 /// What [`worker_one_retries_on_a_lapsed_lease_while_worker_two_asks`]
-/// leaves: each worker's pass, and the fixture, tool and segments they
-/// shared.
+/// leaves: each worker's pass, and the fixture and tool they shared.
 struct Race {
     one: rakka_agent::AgentDispatchResult<AgentDispatchPass>,
     two: AgentDispatchPass,
     fx: AuthorityFixture,
     tool: FlakyTool,
-    segments: Arc<InMemoryAgentSegmentSink>,
 }
 
 /// Worker one is told "not executed" about a failed call, and its lease
@@ -1212,26 +1269,101 @@ async fn worker_one_retries_on_a_lapsed_lease_while_worker_two_asks(
         two: two.expect("worker two's pass runs"),
         fx,
         tool,
-        segments,
     }
 }
 
+/// A late grant leaves the retry to the worker that holds the ticket (issue
+/// #207). In the race above, worker one's authority grants the retry in an
+/// answer that came after its lease lapsed. Worker one ends out of lease and
+/// writes nothing. Worker two, told "not executed" under a current lease,
+/// finds the row where it read it and makes the retry, which succeeds. The
+/// late grant used to make the retry itself, beside worker two's claim.
+#[tokio::test]
+async fn a_late_grant_leaves_the_retry_to_the_worker_that_holds_the_ticket() {
+    let Race {
+        one, two, fx, tool, ..
+    } = worker_one_retries_on_a_lapsed_lease_while_worker_two_asks(None).await;
+
+    let one = one.expect("worker one's pass runs");
+    assert_eq!(
+        (one.lapsed, one.invoked, one.delivered, one.cancelled),
+        (1, 0, 0, 0),
+        "worker one ends out of lease and writes nothing"
+    );
+    assert_eq!(
+        (two.invoked, two.delivered, two.parked_indeterminate),
+        (1, 1, 0)
+    );
+    assert_eq!(tool.calls(), 2, "the failed call, then worker two's retry");
+    fx.pump().await;
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::Completed,
+        "the run completes on worker two's retry"
+    );
+}
+
 /// A row another worker finished, after it had told the run, is not parked
-/// by a claim that read it again. In the race above, worker one's grant
-/// lets it make the retry: it tells the run, then finishes the row. Worker
-/// two, told "not executed" under a current lease, reads the row again and
-/// the run with it, finds the call resolved, and settles its ticket; it
+/// by a claim that read it again. A failed call's next claim asks the
+/// reconciler; meanwhile a worker on a lapsed lease of its own makes the
+/// attempt, which succeeds: it tells the run, then finishes the row. Told
+/// "not executed" under a current lease, the claim reads the row again and
+/// the run with it, finds the call resolved, and settles its ticket. It
 /// used to read the finished row against the run as it read it before the
-/// question, and parked the call as unknown.
+/// question, and parked the call as unknown (issue #195).
+///
+/// The other worker was worker one of the race above, making the retry on
+/// a grant that came after its lease, until issue #207 ended such a claim
+/// at the grant. A worker can still be there by stalling between its lease
+/// check and its `Started`, which the reconciler's hook stands in for.
 #[tokio::test]
 async fn a_row_another_worker_finished_with_a_success_it_delivered_is_not_parked() {
-    let Race {
-        two, fx, segments, ..
-    } = worker_one_retries_on_a_lapsed_lease_while_worker_two_asks(None).await;
+    let fx = failing_reconcileable_call(6);
+    let segments = Arc::new(InMemoryAgentSegmentSink::new());
+    let reconciler = HookedReconciler::new(&fx, &not_executed());
+    let fx = fx
+        .with_reconciler(reconciler.clone())
+        .with_segments(segments.clone())
+        .with_dispatch_segments(segments.clone());
+    let delivery = InProcessRunResultDelivery::new(
+        fx.fx.runs.clone(),
+        fx.fx.effects.clone(),
+        fx.fx.router.clone(),
+        fx.fx.clock.clone(),
+    )
+    .with_effect_policies(fx.fx.policies.clone());
+    reconciler.arm(BeforeTheAnswer::AStaleWorkerSucceeds {
+        store: fx.workflow_store.clone(),
+        clock: fx.wf_clock.clone(),
+        delivery: Arc::new(delivery),
+    });
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    claim_round(&fx).await;
+    assert_eq!(tool_row(&fx).await, (Failed, 1));
+    // Read before the claim: a resolved call leaves the run once its turn
+    // is recorded.
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+
+    let two = claim_round(&fx).await;
+
     assert_eq!(
         (two.invoked, two.parked_indeterminate),
         (0, 0),
-        "worker two made no attempt and parked nothing"
+        "the claim made no attempt and parked nothing"
+    );
+    assert_eq!(
+        fx.outbox_row(&effect)
+            .await
+            .expect("the ticket's row exists")
+            .status(),
+        OutboxStatus::Dispatched,
+        "the other worker finished the row"
+    );
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "the claim invoked nothing; only the failed call ran here"
     );
     let parked: Vec<_> = segments
         .segments()
