@@ -2257,11 +2257,14 @@ pub struct AgentDispatchPass {
     /// so neither of these says an effect's attempts outlast the lease.
     ///
     /// One more is counted with them and ends its batch the same way (issue
-    /// #196): a claim whose dispatch the authority refused definitively,
-    /// before its `Started`, in an answer that came after the lease lapsed.
-    /// The refusal is not delivered, and the claim that follows asks again.
-    /// A value that stays above zero can say the authority answers slower
-    /// than the lease: its refusals are then never delivered, and the run
+    /// #196): a claim whose dispatch was refused definitively before its
+    /// `Started` (for a policy conflict, by the authority, for a grant that
+    /// fails its check or for a guardrail revision mismatch) once its lease
+    /// had lapsed, which is most often during the authority's answer. The
+    /// refusal is not delivered, and the ticket is left to the claim that
+    /// follows. A value that stays above zero can say the authority answers
+    /// slower than the lease: its refusals are then never delivered, and the
+    /// run
     /// waits, spending nothing.
     ///
     /// Nothing is written to the ticket of any of these as its claim ends:
@@ -5406,7 +5409,7 @@ where
     /// (issue #196), per [`Self::settle_undispatchable`].
     ///
     /// The refused attempt did not start, so the run is told the attempts
-    /// before it, which the row counted when the claim read it.
+    /// before it, which the row counts by then.
     ///
     /// The refusal is delivered, or parked, only while the claim's lease is
     /// still current. The authority can answer after the lease lapsed, and
@@ -5414,7 +5417,8 @@ where
     /// this one refused, or have it out. Told now, the run would fail beside
     /// that attempt, and the ticket cancelled with it would lose that
     /// attempt's outcome. So the claim ends as one out of lease does,
-    /// writing nothing, and the claim that follows asks the authority again.
+    /// writing nothing more (a lost attempt it counted first stays counted),
+    /// and the ticket is left to the claim that follows.
     /// A worker that stalls between this check and the delivery can still
     /// deliver.
     #[allow(clippy::too_many_arguments)]

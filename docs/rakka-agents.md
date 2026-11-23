@@ -408,13 +408,14 @@ is still working on it, and from being run by two:
   definitive refusal before `Started` (a policy conflict, the authority's
   refusal, a grant that fails its check, a guardrail revision mismatch) is
   delivered, or parked, only while the claim's lease is still current.
-  Otherwise the claim ends there and writes nothing, as above, and the
-  claim that follows asks the authority again. The lease has to cover the
-  authority's answer: a refusing authority that always answers slower than
-  the lease leaves the run waiting, spending nothing. A transient refusal
-  is not asked, since it tells the run nothing, and neither is a refusal
-  after `Started` (`credential-resolver-missing`). A worker that stalls
-  between the check and the delivery can still deliver.
+  Otherwise the claim ends there, as above, writing nothing more (a lost
+  attempt it counted first stays counted), and the ticket is left to the
+  claim that follows. The lease has to cover the authority's answer: a
+  refusing authority that always answers slower than the lease leaves the
+  run waiting, spending nothing. A transient refusal is not asked, since it
+  tells the run nothing, and neither is a refusal after `Started`
+  (`credential-resolver-missing`). A worker that stalls between the check
+  and the delivery can still deliver.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,

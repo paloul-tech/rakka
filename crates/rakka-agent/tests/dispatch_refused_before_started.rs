@@ -27,21 +27,21 @@ use std::sync::{Arc, Mutex};
 
 use rakka_agent::testkit::{
     DeterministicModelAdapter, InProcessRunResultDelivery, RecordingToolExecutor,
-    ScriptedReconciler, SharedAtomicWorkflowClock,
+    ScriptedCredentialResolver, ScriptedReconciler, SharedAtomicWorkflowClock,
 };
 use rakka_agent::{
     AgentAuthorityRefusal, AgentCheckpointDecision, AgentCredentialBindingRef,
     AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchError, AgentDispatchFuture,
-    AgentDispatchToolExecutor, AgentDispatchWindow, AgentEffectSpec, AgentEntityAuthority,
-    AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
-    AgentGuardrailOutcome, AgentGuardrailStage, AgentGuardrailStageId, AgentModelRetryPolicy,
-    AgentModelTurn, AgentOperationId, AgentOperationKind, AgentReconciliationDecision,
-    AgentReconciliationFinding, AgentReconciliationProtocolRef, AgentRevisionNumber,
-    AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectKind, AgentRunEffectStatus,
-    AgentRunEntityCommand, AgentRunScope, AgentRunState, AgentRunStatus, AgentRunTerminalReason,
-    AgentSegmentOperation, AgentSettingsChange, AgentTaskContent, AgentToolAuthority,
-    AgentToolCallId, AgentToolCallRequest, AgentToolId, InMemoryAgentSegmentSink,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentDispatchToolExecutor, AgentDispatchWindow, AgentEffectReconciler, AgentEffectSpec,
+    AgentEntityAuthority, AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain,
+    AgentGuardrailContext, AgentGuardrailOutcome, AgentGuardrailStage, AgentGuardrailStageId,
+    AgentModelRetryPolicy, AgentModelTurn, AgentOperationId, AgentOperationKind,
+    AgentReconciliationDecision, AgentReconciliationFinding, AgentReconciliationProtocolRef,
+    AgentRevisionNumber, AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectKind,
+    AgentRunEffectStatus, AgentRunEntityCommand, AgentRunScope, AgentRunState, AgentRunStatus,
+    AgentRunTerminalReason, AgentSegmentOperation, AgentSettingsChange, AgentTaskContent,
+    AgentToolAuthority, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    InMemoryAgentSegmentSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::OutboxStatus;
 use rakka_agent_workflow::{
@@ -1145,13 +1145,14 @@ async fn a_refusal_whose_lease_lapsed_after_another_worker_failed_the_attempt_is
     assert_eq!(run.terminal_reason, None, "the run is not failed");
 }
 
-/// A refusal whose lease lapsed is delivered by the claim that follows.
-/// The authority's first answer comes after the lease lapsed, and no other
-/// worker claims the ticket: the claim ends out of lease and tells the run
-/// nothing. The tool is then revoked, and the next claim's authority
-/// refuses it at once, under a current lease: that refusal is delivered.
+/// A late refusal leaves the call to the claim that follows. The
+/// authority's first answer, a refusal, comes after the lease lapsed, and
+/// no other worker claims the ticket: the claim ends out of lease and tells
+/// the run nothing. The tool is then revoked, and the next claim's
+/// authority refuses it at once, under a current lease: that refusal is
+/// delivered.
 #[tokio::test]
-async fn a_refusal_whose_lease_lapsed_is_delivered_by_the_claim_that_follows() {
+async fn a_late_refusal_leaves_the_call_to_the_claim_that_follows() {
     let fx = AuthorityFixture::over(
         tool_then_proposal(),
         tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent()),
@@ -1188,4 +1189,389 @@ async fn a_refusal_whose_lease_lapsed_is_delivered_by_the_claim_that_follows() {
         effect_failed(&fx).await,
         ("tool-revoked".to_string(), Some(0), Some(1))
     );
+}
+
+/// An idempotent retry refused after the lease lapsed parks nothing. Its
+/// first call failed and may have reached the target, so a refusal of the
+/// retry under a current lease parks the call for a reconciliation
+/// decision. Made once the lease has lapsed, the claim ends out of lease
+/// and parks nothing.
+#[tokio::test]
+async fn an_idempotent_retry_refused_after_the_lease_lapsed_parks_nothing() {
+    let (fx, _) = a_call_whose_first_attempt_failed(
+        AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+    )
+    .await;
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        Arc::new(OutlastingAuthority::new(&fx)),
+        Arc::new(fx.tools.clone()),
+    );
+    fx.expire_lease();
+    fx.settle().await;
+
+    let pass = one.pump_run(&run_scope()).await.expect("the pass runs");
+
+    assert_eq!(
+        (pass.lapsed, pass.parked_indeterminate, pass.delivered),
+        (1, 0, 0)
+    );
+    assert_ne!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::WaitingForReconciliation
+    );
+}
+
+/// A policy conflict met after the lease lapsed is not delivered. The
+/// claim's first read of the run's workflow record moves the clock past the
+/// lease, and the policy check that follows refuses the model call: the
+/// claim ends out of lease and the run is not told.
+#[tokio::test]
+async fn a_policy_conflict_met_after_the_lease_lapsed_is_not_delivered() {
+    let adapter = DeterministicModelAdapter::new()
+        .with_turn(proposing_turn("resolved"))
+        .with_retry_policy(AgentModelRetryPolicy {
+            safety_class: rakka_agent::AgentEffectSafetyClass::NonIdempotent,
+            max_attempts: 1,
+        })
+        .expect("the adapter policy is valid");
+    let fx = AuthorityFixture::over(
+        adapter,
+        tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent()),
+        Some(
+            AgentEffectSpec::read_only()
+                .with_max_attempts(3)
+                .expect("the spec is valid"),
+        ),
+    );
+    fx.start().await;
+    fx.settle().await;
+    let mut pipeline = fx.pipeline();
+    pipeline
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    let clock = fx.wf_clock.clone();
+    fx.workflow_store.before_next_load(Box::new(move || {
+        Box::pin(async move { clock.advance(LEASE_MS + 1) })
+    }));
+
+    let pass = pipeline
+        .claim_and_execute()
+        .await
+        .expect("a claim out of lease does not fail the pass");
+
+    assert_eq!((pass.claimed, pass.lapsed, pass.delivered), (1, 1, 0));
+    assert_eq!(fx.adapter.calls(), 0);
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.terminal_reason, None, "the run is not told");
+}
+
+/// An authority that answers its first question as the fixture's own
+/// authority would, and refuses every later one `tool-revoked`, moving the
+/// clock `then_advance` ms first.
+struct GrantThenRefuse {
+    inner: Arc<dyn AgentDispatchAuthority>,
+    clock: SharedAtomicWorkflowClock,
+    asked: AtomicUsize,
+    then_advance: u64,
+}
+
+impl AgentDispatchAuthority for GrantThenRefuse {
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        Box::pin(async move {
+            if self.asked.fetch_add(1, Ordering::SeqCst) == 0 {
+                return self.inner.authorize(scope, run, intent, attempt, now).await;
+            }
+            self.clock.advance(self.then_advance);
+            Ok(AgentDispatchDecision::Refused(AgentAuthorityRefusal::of(
+                "tool-revoked",
+                "the tool was revoked",
+            )))
+        })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentToolResponseDecision> {
+        self.inner
+            .review_tool_response(scope, intent, tool, content)
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentModelResponseDecision> {
+        self.inner.review_model_response(scope, intent, turn)
+    }
+}
+
+/// A tool whose every call moves the clock `advance` ms and succeeds.
+struct SlowTool {
+    clock: SharedAtomicWorkflowClock,
+    advance: u64,
+}
+
+impl AgentDispatchToolExecutor for SlowTool {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        Box::pin(async move {
+            self.clock.advance(self.advance);
+            Ok(
+                AgentTaskContent::inline(serde_json::json!({ "charged": true }))
+                    .expect("the result is inline-bounded"),
+            )
+        })
+    }
+}
+
+/// A refusal inside a renewed lease is delivered: the check asks the
+/// claim's lease as the batch's settles renewed it, not the expiry the
+/// claim was handed. The model asks for two tool calls, both claimed in one
+/// batch. The first call takes most of the lease, and its settle renews the
+/// second claim. The second call's refusal comes after the batch's first
+/// expiry and inside its renewed lease.
+#[tokio::test]
+async fn a_refusal_inside_a_renewed_lease_is_delivered() {
+    let call = |id: &str, amount: u64| {
+        AgentToolCallRequest::new(
+            AgentToolCallId::new(id).expect("call id should be valid"),
+            tool_id(),
+            serde_json::json!({ "amount": amount }),
+        )
+        .expect("the tool call is bounded")
+    };
+    let adapter = DeterministicModelAdapter::new()
+        .with_turn_for(
+            1,
+            AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                .with_text("Two of them.")
+                .with_tool_call(call("call-1", 1))
+                .with_tool_call(call("call-2", 2)),
+        )
+        .with_turn_for(2, proposing_turn("charged"));
+    let fx = AuthorityFixture::over(
+        adapter,
+        tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent()),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        Arc::new(GrantThenRefuse {
+            inner: the_fixtures_authority(&fx),
+            clock: fx.wf_clock.clone(),
+            asked: AtomicUsize::new(0),
+            then_advance: 10,
+        }),
+        Arc::new(SlowTool {
+            clock: fx.wf_clock.clone(),
+            advance: LEASE_MS - 5,
+        }),
+    );
+    fx.expire_lease();
+    fx.settle().await;
+
+    let pass = one.pump_run(&run_scope()).await.expect("the pass runs");
+
+    assert_eq!(pass.claimed, 2, "both calls are claimed in one batch");
+    assert_eq!((pass.invoked, pass.lapsed), (1, 0));
+    assert_eq!(effect_failed(&fx).await.0, "tool-revoked");
+}
+
+/// An authority that answers as the fixture's own authority would, and
+/// whose `hold_on`th answer (counting from one) comes after the lease: it
+/// moves the clock past the lease, signals `held` and waits for `release`
+/// before giving it.
+struct LateAnswer {
+    inner: Arc<dyn AgentDispatchAuthority>,
+    clock: SharedAtomicWorkflowClock,
+    hold_on: usize,
+    asked: AtomicUsize,
+    hand_off: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+}
+
+impl AgentDispatchAuthority for LateAnswer {
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        Box::pin(async move {
+            let decision = self.inner.authorize(scope, run, intent, attempt, now).await;
+            if self.asked.fetch_add(1, Ordering::SeqCst) + 1 == self.hold_on {
+                self.clock.advance(LEASE_MS + 1);
+                let hand_off = self.hand_off.lock().expect("the lock holds").take();
+                if let Some((held, release)) = hand_off {
+                    let _ = held.send(());
+                    let _ = release.await;
+                }
+            }
+            decision
+        })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentToolResponseDecision> {
+        self.inner
+            .review_tool_response(scope, intent, tool, content)
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentModelResponseDecision> {
+        self.inner.review_model_response(scope, intent, turn)
+    }
+}
+
+/// A reconciler that answers "not executed", signalling `asked` and waiting
+/// for `answer` first.
+struct HandingOffReconciler {
+    answers: ScriptedReconciler,
+    hand_off: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+}
+
+impl AgentEffectReconciler for HandingOffReconciler {
+    fn reconcile<'a>(
+        &'a self,
+        protocol: &'a AgentReconciliationProtocolRef,
+        scope: &'a AgentRunScope,
+        effect: &'a AgentRunEffect,
+    ) -> AgentDispatchFuture<'a, AgentReconciliationFinding> {
+        Box::pin(async move {
+            let hand_off = self.hand_off.lock().expect("the lock holds").take();
+            if let Some((asked, answer)) = hand_off {
+                let _ = asked.send(());
+                let _ = answer.await;
+            }
+            self.answers.reconcile(protocol, scope, effect).await
+        })
+    }
+}
+
+/// A refusal after `Started` is told on a lapsed lease, and the claim that
+/// asked the reconciler meanwhile parks nothing. This is the author's call,
+/// not the owner's ruling: `credential-resolver-missing` is not asked
+/// whether the lease is current.
+///
+/// A reconcileable call with a credential binding fails its first attempt.
+/// Worker one, which has no resolver wired, is told "not executed", and the
+/// authority's grant for its retry comes after the lease. Worker two claims
+/// the ticket and asks its reconciler; meanwhile worker one writes `Started`
+/// and is refused for its missing resolver, tells the run and cancels the
+/// row. Worker two, told "not executed", reads the row again, finds it
+/// cancelled and the call resolved, and settles its ticket.
+#[tokio::test]
+async fn a_missing_resolver_refusal_on_a_lapsed_lease_is_told_and_parks_nothing_beside_it() {
+    let spec = reconcileable(3).with_credential_binding(
+        AgentCredentialBindingRef::new("payments").expect("the binding ref is valid"),
+    );
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &spec),
+        None,
+    )
+    .with_credential_resolver("token")
+    .with_reconciler(Arc::new(
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted),
+    ));
+    let (fx, _) = a_first_attempt_that_failed(fx).await;
+    let (held, lapsed) = oneshot::channel();
+    let (release_one, granted) = oneshot::channel();
+    // Worker one's first question is the one asked before the reconciler
+    // (issue #195); its second is its retry's.
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        Arc::new(LateAnswer {
+            inner: the_fixtures_authority(&fx),
+            clock: fx.wf_clock.clone(),
+            hold_on: 2,
+            asked: AtomicUsize::new(0),
+            hand_off: Mutex::new(Some((held, granted))),
+        }),
+        Arc::new(fx.tools.clone()),
+    )
+    .with_reconciler(Arc::new(
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted),
+    ));
+    let (asked, two_asked) = oneshot::channel();
+    let (release_two, answer) = oneshot::channel();
+    let mut two = worker(
+        &fx,
+        "worker-two",
+        the_fixtures_authority(&fx),
+        Arc::new(fx.tools.clone()),
+    )
+    .with_credential_resolver(Arc::new(ScriptedCredentialResolver::new("token")))
+    .with_reconciler(Arc::new(HandingOffReconciler {
+        answers: ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted),
+        hand_off: Mutex::new(Some((asked, answer))),
+    }));
+    let (one_done, one_ended) = oneshot::channel::<()>();
+
+    fx.expire_lease();
+    fx.settle().await;
+    let (one_pass, two_pass, ()) = tokio::join!(
+        async {
+            let pass = one.pump_run(&run_scope()).await;
+            let _ = one_done.send(());
+            pass
+        },
+        async {
+            let _ = lapsed.await;
+            two.pump_run(&run_scope()).await
+        },
+        async {
+            let _ = two_asked.await;
+            let _ = release_one.send(());
+            let _ = one_ended.await;
+            let _ = release_two.send(());
+        }
+    );
+
+    assert_eq!(
+        one_pass.map_err(|error| error.code().to_string()).err(),
+        Some("claim-fenced".to_string()),
+        "worker one told the run, then met its fence at the cancel"
+    );
+    assert_eq!(
+        effect_failed(&fx).await,
+        ("credential-resolver-missing".to_string(), Some(2), Some(3))
+    );
+    let two_pass = two_pass.expect("worker two's pass runs");
+    assert_eq!((two_pass.invoked, two_pass.parked_indeterminate), (0, 0));
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
 }
