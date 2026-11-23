@@ -2177,3 +2177,79 @@ async fn a_claims_own_unknown_attempt_answered_after_the_lease_is_counted_once()
     );
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
 }
+
+/// A claim's own last attempt, found "not executed" after the lease, fails
+/// the run under the lost worker's code. A budget of one: worker one's call
+/// ends with an unknown outcome (`upstream-timeout`), and its reconciler
+/// answers after the lease, so worker one writes nothing and the row still
+/// marks the attempt `Dispatching`. Worker two recovers the row as an
+/// attempt whose worker was lost, is told "not executed", and with no
+/// budget left settles it: the run fails under
+/// `dispatcher-lost-after-started`. Answered inside the lease, the run
+/// fails under the tool's own code. Before issue #212 worker one settled
+/// the row under its lapsed lease (issue #171's exception), with that code.
+/// Every earlier attempt whose claim ran out of lease has been burned under
+/// the lost worker's code since issue #171.
+#[tokio::test]
+async fn a_claims_own_last_attempt_found_not_executed_after_the_lease_fails_under_the_lost_worker_code(
+) {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &reconcileable(1)),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+    let tool = UnknownTool::default();
+    let not_executed =
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted);
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        the_fixtures_authority(&fx),
+        Arc::new(tool.clone()),
+    )
+    .with_reconciler(Arc::new(late_reconciler(&fx, &not_executed)));
+    fx.expire_lease();
+    fx.settle().await;
+
+    let first = one
+        .pump_run(&run_scope())
+        .await
+        .expect("worker one's pass runs");
+
+    assert_eq!((first.invoked, first.lapsed), (1, 1));
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (OutboxStatus::Dispatching, 0)
+    );
+    let mut two = worker(
+        &fx,
+        "worker-two",
+        the_fixtures_authority(&fx),
+        Arc::new(tool.clone()),
+    )
+    .with_reconciler(Arc::new(not_executed.clone()));
+    fx.expire_lease();
+    fx.settle().await;
+    let second = two
+        .pump_run(&run_scope())
+        .await
+        .expect("worker two's pass runs");
+    assert_eq!((second.invoked, second.delivered), (0, 1));
+    fx.pump().await;
+    assert_eq!(
+        effect_failed(&fx).await,
+        (
+            "dispatcher-lost-after-started".to_string(),
+            Some(1),
+            Some(1)
+        )
+    );
+    assert_eq!(
+        (tool.calls.load(Ordering::SeqCst), not_executed.queries()),
+        (1, 2)
+    );
+}

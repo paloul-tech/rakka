@@ -2328,10 +2328,14 @@ pub struct AgentDispatchPass {
     /// counted here. They are in [`Self::claimed`] and in nothing else.
     ///
     /// Two more are counted with the second kind and end their batch the
-    /// same way (issues #195 and #212). One is a claim whose lease lapsed
-    /// while the reconciler answered: whatever the finding, it is not acted
-    /// on, no attempt is made, burned or delivered, nothing is parked, and
-    /// the claim that follows asks again. The other follows a finding of
+    /// same way (issues #195 and #212). One is a claim whose lease had
+    /// lapsed by the time the reconciler answered, during the answer or
+    /// during the claim's own call before it: whatever the finding, it is
+    /// not acted on, no attempt is made, burned or delivered, nothing is
+    /// parked, and the claim that follows asks again. A value that stays
+    /// above zero can say the reconciler answers slower than the lease: its
+    /// findings are then never acted on, and the call waits, asked once by
+    /// each claim. The other follows a finding of
     /// "not executed" about a failed attempt an earlier claim made, before
     /// the attempt that would follow, which is the claim's first. It reads
     /// the ticket's row again: a row still unfinished and no longer

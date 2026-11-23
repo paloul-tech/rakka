@@ -1094,7 +1094,7 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   **What a deployment sees.**
   - A late `Unknown` records no failure over another worker's call and parks nothing, so the run completes on that worker's call. With no other worker, the next claim asks again and burns the attempt once.
   - A late `Executed` is delivered by the next claim, after one more question.
-  - A late "not executed" with no budget left is settled `Exhausted` by the next claim, after one more question.
+  - A late "not executed" with no budget left is settled `Exhausted` by the next claim, after one more question. Where the late answer was about the claim's own attempt (its call ended with an unknown outcome), the late claim writes nothing, so the next claim finds the row as a lost worker leaves it. The run then fails under `dispatcher-lost-after-started`, where it failed under the attempt's own code (`upstream-timeout`, say). Every earlier attempt whose claim ran out of lease has been burned under that code since issue #171.
   - On a winding-down run, the next claim parks or cancels the call.
   - `pump_run` returns a report with one lapsed claim, where these passes returned a `claim-fenced` error.
   - After a late authority error, the reconciler is still asked once on the lapsed lease, and its answer is not acted on.

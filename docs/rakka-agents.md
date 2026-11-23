@@ -406,7 +406,11 @@ is still working on it, and from being run by two:
     failure over another worker's call and parks no call that succeeded;
   - a late `Executed` is not delivered;
   - a late "not executed" makes no attempt. With no budget left, the claim
-    that follows settles it;
+    that follows settles it. Where the late answer was about the claim's
+    own attempt, that claim finds the row as a lost worker leaves it, and
+    the run fails under `dispatcher-lost-after-started` rather than the
+    attempt's own code, as every earlier attempt whose claim ran out of
+    lease has been burned since issue #171;
   - on a winding-down run, a late finding neither cancels nor parks.
 
   An attempt the claim asked about stays as the ticket's row holds it, and

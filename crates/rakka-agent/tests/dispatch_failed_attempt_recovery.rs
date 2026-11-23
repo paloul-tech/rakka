@@ -1576,3 +1576,40 @@ async fn a_late_unknown_finding_on_a_winding_down_run_parks_nothing() {
         AgentRunEffectStatus::Indeterminate
     );
 }
+
+/// A late "not executed" on a winding-down run cancels nothing. The call's
+/// first attempt failed, and the run is then cancelled. The next claim's
+/// reconciler finds the call not executed after its lease: the claim ends
+/// out of lease and cancels nothing. The claim after it asks again and
+/// cancels the call. The late claim used to cancel it under the lapsed
+/// lease and end its pass in `claim-fenced`.
+#[tokio::test]
+async fn a_late_not_executed_on_a_winding_down_run_cancels_nothing() {
+    let answers = not_executed();
+    let fx = a_call_whose_first_finding_comes_late(3, &answers).await;
+    claim_round(&fx).await;
+    assert_eq!(tool_row(&fx).await, (Failed, 1));
+    cancel_the_run(&fx).await;
+
+    let late = the_late_claim(&fx).await;
+
+    assert_eq!((late.lapsed, late.cancelled, late.delivered), (1, 0, 0));
+    assert_eq!(tool_row(&fx).await, (Failed, 1), "nothing was cancelled");
+    assert_ne!(
+        fx.effect_at(1)
+            .await
+            .expect("the run holds the tool call")
+            .status,
+        AgentRunEffectStatus::Cancelled
+    );
+    let next = claim_round(&fx).await;
+    assert_eq!((next.cancelled, answers.queries()), (1, 2));
+    assert_eq!(
+        fx.effect_at(1)
+            .await
+            .expect("the run holds the tool call")
+            .status,
+        AgentRunEffectStatus::Cancelled
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
