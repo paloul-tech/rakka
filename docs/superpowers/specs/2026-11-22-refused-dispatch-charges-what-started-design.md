@@ -146,8 +146,7 @@ policy conflict met after it; so does the turned-around #195 test.
   idempotent `Failed` row as never started. A worker that crashes right
   after that count reaches the same end today, and no placement of the
   lease check prevents it: the root is the fence's reading of a failed
-  idempotent row. A follow-up issue is drafted in
-  `tmp/2026-11-22-issue-196-review-probes/`.
+  idempotent row. Filed as #206.
 - A grant that comes after the lease lapsed still leads to an attempt
   beside another worker's (second review, probe p8). That is the older
   limitation in `docs/rakka-agents.md` ("a worker that stalls past its lease
@@ -244,7 +243,7 @@ review's). It confirmed that every refusal before `Started` goes through
 
 | # | Finding | Answer |
 |---|---|---|
-| F-G | A lost idempotent attempt, a late refusal and a cancellation end the call with no reconciliation (probe p7). | "Not done" (§6), with a drafted follow-up: the root is older than this change. |
+| F-G | A lost idempotent attempt, a late refusal and a cancellation end the call with no reconciliation (probe p7). | "Not done" (§6), filed as #206: the root is older than this change. |
 | F-A | §7 said the missing resolver's unchecked window is one write; it runs from a late grant (probes p1, p1b: through that site a call another worker had out is lost when the workers differ in whether a resolver is wired). | §7 corrected; the call stays the author's, for the owner. |
 | F-C | No test held "or parked": checking only non-idempotent refusals passed every test. | A test: an idempotent retry refused after the lease lapsed parks nothing. |
 | F-D | The declared survivor can be reached with `CrashingStateStore::before_next_load`. | A test: a policy conflict met after the lease lapsed is not delivered. |
@@ -266,4 +265,5 @@ The reviewer also offered an option for the owner: a lease check right after
 the authority answers, grants included. It would close late grants (probe
 p8) and the missing-resolver window along with refusals, and leave no
 `Dispatching` row behind; it would also stop a granting authority slower
-than the lease from ever making an attempt. Not built.
+than the lease from ever making an attempt. Not built; filed as #207 at the
+owner's request.
