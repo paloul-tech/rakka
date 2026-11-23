@@ -577,3 +577,169 @@ async fn a_delegation_send_with_a_failed_attempt_waits_for_its_decision_and_then
     );
     assert!(cancel_sent, "the run sends the child its cancel");
 }
+
+// ---------------------------------------------------------------------------
+// A cancelled row the claim's fence did not write, read by a claim or by the
+// per-run sweep.
+// ---------------------------------------------------------------------------
+
+/// A tool that always fails with a failure a retry may clear, and counts its
+/// calls.
+#[derive(Default)]
+struct CountingRetryable {
+    calls: AtomicUsize,
+}
+
+impl rakka_agent::AgentDispatchToolExecutor for CountingRetryable {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Err(AgentDispatchError::collaborator(
+                "upstream-unavailable",
+                "try again later",
+            ))
+        })
+    }
+}
+
+/// An idempotent three-attempt call whose first attempt ran and failed: the
+/// row is `Failed` and counts one attempt, and the run was told of none. The
+/// run is then cancelled, before anything claims the retry.
+async fn a_failed_attempt_then_a_cancel() -> (AuthorityFixture, Arc<CountingRetryable>) {
+    let tool = Arc::new(CountingRetryable::default());
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(
+            TOOL,
+            &AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+        ),
+        None,
+    )
+    .with_tool_executor(tool.clone());
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let pass = fx.one_pass().await;
+    assert_eq!((pass.invoked, pass.failed_attempts), (1, 1));
+    assert_eq!(tool_row(&fx).await, (OutboxStatus::Failed, 1));
+    cancel_the_run(&fx).await;
+    (fx, tool)
+}
+
+/// Cancels the ticket's row alone, as a fence before issue #206 did first,
+/// and leaves its fleet entry as it is: what that fence left when its worker
+/// was lost before its fleet write and its delivery.
+async fn cancel_the_row_as_an_earlier_fence_did(fx: &AuthorityFixture) {
+    let effect = fx.effect_at(1).await.expect("the run holds its tool call");
+    let mut inbox = rakka_agent_workflow::AgentRunInbox::with_clock(
+        rakka_agent::workflow_run_id(&run_scope()),
+        fx.workflow_store.clone(),
+        fx.wf_clock.clone(),
+    );
+    inbox.recover().await.expect("the inbox recovers");
+    inbox
+        .inner_mut()
+        .record_outbox_cancelled(
+            &rakka_agent_workflow::substrate::OutboxMessageId::new(
+                effect.dispatch_ticket_id().as_str(),
+            ),
+            "run-cancelled",
+        )
+        .await
+        .expect("the row is cancelled");
+    assert_eq!(tool_row(fx).await, (OutboxStatus::Cancelled, 1));
+}
+
+/// The run's record of the call once it is parked, and the run waiting.
+async fn assert_the_call_is_parked(fx: &AuthorityFixture, tool: &CountingRetryable) {
+    assert_eq!(
+        tool_call(fx).await,
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some(PARK_CODE.to_string()),
+            1
+        ),
+        "the call is parked, charged the attempt the row counts"
+    );
+    assert_eq!(
+        run_status(fx).await,
+        Some(AgentRunStatus::WaitingForReconciliation)
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1, "the retry never ran");
+}
+
+/// A deployment cancels the run's dispatches through the workflow tier
+/// (`AgentDispatcherWorker::cancel_run_dispatches`), which cancels the rows
+/// of the entries no worker holds and finishes those entries. The per-run
+/// sweep then tells the winding-down run about the cancelled row. It used to
+/// tell it `Cancelled`, as though the call had never started.
+#[tokio::test]
+async fn the_fleets_own_cancellation_of_a_failed_call_parks_it() {
+    let (fx, tool) = a_failed_attempt_then_a_cancel().await;
+    let mut canceller = rakka_agent_workflow::AgentDispatcherWorker::with_clock_and_metrics(
+        AgentDispatcherWorkerId::new("fleet-canceller"),
+        fx.fleet_store.clone(),
+        fx.workflow_store.clone(),
+        AgentDispatcherFleetSettings::new(16, LEASE_MS),
+        fx.wf_clock.clone(),
+        Arc::new(rakka_core::NoopMetricsRecorder),
+    );
+    let cancellation = canceller
+        .cancel_run_dispatches(&rakka_agent::workflow_run_id(&run_scope()))
+        .await
+        .expect("the fleet cancels the run's dispatches");
+    assert_eq!(cancellation.cancelled_entries, 1);
+    assert_eq!(tool_row(&fx).await, (OutboxStatus::Cancelled, 1));
+
+    let pass = fx.one_pass().await;
+
+    assert_eq!(
+        (pass.parked_indeterminate, pass.cancelled),
+        (1, 0),
+        "the sweep parks the call, and has no ticket of its own to settle"
+    );
+    assert_the_call_is_parked(&fx, &tool).await;
+}
+
+/// A fence before issue #206 cancelled the row and was lost before it wrote
+/// the fleet entry or told the run. The claim that next takes the ticket
+/// finds the cancelled row, and parks the call from it.
+#[tokio::test]
+async fn an_earlier_builds_cancelled_row_is_parked_by_the_claim() {
+    let (fx, tool) = a_failed_attempt_then_a_cancel().await;
+    cancel_the_row_as_an_earlier_fence_did(&fx).await;
+    fx.expire_lease();
+
+    // The claim alone: the per-run half would answer first.
+    let pass = fx
+        .pipeline()
+        .claim_and_execute()
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(
+        (pass.claimed, pass.parked_indeterminate, pass.cancelled),
+        (1, 1, 1),
+        "the claim settles the ticket to follow the row, and parks the call"
+    );
+    assert_the_call_is_parked(&fx, &tool).await;
+}
+
+/// The same row, reached by the per-run half of a pass: the sweep reads the
+/// cancelled row first, and parks the call from it.
+#[tokio::test]
+async fn an_earlier_builds_cancelled_row_is_parked_by_the_sweep() {
+    let (fx, tool) = a_failed_attempt_then_a_cancel().await;
+    cancel_the_row_as_an_earlier_fence_did(&fx).await;
+    fx.expire_lease();
+
+    let pass = fx.one_pass().await;
+
+    assert_eq!(pass.parked_indeterminate, 1);
+    assert_the_call_is_parked(&fx, &tool).await;
+}

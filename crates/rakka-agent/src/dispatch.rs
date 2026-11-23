@@ -486,8 +486,9 @@ struct OwedOutcome<'a> {
 /// What a finished outbox row says of an effect its run still waits on
 /// ([`owed_by_finished_row`]).
 enum RowVerdict {
-    /// The ticket was cancelled before any attempt could start, under a
-    /// wind-down that fences it: the run is told `Cancelled`.
+    /// The ticket was cancelled before its next attempt could start, under a
+    /// wind-down that fences it, and no attempt it made can have reached
+    /// anything consequential: the run is told `Cancelled`.
     NeverStarted,
     /// The budget was spent on failures: the run is told `Exhausted`.
     Exhausted {
@@ -516,7 +517,8 @@ enum RowVerdict {
 /// | The row | The run is owed |
 /// |---|---|
 /// | `Exhausted` | what the row's last failure line says the lost worker was about to deliver ([`owed_by_exhausted_row`]), with the row's attempt count |
-/// | `Cancelled`, and `fence_applies` | `Cancelled`: the wind-down fence's own answer for a ticket that never started |
+/// | `Cancelled`, and `fence_applies`, of a call an attempt of which may have reached the target ([`earlier_attempt_may_have_executed`]) | `Indeterminate` under `run-cancelled-after-attempt`, with the row's attempt count: what the fence answers such a call (issue #206) |
+/// | `Cancelled`, and `fence_applies`, otherwise | `Cancelled`: the wind-down fence's own answer for a ticket whose next attempt never started |
 /// | `Cancelled` otherwise | `Indeterminate`: the ticket was ended, and nothing says with what |
 /// | `Dispatched` | `Indeterminate`: the call succeeded, and its result reached nobody |
 ///
@@ -540,8 +542,23 @@ fn owed_by_finished_row(
             (verdict, counted)
         }
         // The fence cancels a ticket whose next attempt never started, so
-        // the attempts made are the ones the row counts (issue #182).
-        OutboxStatus::Cancelled if fence_applies => (RowVerdict::NeverStarted, counted),
+        // the attempts made are the ones the row counts (issue #182). Since
+        // issue #206 it parks a call an attempt of which may have reached
+        // the target, and cancels its row only once the run is told. A
+        // cancelled row of such a call with the run untold was written by a
+        // fence before that, or by the workflow tier's own cancellation
+        // (`AgentDispatcherWorker::cancel_run_dispatches`), and is read as
+        // the fence now answers it.
+        OutboxStatus::Cancelled if fence_applies => {
+            let verdict = if earlier_attempt_may_have_executed(intent, counted) {
+                RowVerdict::Unknown {
+                    code: RUN_CANCELLED_AFTER_ATTEMPT,
+                }
+            } else {
+                RowVerdict::NeverStarted
+            };
+            (verdict, counted)
+        }
         _ => (
             RowVerdict::Unknown {
                 code: TICKET_ROW_SETTLED,
@@ -3279,7 +3296,10 @@ where
     ///
     /// A row cancelled under a wind-down that fences the ticket keeps the
     /// two steps it always had: the ticket is settled as cancelled at both
-    /// layers, and the run is told `Cancelled`.
+    /// layers, and the run is told `Cancelled`. Not a cancelled row of an
+    /// idempotent call that counts an attempt: that call may have reached
+    /// its target, and is parked from the row as any other unknown outcome
+    /// is (issue #206).
     async fn conclude_on_untold_row(
         &mut self,
         scope: &AgentRunScope,
@@ -6341,7 +6361,7 @@ where
     /// |---|---|---|
     /// | live | finished | the row is cancelled and the effect parked `ticket-row-missing` |
     /// | live | anything else | nothing |
-    /// | `Cancelled`, and the wind-down fences the effect | none, or one that does not rule out a ticket that never started | the run is told `Cancelled` |
+    /// | `Cancelled`, and the wind-down fences the effect | none, or one that does not rule out a ticket that never started | the run is told `Cancelled`, or the effect is parked `run-cancelled-after-attempt` when an attempt of it may have reached the target |
     /// | finished | a worker holds or can claim it | nothing |
     /// | finished | finished, or fenced by a cancellation request, for a lease | the run is told what the row says |
     /// | finished | none, and the row finished a lease ago | the same |
@@ -6393,6 +6413,12 @@ where
     ///   under `ticket-row-missing`, `ticket-row-settled` or
     ///   `indeterminate`, is a ticket whose history is not "never started",
     ///   and its cancelled row is read as any other finished row is.
+    ///   Otherwise the run is told what the claim's replay of the fence
+    ///   tells it ([`owed_by_finished_row`]): `Cancelled`, or, for an
+    ///   idempotent call whose row counts an attempt, a park under
+    ///   `run-cancelled-after-attempt` (issue #206). A row the workflow
+    ///   tier's own cancellation wrote (`cancel_run_dispatches`) is read the
+    ///   same way.
     ///
     /// The compensation and workflow-cancel the wind-down itself authorized,
     /// and the promotion or claim append that copies work already recorded,
@@ -6520,18 +6546,12 @@ where
                     // the count the claim's replay reads from it. The run's
                     // own count knows only what it was told, and a failed
                     // attempt that was retried was never told (issue #182).
-                    let (_, attempt) = owed_by_finished_row(&row, &intent, true);
-                    self.deliver_outcome(
-                        scope,
-                        &intent,
-                        attempt,
-                        0,
-                        AgentRunEffectOutcome::Cancelled {
-                            reason: "run-cancelled".to_string(),
-                        },
-                        pass,
-                    )
-                    .await?;
+                    // The answer is the claim's replay's too: `Cancelled`, or
+                    // a park for a call an attempt of which may have reached
+                    // the target (issue #206).
+                    let (verdict, attempt) = owed_by_finished_row(&row, &intent, true);
+                    self.tell_owed(scope, &intent, attempt, 0, verdict, pass)
+                        .await?;
                 }
                 (Some(row), entry) => {
                     let (settled_at, fence) = match entry {
