@@ -2913,8 +2913,9 @@ impl AuthorityFixture {
 
     /// Wires a dispatch-time credential resolver, so an intent that carries a
     /// credential binding can reach its target at all. Without one the
-    /// pipeline refuses `credential-resolver-missing` before any grant check,
-    /// which is correct but hides every later gate.
+    /// pipeline refuses `credential-resolver-missing` once the grant is
+    /// checked and the attempt's `Started` is written, which is correct but
+    /// hides every later gate.
     pub fn with_credential_resolver(mut self, token: &str) -> Self {
         self.credentials = Some(Arc::new(ScriptedCredentialResolver::new(token)));
         self

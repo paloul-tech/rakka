@@ -16,7 +16,9 @@
 //! - it reads the row and the run again, and makes no attempt when another
 //!   worker has moved the row; a row that worker finished is settled
 //!   against the run as it now stands;
-//! - a park made at once names and links the attempt that failed.
+//! - a park made at once names and links the attempt that failed;
+//! - a refusal whose authority answered once the lease had lapsed is left
+//!   to the worker that holds the ticket (issue #196).
 //!
 //! `effect_dispatch.rs` holds the rest of the issue's cases.
 
@@ -1114,16 +1116,25 @@ async fn a_suspension_during_the_question_is_honoured_by_the_attempts_own_questi
     assert_eq!(tool_row(&fx).await, (Failed, 1));
 }
 
-/// A row another worker finished, after it had told the run, is not parked
-/// by a claim that read it again. Worker one is told "not executed" about a
-/// failed call and its lease lapses while the authority answers for the
-/// retry. Worker two claims the ticket, and while its reconciler answers,
-/// worker one makes the retry: it tells the run, then finishes the row.
-/// Worker two, told "not executed" under a current lease, reads the row again
-/// and the run with it, finds the call resolved, and settles its ticket; it
-/// used to read the finished row against the run as it read it before the
-/// question, and parked the call as unknown.
-async fn a_row_finished_after_the_run_was_told(refusal: Option<AgentAuthorityRefusal>) {
+/// What [`worker_one_retries_on_a_lapsed_lease_while_worker_two_asks`]
+/// leaves: each worker's pass, and the fixture, tool and segments they
+/// shared.
+struct Race {
+    one: rakka_agent::AgentDispatchResult<AgentDispatchPass>,
+    two: AgentDispatchPass,
+    fx: AuthorityFixture,
+    tool: FlakyTool,
+    segments: Arc<InMemoryAgentSegmentSink>,
+}
+
+/// Worker one is told "not executed" about a failed call, and its lease
+/// lapses while the authority answers for the retry: with a grant when
+/// `refusal` is `None`, else with `refusal`. Worker two claims the ticket,
+/// and worker one goes on while worker two's reconciler answers it, which
+/// it does once worker one's pass is over.
+async fn worker_one_retries_on_a_lapsed_lease_while_worker_two_asks(
+    refusal: Option<AgentAuthorityRefusal>,
+) -> Race {
     let fx = a_reconcileable_call_out().await;
     let tool = FlakyTool::failing_first(1);
     let segments = Arc::new(InMemoryAgentSegmentSink::new());
@@ -1178,7 +1189,7 @@ async fn a_row_finished_after_the_run_was_told(refusal: Option<AgentAuthorityRef
 
     fx.expire_lease();
     fx.settle().await;
-    let (_one, two, ()) = tokio::join!(
+    let (one, two, ()) = tokio::join!(
         async {
             let pass = one.pump_run(&run_scope()).await;
             let _ = one_done_tx.send(());
@@ -1196,7 +1207,27 @@ async fn a_row_finished_after_the_run_was_told(refusal: Option<AgentAuthorityRef
         }
     );
 
-    let two = two.expect("worker two's pass runs");
+    Race {
+        one,
+        two: two.expect("worker two's pass runs"),
+        fx,
+        tool,
+        segments,
+    }
+}
+
+/// A row another worker finished, after it had told the run, is not parked
+/// by a claim that read it again. In the race above, worker one's grant
+/// lets it make the retry: it tells the run, then finishes the row. Worker
+/// two, told "not executed" under a current lease, reads the row again and
+/// the run with it, finds the call resolved, and settles its ticket; it
+/// used to read the finished row against the run as it read it before the
+/// question, and parked the call as unknown.
+#[tokio::test]
+async fn a_row_another_worker_finished_with_a_success_it_delivered_is_not_parked() {
+    let Race {
+        two, fx, segments, ..
+    } = worker_one_retries_on_a_lapsed_lease_while_worker_two_asks(None).await;
     assert_eq!(
         (two.invoked, two.parked_indeterminate),
         (0, 0),
@@ -1225,16 +1256,37 @@ async fn a_row_finished_after_the_run_was_told(refusal: Option<AgentAuthorityRef
     );
 }
 
+/// A refusal on a lapsed lease leaves the retry to the worker that holds the
+/// ticket (issue #196). In the race above, worker one's authority refuses
+/// the retry, in an answer that came after its lease lapsed. Worker one
+/// tells the run nothing and writes nothing to the row. Worker two, told
+/// "not executed" under a current lease, finds the row where it read it and
+/// makes the retry, which succeeds. The refusal used to fail the run and
+/// cancel the row, and worker two then settled its ticket against them.
 #[tokio::test]
-async fn a_row_another_worker_finished_with_a_success_it_delivered_is_not_parked() {
-    a_row_finished_after_the_run_was_told(None).await;
-}
-
-#[tokio::test]
-async fn a_row_another_worker_cancelled_after_a_refusal_it_delivered_is_not_parked() {
-    a_row_finished_after_the_run_was_told(Some(AgentAuthorityRefusal::of(
-        "tool-revoked",
-        "the tool was revoked",
-    )))
+async fn a_refusal_on_a_lapsed_lease_leaves_the_retry_to_the_worker_that_holds_the_ticket() {
+    let Race {
+        one, two, fx, tool, ..
+    } = worker_one_retries_on_a_lapsed_lease_while_worker_two_asks(Some(
+        AgentAuthorityRefusal::of("tool-revoked", "the tool was revoked"),
+    ))
     .await;
+
+    let one = one.expect("worker one's pass runs");
+    assert_eq!(
+        (one.lapsed, one.delivered, one.cancelled),
+        (1, 0, 0),
+        "worker one ends out of lease and writes nothing"
+    );
+    assert_eq!(
+        (two.invoked, two.delivered, two.parked_indeterminate),
+        (1, 1, 0)
+    );
+    assert_eq!(tool.calls(), 2, "the failed call, then worker two's retry");
+    fx.pump().await;
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::Completed,
+        "the run completes on worker two's retry"
+    );
 }
