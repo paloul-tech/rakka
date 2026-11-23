@@ -89,7 +89,8 @@
 //! ([specification 8.7](../../../docs/plans/rakka-agent/spec.md); scenario 57).
 //! So does an idempotent effect with an attempt already started, which the
 //! fence parks rather than cancels: that attempt may have reached the target
-//! (issue #206).
+//! (issue #206). A model call or a goal evaluation acts on nothing outside the
+//! run and is cancelled whatever its class.
 //!
 //! Everything the pipeline does is idempotent: outbox rows deduplicate on the
 //! generation's dispatch ticket id, fleet transitions are fenced by the claim
@@ -200,9 +201,47 @@ const PARKED_INDETERMINATE: &str = "indeterminate";
 /// One predicate for the two places that ask it, so they cannot drift: a
 /// refusal of an idempotent retry parks instead of failing the call
 /// (`possibly_executed` in [`AgentRunEffectDispatcher::attempt_invocation`]),
-/// and the wind-down fence parks instead of cancelling it (issue #206).
+/// and the wind-down fence parks instead of cancelling it
+/// ([`the_wind_down_parks`], issue #206).
 fn earlier_attempt_may_have_executed(intent: &AgentRunEffect, started: u32) -> bool {
     intent.safety.class() == AgentEffectSafetyClass::Idempotent && started > 0
+}
+
+/// Whether the wind-down fence parks `intent` rather than cancelling it,
+/// given that `started` of its attempts have started: an attempt may have
+/// reached the target ([`earlier_attempt_may_have_executed`]), and reaching
+/// it may have acted on something outside the run
+/// ([`produces_only_its_result`]).
+///
+/// A model call or a goal evaluation a deployment raised to `Idempotent` is
+/// cancelled as a read-only call is: the cancelled run throws its result
+/// away, and a person asked whether a completion "executed" has nothing to
+/// decide. A refusal of its retry still parks it, as before issue #206.
+fn the_wind_down_parks(intent: &AgentRunEffect, started: u32) -> bool {
+    earlier_attempt_may_have_executed(intent, started) && !produces_only_its_result(intent.kind())
+}
+
+/// Whether an effect of `kind` produces nothing but its result: a model call
+/// a turn, a goal evaluation a verdict. Nothing outside the run is acted on,
+/// so a winding-down run that throws the result away abandons nothing
+/// consequential. Every other kind acts outside the run: a tool, a send, a
+/// workflow start or cancel, a compensation, a memory promotion or a claim
+/// append.
+///
+/// The match names every kind, so a new kind is decided here when it is
+/// added.
+const fn produces_only_its_result(kind: crate::effect::AgentRunEffectKind) -> bool {
+    use crate::effect::AgentRunEffectKind as Kind;
+    match kind {
+        Kind::ModelCall | Kind::GoalEvaluationCall => true,
+        Kind::ToolCall
+        | Kind::CompensationCall
+        | Kind::MemoryPromotionCall
+        | Kind::A2aSendCall
+        | Kind::WorkflowStartCall
+        | Kind::WorkflowCancelCall
+        | Kind::ClaimAppendCall => false,
+    }
 }
 
 /// The detail carried by the `Indeterminate` outcome of an effect whose
@@ -517,7 +556,7 @@ enum RowVerdict {
 /// | The row | The run is owed |
 /// |---|---|
 /// | `Exhausted` | what the row's last failure line says the lost worker was about to deliver ([`owed_by_exhausted_row`]), with the row's attempt count |
-/// | `Cancelled`, and `fence_applies`, of a call an attempt of which may have reached the target ([`earlier_attempt_may_have_executed`]) | `Indeterminate` under `run-cancelled-after-attempt`, with the row's attempt count: what the fence answers such a call (issue #206) |
+/// | `Cancelled`, and `fence_applies`, of a call the fence parks ([`the_wind_down_parks`]) | `Indeterminate` under `run-cancelled-after-attempt`, with the row's attempt count: what the fence answers such a call (issue #206) |
 /// | `Cancelled`, and `fence_applies`, otherwise | `Cancelled`: the wind-down fence's own answer for a ticket whose next attempt never started |
 /// | `Cancelled` otherwise | `Indeterminate`: the ticket was ended, and nothing says with what |
 /// | `Dispatched` | `Indeterminate`: the call succeeded, and its result reached nobody |
@@ -550,7 +589,7 @@ fn owed_by_finished_row(
         // (`AgentDispatcherWorker::cancel_run_dispatches`), and is read as
         // the fence now answers it.
         OutboxStatus::Cancelled if fence_applies => {
-            let verdict = if earlier_attempt_may_have_executed(intent, counted) {
+            let verdict = if the_wind_down_parks(intent, counted) {
                 RowVerdict::Unknown {
                     code: RUN_CANCELLED_AFTER_ATTEMPT,
                 }
@@ -3297,9 +3336,9 @@ where
     /// A row cancelled under a wind-down that fences the ticket keeps the
     /// two steps it always had: the ticket is settled as cancelled at both
     /// layers, and the run is told `Cancelled`. Not a cancelled row of an
-    /// idempotent call that counts an attempt: that call may have reached
-    /// its target, and is parked from the row as any other unknown outcome
-    /// is (issue #206).
+    /// idempotent call that counts an attempt, unless the call is a model
+    /// call or a goal evaluation: that call may have reached its target, and
+    /// is parked from the row as any other unknown outcome is (issue #206).
     async fn conclude_on_untold_row(
         &mut self,
         scope: &AgentRunScope,
@@ -4003,8 +4042,10 @@ where
             // An idempotent call with an attempt started may have reached
             // the target, so it is parked for a reconciliation decision, not
             // cancelled as though it never started: cancelled, it read as
-            // never executed, and nothing asked (issue #206).
-            if earlier_attempt_may_have_executed(&intent, started) {
+            // never executed, and nothing asked (issue #206). Not a model
+            // call or a goal evaluation, which act on nothing outside the
+            // run ([`the_wind_down_parks`]).
+            if the_wind_down_parks(&intent, started) {
                 return self
                     .park_indeterminate(
                         scope,
@@ -6361,7 +6402,7 @@ where
     /// |---|---|---|
     /// | live | finished | the row is cancelled and the effect parked `ticket-row-missing` |
     /// | live | anything else | nothing |
-    /// | `Cancelled`, and the wind-down fences the effect | none, or one that does not rule out a ticket that never started | the run is told `Cancelled`, or the effect is parked `run-cancelled-after-attempt` when an attempt of it may have reached the target |
+    /// | `Cancelled`, and the wind-down fences the effect | none, or one that does not rule out a ticket that never started | the run is told `Cancelled`, or the effect is parked `run-cancelled-after-attempt` where the fence parks it (`the_wind_down_parks`) |
     /// | finished | a worker holds or can claim it | nothing |
     /// | finished | finished, or fenced by a cancellation request, for a lease | the run is told what the row says |
     /// | finished | none, and the row finished a lease ago | the same |
@@ -6415,8 +6456,8 @@ where
     ///   and its cancelled row is read as any other finished row is.
     ///   Otherwise the run is told what the claim's replay of the fence
     ///   tells it ([`owed_by_finished_row`]): `Cancelled`, or, for an
-    ///   idempotent call whose row counts an attempt, a park under
-    ///   `run-cancelled-after-attempt` (issue #206). A row the workflow
+    ///   idempotent call whose row counts an attempt and that acts outside the
+    ///   run, a park under `run-cancelled-after-attempt` (issue #206). A row the workflow
     ///   tier's own cancellation wrote (`cancel_run_dispatches`) is read the
     ///   same way.
     ///
@@ -7244,5 +7285,33 @@ mod owed_outcome {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    /// A model call produces a turn and a goal evaluation a verdict; every
+    /// other kind acts on something outside the run.
+    #[test]
+    fn only_a_model_call_and_a_goal_evaluation_produce_nothing_but_their_result() {
+        use crate::effect::AgentRunEffectKind as Kind;
+        let every_kind = [
+            Kind::ModelCall,
+            Kind::ToolCall,
+            Kind::CompensationCall,
+            Kind::MemoryPromotionCall,
+            Kind::GoalEvaluationCall,
+            Kind::A2aSendCall,
+            Kind::WorkflowStartCall,
+            Kind::WorkflowCancelCall,
+            Kind::ClaimAppendCall,
+        ];
+        let only: Vec<Kind> = every_kind
+            .into_iter()
+            .filter(|kind| produces_only_its_result(*kind))
+            .collect();
+        assert_eq!(only, vec![Kind::ModelCall, Kind::GoalEvaluationCall]);
     }
 }

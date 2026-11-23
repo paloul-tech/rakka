@@ -219,9 +219,10 @@ leaves behind is the same either way.
    started, except an idempotent call with an attempt already made: that
    attempt may have reached its target, so the call parks `Indeterminate`
    under `run-cancelled-after-attempt`, charged the attempts made, and the
-   run waits for the decision (issue #206). An idempotent attempt lost after
-   `Started` that no claim has counted yet is still retried with the same
-   key.
+   run waits for the decision (issue #206). A model call or a goal
+   evaluation is cancelled whatever its class, since it produces only its
+   result. An idempotent attempt lost after `Started` that no claim has
+   counted yet is still retried with the same key.
    Parked runs consume no live task, thread, or timer. When the last
    ambiguous outcome is answered, a run that is still live and not winding
    down leaves `WaitingForReconciliation` for the status of what it rests on

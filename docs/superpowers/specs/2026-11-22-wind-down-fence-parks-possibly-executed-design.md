@@ -163,3 +163,30 @@ site's call to the predicate.
 `docs/rakka-compatibility.md` entry (what changed, what a deployment sees, the
 new stable code), `CHANGELOG.md`, and the `dispatch.rs` module and fence
 comments that say "provably never started".
+
+## 9. The review, and the owner's rulings on it (2026-11-22)
+
+A fresh review of the whole branch (`a5244317..fde7e430`) found no critical
+issue. Each finding below was proved by a probe that failed at `fde7e430`;
+the probes are kept in `tmp/2026-11-22-issue-206-review/`.
+
+- **A model call or goal evaluation a deployment raised to `Idempotent`
+  parked on a cancel.** This branch introduced it. **Owner ruling: cancel
+  them.** The fence asks one more thing than the refusal path:
+  `the_wind_down_parks` is `earlier_attempt_may_have_executed` and not
+  `produces_only_its_result(kind)`. The second is true for `ModelCall` and
+  `GoalEvaluationCall` only, written as an exhaustive match so a new kind is
+  decided when it is added. A refused retry of such a call still parks, as
+  before #206. Call 4 now covers kinds as well as classes.
+- **`cancel_run_dispatches` cancels a row still `Dispatching`.** That is a
+  first attempt lost after `Started`, counting nothing. The run is told
+  `Cancelled`, charged 0, for every safety class. This is older than this
+  branch: `main` does the same. **Owner ruling: file it** — issue #209. Call 5
+  above is narrowed to a row that counts an attempt, and so are the documents.
+- **A crash window parks under `ticket-row-settled`** (minor; deferred). A
+  claim that finds the row cancelled settles the fleet entry from the row
+  (`settle_claim_from_row`) before it tells the run. A claim lost between the
+  two leaves the sweep to park the call from its general arm, under
+  `ticket-row-settled` rather than `run-cancelled-after-attempt`. The outcome
+  is right; only the code differs. A test holds the window, and the
+  compatibility entry says so.

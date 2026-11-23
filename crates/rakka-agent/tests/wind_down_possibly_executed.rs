@@ -743,3 +743,181 @@ async fn an_earlier_builds_cancelled_row_is_parked_by_the_sweep() {
     assert_eq!(pass.parked_indeterminate, 1);
     assert_the_call_is_parked(&fx, &tool).await;
 }
+
+// ---------------------------------------------------------------------------
+// A model call a deployment raised to `Idempotent`: cancelled with its run.
+// ---------------------------------------------------------------------------
+
+/// The run's model call effect.
+async fn model_effect(fx: &AuthorityFixture) -> Option<AgentRunEffect> {
+    let state = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")?;
+    state
+        .loop_state()?
+        .effects()
+        .iter()
+        .find(|effect| effect.kind() == AgentRunEffectKind::ModelCall)
+        .cloned()
+}
+
+/// The model call's outbox row: its status, and the attempts it counts.
+async fn model_row(fx: &AuthorityFixture) -> (OutboxStatus, u32) {
+    let effect = model_effect(fx)
+        .await
+        .expect("the run holds its model call");
+    let row = fx.outbox_row(&effect).await.expect("the ticket has a row");
+    (row.status(), row.attempts().attempts())
+}
+
+/// A run whose model call a deployment raised to `Idempotent` with three
+/// attempts, as `AgentModelRetryPolicy` allows for a provider with an
+/// idempotency key. Its first attempt is lost after `Started`, a claim counts
+/// it and dies before the retry, and the run is then cancelled.
+async fn an_idempotent_model_call_with_a_counted_attempt_then_a_cancel() -> AuthorityFixture {
+    let adapter = DeterministicModelAdapter::new()
+        .with_turn_for(1, proposing_turn("done"))
+        .with_retry_policy(rakka_agent::AgentModelRetryPolicy {
+            safety_class: rakka_agent::AgentEffectSafetyClass::Idempotent,
+            max_attempts: 3,
+        })
+        .expect("the policy is valid");
+    let fx = AuthorityFixture::over(
+        adapter,
+        rakka_agent::AgentToolRegistry::new(),
+        Some(AgentEffectSpec::idempotent(3).expect("the spec is valid")),
+    );
+    fx.start().await;
+    for _ in 0..4 {
+        fx.settle().await;
+        if model_effect(&fx).await.map(|effect| effect.status) == Some(AgentRunEffectStatus::Ready)
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        model_effect(&fx).await.map(|effect| effect.status),
+        Some(AgentRunEffectStatus::Ready),
+        "the model call's ticket is out"
+    );
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    fx.expire_lease();
+    assert!(fx.one_pass().await.died, "the worker dies after Started");
+    fx.probe.arm(AgentDispatchWindow::BeforeStarted);
+    fx.expire_lease();
+    assert!(
+        fx.one_pass().await.died,
+        "the counting claim dies before its retry"
+    );
+    assert_eq!(model_row(&fx).await, (OutboxStatus::Failed, 1));
+    cancel_the_run(&fx).await;
+    fx.expire_lease();
+    fx
+}
+
+/// The model call is cancelled with its run, charged the attempt it made,
+/// and the cancel ends the run.
+async fn assert_the_model_call_is_cancelled(
+    fx: &AuthorityFixture,
+    pass: &rakka_agent::AgentDispatchPass,
+) {
+    let effect = model_effect(fx)
+        .await
+        .expect("the run holds its model call");
+    assert_eq!(
+        (effect.status, effect.attempts, pass.parked_indeterminate),
+        (AgentRunEffectStatus::Cancelled, 1, 0),
+        "the model call is cancelled, charged its attempt, and not parked"
+    );
+    assert_eq!(run_status(fx).await, Some(AgentRunStatus::Cancelled));
+}
+
+/// A completion changes nothing outside the run, and the cancelled run would
+/// throw it away, so the fence cancels a model call whatever its safety
+/// class: an operator is not asked whether a completion "executed". Parked,
+/// the cancel waited on that answer.
+#[tokio::test]
+async fn an_idempotent_model_call_with_a_counted_attempt_is_cancelled_with_its_run() {
+    let fx = an_idempotent_model_call_with_a_counted_attempt_then_a_cancel().await;
+
+    let pass = fx.one_pass().await;
+
+    assert_the_model_call_is_cancelled(&fx, &pass).await;
+}
+
+/// The same model call, its row cancelled by the workflow tier's own
+/// cancellation and read by the per-run sweep: cancelled too.
+#[tokio::test]
+async fn the_fleets_own_cancellation_of_an_idempotent_model_call_cancels_it() {
+    let fx = an_idempotent_model_call_with_a_counted_attempt_then_a_cancel().await;
+    let mut canceller = rakka_agent_workflow::AgentDispatcherWorker::with_clock_and_metrics(
+        AgentDispatcherWorkerId::new("fleet-canceller"),
+        fx.fleet_store.clone(),
+        fx.workflow_store.clone(),
+        AgentDispatcherFleetSettings::new(16, LEASE_MS),
+        fx.wf_clock.clone(),
+        Arc::new(rakka_core::NoopMetricsRecorder),
+    );
+    canceller
+        .cancel_run_dispatches(&rakka_agent::workflow_run_id(&run_scope()))
+        .await
+        .expect("the fleet cancels the run's dispatches");
+    assert_eq!(model_row(&fx).await, (OutboxStatus::Cancelled, 1));
+
+    let pass = fx.one_pass().await;
+
+    assert_the_model_call_is_cancelled(&fx, &pass).await;
+}
+
+/// One crash window parks under another code. A claim that finds the row
+/// cancelled finishes the fleet entry from the row before it tells the run;
+/// lost between the two, it leaves an entry that no longer reads as one that
+/// may never have started, so the sweep parks the call from its general arm,
+/// under `ticket-row-settled`. The call is parked either way; only the code
+/// differs from the fence's. (Found by the review of issue #206; left as it
+/// is, and documented.)
+#[tokio::test]
+async fn a_claim_lost_between_its_fleet_write_and_its_tell_leaves_the_park_to_the_sweep() {
+    let (fx, tool) = a_failed_attempt_then_a_cancel().await;
+    cancel_the_row_as_an_earlier_fence_did(&fx).await;
+    fx.expire_lease();
+
+    fx.fx
+        .runs
+        .crash_at(1, rakka_agent::testkit::CrashPoint::BeforeWrite);
+    fx.pipeline()
+        .claim_and_execute()
+        .await
+        .expect_err("the claim's tell is refused");
+    fx.fx
+        .runs
+        .assert_crash_fired(1, rakka_agent::testkit::CrashPoint::BeforeWrite);
+    fx.fx.runs.survive();
+    assert_eq!(
+        tool_call(&fx).await.0,
+        AgentRunEffectStatus::Ready,
+        "the run was not told"
+    );
+
+    fx.expire_lease();
+    let pass = fx.one_pass().await;
+
+    assert_eq!(pass.parked_indeterminate, 1);
+    assert_eq!(
+        tool_call(&fx).await,
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("ticket-row-settled".to_string()),
+            1
+        )
+    );
+    assert_eq!(
+        run_status(&fx).await,
+        Some(AgentRunStatus::WaitingForReconciliation)
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1, "the retry never ran");
+}
