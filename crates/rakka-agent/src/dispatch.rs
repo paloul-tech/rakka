@@ -80,13 +80,16 @@
 //!
 //! When a run is winding down, [`AgentRunEffectDispatcher::pump_run`] (or its
 //! per-run half, [`AgentRunEffectDispatcher::register_run`]) fences at the
-//! dispatch layer: tickets that provably never started are cancelled
+//! dispatch layer: tickets whose next attempt has not started are cancelled
 //! (with a tombstone row planted for a ticket a laggard flush might still
 //! write), attempts under an active lease finish truthfully, and an ambiguous
 //! attempt is treated exactly as above — a cancelled run's ambiguous
 //! non-idempotent effect still parks as `Indeterminate`, which is what keeps
 //! the run nonterminal in reconciliation
 //! ([specification 8.7](../../../docs/plans/rakka-agent/spec.md); scenario 57).
+//! So does an idempotent effect with an attempt already started, which the
+//! fence parks rather than cancels: that attempt may have reached the target
+//! (issue #206).
 //!
 //! Everything the pipeline does is idempotent: outbox rows deduplicate on the
 //! generation's dispatch ticket id, fleet transitions are fenced by the claim
@@ -174,9 +177,33 @@ pub(crate) const CREDENTIAL_RESOLUTION_FAILED: &str = "credential-resolution-fai
 /// was still waiting on (issue #150).
 const TICKET_ROW_MISSING: &str = "ticket-row-missing";
 
+/// The code a winding-down run's call is parked under when the wind-down
+/// fence finds an attempt of it already started that may have reached the
+/// target ([`earlier_attempt_may_have_executed`], issue #206): the call is
+/// not cancelled as never started, and a reconciliation decision is owed.
+const RUN_CANCELLED_AFTER_ATTEMPT: &str = "run-cancelled-after-attempt";
+
 /// The reason a parked generation's ticket is settled as cancelled under:
 /// the fleet entry's `last_error_code` once its effect is `Indeterminate`.
 const PARKED_INDETERMINATE: &str = "indeterminate";
+
+/// Whether an attempt of `intent` that has started may have reached the
+/// target, given that `started` of its attempts have.
+///
+/// For an idempotent effect every attempt after the first follows a
+/// possibly delivered one — that is why its retries reuse the external key —
+/// so once one has started, nothing the dispatch layer holds says the target
+/// was not reached. Read-only history is inconsequential, a reconcileable
+/// retry runs only once absence is proven, and a non-idempotent effect never
+/// retries.
+///
+/// One predicate for the two places that ask it, so they cannot drift: a
+/// refusal of an idempotent retry parks instead of failing the call
+/// (`possibly_executed` in [`AgentRunEffectDispatcher::attempt_invocation`]),
+/// and the wind-down fence parks instead of cancelling it (issue #206).
+fn earlier_attempt_may_have_executed(intent: &AgentRunEffect, started: u32) -> bool {
+    intent.safety.class() == AgentEffectSafetyClass::Idempotent && started > 0
+}
 
 /// The detail carried by the `Indeterminate` outcome of an effect whose
 /// ticket lost its outbox row.
@@ -3941,23 +3968,45 @@ where
             self.recover_ambiguous(scope, claim, &intent, attempt, started, winding_down, pass)
                 .await?
         } else if winding_down && !intent.kind().exempt_from_wind_down_fence() {
-            // The fence: a ticket that provably never started is cancelled and
-            // its intent settled, never dispatched after the cancellation. A
-            // compensation or workflow-cancel is exempt — it is exactly the
-            // work the wind-down authorized after the fence, and cancelling
-            // its ticket here would strand the wind-down on it forever — and
-            // so is a promotion or claim append, which copies work already
-            // recorded and may be accepted after the run has ended.
+            // The fence: a ticket whose next attempt has not started is never
+            // dispatched after the cancellation. A compensation or
+            // workflow-cancel is exempt — it is exactly the work the
+            // wind-down authorized after the fence, and cancelling its ticket
+            // here would strand the wind-down on it forever — and so is a
+            // promotion or claim append, which copies work already recorded
+            // and may be accepted after the run has ended.
             //
             // The run is told the attempts the row counts, and not the one
             // this claim was about to make: that attempt never started, and
             // the run charges every attempt it is told of (issue #182).
+            let started = attempt.saturating_sub(1);
+            // An idempotent call with an attempt started may have reached
+            // the target, so it is parked for a reconciliation decision, not
+            // cancelled as though it never started: cancelled, it read as
+            // never executed, and nothing asked (issue #206).
+            if earlier_attempt_may_have_executed(&intent, started) {
+                return self
+                    .park_indeterminate(
+                        scope,
+                        claim,
+                        &intent,
+                        started,
+                        RUN_CANCELLED_AFTER_ATTEMPT,
+                        INDETERMINATE_OUTCOME_MESSAGE,
+                        pass,
+                    )
+                    .await;
+            }
+            // Otherwise the cancel abandons nothing consequential: no attempt
+            // has started, or the call is read-only (a reconcileable call's
+            // failed row is recovered above, and a non-idempotent call has
+            // no retry). The ticket is cancelled and its intent settled.
             self.settle_ticket_cancelled(scope, &claim, "run-cancelled", pass)
                 .await?;
             self.deliver_outcome(
                 scope,
                 &intent,
-                attempt.saturating_sub(1),
+                started,
                 claim.fencing_token,
                 AgentRunEffectOutcome::Cancelled {
                     reason: "run-cancelled".to_string(),
@@ -4082,15 +4131,12 @@ where
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
 
         // Whether an earlier attempt of this generation may already have
-        // reached the target. For an idempotent effect every non-first
-        // attempt follows a possibly-delivered one — that is why its retries
-        // reuse the external key — so an undispatchable verdict on such an
-        // attempt must park the ambiguity, not assert that nothing was
-        // invoked. Read-only history is inconsequential, a reconcileable
-        // retry runs only once absence is proven, and a non-idempotent effect
-        // never retries.
+        // reached the target ([`earlier_attempt_may_have_executed`]): the
+        // attempts before this one have started. An undispatchable verdict
+        // on such an attempt must park the ambiguity, not assert that
+        // nothing was invoked.
         let possibly_executed =
-            intent.safety.class() == AgentEffectSafetyClass::Idempotent && attempt > 1;
+            earlier_attempt_may_have_executed(intent, attempt.saturating_sub(1));
 
         // The adapter's declared retry policy is re-enforced at dispatch
         // ([specification 11.2](../../../docs/plans/rakka-agent/spec.md): the

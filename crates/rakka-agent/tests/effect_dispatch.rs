@@ -3054,13 +3054,116 @@ async fn a_call_the_fence_cancels_before_it_starts_is_charged_no_attempt() {
     );
 }
 
-/// The fence tells the run the attempts the ticket's row counts, which is not
-/// always none. A call whose first attempt ran and failed is cancelled before
-/// its retry: one attempt started, and one is charged.
-#[tokio::test]
-async fn a_call_the_fence_cancels_before_its_retry_is_charged_the_attempt_it_made() {
+/// The tool call's last error code, as the run records it.
+async fn tool_call_code(fx: &DispatchFixture) -> Option<String> {
+    let state = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists");
+    state
+        .loop_state()
+        .expect("the loop state exists")
+        .effects()
+        .iter()
+        .find(|effect| effect.kind() == rakka_agent::AgentRunEffectKind::ToolCall)
+        .expect("the run holds its tool call")
+        .last_error_code
+        .clone()
+}
+
+/// A run whose idempotent tool call has failed `failures` times, each failure
+/// counted on the ticket's row, and is then cancelled before the next retry.
+async fn an_idempotent_call_failed_then_cancelled(failures: u32) -> (DispatchFixture, u64) {
     let (fx, spent) = a_tool_ticket_out(
         AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+        RecordingToolExecutor::new().with_failure(TOOL, "upstream-unavailable", "try again later"),
+        ScriptedReconciler::new(),
+    )
+    .await;
+    for _ in 0..failures {
+        fx.expire_lease();
+        fx.pipeline()
+            .pump_run(&run_scope())
+            .await
+            .expect("the pass runs");
+    }
+    assert_eq!(
+        tool_row(&fx).await,
+        (
+            rakka_agent_workflow::substrate::OutboxStatus::Failed,
+            failures
+        ),
+        "every attempt ran and failed, and the row counts each"
+    );
+    cancel_the_run(&fx).await;
+    (fx, spent)
+}
+
+/// An idempotent call whose attempt ran and failed may have reached its
+/// target: the dispatcher's own rule for an idempotent call is that every
+/// attempt after the first follows a possibly delivered one. So the fence
+/// does not cancel it as never started. It parks the call for a
+/// reconciliation decision, charged the attempt the row counts, and the
+/// cancelled run waits for that decision (issue #206). Before, the call was
+/// cancelled and nothing asked whether the attempt had executed.
+#[tokio::test]
+async fn a_call_the_fence_parks_after_a_failed_attempt_is_charged_that_attempt() {
+    let (fx, spent) = an_idempotent_call_failed_then_cancelled(1).await;
+
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "the retry never started"
+    );
+    assert_eq!(
+        tool_call_accounts(&fx).await,
+        (AgentRunEffectStatus::Indeterminate, 1, spent + 1, 0),
+        "the call is parked, charged the one attempt that started"
+    );
+    assert_eq!(
+        tool_call_code(&fx).await.as_deref(),
+        Some("run-cancelled-after-attempt")
+    );
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::WaitingForReconciliation,
+        "the cancelled run waits for the decision"
+    );
+}
+
+/// The park is charged the attempts the row counts, not one: a call that
+/// failed twice before the cancel is charged two.
+#[tokio::test]
+async fn a_call_parked_after_two_failed_attempts_is_charged_both() {
+    let (fx, spent) = an_idempotent_call_failed_then_cancelled(2).await;
+
+    fx.expire_lease();
+    fx.pump().await;
+
+    assert_eq!(fx.tools.invocation_count(TOOL), 2);
+    assert_eq!(
+        tool_call_accounts(&fx).await,
+        (AgentRunEffectStatus::Indeterminate, 2, spent + 2, 0)
+    );
+}
+
+/// The fence tells the run the attempts the ticket's row counts, which is not
+/// always none (issue #182). A read-only call whose first attempt ran and
+/// failed abandons nothing consequential, so it is still cancelled before its
+/// retry: one attempt started, and one is charged.
+#[tokio::test]
+async fn a_read_only_call_the_fence_cancels_before_its_retry_is_charged_the_attempt_it_made() {
+    let (fx, spent) = a_tool_ticket_out(
+        AgentEffectSpec::read_only()
+            .with_max_attempts(3)
+            .expect("the spec is valid"),
         RecordingToolExecutor::new().with_failure(TOOL, "upstream-unavailable", "try again later"),
         ScriptedReconciler::new(),
     )
