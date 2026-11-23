@@ -169,9 +169,9 @@ leaves behind is the same either way.
    marked definitive; a run that fails on an effect records how many attempts
    it made and was allowed. An attempt counts once it reaches its durable
    `Started`, so a dispatch refused before that (a policy conflict, the
-   dispatch authority's refusal, a grant that fails its check, a guardrail
-   revision mismatch) reports the attempts before it, and one refused on its
-   first claim reports none (issue #196).
+   dispatch authority's definitive refusal, a grant that fails its check, a
+   guardrail revision mismatch) reports the attempts before it, and one
+   refused on its first claim reports none (issue #196).
    An outcome settles only the effect it belongs to: the success variant of
    the effect's own request, naming the effect's own call, cell or
    generation, or a failure outcome (`Failed`, `Exhausted`, `Indeterminate`
@@ -351,7 +351,7 @@ settle, a release and a prune. The loss after that is returned as
 
 **A batch and its leases** (issue #157). A claim pass leases every claim of
 its batch at one instant, and a worker runs the claims one after another.
-Four rules keep a claim from being taken by another worker while its pass
+Five rules keep a claim from being taken by another worker while its pass
 is still working on it, and from being run by two:
 
 - **Every settle renews what the pass still holds.** In the same write, each
@@ -401,6 +401,20 @@ is still working on it, and from being run by two:
   lease does, unless what it reads is what a claim settles with no attempt
   (the row finished, gone or put back in a lost row's place, or the call
   resolved), which it settles as a claim that read it first would.
+- **A refusal before `Started` is told to the run only under a current
+  lease** (issue #196). The dispatch authority can answer after the
+  claim's lease lapsed, and by then another worker may hold the ticket and
+  have made the attempt the answer refuses, or have it out. So a
+  definitive refusal before `Started` (a policy conflict, the authority's
+  refusal, a grant that fails its check, a guardrail revision mismatch) is
+  delivered, or parked, only while the claim's lease is still current.
+  Otherwise the claim ends there and writes nothing, as above, and the
+  claim that follows asks the authority again. The lease has to cover the
+  authority's answer: a refusing authority that always answers slower than
+  the lease leaves the run waiting, spending nothing. A transient refusal
+  is not asked, since it tells the run nothing, and neither is a refusal
+  after `Started` (`credential-resolver-missing`). A worker that stalls
+  between the check and the delivery can still deliver.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,

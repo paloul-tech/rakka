@@ -10628,7 +10628,13 @@ pub enum AgentRunEntityCommand {
         effect_id: AgentEffectId,
         /// The generation the result answers for.
         generation: AgentEffectGeneration,
-        /// The dispatch attempt that produced the result.
+        /// The attempts of the generation the result accounts for: the
+        /// attempt that produced it, or, for an outcome the dispatcher
+        /// settles without making an attempt (a refusal before `Started`, a
+        /// call the wind-down fence cancels), the attempts that started
+        /// before it. The run records the largest it is told, and charges
+        /// that many effect attempts the first time the effect resolves, a
+        /// park for a reconciliation decision included.
         attempt: u32,
         /// The lease fencing token of that attempt; zero for an in-process
         /// driver that holds no fleet lease.

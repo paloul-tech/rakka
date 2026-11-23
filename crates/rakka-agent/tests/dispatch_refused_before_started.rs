@@ -3,28 +3,53 @@
 //!
 //! The dispatcher refuses a dispatch before it writes `Started` at four
 //! places: a model call whose policy is weaker than its adapter's
-//! declaration, the dispatch authority's refusal, a grant that fails its
-//! check, and a tool call pinned to another guardrail chain revision. Each
-//! used to tell the run the attempt it was about to make, and the run
-//! recorded and charged it, though nothing was invoked. Each test here reads
-//! what the run recorded for the call, what it charged, and the attempts its
-//! terminal reason reports.
+//! declaration, the dispatch authority's definitive refusal, a grant that
+//! fails its check, and a tool call pinned to another guardrail chain
+//! revision. Each used to tell the run the attempt it was about to make, and
+//! the run recorded and charged it, though nothing was invoked. Each test
+//! here reads what the run recorded for the call, what it charged, and the
+//! attempts its terminal reason reports.
 //!
 //! One refusal comes after `Started`: no credential resolver for the call's
 //! binding. Its attempt did start, and it is still charged.
+//!
+//! The refusals are met on each path that reaches an attempt: a fresh claim,
+//! the recovery of a lost attempt, the retry after a failed attempt (with
+//! and without a reconciler), and a later attempt under the same claim.
+//!
+//! A refusal before `Started` is told to the run only while the claim's
+//! lease is still current. The last tests here give the authority an answer
+//! that outlasts the lease, with another worker running the ticket
+//! meanwhile and without.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use rakka_agent::testkit::{DeterministicModelAdapter, RecordingToolExecutor};
+use rakka_agent::testkit::{
+    DeterministicModelAdapter, InProcessRunResultDelivery, RecordingToolExecutor,
+    ScriptedReconciler, SharedAtomicWorkflowClock,
+};
 use rakka_agent::{
-    AgentCredentialBindingRef, AgentEffectSpec, AgentGuardrail, AgentGuardrailBoundary,
-    AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailOutcome, AgentGuardrailStage,
-    AgentGuardrailStageId, AgentModelRetryPolicy, AgentModelTurn, AgentRevisionNumber,
-    AgentRunEffectKind, AgentRunEffectStatus, AgentRunStatus, AgentRunTerminalReason,
-    AgentSettingsChange, AgentTaskContent, AgentToolAuthority, AgentToolCallId,
-    AgentToolCallRequest, AgentToolId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentAuthorityRefusal, AgentCheckpointDecision, AgentCredentialBindingRef,
+    AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchError, AgentDispatchFuture,
+    AgentDispatchToolExecutor, AgentDispatchWindow, AgentEffectSpec, AgentEntityAuthority,
+    AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
+    AgentGuardrailOutcome, AgentGuardrailStage, AgentGuardrailStageId, AgentModelRetryPolicy,
+    AgentModelTurn, AgentOperationId, AgentOperationKind, AgentReconciliationDecision,
+    AgentReconciliationFinding, AgentReconciliationProtocolRef, AgentRevisionNumber,
+    AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectKind, AgentRunEffectStatus,
+    AgentRunEntityCommand, AgentRunScope, AgentRunState, AgentRunStatus, AgentRunTerminalReason,
+    AgentSegmentOperation, AgentSettingsChange, AgentTaskContent, AgentToolAuthority,
+    AgentToolCallId, AgentToolCallRequest, AgentToolId, InMemoryAgentSegmentSink,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+};
+use rakka_agent_workflow::substrate::OutboxStatus;
+use rakka_agent_workflow::{
+    AgentDispatcherFleetSettings, AgentDispatcherWorkerId, AgentEphemeralCredential,
+    AgentTelemetryContext, AgentTimestampMillis, PrincipalRef,
 };
 use serde_json::Value;
+use tokio::sync::oneshot;
 
 mod common;
 
@@ -171,7 +196,10 @@ async fn a_call_whose_grant_fails_its_check_is_charged_no_attempt() {
         accounts(&fx, AgentRunEffectKind::ModelCall).await,
         (AgentRunEffectStatus::Failed, 0, 0)
     );
-    assert_eq!(effect_failed(&fx).await.1, Some(0));
+    assert_eq!(
+        effect_failed(&fx).await,
+        ("grant-expired".to_string(), Some(0), Some(1))
+    );
 }
 
 /// A call the dispatch authority refuses is charged no attempt. The tool is
@@ -271,13 +299,23 @@ async fn a_call_refused_for_its_guardrail_revision_is_charged_no_attempt() {
 /// with a retryable failure, with its first attempt made and failed. Returns
 /// the effect attempts the run counts as spent before the tool.
 async fn a_call_whose_first_attempt_failed(spec: AgentEffectSpec) -> (AuthorityFixture, u64) {
-    let mut fx = AuthorityFixture::over(
+    let fx = AuthorityFixture::over(
         tool_then_proposal(),
         tool_registry_for_spec(TOOL, &spec),
         None,
     );
+    a_first_attempt_that_failed(fx).await
+}
+
+/// Makes and fails the first attempt of `fx`'s tool call, every call of
+/// which fails with a retryable failure. Returns the fixture and the effect
+/// attempts the run counts as spent before the tool.
+async fn a_first_attempt_that_failed(mut fx: AuthorityFixture) -> (AuthorityFixture, u64) {
     fx.tools = RecordingToolExecutor::new().with_failure(TOOL, "upstream-unavailable", "later");
-    fx.start().await;
+    fx.fx
+        .instantiate_agent_with_envelope(fx.envelope.clone())
+        .await;
+    fx.fx.create_task_traced(traced()).await;
     fx.pump_until_tool_ticket().await;
     let spent = spent_before_the_tool(&fx).await;
     fx.expire_lease();
@@ -318,17 +356,33 @@ async fn a_call_refused_on_its_retry_is_charged_the_attempt_it_made() {
     );
 }
 
-/// An idempotent call refused on its retry parks charged the attempt that
-/// may have executed. Its first attempt failed and may have reached the
-/// target, so the refusal of the retry cannot say nothing was invoked: the
-/// call parks for a reconciliation decision. One attempt started, and the
-/// park is charged that one; it used to be charged two.
-#[tokio::test]
-async fn an_idempotent_call_refused_on_its_retry_parks_charged_the_attempt_it_made() {
-    let (fx, spent) = a_call_whose_first_attempt_failed(
-        AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+/// A task traced from a caller's span, so the run derives a span identity
+/// for each of its effect attempts.
+fn traced() -> AgentTelemetryContext {
+    AgentTelemetryContext {
+        trace_parent: Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string()),
+        ..AgentTelemetryContext::default()
+    }
+}
+
+/// An idempotent tool call whose first attempt failed and whose retry was
+/// refused (the tool revoked meanwhile), parked for a reconciliation
+/// decision, with every segment in `segments`. Returns the fixture and the
+/// effect attempts the run counts as spent before the tool.
+async fn an_idempotent_call_parked_on_a_refused_retry(
+    segments: Arc<InMemoryAgentSegmentSink>,
+) -> (AuthorityFixture, u64) {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(
+            TOOL,
+            &AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+        ),
+        None,
     )
-    .await;
+    .with_segments(segments.clone())
+    .with_dispatch_segments(segments);
+    let (fx, spent) = a_first_attempt_that_failed(fx).await;
     fx.apply_settings(
         "revoke-tool",
         vec![AgentSettingsChange::RevokeTool(tool_id())],
@@ -337,6 +391,19 @@ async fn an_idempotent_call_refused_on_its_retry_parks_charged_the_attempt_it_ma
 
     fx.expire_lease();
     fx.one_pass().await;
+    (fx, spent)
+}
+
+/// An idempotent call refused on its retry parks charged the attempt that
+/// may have executed. Its first attempt failed and may have reached the
+/// target, so the refusal of the retry cannot say nothing was invoked: the
+/// call parks for a reconciliation decision. One attempt started, and the
+/// park is charged that one; it used to be charged two.
+#[tokio::test]
+async fn an_idempotent_call_refused_on_its_retry_parks_charged_the_attempt_it_made() {
+    let (fx, spent) =
+        an_idempotent_call_parked_on_a_refused_retry(Arc::new(InMemoryAgentSegmentSink::new()))
+            .await;
 
     assert_eq!(fx.tools.invocation_count(TOOL), 1);
     assert_eq!(
@@ -381,5 +448,744 @@ async fn a_call_refused_after_its_attempt_started_is_charged_that_attempt() {
     assert_eq!(
         effect_failed(&fx).await,
         ("credential-resolver-missing".to_string(), Some(1), Some(2))
+    );
+}
+
+/// The park after a refused retry links the attempt that failed, the one
+/// that may have executed. Both segments that carry an `ambiguous-attempt`
+/// link (the run's park and the checkpoint it opens) name attempt one and
+/// link the span attempt one's dispatch exported. They used to name
+/// attempt two, which never started and exported no span.
+#[tokio::test]
+async fn the_park_after_a_refused_retry_links_the_attempt_that_failed() {
+    let segments = Arc::new(InMemoryAgentSegmentSink::new());
+    let (fx, _) = an_idempotent_call_parked_on_a_refused_retry(segments.clone()).await;
+
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+    let first = effect
+        .attempt_span_identity(1)
+        .expect("the run is traced")
+        .span_id;
+    let exported: Vec<_> = segments
+        .segments()
+        .into_iter()
+        .filter(|segment| {
+            matches!(
+                segment.operation,
+                AgentSegmentOperation::EffectDispatch {
+                    effect_kind: "tool-call"
+                }
+            ) && segment.span_id.is_some()
+        })
+        .map(|segment| segment.span_id)
+        .collect();
+    assert_eq!(
+        exported,
+        vec![Some(first.clone())],
+        "attempt one's dispatch is the one exported span"
+    );
+    let links: Vec<_> = segments
+        .segments()
+        .iter()
+        .filter_map(|segment| {
+            let link = segment.telemetry.span_links.iter().find(|link| {
+                link.attributes
+                    .get(rakka_agent::ATTR_AGENT_TELEMETRY_LINK_KIND)
+                    .map(String::as_str)
+                    == Some(rakka_agent::LINK_KIND_AMBIGUOUS_ATTEMPT)
+            })?;
+            Some((
+                segment
+                    .attributes
+                    .get("rakka.agent.effect.attempt")
+                    .cloned(),
+                link.span_id.clone(),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        links,
+        vec![
+            (Some("1".to_string()), first.clone()),
+            (Some("1".to_string()), first)
+        ]
+    );
+}
+
+/// A run that abandons the park after a refused retry reports the attempt
+/// that started. The operator's `AbandonAndFail` fails the run, and its
+/// terminal reason reports one attempt of three; it used to report two.
+#[tokio::test]
+async fn abandoning_the_park_after_a_refused_retry_reports_the_attempt_it_made() {
+    let (fx, spent) =
+        an_idempotent_call_parked_on_a_refused_retry(Arc::new(InMemoryAgentSegmentSink::new()))
+            .await;
+    let checkpoint_id = rakka_agent::load_agent_run_state(
+        &fx.fx.runs,
+        &run_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the run state loads")
+    .expect("the run exists")
+    .loop_state()
+    .expect("the loop is started")
+    .open_checkpoints()
+    .first()
+    .expect("the park opened its checkpoint")
+    .checkpoint_id
+    .clone();
+
+    let mut run = fx.fx.run();
+    run.recover(fx.fx.now()).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "abandon",
+            )
+            .expect("the operation id derives"),
+            checkpoint_id,
+            resolver: PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "operator".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(AgentCheckpointDecision::Reconciliation(
+                AgentReconciliationDecision::AbandonAndFail,
+            )),
+            telemetry: AgentTelemetryContext::default(),
+        },
+        &fx.fx.router,
+        fx.fx.now(),
+    )
+    .await
+    .expect("the abandonment applies");
+    fx.settle().await;
+
+    assert_eq!(
+        accounts(&fx, AgentRunEffectKind::ToolCall).await,
+        (AgentRunEffectStatus::Failed, 1, spent + 1)
+    );
+    assert_eq!(
+        effect_failed(&fx).await,
+        ("reconciliation-abandoned".to_string(), Some(1), Some(3))
+    );
+}
+
+/// The missing resolver is refused after the attempt's `Started`: a worker
+/// that dies right after writing it leaves the row `Dispatching`, so the
+/// refusal the guard above meets comes after the attempt started.
+#[tokio::test]
+async fn a_missing_resolver_is_refused_after_the_attempts_started() {
+    let spec = AgentEffectSpec::idempotent(2)
+        .expect("the spec is valid")
+        .with_credential_binding(
+            AgentCredentialBindingRef::new("payments").expect("the binding ref is valid"),
+        );
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &spec),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+
+    fx.expire_lease();
+    let pass = fx.one_pass().await;
+
+    assert!(pass.died, "the worker dies once `Started` is written");
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+    let row = fx
+        .outbox_row(&effect)
+        .await
+        .expect("the ticket's row exists");
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (OutboxStatus::Dispatching, 0)
+    );
+}
+
+/// A refusal after a lost attempt is charged the lost attempt alone. A
+/// read-only tool call's worker dies once its attempt's `Started` is
+/// written; the tool is then revoked. The next claim counts the lost
+/// attempt and refuses the next before `Started`: one attempt started and
+/// one is charged. It used to be two.
+#[tokio::test]
+async fn a_call_refused_after_a_lost_attempt_is_charged_that_attempt() {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(
+            TOOL,
+            &AgentEffectSpec::read_only()
+                .with_max_attempts(3)
+                .expect("the spec is valid"),
+        ),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let spent = spent_before_the_tool(&fx).await;
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    fx.expire_lease();
+    assert!(fx.one_pass().await.died);
+    fx.apply_settings(
+        "revoke-tool",
+        vec![AgentSettingsChange::RevokeTool(tool_id())],
+    )
+    .await;
+
+    fx.expire_lease();
+    let pass = fx.one_pass().await;
+
+    assert_eq!(pass.failed_attempts, 1, "the lost attempt is counted");
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    assert_eq!(
+        accounts(&fx, AgentRunEffectKind::ToolCall).await,
+        (AgentRunEffectStatus::Failed, 1, spent + 1)
+    );
+    assert_eq!(
+        effect_failed(&fx).await,
+        ("tool-revoked".to_string(), Some(1), Some(3))
+    );
+}
+
+/// A model call refused for a policy conflict after a lost attempt is
+/// charged the lost attempt alone. The adapter's declaration permits the
+/// spec at first; the worker dies once the call's `Started` is written, and
+/// the adapter's declaration tightens before the next claim. That claim
+/// counts the lost attempt and refuses the next before `Started`. It used to
+/// be charged two.
+#[tokio::test]
+async fn a_model_call_refused_for_a_policy_conflict_after_a_lost_attempt_is_charged_that_attempt() {
+    let declared = |safety_class, max_attempts| {
+        DeterministicModelAdapter::new()
+            .with_turn(proposing_turn("resolved"))
+            .with_retry_policy(AgentModelRetryPolicy {
+                safety_class,
+                max_attempts,
+            })
+            .expect("the adapter policy is valid")
+    };
+    let mut fx = AuthorityFixture::over(
+        declared(rakka_agent::AgentEffectSafetyClass::ReadOnly, 3),
+        tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent()),
+        Some(
+            AgentEffectSpec::read_only()
+                .with_max_attempts(3)
+                .expect("the spec is valid"),
+        ),
+    );
+    fx.start().await;
+    fx.settle().await;
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    assert!(fx.one_pass().await.died);
+    fx.model_adapter = Some(Arc::new(declared(
+        rakka_agent::AgentEffectSafetyClass::NonIdempotent,
+        1,
+    )));
+
+    fx.expire_lease();
+    fx.one_pass().await;
+
+    assert_eq!(fx.adapter.calls(), 0, "nothing was invoked");
+    assert_eq!(
+        accounts(&fx, AgentRunEffectKind::ModelCall).await,
+        (AgentRunEffectStatus::Failed, 1, 1)
+    );
+    assert_eq!(
+        effect_failed(&fx).await,
+        ("model-policy-conflict".to_string(), Some(1), Some(3))
+    );
+}
+
+/// A reconcileable tool's spec: retried only once absence is proven.
+fn reconcileable(attempts: u32) -> AgentEffectSpec {
+    AgentEffectSpec::reconcileable(
+        AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid"),
+        attempts,
+    )
+    .expect("the spec is valid")
+}
+
+/// A reconcileable call refused on its retry is charged the attempt it
+/// made. Its first call fails; the tool is then revoked. The next claim
+/// asks the reconciler, which finds the call not executed, and the retry is
+/// refused before `Started` (issue #195's path). It used to be charged two.
+#[tokio::test]
+async fn a_reconcileable_call_refused_on_its_retry_is_charged_the_attempt_it_made() {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &reconcileable(3)),
+        None,
+    )
+    .with_reconciler(Arc::new(
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted),
+    ));
+    let (fx, spent) = a_first_attempt_that_failed(fx).await;
+    fx.apply_settings(
+        "revoke-tool",
+        vec![AgentSettingsChange::RevokeTool(tool_id())],
+    )
+    .await;
+
+    fx.expire_lease();
+    fx.one_pass().await;
+
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+    assert_eq!(
+        accounts(&fx, AgentRunEffectKind::ToolCall).await,
+        (AgentRunEffectStatus::Failed, 1, spent + 1)
+    );
+    assert_eq!(
+        effect_failed(&fx).await,
+        ("tool-revoked".to_string(), Some(1), Some(3))
+    );
+}
+
+/// An authority that answers its first `grant` questions as the fixture's
+/// own authority would, and refuses `tool-revoked` from then on. It records
+/// the attempt each question names.
+struct RefusingAfter {
+    inner: Arc<dyn AgentDispatchAuthority>,
+    grant: usize,
+    asked: Mutex<Vec<u32>>,
+}
+
+impl AgentDispatchAuthority for RefusingAfter {
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        Box::pin(async move {
+            let asked = {
+                let mut asked = self.asked.lock().expect("the lock holds");
+                asked.push(attempt);
+                asked.len()
+            };
+            if asked > self.grant {
+                return Ok(AgentDispatchDecision::Refused(AgentAuthorityRefusal::of(
+                    "tool-revoked",
+                    "the tool was revoked",
+                )));
+            }
+            self.inner.authorize(scope, run, intent, attempt, now).await
+        })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentToolResponseDecision> {
+        self.inner
+            .review_tool_response(scope, intent, tool, content)
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentModelResponseDecision> {
+        self.inner.review_model_response(scope, intent, turn)
+    }
+}
+
+/// A tool whose every call ends with an unknown outcome.
+#[derive(Clone, Default)]
+struct UnknownTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl AgentDispatchToolExecutor for UnknownTool {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(AgentDispatchError::outcome_unknown(
+                "upstream-timeout",
+                "the answer was lost",
+            ))
+        })
+    }
+}
+
+/// A later attempt refused under the same claim is charged the attempt
+/// before it. A reconcileable call's first attempt ends with an unknown
+/// outcome; the reconciler finds it not executed, the attempt is counted,
+/// and the claim goes on to the next attempt (issues #165 and #171), which
+/// the authority refuses before `Started`. It used to be charged two.
+#[tokio::test]
+async fn a_later_attempt_refused_under_the_same_claim_is_charged_the_attempt_before_it() {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &reconcileable(3)),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let spent = spent_before_the_tool(&fx).await;
+    let authority = Arc::new(RefusingAfter {
+        inner: Arc::new(AgentEntityAuthority::new(
+            fx.fx.agents.clone(),
+            fx.authority.clone(),
+        )),
+        grant: 1,
+        asked: Mutex::new(Vec::new()),
+    });
+    let tool = UnknownTool::default();
+    let mut worker = worker(&fx, "worker-1", authority.clone(), Arc::new(tool.clone()))
+        .with_reconciler(Arc::new(
+            ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted),
+        ));
+
+    fx.expire_lease();
+    fx.settle().await;
+    let pass = worker.pump_run(&run_scope()).await.expect("the pass runs");
+
+    assert_eq!((pass.invoked, pass.failed_attempts), (1, 1));
+    assert_eq!(
+        authority.asked.lock().expect("the lock holds").clone(),
+        vec![1, 2],
+        "one claim asks about both attempts"
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        accounts(&fx, AgentRunEffectKind::ToolCall).await,
+        (AgentRunEffectStatus::Failed, 1, spent + 1)
+    );
+    assert_eq!(
+        effect_failed(&fx).await,
+        ("tool-revoked".to_string(), Some(1), Some(3))
+    );
+}
+
+/// A dispatcher worker over `fx`'s stores, asking `authority` and calling
+/// `tools`, with the fixture's lease.
+fn worker(
+    fx: &AuthorityFixture,
+    worker_id: &str,
+    authority: Arc<dyn AgentDispatchAuthority>,
+    tools: Arc<dyn AgentDispatchToolExecutor>,
+) -> Pipeline {
+    let delivery = InProcessRunResultDelivery::new(
+        fx.fx.runs.clone(),
+        fx.fx.effects.clone(),
+        fx.fx.router.clone(),
+        fx.fx.clock.clone(),
+    )
+    .with_effect_policies(fx.fx.policies.clone());
+    AgentRunEffectDispatcher::new(
+        AgentDispatcherWorkerId::new(worker_id),
+        fx.workflow_store.clone(),
+        fx.fleet_store.clone(),
+        fx.fx.runs.clone(),
+        fx.wf_clock.clone(),
+        Arc::new(fx.adapter.clone()),
+        tools,
+        authority,
+        Arc::new(delivery),
+    )
+    .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
+}
+
+/// The fixture's own dispatch authority.
+fn the_fixtures_authority(fx: &AuthorityFixture) -> Arc<dyn AgentDispatchAuthority> {
+    Arc::new(AgentEntityAuthority::new(
+        fx.fx.agents.clone(),
+        fx.authority.clone(),
+    ))
+}
+
+/// An authority whose first answer outlasts the claim's lease. It moves the
+/// clock past the lease and, when given a hand-off, signals it and waits to
+/// be released; then it refuses `tool-revoked`. Every later question it
+/// answers as the fixture's own authority would.
+struct OutlastingAuthority {
+    inner: Arc<dyn AgentDispatchAuthority>,
+    clock: SharedAtomicWorkflowClock,
+    answered: AtomicBool,
+    hand_off: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+}
+
+impl OutlastingAuthority {
+    fn new(fx: &AuthorityFixture) -> Self {
+        Self {
+            inner: the_fixtures_authority(fx),
+            clock: fx.wf_clock.clone(),
+            answered: AtomicBool::new(false),
+            hand_off: Mutex::new(None),
+        }
+    }
+
+    /// Signals `held` once the lease has lapsed, and refuses once `release`
+    /// fires.
+    fn handing_off(self, held: oneshot::Sender<()>, release: oneshot::Receiver<()>) -> Self {
+        *self.hand_off.lock().expect("the lock holds") = Some((held, release));
+        self
+    }
+}
+
+impl AgentDispatchAuthority for OutlastingAuthority {
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        Box::pin(async move {
+            if self.answered.swap(true, Ordering::SeqCst) {
+                return self.inner.authorize(scope, run, intent, attempt, now).await;
+            }
+            self.clock.advance(LEASE_MS + 1);
+            let hand_off = self.hand_off.lock().expect("the lock holds").take();
+            if let Some((held, release)) = hand_off {
+                let _ = held.send(());
+                let _ = release.await;
+            }
+            Ok(AgentDispatchDecision::Refused(AgentAuthorityRefusal::of(
+                "tool-revoked",
+                "the tool was revoked",
+            )))
+        })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentToolResponseDecision> {
+        self.inner
+            .review_tool_response(scope, intent, tool, content)
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentModelResponseDecision> {
+        self.inner.review_model_response(scope, intent, turn)
+    }
+}
+
+/// A tool whose first call signals `entered` and waits for `release`, and
+/// whose every call succeeds.
+struct HeldTool {
+    calls: AtomicUsize,
+    gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+}
+
+impl AgentDispatchToolExecutor for HeldTool {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _intent: &'a AgentRunEffect,
+        _call: &'a AgentToolCallRequest,
+        _credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.lock().expect("the lock holds").take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            Ok(
+                AgentTaskContent::inline(serde_json::json!({ "charged": true }))
+                    .expect("the result is inline-bounded"),
+            )
+        })
+    }
+}
+
+/// A refusal whose lease lapsed while another worker's call was out is not
+/// delivered. Worker one's authority answers after the lease lapsed; worker
+/// two claims the ticket meanwhile and its call of a non-idempotent tool is
+/// out when worker one's refusal comes. Worker one tells the run nothing and
+/// cancels nothing; worker two's call succeeds and the run completes on it.
+/// The refusal used to fail the run `tool-revoked` and cancel the row, and
+/// the call that had executed was lost.
+#[tokio::test]
+async fn a_refusal_whose_lease_lapsed_while_another_worker_called_the_tool_is_not_delivered() {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent()),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let (held, lapsed) = oneshot::channel();
+    let (release_one, refuse) = oneshot::channel();
+    let (entered, out) = oneshot::channel();
+    let (release_two, answer) = oneshot::channel();
+    let tool = Arc::new(HeldTool {
+        calls: AtomicUsize::new(0),
+        gate: Mutex::new(Some((entered, answer))),
+    });
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        Arc::new(OutlastingAuthority::new(&fx).handing_off(held, refuse)),
+        tool.clone(),
+    );
+    let mut two = worker(&fx, "worker-two", the_fixtures_authority(&fx), tool.clone());
+    let (one_done, one_ended) = oneshot::channel::<()>();
+
+    fx.expire_lease();
+    fx.settle().await;
+    let (one_pass, two_pass, ()) = tokio::join!(
+        async {
+            let pass = one.pump_run(&run_scope()).await;
+            let _ = one_done.send(());
+            pass
+        },
+        async {
+            let _ = lapsed.await;
+            two.pump_run(&run_scope()).await
+        },
+        async {
+            let _ = out.await;
+            let _ = release_one.send(());
+            let _ = one_ended.await;
+            let _ = release_two.send(());
+        }
+    );
+
+    let one_pass = one_pass.expect("worker one's pass runs");
+    assert_eq!(
+        (one_pass.lapsed, one_pass.delivered, one_pass.cancelled),
+        (1, 0, 0),
+        "worker one ends out of lease and writes nothing"
+    );
+    let two_pass = two_pass.expect("worker two's pass runs");
+    assert_eq!((two_pass.invoked, two_pass.delivered), (1, 1));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    fx.pump().await;
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+/// A refusal whose lease lapsed after another worker failed the attempt is
+/// not delivered. A read-only tool's first call fails. Worker one's
+/// authority answers about the retry after the lease lapsed; worker two
+/// claims the ticket meanwhile, and its retry fails too. Worker one tells
+/// the run nothing, and the row keeps both failures for the next claim. The
+/// refusal used to fail the run, which this fix would have charged one of
+/// the two attempts that started.
+#[tokio::test]
+async fn a_refusal_whose_lease_lapsed_after_another_worker_failed_the_attempt_is_not_delivered() {
+    let (fx, _) = a_call_whose_first_attempt_failed(
+        AgentEffectSpec::read_only()
+            .with_max_attempts(3)
+            .expect("the spec is valid"),
+    )
+    .await;
+    let (held, lapsed) = oneshot::channel();
+    let (release_one, refuse) = oneshot::channel();
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        Arc::new(OutlastingAuthority::new(&fx).handing_off(held, refuse)),
+        Arc::new(fx.tools.clone()),
+    );
+    let mut two = worker(
+        &fx,
+        "worker-two",
+        the_fixtures_authority(&fx),
+        Arc::new(fx.tools.clone()),
+    );
+
+    fx.expire_lease();
+    fx.settle().await;
+    let scope = run_scope();
+    let (one_pass, two_pass) = tokio::join!(one.pump_run(&scope), async {
+        let _ = lapsed.await;
+        let pass = two.pump_run(&run_scope()).await;
+        let _ = release_one.send(());
+        pass
+    });
+
+    let one_pass = one_pass.expect("worker one's pass runs");
+    assert_eq!(
+        (one_pass.lapsed, one_pass.delivered, one_pass.cancelled),
+        (1, 0, 0)
+    );
+    let two_pass = two_pass.expect("worker two's pass runs");
+    assert_eq!((two_pass.invoked, two_pass.failed_attempts), (1, 1));
+    assert_eq!(fx.tools.invocation_count(TOOL), 2);
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+    let row = fx
+        .outbox_row(&effect)
+        .await
+        .expect("the ticket's row exists");
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (OutboxStatus::Failed, 2)
+    );
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.terminal_reason, None, "the run is not failed");
+}
+
+/// A refusal whose lease lapsed is delivered by the claim that follows.
+/// The authority's first answer comes after the lease lapsed, and no other
+/// worker claims the ticket: the claim ends out of lease and tells the run
+/// nothing. The tool is then revoked, and the next claim's authority
+/// refuses it at once, under a current lease: that refusal is delivered.
+#[tokio::test]
+async fn a_refusal_whose_lease_lapsed_is_delivered_by_the_claim_that_follows() {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent()),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        Arc::new(OutlastingAuthority::new(&fx)),
+        Arc::new(fx.tools.clone()),
+    );
+    fx.expire_lease();
+    fx.settle().await;
+
+    let first = one.pump_run(&run_scope()).await.expect("the pass runs");
+
+    assert_eq!((first.lapsed, first.delivered, first.cancelled), (1, 0, 0));
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.terminal_reason, None);
+
+    fx.apply_settings(
+        "revoke-tool",
+        vec![AgentSettingsChange::RevokeTool(tool_id())],
+    )
+    .await;
+    fx.expire_lease();
+    let second = fx.one_pass().await;
+
+    assert_eq!((second.delivered, second.cancelled), (1, 1));
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    assert_eq!(
+        effect_failed(&fx).await,
+        ("tool-revoked".to_string(), Some(0), Some(1))
     );
 }

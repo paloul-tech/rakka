@@ -2256,6 +2256,14 @@ pub struct AgentDispatchPass {
     /// worker's. Such a claim can end with its own lease standing in full,
     /// so neither of these says an effect's attempts outlast the lease.
     ///
+    /// One more is counted with them and ends its batch the same way (issue
+    /// #196): a claim whose dispatch the authority refused definitively,
+    /// before its `Started`, in an answer that came after the lease lapsed.
+    /// The refusal is not delivered, and the claim that follows asks again.
+    /// A value that stays above zero can say the authority answers slower
+    /// than the lease: its refusals are then never delivered, and the run
+    /// waits, spending nothing.
+    ///
     /// Nothing is written to the ticket of any of these as its claim ends:
     /// once the lease is over any worker can take it. A pass that ends in an
     /// error returns no report, and the claims it passed over are then
@@ -2294,8 +2302,10 @@ enum ClaimConclusion {
     /// first attempt, the reconciler answered about an attempt an earlier
     /// claim made and the claim's lease had lapsed by then, or the ticket's
     /// row had been moved meanwhile by a worker whose own lease had lapsed
-    /// (issue #195). Its ticket is unsettled, and no settle renewed the
-    /// claims its pass holds behind it.
+    /// (issue #195). Or its dispatch was refused definitively before its
+    /// `Started` once its lease had lapsed, and the refusal was not
+    /// delivered (issue #196). Its ticket is unsettled, and no settle renewed
+    /// the claims its pass holds behind it.
     OutOfLease,
 }
 
@@ -4103,14 +4113,12 @@ where
                         declared.max_attempts
                     ),
                 );
-                // Refused before `Started`: the run is told the attempts that
-                // started, which the row counts (issue #196).
                 return self
-                    .settle_undispatchable(
+                    .settle_refused_before_started(
                         scope,
                         &claim,
                         intent,
-                        attempt.saturating_sub(1),
+                        attempt,
                         &refusal,
                         possibly_executed,
                         pass,
@@ -5364,11 +5372,8 @@ where
     /// Routes one authority refusal to its truthful settlement: a transient
     /// refusal defers the ticket without spending anything durable; a
     /// definitive one settles the generation per
-    /// [`Self::settle_undispatchable`].
-    ///
-    /// Every refusal routed here comes before `Started`, so `attempt`, the
-    /// attempt about to be made, did not start: a definitive one tells the
-    /// run the attempts before it, which the row counts (issue #196).
+    /// [`Self::settle_refused_before_started`]. Every refusal routed here
+    /// comes before `Started`.
     #[allow(clippy::too_many_arguments)]
     async fn settle_refusal(
         &mut self,
@@ -5384,6 +5389,47 @@ where
             return self
                 .defer_dispatch(claim, attempt, &refusal.code, &refusal.message, pass)
                 .await;
+        }
+        self.settle_refused_before_started(
+            scope,
+            claim,
+            intent,
+            attempt,
+            refusal,
+            possibly_executed,
+            pass,
+        )
+        .await
+    }
+
+    /// Settles one definitive refusal of `attempt` made before its `Started`
+    /// (issue #196), per [`Self::settle_undispatchable`].
+    ///
+    /// The refused attempt did not start, so the run is told the attempts
+    /// before it, which the row counted when the claim read it.
+    ///
+    /// The refusal is delivered, or parked, only while the claim's lease is
+    /// still current. The authority can answer after the lease lapsed, and
+    /// by then another worker may hold the ticket and have made the attempt
+    /// this one refused, or have it out. Told now, the run would fail beside
+    /// that attempt, and the ticket cancelled with it would lose that
+    /// attempt's outcome. So the claim ends as one out of lease does,
+    /// writing nothing, and the claim that follows asks the authority again.
+    /// A worker that stalls between this check and the delivery can still
+    /// deliver.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_refused_before_started(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: &AgentDispatchClaim,
+        intent: &AgentRunEffect,
+        attempt: u32,
+        refusal: &AgentAuthorityRefusal,
+        possibly_executed: bool,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        if !self.fleet.is_current_claim_for(claim, 0)? {
+            return Ok(ClaimConclusion::OutOfLease);
         }
         self.settle_undispatchable(
             scope,
@@ -5410,8 +5456,10 @@ where
     /// `started` is how many of the generation's attempts have started, which
     /// is what the run is told and charges: a refusal before `Started` does
     /// not count the attempt it refused, and one after it does (issue #196).
-    /// A park's `ambiguous-attempt` link is to the last of them, the attempt
-    /// that may have executed.
+    /// A park's `ambiguous-attempt` link is to the last attempt that started:
+    /// after a refusal before `Started`, the attempt before the refused one,
+    /// which may have executed; after `credential-resolver-missing`, the
+    /// refused attempt itself, which invoked nothing.
     #[allow(clippy::too_many_arguments)]
     async fn settle_undispatchable(
         &mut self,
