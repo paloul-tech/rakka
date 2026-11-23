@@ -1422,3 +1422,157 @@ async fn a_refusal_on_a_lapsed_lease_leaves_the_retry_to_the_worker_that_holds_t
         "the run completes on worker two's retry"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A finding after the lease (issue #212). The reconciler can answer after
+// the asking claim's lease lapsed, whatever it finds. The claim then acts on
+// nothing, ends out of lease, and leaves the ticket to the claim that
+// follows, which asks again.
+// ---------------------------------------------------------------------------
+
+/// A reconciler that always answers `Unknown`.
+fn unknown() -> ScriptedReconciler {
+    ScriptedReconciler::new().with_finding(AgentReconciliationFinding::Unknown)
+}
+
+/// A reconcileable call with a budget of `attempts`, every call of which
+/// fails, whose reconciler answers as `answers` does, its first answer after
+/// the asking claim's lease. Started and pumped to the tool ticket.
+async fn a_call_whose_first_finding_comes_late(
+    attempts: u32,
+    answers: &ScriptedReconciler,
+) -> AuthorityFixture {
+    let fx = failing_reconcileable_call(attempts);
+    let reconciler = HookedReconciler::new(&fx, answers);
+    let fx = fx.with_reconciler(reconciler.clone());
+    reconciler.arm(BeforeTheAnswer::OutlastsTheLease);
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    fx
+}
+
+/// A late `Unknown` leaves the burn to the claim that follows. The call's
+/// first attempt failed, and the next claim's reconciler answers `Unknown`
+/// after its lease: the claim ends out of lease and burns nothing. The
+/// claim after it asks again and burns the attempt once. The late claim
+/// used to burn it under the lapsed lease and end its pass in
+/// `claim-fenced`.
+#[tokio::test]
+async fn a_late_unknown_finding_leaves_the_burn_to_the_claim_that_follows() {
+    let answers = unknown();
+    let fx = a_call_whose_first_finding_comes_late(3, &answers).await;
+    claim_round(&fx).await;
+    assert_eq!(tool_row(&fx).await, (Failed, 1));
+
+    let late = the_late_claim(&fx).await;
+
+    assert_eq!(
+        (late.lapsed, late.failed_attempts, late.parked_indeterminate),
+        (1, 0, 0)
+    );
+    assert_eq!(answers.queries(), 1);
+    assert_eq!(tool_row(&fx).await, (Failed, 1), "nothing was burned");
+    let next = claim_round(&fx).await;
+    assert_eq!((next.failed_attempts, answers.queries()), (1, 2));
+    assert_eq!(
+        tool_row(&fx).await,
+        (Failed, 2),
+        "the claim that followed burned the attempt once"
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
+
+/// A late `Executed` is left to the claim that follows. The next claim's
+/// reconciler finds the failed call executed, after its lease: the claim
+/// ends out of lease and delivers nothing. The claim after it asks again,
+/// delivers the outcome, and the run completes. The late claim used to
+/// deliver it under the lapsed lease and end its pass in `claim-fenced`.
+#[tokio::test]
+async fn a_late_executed_finding_is_left_to_the_claim_that_follows() {
+    let answers = ScriptedReconciler::new().with_finding(executed());
+    let fx = a_call_whose_first_finding_comes_late(3, &answers).await;
+    claim_round(&fx).await;
+    assert_eq!(tool_row(&fx).await, (Failed, 1));
+
+    let late = the_late_claim(&fx).await;
+
+    assert_eq!((late.lapsed, late.delivered), (1, 0));
+    assert_eq!(tool_row(&fx).await, (Failed, 1), "nothing was settled");
+    let next = claim_round(&fx).await;
+    assert_eq!((next.delivered, answers.queries()), (1, 2));
+    fx.pump().await;
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::Completed
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
+
+/// A late "not executed" with no budget left is settled by the claim that
+/// follows. A budget of one: the only attempt is lost after its `Started`.
+/// The next claim is told "not executed" after its lease, and no attempt
+/// would follow; it ends out of lease, and the row still marks the lost
+/// attempt. The claim after it asks again and settles the row `Exhausted`.
+/// The late claim used to settle it under the lapsed lease (issue #171
+/// kept that, since no worker could make another attempt) and end its pass
+/// in `claim-fenced`.
+#[tokio::test]
+async fn a_late_not_executed_with_no_budget_left_is_settled_by_the_claim_that_follows() {
+    let answers = not_executed();
+    let fx = a_call_whose_first_finding_comes_late(1, &answers).await;
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    assert!(fx.one_pass().await.died, "the worker is lost after Started");
+    assert_eq!(tool_row(&fx).await, (Dispatching, 0));
+
+    let late = the_late_claim(&fx).await;
+
+    assert_eq!((late.invoked, late.lapsed), (0, 1));
+    assert_eq!(answers.queries(), 1);
+    assert_eq!(tool_row(&fx).await, (Dispatching, 0), "nothing was burned");
+    claim_round(&fx).await;
+    assert_eq!(tool_row(&fx).await, (Exhausted, 1));
+    assert_eq!((answers.queries(), fx.tools.invocation_count(TOOL)), (2, 0));
+    assert_eq!(
+        fx.effect_at(1)
+            .await
+            .expect("the run holds the tool call")
+            .status,
+        AgentRunEffectStatus::Exhausted
+    );
+}
+
+/// A late `Unknown` on a winding-down run parks nothing. The call's first
+/// attempt failed, and the run is then cancelled. The next claim's
+/// reconciler answers `Unknown` after its lease: the claim ends out of lease
+/// and parks nothing. The claim after it asks again and parks the call. The
+/// late claim used to park it under the lapsed lease and end its pass in
+/// `claim-fenced`.
+#[tokio::test]
+async fn a_late_unknown_finding_on_a_winding_down_run_parks_nothing() {
+    let answers = unknown();
+    let fx = a_call_whose_first_finding_comes_late(3, &answers).await;
+    claim_round(&fx).await;
+    assert_eq!(tool_row(&fx).await, (Failed, 1));
+    cancel_the_run(&fx).await;
+
+    let late = the_late_claim(&fx).await;
+
+    assert_eq!((late.lapsed, late.parked_indeterminate), (1, 0));
+    assert_eq!(tool_row(&fx).await, (Failed, 1), "nothing was parked");
+    assert_ne!(
+        fx.effect_at(1)
+            .await
+            .expect("the run holds the tool call")
+            .status,
+        AgentRunEffectStatus::Indeterminate
+    );
+    let next = claim_round(&fx).await;
+    assert_eq!((next.parked_indeterminate, answers.queries()), (1, 2));
+    assert_eq!(
+        fx.effect_at(1)
+            .await
+            .expect("the run holds the tool call")
+            .status,
+        AgentRunEffectStatus::Indeterminate
+    );
+}

@@ -2328,12 +2328,13 @@ pub struct AgentDispatchPass {
     /// counted here. They are in [`Self::claimed`] and in nothing else.
     ///
     /// Two more are counted with the second kind and end their batch the
-    /// same way (issue #195). Both follow the reconciler's finding of "not
-    /// executed" about an attempt an earlier claim made, before the attempt
-    /// that would follow, which is the claim's first. One is a claim whose
-    /// lease lapsed while the reconciler answered: that attempt is made only
-    /// while the lease is still current. The other follows a failed attempt
-    /// and reads the ticket's row again: a row still unfinished and no longer
+    /// same way (issues #195 and #212). One is a claim whose lease lapsed
+    /// while the reconciler answered: whatever the finding, it is not acted
+    /// on, no attempt is made, burned or delivered, nothing is parked, and
+    /// the claim that follows asks again. The other follows a finding of
+    /// "not executed" about a failed attempt an earlier claim made, before
+    /// the attempt that would follow, which is the claim's first. It reads
+    /// the ticket's row again: a row still unfinished and no longer
     /// where the claim first read it was written meanwhile by a worker whose
     /// own lease had lapsed, and the claim makes no attempt beside that
     /// worker's. Such a claim can end with its own lease standing in full,
@@ -2388,10 +2389,11 @@ enum ClaimConclusion {
     /// The claim made an attempt that was found not executed, and could not
     /// make another in the time its lease covers (issue #171): the lease did
     /// not cover one, or the attempt's bound, counted from the instant the
-    /// claim asked, was spent before the attempt could start. Or, before its
-    /// first attempt, the reconciler answered about an attempt an earlier
-    /// claim made and the claim's lease had lapsed by then, or the ticket's
-    /// row had been moved meanwhile by a worker whose own lease had lapsed
+    /// claim asked, was spent before the attempt could start. Or the
+    /// reconciler answered once the claim's lease had lapsed, and the
+    /// finding, whatever it was, was not acted on (issues #195 and #212).
+    /// Or, before its first attempt, the ticket's row had been moved while
+    /// the reconciler answered by a worker whose own lease had lapsed
     /// (issue #195). Or the dispatch authority answered once its lease had
     /// lapsed, and the answer, whatever it was, was not acted on (issues
     /// #196 and #207), or a model call's policy conflict was met on a lease
@@ -5061,6 +5063,11 @@ where
     /// a cancellation. The two are equal where the row has not counted the
     /// attempt asked about. `started` is one fewer where the row counted it
     /// when it failed ([`Self::recover_ambiguous`], issue #195).
+    ///
+    /// A finding is acted on only while the claim's lease is still current
+    /// (issue #212). One that comes after the lease lapsed, whatever it is,
+    /// ends the claim out of lease with nothing written, and the claim that
+    /// follows asks again.
     #[allow(clippy::too_many_arguments)]
     async fn reconcile_ambiguous(
         &mut self,
@@ -5105,6 +5112,27 @@ where
         };
 
         let finding = reconciler.reconcile(&protocol, scope, intent).await?;
+        // The reconciler can answer after the claim's lease lapsed, and by
+        // then another worker may hold the ticket and have the attempt out.
+        // Acted on, a late `Unknown` recorded a failure over that worker's
+        // call and could park a call that succeeded, and a late `Executed`
+        // was delivered beside it. So whatever the finding, the claim acts on
+        // it only while its lease is still current, and otherwise ends here,
+        // writes nothing, and leaves the ticket to the claim that follows,
+        // which asks again (issue #212). An attempt this claim asked about
+        // stays as the row holds it, and the claim that follows counts it
+        // once.
+        //
+        // Only that the lease has not lapsed is asked, not that it covers
+        // what follows: every claim on this path starts with the
+        // reconciler's question, so one whose lease could not cover the
+        // question and a whole attempt would never make one, and nothing
+        // would ever retry the effect (issue #195). The lease has to cover
+        // the reconciler's answer: a reconciler that always answers slower
+        // than the lease is asked once by each claim, and the call waits.
+        if !self.fleet.is_current_claim_for(&claim, 0)? {
+            return Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease));
+        }
         match finding {
             AgentReconciliationFinding::Executed { outcome } => {
                 if let Err(error) =
@@ -5185,8 +5213,9 @@ where
                     return Ok(ClaimStep::Concluded(ClaimConclusion::Settled));
                 }
                 // Another attempt under the same claim needs a lease that
-                // covers it. Nothing renews the claim being run, and once its
-                // lease has lapsed any worker may take the ticket, ask the
+                // covers it, not only one that is current, as every finding
+                // needs above. Nothing renews the claim being run, and once
+                // its lease has lapsed any worker may take the ticket, ask the
                 // reconciler while this claim's attempt is in flight, be told
                 // "not executed", and invoke beside it. So the claim asks
                 // whether its lease is still active for the length of one
@@ -5195,39 +5224,18 @@ where
                 // It ends before the burn and writes nothing: the row stays
                 // `Dispatching`, the claim that follows asks the reconciler
                 // about this attempt and burns it, and the budget counts it
-                // once. An attempt that spends the budget has none after it,
-                // so it is not asked and is settled here as before: under a
-                // lease that is over, the row is still written `Exhausted`
-                // and the fleet answers the claim `claim-fenced`.
-                //
-                // The first attempt a claim makes after the reconciler
-                // answered about an attempt that was not its own needs the
-                // lease to be current still (issue #195). The answer can come
-                // after the lease lapsed, and by then another worker may have
-                // taken the ticket and be making that attempt. Only that the
-                // lease has not lapsed is asked, not that it covers the
-                // attempt: every claim on this path starts with the
-                // reconciler's question, so one whose lease could not cover
-                // the question and a whole attempt would never make one, and
-                // nothing would ever retry the effect. Where the row counted
-                // the attempt asked about, an attempt follows unless the row
-                // has moved meanwhile; where it did not, one follows if the
-                // burn leaves budget.
+                // once. A claim's first attempt after the answer needs only
+                // the current lease found above (issue #195).
                 //
                 // The next attempt's bound is counted from this instant, read
                 // before the fleet reads its own clock, so the deadline it is
                 // handed is inside the lease the fleet just answered for.
                 let asked_at = self.now();
                 let another_follows = ambiguity.under_this_claim && attempt < intent.max_attempts;
-                let first_follows = !ambiguity.under_this_claim
-                    && (started < attempt || attempt < intent.max_attempts);
-                let covered_ms = if another_follows {
-                    intent.timeout_ms.unwrap_or(0)
-                } else {
-                    0
-                };
-                if (another_follows || first_follows)
-                    && !self.fleet.is_current_claim_for(&claim, covered_ms)?
+                if another_follows
+                    && !self
+                        .fleet
+                        .is_current_claim_for(&claim, intent.timeout_ms.unwrap_or(0))?
                 {
                     return Ok(ClaimStep::Concluded(ClaimConclusion::OutOfLease));
                 }
@@ -5288,7 +5296,9 @@ where
     /// `attempt` and `started` are [`Self::reconcile_ambiguous`]'s. A
     /// winding-down run's park is made at once and charged `started`. On a
     /// live run the finding burns an attempt whatever row it was asked about,
-    /// which is what keeps the queries inside the budget, and a park after a
+    /// which is what keeps the queries inside the budget while the
+    /// reconciler answers inside the lease (a later finding is not acted on
+    /// and burns nothing, issue #212), and a park after a
     /// burn that spent the budget is charged what the row then counts:
     /// `attempt`.
     #[allow(clippy::too_many_arguments)]
