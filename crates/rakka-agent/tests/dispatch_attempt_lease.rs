@@ -1004,3 +1004,26 @@ async fn a_later_attempt_whose_bound_is_spent_is_not_made() {
         );
     }
 }
+
+/// A finding inside a lease a batch's settles renewed is acted on (issue
+/// #212). The claim asks whether its lease is current after the reconciler
+/// answers, and the lease it asks about is the one its entry holds, which a
+/// renewal moves. The first ticket of a batch answers at 40 s, and its
+/// settle renews the second to 100 s. The second ticket's only attempt ends
+/// unknown at 80 s, after the 60 s the batch was leased to, and is found
+/// not executed then: the claim settles it as exhausted. A check of the
+/// expiry the claim was handed would have ended it out of lease instead.
+#[tokio::test]
+async fn a_finding_inside_a_renewed_lease_is_acted_on() {
+    let (fx, calls, reconciler) = world_of(&[TOOL, OTHER_TOOL], 1, Some(40_000), 40_000);
+    ready(&fx).await;
+    let second = fx.effect_at(2).await.expect("the second tool effect");
+    *calls.answers.lock().expect("the knob is writable") = Some("call-1".to_string());
+
+    let pass = pass_of(&fx, "worker-1").await;
+
+    assert_eq!(calls.started_at_of("call-2"), vec![40_000]);
+    assert_eq!((pass.invoked, pass.lapsed), (2, 0));
+    assert_eq!(reconciler.queries(), 1, "the finding came at 80 s");
+    assert_eq!(row_of(&fx, &second).await, (OutboxStatus::Exhausted, 1));
+}

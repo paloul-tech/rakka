@@ -1836,3 +1836,420 @@ async fn a_late_grant_on_the_retry_of_a_counted_lost_attempt_leaves_it_to_the_ne
     assert_eq!(next.invoked, 1);
     assert_eq!(fx.tools.invocation_count(TOOL), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Every late finding (issue #212). A claim asks whether its lease is still
+// current right after the reconciler answers, whatever the finding, and
+// ends out of lease, writing nothing more, when it is not.
+// ---------------------------------------------------------------------------
+
+/// A hand-off between a held collaborator and the test: the collaborator
+/// signals the sender, then waits on the receiver.
+type HandOff = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+/// A reconciler whose first answer comes after the claim's lease: it moves
+/// the clock past the lease and, when a hand-off is armed, signals `held`
+/// and waits for `release`. Every answer is `answers`'.
+struct LateReconciler {
+    answers: ScriptedReconciler,
+    clock: SharedAtomicWorkflowClock,
+    late: AtomicBool,
+    hand_off: Mutex<Option<HandOff>>,
+}
+
+/// A [`LateReconciler`] answering as `answers` does, with no hand-off armed.
+fn late_reconciler(fx: &AuthorityFixture, answers: &ScriptedReconciler) -> LateReconciler {
+    LateReconciler {
+        answers: answers.clone(),
+        clock: fx.wf_clock.clone(),
+        late: AtomicBool::new(true),
+        hand_off: Mutex::new(None),
+    }
+}
+
+impl AgentEffectReconciler for LateReconciler {
+    fn reconcile<'a>(
+        &'a self,
+        protocol: &'a AgentReconciliationProtocolRef,
+        scope: &'a AgentRunScope,
+        effect: &'a AgentRunEffect,
+    ) -> AgentDispatchFuture<'a, AgentReconciliationFinding> {
+        Box::pin(async move {
+            if self.late.swap(false, Ordering::SeqCst) {
+                self.clock.advance(LEASE_MS + 1);
+                let hand_off = self.hand_off.lock().expect("the lock holds").take();
+                if let Some((held, release)) = hand_off {
+                    let _ = held.send(());
+                    let _ = release.await;
+                }
+            }
+            self.answers.reconcile(protocol, scope, effect).await
+        })
+    }
+}
+
+/// An authority whose first answer is an error that comes after the
+/// claim's lease: it moves the clock past the lease, signals `held`, waits
+/// for `release`, then fails as an unavailable authority does. Every later
+/// question is `inner`'s.
+struct LateErrorAuthority {
+    inner: Arc<dyn AgentDispatchAuthority>,
+    clock: SharedAtomicWorkflowClock,
+    hand_off: Mutex<Option<HandOff>>,
+}
+
+impl AgentDispatchAuthority for LateErrorAuthority {
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        Box::pin(async move {
+            let hand_off = self.hand_off.lock().expect("the lock holds").take();
+            if let Some((held, release)) = hand_off {
+                self.clock.advance(LEASE_MS + 1);
+                let _ = held.send(());
+                let _ = release.await;
+                return Err(AgentDispatchError::collaborator(
+                    "authority-unavailable",
+                    "the authority timed out",
+                ));
+            }
+            self.inner.authorize(scope, run, intent, attempt, now).await
+        })
+    }
+
+    fn review_tool_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        tool: Option<&'a AgentToolId>,
+        content: AgentTaskContent,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentToolResponseDecision> {
+        self.inner
+            .review_tool_response(scope, intent, tool, content)
+    }
+
+    fn review_model_response<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        turn: AgentModelTurn,
+    ) -> AgentDispatchFuture<'a, rakka_agent::AgentModelResponseDecision> {
+        self.inner.review_model_response(scope, intent, turn)
+    }
+}
+
+/// What [`worker_two_retries_while_worker_one_waits_for_an_answer`] leaves:
+/// each worker's pass, the calls of worker two's tool, the fixture and the
+/// tool call's effect as it was before the passes.
+struct LateRace {
+    one: rakka_agent::AgentDispatchResult<rakka_agent::AgentDispatchPass>,
+    two: rakka_agent::AgentDispatchResult<rakka_agent::AgentDispatchPass>,
+    calls: usize,
+    fx: AuthorityFixture,
+    effect: AgentRunEffect,
+}
+
+/// A reconcileable call with a budget of two fails its first attempt. Worker
+/// one, built by `worker_one` with the race's hand-off, claims the ticket and
+/// is held past its lease at the hand-off. Worker two claims the ticket
+/// meanwhile, is told "not executed", and its retry is out when worker one
+/// goes on; the retry succeeds once worker one's pass is over.
+async fn worker_two_retries_while_worker_one_waits_for_an_answer(
+    worker_one: impl FnOnce(&AuthorityFixture, HandOff) -> Pipeline,
+) -> LateRace {
+    let (fx, _) = a_call_whose_first_attempt_failed(reconcileable(2)).await;
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+    let (held, lapsed) = oneshot::channel();
+    let (release_one, answered) = oneshot::channel();
+    let (entered, out) = oneshot::channel();
+    let (release_two, answer) = oneshot::channel();
+    let tool = Arc::new(HeldTool {
+        calls: AtomicUsize::new(0),
+        gate: Mutex::new(Some((entered, answer))),
+    });
+    let mut one = worker_one(&fx, (held, answered));
+    let mut two = worker(&fx, "worker-two", the_fixtures_authority(&fx), tool.clone())
+        .with_reconciler(Arc::new(
+            ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted),
+        ));
+    let (one_done, one_ended) = oneshot::channel::<()>();
+
+    fx.expire_lease();
+    fx.settle().await;
+    let (one, two, ()) = tokio::join!(
+        async {
+            let pass = one.pump_run(&run_scope()).await;
+            let _ = one_done.send(());
+            pass
+        },
+        async {
+            let _ = lapsed.await;
+            two.pump_run(&run_scope()).await
+        },
+        async {
+            let _ = out.await;
+            let _ = release_one.send(());
+            let _ = one_ended.await;
+            let _ = release_two.send(());
+        }
+    );
+
+    LateRace {
+        one,
+        two,
+        calls: tool.calls.load(Ordering::SeqCst),
+        fx,
+        effect,
+    }
+}
+
+/// Worker one ended out of lease and wrote nothing, and the run completed
+/// on worker two's call.
+async fn the_run_completes_on_worker_twos_call(race: LateRace) {
+    let one = race.one.expect("worker one's pass runs");
+    assert_eq!(
+        (
+            one.lapsed,
+            one.failed_attempts,
+            one.parked_indeterminate,
+            one.delivered
+        ),
+        (1, 0, 0, 0),
+        "worker one ends out of lease and writes nothing"
+    );
+    let two = race.two.expect("worker two's pass runs");
+    assert_eq!((two.invoked, two.delivered), (1, 1));
+    assert_eq!(race.calls, 1, "worker two's retry is the one call made");
+    let row = race
+        .fx
+        .outbox_row(&race.effect)
+        .await
+        .expect("the ticket's row exists");
+    assert_eq!(
+        row.status(),
+        OutboxStatus::Dispatched,
+        "worker two finished the row"
+    );
+    race.fx.pump().await;
+    assert_eq!(
+        race.fx
+            .fx
+            .run_snapshot()
+            .await
+            .expect("the run exists")
+            .status,
+        AgentRunStatus::Completed,
+        "the run completes on worker two's call"
+    );
+}
+
+/// A late `Unknown` is not acted on beside another worker's call (the
+/// review's probe A). Worker one's reconciler answers `Unknown` after its
+/// lease lapsed, while worker two's retry is out. Worker one ends out of
+/// lease, and the run completes on worker two's call. The late `Unknown`
+/// used to record a failure over worker two's call, spending the budget,
+/// and park the call: the run waited for a decision about a call that had
+/// run, and its result was lost.
+#[tokio::test]
+async fn a_late_unknown_finding_is_not_acted_on_beside_another_workers_call() {
+    let race = worker_two_retries_while_worker_one_waits_for_an_answer(|fx, hand_off| {
+        let late = late_reconciler(
+            fx,
+            &ScriptedReconciler::new().with_finding(AgentReconciliationFinding::Unknown),
+        );
+        *late.hand_off.lock().expect("the lock holds") = Some(hand_off);
+        worker(
+            fx,
+            "worker-one",
+            the_fixtures_authority(fx),
+            Arc::new(fx.tools.clone()),
+        )
+        .with_reconciler(Arc::new(late))
+    })
+    .await;
+
+    the_run_completes_on_worker_twos_call(race).await;
+}
+
+/// An `Unknown` met after a late authority error is not acted on beside
+/// another worker's call (the review's probe B). Worker one asks the
+/// authority before the reconciler (issue #195), and the authority's error
+/// comes after the lease. An error keeps its handling, so worker one goes
+/// on to the reconciler, which answers `Unknown` at once: asked once, and
+/// its answer is not acted on, as the lease has lapsed. The run completes
+/// on worker two's call.
+#[tokio::test]
+async fn an_unknown_finding_after_a_late_authority_error_is_not_acted_on_beside_another_workers_call(
+) {
+    let asked =
+        Arc::new(ScriptedReconciler::new().with_finding(AgentReconciliationFinding::Unknown));
+    let reconciler = asked.clone();
+    let race = worker_two_retries_while_worker_one_waits_for_an_answer(move |fx, hand_off| {
+        worker(
+            fx,
+            "worker-one",
+            Arc::new(LateErrorAuthority {
+                inner: the_fixtures_authority(fx),
+                clock: fx.wf_clock.clone(),
+                hand_off: Mutex::new(Some(hand_off)),
+            }),
+            Arc::new(fx.tools.clone()),
+        )
+        .with_reconciler(reconciler)
+    })
+    .await;
+
+    assert_eq!(
+        asked.queries(),
+        1,
+        "the reconciler is asked once, on the lapsed lease"
+    );
+    the_run_completes_on_worker_twos_call(race).await;
+}
+
+/// A claim's own attempt that ends unknown and is answered `Unknown` after
+/// its lease is counted once, by the claim that follows. Worker one's call
+/// ends with an unknown outcome, and its reconciler answers after the
+/// lease: worker one ends out of lease and counts nothing. Worker two asks
+/// again and burns the attempt. It used to be burned by worker one under
+/// the lapsed lease, which then ended its pass in `claim-fenced`.
+#[tokio::test]
+async fn a_claims_own_unknown_attempt_answered_after_the_lease_is_counted_once() {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &reconcileable(3)),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+    let tool = UnknownTool::default();
+    let unknown = ScriptedReconciler::new().with_finding(AgentReconciliationFinding::Unknown);
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        the_fixtures_authority(&fx),
+        Arc::new(tool.clone()),
+    )
+    .with_reconciler(Arc::new(late_reconciler(&fx, &unknown)));
+    fx.expire_lease();
+    fx.settle().await;
+
+    let first = one
+        .pump_run(&run_scope())
+        .await
+        .expect("worker one's pass runs");
+
+    assert_eq!(
+        (first.invoked, first.lapsed, first.failed_attempts),
+        (1, 1, 0)
+    );
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (OutboxStatus::Dispatching, 0),
+        "nothing was counted"
+    );
+    let mut two = worker(
+        &fx,
+        "worker-two",
+        the_fixtures_authority(&fx),
+        Arc::new(tool.clone()),
+    )
+    .with_reconciler(Arc::new(unknown.clone()));
+    fx.expire_lease();
+    fx.settle().await;
+    let second = two
+        .pump_run(&run_scope())
+        .await
+        .expect("worker two's pass runs");
+    assert_eq!((second.invoked, second.failed_attempts), (0, 1));
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (OutboxStatus::Failed, 1),
+        "the attempt is counted once"
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+}
+
+/// A claim's own last attempt, found "not executed" after the lease, fails
+/// the run under the lost worker's code. A budget of one: worker one's call
+/// ends with an unknown outcome (`upstream-timeout`), and its reconciler
+/// answers after the lease, so worker one writes nothing and the row still
+/// marks the attempt `Dispatching`. Worker two recovers the row as an
+/// attempt whose worker was lost, is told "not executed", and with no
+/// budget left settles it: the run fails under
+/// `dispatcher-lost-after-started`. Answered inside the lease, the run
+/// fails under the tool's own code. Before issue #212 worker one settled
+/// the row under its lapsed lease (issue #171's exception), with that code.
+/// Every earlier attempt whose claim ran out of lease has been burned under
+/// the lost worker's code since issue #171.
+#[tokio::test]
+async fn a_claims_own_last_attempt_found_not_executed_after_the_lease_fails_under_the_lost_worker_code(
+) {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &reconcileable(1)),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+    let tool = UnknownTool::default();
+    let not_executed =
+        ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted);
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        the_fixtures_authority(&fx),
+        Arc::new(tool.clone()),
+    )
+    .with_reconciler(Arc::new(late_reconciler(&fx, &not_executed)));
+    fx.expire_lease();
+    fx.settle().await;
+
+    let first = one
+        .pump_run(&run_scope())
+        .await
+        .expect("worker one's pass runs");
+
+    assert_eq!((first.invoked, first.lapsed), (1, 1));
+    let row = fx.outbox_row(&effect).await.expect("the ticket's row");
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (OutboxStatus::Dispatching, 0)
+    );
+    let mut two = worker(
+        &fx,
+        "worker-two",
+        the_fixtures_authority(&fx),
+        Arc::new(tool.clone()),
+    )
+    .with_reconciler(Arc::new(not_executed.clone()));
+    fx.expire_lease();
+    fx.settle().await;
+    let second = two
+        .pump_run(&run_scope())
+        .await
+        .expect("worker two's pass runs");
+    assert_eq!((second.invoked, second.delivered), (0, 1));
+    fx.pump().await;
+    assert_eq!(
+        effect_failed(&fx).await,
+        (
+            "dispatcher-lost-after-started".to_string(),
+            Some(1),
+            Some(1)
+        )
+    );
+    assert_eq!(
+        (tool.calls.load(Ordering::SeqCst), not_executed.queries()),
+        (1, 2)
+    );
+}

@@ -1079,6 +1079,30 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Not changed.** A worker that stalls past its lease between this check and its `Started` write can still start an attempt beside another worker. Between the two the dispatcher only checks the grant against the intent. A refusal inside a lease a batch's settles renewed is acted on, as before. **Mixed builds.** Each claim is decided by the worker that holds it, and an earlier build's worker acts on a late answer as before.
 
+- Issue #212 ("a reconciler finding that comes after the lease is acted on beside another worker's call") changes what a claim does with a reconciler finding that comes after its lease lapsed. **No durable field, status, error code or decision kind is added, and no record changes shape.**
+
+  **What was wrong.** The reconciler can answer after the claim's lease lapsed, and by then another worker may hold the ticket and have its retry out. Only a finding of "not executed" was checked against the lease, and only where an attempt followed it.
+  - A late `Unknown` on a live run burned an attempt, recording a failure over the other worker's call in flight. Where that spent the budget, it parked the call: the run waited for a decision about a call that had succeeded, and that call's result was lost.
+  - A late `Executed` was delivered.
+  - On a winding-down run, a late finding parked or cancelled the call.
+  - A late "not executed" with no budget left settled the row `Exhausted`. Issue #171 kept that deliberately, since no worker could make another attempt.
+
+  Each of these ended the pass in a `claim-fenced` error. A late error from the dispatch authority, to the question asked before the reconciler (issue #195), also led to the reconciler on a lapsed lease, and from there to the first case.
+
+  **The rule.** Right after the reconciler answers, whatever the finding, a claim asks whether its lease is still current. If it is not, the claim ends there, writing nothing, is counted in `AgentDispatchPass::lapsed`, and leaves the ticket to the claim that follows, which asks again. Only that the lease is current is asked, for the reason issue #195 gives. Issue #171's check that the lease covers another attempt under the same claim is unchanged. An error from the reconciler is not a finding and keeps its handling.
+
+  **What a deployment sees.**
+  - A late `Unknown` records no failure over another worker's call and parks nothing, so the run completes on that worker's call. With no other worker, the next claim asks again and burns the attempt once.
+  - A late `Executed` is delivered by the next claim, after one more question.
+  - A late "not executed" with no budget left is settled `Exhausted` by the next claim, after one more question. Where the late answer was about the claim's own attempt (its call ended with an unknown outcome), the late claim writes nothing, so the next claim finds the row as a lost worker leaves it. The run then fails under `dispatcher-lost-after-started`, where it failed under the attempt's own code (`upstream-timeout`, say). Every earlier attempt whose claim ran out of lease has been burned under that code since issue #171.
+  - On a winding-down run, the next claim parks or cancels the call.
+  - `pump_run` returns a report with one lapsed claim, where these passes returned a `claim-fenced` error.
+  - After a late authority error, the reconciler is still asked once on the lapsed lease, and its answer is not acted on.
+
+  **The cost:** the lease has to cover the reconciler's answer for every finding. A reconciler that always answers slower than the lease never resolves the call: it is asked once by each claim, and the call waits, where an `Unknown` used to spend the budget and park the call for a person. A finding of "not executed" has had that cost since issue #195.
+
+  **Not changed.** A worker that stalls past its lease between this check and its first write (the burn, the delivery, the park or the cancel) can still act. **Mixed builds.** Each claim is decided by the worker that holds it, and an earlier build's worker acts on a late finding as before. Rolled back, nothing is left to undo.
+
 Run the default compatibility matrix:
 
 ```sh
