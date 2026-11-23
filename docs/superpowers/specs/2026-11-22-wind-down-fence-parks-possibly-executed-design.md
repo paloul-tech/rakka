@@ -114,8 +114,10 @@ already uses.
 - The call reads `Indeterminate`, `last_error_code` `run-cancelled-after-attempt`,
   charged the attempts that started (the row's count), as the fence's cancel
   was (issue #182).
-- `AgentDispatchPass::parked_indeterminate` counts one where `cancelled` did.
-  The fleet entry's `last_error_code` is `indeterminate`, where it was
+- `AgentDispatchPass::parked_indeterminate` counts one more. A park under a
+  claim still settles the ticket as cancelled, so `cancelled` counts it as
+  before; the sweep's park settles no ticket and counts only the park. The
+  fleet entry's `last_error_code` is `indeterminate`, where it was
   `run-cancelled`.
 - A delegation send, handoff send or workflow start stays pending until the
   decision; a decision of "executed" lets the run's usual cancel chase the
@@ -145,8 +147,11 @@ counts and the tool's invocation count:
   untold run (the claim's replay), and with a finished entry (the sweep).
 - A workflow start or delegation send through the park and a decision of
   "executed", to the chase.
-- Guards: a read-only call with a failed attempt is still cancelled; an
-  idempotent call with no attempt is still cancelled with none charged.
+- Guards, in `effect_dispatch.rs` beside #182's tests: a read-only call with
+  a failed attempt is still cancelled, charged that attempt (new); an
+  idempotent call with no attempt is still cancelled with none charged
+  (`a_call_the_fence_cancels_before_it_starts_is_charged_no_attempt`,
+  unchanged).
 
 Each fails on `main` except the guards. The breaks to run one at a time: each
 of the three places restored, the predicate's `>= 1` moved, and the refusal
