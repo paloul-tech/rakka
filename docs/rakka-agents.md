@@ -200,7 +200,11 @@ leaves behind is the same either way.
    On a live run an `Unknown` or mismatched finding still burns one attempt,
    whichever attempt it was asked about, so a reconciler that keeps
    answering `Unknown` is asked at most once for each attempt in the
-   budget. After a failed attempt the dispatch authority is asked before
+   budget, as long as it answers inside the claim's lease. A finding that
+   comes after the lease is not acted on (issue #212): it burns nothing,
+   and the next claim asks again. So a reconciler that always answers
+   slower than the lease is asked once by each claim, and the call waits.
+   After a failed attempt the dispatch authority is asked before
    the reconciler, unless the wind-down fence applies to the call or no
    reconciler is wired, and a retry it defers (a suspended agent, say) asks
    the reconciler nothing and spends none of the budget. So while it is
@@ -388,23 +392,38 @@ is still working on it, and from being run by two:
   the lease has lapsed, the next claim asks the reconciler about the
   attempt that one left and goes on from its answer, as for an attempt
   whose worker was lost. The lease has to cover one attempt, not a budget.
-  An attempt that spends the budget has none after it, so its claim is not
-  asked and settles it as before; a claim's first attempt is not asked
-  whether the lease covers it either.
-- **A claim's first attempt after the reconciler's answer needs a current
-  lease** (issue #195). A claim's first attempt can follow the
-  reconciler's answer about an attempt an earlier claim made: one whose
-  worker was lost, or one that failed. The answer can come after the lease
-  lapsed, so on a finding of "not executed" the claim makes that attempt
-  only if its lease is still current, and otherwise ends there and writes
-  nothing, as above; a lost attempt is then counted by the claim that
-  follows. Only that the lease is current is asked, not that it covers the
-  attempt: every such claim asks the reconciler first, so a rule that the
-  lease cover the attempt too would never retry an effect whose answer and
-  call together outlast the lease. On this path the lease has to cover the
-  reconciler's answer and the call, and after a failed attempt the
-  authority's answer before the question too. After a failed attempt the
-  claim also reads the ticket's row and the run again, and makes no attempt
+  A claim's first attempt is not asked whether the lease covers it, and an
+  attempt that spends the budget has none after it to be covered: each
+  needs only the current lease every finding needs (below).
+- **The reconciler's finding is acted on only under a current lease**
+  (issues #195 and #212). The reconciler can answer after the claim's
+  lease lapsed, and by then another worker may hold the ticket and have
+  the attempt out. So right after the reconciler answers, whatever it
+  finds, the claim asks whether its lease is still current. If it is not,
+  the claim ends there, writes nothing, as above, and leaves the ticket to
+  the claim that follows, which asks again:
+  - a late `Unknown` burns nothing and parks nothing, so it records no
+    failure over another worker's call and parks no call that succeeded;
+  - a late `Executed` is not delivered;
+  - a late "not executed" makes no attempt. With no budget left, the claim
+    that follows settles it;
+  - on a winding-down run, a late finding neither cancels nor parks.
+
+  An attempt the claim asked about stays as the ticket's row holds it, and
+  the claim that follows counts it once. Only that the lease is current is
+  asked, not that it covers the attempt: every such claim asks the
+  reconciler first, so a rule that the lease cover the attempt too would
+  never retry an effect whose answer and call together outlast the lease.
+  On this path the lease has to cover the reconciler's answer and the
+  call, and after a failed attempt the authority's answer before the
+  question too. A reconciler that always answers slower than the lease is
+  asked once by each claim, and the call waits, spending nothing. An error
+  from the reconciler is not a finding and keeps its handling. A worker
+  that stalls past its lease between the check and its first write (the
+  burn, the delivery, the park or the cancel) can still act.
+
+  After a failed attempt, a claim told "not executed" under a current lease
+  also reads the ticket's row and the run again, and makes no attempt
   if the row is no longer where the claim read it: it ends as one out of
   lease does, unless what it reads is what a claim settles with no attempt
   (the row finished, gone or put back in a lost row's place, or the call
