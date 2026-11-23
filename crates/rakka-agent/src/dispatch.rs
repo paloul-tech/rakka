@@ -2339,16 +2339,20 @@ pub struct AgentDispatchPass {
     /// worker's. Such a claim can end with its own lease standing in full,
     /// so neither of these says an effect's attempts outlast the lease.
     ///
-    /// One more is counted with them and ends its batch the same way (issue
-    /// #196): a claim whose dispatch was refused definitively before its
-    /// `Started` (for a policy conflict, by the authority, for a grant that
-    /// fails its check or for a guardrail revision mismatch) once its lease
-    /// had lapsed, which is most often during the authority's answer. The
-    /// refusal is not delivered, and the ticket is left to the claim that
-    /// follows. A value that stays above zero can say the authority answers
-    /// slower than the lease: its refusals are then never delivered, and the
-    /// run
-    /// waits, spending nothing.
+    /// One more is counted with them and ends its batch the same way (issues
+    /// #196 and #207): a claim whose lease lapsed while the dispatch
+    /// authority answered. Whatever the answer, a grant, a refusal
+    /// definitive or transient, or an answer to the question asked before
+    /// the reconciler after a failed attempt, it is not acted on: no attempt
+    /// is made, no refusal is delivered, the reconciler is not asked, and
+    /// the ticket is left to the claim that follows. A model call's policy
+    /// conflict, which the dispatcher decides without asking the authority,
+    /// is counted here too when the lease has lapsed before it is delivered.
+    /// Such a claim used to end its pass in a `claim-fenced` error after a
+    /// late grant or a late transient refusal; it ends here now, and the
+    /// pass returns its report. A value that stays above zero can say the
+    /// authority answers slower than the lease: its answers are then never
+    /// acted on, grants included, and the run waits, spending nothing.
     ///
     /// Nothing is written to the ticket of any of these as its claim ends:
     /// once the lease is over any worker can take it. A pass that ends in an
@@ -2388,10 +2392,11 @@ enum ClaimConclusion {
     /// first attempt, the reconciler answered about an attempt an earlier
     /// claim made and the claim's lease had lapsed by then, or the ticket's
     /// row had been moved meanwhile by a worker whose own lease had lapsed
-    /// (issue #195). Or its dispatch was refused definitively before its
-    /// `Started` once its lease had lapsed, and the refusal was not
-    /// delivered (issue #196). Its ticket is unsettled, and no settle renewed
-    /// the claims its pass holds behind it.
+    /// (issue #195). Or the dispatch authority answered once its lease had
+    /// lapsed, and the answer, whatever it was, was not acted on (issues
+    /// #196 and #207), or a model call's policy conflict was met on a lease
+    /// that had lapsed. Its ticket is unsettled, and no settle renewed the
+    /// claims its pass holds behind it.
     OutOfLease,
 }
 
