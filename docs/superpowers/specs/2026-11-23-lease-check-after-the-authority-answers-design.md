@@ -92,14 +92,16 @@ In `crates/rakka-agent/tests/dispatch_refused_before_started.rs`, beside
 - A late transient refusal: the pass returns a report with one lapsed claim,
   not an error.
 - A late answer to #195's question: the reconciler is asked nothing.
+- A late grant on the retry of a counted lost attempt (idempotent): the
+  loss stays counted, no retry is made, and the next claim makes it once.
 - #196's resolver-race test turns around. The late grant ends worker one
   out of lease before `Started`, worker two makes the retry, and the run is
   not failed.
 - Guard, unchanged: a refusal inside a renewed lease is still delivered.
 
 Each new test fails on `main` except the guard. The breaks to run: the check
-removed; the check moved below the grant's validation; the
-`defer_before_reconciling` arm ignoring "out of lease".
+removed; the check made for a grant only; the `defer_before_reconciling` arm
+ignoring "out of lease".
 
 ## 8. Documents
 
