@@ -913,13 +913,15 @@ fn the_fixtures_authority(fx: &AuthorityFixture) -> Arc<dyn AgentDispatchAuthori
 
 /// An authority whose first answer outlasts the claim's lease. It moves the
 /// clock past the lease and, when given a hand-off, signals it and waits to
-/// be released; then it refuses `tool-revoked`. Every later question it
-/// answers as the fixture's own authority would.
+/// be released; then it refuses, `tool-revoked` unless told another refusal
+/// ([`Self::refusing`]). Every later question it answers as the fixture's
+/// own authority would.
 struct OutlastingAuthority {
     inner: Arc<dyn AgentDispatchAuthority>,
     clock: SharedAtomicWorkflowClock,
     answered: AtomicBool,
     hand_off: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    refusal: AgentAuthorityRefusal,
 }
 
 impl OutlastingAuthority {
@@ -929,7 +931,14 @@ impl OutlastingAuthority {
             clock: fx.wf_clock.clone(),
             answered: AtomicBool::new(false),
             hand_off: Mutex::new(None),
+            refusal: AgentAuthorityRefusal::of("tool-revoked", "the tool was revoked"),
         }
+    }
+
+    /// Refuses with `refusal` instead of `tool-revoked`.
+    fn refusing(mut self, refusal: AgentAuthorityRefusal) -> Self {
+        self.refusal = refusal;
+        self
     }
 
     /// Signals `held` once the lease has lapsed, and refuses once `release`
@@ -959,10 +968,7 @@ impl AgentDispatchAuthority for OutlastingAuthority {
                 let _ = held.send(());
                 let _ = release.await;
             }
-            Ok(AgentDispatchDecision::Refused(AgentAuthorityRefusal::of(
-                "tool-revoked",
-                "the tool was revoked",
-            )))
+            Ok(AgentDispatchDecision::Refused(self.refusal.clone()))
         })
     }
 
@@ -1481,20 +1487,21 @@ impl AgentEffectReconciler for HandingOffReconciler {
     }
 }
 
-/// A refusal after `Started` is told on a lapsed lease, and the claim that
-/// asked the reconciler meanwhile parks nothing. This is the author's call,
-/// not the owner's ruling: `credential-resolver-missing` is not asked
-/// whether the lease is current.
+/// A late grant ends the claim before a missing resolver is met (issue
+/// #207). `credential-resolver-missing` is refused after `Started`, so the
+/// claim checks its lease before then, right after the authority's answer.
 ///
 /// A reconcileable call with a credential binding fails its first attempt.
 /// Worker one, which has no resolver wired, is told "not executed", and the
 /// authority's grant for its retry comes after the lease. Worker two claims
-/// the ticket and asks its reconciler; meanwhile worker one writes `Started`
-/// and is refused for its missing resolver, tells the run and cancels the
-/// row. Worker two, told "not executed", reads the row again, finds it
-/// cancelled and the call resolved, and settles its ticket.
+/// the ticket and asks its reconciler. Worker one's late grant ends its claim
+/// out of lease: it writes no `Started`, meets no missing resolver, and tells
+/// the run nothing. Worker two, told "not executed", finds the row as it read
+/// it and makes the retry, which fails as every call of the tool does. The
+/// late grant used to go on to `Started` and the missing resolver, failing
+/// the run and cancelling the row beside worker two's claim.
 #[tokio::test]
-async fn a_missing_resolver_refusal_on_a_lapsed_lease_is_told_and_parks_nothing_beside_it() {
+async fn a_late_grant_ends_the_claim_before_a_missing_resolver_is_met() {
     let spec = reconcileable(3).with_credential_binding(
         AgentCredentialBindingRef::new("payments").expect("the binding ref is valid"),
     );
@@ -1562,16 +1569,270 @@ async fn a_missing_resolver_refusal_on_a_lapsed_lease_is_told_and_parks_nothing_
         }
     );
 
+    let one_pass = one_pass.expect("worker one's pass runs");
     assert_eq!(
-        one_pass.map_err(|error| error.code().to_string()).err(),
-        Some("claim-fenced".to_string()),
-        "worker one told the run, then met its fence at the cancel"
-    );
-    assert_eq!(
-        effect_failed(&fx).await,
-        ("credential-resolver-missing".to_string(), Some(2), Some(3))
+        (one_pass.lapsed, one_pass.delivered, one_pass.cancelled),
+        (1, 0, 0),
+        "worker one ends out of lease and writes nothing"
     );
     let two_pass = two_pass.expect("worker two's pass runs");
-    assert_eq!((two_pass.invoked, two_pass.parked_indeterminate), (0, 0));
+    assert_eq!(
+        (
+            two_pass.invoked,
+            two_pass.failed_attempts,
+            two_pass.parked_indeterminate
+        ),
+        (1, 1, 0),
+        "worker two makes the retry"
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 2);
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+    let row = fx
+        .outbox_row(&effect)
+        .await
+        .expect("the ticket's row exists");
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (OutboxStatus::Failed, 2)
+    );
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.terminal_reason, None, "the run is not failed");
+}
+
+// ---------------------------------------------------------------------------
+// Every late answer (issue #207). A claim asks whether its lease is still
+// current right after the dispatch authority answers, whatever the answer,
+// and ends out of lease, writing nothing more, when it is not.
+// ---------------------------------------------------------------------------
+
+/// The fixture's own authority, answering its `hold_on`th question (counting
+/// from one) after the claim's lease has lapsed.
+fn late_answer(fx: &AuthorityFixture, hold_on: usize) -> LateAnswer {
+    LateAnswer {
+        inner: the_fixtures_authority(fx),
+        clock: fx.wf_clock.clone(),
+        hold_on,
+        asked: AtomicUsize::new(0),
+        hand_off: Mutex::new(None),
+    }
+}
+
+/// A grant that comes after the lease makes no attempt beside another
+/// worker's call. Worker one's authority grants the call after the lease
+/// lapsed; worker two claims the ticket meanwhile, and its call of a
+/// non-idempotent tool is out when worker one's grant comes. Worker one ends
+/// out of lease and calls nothing; worker two's call succeeds and the run
+/// completes on it. The late grant used to write `Started` over worker two's
+/// row and call the tool a second time.
+#[tokio::test]
+async fn a_late_grant_makes_no_attempt_beside_another_workers_call() {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent()),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let (held, lapsed) = oneshot::channel();
+    let (release_one, grant) = oneshot::channel();
+    let (entered, out) = oneshot::channel();
+    let (release_two, answer) = oneshot::channel();
+    let tool = Arc::new(HeldTool {
+        calls: AtomicUsize::new(0),
+        gate: Mutex::new(Some((entered, answer))),
+    });
+    let late = late_answer(&fx, 1);
+    *late.hand_off.lock().expect("the lock holds") = Some((held, grant));
+    let mut one = worker(&fx, "worker-one", Arc::new(late), tool.clone());
+    let mut two = worker(&fx, "worker-two", the_fixtures_authority(&fx), tool.clone());
+    let (one_done, one_ended) = oneshot::channel::<()>();
+
+    fx.expire_lease();
+    fx.settle().await;
+    let (one_pass, two_pass, ()) = tokio::join!(
+        async {
+            let pass = one.pump_run(&run_scope()).await;
+            let _ = one_done.send(());
+            pass
+        },
+        async {
+            let _ = lapsed.await;
+            two.pump_run(&run_scope()).await
+        },
+        async {
+            let _ = out.await;
+            let _ = release_one.send(());
+            let _ = one_ended.await;
+            let _ = release_two.send(());
+        }
+    );
+
+    let one_pass = one_pass.expect("worker one's pass runs");
+    assert_eq!(
+        (
+            one_pass.lapsed,
+            one_pass.invoked,
+            one_pass.delivered,
+            one_pass.cancelled
+        ),
+        (1, 0, 0, 0),
+        "worker one ends out of lease and writes nothing"
+    );
+    let two_pass = two_pass.expect("worker two's pass runs");
+    assert_eq!((two_pass.invoked, two_pass.delivered), (1, 1));
+    assert_eq!(
+        tool.calls.load(Ordering::SeqCst),
+        1,
+        "the tool is called once"
+    );
+    fx.pump().await;
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+/// A late grant with no other worker about leaves the attempt to the claim
+/// that follows: the claim ends out of lease and calls nothing, and the next
+/// claim's grant, under a current lease, makes the attempt.
+#[tokio::test]
+async fn a_late_grant_alone_leaves_the_attempt_to_the_claim_that_follows() {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent()),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        Arc::new(late_answer(&fx, 1)),
+        Arc::new(fx.tools.clone()),
+    );
+    fx.expire_lease();
+    fx.settle().await;
+
+    let first = one.pump_run(&run_scope()).await.expect("the pass runs");
+
+    assert_eq!((first.lapsed, first.invoked), (1, 0));
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+    fx.expire_lease();
+    let second = fx.one_pass().await;
+    assert_eq!(second.invoked, 1);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
+
+/// A transient refusal that comes after the lease ends the claim out of
+/// lease, as every late answer does. It used to end the pass in a
+/// `claim-fenced` error, with no report: the deferral's fleet write was
+/// fenced.
+#[tokio::test]
+async fn a_late_transient_refusal_ends_the_claim_out_of_lease_not_in_an_error() {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent()),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        Arc::new(
+            OutlastingAuthority::new(&fx).refusing(AgentAuthorityRefusal::transient(
+                "agent-suspended",
+                "the agent is suspended",
+            )),
+        ),
+        Arc::new(fx.tools.clone()),
+    );
+    fx.expire_lease();
+    fx.settle().await;
+
+    let pass = one.pump_run(&run_scope()).await.expect("the pass runs");
+
+    assert_eq!((pass.lapsed, pass.deferred, pass.delivered), (1, 0, 0));
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+}
+
+/// A late answer to the question asked before the reconciler (issue #195)
+/// ends the claim before the reconciler is asked. A reconcileable call's
+/// first attempt failed; the claim that follows asks the authority about the
+/// retry first, and the answer comes after the lease. The reconciler used to
+/// be asked anyway, and the claim then ended out of lease at the check after
+/// its answer.
+#[tokio::test]
+async fn a_late_answer_before_the_reconciler_ends_the_claim_unasked() {
+    let (fx, _) = a_call_whose_first_attempt_failed(reconcileable(3)).await;
+    let reconciler =
+        Arc::new(ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted));
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        Arc::new(late_answer(&fx, 1)),
+        Arc::new(fx.tools.clone()),
+    )
+    .with_reconciler(reconciler.clone());
+    fx.expire_lease();
+    fx.settle().await;
+
+    let pass = one.pump_run(&run_scope()).await.expect("the pass runs");
+
+    assert_eq!(pass.lapsed, 1);
+    assert_eq!(reconciler.queries(), 0, "the reconciler is not asked");
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "only the first attempt ran"
+    );
+}
+
+/// A late grant on the retry of a counted lost attempt leaves the retry to
+/// the claim that follows. An idempotent call's first attempt is lost after
+/// `Started`. The next claim counts the loss and asks about the retry, and
+/// the grant comes after the lease: the loss stays counted and no retry is
+/// made. The claim after that makes the retry, once.
+#[tokio::test]
+async fn a_late_grant_on_the_retry_of_a_counted_lost_attempt_leaves_it_to_the_next_claim() {
+    let fx = AuthorityFixture::over(
+        tool_then_proposal(),
+        tool_registry_for_spec(
+            TOOL,
+            &AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+        ),
+        None,
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    fx.probe.arm(AgentDispatchWindow::AfterStarted);
+    fx.expire_lease();
+    assert!(fx.one_pass().await.died, "the first attempt is lost");
+    let mut one = worker(
+        &fx,
+        "worker-one",
+        Arc::new(late_answer(&fx, 1)),
+        Arc::new(fx.tools.clone()),
+    );
+    fx.expire_lease();
+    fx.settle().await;
+
+    let pass = one.pump_run(&run_scope()).await.expect("the pass runs");
+
+    assert_eq!(
+        (pass.lapsed, pass.failed_attempts, pass.invoked),
+        (1, 1, 0),
+        "the loss is counted, and no retry is made"
+    );
+    let effect = fx.effect_at(1).await.expect("the run holds the tool call");
+    let row = fx
+        .outbox_row(&effect)
+        .await
+        .expect("the ticket's row exists");
+    assert_eq!(
+        (row.status(), row.attempts().attempts()),
+        (OutboxStatus::Failed, 1)
+    );
+    fx.expire_lease();
+    let next = fx.one_pass().await;
+    assert_eq!(next.invoked, 1);
     assert_eq!(fx.tools.invocation_count(TOOL), 1);
 }
