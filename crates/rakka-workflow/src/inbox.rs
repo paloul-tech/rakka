@@ -604,6 +604,59 @@ where
         }))
     }
 
+    /// Cancels a `Dispatching` outbox entry, counting the attempt in flight.
+    ///
+    /// A `Dispatching` entry's attempt started, and its outcome was never
+    /// recorded: the worker making it was lost, or is still making it.
+    /// Cancelled as [`Self::record_outbox_cancelled`] cancels, the entry
+    /// would keep the count it had, and nothing durable would say the
+    /// attempt started. So this counts that attempt, with `line` as the
+    /// entry's last failure, and marks the entry
+    /// [`OutboxStatus::Cancelled`], in one write. No retry is scheduled, and
+    /// the budget plays no part: the entry ends cancelled even when the count
+    /// reaches it. A reader tells such an entry from one whose next attempt
+    /// never started by `line`.
+    ///
+    /// Only a `Dispatching` entry is written. For any other entry nothing is
+    /// written and `None` is returned; cancel those with
+    /// [`Self::record_outbox_cancelled`].
+    ///
+    /// # Errors
+    ///
+    /// [`WorkflowError::OutboxEntryNotFound`] for an entry the workflow does
+    /// not hold, and the store's error.
+    pub async fn record_outbox_cancelled_in_flight(
+        &mut self,
+        message_id: &OutboxMessageId,
+        line: impl Into<String>,
+    ) -> WorkflowResult<Option<WorkflowTelemetryEvent>> {
+        let line = line.into();
+        let now = self.clock.now();
+        let record = self.recovered_record()?;
+        let mut next_state = record.state.clone();
+        let mut cancelled = false;
+        let entry = next_state
+            .update_outbox(message_id, |entry| {
+                if entry.status() == OutboxStatus::Dispatching {
+                    entry.mark_cancelled_in_flight(now, line.clone());
+                    cancelled = true;
+                }
+            })
+            .ok_or_else(|| WorkflowError::OutboxEntryNotFound {
+                workflow_id: self.workflow_id.clone(),
+                message_id: message_id.clone(),
+            })?;
+        if !cancelled {
+            return Ok(None);
+        }
+        self.persist_state(record.revision, next_state).await?;
+        Ok(Some(WorkflowTelemetryEvent::OutboxDispatchCancelled {
+            message_id: entry.message_id().clone(),
+            at: now,
+            message: line,
+        }))
+    }
+
     /// Records a failed outbox dispatch and either schedules retry or exhausts the entry.
     pub async fn record_outbox_failure(
         &mut self,

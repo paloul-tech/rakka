@@ -248,6 +248,20 @@ const REVISION_CONFLICT_CODE: &str = "revision-conflict";
 /// requested while a worker held its lease.
 const CANCELLATION_REQUESTED: &str = "cancellation-requested";
 
+/// The last failure line of an outbox row a cancellation settled while an
+/// attempt was in flight (issue #209).
+///
+/// A `Dispatching` row's attempt started, and its outcome was never
+/// recorded. [`AgentDispatcherWorker::cancel_run_dispatches`] and
+/// [`AgentDispatcherWorker::refresh_run`] cancel such a row through
+/// `DurableInbox::record_outbox_cancelled_in_flight`, which counts that
+/// attempt under this line. A reader tells the row by it from one whose
+/// next attempt never started: the attempt it counts may have reached its
+/// target. The agent dispatcher parks such a call for a decision.
+///
+/// The line is stored on rows, so it must never change.
+pub const DISPATCH_CANCELLED_IN_FLIGHT_LINE: &str = "cancelled while an attempt was in flight";
+
 /// The code a fleet entry carries when its claim was settled to match an
 /// outbox row that was already finished: another worker finished the row, or
 /// a crash fell between the outbox write and the fleet write.
@@ -1995,7 +2009,9 @@ where
     /// A caller that stops after this step leaves fenced, unfinished
     /// entries: no worker claims them and no prune removes them, and the
     /// next request or [`AgentDispatcherWorker::refresh_run`] for the run
-    /// lists them again. One write, and none when nothing changed.
+    /// lists them again. One write, and none when nothing changed. The
+    /// settlement that follows cancels a `Dispatching` row with its attempt
+    /// counted under [`DISPATCH_CANCELLED_IN_FLIGHT_LINE`] (issue #209).
     ///
     /// Use [`AgentDispatcherWorker::cancel_run_dispatches`] for the three
     /// steps together.
@@ -2072,6 +2088,10 @@ where
     /// [`AgentDispatcherWorker::refresh_run`] do. An entry that was in
     /// flight at the request is not in that request's list, so a caller that
     /// passes the list back never finishes one whose lease lapsed since.
+    /// Those two settle a `Dispatching` row through
+    /// `DurableInbox::record_outbox_cancelled_in_flight`, with
+    /// [`DISPATCH_CANCELLED_IN_FLIGHT_LINE`], and a caller that settles its
+    /// own rows should too (issue #209).
     ///
     /// One write, and none when it finishes nothing.
     pub async fn finalize_run_cancellations(
@@ -3116,6 +3136,11 @@ where
     /// still unsettled is what a build from before this order could leave
     /// behind; its row is settled here too.
     ///
+    /// A `Dispatching` row settled here, an attempt whose worker was lost,
+    /// is cancelled with that attempt counted under
+    /// [`DISPATCH_CANCELLED_IN_FLIGHT_LINE`], so that the row still says the
+    /// attempt started (issue #209).
+    ///
     /// A registration that loses its compare-and-set is made again, at most
     /// three more times, from a fresh read of the
     /// fleet record and then of the run's outbox
@@ -3197,7 +3222,9 @@ where
     /// Three steps, in this order: the run's unfinished entries are fenced
     /// against being claimed
     /// ([`AgentDispatcherFleet::request_run_cancellation`]); the outbox rows
-    /// of the fenced entries no worker holds are settled as cancelled; and
+    /// of the fenced entries no worker holds are settled as cancelled, a
+    /// `Dispatching` row among them with its attempt counted under
+    /// [`DISPATCH_CANCELLED_IN_FLIGHT_LINE`] (issue #209); and
     /// those entries are finished
     /// ([`AgentDispatcherFleet::finalize_run_cancellations`]). A fleet entry
     /// is therefore never finished before its outbox row is.
@@ -3246,6 +3273,12 @@ where
     /// Outbox entries that already reached a terminal state (or were
     /// compacted away) are skipped, so the settlement pass is idempotent and
     /// safe to repeat on every refresh.
+    ///
+    /// A `Dispatching` row is an attempt that started and whose outcome was
+    /// never recorded. It is cancelled with its attempt counted under
+    /// [`DISPATCH_CANCELLED_IN_FLIGHT_LINE`], so that the row still says the
+    /// attempt started (issue #209). Cancelled as the other rows are, it read
+    /// as a ticket that never started.
     async fn settle_cancelled_effects(
         &self,
         inbox: &mut AgentRunInbox<WorkflowStore, Clock>,
@@ -3254,18 +3287,32 @@ where
     ) -> AgentDispatcherResult<()> {
         for effect_id in effect_ids {
             let message_id = OutboxMessageId::new(effect_id.as_str());
-            let cancellable = inbox
+            let status = inbox
                 .inner()
                 .state()
                 .map_err(AgentDispatcherError::from)?
                 .outbox_entry(&message_id)
-                .is_some_and(OutboxEntry::is_cancellable);
-            if cancellable {
-                inbox
-                    .inner_mut()
-                    .record_outbox_cancelled(&message_id, reason)
-                    .await
-                    .map_err(AgentDispatcherError::from)?;
+                .filter(|entry| entry.is_cancellable())
+                .map(OutboxEntry::status);
+            match status {
+                Some(OutboxStatus::Dispatching) => {
+                    inbox
+                        .inner_mut()
+                        .record_outbox_cancelled_in_flight(
+                            &message_id,
+                            DISPATCH_CANCELLED_IN_FLIGHT_LINE,
+                        )
+                        .await
+                        .map_err(AgentDispatcherError::from)?;
+                }
+                Some(_) => {
+                    inbox
+                        .inner_mut()
+                        .record_outbox_cancelled(&message_id, reason)
+                        .await
+                        .map_err(AgentDispatcherError::from)?;
+                }
+                None => {}
             }
         }
         Ok(())

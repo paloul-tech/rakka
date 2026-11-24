@@ -227,6 +227,31 @@ leaves behind is the same either way.
    evaluation is cancelled whatever its class, since it produces only its
    result. An idempotent attempt lost after `Started` that no claim has
    counted yet is still retried with the same key.
+   A run whose dispatches the fleet fenced is settled by the same rule
+   (issues #209 and #211). The fence comes from
+   `AgentDispatcherFleet::request_run_cancellation`, or from the workflow
+   tier's `AgentDispatcherWorker::cancel_run_dispatches`.
+   - **A ticket whose attempt was in flight** is cancelled by the workflow
+     tier's cancellation with that attempt counted, under the row line
+     `cancelled while an attempt was in flight`
+     (`DISPATCH_CANCELLED_IN_FLIGHT_LINE`). The call parks `Indeterminate`
+     under `run-cancelled-after-attempt`, unless it is read-only, a model
+     call or a goal evaluation.
+   - **A reconcileable call whose failed attempt was counted** parks the same
+     way, since nothing asks the reconciler about it.
+   - **The agent dispatcher's per-run sweep settles a fenced ticket** that no
+     worker holds, as the workflow tier's `refresh_run` would. So a
+     deployment that pumps runs only through `AgentRunEffectDispatcher`
+     needs no `refresh_run`. A ticket a worker still holds is left to that
+     worker. The row is cancelled as it stands when the write lands, so a
+     late worker's failure in between is cancelled too, and the entry is
+     finished only once its row is.
+   - **A row the run put back** after the ticket's own row was lost is
+     parked `ticket-row-missing`. That holds when the sweep's settlement of
+     it is interrupted, and when the workflow tier cancelled it; then the
+     park comes a lease after the entry was last written.
+   - **A run fenced at the fleet without being cancelled** parks its call
+     `ticket-row-settled` once a lease has passed.
    Parked runs consume no live task, thread, or timer. When the last
    ambiguous outcome is answered, a run that is still live and not winding
    down leaves `WaitingForReconciliation` for the status of what it rests on
@@ -602,7 +627,11 @@ is another read and another attempt to write all of it. A registration or a
 claim that lost used to leave the record alone until its next pass; it now
 reads and tries again within tens of milliseconds, so the same writes land
 sooner and closer together. The two writes of a cancellation through
-`AgentDispatcherWorker` are still one try each and are not counted.
+`AgentDispatcherWorker` are still one try each and are not counted. So is
+the agent dispatcher's per-run write finishing an entry a cancellation
+request fenced (issue #211): a pass that loses it fails as
+`revision-conflict` before it claims anything, and the next pass finishes
+the entry from the row the lost one left cancelled.
 
 `AgentRunEffectDispatcher` checks a claim's lease when its pass reaches the
 claim, again right after the reconciler answers (issue #212), and again
@@ -632,7 +661,11 @@ row that is not finished:
   result to a row that is not finished. Its failure burns an attempt, and
   can exhaust the row, under a ticket another worker is running; its success
   finishes the row under that worker. Only then is it answered
-  `claim-fenced`.
+  `claim-fenced`. If the fleet fenced the run meanwhile and the row was
+  settled, by the per-run sweep or by the workflow tier, the worker's
+  success finds the row finished. On a winding-down run the settlement
+  parks or cancels the call at once, so the worker's result is then
+  refused, and the call stays as the settlement left it (issue #211).
 
 ## Goals: finite and continuous
 
