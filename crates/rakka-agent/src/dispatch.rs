@@ -184,6 +184,11 @@ const TICKET_ROW_MISSING: &str = "ticket-row-missing";
 /// not cancelled as never started, and a reconciliation decision is owed.
 const RUN_CANCELLED_AFTER_ATTEMPT: &str = "run-cancelled-after-attempt";
 
+/// The reason the per-run sweep cancels a live row under an entry a
+/// cancellation request fenced: the workflow tier's `refresh_run` cancels
+/// such a row under it too (issue #211).
+const DISPATCH_CANCELLED: &str = "dispatch-cancelled";
+
 /// The reason a parked generation's ticket is settled as cancelled under:
 /// the fleet entry's `last_error_code` once its effect is `Indeterminate`.
 const PARKED_INDETERMINATE: &str = "indeterminate";
@@ -667,6 +672,15 @@ enum InboxWrite<'a> {
         /// The bounded settle reason.
         reason: &'a str,
     },
+    /// A `Dispatching` ticket's settlement as cancelled, its attempt in
+    /// flight counted under `line`, as the workflow tier's cancellation
+    /// settles it (issues #209 and #211). Written only over a `Dispatching`
+    /// row; over any other row it writes nothing.
+    CancelledInFlight {
+        /// The witness line the row keeps:
+        /// [`rakka_agent_workflow::DISPATCH_CANCELLED_IN_FLIGHT_LINE`].
+        line: &'a str,
+    },
 }
 
 impl InboxWrite<'_> {
@@ -680,6 +694,7 @@ impl InboxWrite<'_> {
             Self::Failed { .. } => "failed",
             Self::Exhausted { .. } => "exhausted",
             Self::Cancelled { .. } => "cancelled",
+            Self::CancelledInFlight { .. } => "cancelled-in-flight",
         }
     }
 }
@@ -3133,6 +3148,12 @@ where
                     inbox
                         .inner_mut()
                         .record_outbox_cancelled(message_id, *reason)
+                        .await
+                }
+                InboxWrite::CancelledInFlight { line } => {
+                    inbox
+                        .inner_mut()
+                        .record_outbox_cancelled_in_flight(message_id, *line)
                         .await
                 }
             };
@@ -6597,7 +6618,9 @@ where
         }
         let run_id = workflow_run_id(scope);
 
-        // The look that costs nothing.
+        // The look that costs nothing. A live row under an entry no claim
+        // will come for, because a cancellation request fenced it and no
+        // worker holds it, is owed a settlement too (issue #211).
         {
             let rows = registered_from
                 .inner()
@@ -6608,15 +6631,18 @@ where
             } else {
                 None
             };
+            let looked_at = self.now();
             let nothing_owed = waited.iter().all(|intent| {
                 let ticket_id = intent.dispatch_ticket_id();
                 let live = rows
                     .outbox_entry(&OutboxMessageId::new(ticket_id.as_str()))
                     .is_some_and(|row| !row_is_finished(row.status()));
-                let entry_finished = entries
-                    .and_then(|entries| entries.entry(&agent_dispatch_id(&run_id, &ticket_id)))
-                    .is_some_and(|entry| entry.status.is_terminal());
-                live && !entry_finished
+                let entry = entries
+                    .and_then(|entries| entries.entry(&agent_dispatch_id(&run_id, &ticket_id)));
+                let entry_finished = entry.is_some_and(|entry| entry.status.is_terminal());
+                let awaits_settlement =
+                    entry.is_some_and(|entry| entry.awaits_cancellation_settlement(looked_at));
+                live && !entry_finished && !awaits_settlement
             });
             if nothing_owed {
                 return Ok(());
@@ -6640,14 +6666,52 @@ where
                 .map_err(AgentInboxError::from)?
                 .outbox_entry(&message_id)
                 .cloned();
+            let at = self.now();
             let entry = self
                 .fleet
                 .state()?
                 .entry(&dispatch_id)
-                .map(WaitedTicket::of);
-            let now = self.now().as_millis();
+                .map(|entry| WaitedTicket::of(entry, row.as_ref(), at));
+            let now = at.as_millis();
+            let effect_id = rakka_agent_workflow::AgentEffectId::new(ticket_id.as_str());
+
+            // A finished row under an entry a cancellation request fenced
+            // and left unfinished: the cancellation's settlement lost its
+            // last write, or a worker finished the row after the fence. The
+            // entry is finished first, as the workflow tier's `refresh_run`
+            // finishes it, so that it does not stay fenced and unfinished
+            // where no prune removes it; the row is not written again.
+            if row
+                .as_ref()
+                .is_some_and(|row| row_is_finished(row.status()))
+                && entry.is_some_and(|entry| entry.awaits_settlement)
+            {
+                self.fleet
+                    .finalize_run_cancellations(&run_id, std::slice::from_ref(&effect_id))
+                    .await?;
+            }
 
             match (row, entry) {
+                // A live row under an entry a cancellation request fenced, no
+                // worker holds and nothing has finished: no claim will come
+                // for it. It is settled as the workflow tier's `refresh_run`
+                // settles it (issue #211), so an agent-only deployment needs
+                // no `refresh_run` to end such a run.
+                (Some(row), Some(entry))
+                    if !row_is_finished(row.status()) && entry.awaits_settlement =>
+                {
+                    Box::pin(self.settle_fenced_live_row(
+                        scope,
+                        &intent,
+                        &row,
+                        entry,
+                        &effect_id,
+                        &dispatch_id,
+                        fenced,
+                        pass,
+                    ))
+                    .await?;
+                }
                 (Some(row), entry) if !row_is_finished(row.status()) => {
                     let Some(last_fence) = entry
                         .filter(|entry| entry.finished)
@@ -6769,6 +6833,109 @@ where
         }
         Ok(())
     }
+
+    /// Settles a live row under an entry a cancellation request fenced and
+    /// no worker holds, as the workflow tier's `refresh_run` settles it
+    /// (issue #211), and tells the run where the wind-down fence applies.
+    ///
+    /// - A row the run put back after the ticket's own was lost (the entry
+    ///   does not index it, issue #153) is cancelled with nothing
+    ///   witnessed, the entry finished, and the call parked
+    ///   `ticket-row-missing`, as the claim path parks such a row: its count
+    ///   says nothing of the row that was lost, which may have been
+    ///   `Dispatching`.
+    /// - A `Dispatching` row, an attempt whose worker was lost, is cancelled
+    ///   with that attempt counted under
+    ///   [`rakka_agent_workflow::DISPATCH_CANCELLED_IN_FLIGHT_LINE`] (issue
+    ///   #209). Any other live row is cancelled as `refresh_run` cancels it.
+    ///   The entry is then finished, and on a winding-down run the run is
+    ///   told what the cancelled row owes it ([`owed_by_finished_row`]). On
+    ///   a live run the sweep's general arm tells it, once a lease has
+    ///   passed since the entry finished.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_fenced_live_row(
+        &mut self,
+        scope: &AgentRunScope,
+        intent: &AgentRunEffect,
+        row: &OutboxEntry,
+        entry: WaitedTicket,
+        effect_id: &rakka_agent_workflow::AgentEffectId,
+        dispatch_id: &AgentDispatchId,
+        fenced: bool,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<()> {
+        let run_id = workflow_run_id(scope);
+        let message_id = OutboxMessageId::new(effect_id.as_str());
+        if !entry.indexes_row {
+            if self
+                .write_outbox(
+                    scope,
+                    &message_id,
+                    InboxWrite::Cancelled {
+                        reason: DISPATCH_CANCELLED,
+                    },
+                )
+                .await?
+                .is_some()
+            {
+                pass.cancelled += 1;
+            }
+            self.fleet
+                .finalize_run_cancellations(&run_id, std::slice::from_ref(effect_id))
+                .await?;
+            let attempt = self.attempts_counted(dispatch_id, intent);
+            return self
+                .tell_indeterminate(
+                    scope,
+                    intent,
+                    attempt,
+                    entry.last_fence,
+                    TICKET_ROW_MISSING,
+                    TICKET_ROW_MISSING_MESSAGE,
+                    None,
+                    None,
+                    pass,
+                )
+                .await;
+        }
+        let write = if row.status() == OutboxStatus::Dispatching {
+            InboxWrite::CancelledInFlight {
+                line: rakka_agent_workflow::DISPATCH_CANCELLED_IN_FLIGHT_LINE,
+            }
+        } else {
+            InboxWrite::Cancelled {
+                reason: DISPATCH_CANCELLED,
+            }
+        };
+        if self
+            .write_outbox(scope, &message_id, write)
+            .await?
+            .is_some()
+        {
+            pass.cancelled += 1;
+        }
+        self.fleet
+            .finalize_run_cancellations(&run_id, std::slice::from_ref(effect_id))
+            .await?;
+        if !fenced {
+            return Ok(());
+        }
+        let mut inbox = self.inbox(scope);
+        inbox.recover().await?;
+        let settled = inbox
+            .inner()
+            .state()
+            .map_err(AgentInboxError::from)?
+            .outbox_entry(&message_id)
+            .filter(|row| row.status() == OutboxStatus::Cancelled)
+            .cloned();
+        if let Some(settled) = settled {
+            let (verdict, attempt) = owed_by_finished_row(&settled, intent, true);
+            self.tell_owed(scope, intent, attempt, 0, verdict, pass)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 /// What the per-run sweep reads of the fleet entry of a ticket a run waits
@@ -6788,10 +6955,22 @@ struct WaitedTicket {
     /// When the entry was last written, in milliseconds: when it finished,
     /// or was fenced.
     since: u64,
+    /// A cancellation request fenced the entry, it is not finished, and no
+    /// worker holds it: its row is the next thing to settle, and then the
+    /// entry can be finished (`awaits_cancellation_settlement`, issue #211).
+    awaits_settlement: bool,
+    /// The entry was registered from the ticket's row as it stands, as far
+    /// as the entry can tell. A row the run put back after the ticket's own
+    /// was lost is not (issue #153).
+    indexes_row: bool,
 }
 
 impl WaitedTicket {
-    fn of(entry: &rakka_agent_workflow::AgentDispatchEntry) -> Self {
+    fn of(
+        entry: &rakka_agent_workflow::AgentDispatchEntry,
+        row: Option<&OutboxEntry>,
+        now: AgentTimestampMillis,
+    ) -> Self {
         use rakka_agent_workflow::AgentDispatchStatus;
         // An entry that finished `Exhausted` or `Completed` records
         // attempts. One this dispatcher finished as cancelled because the
@@ -6813,6 +6992,8 @@ impl WaitedTicket {
             may_never_have_started,
             last_fence: entry.last_fencing_token,
             since: entry.updated_at.as_millis(),
+            awaits_settlement: entry.awaits_cancellation_settlement(now),
+            indexes_row: row.is_none_or(|row| entry.indexes_row(row)),
         }
     }
 }

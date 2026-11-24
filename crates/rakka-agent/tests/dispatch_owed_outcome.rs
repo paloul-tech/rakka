@@ -1306,11 +1306,17 @@ async fn a_live_run_whose_finished_ticket_lost_its_row_is_parked() {
 }
 
 /// A live row under an entry that a cancellation request fenced is not a
-/// lost row. The request is the first step of a cancellation another worker
-/// is carrying out, and that worker settles the row itself. The sweep
-/// leaves both alone.
+/// lost row: it is not parked as one. Since issue #211 the sweep settles it
+/// as the workflow tier's cancellation would. It cancels the row and
+/// finishes the entry, which no worker holds, and tells this live run
+/// nothing until a lease has passed. The request may be the first step of a
+/// cancellation another worker is carrying out. That worker's own steps
+/// then find the row cancelled and the entry finished, and change nothing:
+/// each write leaves a settled row or a finished entry as it is. The sweep
+/// used to leave both alone. A deployment that fenced at the fleet and
+/// called nothing else then waited on the call for ever.
 #[tokio::test]
-async fn a_live_row_under_a_cancellation_in_progress_is_left_alone() {
+async fn a_live_row_under_a_cancellation_in_progress_is_settled_as_the_cancellation_would() {
     let (fx, effect) = ticket(&idempotent(3), None, None).await;
     fx.pipeline()
         .register_run(&run_scope())
@@ -1333,7 +1339,37 @@ async fn a_live_row_under_a_cancellation_in_progress_is_left_alone() {
         (0, 0, 0)
     );
     assert_eq!(fx.effect_status(1).await, Some(AgentRunEffectStatus::Ready));
-    assert_eq!(row_status(&fx, &effect).await, Some(OutboxStatus::Pending));
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Cancelled)
+    );
+    assert_eq!(
+        fleet_entry(&fx, &effect).await.map(|entry| entry.status),
+        Some(AgentDispatchStatus::Cancelled)
+    );
+    let cancellation = rakka_agent_workflow::AgentDispatcherWorker::with_clock_and_metrics(
+        AgentDispatcherWorkerId::new("canceller"),
+        fx.fleet_store.clone(),
+        fx.workflow_store.clone(),
+        AgentDispatcherFleetSettings::new(16, LEASE_MS),
+        fx.wf_clock.clone(),
+        std::sync::Arc::new(rakka_core::NoopMetricsRecorder),
+    )
+    .cancel_run_dispatches(&rakka_agent::workflow_run_id(&run_scope()))
+    .await
+    .expect("the cancellation in progress goes on");
+    assert_eq!(
+        (
+            cancellation.cancelled_entries,
+            cancellation.already_terminal_entries
+        ),
+        (0, 2),
+        "the cancellation in progress finds both of the run's entries, its model call's and this one, finished"
+    );
+    assert_eq!(
+        row_status(&fx, &effect).await,
+        Some(OutboxStatus::Cancelled)
+    );
 }
 
 /// Rewrites the fleet record without any entry's row stamp: the record a
