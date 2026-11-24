@@ -17,8 +17,10 @@
 //!   worker has moved the row; a row that worker finished is settled
 //!   against the run as it now stands;
 //! - a park made at once names and links the attempt that failed;
-//! - a refusal whose authority answered once the lease had lapsed is left
-//!   to the worker that holds the ticket (issue #196).
+//! - an answer that comes from the authority or the reconciler once the
+//!   lease has lapsed is not acted on, whatever it is: the ticket is left
+//!   to the worker that holds it, or to the claim that follows (issues
+//!   #196, #207 and #212).
 //!
 //! `effect_dispatch.rs` holds the rest of the issue's cases.
 
@@ -1175,7 +1177,7 @@ async fn a_suspension_during_the_question_is_honoured_by_the_attempts_own_questi
     assert_eq!(tool_row(&fx).await, (Failed, 1));
 }
 
-/// What [`worker_one_retries_on_a_lapsed_lease_while_worker_two_asks`]
+/// What [`worker_one_hears_late_while_worker_two_asks`]
 /// leaves: each worker's pass, and the fixture and tool they shared.
 struct Race {
     one: rakka_agent::AgentDispatchResult<AgentDispatchPass>,
@@ -1186,10 +1188,11 @@ struct Race {
 
 /// Worker one is told "not executed" about a failed call, and its lease
 /// lapses while the authority answers for the retry: with a grant when
-/// `refusal` is `None`, else with `refusal`. Worker two claims the ticket,
-/// and worker one goes on while worker two's reconciler answers it, which
-/// it does once worker one's pass is over.
-async fn worker_one_retries_on_a_lapsed_lease_while_worker_two_asks(
+/// `refusal` is `None`, else with `refusal`. Worker two claims the ticket
+/// and asks its reconciler, which answers once worker one's pass is over.
+/// Since issues #196 and #207 worker one's pass ends out of lease at the
+/// late answer; before them, worker one went on to act on it.
+async fn worker_one_hears_late_while_worker_two_asks(
     refusal: Option<AgentAuthorityRefusal>,
 ) -> Race {
     let fx = a_reconcileable_call_out().await;
@@ -1282,7 +1285,7 @@ async fn worker_one_retries_on_a_lapsed_lease_while_worker_two_asks(
 async fn a_late_grant_leaves_the_retry_to_the_worker_that_holds_the_ticket() {
     let Race {
         one, two, fx, tool, ..
-    } = worker_one_retries_on_a_lapsed_lease_while_worker_two_asks(None).await;
+    } = worker_one_hears_late_while_worker_two_asks(None).await;
 
     let one = one.expect("worker one's pass runs");
     assert_eq!(
@@ -1399,9 +1402,10 @@ async fn a_row_another_worker_finished_with_a_success_it_delivered_is_not_parked
 async fn a_refusal_on_a_lapsed_lease_leaves_the_retry_to_the_worker_that_holds_the_ticket() {
     let Race {
         one, two, fx, tool, ..
-    } = worker_one_retries_on_a_lapsed_lease_while_worker_two_asks(Some(
-        AgentAuthorityRefusal::of("tool-revoked", "the tool was revoked"),
-    ))
+    } = worker_one_hears_late_while_worker_two_asks(Some(AgentAuthorityRefusal::of(
+        "tool-revoked",
+        "the tool was revoked",
+    )))
     .await;
 
     let one = one.expect("worker one's pass runs");
