@@ -227,6 +227,27 @@ leaves behind is the same either way.
    evaluation is cancelled whatever its class, since it produces only its
    result. An idempotent attempt lost after `Started` that no claim has
    counted yet is still retried with the same key.
+   A run whose dispatches the fleet fenced is settled by the same rule
+   (issues #209 and #211). The fence comes from
+   `AgentDispatcherFleet::request_run_cancellation`, or from the workflow
+   tier's `AgentDispatcherWorker::cancel_run_dispatches`.
+   - **A ticket whose attempt was in flight** is cancelled by the workflow
+     tier's cancellation with that attempt counted, under the row line
+     `cancelled while an attempt was in flight`
+     (`DISPATCH_CANCELLED_IN_FLIGHT_LINE`). The call parks `Indeterminate`
+     under `run-cancelled-after-attempt`, unless it is read-only, a model
+     call or a goal evaluation.
+   - **A reconcileable call whose failed attempt was counted** parks the same
+     way, since nothing asks the reconciler about it.
+   - **The agent dispatcher's per-run sweep settles a fenced ticket** that no
+     worker holds, as the workflow tier's `refresh_run` would. So a
+     deployment that pumps runs only through `AgentRunEffectDispatcher`
+     needs no `refresh_run`. A ticket a worker still holds is left to that
+     worker.
+   - **A row the run put back** after the ticket's own row was lost is
+     parked `ticket-row-missing`.
+   - **A run fenced at the fleet without being cancelled** parks its call
+     `ticket-row-settled` once a lease has passed.
    Parked runs consume no live task, thread, or timer. When the last
    ambiguous outcome is answered, a run that is still live and not winding
    down leaves `WaitingForReconciliation` for the status of what it rests on
@@ -624,7 +645,11 @@ a row that is not finished:
   result to a row that is not finished. Its failure burns an attempt, and
   can exhaust the row, under a ticket another worker is running; its success
   finishes the row under that worker. Only then is it answered
-  `claim-fenced`.
+  `claim-fenced`. If the fleet fenced the run meanwhile and the row was
+  settled, by the per-run sweep or by the workflow tier, the worker's
+  success finds the row finished. On a winding-down run the settlement
+  parks or cancels the call at once, so the worker's result is then
+  refused, and the call stays as the settlement left it (issue #211).
 
 ## Goals: finite and continuous
 
