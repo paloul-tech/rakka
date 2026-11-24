@@ -957,3 +957,150 @@ async fn a_definitive_failure_exhausts_a_dispatching_or_dispatched_entry() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Cancelling an entry whose attempt is in flight (issue #209). A `Dispatching`
+// entry's attempt started and has not been recorded; cancelling it must keep
+// that it started, so the attempt is counted with a line in the same write.
+// ---------------------------------------------------------------------------
+
+type InMemoryInbox = DurableInbox<InMemoryDurableStateStore<WorkflowState>, ManualWorkflowClock>;
+
+/// A fresh workflow with one outbox entry, `out-in-flight`, scheduled under a
+/// retry policy of `attempts`.
+async fn one_entry(
+    label: &str,
+    attempts: u32,
+) -> (
+    InMemoryInbox,
+    InMemoryDurableStateStore<WorkflowState>,
+    ManualWorkflowClock,
+    OutboxMessageId,
+) {
+    let store = InMemoryDurableStateStore::<WorkflowState>::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(900));
+    let mut workflow = DurableInbox::with_clock(
+        WorkflowId::new(format!("workflow-in-flight-{label}")),
+        store.clone(),
+        clock.clone(),
+    );
+    workflow.recover().await.unwrap();
+    workflow
+        .schedule_outbox(
+            OutboxCommand::new(
+                "out-in-flight",
+                OutboxTarget::application("payments"),
+                "Charge",
+                b"payload".to_vec(),
+            )
+            .retry_policy(RetryPolicy::new(attempts, 10, 10)),
+        )
+        .await
+        .unwrap();
+    (
+        workflow,
+        store,
+        clock,
+        OutboxMessageId::new("out-in-flight"),
+    )
+}
+
+/// The entry's status, attempt count and last failure line, as `workflow`
+/// holds them.
+fn entry_of(workflow: &InMemoryInbox, id: &OutboxMessageId) -> (OutboxStatus, u32, Option<String>) {
+    let state = workflow.state().unwrap();
+    let entry = state.outbox_entry(id).expect("the entry exists");
+    (
+        entry.status(),
+        entry.attempts().attempts(),
+        entry.attempts().last_error().map(str::to_string),
+    )
+}
+
+#[tokio::test]
+async fn a_dispatching_entry_cancelled_in_flight_counts_the_attempt_with_its_line() {
+    let (mut workflow, store, clock, id) = one_entry("counted", 3).await;
+    workflow.mark_outbox_dispatching(&id).await.unwrap();
+
+    let event = workflow
+        .record_outbox_cancelled_in_flight(&id, "line")
+        .await
+        .expect("the write applies");
+
+    assert!(
+        matches!(
+            &event,
+            Some(WorkflowTelemetryEvent::OutboxDispatchCancelled { message_id, message, .. })
+                if message_id == &id && message == "line"
+        ),
+        "{event:?}"
+    );
+    assert_eq!(
+        entry_of(&workflow, &id),
+        (OutboxStatus::Cancelled, 1, Some("line".to_string()))
+    );
+    let mut recovered =
+        DurableInbox::with_clock(WorkflowId::new("workflow-in-flight-counted"), store, clock);
+    recovered.recover().await.unwrap();
+    assert_eq!(
+        entry_of(&recovered, &id),
+        (OutboxStatus::Cancelled, 1, Some("line".to_string())),
+        "the count and the line are durable"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_in_flight_leaves_any_other_entry_alone() {
+    for label in ["pending", "failed", "dispatched"] {
+        let (mut workflow, _store, _clock, id) = one_entry(label, 3).await;
+        match label {
+            "failed" => {
+                workflow.mark_outbox_dispatching(&id).await.unwrap();
+                workflow
+                    .record_outbox_failure(&id, "upstream-unavailable: later", false)
+                    .await
+                    .unwrap();
+            }
+            "dispatched" => {
+                workflow.mark_outbox_dispatching(&id).await.unwrap();
+                workflow.record_outbox_success(&id).await.unwrap();
+            }
+            _ => {}
+        }
+        let before = entry_of(&workflow, &id);
+
+        let event = workflow
+            .record_outbox_cancelled_in_flight(&id, "line")
+            .await
+            .unwrap_or_else(|error| panic!("{label}: the write answers: {error}"));
+
+        assert_eq!(event, None, "{label}: nothing is written");
+        assert_eq!(entry_of(&workflow, &id), before, "{label}: unchanged");
+    }
+    let (mut workflow, _store, _clock, _id) = one_entry("missing", 3).await;
+    let error = workflow
+        .record_outbox_cancelled_in_flight(&OutboxMessageId::new("missing"), "line")
+        .await
+        .expect_err("no such entry");
+    assert!(
+        matches!(error, WorkflowError::OutboxEntryNotFound { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_entry_cancelled_in_flight_at_its_budget_ends_cancelled() {
+    let (mut workflow, _store, _clock, id) = one_entry("budget", 1).await;
+    workflow.mark_outbox_dispatching(&id).await.unwrap();
+
+    workflow
+        .record_outbox_cancelled_in_flight(&id, "line")
+        .await
+        .expect("the write applies");
+
+    assert_eq!(
+        entry_of(&workflow, &id),
+        (OutboxStatus::Cancelled, 1, Some("line".to_string())),
+        "cancelled, not exhausted, though the count reaches the budget"
+    );
+}

@@ -411,3 +411,112 @@ async fn the_workers_cancellation_reports_what_it_finished() {
     assert_eq!(flight.status, AgentDispatchStatus::Claimed);
     assert!(flight.cancellation_requested);
 }
+
+// ---------------------------------------------------------------------------
+// A lost attempt survives the cancellation (issue #209). A `Dispatching` row
+// is an attempt whose worker was lost after `Started`: its outcome is
+// unknown. The cancellation counts it with a line every reader can tell from
+// a ticket that never started.
+// ---------------------------------------------------------------------------
+
+/// `effect`'s row: its status, attempt count and last failure line.
+async fn row_of(world: &World, effect: &str) -> (OutboxStatus, u32, Option<String>) {
+    let row = outbox_row(&world.workflow_store, &world.clock, &run(), effect)
+        .await
+        .expect("the row exists");
+    (
+        row.status(),
+        row.attempts().attempts(),
+        row.attempts().last_error().map(str::to_string),
+    )
+}
+
+/// A `Dispatching` row is cancelled with the witness. `effect-flight`'s
+/// worker marked its row and was lost; its lease has lapsed. The worker's
+/// cancellation counts that attempt with the witness line, and cancels a
+/// waiting row as before, counting nothing.
+#[tokio::test]
+async fn a_dispatching_row_is_cancelled_with_the_witness() {
+    let world = World::new();
+    let mut worker = world.worker("worker-a");
+    let _claim = world.claim_one(&mut worker, RUN, "effect-flight").await;
+    move_row_to(
+        &world.workflow_store,
+        &world.clock,
+        &run(),
+        "effect-flight",
+        OutboxStatus::Dispatching,
+    )
+    .await;
+    world.register_one(&mut worker, RUN, "effect-waiting").await;
+    world.clock.advance_millis(LEASE_MS + 1);
+
+    worker
+        .cancel_run_dispatches(&run())
+        .await
+        .expect("the cancellation runs");
+
+    assert_eq!(
+        row_of(&world, "effect-flight").await,
+        (
+            OutboxStatus::Cancelled,
+            1,
+            Some(rakka_agent_workflow::DISPATCH_CANCELLED_IN_FLIGHT_LINE.to_string())
+        )
+    );
+    assert_eq!(
+        row_of(&world, "effect-waiting").await,
+        (OutboxStatus::Cancelled, 0, None)
+    );
+    for effect in ["effect-flight", "effect-waiting"] {
+        assert_eq!(
+            entry_of(&world, effect).await.status,
+            AgentDispatchStatus::Cancelled,
+            "{effect}"
+        );
+    }
+}
+
+/// A refresh settles a fenced `Dispatching` row with the witness. The
+/// cancellation request lands while `effect-flight` is in flight; its
+/// worker marks the row and is lost, and the lease lapses. The next refresh
+/// counts the attempt with the witness line and finishes the entry.
+#[tokio::test]
+async fn a_refresh_settles_a_fenced_dispatching_row_with_the_witness() {
+    let world = World::new();
+    let mut worker = world.worker("worker-a");
+    let _claim = world.claim_one(&mut worker, RUN, "effect-flight").await;
+    let request = worker
+        .fleet_mut()
+        .request_run_cancellation(&run())
+        .await
+        .expect("the request runs");
+    assert_eq!(request.in_flight_entries, 1);
+    move_row_to(
+        &world.workflow_store,
+        &world.clock,
+        &run(),
+        "effect-flight",
+        OutboxStatus::Dispatching,
+    )
+    .await;
+    world.clock.advance_millis(LEASE_MS + 1);
+
+    worker
+        .refresh_run(run(), None)
+        .await
+        .expect("the refresh runs");
+
+    assert_eq!(
+        row_of(&world, "effect-flight").await,
+        (
+            OutboxStatus::Cancelled,
+            1,
+            Some(rakka_agent_workflow::DISPATCH_CANCELLED_IN_FLIGHT_LINE.to_string())
+        )
+    );
+    assert_eq!(
+        entry_of(&world, "effect-flight").await.status,
+        AgentDispatchStatus::Cancelled
+    );
+}

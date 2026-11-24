@@ -643,6 +643,18 @@ impl OutboxEntry {
         self.set_status(OutboxStatus::Cancelled, now);
     }
 
+    /// Counts the attempt in flight with `line`, scheduling no retry, and
+    /// marks the entry cancelled, whatever budget is left
+    /// ([`crate::DurableInbox::record_outbox_cancelled_in_flight`]).
+    pub(crate) fn mark_cancelled_in_flight(
+        &mut self,
+        now: WorkflowTimestamp,
+        line: impl Into<String>,
+    ) {
+        self.attempts = self.attempts.clone().record_exhaustion(line);
+        self.set_status(OutboxStatus::Cancelled, now);
+    }
+
     pub(crate) fn record_failure(
         &mut self,
         now: WorkflowTimestamp,
