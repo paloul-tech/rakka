@@ -393,8 +393,9 @@ is still working on it, and from being run by two:
   attempt that one left and goes on from its answer, as for an attempt
   whose worker was lost. The lease has to cover one attempt, not a budget.
   A claim's first attempt is not asked whether the lease covers it, and an
-  attempt that spends the budget has none after it to be covered: each
-  needs only the current lease every finding needs (below).
+  attempt that spends the budget has no attempt after it to cover. The
+  reconciler's finding, whichever attempt it is about, still needs a
+  current lease (below).
 - **The reconciler's finding is acted on only under a current lease**
   (issues #195 and #212). The reconciler can answer after the claim's
   lease lapsed, and by then another worker may hold the ticket and have
@@ -432,10 +433,10 @@ is still working on it, and from being run by two:
   lease does, unless what it reads is what a claim settles with no attempt
   (the row finished, gone or put back in a lost row's place, or the call
   resolved), which it settles as a claim that read it first would.
-- **The dispatch authority's answer is acted on only under a current
-  lease** (issues #196 and #207). The authority can answer after the
-  claim's lease lapsed, and by then another worker may hold the ticket and
-  have the attempt out. So right after the authority answers, whatever the
+- **The dispatch authority's decision on an attempt is acted on only
+  under a current lease** (issues #196 and #207). The authority can
+  answer after the claim's lease lapsed, and by then another worker may
+  hold the ticket and have the attempt out. So right after the authority answers, whatever the
   answer, the claim asks whether its lease is still current, and otherwise
   ends there, as above, writing nothing more (a lost attempt it counted
   first stays counted); the ticket is left to the claim that follows. A
@@ -450,8 +451,10 @@ is still working on it, and from being run by two:
   cover the authority's answer: an authority that always answers slower
   than the lease, granting or refusing, leaves the run waiting, spending
   nothing. An error from the authority is not an answer and keeps its
-  handling. A worker that stalls between the check and what follows it
-  can still act.
+  handling. The authority's review of a call's response
+  (`review_tool_response`, `review_model_response`) comes after the call
+  and is not checked. A worker that stalls between the check and what
+  follows it can still act.
 
 A renewed batch stays with its worker. A ticket claimed behind long calls
 waits for every one of them, and no other worker can take it meanwhile,
@@ -602,17 +605,22 @@ sooner and closer together. The two writes of a cancellation through
 `AgentDispatcherWorker` are still one try each and are not counted.
 
 `AgentRunEffectDispatcher` checks a claim's lease when its pass reaches the
-claim, and again right after the dispatch authority answers (issue #207),
-and not again before it marks the ticket's row `Dispatching`. A finished
-row is protected at both ends: the mark and a settle each leave a row that
-is `Dispatched`, `Exhausted` or `Cancelled` as it is. What is left concerns
-a row that is not finished:
+claim, again right after the reconciler answers (issue #212), and again
+right after the dispatch authority answers (issue #207), and not again
+before it marks the ticket's row `Dispatching`. A finished row is
+protected at both ends: the mark and a settle each leave a row that is
+`Dispatched`, `Exhausted` or `Cancelled` as it is. What is left concerns a
+row that is not finished:
 
 - A worker that stalls past its lease between the check after the
   authority's answer and its durable `Started` can still start an attempt
   on a ticket another worker has since claimed and is running. Between the
   two the dispatcher only checks the grant against the intent; it writes
   nothing and calls nothing.
+- A worker that stalls past its lease between the check after the
+  reconciler's answer and its first write can still act on the finding
+  beside another worker. That write is the burn, the delivery of an
+  executed outcome, the park, or the wind-down's cancel.
 - Nothing renews a lease during a call. A call that outlives its lease loses
   its claim, and the next claim recovers the ticket as an attempt that
   disappeared, by its safety class, while that call may still be out. The

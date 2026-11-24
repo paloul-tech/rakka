@@ -17,10 +17,11 @@
 //! the recovery of a lost attempt, the retry after a failed attempt (with
 //! and without a reconciler), and a later attempt under the same claim.
 //!
-//! A refusal before `Started` is told to the run only while the claim's
-//! lease is still current. The last tests here give the authority an answer
-//! that outlasts the lease, with another worker running the ticket
-//! meanwhile and without.
+//! The dispatch authority's decision, whatever it is, is acted on only
+//! while the claim's lease is still current (issues #196 and #207), and so
+//! is the reconciler's finding (issue #212). The last tests here give the
+//! authority or the reconciler an answer that outlasts the lease, with
+//! another worker running the ticket meanwhile and without.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
