@@ -1454,7 +1454,10 @@ async fn a_live_run_whose_finished_ticket_lost_its_row_is_parked_before_it_settl
 /// run `Cancelled` for a ready effect whose row is already cancelled: an
 /// earlier fence died between the row and the word. This row is not the
 /// fence's. Its ticket's entry records attempts that spent a budget, so
-/// nobody can say the effect never started, and the run is parked.
+/// nobody can say the effect never started, and the run is parked. Since
+/// issue #211's review it is parked under `ticket-row-missing`, as the
+/// sweep that was lost was about to park it: the entry does not index the
+/// row the run put back, whose count says nothing of the row that was lost.
 #[tokio::test]
 async fn a_row_the_sweep_cancelled_is_not_read_as_the_fences_own() {
     let (fx, effect) = a_finished_ticket_that_lost_its_row().await;
@@ -1486,7 +1489,7 @@ async fn a_row_the_sweep_cancelled_is_not_read_as_the_fences_own() {
         (told.status, told.code.as_deref()),
         (
             AgentRunEffectStatus::Indeterminate,
-            Some("ticket-row-settled")
+            Some("ticket-row-missing")
         )
     );
     assert_eq!(

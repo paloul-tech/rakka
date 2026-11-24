@@ -17,11 +17,11 @@
 //!   stalled unless the workflow tier's `refresh_run` was called. The agent
 //!   dispatcher's per-run sweep now settles it as `refresh_run` would.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rakka_agent::testkit::{
-    DeterministicModelAdapter, RecordingToolExecutor, SharedAtomicWorkflowClock,
+    DeterministicModelAdapter, RecordingToolExecutor, SharedAtomicWorkflowClock, StoreLoadHook,
 };
 use rakka_agent::{
     AgentDispatchError, AgentDispatchFuture, AgentDispatchToolExecutor, AgentDispatchWindow,
@@ -800,4 +800,261 @@ async fn a_cancel_whose_finish_was_lost_is_finished_by_the_next_pass() {
         "the row is written once"
     );
     assert_parked(&fx, "after the lost finish").await;
+}
+
+// ---------------------------------------------------------------------------
+// The final review's findings: a row that moves between the sweep's read and
+// its write, and a row the run put back whose settlement was interrupted.
+// ---------------------------------------------------------------------------
+
+/// Whether nothing has finished the row yet.
+fn row_is_live(status: OutboxStatus) -> bool {
+    matches!(
+        status,
+        OutboxStatus::Pending | OutboxStatus::Dispatching | OutboxStatus::Failed
+    )
+}
+
+/// Prunes every finished fleet entry, whatever its age.
+async fn prune_everything(fx: &AuthorityFixture) -> usize {
+    fleet_handle(fx)
+        .prune_terminal(rakka_agent_workflow::AgentTimestampMillis::new(u64::MAX))
+        .await
+        .expect("the prune runs")
+        .pruned
+}
+
+/// The link of a hook chain that runs at the `remaining`-th load of the
+/// run's workflow store from now. There, a worker whose call outlived its
+/// lease records the call's retryable failure over the tool's row, if the
+/// row is still `Dispatching`.
+fn late_failure_hook(
+    store: WorkflowStore,
+    clock: SharedAtomicWorkflowClock,
+    ticket: String,
+    remaining: usize,
+    fired: Arc<AtomicBool>,
+) -> StoreLoadHook {
+    Box::new(move || {
+        Box::pin(async move {
+            if remaining > 1 {
+                let next = late_failure_hook(store.clone(), clock, ticket, remaining - 1, fired);
+                store.before_next_load(next);
+                return;
+            }
+            let mut inbox = rakka_agent_workflow::AgentRunInbox::with_clock(
+                rakka_agent::workflow_run_id(&run_scope()),
+                store.clone(),
+                clock.clone(),
+            );
+            inbox
+                .recover()
+                .await
+                .expect("the late worker's inbox recovers");
+            let id = OutboxMessageId::new(ticket.as_str());
+            let dispatching = inbox
+                .inner()
+                .state()
+                .expect("the state reads")
+                .outbox_entry(&id)
+                .is_some_and(|row| row.status() == OutboxStatus::Dispatching);
+            if dispatching {
+                inbox
+                    .inner_mut()
+                    .record_outbox_failure(&id, "upstream-unavailable: later", false)
+                    .await
+                    .expect("the late failure lands");
+                fired.store(true, Ordering::SeqCst);
+            }
+        })
+    })
+}
+
+/// Arms a late failure at the `nth` load of the run's workflow store from
+/// now, and answers whether it landed.
+async fn arm_late_failure(fx: &AuthorityFixture, nth: usize) -> Arc<AtomicBool> {
+    let ticket = fx
+        .effect_at(1)
+        .await
+        .expect("the run holds its tool call")
+        .dispatch_ticket_id()
+        .as_str()
+        .to_string();
+    let fired = Arc::new(AtomicBool::new(false));
+    fx.workflow_store.before_next_load(late_failure_hook(
+        fx.workflow_store.clone(),
+        fx.wf_clock.clone(),
+        ticket,
+        nth,
+        fired.clone(),
+    ));
+    fired
+}
+
+/// Disarms a late failure that has not run yet.
+fn disarm(fx: &AuthorityFixture) {
+    fx.workflow_store
+        .before_next_load(Box::new(|| Box::pin(async {})));
+}
+
+/// A late failure that lands between the sweep's read of a fenced
+/// `Dispatching` row and its write is still cancelled. The worker whose call
+/// outlived its lease records its call's failure over the row at each load
+/// of the run's workflow store in turn. Wherever it lands, the pass leaves
+/// no finished fleet entry over a live row, and the read-only call is
+/// cancelled, charged the attempt, with the run. The sweep used to choose
+/// its write from the row as it first read it; the witnessed write then
+/// found a `Failed` row and wrote nothing, and the entry was finished over
+/// the live row.
+#[tokio::test]
+async fn a_late_failure_between_the_sweeps_read_and_its_write_is_still_cancelled() {
+    let mut landed = 0;
+    for nth in 1..=8 {
+        let fx = a_lost_attempt_fenced_under_its_lease(&read_only()).await;
+        cancel_the_run(&fx).await;
+        fx.expire_lease();
+        fx.settle().await;
+        let fired = arm_late_failure(&fx, nth).await;
+
+        let _ = fx.pipeline().pump_run(&run_scope()).await;
+
+        disarm(&fx);
+        if fired.load(Ordering::SeqCst) {
+            landed += 1;
+        }
+        let row = tool_row(&fx).await;
+        let entry = tool_entry(&fx).await;
+        assert!(
+            !(entry.0 == AgentDispatchStatus::Cancelled && row_is_live(row.0)),
+            "nth={nth}: a finished entry over a live row {row:?}"
+        );
+        fx.one_pass().await;
+        let (status, attempts, _) = tool_effect(&fx).await;
+        assert_eq!(
+            (status, attempts, run_status(&fx).await),
+            (
+                AgentRunEffectStatus::Cancelled,
+                1,
+                Some(AgentRunStatus::Cancelled)
+            ),
+            "nth={nth}"
+        );
+    }
+    assert!(landed > 0, "the late failure landed somewhere in the pass");
+}
+
+/// A late failure that lands between the sweep's read and its write on a
+/// live run fenced at the fleet never has the call run again. Wherever the
+/// failure lands, a prune of every finished fleet entry and a pass later,
+/// the tool has not been invoked. The finished entry over a live row used
+/// to be pruned, the row registered again as a new ticket, and the call
+/// whose dispatches the fleet had fenced invoked.
+#[tokio::test]
+async fn a_late_failure_on_a_live_run_fenced_at_the_fleet_never_runs_the_call_again() {
+    for nth in 1..=8 {
+        let fx = a_lost_attempt_fenced_under_its_lease(&idempotent()).await;
+        fx.expire_lease();
+        fx.settle().await;
+        let fired = arm_late_failure(&fx, nth).await;
+
+        let _ = fx.pipeline().pump_run(&run_scope()).await;
+
+        disarm(&fx);
+        let _ = fired;
+        prune_everything(&fx).await;
+        fx.wf_clock.advance(1_000);
+        fx.one_pass().await;
+        assert_eq!(fx.tools.invocation_count(TOOL), 0, "nth={nth}");
+    }
+}
+
+/// A row the run put back under a fenced entry, on a cancelled run.
+async fn a_put_back_row_under_a_fenced_entry_on_a_cancelled_run() -> AuthorityFixture {
+    let fx = a_tool_call_out(&AgentEffectSpec::non_idempotent()).await;
+    fx.pipeline()
+        .register_run(&run_scope())
+        .await
+        .expect("the registration runs");
+    let id = workflow_persistence_id(&run_scope());
+    let record = fx
+        .workflow_store
+        .load(&id)
+        .await
+        .expect("the workflow store loads")
+        .expect("the run has a workflow record");
+    fx.workflow_store
+        .delete(&id, record.revision)
+        .await
+        .expect("the workflow record is deleted");
+    fx.wf_clock.advance(1_000);
+    fx.settle().await;
+    assert_eq!(tool_row(&fx).await, (OutboxStatus::Pending, 0, None));
+    assert_eq!(fence_at_the_fleet(&fx).await, 0);
+    cancel_the_run(&fx).await;
+    fx.expire_lease();
+    fx.settle().await;
+    fx
+}
+
+/// The call is parked `ticket-row-missing`, and the run waits.
+async fn assert_parked_as_missing(fx: &AuthorityFixture, label: &str) {
+    let (status, _, code) = tool_effect(fx).await;
+    assert_eq!(
+        (status, code.as_deref(), run_status(fx).await),
+        (
+            AgentRunEffectStatus::Indeterminate,
+            Some("ticket-row-missing"),
+            Some(AgentRunStatus::WaitingForReconciliation)
+        ),
+        "{label}"
+    );
+}
+
+/// A row the run put back, whose settlement was interrupted, still parks
+/// `ticket-row-missing`. The sweep cancels the row and then loses its write
+/// finishing the fleet entry, or crashes after it and before telling the
+/// run. A pass a lease later reads the cancelled row, which counts nothing
+/// of the row that was lost, and parks the call. It used to read that count
+/// as "never started" and tell a non-idempotent call `Cancelled`, charged
+/// nothing.
+#[tokio::test]
+async fn a_put_back_row_whose_settlement_was_interrupted_still_parks_ticket_row_missing() {
+    use rakka_agent::testkit::CrashPoint;
+    for point in [
+        CrashPoint::BeforeWrite,
+        CrashPoint::ConflictBeforeWrite,
+        CrashPoint::AfterWrite,
+    ] {
+        let fx = a_put_back_row_under_a_fenced_entry_on_a_cancelled_run().await;
+        fx.fleet_store.crash_at(1, point);
+        let _ = fx.pipeline().pump_run(&run_scope()).await;
+        fx.fleet_store.assert_crash_fired(1, point);
+        fx.fleet_store.survive();
+        assert_eq!(
+            (tool_row(&fx).await.0, tool_effect(&fx).await.0),
+            (OutboxStatus::Cancelled, AgentRunEffectStatus::Ready),
+            "{point:?}: the row is cancelled and the run not told"
+        );
+        fx.expire_lease();
+
+        fx.one_pass().await;
+
+        assert_parked_as_missing(&fx, &format!("{point:?}")).await;
+    }
+}
+
+/// A row the run put back that the workflow tier's cancellation cancelled
+/// parks `ticket-row-missing` too. `cancel_run_dispatches` cancels the row
+/// and finishes the entry without reading the row's stamp; the agent
+/// dispatcher's sweep, a lease later, does read it.
+#[tokio::test]
+async fn a_put_back_row_the_workflow_tier_cancelled_parks_ticket_row_missing() {
+    let fx = a_put_back_row_under_a_fenced_entry_on_a_cancelled_run().await;
+    cancel_with_the_workflow_tier(&fx).await;
+    assert_eq!(tool_row(&fx).await, (OutboxStatus::Cancelled, 0, None));
+    fx.expire_lease();
+
+    fx.one_pass().await;
+
+    assert_parked_as_missing(&fx, "the workflow tier cancelled").await;
 }

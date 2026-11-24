@@ -243,9 +243,13 @@ leaves behind is the same either way.
      worker holds, as the workflow tier's `refresh_run` would. So a
      deployment that pumps runs only through `AgentRunEffectDispatcher`
      needs no `refresh_run`. A ticket a worker still holds is left to that
-     worker.
+     worker. The row is cancelled as it stands when the write lands, so a
+     late worker's failure in between is cancelled too, and the entry is
+     finished only once its row is.
    - **A row the run put back** after the ticket's own row was lost is
-     parked `ticket-row-missing`.
+     parked `ticket-row-missing`. That holds when the sweep's settlement of
+     it is interrupted, and when the workflow tier cancelled it; then the
+     park comes a lease after the entry was last written.
    - **A run fenced at the fleet without being cancelled** parks its call
      `ticket-row-settled` once a lease has passed.
    Parked runs consume no live task, thread, or timer. When the last
@@ -620,7 +624,11 @@ is another read and another attempt to write all of it. A registration or a
 claim that lost used to leave the record alone until its next pass; it now
 reads and tries again within tens of milliseconds, so the same writes land
 sooner and closer together. The two writes of a cancellation through
-`AgentDispatcherWorker` are still one try each and are not counted.
+`AgentDispatcherWorker` are still one try each and are not counted. So is
+the agent dispatcher's per-run write finishing an entry a cancellation
+request fenced (issue #211): a pass that loses it fails as
+`revision-conflict` before it claims anything, and the next pass finishes
+the entry from the row the lost one left cancelled.
 
 `AgentRunEffectDispatcher` checks a claim's lease when its pass reaches the
 claim, and again right after the dispatch authority answers (issue #207),
