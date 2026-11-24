@@ -208,17 +208,36 @@ fn earlier_attempt_may_have_executed(intent: &AgentRunEffect, started: u32) -> b
 }
 
 /// Whether the wind-down fence parks `intent` rather than cancelling it,
-/// given that `started` of its attempts have started: an attempt may have
-/// reached the target ([`earlier_attempt_may_have_executed`]), and reaching
-/// it may have acted on something outside the run
-/// ([`produces_only_its_result`]).
+/// given that `started` of its attempts have started, and whether its
+/// cancelled row carries the witness that the workflow tier's cancellation
+/// cancelled it while an attempt was in flight (`witnessed`,
+/// [`rakka_agent_workflow::DISPATCH_CANCELLED_IN_FLIGHT_LINE`]). It parks
+/// when an attempt may have reached the target, and reaching it may have
+/// acted on something outside the run ([`produces_only_its_result`]).
 ///
-/// A model call or a goal evaluation a deployment raised to `Idempotent` is
-/// cancelled as a read-only call is: the cancelled run throws its result
-/// away, and a person asked whether a completion "executed" has nothing to
-/// decide. A refusal of its retry still parks it, as before issue #206.
-fn the_wind_down_parks(intent: &AgentRunEffect, started: u32) -> bool {
-    earlier_attempt_may_have_executed(intent, started) && !produces_only_its_result(intent.kind())
+/// An attempt may have reached the target:
+/// - for an idempotent call with an attempt started
+///   ([`earlier_attempt_may_have_executed`], issue #206);
+/// - for a reconcileable call with an attempt counted, which the claim path
+///   would have asked the reconciler about before anything followed it
+///   (issue #209, the owner's ruling). The claim's own fence never meets
+///   one: such a row takes the ambiguous branch first. Only a row cancelled
+///   without the reconciler's word does;
+/// - for any call but a read-only one whose row carries the witness: an
+///   attempt whose worker was lost, with its outcome unknown (issue #209).
+///
+/// A model call or a goal evaluation is cancelled as a read-only call is,
+/// whatever its class or its row: the cancelled run throws its result away,
+/// and a person asked whether a completion "executed" has nothing to decide.
+/// A refusal of its retry still parks it, as before issue #206.
+fn the_wind_down_parks(intent: &AgentRunEffect, started: u32, witnessed: bool) -> bool {
+    if produces_only_its_result(intent.kind()) {
+        return false;
+    }
+    let class = intent.safety.class();
+    (witnessed && class != AgentEffectSafetyClass::ReadOnly)
+        || earlier_attempt_may_have_executed(intent, started)
+        || (class == AgentEffectSafetyClass::Reconcileable && started > 0)
 }
 
 /// Whether an effect of `kind` produces nothing but its result: a model call
@@ -557,6 +576,7 @@ enum RowVerdict {
 /// |---|---|
 /// | `Exhausted` | what the row's last failure line says the lost worker was about to deliver ([`owed_by_exhausted_row`]), with the row's attempt count |
 /// | `Cancelled`, and `fence_applies`, of a call the fence parks ([`the_wind_down_parks`]) | `Indeterminate` under `run-cancelled-after-attempt`, with the row's attempt count: what the fence answers such a call (issue #206) |
+/// | `Cancelled`, and `fence_applies`, carrying the workflow tier's witness of an attempt in flight ([`rakka_agent_workflow::DISPATCH_CANCELLED_IN_FLIGHT_LINE`]), or of a reconcileable call with attempts counted, unless the call is read-only or produces only its result | `Indeterminate` under `run-cancelled-after-attempt`, with the row's attempt count: an attempt may have reached the target, and nothing asked (issue #209) |
 /// | `Cancelled`, and `fence_applies`, otherwise | `Cancelled`: the wind-down fence's own answer for a ticket whose next attempt never started |
 /// | `Cancelled` otherwise | `Indeterminate`: the ticket was ended, and nothing says with what |
 /// | `Dispatched` | `Indeterminate`: the call succeeded, and its result reached nobody |
@@ -589,7 +609,9 @@ fn owed_by_finished_row(
         // (`AgentDispatcherWorker::cancel_run_dispatches`), and is read as
         // the fence now answers it.
         OutboxStatus::Cancelled if fence_applies => {
-            let verdict = if the_wind_down_parks(intent, counted) {
+            let witnessed = row.attempts().last_error()
+                == Some(rakka_agent_workflow::DISPATCH_CANCELLED_IN_FLIGHT_LINE);
+            let verdict = if the_wind_down_parks(intent, counted, witnessed) {
                 RowVerdict::Unknown {
                     code: RUN_CANCELLED_AFTER_ATTEMPT,
                 }
@@ -4072,7 +4094,7 @@ where
             // never executed, and nothing asked (issue #206). Not a model
             // call or a goal evaluation, which act on nothing outside the
             // run ([`the_wind_down_parks`]).
-            if the_wind_down_parks(&intent, started) {
+            if the_wind_down_parks(&intent, started, false) {
                 return self
                     .park_indeterminate(
                         scope,
