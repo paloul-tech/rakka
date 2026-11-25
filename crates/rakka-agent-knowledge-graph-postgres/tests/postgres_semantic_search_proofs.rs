@@ -399,6 +399,56 @@ async fn doctor(
     .await
 }
 
+/// Writes a copy of `source`'s row under `raw_id` past the store, as a
+/// later build with a wider id alphabet would: a claim id this build
+/// refuses.
+async fn plant_refused_claim_id(
+    raw: &Client,
+    scope: &KnowledgeSpaceScope,
+    source: &ClaimId,
+    raw_id: &str,
+) {
+    assert!(
+        ClaimId::new(raw_id).is_err(),
+        "{raw_id} is a claim id this build refuses"
+    );
+    let planted = raw
+        .execute(
+            "INSERT INTO rakka_agent_knowledge_claim \
+                (tenant, space, claim_id, operation_id, subject, predicate, object_node, trust, \
+                 transition_count, record, tombstoned, search_tokens, search_classification, \
+                 search_confidence_bps, search_read_capabilities) \
+             SELECT tenant, space, $3, operation_id || $3, subject, predicate, object_node, \
+                    trust, transition_count, record, tombstoned, search_tokens, \
+                    search_classification, search_confidence_bps, search_read_capabilities \
+             FROM rakka_agent_knowledge_claim \
+             WHERE tenant = $1 AND space = $2 AND claim_id = $4",
+            &[
+                &scope.tenant().as_str(),
+                &scope.space().as_str(),
+                &raw_id,
+                &source.as_str(),
+            ],
+        )
+        .await
+        .expect("the row is planted");
+    assert_eq!(planted, 1, "one copy of the source row is planted");
+}
+
+/// The claim ids of one space in the database's own order.
+async fn claim_order(raw: &Client, scope: &KnowledgeSpaceScope) -> Vec<String> {
+    raw.query(
+        "SELECT claim_id FROM rakka_agent_knowledge_claim \
+         WHERE tenant = $1 AND space = $2 ORDER BY claim_id",
+        &[&scope.tenant().as_str(), &scope.space().as_str()],
+    )
+    .await
+    .expect("the claim ids read")
+    .iter()
+    .map(|row| row.get::<_, String>("claim_id"))
+    .collect()
+}
+
 const RAW_EMBEDDING: &str = "embedding = '[1,0,0]'::vector, embedding_model = 'proof-embedder', \
                              embedding_dimensions = 3, embedding_version = 1";
 
@@ -1065,6 +1115,74 @@ async fn postgres_two_embedding_passes_at_once_embed_every_claim_when_dsn_is_set
         walk(&first, &embedder, scope).await,
         0,
         "nothing is left to embed"
+    );
+    schema.drop().await;
+}
+
+#[tokio::test]
+async fn postgres_the_embedding_pass_reads_past_a_claim_id_this_build_refuses_when_dsn_is_set() {
+    // A row whose claim id this build refuses (one written past the store,
+    // by a later build with a wider id alphabet) is counted and read past,
+    // and does not count toward the limit. It used to make a full page whose
+    // last row it was an error, and every retry the same error.
+    let Some(dsn) =
+        pgvector_dsn("postgres_the_embedding_pass_reads_past_a_claim_id_this_build_refuses").await
+    else {
+        return;
+    };
+    let (schema, raw, store) = PrivateSchema::migrated(&dsn, "sem_refused_id").await;
+    let scopes = ConformanceScopes::unique("pg-sem-refused-id");
+    let scope = &scopes.primary;
+    let embedder = ConceptEmbedder::new(&[&["car", "automobile"]]);
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        ids.push(
+            append(&store, scope, &format!("claim-{index}"), "the car is here")
+                .await
+                .claim_id,
+        );
+    }
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let first_refused = format!("{}|x", ids[0].as_str());
+    let last_refused = format!("{}|x", ids[2].as_str());
+    plant_refused_claim_id(&raw, scope, &ids[0], &first_refused).await;
+    plant_refused_claim_id(&raw, scope, &ids[2], &last_refused).await;
+    assert_eq!(
+        claim_order(&raw, scope).await,
+        [
+            ids[0].as_str(),
+            first_refused.as_str(),
+            ids[1].as_str(),
+            ids[2].as_str(),
+            last_refused.as_str(),
+        ]
+    );
+
+    let mut pages = Vec::new();
+    let mut after: Option<ClaimId> = None;
+    for _ in 0..8 {
+        let page = embed_claims(&store, &embedder, &unclassified(), scope, after.as_ref(), 1)
+            .await
+            .expect("a refused claim id never fails the pass");
+        pages.push((
+            page.embedded,
+            page.failed,
+            page.undecodable,
+            page.next.clone(),
+        ));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(
+        pages,
+        vec![
+            (1, 0, 0, Some(ids[0].clone())),
+            (1, 0, 1, Some(ids[1].clone())),
+            (1, 0, 0, Some(ids[2].clone())),
+            (0, 0, 1, None),
+        ]
     );
     schema.drop().await;
 }

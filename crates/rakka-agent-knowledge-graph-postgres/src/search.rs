@@ -192,14 +192,16 @@ pub struct ClaimSearchIndexPage {
     /// A row another pass indexed first, or a tombstone withdrew first, is
     /// not counted.
     pub indexed: u64,
-    /// How many rows this page read and could not index because their record
-    /// cannot be decoded by this build. Such a row stays unindexed, so its
-    /// space keeps reporting `unindexed` until the record is repaired or
-    /// erased; a non-zero count is the signal to look.
+    /// How many rows this page read and could not index because this build
+    /// cannot decode their record or refuses their claim id. Such a row
+    /// stays unindexed, so its space keeps reporting `unindexed` until the
+    /// row is repaired or erased; a non-zero count is the signal to look.
     pub skipped: u64,
     /// The cursor for the next page: the last claim this page read, when the
-    /// page was full. `None` when the page read fewer rows than its limit,
-    /// which is the end of the pass.
+    /// page was full. `None` when the rows ran out before the page was full,
+    /// which is the end of the pass. Always a claim id this build reads: a
+    /// row whose claim id it refuses is read past and does not fill the
+    /// page.
     pub next: Option<ClaimId>,
 }
 
@@ -256,6 +258,14 @@ impl PostgresKnowledgeGraphStore {
     /// is counted in [`ClaimSearchIndexPage::skipped`] and passed over; it
     /// does not stop the pass.
     ///
+    /// Nor does a row whose claim id this build refuses (one written past
+    /// the store, by a later build with a wider id alphabet or by a hand
+    /// repair). It is counted in [`ClaimSearchIndexPage::skipped`] and read
+    /// past, and does not count toward `limit`: the call reads on until it
+    /// has read `limit` rows whose claim id it reads, or the rows run out,
+    /// so [`ClaimSearchIndexPage::next`] is always a claim id. One call may
+    /// read more than `limit` rows.
+    ///
     /// The pass is idempotent and safe to run at any time, on any number of
     /// nodes at once, while the store is serving. It only ever touches the
     /// addressed tenant and space.
@@ -271,65 +281,86 @@ impl PostgresKnowledgeGraphStore {
         limit: usize,
     ) -> ClaimResult<ClaimSearchIndexPage> {
         let limit = limit.clamp(1, CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS);
-        // Every claim id sorts after the empty string.
-        let after = after.map_or("", ClaimId::as_str);
-        let rows = self
-            .client
-            .query(
-                CLAIM_SEARCH_INDEX_READ_SQL,
-                &[
-                    &scope.tenant().as_str(),
-                    &scope.space().as_str(),
-                    &after,
-                    &i64::try_from(limit).unwrap_or(i64::MAX),
-                ],
-            )
-            .await
-            .map_err(map_error)?;
+        // The cursor inside the call is the raw text of the last row read,
+        // whatever it holds, so the next read starts past a row whose claim
+        // id this build refuses. Every claim id sorts after the empty string.
+        let mut after_raw = after.map_or_else(String::new, |id| id.as_str().to_string());
 
         let mut page = ClaimSearchIndexPage {
             indexed: 0,
             skipped: 0,
             next: None,
         };
-        let full = rows.len() == limit;
-        let mut last: Option<String> = None;
-        for row in rows {
-            let claim_id: String = row.get("claim_id");
-            // The record is the only source of the index. One that cannot be
-            // decoded, or that is not the claim its own row names, has no
-            // index this build could vouch for.
-            let claim = decode_claim_row(&row)
-                .ok()
-                .filter(|claim| claim.claim_id.as_str() == claim_id);
-            match claim {
-                Some(claim) => {
-                    let index = search_columns(&claim);
-                    let written = self
-                        .client
-                        .execute(
-                            CLAIM_SEARCH_INDEX_WRITE_SQL,
-                            &[
-                                &scope.tenant().as_str(),
-                                &scope.space().as_str(),
-                                &claim_id,
-                                &index.tokens,
-                                &index.classification,
-                                &index.confidence_bps,
-                                &index.read_capabilities,
-                            ],
-                        )
-                        .await
-                        .map_err(map_error)?;
-                    page.indexed += written;
+        let mut last: Option<ClaimId> = None;
+        // Rows whose claim id this build reads; only they count toward
+        // `limit`.
+        let mut handled = 0usize;
+        let mut ended = false;
+        while handled < limit {
+            let want = limit - handled;
+            let rows = self
+                .client
+                .query(
+                    CLAIM_SEARCH_INDEX_READ_SQL,
+                    &[
+                        &scope.tenant().as_str(),
+                        &scope.space().as_str(),
+                        &after_raw,
+                        &i64::try_from(want).unwrap_or(i64::MAX),
+                    ],
+                )
+                .await
+                .map_err(map_error)?;
+            let read = rows.len();
+            for row in rows {
+                let claim_id: String = row.get("claim_id");
+                let parsed = ClaimId::new(claim_id.as_str());
+                after_raw = claim_id;
+                // A row whose claim id this build refuses is counted and read
+                // past, and does not count toward `limit`: the page ends on a
+                // claim id it read, or at the end of the rows.
+                let Ok(parsed) = parsed else {
+                    page.skipped += 1;
+                    continue;
+                };
+                handled += 1;
+                // The record is the only source of the index. One that cannot
+                // be decoded, or that is not the claim its own row names, has
+                // no index this build could vouch for.
+                let claim = decode_claim_row(&row)
+                    .ok()
+                    .filter(|claim| claim.claim_id == parsed);
+                match claim {
+                    Some(claim) => {
+                        let index = search_columns(&claim);
+                        let written = self
+                            .client
+                            .execute(
+                                CLAIM_SEARCH_INDEX_WRITE_SQL,
+                                &[
+                                    &scope.tenant().as_str(),
+                                    &scope.space().as_str(),
+                                    &parsed.as_str(),
+                                    &index.tokens,
+                                    &index.classification,
+                                    &index.confidence_bps,
+                                    &index.read_capabilities,
+                                ],
+                            )
+                            .await
+                            .map_err(map_error)?;
+                        page.indexed += written;
+                    }
+                    None => page.skipped += 1,
                 }
-                None => page.skipped += 1,
+                last = Some(parsed);
             }
-            last = Some(claim_id);
+            if read < want {
+                ended = true;
+                break;
+            }
         }
-        if full {
-            page.next = last.map(ClaimId::new).transpose()?;
-        }
+        page.next = if ended { None } else { last };
         Ok(page)
     }
 }

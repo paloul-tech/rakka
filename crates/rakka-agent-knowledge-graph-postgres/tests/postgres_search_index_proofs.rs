@@ -1671,6 +1671,56 @@ async fn index_to_the_end(
     }
 }
 
+/// Writes a copy of `source`'s row under `raw_id` past the store, as a
+/// later build with a wider id alphabet would: a claim id this build
+/// refuses.
+async fn plant_refused_claim_id(
+    raw: &Client,
+    scope: &KnowledgeSpaceScope,
+    source: &ClaimId,
+    raw_id: &str,
+) {
+    assert!(
+        ClaimId::new(raw_id).is_err(),
+        "{raw_id} is a claim id this build refuses"
+    );
+    let planted = raw
+        .execute(
+            "INSERT INTO rakka_agent_knowledge_claim \
+                (tenant, space, claim_id, operation_id, subject, predicate, object_node, trust, \
+                 transition_count, record, tombstoned, search_tokens, search_classification, \
+                 search_confidence_bps, search_read_capabilities) \
+             SELECT tenant, space, $3, operation_id || $3, subject, predicate, object_node, \
+                    trust, transition_count, record, tombstoned, search_tokens, \
+                    search_classification, search_confidence_bps, search_read_capabilities \
+             FROM rakka_agent_knowledge_claim \
+             WHERE tenant = $1 AND space = $2 AND claim_id = $4",
+            &[
+                &scope.tenant().as_str(),
+                &scope.space().as_str(),
+                &raw_id,
+                &source.as_str(),
+            ],
+        )
+        .await
+        .expect("the row is planted");
+    assert_eq!(planted, 1, "one copy of the source row is planted");
+}
+
+/// The claim ids of one space in the database's own order.
+async fn claim_order(raw: &Client, scope: &KnowledgeSpaceScope) -> Vec<String> {
+    raw.query(
+        "SELECT claim_id FROM rakka_agent_knowledge_claim \
+         WHERE tenant = $1 AND space = $2 ORDER BY claim_id",
+        &[&scope.tenant().as_str(), &scope.space().as_str()],
+    )
+    .await
+    .expect("the claim ids read")
+    .iter()
+    .map(|row| row.get::<_, String>("claim_id"))
+    .collect()
+}
+
 /// How many live rows of one scope have no search words.
 async fn unindexed_rows(raw: &Client, scope: &KnowledgeSpaceScope) -> i64 {
     raw.query_one(
@@ -1813,6 +1863,81 @@ async fn postgres_the_indexing_pass_skips_a_damaged_record_when_dsn_is_set() {
     assert!(
         report.unindexed,
         "a claim the pass could not index is still reported"
+    );
+
+    schema.drop().await;
+}
+
+#[tokio::test]
+async fn postgres_the_indexing_pass_reads_past_a_claim_id_this_build_refuses_when_dsn_is_set() {
+    // A row whose claim id this build refuses is counted in `skipped` and
+    // read past, and does not count toward the limit. It used to make a full
+    // page whose last row it was an error, and every retry the same error.
+    let Some(dsn) = dsn() else { return };
+    let (schema, raw, store) = PrivateSchema::migrated(&dsn, "search_refused_id").await;
+    let scope = ConformanceScopes::unique("pg-index-refused-id").primary;
+    let mut ids: Vec<ClaimId> = earlier_claims(&raw, &scope, 3)
+        .await
+        .into_iter()
+        .map(|claim| claim.claim_id)
+        .collect();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let first_refused = format!("{}|x", ids[0].as_str());
+    let last_refused = format!("{}|x", ids[2].as_str());
+    plant_refused_claim_id(&raw, &scope, &ids[0], &first_refused).await;
+    plant_refused_claim_id(&raw, &scope, &ids[2], &last_refused).await;
+    assert_eq!(
+        claim_order(&raw, &scope).await,
+        [
+            ids[0].as_str(),
+            first_refused.as_str(),
+            ids[1].as_str(),
+            ids[2].as_str(),
+            last_refused.as_str(),
+        ]
+    );
+
+    let mut pages = Vec::new();
+    let mut after: Option<ClaimId> = None;
+    for _ in 0..8 {
+        let page = store
+            .index_claims(&scope, after.as_ref(), 1)
+            .await
+            .expect("a refused claim id never fails the pass");
+        pages.push((page.indexed, page.skipped, page.next.clone()));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(
+        pages,
+        vec![
+            (1, 0, Some(ids[0].clone())),
+            (1, 1, Some(ids[1].clone())),
+            (1, 0, Some(ids[2].clone())),
+            (0, 1, None),
+        ]
+    );
+
+    // A limit of zero reads one row whose id the pass reads, and reads past
+    // a refused one to reach it.
+    let zero = ConformanceScopes::unique("pg-index-refused-zero").primary;
+    let mut ids: Vec<ClaimId> = earlier_claims(&raw, &zero, 2)
+        .await
+        .into_iter()
+        .map(|claim| claim.claim_id)
+        .collect();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let refused = format!("{}|x", ids[0].as_str());
+    plant_refused_claim_id(&raw, &zero, &ids[0], &refused).await;
+    let page = store
+        .index_claims(&zero, Some(&ids[0]), 0)
+        .await
+        .expect("a refused claim id never fails the pass");
+    assert_eq!(
+        (page.indexed, page.skipped, page.next),
+        (1, 1, Some(ids[1].clone()))
     );
 
     schema.drop().await;

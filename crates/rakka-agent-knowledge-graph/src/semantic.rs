@@ -254,11 +254,14 @@ pub struct ClaimEmbeddingPage {
     /// The claims, whole, in ascending claim-id order.
     pub claims: Vec<Claim>,
     /// How many records this page read and could not answer, because this
-    /// build cannot decode them or cannot vouch for them. The cursor moves
-    /// past them; a non-zero count is the signal to look.
+    /// build cannot decode them, cannot vouch for them, or refuses their
+    /// claim id. The cursor moves past them; a non-zero count is the signal
+    /// to look.
     pub undecodable: u64,
     /// The cursor for the next page: the last claim this page read, when the
-    /// page was full. `None` is the end of the walk.
+    /// page was full. `None` is the end of the walk. Always a claim id: a
+    /// row whose claim id this build refuses is read past and does not fill
+    /// the page.
     pub next: Option<ClaimId>,
 }
 

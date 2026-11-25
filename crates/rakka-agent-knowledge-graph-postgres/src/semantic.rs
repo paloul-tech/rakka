@@ -512,6 +512,13 @@ impl PostgresKnowledgeGraphStore {
     /// selected it by (its classification is outside the set, or it is
     /// retracted) is counted in [`ClaimEmbeddingPage::undecodable`] and not
     /// listed. The cursor moves past it.
+    ///
+    /// So is a row whose claim id this build refuses (one written past the
+    /// store, by a later build with a wider id alphabet or by a hand
+    /// repair), which also does not count toward `limit`: the call reads on
+    /// until it has read `limit` rows whose claim id it reads, or the rows
+    /// run out, so [`ClaimEmbeddingPage::next`] is always a claim id. One
+    /// call may read more than `limit` rows.
     pub(crate) async fn unembedded(
         &self,
         scope: &KnowledgeSpaceScope,
@@ -524,44 +531,65 @@ impl PostgresKnowledgeGraphStore {
         let limit = limit.clamp(1, CLAIM_EMBEDDING_PAGE_MAX_CLAIMS);
         let reference = reference_columns(reference)?;
         let labels = classification_labels(classifications);
-        // Every claim id sorts after the empty string.
-        let after = after.map_or("", ClaimId::as_str);
-        let params: [&(dyn ToSql + Sync); 8] = [
-            &scope.tenant().as_str(),
-            &scope.space().as_str(),
-            &labels,
-            &reference.model,
-            &reference.dimensions,
-            &reference.version,
-            &after,
-            &i64::try_from(limit).unwrap_or(i64::MAX),
-        ];
-        let rows = self
-            .client
-            .query(CLAIM_UNEMBEDDED_READ_SQL, &params)
-            .await
-            .map_err(map_error)?;
+        // The cursor inside the call is the raw text of the last row read,
+        // whatever it holds, so the next read starts past a row whose claim
+        // id this build refuses. Every claim id sorts after the empty string.
+        let mut after_raw = after.map_or_else(String::new, |id| id.as_str().to_string());
 
         let mut page = ClaimEmbeddingPage::default();
-        let full = rows.len() == limit;
-        let mut last: Option<String> = None;
-        for row in rows {
-            let claim_id: String = row.get("claim_id");
-            let claim = decode_claim_row(&row).ok().filter(|claim| {
-                claim.claim_id.as_str() == claim_id
-                    && !claim.is_tombstoned()
-                    && claim.trust() != ClaimTrustStatus::Retracted
-                    && classifications.contains(&claim.classification)
-            });
-            match claim {
-                Some(claim) => page.claims.push(claim),
-                None => page.undecodable += 1,
+        let mut last: Option<ClaimId> = None;
+        // Rows whose claim id this build reads; only they count toward
+        // `limit`.
+        let mut handled = 0usize;
+        let mut ended = false;
+        while handled < limit {
+            let want = limit - handled;
+            let params: [&(dyn ToSql + Sync); 8] = [
+                &scope.tenant().as_str(),
+                &scope.space().as_str(),
+                &labels,
+                &reference.model,
+                &reference.dimensions,
+                &reference.version,
+                &after_raw,
+                &i64::try_from(want).unwrap_or(i64::MAX),
+            ];
+            let rows = self
+                .client
+                .query(CLAIM_UNEMBEDDED_READ_SQL, &params)
+                .await
+                .map_err(map_error)?;
+            let read = rows.len();
+            for row in rows {
+                let claim_id: String = row.get("claim_id");
+                let parsed = ClaimId::new(claim_id.as_str());
+                after_raw = claim_id;
+                // A row whose claim id this build refuses is counted and read
+                // past, and does not count toward `limit`: the page ends on a
+                // claim id it read, or at the end of the rows.
+                let Ok(parsed) = parsed else {
+                    page.undecodable += 1;
+                    continue;
+                };
+                handled += 1;
+                let claim = decode_claim_row(&row).ok().filter(|claim| {
+                    claim.claim_id == parsed
+                        && !claim.is_tombstoned()
+                        && claim.trust() != ClaimTrustStatus::Retracted
+                        && classifications.contains(&claim.classification)
+                });
+                match claim {
+                    Some(claim) => page.claims.push(claim),
+                    None => page.undecodable += 1,
+                }
+                last = Some(parsed);
             }
-            last = Some(claim_id);
+            if read < want {
+                ended = true;
+                break;
+            }
         }
-        if full {
-            page.next = last.map(ClaimId::new).transpose()?;
-        }
+        page.next = if ended { None } else { last };
         Ok(page)
     }
 }
