@@ -13,7 +13,9 @@
 //! Each operation first recovers a component that lost a compare-and-set
 //! ([`AgentRunCore::refresh_if_stale`]), then runs, then records the run's
 //! snapshot, or its error, in the registry under the operation's phase. The
-//! phases are the ones the actor has always recorded under.
+//! phases are the ones the actor has always recorded under. Each operation
+//! boxes its work, so an owner that awaits one inline, as an entity's handler
+//! does, holds a small future in its own state and its debug-build stack.
 //!
 //! An owner calls [`AgentRunCore::recover`] before the first operation, and
 //! again whenever the owner itself is re-created: the actor does so when it
@@ -205,11 +207,18 @@ where
     /// The contract for a composed write:
     ///
     /// - **Refresh first.** Call [`Self::refresh_if_stale`] before it.
-    /// - **Read after the refresh.** Compute the write from state read after
-    ///   that refresh, never from a copy read before it. The refresh replaces
-    ///   a stale copy with the stored one, and a write computed from the
-    ///   stale copy would then land over another writer's change that its
+    /// - **Read after the last refresh.** Compute the write from state read
+    ///   after that refresh, with **no core operation between the read and
+    ///   the write**: every core operation may refresh too. A refresh replaces
+    ///   a stale copy with the stored one, so a write computed from a copy
+    ///   read before it would land over another writer's change that its
     ///   compare-and-set would otherwise have refused.
+    /// - **A store error leaves the outcome unknown.** A write that fails
+    ///   with a store error other than a revision conflict may have
+    ///   committed, and leaves nothing stale. Call [`Self::recover`] before
+    ///   relying on the core's state again: otherwise the core can hold the
+    ///   revision from before its own committed write, and its next write
+    ///   loses the compare-and-set to it.
     /// - **A loss leaves the component stale.** A composed write that loses
     ///   its compare-and-set to another writer of the store leaves that
     ///   component stale. The core's next operation, or the next
@@ -255,15 +264,18 @@ where
     /// A store's failure to load, or a recovered record this build cannot
     /// read.
     pub async fn recover(&mut self) -> AgentRunRuntimeResult<AgentRunActorSnapshot> {
-        let result = async {
-            self.runner.recover().await?;
-            self.inbox.recover().await?;
-            self.reconcile_recovered_graph_effects().await?;
-            self.read_snapshot()
-        }
-        .await;
-        self.record_snapshot_result("recover", &result);
-        result
+        Box::pin(async move {
+            let result = async {
+                self.runner.recover().await?;
+                self.inbox.recover().await?;
+                self.reconcile_recovered_graph_effects().await?;
+                self.read_snapshot()
+            }
+            .await;
+            self.record_snapshot_result("recover", &result);
+            result
+        })
+        .await
     }
 
     /// Re-links durable outbox effects to their graph nodes after recovery.
@@ -336,10 +348,13 @@ where
     ///
     /// The refresh's recovery failing, or a component that cannot be read.
     pub async fn snapshot(&mut self) -> AgentRunRuntimeResult<AgentRunActorSnapshot> {
-        self.refresh_if_stale().await?;
-        let result = self.read_snapshot();
-        self.record_snapshot_result("snapshot", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self.read_snapshot();
+            self.record_snapshot_result("snapshot", &result);
+            result
+        })
+        .await
     }
 
     fn read_snapshot(&self) -> AgentRunRuntimeResult<AgentRunActorSnapshot> {
@@ -374,14 +389,17 @@ where
         &mut self,
         command: AgentCommand,
     ) -> AgentRunRuntimeResult<AgentInboxAcceptance> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .inbox
-            .accept_command(command)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("accept-command", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .inbox
+                .accept_command(command)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("accept-command", &result);
+            result
+        })
+        .await
     }
 
     /// Persists the initial accepted run state. Recorded under `start`.
@@ -393,14 +411,17 @@ where
         &mut self,
         initial_state: AgentRunState,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .start(initial_state)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("start", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .start(initial_state)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("start", &result);
+            result
+        })
+        .await
     }
 
     /// Initializes compiled graph state and persists the accepted run state.
@@ -416,13 +437,16 @@ where
         plan: &AgentCompiledExecutionPlan,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .graph_runtime
-            .start_graph_run(&mut self.runner, initial_state, plan, now)
-            .await;
-        self.record_operation_result("start-graph", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .graph_runtime
+                .start_graph_run(&mut self.runner, initial_state, plan, now)
+                .await;
+            self.record_operation_result("start-graph", &result);
+            result
+        })
+        .await
     }
 
     /// Marks ready graph nodes runnable. Recorded under `mark-graph-ready`.
@@ -436,13 +460,16 @@ where
         plan: &AgentCompiledExecutionPlan,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentGraphRuntimeTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .graph_runtime
-            .mark_ready_nodes(&mut self.runner, plan, now)
-            .await;
-        self.record_operation_result("mark-graph-ready", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .graph_runtime
+                .mark_ready_nodes(&mut self.runner, plan, now)
+                .await;
+            self.record_operation_result("mark-graph-ready", &result);
+            result
+        })
+        .await
     }
 
     /// Starts one runnable graph node. Recorded under `start-graph-node`.
@@ -457,13 +484,16 @@ where
         node_id: AgentCompiledNodeId,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentGraphRuntimeTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .graph_runtime
-            .start_node(&mut self.runner, plan, node_id, now)
-            .await;
-        self.record_operation_result("start-graph-node", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .graph_runtime
+                .start_node(&mut self.runner, plan, node_id, now)
+                .await;
+            self.record_operation_result("start-graph-node", &result);
+            result
+        })
+        .await
     }
 
     /// Completes one running graph node. Recorded under
@@ -479,13 +509,16 @@ where
         node_id: AgentCompiledNodeId,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentGraphRuntimeTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .graph_runtime
-            .complete_node(&mut self.runner, plan, node_id, now)
-            .await;
-        self.record_operation_result("complete-graph-node", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .graph_runtime
+                .complete_node(&mut self.runner, plan, node_id, now)
+                .await;
+            self.record_operation_result("complete-graph-node", &result);
+            result
+        })
+        .await
     }
 
     /// Schedules one running effect-producing graph node's effect. Recorded
@@ -500,13 +533,16 @@ where
         plan: &AgentCompiledExecutionPlan,
         request: AgentGraphEffectScheduleRequest,
     ) -> AgentRunRuntimeResult<AgentGraphRuntimeEffectOutcome> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .graph_runtime
-            .schedule_node_effect(&mut self.runner, &mut self.inbox, plan, request)
-            .await;
-        self.record_operation_result("schedule-graph-node-effect", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .graph_runtime
+                .schedule_node_effect(&mut self.runner, &mut self.inbox, plan, request)
+                .await;
+            self.record_operation_result("schedule-graph-node-effect", &result);
+            result
+        })
+        .await
     }
 
     /// Begins executing the current step. Recorded under `begin-step`.
@@ -518,14 +554,17 @@ where
         &mut self,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .begin_step(now)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("begin-step", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .begin_step(now)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("begin-step", &result);
+            result
+        })
+        .await
     }
 
     /// Records the current step's success. Recorded under `succeed-step`.
@@ -538,14 +577,17 @@ where
         success: AgentStepSuccess,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .succeed_step(success, now)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("succeed-step", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .succeed_step(success, now)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("succeed-step", &result);
+            result
+        })
+        .await
     }
 
     /// Records the current step's failure and fails the run. Recorded under
@@ -559,14 +601,17 @@ where
         error_code: String,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .fail_step(error_code, now)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("fail-step", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .fail_step(error_code, now)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("fail-step", &result);
+            result
+        })
+        .await
     }
 
     /// Pauses the run for a durable wait condition. Recorded under `wait`.
@@ -579,14 +624,17 @@ where
         reason: AgentRunWaitReason,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .wait(reason, now)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("wait", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .wait(reason, now)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("wait", &result);
+            result
+        })
+        .await
     }
 
     /// Resumes a waiting run. Recorded under `resume`.
@@ -598,14 +646,17 @@ where
         &mut self,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .resume(now)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("resume", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .resume(now)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("resume", &result);
+            result
+        })
+        .await
     }
 
     /// Completes a running run. Recorded under `complete`.
@@ -617,14 +668,17 @@ where
         &mut self,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .complete(now)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("complete", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .complete(now)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("complete", &result);
+            result
+        })
+        .await
     }
 
     /// Fails a non-terminal run outside a specific step failure. Recorded
@@ -638,14 +692,17 @@ where
         error_code: String,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .fail_run(error_code, now)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("fail-run", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .fail_run(error_code, now)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("fail-run", &result);
+            result
+        })
+        .await
     }
 
     /// Requests run cancellation. Recorded under `request-cancellation`.
@@ -659,14 +716,17 @@ where
         reason_summary: Option<String>,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .request_cancellation(reason_code, reason_summary, now)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("request-cancellation", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .request_cancellation(reason_code, reason_summary, now)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("request-cancellation", &result);
+            result
+        })
+        .await
     }
 
     /// Marks a cancelling run cancelled. Recorded under `cancel`.
@@ -678,14 +738,17 @@ where
         &mut self,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .cancel(now)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("cancel", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .cancel(now)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("cancel", &result);
+            result
+        })
+        .await
     }
 
     /// Moves a failed run into compensation. Recorded under
@@ -698,14 +761,17 @@ where
         &mut self,
         now: AgentTimestampMillis,
     ) -> AgentRunRuntimeResult<AgentRunTransition> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .runner
-            .begin_compensation(now)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("begin-compensation", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .runner
+                .begin_compensation(now)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("begin-compensation", &result);
+            result
+        })
+        .await
     }
 
     /// Schedules a first-class effect through the durable outbox. Recorded
@@ -718,14 +784,17 @@ where
         &mut self,
         effect: AgentEffect,
     ) -> AgentRunRuntimeResult<AgentOutboxAcceptance> {
-        self.refresh_if_stale().await?;
-        let result = self
-            .inbox
-            .schedule_effect(effect)
-            .await
-            .map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("schedule-effect", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result = self
+                .inbox
+                .schedule_effect(effect)
+                .await
+                .map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("schedule-effect", &result);
+            result
+        })
+        .await
     }
 
     /// Answers the due effects in the durable outbox. Recorded under
@@ -736,11 +805,14 @@ where
     /// The refresh's recovery failing, or an outbox entry that cannot be
     /// read.
     pub async fn due_effects(&mut self) -> AgentRunRuntimeResult<Vec<AgentDueEffect>> {
-        self.refresh_if_stale().await?;
-        let result: AgentOutboxResult<Vec<AgentDueEffect>> = self.inbox.due_effects();
-        let result = result.map_err(AgentRunRuntimeError::from);
-        self.record_operation_result("due-effects", &result);
-        result
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
+            let result: AgentOutboxResult<Vec<AgentDueEffect>> = self.inbox.due_effects();
+            let result = result.map_err(AgentRunRuntimeError::from);
+            self.record_operation_result("due-effects", &result);
+            result
+        })
+        .await
     }
 
     fn record_snapshot_result(

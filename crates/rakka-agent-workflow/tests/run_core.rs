@@ -1256,8 +1256,8 @@ fn last_error_phase(registry: &AgentWorkflowSnapshotRegistry) -> String {
 /// always recorded under. The phase names are part of the registry's
 /// surface; the parity test cannot see one change, since the actor and the
 /// core now run the same method. Each operation is made to fail, and the
-/// phase it recorded is read back. `due_effects` and `snapshot` fail only on
-/// a store or record that cannot be read, and are not reached here.
+/// phase it recorded is read back. The two reads, `due_effects` and
+/// `snapshot`, fail on a core never recovered.
 #[tokio::test]
 async fn every_operation_records_its_errors_under_the_actors_phase_names() {
     // On a core whose run was never started, every operation that needs a
@@ -1334,6 +1334,12 @@ async fn every_operation_records_its_errors_under_the_actors_phase_names() {
     invalid.metadata.tenant = AgentTenantId::new("");
     fails_under!(&registry, "accept-command", empty.accept_command(invalid));
 
+    // A core never recovered refuses the two reads too.
+    let registry = AgentWorkflowSnapshotRegistry::new();
+    let mut never = core(&fixture, run_id.clone()).with_snapshot_registry(registry.clone());
+    fails_under!(&registry, "due-effects", never.due_effects());
+    fails_under!(&registry, "snapshot", never.snapshot());
+
     // On a core whose run is started, starting it again fails, and an effect
     // with no id is refused.
     let fixture = RuntimeFixture::new(workflow());
@@ -1367,4 +1373,72 @@ async fn every_operation_records_its_errors_under_the_actors_phase_names() {
         "schedule-effect",
         started.schedule_effect(effect)
     );
+}
+
+/// The core's operations box their work, so an owner that awaits one inline,
+/// as a host entity does, holds a small future in its own state and its
+/// debug-build stack frame, not the whole operation: the #162 rule. Each
+/// future is bounded by its arguments plus a box. An unboxed core future is
+/// 4.4 to 6.6 KB.
+#[test]
+fn the_cores_futures_are_small_because_their_work_is_boxed() {
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-core-future-sizes");
+    let plan = effect_graph_plan(&fixture.workflow);
+    let mut run_core = core(&fixture, run_id.clone());
+    let state = graph_accepted_run_state(&fixture.workflow, &run_id);
+    let request = effect_request(run_id.clone(), "effect", 160);
+    let command = start_command(&fixture.workflow, &run_id, "cmd-size");
+    let bound = |arguments: usize| arguments + 128;
+    let state_size = std::mem::size_of_val(&state);
+    let request_size = std::mem::size_of_val(&request);
+    let command_size = std::mem::size_of_val(&command);
+
+    let mut sizes = Vec::new();
+    sizes.push(("recover", std::mem::size_of_val(&run_core.recover()), 0));
+    sizes.push(("snapshot", std::mem::size_of_val(&run_core.snapshot()), 0));
+    sizes.push((
+        "accept_command",
+        std::mem::size_of_val(&run_core.accept_command(command)),
+        command_size,
+    ));
+    sizes.push((
+        "start",
+        std::mem::size_of_val(&run_core.start(state.clone())),
+        state_size,
+    ));
+    sizes.push((
+        "start_graph",
+        std::mem::size_of_val(&run_core.start_graph(state, &plan, at(1))),
+        state_size,
+    ));
+    sizes.push((
+        "mark_graph_ready",
+        std::mem::size_of_val(&run_core.mark_graph_ready(&plan, at(1))),
+        0,
+    ));
+    sizes.push((
+        "schedule_graph_node_effect",
+        std::mem::size_of_val(&run_core.schedule_graph_node_effect(&plan, request)),
+        request_size,
+    ));
+    sizes.push((
+        "begin_step",
+        std::mem::size_of_val(&run_core.begin_step(at(1))),
+        0,
+    ));
+    sizes.push(("cancel", std::mem::size_of_val(&run_core.cancel(at(1))), 0));
+    sizes.push((
+        "due_effects",
+        std::mem::size_of_val(&run_core.due_effects()),
+        0,
+    ));
+
+    for (operation, size, arguments) in sizes {
+        assert!(
+            size <= bound(arguments),
+            "{operation}: {size} bytes, over {} (arguments {arguments})",
+            bound(arguments)
+        );
+    }
 }

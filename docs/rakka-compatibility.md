@@ -1144,11 +1144,12 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   - **`refresh_if_stale()`**, now public.
   - **On the actor:** `AgentRunActor::from_core(core)` and `AgentRunActor::core()`.
 
-  **The actor.** It now holds one core, and each command runs the core's method of the same name. Its replies, its answers when a stale component cannot be recovered, its recovery when it starts and restarts, and what it records in the snapshot registry are unchanged. Its existing tests pass unmodified, and a parity test records the same registry snapshots through both. Upstream's sharded run entity, the A2A host and the clustered example are unaffected.
+  **The actor.** It now holds one core, and each command runs the core's method of the same name. Each core operation boxes its work, so awaiting one, from the actor or inline in an owner, holds a small future: the actor's tests need less debug stack than before. Its replies, its answers when a stale component cannot be recovered, its recovery when it starts and restarts, and what it records in the snapshot registry are unchanged. Its existing tests pass unmodified, and a test pins the phase each of the 21 operations records an error under. The actor and the core run the same code, so a test that compares the two can only catch a difference in how the actor calls the core. Upstream's sharded run entity, the A2A host and the clustered example are unaffected.
 
   **The single-writer contract** for an owner that holds the core instead of an actor. The owner must already be a single writer of the run's stores, as a sharded entity whose mailbox orders every write is.
   - **Recover first.** It calls `recover()` before the first operation and whenever it is re-created. A core never recovered refuses with `not-recovered`.
-  - **Refresh, then read.** It starts a composed write with `refresh_if_stale()`, and computes the write from state read after that refresh.
+  - **Refresh, then read, then write.** It starts a composed write with `refresh_if_stale()`, and computes the write from state read after that refresh, with no core operation between the read and the write: every core operation may refresh too, and a write computed from state read before a refresh can land over another writer's change.
+  - **A store error leaves the outcome unknown.** A write that fails with a store error other than a revision conflict may have committed, and marks nothing stale. The owner calls `recover()` before relying on the core's state again.
   - **A loss leaves the component stale.** A composed write that loses its compare-and-set to another writer of the store leaves that component stale, and the core's next operation recovers it.
   - **Not recorded.** A composed write is not recorded in the snapshot registry until the owner's next core operation.
 
